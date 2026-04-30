@@ -1,0 +1,16 @@
+// Go workspace for the Fishhawk monorepo.
+//
+// Each major component (backend control plane, runner action, CLI) lives
+// in its own Go module so it can be tagged and published independently.
+// In particular, fishhawk/runner@vX.Y is a real semver tag on the runner
+// module, which matters for customers who pin the GitHub Action via
+// `uses: kuhlman-labs/fishhawk/runner@vX.Y` (per MVP_SPEC §5.1.2).
+//
+// Modules will be added as use directives here as they're scaffolded:
+//   E3.1 (#41) → use ./backend
+//   E5.1 (#52) → use ./runner
+//   E6.1 (#55) → use ./cli
+//
+// See ADR-014 (#78) for the rationale.
+
+go 1.22
