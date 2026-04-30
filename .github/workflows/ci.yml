@@ -68,19 +68,27 @@ jobs:
             echo "::notice::No Go modules registered in go.work yet. Skipping lint/build/test."
           fi
 
-      - name: golangci-lint
+      - name: Install golangci-lint
         if: steps.have-modules.outputs.yes == 'true'
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: v1.59
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.0.0
 
-      - name: Build
+      - name: Lint, build, and test each module
         if: steps.have-modules.outputs.yes == 'true'
-        run: go build ./...
-
-      - name: Test
-        if: steps.have-modules.outputs.yes == 'true'
-        run: go test -race ./...
+        run: |
+          set -eu
+          GOLANGCI_LINT="$(go env GOPATH)/bin/golangci-lint"
+          for m in $(go work edit -json | jq -r '.Use[].DiskPath'); do
+            echo "::group::go module: $m"
+            (
+              cd "$m"
+              "$GOLANGCI_LINT" run ./...
+              go build ./...
+              go test -race ./...
+            )
+            echo "::endgroup::"
+          done
 
   ts:
     name: TypeScript (lint + build + test)
