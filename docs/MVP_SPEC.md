@@ -435,13 +435,13 @@ Failures are first-class. All failure modes are recorded in the audit log with c
 
 | # | Decision | Deadline | Notes |
 |---|---|---|---|
-| 1 | Backend implementation language | Day 1 | Go vs. TypeScript. Both viable. Go is better for the agent-runtime semantics; TS is faster for the founder if more familiar. |
+| 1 | Backend implementation language | ~~Day 1~~ **Decided 2026-04-30: Go.** | Go for agent-runtime semantics, single-binary deploys, and ecosystem fit with the GitHub Actions runner. |
 | 2 | Hosted infrastructure (cloud, primary services) | Day 3 | Likely AWS or GCP. Postgres + S3-compatible object storage + container runtime for backend. |
 | 3 | Pricing for design partners | Day 60 | Free during DP phase, locked-in pricing later? Specific dollars TBD. |
 | 4 | Pricing model: per-engineer vs. per-run | Day 60 | Leaning per-engineer. |
 | 5 | Design partner sourcing strategy | Day 30 | Network, cold outreach, both? Target: 5 partners by day 75. |
-| 6 | OSS repo: public from day 1 or at v0.1? | Day 14 | Public from day 1 is the more honest "built by agents" story. |
-| 7 | Contribution model (CLA vs. DCO) | Day 30 | DCO preferred unless legal pushes for CLA. |
+| 6 | OSS repo: public from day 1 or at v0.1? | ~~Day 14~~ **Decided 2026-04-30: public from day 1.** | Repository is live at github.com/kuhlman-labs/fishhawk under Apache 2.0. |
+| 7 | Contribution model (CLA vs. DCO) | ~~Day 30~~ **Decided 2026-04-30: DCO.** | See CONTRIBUTING.md. Sign-off required on all commits. |
 | 8 | Marketplace billing: through GitHub or direct? | Day 45 | Through GitHub for early-stage convenience; revisit for enterprise. |
 
 ---
