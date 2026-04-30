@@ -11,6 +11,7 @@ Very early. This repository is public from day one as a deliberate commitment to
 There is no working software here yet. The repository currently contains:
 
 - The v0 specification: [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md)
+- The current technical architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - The brand foundations: [`docs/BRAND_FOUNDATIONS.md`](docs/BRAND_FOUNDATIONS.md)
 - The methodology Fishhawk holds itself to: [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md)
 - The (placeholder) workflow spec for Fishhawk's own development: [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml)
