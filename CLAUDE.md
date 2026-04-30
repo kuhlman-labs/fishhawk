@@ -9,6 +9,7 @@ Pre-alpha. Most code referenced in `docs/MVP_SPEC.md` doesn't exist yet — it's
 ## Canonical references
 
 - `docs/MVP_SPEC.md` — v0 scope. Cite section numbers when scope is in question.
+- `docs/ARCHITECTURE.md` — current technical realization (stack, lifecycle, storage, invariants). Read before designing anything cross-component.
 - `docs/BRAND_FOUNDATIONS.md` — voice, naming, positioning.
 - `docs/METHODOLOGY.md` — autonomy tiers (low/medium/high).
 - `.fishhawk/workflows.yaml` — placeholder; executed by the product itself starting Day 21 (~2026-05-20).
