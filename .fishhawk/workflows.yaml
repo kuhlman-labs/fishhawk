@@ -1,0 +1,154 @@
+# Fishhawk's own development workflow.
+#
+# This file exists from day one as a public commitment to the methodology
+# described in docs/METHODOLOGY.md: Fishhawk is built using Fishhawk.
+#
+# It is not yet executed. The Fishhawk runtime that interprets this file is
+# the product being built in this repository. Per docs/MVP_SPEC.md §8, the
+# target for self-execution is day 21 of the v0 build. Until then, this is
+# a placeholder and a public commitment, not a running system.
+#
+# When the product can execute this spec, the syntax may be revised to
+# match the frozen v0 schema. The intent expressed here will not change.
+
+version: "0.1"
+
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+  # Additional roles will be added as the team grows.
+
+workflows:
+
+  # Medium autonomy — the default for most product work.
+  # Agent implements; human approves the plan; human approves the PR.
+  feature_change:
+    description: >-
+      Default workflow for feature work and non-trivial changes.
+      Human approves plan and PR; agent does the implementation.
+
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        budget:
+          max_tokens: 200000
+          max_runtime_minutes: 15
+          enforcement: advisory
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 30
+          - forbidden_paths:
+              - ".github/workflows/**"
+              - ".fishhawk/**"
+              - "LICENSE"
+              - "NOTICE"
+          - required_outcomes:
+              - tests_added_or_updated
+              - ci_green
+        budget:
+          max_tokens: 500000
+          max_runtime_minutes: 30
+          enforcement: advisory
+
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+            blocking_checks:
+              - ci_pass
+              - fishhawk_audit_complete
+
+  # Low autonomy — human-led work.
+  # Used for cryptographic, policy, and audit-integrity surfaces.
+  # The workflow exists to record the work in the audit log; the agent
+  # is not the author. See docs/METHODOLOGY.md for what falls under this.
+  human_led_change:
+    description: >-
+      Workflow for human-authored changes to load-bearing surfaces
+      (crypto, policy engine, audit integrity, GitHub App auth).
+      The audit log records what was changed and who approved it.
+
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - source: pull_request
+            required: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+            blocking_checks:
+              - ci_pass
+
+  # High autonomy — agent implements and merges if gates pass.
+  # Reserved for low-risk, high-volume work where the cost of a mistake
+  # is contained and CI is a sufficient check.
+  routine_change:
+    description: >-
+      Workflow for documentation, dependency bumps, lint/format fixes,
+      and tests for existing behavior. Agent may merge if all gates pass.
+
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 20
+          - allowed_paths:
+              - "docs/**"
+              - "**/*.md"
+              - "go.mod"
+              - "go.sum"
+              - "**/*_test.go"
+          - required_outcomes:
+              - ci_green
+
+      - id: review
+        type: review
+        executor:
+          agent: claude-code
+        gates:
+          - type: check
+            blocking_checks:
+              - ci_pass
+              - fishhawk_audit_complete
