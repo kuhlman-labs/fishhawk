@@ -15,8 +15,8 @@ dist/
 coverage.txt
 coverage.html
 
-# Go workspace file
-go.work
+# Go workspace file is committed for the Fishhawk monorepo (see ADR-014).
+# go.work.sum is generated and not committed.
 go.work.sum
 
 # Dependency directories (rarely used; modules are the default)
@@ -46,6 +46,14 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Node / frontend build artifacts (will land with E7.1)
+node_modules/
+.pnpm-store/
+.cache/
+.eslintcache
+.parcel-cache/
+.vite/
 
 # Local Fishhawk runtime state (when the product can produce it)
 .fishhawk/runs/

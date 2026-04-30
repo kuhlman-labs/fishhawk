@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      ts: ${{ steps.filter.outputs.ts }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            go:
+              - '**/*.go'
+              - '**/go.mod'
+              - '**/go.sum'
+              - 'go.work'
+              - 'go.work.sum'
+              - '.golangci.yml'
+              - '.github/workflows/ci.yml'
+            ts:
+              - 'frontend/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'package-lock.json'
+              - 'yarn.lock'
+              - '.eslintrc*'
+              - 'eslint.config.*'
+              - '.prettierrc*'
+              - '.github/workflows/ci.yml'
+
+  go:
+    name: Go (lint + build + test)
+    needs: detect
+    if: ${{ needs.detect.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Detect registered modules
+        id: have-modules
+        run: |
+          if [ -f go.work ] && grep -q '^use ' go.work; then
+            echo "yes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "yes=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Go modules registered in go.work yet. Skipping lint/build/test."
+          fi
+
+      - name: golangci-lint
+        if: steps.have-modules.outputs.yes == 'true'
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.59
+
+      - name: Build
+        if: steps.have-modules.outputs.yes == 'true'
+        run: go build ./...
+
+      - name: Test
+        if: steps.have-modules.outputs.yes == 'true'
+        run: go test -race ./...
+
+  ts:
+    name: TypeScript (lint + build + test)
+    needs: detect
+    if: ${{ needs.detect.outputs.ts == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "::notice::TypeScript pipeline lands with E7.1 (frontend scaffold, issue #37)."
+          echo "Until then this job is a placeholder so the path filter is exercised."

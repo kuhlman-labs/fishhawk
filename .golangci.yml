@@ -1,0 +1,55 @@
+# Linter config for every Go module in this monorepo.
+# Decision recorded in ADR-014 (#78).
+#
+# Curated preset, not enable-all. Each linter below earns its place by
+# catching real bugs (errcheck, ineffassign), enforcing style the team
+# already agrees on (gofmt, goimports, revive), or surfacing deprecations
+# (staticcheck, govet). Add linters when they fix a problem you've seen,
+# not preemptively.
+
+version: "2"
+
+run:
+  go: "1.22"
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - revive
+    - staticcheck
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    revive:
+      rules:
+        - name: var-naming
+        - name: package-comments
+        - name: exported
+        - name: unused-parameter
+        - name: unused-receiver
+        - name: error-return
+        - name: error-naming
+        - name: if-return
+        - name: empty-block
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - revive
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/kuhlman-labs/fishhawk
