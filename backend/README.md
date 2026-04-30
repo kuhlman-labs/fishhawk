@@ -31,17 +31,25 @@ Or from this directory directly:
 
 ## Status
 
-This module is at the scaffold stage (E3.1, #41). The skeleton compiles,
-prints its version, and ships a smoke test so the CI pipeline has
-something to run. Real behaviour lands in subsequent issues under epic
-E3 (#3):
+E3.2 (#42) — HTTP server with graceful shutdown, middleware stack, and
+the `/healthz` endpoint. The middleware order, outermost first, is
+recovery → request ID → logging → auth stub → mux. Auth is a stub that
+sets `Identity{Subject: "anonymous"}` until E4 (#4) lands real auth.
 
-- E3.2 (#42) — HTTP server + routing on stdlib net/http.
+Subsequent issues under epic E3 (#3):
+
 - E3.3 (#43) — run/stage state machine.
 - E3.4 (#44) — policy evaluator.
 - E3.5 (#45) — approval state + SLA tracking.
 - E3.6 (#46) — REST API surface for CLI + UI.
 - E3.7 (#47) — GitHub App webhook receiver wiring.
+
+## Run
+
+    go run ./backend/cmd/fishhawkd
+    curl http://localhost:8080/healthz
+
+Override the listen address with `--addr` or `FISHHAWKD_ADDR`.
 
 Larger context: `docs/MVP_SPEC.md` §5.1.1 (component) and §5.2 (execution
 flow).
