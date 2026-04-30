@@ -1,0 +1,263 @@
+package run
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	rundb "github.com/kuhlman-labs/fishhawk/backend/internal/run/db"
+)
+
+// pgxQueries is the minimum surface used by both *pgxpool.Pool and
+// pgx.Tx, satisfied by both via their respective Begin/Acquire APIs.
+// Keeping the adapter agnostic here lets the same query code run
+// inside or outside a transaction.
+type pgxQueries interface {
+	rundb.DBTX
+}
+
+// postgresRepo is the production Repository implementation. State
+// transitions are wrapped in a SERIALIZABLE-eligible transaction
+// with SELECT … FOR UPDATE to prevent two concurrent transitions
+// from observing the same prior state.
+type postgresRepo struct {
+	pool *pgxpool.Pool
+}
+
+// NewPostgresRepository wraps a pgxpool.Pool to satisfy Repository.
+// Caller retains ownership of the pool and is responsible for Close.
+func NewPostgresRepository(pool *pgxpool.Pool) Repository {
+	return &postgresRepo{pool: pool}
+}
+
+// --- Run methods ---
+
+func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, error) {
+	q := rundb.New(r.pool)
+	row, err := q.CreateRun(ctx, rundb.CreateRunParams{
+		ID:            uuid.New(),
+		Repo:          p.Repo,
+		WorkflowID:    p.WorkflowID,
+		WorkflowSha:   p.WorkflowSHA,
+		TriggerSource: string(p.TriggerSource),
+		TriggerRef:    p.TriggerRef,
+		State:         string(StatePending),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create run: %w", err)
+	}
+	return rowToRun(row), nil
+}
+
+func (r *postgresRepo) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
+	q := rundb.New(r.pool)
+	row, err := q.GetRun(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get run: %w", err)
+	}
+	return rowToRun(row), nil
+}
+
+func (r *postgresRepo) TransitionRun(ctx context.Context, id uuid.UUID, to State) (*Run, error) {
+	var result *Run
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		current, err := q.LockRunForUpdate(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock run: %w", err)
+		}
+		from := State(current.State)
+		if from == to {
+			result = rowToRun(current)
+			return nil
+		}
+		if !ValidRunTransition(from, to) {
+			return InvalidTransitionError{Kind: "run", From: string(from), To: string(to)}
+		}
+		updated, err := q.UpdateRunState(ctx, rundb.UpdateRunStateParams{
+			ID:    id,
+			State: string(to),
+		})
+		if err != nil {
+			return fmt.Errorf("update run state: %w", err)
+		}
+		result = rowToRun(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// --- Stage methods ---
+
+func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*Stage, error) {
+	q := rundb.New(r.pool)
+	row, err := q.CreateStage(ctx, rundb.CreateStageParams{
+		ID:           uuid.New(),
+		RunID:        p.RunID,
+		Sequence:     int32(p.Sequence),
+		StageType:    string(p.Type),
+		ExecutorKind: string(p.ExecutorKind),
+		ExecutorRef:  p.ExecutorRef,
+		State:        string(StageStatePending),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create stage: %w", err)
+	}
+	return rowToStage(row), nil
+}
+
+func (r *postgresRepo) GetStage(ctx context.Context, id uuid.UUID) (*Stage, error) {
+	q := rundb.New(r.pool)
+	row, err := q.GetStage(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get stage: %w", err)
+	}
+	return rowToStage(row), nil
+}
+
+func (r *postgresRepo) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]*Stage, error) {
+	q := rundb.New(r.pool)
+	rows, err := q.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list stages: %w", err)
+	}
+	out := make([]*Stage, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToStage(row))
+	}
+	return out, nil
+}
+
+func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion) (*Stage, error) {
+	if to == StageStateFailed && (completion == nil || completion.FailureCategory == nil) {
+		return nil, errors.New("transition to failed requires StageCompletion with FailureCategory")
+	}
+	if to != StageStateFailed && completion != nil && completion.FailureCategory != nil {
+		return nil, errors.New("FailureCategory only valid when transitioning to failed")
+	}
+
+	now := time.Now().UTC()
+
+	var result *Stage
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		current, err := q.LockStageForUpdate(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock stage: %w", err)
+		}
+		from := StageState(current.State)
+		if from == to {
+			result = rowToStage(current)
+			return nil
+		}
+		if !ValidStageTransition(from, to) {
+			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(to)}
+		}
+
+		params := rundb.UpdateStageStateParams{
+			ID:    id,
+			State: string(to),
+		}
+		// Stamp started_at the first time we leave Pending/Dispatched.
+		if to == StageStateRunning && !current.StartedAt.Valid {
+			params.StartedAt = pgtype.Timestamptz{Time: now, Valid: true}
+		}
+		// Stamp ended_at when entering a terminal state.
+		if to.IsTerminal() {
+			params.EndedAt = pgtype.Timestamptz{Time: now, Valid: true}
+		}
+		if completion != nil {
+			if completion.FailureCategory != nil {
+				cat := string(*completion.FailureCategory)
+				params.FailureCategory = &cat
+			}
+			if completion.FailureReason != nil {
+				params.FailureReason = completion.FailureReason
+			}
+		}
+
+		updated, err := q.UpdateStageState(ctx, params)
+		if err != nil {
+			return fmt.Errorf("update stage state: %w", err)
+		}
+		result = rowToStage(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// --- Conversions between DB and domain types ---
+
+func rowToRun(r rundb.Run) *Run {
+	return &Run{
+		ID:            r.ID,
+		Repo:          r.Repo,
+		WorkflowID:    r.WorkflowID,
+		WorkflowSHA:   r.WorkflowSha,
+		TriggerSource: TriggerSource(r.TriggerSource),
+		TriggerRef:    r.TriggerRef,
+		State:         State(r.State),
+		CreatedAt:     r.CreatedAt.Time,
+		UpdatedAt:     r.UpdatedAt.Time,
+	}
+}
+
+func rowToStage(s rundb.Stage) *Stage {
+	out := &Stage{
+		ID:            s.ID,
+		RunID:         s.RunID,
+		Sequence:      int(s.Sequence),
+		Type:          StageType(s.StageType),
+		ExecutorKind:  ExecutorKind(s.ExecutorKind),
+		ExecutorRef:   s.ExecutorRef,
+		State:         StageState(s.State),
+		FailureReason: s.FailureReason,
+		CreatedAt:     s.CreatedAt.Time,
+		UpdatedAt:     s.UpdatedAt.Time,
+	}
+	if s.StartedAt.Valid {
+		t := s.StartedAt.Time
+		out.StartedAt = &t
+	}
+	if s.EndedAt.Valid {
+		t := s.EndedAt.Time
+		out.EndedAt = &t
+	}
+	if s.FailureCategory != nil {
+		fc := FailureCategory(*s.FailureCategory)
+		out.FailureCategory = &fc
+	}
+	return out
+}
+
+// Compile-time check that postgresRepo implements Repository.
+var _ Repository = (*postgresRepo)(nil)
+
+// pgxQueries is unused at the type level today; keeping it ensures
+// future tx-scoped helpers can declare the right interface without
+// importing rundb.
+var _ pgxQueries = rundb.DBTX(nil)

@@ -1,75 +1,75 @@
 // Command fishhawkd is the Fishhawk backend control plane.
 //
-// E3.2 (https://github.com/kuhlman-labs/fishhawk/issues/42) wires up the
-// HTTP server with graceful shutdown, the middleware stack, and the
-// /healthz endpoint. Runs and stages, the policy evaluator, and the
-// REST API surface land in subsequent issues under epic E3 (#3).
+// Subcommands:
+//
+//	fishhawkd serve          start the HTTP server (default if no subcommand)
+//	fishhawkd migrate up     apply pending DB migrations
+//	fishhawkd migrate down   roll back the most recent migration (dev only)
+//
+// E3.2 (#42) wired the HTTP serve path. E3.3 (#43) added the run state
+// machine, the Postgres pool, and the migrate subcommand.
 package main
 
 import (
-	"context"
-	"errors"
-	"flag"
+	"fmt"
 	"io"
-	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
-
-	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
+	"strings"
 )
 
-const exitFailure = 1
+const (
+	exitOK      = 0
+	exitFailure = 1
+	exitUsage   = 2
+)
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stderr))
 }
 
-// run is split out from main so tests can drive it without exiting
-// the test process. Returns the intended process exit code.
+// run dispatches to the appropriate subcommand. Split out of main so
+// tests can drive it without exiting the test process.
 func run(args []string, logSink io.Writer) int {
-	fs := flag.NewFlagSet("fishhawkd", flag.ContinueOnError)
-	fs.SetOutput(logSink)
-	addr := fs.String("addr", envOr("FISHHAWKD_ADDR", ":8080"), "listen address")
-	if err := fs.Parse(args); err != nil {
-		return exitFailure
+	cmd, rest := splitCommand(args)
+	switch cmd {
+	case "", "serve":
+		return runServe(rest, logSink)
+	case "migrate":
+		return runMigrate(rest, logSink)
+	case "-h", "--help", "help":
+		printUsage(logSink)
+		return exitOK
+	default:
+		_, _ = fmt.Fprintf(logSink, "fishhawkd: unknown subcommand %q\n\n", cmd)
+		printUsage(logSink)
+		return exitUsage
 	}
+}
 
-	logger := slog.New(slog.NewJSONHandler(logSink, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	logger = logger.With(
-		slog.String("service", "fishhawkd"),
-		slog.String("version", version.Version),
-	)
-	slog.SetDefault(logger)
-
-	srv := server.New(server.Config{
-		Addr:   *addr,
-		Logger: logger,
-	})
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Start() }()
-
-	select {
-	case <-ctx.Done():
-		logger.Info("shutdown signal received")
-	case err := <-errCh:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("server start failed", slog.String("error", err.Error()))
-			return exitFailure
-		}
+// splitCommand pulls the first positional arg as the subcommand name.
+// Anything starting with "-" is treated as a flag for the implicit
+// `serve` subcommand, preserving the bare "fishhawkd --addr=…" form.
+func splitCommand(args []string) (cmd string, rest []string) {
+	if len(args) == 0 {
+		return "", nil
 	}
-
-	if err := srv.Shutdown(context.Background()); err != nil {
-		logger.Error("shutdown failed", slog.String("error", err.Error()))
-		return exitFailure
+	if strings.HasPrefix(args[0], "-") {
+		return "", args
 	}
-	logger.Info("shutdown complete")
-	return 0
+	return args[0], args[1:]
+}
+
+func printUsage(w io.Writer) {
+	for _, line := range []string{
+		"Usage: fishhawkd [serve|migrate] [flags]",
+		"",
+		"Subcommands:",
+		"  serve         Run the HTTP server (default).",
+		"  migrate up    Apply pending DB migrations.",
+		"  migrate down  Roll back the most recent migration (dev only).",
+	} {
+		_, _ = fmt.Fprintln(w, line)
+	}
 }
 
 func envOr(key, def string) string {
