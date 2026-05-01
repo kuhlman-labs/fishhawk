@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/plan-standard-v1.schema.json",
+  "title": "Fishhawk plan artifact (standard_v1)",
+  "description": "The plan-stage output produced by the agent and validated by the runner before the stage is considered successful. Frozen at Day 21 of the v0 build per MVP_SPEC.md §8 — old plans in the audit log remain readable forever; never break this schema in place. Future versions land as standard_v2, etc.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "plan_version",
+    "ticket_reference",
+    "generated_by",
+    "summary",
+    "scope",
+    "approach",
+    "verification"
+  ],
+
+  "properties": {
+    "plan_version": {
+      "type": "string",
+      "enum": ["standard_v1"],
+      "description": "Schema version the document was authored against."
+    },
+    "ticket_reference": { "$ref": "#/$defs/ticket-reference" },
+    "generated_by":     { "$ref": "#/$defs/generated-by" },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable description of the change. Rendered as the lead paragraph in the issue comment."
+    },
+    "scope":              { "$ref": "#/$defs/scope" },
+    "approach": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/approach-step" },
+      "description": "Ordered steps the agent intends to take."
+    },
+    "verification":       { "$ref": "#/$defs/verification" },
+    "risks_and_assumptions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Optional. Things the agent flagged as uncertain or assumed; surfaces in the review UI."
+    }
+  },
+
+  "$defs": {
+    "ticket-reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "url", "id"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["github_issue"],
+          "description": "v0 closed set; v0.x adds linear_ticket and jira_ticket."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Canonical URL of the originating ticket."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier — e.g. \"kuhlman-labs/fishhawk#1247\"."
+        }
+      }
+    },
+
+    "generated-by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "model", "timestamp"],
+      "properties": {
+        "agent": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent identifier matching the workflow spec's executor.agent."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Specific model used (e.g. claude-opus-4-7)."
+        },
+        "version": {
+          "type": "string",
+          "description": "Optional. Model version or build SHA when agent reports it."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 timestamp of generation. The runner wall-clock at agent invocation."
+        }
+      }
+    },
+
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files"],
+      "properties": {
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/scope-file" },
+          "description": "Files the agent intends to create, modify, or delete."
+        },
+        "estimated_lines_changed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Rough estimate. Used by reviewers to gauge change size; not enforced."
+        }
+      }
+    },
+
+    "scope-file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "operation"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative path."
+        },
+        "operation": {
+          "type": "string",
+          "enum": ["create", "modify", "delete"]
+        }
+      }
+    },
+
+    "approach-step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step", "description"],
+      "properties": {
+        "step": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["test_strategy", "rollback_plan"],
+      "properties": {
+        "test_strategy": {
+          "type": "string",
+          "minLength": 1,
+          "description": "How the change will be tested. Free-form prose; reviewers expect concrete tests, not just \"add tests\"."
+        },
+        "rollback_plan": {
+          "type": "string",
+          "minLength": 1,
+          "description": "How a regression would be undone. \"Revert PR\" is a valid answer for purely-additive changes; data migrations need more."
+        }
+      }
+    }
+  }
+}
