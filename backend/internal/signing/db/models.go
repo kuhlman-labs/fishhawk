@@ -2,7 +2,7 @@
 // versions:
 //   sqlc v1.31.1
 
-package auditdb
+package signingdb
 
 import (
 	"github.com/google/uuid"

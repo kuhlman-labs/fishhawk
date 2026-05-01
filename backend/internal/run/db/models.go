@@ -45,6 +45,13 @@ type Run struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type SigningKey struct {
+	RunID     uuid.UUID          `json:"run_id"`
+	PublicKey []byte             `json:"public_key"`
+	IssuedAt  pgtype.Timestamptz `json:"issued_at"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+}
+
 type Stage struct {
 	ID              uuid.UUID          `json:"id"`
 	RunID           uuid.UUID          `json:"run_id"`

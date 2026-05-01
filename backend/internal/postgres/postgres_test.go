@@ -202,19 +202,18 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. With multiple migrations
-	// applied (0001 runs/stages, 0002 audit log), one step removes
-	// only the most-recent migration's tables. Confirm:
-	//   - audit_entries (added in 0002) is gone.
-	//   - runs (added in 0001) is still present.
-	var auditCount, runsCount int
+	// MigrateDown rolls back one step. The most-recent migration is
+	// always removed; older migrations stay applied. Confirm with
+	// the most-recent migration's table (signing_keys from 0003)
+	// gone and an earlier table (runs from 0001) still present.
+	var newestCount, runsCount int
 	if err := pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'audit_entries'`,
-	).Scan(&auditCount); err != nil {
-		t.Fatalf("query audit_entries table: %v", err)
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'signing_keys'`,
+	).Scan(&newestCount); err != nil {
+		t.Fatalf("query signing_keys table: %v", err)
 	}
-	if auditCount != 0 {
-		t.Errorf("'audit_entries' count after MigrateDown = %d, want 0", auditCount)
+	if newestCount != 0 {
+		t.Errorf("'signing_keys' count after MigrateDown = %d, want 0 (most-recent migration rolled back)", newestCount)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'runs'`,
