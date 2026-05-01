@@ -92,10 +92,27 @@ jobs:
               cd "$m"
               "$GOLANGCI_LINT" run ./...
               go build ./...
-              go test -race ./...
+              go test -race -coverprofile=coverage.out -covermode=atomic ./...
             )
             echo "::endgroup::"
           done
+
+      - name: Coverage threshold (≥ 80% aggregate, excl. sqlc-generated)
+        if: steps.have-modules.outputs.yes == 'true'
+        run: |
+          set -eu
+          # Build a list of per-module coverage profiles. The threshold
+          # script aggregates across all of them; --exclude drops generated
+          # packages before counting. Targets documented in
+          # docs/ARCHITECTURE.md §9.
+          profiles=()
+          while IFS= read -r m; do
+            profiles+=("$m/coverage.out")
+          done < <(go work edit -json | jq -r '.Use[].DiskPath')
+          python3 scripts/check-coverage.py \
+            --threshold 80 \
+            --exclude 'internal/run/db' \
+            "${profiles[@]}"
 
   ts:
     name: TypeScript (lint + build + test)

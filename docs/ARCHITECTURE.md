@@ -136,6 +136,12 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 
 - **CI workflow** at `.github/workflows/ci.yml`. Path-aware via `dorny/paths-filter`. The Go job iterates `go.work` `use` directives — adding a new module Just Works.
 - **Lint config** at `/.golangci.yml` (v2 format). Shared across all Go modules in the workspace.
+- **Coverage targets**, tiered to the autonomy levels in `docs/METHODOLOGY.md`:
+  - **Low-autonomy code** (audit log integrity, signing/crypto, policy evaluator, run state machine, workflow spec parser): ≥ 85% statement coverage.
+  - **Medium-autonomy code** (HTTP handlers, runner adapters, REST endpoints, UI logic): ≥ 75%.
+  - **High-autonomy code** (docs, dep bumps, lint/format): no target.
+  - **Generated code** (sqlc outputs, etc.): excluded from numerator and denominator.
+  - **Aggregate floor (excluding generated): ≥ 80%.** Enforced by `scripts/check-coverage.py` in the Go CI job; PRs that drop below fail `CI Pass`. Run locally with `(cd backend && go test -race -coverprofile=coverage.out -covermode=atomic ./...) && python3 scripts/check-coverage.py --threshold 80 --exclude internal/run/db backend/coverage.out`.
 - **Release**: each module is tagged independently. The runner is the customer-facing one — `kuhlman-labs/fishhawk/runner@v0.1` etc. — built with signed releases + SBOM (E5.7 / #54, E13.6 / #63).
 
 ## 10. Where to look
