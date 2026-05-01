@@ -8,7 +8,7 @@
 //
 // Modules will be added as use directives here as they're scaffolded:
 //   E3.1 (#41) → use ./backend  ✓
-//   E5.1 (#52) → use ./runner
+//   E5.1 (#52) → use ./runner   ✓
 //   E6.1 (#55) → use ./cli
 //
 // See ADR-014 (#78) for the rationale.
@@ -16,3 +16,4 @@
 go 1.25.0
 
 use ./backend
+use ./runner

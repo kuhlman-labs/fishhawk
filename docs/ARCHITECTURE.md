@@ -17,7 +17,7 @@ Five surfaces, deployed independently. Each maps to a directory in this monorepo
 | Component | Path | Role | Epic |
 |---|---|---|---|
 | **Backend control plane** (`fishhawkd`) | `/backend` | Workflow state machine, policy evaluator, approval state, audit writer, REST API, GitHub App webhook receiver. | E3 (#3) |
-| **Runner action** (`fishhawk/runner`) | `/runner` (planned) | GitHub Action published as `kuhlman-labs/fishhawk/runner@vX.Y`. Runs on the customer's CI: invokes the agent, captures trace, validates the produced plan, signs and ships the bundle. | E5 (#5) |
+| **Runner action** (`fishhawk/runner`) | `/runner` | GitHub Action published as `kuhlman-labs/fishhawk/runner@vX.Y`. Runs on the customer's CI: invokes the agent, captures trace, validates the produced plan, signs and ships the bundle. Currently a scaffold (E5.1) — flag parsing only, no agent invocation yet. | E5 (#5) |
 | **Web UI** | `/frontend` (planned) | Authenticated SPA — plan review, approval, audit search, run visualization. | E7 (#7) |
 | **CLI** (`fishhawk`) | `/cli` (planned) | Validate workflow specs locally; trigger and inspect runs from the terminal. Plan review and approval explicitly stay in the UI. | E6 (#6) |
 | **GitHub App** | (registered with GitHub; manifest in repo) | Per-installation tokens for repo access; OAuth provider for user sign-in; webhook source for triggers. | E4 (#4) |
@@ -113,7 +113,7 @@ These are load-bearing. Do not break them without explicit ADR.
 The Go monorepo is a workspace, not a single module. Each top-level directory is independently taggable:
 
 - `/backend` — `github.com/kuhlman-labs/fishhawk/backend`. Internal packages only (no exported API to other modules).
-- `/runner` (planned) — `github.com/kuhlman-labs/fishhawk/runner`. The published GitHub Action artifact. Customers pin a tag.
+- `/runner` — `github.com/kuhlman-labs/fishhawk/runner`. The published GitHub Action artifact (composite action manifest at `runner/action.yml`). Customers pin a tag.
 - `/cli` (planned) — `github.com/kuhlman-labs/fishhawk/cli`. Single binary.
 
 Cross-module type sharing is intentionally avoided in v0. If two modules need the same struct (e.g., the `standard_v1` plan schema), the canonical source is a JSON Schema in `/docs/spec/` and each side parses independently. This keeps the runner's dependency graph small and the supply-chain surface minimal.
