@@ -42,6 +42,13 @@ done
 
 `.golangci.yml` is **v2 format** (`version: "2"` at top). Local install must be golangci-lint v2.x; v1 binaries reject this config.
 
+**Coverage gate**: aggregate ≥ 80% excluding `internal/run/db` (sqlc-generated). Tiered targets in `docs/ARCHITECTURE.md` §9. CI fails `CI Pass` if the threshold drops. Reproduce locally:
+
+```sh
+(cd backend && go test -race -coverprofile=coverage.out -covermode=atomic ./...)
+python3 scripts/check-coverage.py --threshold 80 --exclude internal/run/db backend/coverage.out
+```
+
 ## Adding a Go module
 
 1. `mkdir <name> && cd <name> && go mod init github.com/kuhlman-labs/fishhawk/<name>`
