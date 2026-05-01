@@ -103,6 +103,24 @@ func makeRun(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	return r.ID
 }
 
+// makeStageInRun adds a stage under an existing run so audit
+// entries can carry a non-nil StageID.
+func makeStageInRun(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID) uuid.UUID {
+	t.Helper()
+	repo := run.NewPostgresRepository(pool)
+	s, err := repo.CreateStage(context.Background(), run.CreateStageParams{
+		RunID:        runID,
+		Sequence:     0,
+		Type:         run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create stage: %v", err)
+	}
+	return s.ID
+}
+
 func entryHash(seq int64, payload []byte) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(time.Now().Format(time.RFC3339Nano)))
