@@ -1,0 +1,62 @@
+# Dependabot keeps Fishhawk's dependencies current.
+#
+# Per docs/METHODOLOGY.md, dependency bumps that pass CI fall under the
+# high-autonomy tier — agents may merge them once all gates are green.
+# The labels below feed Project #7's filters so bump PRs slot into the
+# right Component/Autonomy buckets automatically.
+#
+# Add new entries as new modules land:
+#   /runner under E5.1 (#52)
+#   /cli    under E6.1 (#55)
+#   /frontend under E7.1 (#37)
+
+version: 2
+
+updates:
+  # Backend Go module.
+  - package-ecosystem: gomod
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:backend
+      - autonomy:high
+    commit-message:
+      prefix: deps(backend)
+      include: scope
+    groups:
+      pgx:
+        patterns:
+          - "github.com/jackc/pgx/*"
+      otel:
+        patterns:
+          - "go.opentelemetry.io/*"
+      testcontainers:
+        patterns:
+          - "github.com/testcontainers/*"
+      golang-migrate:
+        patterns:
+          - "github.com/golang-migrate/*"
+
+  # GitHub Actions workflows. Especially load-bearing given the
+  # September-2026 deprecation of Node-20-based actions warned about
+  # on PR #85.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:infra
+      - autonomy:high
+    commit-message:
+      prefix: ci
