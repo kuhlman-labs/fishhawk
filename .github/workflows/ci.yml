@@ -21,7 +21,7 @@ jobs:
       go: ${{ steps.filter.outputs.go }}
       ts: ${{ steps.filter.outputs.ts }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -51,7 +51,7 @@ jobs:
     if: ${{ needs.detect.outputs.go == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-go@v6
         with:
@@ -103,7 +103,7 @@ jobs:
     if: ${{ needs.detect.outputs.ts == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: |
           echo "::notice::TypeScript pipeline lands with E7.1 (frontend scaffold, issue #37)."
           echo "Until then this job is a placeholder so the path filter is exercised."
