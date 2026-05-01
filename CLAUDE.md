@@ -12,6 +12,7 @@ Pre-alpha. Most code referenced in `docs/MVP_SPEC.md` doesn't exist yet — it's
 - `docs/ARCHITECTURE.md` — current technical realization (stack, lifecycle, storage, invariants). Read before designing anything cross-component.
 - `docs/BRAND_FOUNDATIONS.md` — voice, naming, positioning.
 - `docs/METHODOLOGY.md` — autonomy tiers (low/medium/high).
+- `docs/spec/` — canonical JSON Schemas + reference docs for the workflow spec (`.fishhawk/workflows.yaml`) and the plan artifact (`standard_v1`). Validate with `check-jsonschema --schemafile <schema> <yaml-or-json>`.
 - `.fishhawk/workflows.yaml` — placeholder; executed by the product itself starting Day 21 (~2026-05-20).
 
 ## Documentation surfaces

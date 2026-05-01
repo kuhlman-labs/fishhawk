@@ -1,0 +1,49 @@
+{
+  "plan_version": "standard_v1",
+  "ticket_reference": {
+    "type": "github_issue",
+    "url": "https://github.com/kuhlman-labs/fishhawk/issues/1247",
+    "id": "kuhlman-labs/fishhawk#1247"
+  },
+  "generated_by": {
+    "agent": "claude-code",
+    "model": "claude-opus-4-7",
+    "version": "build-abc123",
+    "timestamp": "2026-04-30T14:22:11Z"
+  },
+  "summary": "Add a bulk export endpoint for the audit log so customers can hand a date-ranged JSON dump to their compliance officer without scraping the UI.",
+  "scope": {
+    "files": [
+      { "path": "backend/internal/api/audit_export.go", "operation": "create" },
+      { "path": "backend/internal/api/audit_export_test.go", "operation": "create" },
+      { "path": "backend/internal/api/router.go", "operation": "modify" }
+    ],
+    "estimated_lines_changed": 280
+  },
+  "approach": [
+    {
+      "step": 1,
+      "description": "Add GET /v0/audit/export with --from and --to query parameters validated as RFC-3339 timestamps."
+    },
+    {
+      "step": 2,
+      "description": "Stream JSON Lines from audit_entries with cursor-based pagination (limit 1000 rows per page); cursor is the (created_at, entry_id) of the last row."
+    },
+    {
+      "step": 3,
+      "description": "Reuse existing rate-limit middleware; document the endpoint in docs/api/v0.md."
+    },
+    {
+      "step": 4,
+      "description": "Add an integration test that seeds 1000 entries across 3 dates and exercises pagination end-to-end."
+    }
+  ],
+  "verification": {
+    "test_strategy": "Integration test under backend/internal/api/audit_export_test.go uses testcontainers Postgres, seeds entries, asserts (a) date filtering correctness, (b) pagination cursor stability across pages, (c) JSON Lines output framing. Manual smoke: curl against local docker-compose to confirm streaming works end-to-end.",
+    "rollback_plan": "Revert the PR. The endpoint is purely additive and reads existing tables; no data migration to roll back."
+  },
+  "risks_and_assumptions": [
+    "Assumes audit_entries (created_at, entry_id) is the natural sort order; if a future migration adds an `inserted_at` distinct from `created_at` the cursor format will need to be revisited.",
+    "Risk: very large date ranges (months) could pull millions of rows; mitigated by the per-page cap of 1000 rows and a server-side total cap of 100k rows per request, with a clear error advising the caller to narrow the range."
+  ]
+}
