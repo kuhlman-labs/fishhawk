@@ -146,7 +146,8 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | Why a decision was made | The corresponding closed ADR issue (`gh issue list --label adr --state closed`) |
 | Voice / naming for new surfaces | `docs/BRAND_FOUNDATIONS.md` §5–§7 |
 | Autonomy tier of a change | `docs/METHODOLOGY.md` |
-| Workflow primitive grammar | `.fishhawk/workflows.yaml` (canonical example) and the spec's §4.2 |
+| Workflow spec grammar | `docs/spec/workflow-v0.md` + `docs/spec/workflow-v0.schema.json` |
+| Plan artifact structure | `docs/spec/plan-standard-v1.md` + `docs/spec/plan-standard-v1.schema.json` |
 | HTTP middleware order / context keys | `backend/internal/server/middleware.go` |
 | How a new Go module gets added | `CLAUDE.md` "Adding a Go module" |
 

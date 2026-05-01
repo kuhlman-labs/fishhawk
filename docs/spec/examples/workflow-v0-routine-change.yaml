@@ -1,0 +1,47 @@
+# High-autonomy workflow example — agent implements and merges if all
+# gates pass. Mirrors the routine_change workflow in
+# /.fishhawk/workflows.yaml. Used to exercise the schema's:
+# - check-gate path (no human approver)
+# - allowed_paths constraint kind
+# - executor on a review stage being an agent
+# - omitted optional sections (no inputs, no budget on either stage)
+
+version: "0.1"
+
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+
+workflows:
+  routine_change:
+    description: >-
+      Workflow for documentation, dependency bumps, lint/format fixes,
+      and tests for existing behavior. Agent may merge if all gates pass.
+
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 20
+          - allowed_paths:
+              - "docs/**"
+              - "**/*.md"
+              - "go.mod"
+              - "go.sum"
+              - "**/*_test.go"
+          - required_outcomes:
+              - ci_green
+
+      - id: review
+        type: review
+        executor:
+          agent: claude-code
+        gates:
+          - type: check
+            blocking_checks:
+              - ci_pass
+              - fishhawk_audit_complete
