@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/workflow-v0.schema.json",
+  "title": "Fishhawk workflow spec v0",
+  "description": "Schema for .fishhawk/workflows.yaml. Frozen at Day 21 of the v0 build per MVP_SPEC.md §8. Old workflow runs in the audit log remain readable forever — never break this schema in place; bump to a new spec version instead.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "workflows"],
+
+  "properties": {
+    "version": {
+      "type": "string",
+      "enum": ["0.1"],
+      "description": "Spec syntax version. v0 freezes at 0.1; future syntax bumps land as 0.2 etc., with new schema files."
+    },
+    "roles": {
+      "type": "object",
+      "description": "Named roles referenced by gate approvers. Keys are snake_case identifiers; values list GitHub user/team refs.",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": { "$ref": "#/$defs/role" }
+      }
+    },
+    "workflows": {
+      "type": "object",
+      "description": "Named workflows. Keys are snake_case identifiers (e.g. feature_change). At least one workflow must be defined.",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": { "$ref": "#/$defs/workflow" }
+      }
+    }
+  },
+
+  "$defs": {
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["members"],
+      "properties": {
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/member-ref" }
+        }
+      }
+    },
+
+    "member-ref": {
+      "type": "string",
+      "pattern": "^@[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$",
+      "description": "GitHub user (@user) or team (@org/team) reference. Resolved against the GitHub App installation at run time."
+    },
+
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stages"],
+      "properties": {
+        "description": { "type": "string" },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/stage" }
+        }
+      }
+    },
+
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "executor"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Unique within the parent workflow. Referenced by inputs.from_stage."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["plan", "implement", "review"],
+          "description": "v0 closed set. Custom stage types are deliberately disallowed."
+        },
+        "executor": { "$ref": "#/$defs/executor" },
+        "inputs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/input" }
+        },
+        "produces": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/produces" }
+        },
+        "constraints": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/constraint" }
+        },
+        "budget":  { "$ref": "#/$defs/budget" },
+        "gates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/gate" }
+        }
+      }
+    },
+
+    "executor": {
+      "type": "object",
+      "description": "Exactly one of agent (string) or human (true).",
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {
+          "required": ["agent"],
+          "properties": {
+            "agent": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Agent identifier. v0 ships with claude-code; v0.x adds cursor and copilot."
+            }
+          }
+        },
+        {
+          "required": ["human"],
+          "properties": {
+            "human": { "type": "boolean", "const": true }
+          }
+        }
+      ]
+    },
+
+    "input": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {
+          "description": "Trigger input from outside the workflow (an issue, a PR).",
+          "required": ["source"],
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["github_issue", "pull_request"]
+            },
+            "required": { "type": "boolean" }
+          }
+        },
+        {
+          "description": "Artifact input from a prior stage in the same run.",
+          "required": ["artifact", "from_stage"],
+          "properties": {
+            "artifact": {
+              "type": "string",
+              "enum": ["plan", "pull_request"]
+            },
+            "from_stage": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$"
+            }
+          }
+        }
+      ]
+    },
+
+    "produces": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact"],
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "enum": ["plan", "pull_request"],
+          "description": "v0 closed set. Custom artifacts deferred."
+        },
+        "schema": {
+          "type": "string",
+          "description": "Artifact schema version (e.g. standard_v1 for plan)."
+        },
+        "persistence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/persistence" }
+        }
+      }
+    },
+
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "mode"],
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": ["originating_issue", "fishhawk_audit_log"]
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["rendered_comment", "canonical"],
+          "description": "rendered_comment: posted as a formatted comment on the target. canonical: stored as the authoritative copy in the audit log."
+        },
+        "update_on_change": {
+          "type": "boolean",
+          "description": "Re-publish to the target if the artifact is regenerated."
+        }
+      }
+    },
+
+    "constraint": {
+      "type": "object",
+      "description": "Exactly one constraint kind per object. Closed set per MVP_SPEC §4.1.",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "max_files_changed": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "forbidden_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Glob patterns (gitignore-style) that the stage's diff must not touch."
+        },
+        "allowed_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Glob patterns; the stage's diff must touch only these paths."
+        },
+        "required_outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["tests_added_or_updated", "ci_green"]
+          }
+        }
+      }
+    },
+
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_tokens": { "type": "integer", "minimum": 1 },
+        "max_runtime_minutes": { "type": "integer", "minimum": 1 },
+        "enforcement": {
+          "type": "string",
+          "enum": ["advisory", "blocking"],
+          "description": "v0 ships advisory only; blocking arrives in v0.x with the Fishhawk-issued ephemeral key path."
+        }
+      }
+    },
+
+    "gate": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": ["type"],
+      "oneOf": [
+        {
+          "description": "Approval gate — blocks until an approver acts.",
+          "required": ["type", "approvers"],
+          "properties": {
+            "type": { "const": "approval" },
+            "approvers": { "$ref": "#/$defs/approvers" },
+            "sla": {
+              "type": "string",
+              "description": "SLA before timeout fires a category-D failure (e.g. '4_business_hours', '24_hours')."
+            },
+            "blocking_checks": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string" }
+            }
+          }
+        },
+        {
+          "description": "Check gate — passes when all blocking_checks succeed; no human approval.",
+          "required": ["type", "blocking_checks"],
+          "properties": {
+            "type": { "const": "check" },
+            "blocking_checks": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string" }
+            }
+          }
+        }
+      ]
+    },
+
+    "approvers": {
+      "type": "object",
+      "description": "Either any_of (one approver suffices) or all_of (every named role must approve).",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "any_of": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+        },
+        "all_of": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+        }
+      }
+    }
+  }
+}

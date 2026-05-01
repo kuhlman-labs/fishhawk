@@ -1,0 +1,15 @@
+# Smallest valid spec: one workflow with one stage, no roles, no
+# gates, no constraints. Useful as a regression baseline that
+# nothing about the parser regressed for the bare-bones case.
+
+version: "0.1"
+
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request

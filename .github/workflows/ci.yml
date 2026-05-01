@@ -72,6 +72,16 @@ jobs:
             echo "::notice::No Go modules registered in go.work yet. Skipping lint/build/test."
           fi
 
+      - name: Schema sync (docs/spec ↔ embedded copies)
+        if: steps.have-modules.outputs.yes == 'true'
+        run: |
+          # The Go parser embeds workflow-v0.schema.json under
+          # backend/internal/spec/schemas/. The canonical copy lives
+          # at docs/spec/. CI fails if they drift; update both in the
+          # same PR.
+          diff -u docs/spec/workflow-v0.schema.json \
+                  backend/internal/spec/schemas/workflow-v0.schema.json
+
       - name: Install golangci-lint
         if: steps.have-modules.outputs.yes == 'true'
         run: |

@@ -1,0 +1,83 @@
+# Mirror of docs/spec/examples/workflow-v0-feature-change.yaml.
+# Used as a regression fixture: any change to the parser must keep
+# this example parseable end-to-end.
+
+version: "0.1"
+
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+  senior_engineer:
+    members: ["@org/senior-engineers", "@org/tech-leads"]
+  any_engineer:
+    members: ["@org/engineering"]
+
+workflows:
+  feature_change:
+    description: "Default workflow for new features and non-trivial changes."
+
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        budget:
+          max_tokens: 200000
+          max_runtime_minutes: 15
+          enforcement: advisory
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead, senior_engineer]
+            sla: 4_business_hours
+
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 30
+          - forbidden_paths:
+              - "infra/**"
+              - ".github/workflows/**"
+              - "security/**"
+              - ".fishhawk/**"
+          - required_outcomes:
+              - tests_added_or_updated
+              - ci_green
+        budget:
+          max_tokens: 500000
+          max_runtime_minutes: 30
+          enforcement: advisory
+
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers:
+              any_of: [senior_engineer]
+            blocking_checks:
+              - ci_pass
+              - fishhawk_audit_complete
