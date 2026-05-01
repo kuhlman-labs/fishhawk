@@ -2,7 +2,7 @@
 // versions:
 //   sqlc v1.31.1
 
-package rundb
+package artifactdb
 
 import (
 	"github.com/google/uuid"

@@ -116,13 +116,17 @@ jobs:
           # script aggregates across all of them; --exclude drops generated
           # packages before counting. Targets documented in
           # docs/ARCHITECTURE.md §9.
+          #
+          # The /db/ exclude pattern matches every sqlc-generated package
+          # (convention: `internal/<feature>/db/`). New sqlc packages
+          # auto-skip without editing this list.
           profiles=()
           while IFS= read -r m; do
             profiles+=("$m/coverage.out")
           done < <(go work edit -json | jq -r '.Use[].DiskPath')
           python3 scripts/check-coverage.py \
             --threshold 80 \
-            --exclude 'internal/run/db' \
+            --exclude '/db/' \
             "${profiles[@]}"
 
   ts:
