@@ -107,3 +107,27 @@ jobs:
       - run: |
           echo "::notice::TypeScript pipeline lands with E7.1 (frontend scaffold, issue #37)."
           echo "Until then this job is a placeholder so the path filter is exercised."
+
+  # Rollup gate. The repo ruleset requires only this job; it inherits
+  # the result of every job listed in `needs`. Add new jobs to that
+  # list and they automatically become part of the gate without
+  # touching the ruleset.
+  ci-pass:
+    name: CI Pass
+    needs: [detect, go, ts]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs
+        run: |
+          # Skipped jobs (e.g. the TS job when no TS files changed)
+          # are NOT failures. Cancellations are.
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "::error::One or more required jobs failed."
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::One or more required jobs was cancelled."
+            exit 1
+          fi
+          echo "All required jobs passed (or were correctly skipped)."
