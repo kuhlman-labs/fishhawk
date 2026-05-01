@@ -1,0 +1,50 @@
+name: 'Fishhawk Runner'
+description: 'Run an agent under a Fishhawk workflow stage and ship the signed trace bundle to the backend.'
+author: 'Fishhawk'
+branding:
+  icon: 'play-circle'
+  color: 'blue'
+
+# Customers reference this action as
+#   uses: kuhlman-labs/fishhawk/runner@vX.Y
+# and pass the inputs below. The composite action checks out a Go
+# toolchain and invokes ./cmd/fishhawk-runner from this directory.
+#
+# E5.1 (#52) ships the scaffold: the Go binary parses its inputs and
+# exits 0. The agent invocation, trace capture, signing, and trace
+# shipping arrive in E5.2–E5.6. Customers pinning v0.1 see a no-op
+# success until those land — useful for exercising the dispatch
+# path early.
+
+inputs:
+  run-id:
+    description: 'Workflow run identifier (UUID, supplied by the backend dispatch).'
+    required: true
+  backend-url:
+    description: 'Fishhawk backend URL the runner ships its trace bundle to.'
+    required: true
+  workflow:
+    description: 'Workflow ID matching a top-level key in .fishhawk/workflows.yaml.'
+    required: true
+  stage:
+    description: 'Stage ID within the workflow (e.g. plan, implement, review).'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version: '1.25'
+        cache: false
+
+    - name: Run fishhawk-runner
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        go run ./cmd/fishhawk-runner \
+          --run-id "${{ inputs.run-id }}" \
+          --backend-url "${{ inputs.backend-url }}" \
+          --workflow "${{ inputs.workflow }}" \
+          --stage "${{ inputs.stage }}"
