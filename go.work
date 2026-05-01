@@ -13,6 +13,6 @@
 //
 // See ADR-014 (#78) for the rationale.
 
-go 1.22
+go 1.25.0
 
 use ./backend

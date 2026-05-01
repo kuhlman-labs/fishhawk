@@ -1,0 +1,29 @@
+# sqlc configuration per ADR-002 (#66).
+#
+# Single config covers every feature in this module. Each feature
+# keeps its own queries.sql; sqlc emits typed Go alongside the
+# feature in internal/<feature>/db.
+
+version: "2"
+
+sql:
+  - engine: "postgresql"
+    queries: "internal/run/queries.sql"
+    schema: "internal/postgres/migrations"
+    gen:
+      go:
+        package: "rundb"
+        out: "internal/run/db"
+        sql_package: "pgx/v5"
+        emit_pointers_for_null_types: true
+        emit_json_tags: true
+        json_tags_case_style: "snake"
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              type: "uuid.UUID"
+              import: "github.com/google/uuid"
+              pointer: true

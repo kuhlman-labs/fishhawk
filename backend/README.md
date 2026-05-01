@@ -13,9 +13,11 @@ multi-module rationale.
 
 ## Layout
 
-- `cmd/fishhawkd/` — the binary entrypoint.
-- `internal/` — packages private to this module. The bulk of backend
-  logic lives here as it lands.
+- `cmd/fishhawkd/` — the binary entrypoint with `serve` and `migrate` subcommands.
+- `internal/postgres/` — pgx pool wrapper and embedded `golang-migrate` runner. Migrations live under `internal/postgres/migrations/`.
+- `internal/run/` — workflow run / stage state machine. Domain types in `run.go`, transition tables in `transition.go`, `Repository` interface in `repository.go`, Postgres adapter in `postgres.go`. sqlc-generated code under `internal/run/db/`.
+- `internal/server/` — HTTP server, middleware, handlers.
+- `internal/version/` — build version exposed via `-ldflags`.
 
 ## Build and test
 
@@ -23,22 +25,22 @@ From the repo root (workspace-aware):
 
     go build ./backend/...
     go test ./backend/...
+    golangci-lint run ./backend/...
 
-Or from this directory directly:
+Integration tests under `internal/run/postgres_test.go` require Docker (testcontainers spins up Postgres 16). Devs without Docker get a `t.Skip`.
 
-    go build ./...
-    go test ./...
+To regenerate sqlc code after editing `internal/run/queries.sql`:
+
+    cd backend && sqlc generate
 
 ## Status
 
-E3.2 (#42) — HTTP server with graceful shutdown, middleware stack, and
-the `/healthz` endpoint. The middleware order, outermost first, is
-recovery → request ID → logging → auth stub → mux. Auth is a stub that
-sets `Identity{Subject: "anonymous"}` until E4 (#4) lands real auth.
+- **E3.1 (#41)** — module scaffold.
+- **E3.2 (#42)** — HTTP server, middleware, `/healthz`. Middleware order: `recovery → requestID → logging → authStub → mux`.
+- **E3.3 (#43)** — run/stage state machine on Postgres. Transitions are validated against an explicit table; persistence uses `SELECT … FOR UPDATE` inside a transaction so concurrent transitions can't both succeed. `fishhawkd migrate up|down` applies the embedded migrations.
 
-Subsequent issues under epic E3 (#3):
+Upcoming under epic E3 (#3):
 
-- E3.3 (#43) — run/stage state machine.
 - E3.4 (#44) — policy evaluator.
 - E3.5 (#45) — approval state + SLA tracking.
 - E3.6 (#46) — REST API surface for CLI + UI.
@@ -46,10 +48,18 @@ Subsequent issues under epic E3 (#3):
 
 ## Run
 
-    go run ./backend/cmd/fishhawkd
+Bring up Postgres locally:
+
+    docker compose up -d postgres
+
+Apply migrations and start the server:
+
+    export FISHHAWKD_DATABASE_URL='postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable'
+    go run ./backend/cmd/fishhawkd migrate up
+    go run ./backend/cmd/fishhawkd serve
+
     curl http://localhost:8080/healthz
 
 Override the listen address with `--addr` or `FISHHAWKD_ADDR`.
 
-Larger context: `docs/MVP_SPEC.md` §5.1.1 (component) and §5.2 (execution
-flow).
+Larger context: `docs/MVP_SPEC.md` §5.1.1 (component) and §5.2 (execution flow); `docs/ARCHITECTURE.md` §4–§6 for the workflow lifecycle, storage model, and invariants.
