@@ -55,7 +55,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          # Some transitive deps (pgx, testcontainers, golang-migrate) declare
+          # `go 1.25` directives, so the toolchain on the runner must be >= 1.25
+          # even though our own code only uses 1.22-era features (method-aware
+          # ServeMux). Bumping conservatively to the major version line.
+          go-version: '1.25'
           cache: true
 
       - name: Detect registered modules
@@ -71,8 +75,11 @@ jobs:
       - name: Install golangci-lint
         if: steps.have-modules.outputs.yes == 'true'
         run: |
+          # v2.8.0 binaries are built with go1.25.x, so they can typecheck
+          # packages whose deps require go 1.25. Older v2 releases (v2.0.x)
+          # were built with go1.24 and reject go 1.25 packages.
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin" v2.0.0
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
 
       - name: Lint, build, and test each module
         if: steps.have-modules.outputs.yes == 'true'
