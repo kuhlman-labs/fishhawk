@@ -1,0 +1,118 @@
+// Package agent defines the abstraction the runner uses to invoke a
+// coding agent (Claude Code in v0; pluggable for v1+) and capture
+// its execution as an ordered stream of trace events.
+//
+// The runner is agent-agnostic: it speaks this package's Invoker
+// interface and never imports Claude Code internals directly. The
+// concrete adapter for Claude Code lives in
+// runner/internal/agent/claudecode.
+//
+// Trace event vocabulary aligns with docs/ARCHITECTURE.md §5.3. The
+// bundling step (E5.3) consumes Result.Events to produce the signed
+// trace bundle that ships to the backend.
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+)
+
+// Invocation is everything an Invoker needs for a single stage run.
+// The runner constructs this from the workflow spec, the stage
+// definition, and the resolved inputs (issue body, prior-stage
+// artifact, etc.).
+type Invocation struct {
+	// RunID and Stage are carried through so trace events can be
+	// tagged and correlated server-side.
+	RunID string
+	Stage string
+
+	// Prompt is the constructed text the runner hands the agent.
+	// Construction lives outside this package — by the time the
+	// Invoker sees the prompt, every variable is already
+	// substituted.
+	Prompt string
+
+	// WorkingDir is the customer's checked-out repo. The agent runs
+	// with this as its CWD; relative paths in tool calls resolve
+	// here. The agent must NOT escape this directory; enforcement
+	// is via OS sandboxing in v0.x, not v0.
+	WorkingDir string
+
+	// Budget bounds the agent's resource consumption. Zero values
+	// mean "no limit from this layer" — the runner sets sensible
+	// defaults; the workflow spec can override them per stage.
+	Budget Budget
+}
+
+// Budget caps an agent invocation. Per MVP_SPEC §4.2 (`budget`
+// block) v0 budgets are advisory. The harness enforces them anyway:
+// a hard cap is more useful than a polite warning when it's burning
+// money.
+type Budget struct {
+	// MaxTokens is the cap on total tokens (input + output)
+	// reported by the agent. The harness terminates the agent
+	// when it exceeds the cap.
+	MaxTokens int
+
+	// Timeout is the wall-clock cap on the invocation.
+	Timeout time.Duration
+}
+
+// Result is what the harness produces for a single Invoke call.
+// OK distinguishes clean completion from any kind of failure;
+// FailureCategory maps to MVP_SPEC §6 (always 'A' — agent failure —
+// for anything originating in this package).
+type Result struct {
+	OK              bool
+	FailureCategory string
+	FailureReason   string
+
+	// Events is the captured trace, in order. The first event is
+	// always kind=invocation_start; the last is invocation_end.
+	// Bundling (E5.3) wraps these with manifest/trailer events.
+	Events []Event
+
+	// TokensUsed is the agent-reported token total when known
+	// (Claude Code emits a final result event with usage). Zero
+	// when the agent didn't report or didn't get that far.
+	TokensUsed int
+}
+
+// Event is one entry in the captured trace. Kind is the discriminant
+// for Payload's shape; bundling treats Payload as opaque bytes so
+// we can evolve event schemas independently of the trace format.
+type Event struct {
+	Kind      string          `json:"kind"`
+	Timestamp time.Time       `json:"ts"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+// Invoker runs an agent and produces a Result. Implementations are
+// agent-specific; the runner wires whichever Invoker matches the
+// workflow stage's `executor.agent` value.
+type Invoker interface {
+	Invoke(ctx context.Context, inv Invocation) (Result, error)
+}
+
+// Errors callers may want to switch on. All concrete failures wrap
+// one of these.
+var (
+	ErrAgentFailed    = errors.New("agent: agent failed")
+	ErrBudgetExceeded = errors.New("agent: budget exceeded")
+	ErrTimeout        = errors.New("agent: timeout")
+	ErrBinaryNotFound = errors.New("agent: binary not found")
+)
+
+// MakePayload marshals v to a json.RawMessage or panics. Helper for
+// adapters; payloads are constructed from typed Go values whose
+// shapes we control, so a marshal failure is a programmer error.
+func MakePayload(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic("agent: payload marshal: " + err.Error())
+	}
+	return b
+}

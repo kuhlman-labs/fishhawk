@@ -4,18 +4,29 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/version"
 )
 
-// config is the parsed CLI input that future stages will consume.
-// Every field has a corresponding flag; the action.yml inputs map
-// 1:1 onto these.
+// config is the parsed CLI input. Every field has a corresponding
+// flag; the action.yml inputs map 1:1 onto the required flags.
+//
+// E5.2 added the agent-invocation flags (promptFile, workingDir,
+// budget). They're optional in the scaffold sense — if promptFile
+// is empty, the runner emits a startup line and exits 0, preserving
+// the v0.1 dispatch-path probe. Once a prompt is supplied, the
+// runner actually invokes Claude Code.
 type config struct {
 	runID      string
 	backendURL string
 	workflow   string
 	stage      string
+
+	promptFile string
+	workingDir string
+	maxTokens  int
+	timeout    time.Duration
 }
 
 // parseFlags reads args and populates a config. Returns a usage
@@ -35,6 +46,16 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 	fs.StringVar(&cfg.backendURL, "backend-url", "", "Fishhawk backend URL")
 	fs.StringVar(&cfg.workflow, "workflow", "", "workflow ID matching .fishhawk/workflows.yaml")
 	fs.StringVar(&cfg.stage, "stage", "", "stage ID within the workflow")
+
+	fs.StringVar(&cfg.promptFile, "prompt-file", "",
+		"path to a UTF-8 file containing the prompt; when empty the runner exits 0 without invoking the agent")
+	fs.StringVar(&cfg.workingDir, "working-dir", "",
+		"agent CWD; defaults to the runner's CWD")
+	fs.IntVar(&cfg.maxTokens, "max-tokens", 0,
+		"hard cap on agent tokens (input + output); 0 means no cap")
+	fs.DurationVar(&cfg.timeout, "timeout", 15*time.Minute,
+		"wall-clock cap on agent invocation")
+
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
