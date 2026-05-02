@@ -58,13 +58,19 @@ python3 scripts/check-coverage.py --threshold 80 --exclude internal/run/db backe
 
 ## Git flow
 
-**Issue → feature branch → PR → close issue → update relevant issues.**
+**Issue → feature branch → PR → docs + follow-ups → close issue → update relevant issues.**
 
 1. Pick a child issue from Project #7. If a blocking ADR is open, resolve it first.
 2. Branch from `origin/main`: `<issue-slug>-<desc>`, e.g. `e3.1-backend-skeleton`.
 3. Commit with `git commit -s` (DCO is mandatory; PRs without sign-off are rejected). Imperative-mood title, no conventional-commits prefix. Use HEREDOC for multi-line messages.
-4. Open PR — body uses `## Summary` / `## Test plan` / optional `## Notes` / `Closes #<issue>`. Match #80, #81.
-5. After merge, walk the dependents:
+4. **Update docs in the same PR**, before opening:
+   - New package / HTTP route / env var / flag → `docs/ARCHITECTURE.md` "Where to look" table; operator-facing inputs also → component `README.md`.
+   - Spec or schema change → `docs/spec/<x>.md` + every embedded copy (CI's schema-sync diff fails otherwise).
+   - HTTP API change → `docs/api/v0.openapi.yaml` (source of truth) + `docs/api/v0.md`.
+   - Voice/naming → `BRAND_FOUNDATIONS.md`. New trap / build workflow → `CLAUDE.md`. Autonomy convention → `METHODOLOGY.md`.
+5. **File issues for deferred work** before the PR opens. Any TODO, "follow-up PR", "deferred to E…", or obvious operability gap gets a tracking issue: title `[E<parent>.<n>]` (or `[ADR-NNN]`), same `area:*/autonomy:*/phase:*/type:*` labels as siblings, add to Project #7 with `Status=Backlog`, link from the parent epic's Children list, and reference from the PR body's `## Notes` so the deferral is reviewable.
+6. Open PR — body uses `## Summary` / `## Test plan` / optional `## Notes` / `Closes #<issue>`. Match #80, #81.
+7. After merge, walk the dependents:
    - Verify parent epic's task list checked off.
    - Update sibling issues if scope shifted (e.g., a CI fix bundled here means another sibling no longer needs it).
    - If an ADR was resolved, edit its body's Decision section and close.
