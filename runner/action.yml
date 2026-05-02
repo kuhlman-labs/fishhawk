@@ -59,6 +59,14 @@ inputs:
     description: 'Path the agent writes its plan artifact to. When set, the runner validates against standard_v1 after a successful agent invocation.'
     required: false
     default: ''
+  constraints-file:
+    description: 'Path to a JSON file describing the stage constraints (forbidden_paths, allowed_paths, max_files_changed, required_outcomes).'
+    required: false
+    default: ''
+  check-base-ref:
+    description: 'Git ref to diff against for constraint evaluation (e.g. origin/main). Constraints run only when both constraints-file and check-base-ref are set.'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -85,4 +93,6 @@ runs:
           --max-tokens "${{ inputs.max-tokens }}" \
           --timeout "${{ inputs.timeout }}" \
           --bundle-out "${{ inputs.bundle-out }}" \
-          --plan-out "${{ inputs.plan-out }}"
+          --plan-out "${{ inputs.plan-out }}" \
+          --constraints-file "${{ inputs.constraints-file }}" \
+          --check-base-ref "${{ inputs.check-base-ref }}"

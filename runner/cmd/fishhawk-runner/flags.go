@@ -23,12 +23,14 @@ type config struct {
 	workflow   string
 	stage      string
 
-	promptFile string
-	workingDir string
-	maxTokens  int
-	timeout    time.Duration
-	bundleOut  string
-	planOut    string
+	promptFile      string
+	workingDir      string
+	maxTokens       int
+	timeout         time.Duration
+	bundleOut       string
+	planOut         string
+	constraintsFile string
+	checkBaseRef    string
 }
 
 // parseFlags reads args and populates a config. Returns a usage
@@ -61,6 +63,10 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"path to write the gzipped trace bundle (ADR-007); when empty, events go to stdout as JSONL")
 	fs.StringVar(&cfg.planOut, "plan-out", "",
 		"path the agent writes its plan artifact to; when set, the runner validates it against standard_v1 after a successful agent invocation")
+	fs.StringVar(&cfg.constraintsFile, "constraints-file", "",
+		"path to a JSON file describing the stage's constraints (forbidden_paths, allowed_paths, max_files_changed, required_outcomes); requires --check-base-ref to be useful")
+	fs.StringVar(&cfg.checkBaseRef, "check-base-ref", "",
+		"git ref to diff against for constraint evaluation (e.g. origin/main); when set together with --constraints-file the runner enforces post-hoc")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
