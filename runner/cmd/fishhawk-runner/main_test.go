@@ -555,6 +555,109 @@ func TestRun_PlanValidationSkippedOnAgentFailure(t *testing.T) {
 	}
 }
 
+func TestRun_ConstraintsConfigUnreadable_DemotesToB(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--constraints-file", filepath.Join(dir, "no-such.json"),
+		"--check-base-ref", "main",
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("missing category B: %s", stderr.String())
+	}
+}
+
+func TestRun_ConstraintsConfigInvalidJSON_DemotesToB(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	configPath := filepath.Join(dir, "constraints.json")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--constraints-file", configPath,
+		"--check-base-ref", "main",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("missing category B: %s", stderr.String())
+	}
+}
+
+func TestRun_ConstraintsRequiresBothFlags(t *testing.T) {
+	// --constraints-file alone (no --check-base-ref) should NOT
+	// trigger constraint evaluation. Use a path that would error
+	// if read; if we still exit OK, the wiring is correct.
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--constraints-file", filepath.Join(dir, "no-such.json"),
+		// --check-base-ref intentionally absent.
+	}, &stderr)
+	if got != exitOK {
+		t.Errorf("run = %d, want exitOK (constraints should be skipped without --check-base-ref)", got)
+	}
+}
+
+func TestRun_ConstraintsSkippedOnAgentFailure(t *testing.T) {
+	// If the agent failed, constraint evaluation must not run —
+	// keep failure category A.
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{
+			OK: false, FailureCategory: "A", FailureReason: "agent crash",
+		},
+		returnErr: agent.ErrAgentFailed,
+	})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--constraints-file", filepath.Join(dir, "no-such.json"),
+		"--check-base-ref", "main",
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("expected category A preserved: %s", stderr.String())
+	}
+}
+
 func TestEmitEvents_OneJSONPerLine(t *testing.T) {
 	var w bytes.Buffer
 	emitEvents(&w, []agent.Event{

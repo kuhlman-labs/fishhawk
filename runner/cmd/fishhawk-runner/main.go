@@ -21,10 +21,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan"
 )
 
@@ -103,6 +106,21 @@ func run(args []string, logSink io.Writer) int {
 			invokeErr = demote
 		} else {
 			res.Events = append(res.Events, ev)
+		}
+	}
+
+	// Constraint evaluation: same demotion rules as plan
+	// validation. Only runs if everything before it succeeded so
+	// we don't double-stamp a category-A failure as B.
+	if res.OK && cfg.constraintsFile != "" && cfg.checkBaseRef != "" {
+		if evs, demote := enforceConstraints(cfg); demote != nil {
+			res.Events = append(res.Events, evs...)
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = demote.Error()
+			invokeErr = demote
+		} else {
+			res.Events = append(res.Events, evs...)
 		}
 	}
 
@@ -200,6 +218,77 @@ func classifyErr(err error) string {
 	default:
 		return "other"
 	}
+}
+
+// enforceConstraints runs `git diff --name-status` against the
+// configured base ref and evaluates the constraints from the JSON
+// file. Returns one or more policy_event events for the bundle
+// plus a non-nil error iff any constraint was violated. The
+// caller demotes the run to category-B on a non-nil error.
+//
+// On infra failures (file read, git error) we still demote to
+// category-B because from the workflow author's perspective "the
+// runner couldn't verify your constraints" is a constraint-stage
+// failure, not an agent failure.
+func enforceConstraints(cfg config) ([]agent.Event, error) {
+	raw, err := os.ReadFile(cfg.constraintsFile)
+	if err != nil {
+		return []agent.Event{{
+			Kind:    "policy_event",
+			Payload: agent.MakePayload(map[string]string{"check": "constraints", "outcome": "config_unreadable", "error": err.Error()}),
+		}}, fmt.Errorf("constraints: read %s: %w", cfg.constraintsFile, err)
+	}
+	var c constraint.Constraints
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return []agent.Event{{
+			Kind:    "policy_event",
+			Payload: agent.MakePayload(map[string]string{"check": "constraints", "outcome": "config_invalid", "error": err.Error()}),
+		}}, fmt.Errorf("constraints: parse %s: %w", cfg.constraintsFile, err)
+	}
+
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	d, err := (&gitdiff.Runner{}).Run(context.Background(), cfg.checkBaseRef, repoDir)
+	if err != nil {
+		return []agent.Event{{
+			Kind:    "policy_event",
+			Payload: agent.MakePayload(map[string]string{"check": "constraints", "outcome": "diff_failed", "error": err.Error()}),
+		}}, fmt.Errorf("constraints: %w", err)
+	}
+
+	violations := constraint.Evaluate(d, c)
+	if len(violations) == 0 {
+		return []agent.Event{{
+			Kind: "policy_event",
+			Payload: agent.MakePayload(map[string]any{
+				"check":         "constraints",
+				"outcome":       "valid",
+				"files_checked": len(d.ChangedFiles),
+			}),
+		}}, nil
+	}
+
+	// One policy_event per violation keeps the bundle structured —
+	// audit consumers can group / filter by Constraint without
+	// parsing free-text.
+	var evs []agent.Event
+	var summary []string
+	for _, v := range violations {
+		evs = append(evs, agent.Event{
+			Kind: "policy_event",
+			Payload: agent.MakePayload(map[string]any{
+				"check":      "constraints",
+				"outcome":    "violation",
+				"constraint": v.Constraint,
+				"detail":     v.Detail,
+				"files":      v.Files,
+			}),
+		})
+		summary = append(summary, v.String())
+	}
+	return evs, fmt.Errorf("constraint violations: %s", strings.Join(summary, "; "))
 }
 
 // validatePlan reads the plan artifact at path and validates it
