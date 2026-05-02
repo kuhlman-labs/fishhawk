@@ -13,13 +13,13 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/runner`) 
 - `internal/agent/` — the agent abstraction (`Invoker`, `Invocation`, `Result`, `Event`).
 - `internal/agent/claudecode/` — adapter for Anthropic's Claude Code CLI.
 - `internal/bundle/` — `*.jsonl.gz` trace bundle pack/unpack per ADR-007 (#71).
+- `internal/plan/` — plan-artifact validator against `standard_v1` (E1.5 schema; embedded copy under `schemas/`).
 - `internal/version/` — build-version package; set via `-ldflags` at release time.
 
 ## Status
 
-E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation harness. E5.3 (#30) added trace bundling: when `--prompt-file` and `--bundle-out` are supplied together, the runner invokes Claude Code, packs the captured events into the ADR-007 `*.jsonl.gz` format (manifest first, trailer last with content hash), and writes the gzipped bundle to disk. Without `--bundle-out` the runner falls back to JSONL on stdout for ad-hoc inspection. Signed upload lands in E5.6.
+E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation harness. E5.3 (#30) added trace bundling. E5.4 (#31) added plan-artifact validation: when `--plan-out` points at a file the agent writes its plan to, the runner validates it against `standard_v1` after the agent succeeds. A validation failure demotes the run to category-B (constraint/policy violation, MVP_SPEC §6) and the bundle records a `policy_event` with the outcome.
 
-- E5.4 (#31) — plan validation against `standard_v1` (reuses `backend/internal/plan`)
 - E5.5 (#53) — post-hoc constraint enforcement on stage output
 - E5.6 (#32) — signed trace shipping to backend (uses `backend/internal/signing` + `backend/internal/tracestore`)
 - E5.7 (#54) — versioned, signed releases of `fishhawk/runner` with SBOM
@@ -37,6 +37,7 @@ E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation har
 | `max-tokens` | no | Hard cap on agent tokens (input + output); 0 means no cap. |
 | `timeout` | no | Wall-clock cap on the agent invocation, e.g. `15m`. Default 15m. |
 | `bundle-out` | no | Path to write the gzipped trace bundle. When set the runner produces an ADR-007 `*.jsonl.gz` artifact instead of JSONL on stdout. |
+| `plan-out` | no | Path the agent writes its plan artifact to. When set, the runner validates the file against `standard_v1` after a successful agent invocation; a malformed plan demotes the run to category-B failure. |
 
 The Claude Code API key is supplied via the `ANTHROPIC_API_KEY` environment variable, which customers populate from their GitHub Secrets. v0.x will replace this with a Fishhawk-issued ephemeral key (MVP_SPEC §5.3).
 

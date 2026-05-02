@@ -406,6 +406,155 @@ func TestRun_BundleWriteFailureSurfacesAsExitFailure(t *testing.T) {
 	}
 }
 
+// validPlanJSON returns a minimal standard_v1 plan that the
+// validator accepts. Inline rather than reading a fixture so the
+// test is self-contained.
+func validPlanJSON() string {
+	return `{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type":"github_issue","url":"https://github.com/x/y/issues/1","id":"x/y#1"},
+  "generated_by": {"agent":"claude-code","model":"claude-opus-4-7","version":"build-1","timestamp":"2026-05-02T10:00:00Z"},
+  "summary": "Add a thing.",
+  "scope": {"files": [{"path":"a.go","operation":"create"}], "estimated_lines_changed": 10},
+  "approach": [{"step":1,"description":"Do."}],
+  "verification": {"test_strategy":"go test","rollback_plan":"revert PR"}
+}`
+}
+
+func TestRun_PlanValidationOK(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planPath, []byte(validPlanJSON()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{
+			OK:     true,
+			Events: []agent.Event{{Kind: "system.init"}},
+		},
+	})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath, "--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want %d:\n%s", got, exitOK, stderr.String())
+	}
+	// Bundle should now contain the system.init plus a policy_event
+	// with outcome=valid.
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawValid bool
+	for _, ev := range events {
+		if ev.Kind == "policy_event" && strings.Contains(string(ev.Data), `"outcome":"valid"`) {
+			sawValid = true
+		}
+	}
+	if !sawValid {
+		t.Errorf("missing policy_event outcome=valid in bundle:\n%+v", events)
+	}
+}
+
+func TestRun_PlanValidationInvalid_DemotesToCategoryB(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Drop required field "summary" — schema rejects.
+	bad := strings.Replace(validPlanJSON(), `"summary": "Add a thing.",`, "", 1)
+	if err := os.WriteFile(planPath, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath,
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"category":"B"`) {
+		t.Errorf("missing category B (plan validation should demote): %s", out)
+	}
+	if !strings.Contains(out, `"outcome":"failed"`) {
+		t.Errorf("missing failed outcome: %s", out)
+	}
+}
+
+func TestRun_PlanFileMissing_DemotesToCategoryB(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--plan-out", filepath.Join(dir, "nonexistent.json"),
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("missing category B: %s", stderr.String())
+	}
+}
+
+func TestRun_PlanValidationSkippedOnAgentFailure(t *testing.T) {
+	// If the agent already failed (category A), don't run plan
+	// validation — there's no plan to validate, and the failure
+	// classification must remain A.
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{
+			OK:              false,
+			FailureCategory: "A",
+			FailureReason:   "agent crash",
+		},
+		returnErr: agent.ErrAgentFailed,
+	})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		// plan-out points to a missing file — if validation ran, this
+		// would override category to B; assert it doesn't.
+		"--plan-out", filepath.Join(dir, "nope.json"),
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("expected category A preserved: %s", stderr.String())
+	}
+}
+
 func TestEmitEvents_OneJSONPerLine(t *testing.T) {
 	var w bytes.Buffer
 	emitEvents(&w, []agent.Event{
