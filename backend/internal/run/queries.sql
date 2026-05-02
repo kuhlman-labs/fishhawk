@@ -10,6 +10,17 @@ RETURNING *;
 -- name: GetRun :one
 SELECT * FROM runs WHERE id = $1;
 
+-- name: ListRuns :many
+-- Empty string in any filter means "no constraint." created_at DESC
+-- + id DESC tiebreak so paginations are stable across concurrent
+-- inserts at the same created_at microsecond.
+SELECT * FROM runs
+ WHERE (sqlc.arg('repo')::text = '' OR repo = sqlc.arg('repo'))
+   AND (sqlc.arg('workflow_id')::text = '' OR workflow_id = sqlc.arg('workflow_id'))
+   AND (sqlc.arg('state')::text = '' OR state = sqlc.arg('state'))
+ ORDER BY created_at DESC, id DESC
+ LIMIT sqlc.arg('lim') OFFSET sqlc.arg('off');
+
 -- name: LockRunForUpdate :one
 SELECT * FROM runs WHERE id = $1 FOR UPDATE;
 

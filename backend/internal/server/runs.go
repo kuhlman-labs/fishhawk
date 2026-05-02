@@ -152,3 +152,125 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 
 	s.writeJSON(w, r, http.StatusOK, toRunResponse(got))
 }
+
+const (
+	runsDefaultLimit = 50
+	runsMaxLimit     = 200
+)
+
+// handleListRuns implements GET /v0/runs. Cursor-paginated by
+// created_at DESC; filter params (repo, workflow_id, state) are
+// additive — multiple filters AND together. Cursor encoding is
+// shared with the audit endpoint via pageOffset / encodeOffsetCursor.
+func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RunRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
+			"runs endpoint requires a configured run repository", nil)
+		return
+	}
+	q := r.URL.Query()
+	limit, err := parseLimit(q.Get("limit"), runsDefaultLimit, runsMaxLimit)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			err.Error(), map[string]any{"field": "limit"})
+		return
+	}
+	offset, err := decodeOffsetCursor(q.Get("cursor"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "cursor_invalid",
+			err.Error(), nil)
+		return
+	}
+	stateFilter := q.Get("state")
+	if stateFilter != "" {
+		if _, ok := validRunStates[stateFilter]; !ok {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"state must be one of pending, running, succeeded, failed, cancelled",
+				map[string]any{"field": "state", "got": stateFilter})
+			return
+		}
+	}
+
+	// Fetch one extra row so we can tell whether there's a next
+	// page without a separate COUNT query. The trick: ask for
+	// limit+1, drop the extra in the response if present.
+	rows, err := s.cfg.RunRepo.ListRuns(r.Context(), run.ListRunsFilter{
+		Repo:       q.Get("repo"),
+		WorkflowID: q.Get("workflow_id"),
+		State:      stateFilter,
+		Limit:      limit + 1,
+		Offset:     offset,
+	})
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list runs failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	var nextCursor string
+	if len(rows) > limit {
+		nextCursor = encodeOffsetCursor(offset + limit)
+		rows = rows[:limit]
+	}
+	items := make([]runResponse, 0, len(rows))
+	for _, ru := range rows {
+		items = append(items, toRunResponse(ru))
+	}
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
+		"items":       items,
+		"next_cursor": nextCursor,
+	})
+}
+
+// validRunStates pins the closed set per docs/api/v0.openapi.yaml.
+// Schema constraint mirrors backend/internal/postgres/migrations/0001
+// CHECK; defense-in-depth at the handler keeps a typo from
+// reaching the DB layer.
+var validRunStates = map[string]struct{}{
+	string(run.StatePending):   {},
+	string(run.StateRunning):   {},
+	string(run.StateSucceeded): {},
+	string(run.StateFailed):    {},
+	string(run.StateCancelled): {},
+}
+
+// handleCancelRun implements POST /v0/runs/{run_id}/cancel.
+// Idempotent: cancelling an already-cancelled run returns 200 with
+// the same body as a fresh cancel. Cancelling a terminally-completed
+// run (succeeded / failed) returns 409 because the state machine
+// rejects the transition.
+func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RunRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
+			"runs endpoint requires a configured run repository", nil)
+		return
+	}
+	runID, err := uuid.Parse(r.PathValue("run_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"run_id must be a valid UUID",
+			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
+		return
+	}
+
+	got, err := s.cfg.RunRepo.TransitionRun(r.Context(), runID, run.StateCancelled)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "run_not_found",
+				"no run with that id", map[string]any{"run_id": runID.String()})
+			return
+		}
+		var inv run.InvalidTransitionError
+		if errors.As(err, &inv) {
+			s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+				err.Error(),
+				map[string]any{"run_id": runID.String(), "from": inv.From, "to": inv.To})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"cancel run failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	s.writeJSON(w, r, http.StatusOK, toRunResponse(got))
+}

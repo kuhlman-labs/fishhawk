@@ -178,6 +178,100 @@ func TestPostgres_GetRun_NotFound(t *testing.T) {
 	}
 }
 
+func TestPostgres_ListRuns(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+
+	// Three runs across two repos and two states.
+	r1, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "sha1",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "hotfix", WorkflowSHA: "sha2",
+		TriggerSource: run.TriggerCLI,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r3, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "a/b", WorkflowID: "feature_change", WorkflowSHA: "sha3",
+		TriggerSource: run.TriggerUI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No filter: returns all 3.
+	all, err := repo.ListRuns(context.Background(), run.ListRunsFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("got %d, want 3", len(all))
+	}
+
+	// Repo filter.
+	xy, err := repo.ListRuns(context.Background(), run.ListRunsFilter{Repo: "x/y", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(xy) != 2 {
+		t.Errorf("got %d for repo x/y, want 2", len(xy))
+	}
+
+	// Workflow filter combined with repo filter.
+	xyHotfix, err := repo.ListRuns(context.Background(),
+		run.ListRunsFilter{Repo: "x/y", WorkflowID: "hotfix", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(xyHotfix) != 1 {
+		t.Errorf("got %d for x/y+hotfix, want 1", len(xyHotfix))
+	}
+
+	// State filter (transition r1 → running first).
+	if _, err := repo.TransitionRun(context.Background(), r1.ID, run.StateRunning); err != nil {
+		t.Fatal(err)
+	}
+	running, err := repo.ListRuns(context.Background(),
+		run.ListRunsFilter{State: string(run.StateRunning), Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(running) != 1 || running[0].ID != r1.ID {
+		t.Errorf("running filter broken: %+v", running)
+	}
+
+	// Limit + offset pagination — page 1 of 2 with limit=2.
+	page1, err := repo.ListRuns(context.Background(), run.ListRunsFilter{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1) != 2 {
+		t.Errorf("page1 = %d, want 2", len(page1))
+	}
+	page2, err := repo.ListRuns(context.Background(), run.ListRunsFilter{Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 1 {
+		t.Errorf("page2 = %d, want 1", len(page2))
+	}
+
+	// Bad limit / offset surface as errors.
+	if _, err := repo.ListRuns(context.Background(), run.ListRunsFilter{Limit: 0}); err == nil {
+		t.Error("expected error on limit=0")
+	}
+	if _, err := repo.ListRuns(context.Background(), run.ListRunsFilter{Limit: 1, Offset: -1}); err == nil {
+		t.Error("expected error on negative offset")
+	}
+
+	_ = r3 // silence "declared and not used" if filters change.
+}
+
 func TestPostgres_TransitionRun_HappyPath(t *testing.T) {
 	pool := startPostgres(t)
 	repo := run.NewPostgresRepository(pool)

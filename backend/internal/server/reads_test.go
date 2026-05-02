@@ -48,6 +48,9 @@ func (r *stagesRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Ru
 func (r *stagesRunRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *stagesRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *stagesRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }

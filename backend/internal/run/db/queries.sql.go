@@ -148,6 +148,62 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 	return i, err
 }
 
+const listRuns = `-- name: ListRuns :many
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at FROM runs
+ WHERE ($1::text = '' OR repo = $1)
+   AND ($2::text = '' OR workflow_id = $2)
+   AND ($3::text = '' OR state = $3)
+ ORDER BY created_at DESC, id DESC
+ LIMIT $5 OFFSET $4
+`
+
+type ListRunsParams struct {
+	Repo       string `json:"repo"`
+	WorkflowID string `json:"workflow_id"`
+	State      string `json:"state"`
+	Off        int32  `json:"off"`
+	Lim        int32  `json:"lim"`
+}
+
+// Empty string in any filter means "no constraint." created_at DESC
+// + id DESC tiebreak so paginations are stable across concurrent
+// inserts at the same created_at microsecond.
+func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, error) {
+	rows, err := q.db.Query(ctx, listRuns,
+		arg.Repo,
+		arg.WorkflowID,
+		arg.State,
+		arg.Off,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Run
+	for rows.Next() {
+		var i Run
+		if err := rows.Scan(
+			&i.ID,
+			&i.Repo,
+			&i.WorkflowID,
+			&i.WorkflowSha,
+			&i.TriggerSource,
+			&i.TriggerRef,
+			&i.State,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStagesForRun = `-- name: ListStagesForRun :many
 SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at FROM stages WHERE run_id = $1 ORDER BY sequence ASC
 `

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -28,10 +29,12 @@ type fakeRepo struct {
 	mu   sync.Mutex
 	runs map[uuid.UUID]*run.Run
 
-	// createErr / getErr let tests inject failures without
-	// instrumenting fakeRepo's internals.
-	createErr error
-	getErr    error
+	// createErr / getErr / transitionErr / listErr let tests inject
+	// failures without instrumenting fakeRepo's internals.
+	createErr     error
+	getErr        error
+	transitionErr error
+	listErr       error
 }
 
 func newFakeRepo() *fakeRepo {
@@ -73,11 +76,70 @@ func (f *fakeRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 	return r, nil
 }
 
-// The remaining methods aren't exercised by these handler tests but
-// must exist so fakeRepo satisfies run.Repository. Returning
-// "not implemented" errors makes any accidental call obvious.
-func (f *fakeRepo) TransitionRun(_ context.Context, _ uuid.UUID, _ run.State) (*run.Run, error) {
-	return nil, errors.New("fakeRepo: TransitionRun not implemented")
+// transitionErr lets tests inject specific errors out of TransitionRun
+// so the cancel handler's branches (404, 409, 500) are reachable.
+// listErr does the same for ListRuns.
+//
+// The remaining stage methods aren't exercised by these handler tests
+// but must exist so fakeRepo satisfies run.Repository.
+
+func (f *fakeRepo) TransitionRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.transitionErr != nil {
+		return nil, f.transitionErr
+	}
+	r, ok := f.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	// Match the postgres adapter's transition rules: same-state is
+	// idempotent, terminal states reject further transitions.
+	if r.State == to {
+		return r, nil
+	}
+	if r.State == run.StateSucceeded || r.State == run.StateFailed || r.State == run.StateCancelled {
+		return nil, run.InvalidTransitionError{Kind: "run", From: string(r.State), To: string(to)}
+	}
+	r.State = to
+	r.UpdatedAt = time.Now().UTC()
+	return r, nil
+}
+
+func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var matched []*run.Run
+	for _, r := range f.runs {
+		if fil.Repo != "" && r.Repo != fil.Repo {
+			continue
+		}
+		if fil.WorkflowID != "" && r.WorkflowID != fil.WorkflowID {
+			continue
+		}
+		if fil.State != "" && string(r.State) != fil.State {
+			continue
+		}
+		matched = append(matched, r)
+	}
+	// Order matches the SQL: created_at DESC, id DESC.
+	sort.Slice(matched, func(i, j int) bool {
+		if !matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
+			return matched[i].CreatedAt.After(matched[j].CreatedAt)
+		}
+		return matched[i].ID.String() > matched[j].ID.String()
+	})
+	if fil.Offset >= len(matched) {
+		return nil, nil
+	}
+	end := fil.Offset + fil.Limit
+	if end > len(matched) {
+		end = len(matched)
+	}
+	return matched[fil.Offset:end], nil
 }
 func (f *fakeRepo) CreateStage(_ context.Context, _ run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("fakeRepo: CreateStage not implemented")
@@ -356,6 +418,259 @@ func requestPath(t *testing.T, s *Server, method, path string, body any) (*httpt
 	}
 	s.Handler().ServeHTTP(w, req)
 	return w, w.Body.Bytes()
+}
+
+// seedRun inserts a run with controlled fields directly into the
+// fake's map so list/cancel tests don't depend on POST /v0/runs.
+func seedRun(repo *fakeRepo, repoName, workflowID string, state run.State, createdAt time.Time) *run.Run {
+	r := &run.Run{
+		ID:            uuid.New(),
+		Repo:          repoName,
+		WorkflowID:    workflowID,
+		WorkflowSHA:   "sha-" + string(state),
+		TriggerSource: run.TriggerCLI,
+		State:         state,
+		CreatedAt:     createdAt,
+		UpdatedAt:     createdAt,
+	}
+	repo.mu.Lock()
+	repo.runs[r.ID] = r
+	repo.mu.Unlock()
+	return r
+}
+
+func TestListRuns_HappyPath(t *testing.T) {
+	repo := newFakeRepo()
+	t0 := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	seedRun(repo, "x/y", "feature_change", run.StatePending, t0)
+	seedRun(repo, "x/y", "feature_change", run.StateRunning, t0.Add(time.Second))
+	seedRun(repo, "a/b", "hotfix", run.StateSucceeded, t0.Add(2*time.Second))
+	s := newServer(t, repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items      []runResponse `json:"items"`
+		NextCursor string        `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 3 {
+		t.Errorf("items = %d, want 3", len(got.Items))
+	}
+	// created_at DESC: most-recently created comes first.
+	if got.Items[0].State != string(run.StateSucceeded) {
+		t.Errorf("first state = %q, want succeeded", got.Items[0].State)
+	}
+	if got.NextCursor != "" {
+		t.Errorf("next_cursor = %q, want empty", got.NextCursor)
+	}
+}
+
+func TestListRuns_RepoFilter(t *testing.T) {
+	repo := newFakeRepo()
+	t0 := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	seedRun(repo, "x/y", "w", run.StatePending, t0)
+	seedRun(repo, "a/b", "w", run.StatePending, t0)
+	s := newServer(t, repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs?repo=x/y", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got struct {
+		Items []runResponse `json:"items"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if len(got.Items) != 1 || got.Items[0].Repo != "x/y" {
+		t.Errorf("repo filter broken: %+v", got.Items)
+	}
+}
+
+func TestListRuns_StateFilter_BadValue(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs?state=fake", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"validation_failed"`) {
+		t.Errorf("body missing validation_failed: %s", w.Body.String())
+	}
+}
+
+func TestListRuns_Pagination(t *testing.T) {
+	repo := newFakeRepo()
+	t0 := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		seedRun(repo, "x/y", "w", run.StatePending, t0.Add(time.Duration(i)*time.Second))
+	}
+	s := newServer(t, repo)
+
+	// Page 1: limit=2.
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs?limit=2", nil))
+	var page1 struct {
+		Items      []runResponse `json:"items"`
+		NextCursor string        `json:"next_cursor"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &page1)
+	if len(page1.Items) != 2 {
+		t.Errorf("page1 size = %d, want 2", len(page1.Items))
+	}
+	if page1.NextCursor == "" {
+		t.Fatal("page1 next_cursor empty")
+	}
+
+	// Follow cursor — page 2.
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs?limit=2&cursor="+page1.NextCursor, nil))
+	var page2 struct {
+		Items      []runResponse `json:"items"`
+		NextCursor string        `json:"next_cursor"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &page2)
+	if len(page2.Items) != 2 {
+		t.Errorf("page2 size = %d, want 2", len(page2.Items))
+	}
+	if page2.NextCursor == "" {
+		t.Fatal("page2 next_cursor empty")
+	}
+
+	// Page 3 — last item, empty cursor.
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs?limit=2&cursor="+page2.NextCursor, nil))
+	var page3 struct {
+		Items      []runResponse `json:"items"`
+		NextCursor string        `json:"next_cursor"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &page3)
+	if len(page3.Items) != 1 {
+		t.Errorf("page3 size = %d, want 1", len(page3.Items))
+	}
+	if page3.NextCursor != "" {
+		t.Errorf("page3 cursor = %q, want empty", page3.NextCursor)
+	}
+}
+
+func TestListRuns_RepoError(t *testing.T) {
+	repo := newFakeRepo()
+	repo.listErr = errors.New("db down")
+	s := newServer(t, repo)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs", nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+func TestListRuns_NilRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+func TestCancelRun_HappyPath(t *testing.T) {
+	repo := newFakeRepo()
+	t0 := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	r := seedRun(repo, "x/y", "w", run.StatePending, t0)
+	s := newServer(t, repo)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/runs/%s/cancel", r.ID), nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.State != string(run.StateCancelled) {
+		t.Errorf("State = %q, want cancelled", got.State)
+	}
+}
+
+func TestCancelRun_Idempotent(t *testing.T) {
+	repo := newFakeRepo()
+	t0 := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	r := seedRun(repo, "x/y", "w", run.StateCancelled, t0)
+	s := newServer(t, repo)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/runs/%s/cancel", r.ID), nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("idempotent cancel status = %d, want 200", w.Code)
+	}
+}
+
+func TestCancelRun_TerminalStateConflict(t *testing.T) {
+	repo := newFakeRepo()
+	t0 := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	r := seedRun(repo, "x/y", "w", run.StateSucceeded, t0)
+	s := newServer(t, repo)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/runs/%s/cancel", r.ID), nil))
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"invalid_state_transition"`) {
+		t.Errorf("body missing invalid_state_transition: %s", w.Body.String())
+	}
+}
+
+func TestCancelRun_NotFound(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/runs/%s/cancel", uuid.New()), nil))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestCancelRun_BadUUID(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+		"/v0/runs/not-a-uuid/cancel", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestCancelRun_RepoError(t *testing.T) {
+	repo := newFakeRepo()
+	repo.transitionErr = errors.New("db down")
+	s := newServer(t, repo)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/runs/%s/cancel", uuid.New()), nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+func TestCancelRun_NilRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/runs/%s/cancel", uuid.New()), nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
 }
 
 func TestRoundTrip_CreateThenGet(t *testing.T) {
