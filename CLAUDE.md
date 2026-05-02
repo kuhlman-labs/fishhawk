@@ -13,6 +13,7 @@ Pre-alpha. Most code referenced in `docs/MVP_SPEC.md` doesn't exist yet — it's
 - `docs/BRAND_FOUNDATIONS.md` — voice, naming, positioning.
 - `docs/METHODOLOGY.md` — autonomy tiers (low/medium/high).
 - `docs/spec/` — canonical JSON Schemas + reference docs for the workflow spec (`.fishhawk/workflows.yaml`) and the plan artifact (`standard_v1`). Validate with `check-jsonschema --schemafile <schema> <yaml-or-json>`.
+- `docs/api/` — REST API surface: `v0.openapi.yaml` is source of truth, `v0.md` is the human companion. Lint with `npx -y @redocly/cli@latest lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml`.
 - `.fishhawk/workflows.yaml` — placeholder; executed by the product itself starting Day 21 (~2026-05-20).
 
 ## Documentation surfaces
