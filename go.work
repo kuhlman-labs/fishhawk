@@ -17,3 +17,4 @@ go 1.25.0
 
 use ./backend
 use ./runner
+use ./verifier
