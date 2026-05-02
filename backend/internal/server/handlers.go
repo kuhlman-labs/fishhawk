@@ -9,10 +9,12 @@ import (
 )
 
 // registerRoutes wires every endpoint onto mux. Method-aware patterns
-// require Go 1.22+ ServeMux. Add new routes here as the API surface
-// grows under E3.6 (#46); for v0 the surface is just liveness.
+// require Go 1.22+ ServeMux. Add new routes here as handlers land
+// per docs/api/v0.openapi.yaml.
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("POST /v0/runs", s.handleCreateRun)
+	mux.HandleFunc("GET /v0/runs/{run_id}", s.handleGetRun)
 }
 
 type healthResponse struct {
