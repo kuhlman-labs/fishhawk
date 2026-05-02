@@ -1,0 +1,34 @@
+{
+  "plan_version": "standard_v1",
+  "ticket_reference": {
+    "type": "github_issue",
+    "url": "https://github.com/kuhlman-labs/fishhawk/issues/1247",
+    "id": "kuhlman-labs/fishhawk#1247"
+  },
+  "generated_by": {
+    "agent": "claude-code",
+    "model": "claude-opus-4-7",
+    "version": "build-abc123",
+    "timestamp": "2026-04-30T14:22:11Z"
+  },
+  "summary": "Add a bulk export endpoint for the audit log.",
+  "scope": {
+    "files": [
+      { "path": "backend/internal/api/audit_export.go", "operation": "create" },
+      { "path": "backend/internal/api/router.go", "operation": "modify" }
+    ],
+    "estimated_lines_changed": 280
+  },
+  "approach": [
+    { "step": 1, "description": "Add GET /v0/audit/export with --from and --to query parameters." },
+    { "step": 2, "description": "Stream JSON Lines from audit_entries with cursor-based pagination." }
+  ],
+  "verification": {
+    "test_strategy": "Integration test under backend/internal/api/audit_export_test.go uses testcontainers Postgres, seeds entries, asserts pagination cursor stability.",
+    "rollback_plan": "Revert the PR. The endpoint is purely additive; no data migration to roll back."
+  },
+  "risks_and_assumptions": [
+    "Assumes (created_at, entry_id) is the natural sort order.",
+    "Risk: very large date ranges; mitigated by per-page limit of 1000 rows."
+  ]
+}

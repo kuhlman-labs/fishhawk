@@ -25,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/plan"
 )
 
 const (
@@ -87,6 +88,23 @@ func run(args []string, logSink io.Writer) int {
 
 	invoker := newInvoker(os.Getenv("ANTHROPIC_API_KEY"))
 	res, invokeErr := invoker.Invoke(context.Background(), inv)
+
+	// Plan validation runs only if the agent itself succeeded —
+	// no point re-stating "your plan is malformed" when the
+	// agent already failed. A plan-validation failure overrides
+	// res.OK and demotes the run to category-B (constraint /
+	// policy violation per MVP_SPEC §6).
+	if res.OK && cfg.planOut != "" {
+		if ev, demote := validatePlan(cfg.planOut); demote != nil {
+			res.Events = append(res.Events, ev)
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = demote.Error()
+			invokeErr = demote
+		} else {
+			res.Events = append(res.Events, ev)
+		}
+	}
 
 	if cfg.bundleOut != "" {
 		if err := writeBundle(cfg, res); err != nil {
@@ -184,9 +202,36 @@ func classifyErr(err error) string {
 	}
 }
 
+// validatePlan reads the plan artifact at path and validates it
+// against the standard_v1 schema. The first return is a policy_event
+// suitable for the trace bundle: kind=policy_event, payload describes
+// the validation outcome. The second return is non-nil ONLY on
+// validation failure — it carries the reason for callers wiring up
+// category-B failure handling per MVP_SPEC §6.
+func validatePlan(path string) (agent.Event, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return agent.Event{
+			Kind:    "policy_event",
+			Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "missing", "path": path, "error": err.Error()}),
+		}, fmt.Errorf("plan: read %s: %w", path, err)
+	}
+	if vErr := plan.Validate(data); vErr != nil {
+		return agent.Event{
+			Kind:    "policy_event",
+			Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "invalid", "path": path, "error": vErr.Error()}),
+		}, vErr
+	}
+	return agent.Event{
+		Kind:    "policy_event",
+		Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "valid", "path": path}),
+	}, nil
+}
+
 // emitEvents writes one JSON object per line. This is the
-// placeholder transport — E5.3 / #30 replaces it with the
-// JSONL.gz bundle format and E5.6 / #32 with the signed upload.
+// placeholder transport — E5.3 / #30 replaced it with the
+// JSONL.gz bundle format when --bundle-out is set; E5.6 / #32
+// adds the signed upload.
 func emitEvents(w io.Writer, events []agent.Event) {
 	enc := json.NewEncoder(w)
 	for _, ev := range events {

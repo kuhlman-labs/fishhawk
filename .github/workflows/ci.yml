@@ -86,6 +86,8 @@ jobs:
                   backend/internal/spec/schemas/workflow-v0.schema.json
           diff -u docs/spec/plan-standard-v1.schema.json \
                   backend/internal/plan/schemas/plan-standard-v1.schema.json
+          diff -u docs/spec/plan-standard-v1.schema.json \
+                  runner/internal/plan/schemas/plan-standard-v1.schema.json
 
       - name: Install golangci-lint
         if: steps.have-modules.outputs.yes == 'true'
