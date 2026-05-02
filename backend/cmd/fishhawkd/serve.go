@@ -15,6 +15,7 @@ import (
 
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -52,9 +53,10 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 		defer pool.Close()
 		cfg.RunRepo = runpkg.NewPostgresRepository(pool)
-		logger.Info("run repository configured", slog.String("driver", "postgres"))
+		cfg.SigningRepo = signing.NewPostgresRepository(pool)
+		logger.Info("run + signing repositories configured", slog.String("driver", "postgres"))
 	} else {
-		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs endpoints will respond 503")
+		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
 	}
 
 	// Webhook receiver wiring. Secret + delivery store both need

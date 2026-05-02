@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
@@ -37,6 +38,11 @@ type Config struct {
 	// Tests inject in-memory fakes; production wires the Postgres
 	// adapter (run.NewPostgresRepository).
 	RunRepo run.Repository
+
+	// SigningRepo issues + persists per-run Ed25519 keys for the
+	// trace bundle signing flow. Wired by the
+	// /v0/runs/{id}/signing-key handler; nil leaves it 503.
+	SigningRepo signing.Repository
 
 	// GitHubWebhookSecret is the shared secret GitHub uses to
 	// HMAC-sign webhook deliveries. Empty disables the
