@@ -14,8 +14,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
@@ -43,6 +45,15 @@ type Config struct {
 	// trace bundle signing flow. Wired by the
 	// /v0/runs/{id}/signing-key handler; nil leaves it 503.
 	SigningRepo signing.Repository
+
+	// TraceStore persists agent trace bundles to S3 / MinIO. Wired
+	// by the /v0/runs/{id}/trace handler; nil leaves it 503.
+	TraceStore tracestore.Storage
+
+	// AuditRepo writes the audit log entries that pair with every
+	// state change. Wired by the trace-upload handler; nil leaves
+	// it 503.
+	AuditRepo audit.Repository
 
 	// GitHubWebhookSecret is the shared secret GitHub uses to
 	// HMAC-sign webhook deliveries. Empty disables the
