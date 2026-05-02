@@ -27,6 +27,7 @@ type config struct {
 	workingDir string
 	maxTokens  int
 	timeout    time.Duration
+	bundleOut  string
 }
 
 // parseFlags reads args and populates a config. Returns a usage
@@ -55,6 +56,8 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"hard cap on agent tokens (input + output); 0 means no cap")
 	fs.DurationVar(&cfg.timeout, "timeout", 15*time.Minute,
 		"wall-clock cap on agent invocation")
+	fs.StringVar(&cfg.bundleOut, "bundle-out", "",
+		"path to write the gzipped trace bundle (ADR-007); when empty, events go to stdout as JSONL")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err

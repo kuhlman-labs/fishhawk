@@ -13,7 +13,17 @@ import (
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 )
+
+// openBundleForTest is a thin wrapper around bundle.Open so the
+// table-driven test reads cleanly. We round-trip in tests because
+// the runner is the producer; the canonical verifier path lives in
+// /verifier (and it intentionally re-implements bundle parsing
+// rather than importing this code, per ADR-008's no-trust model).
+func openBundleForTest(data []byte) (bundle.ManifestData, []bundle.Line, bundle.TrailerData, error) {
+	return bundle.Open(bytes.NewReader(data))
+}
 
 // fakeInvoker lets tests drive run() without spawning a child
 // process. Returning (canned, returnErr) keeps the seam tiny.
@@ -303,6 +313,96 @@ func TestRun_AgentFailureMapsToExit1(t *testing.T) {
 	}
 	if !strings.Contains(out, `"err_class":"timeout"`) {
 		t.Errorf("missing err_class timeout: %s", out)
+	}
+}
+
+func TestRun_PromptWithBundleOut_WritesGzipFile(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeInvoker{
+		canned: agent.Result{
+			OK:         true,
+			TokensUsed: 7,
+			Events: []agent.Event{
+				{Kind: "system.init", Payload: agent.MakePayload(map[string]string{"a": "b"})},
+				{Kind: "result", Payload: agent.MakePayload(map[string]int{"n": 1})},
+			},
+		},
+	}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change",
+		"--stage", "plan",
+		"--prompt-file", promptPath,
+		"--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want %d:\n%s", got, exitOK, stderr.String())
+	}
+	info, err := os.Stat(bundlePath)
+	if err != nil {
+		t.Fatalf("bundle not written: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("bundle is empty")
+	}
+
+	// Sanity-check that the file is a valid bundle. We import
+	// internal/bundle here just to round-trip-verify; in
+	// production the backend re-implements verification under
+	// the audit-grade no-trust constraint (see verifier/).
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, events, trailer, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if manifest.RunID != "11111111-2222-3333-4444-555555555555" {
+		t.Errorf("manifest RunID = %q", manifest.RunID)
+	}
+	if len(events) != 2 {
+		t.Errorf("events = %d, want 2", len(events))
+	}
+	if trailer.EventCount != 2 {
+		t.Errorf("trailer EventCount = %d, want 2", trailer.EventCount)
+	}
+}
+
+func TestRun_BundleWriteFailureSurfacesAsExitFailure(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid",
+		"--backend-url", "https://x",
+		"--workflow", "w",
+		"--stage", "s",
+		"--prompt-file", promptPath,
+		// Path under a non-existent parent directory.
+		"--bundle-out", filepath.Join(dir, "no-such-subdir", "trace.jsonl.gz"),
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want %d", got, exitFailure)
+	}
+	if !strings.Contains(stderr.String(), `"reason":"bundle_write"`) {
+		t.Errorf("missing bundle_write reason: %s", stderr.String())
 	}
 }
 

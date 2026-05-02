@@ -51,6 +51,10 @@ inputs:
     description: 'API key forwarded to Claude Code as ANTHROPIC_API_KEY. Customers populate this from a GitHub Secret.'
     required: false
     default: ''
+  bundle-out:
+    description: 'Path to write the gzipped trace bundle (ADR-007 *.jsonl.gz). When unset, events go to stdout as JSONL.'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -75,4 +79,5 @@ runs:
           --prompt-file "${{ inputs.prompt-file }}" \
           --working-dir "${{ inputs.working-dir }}" \
           --max-tokens "${{ inputs.max-tokens }}" \
-          --timeout "${{ inputs.timeout }}"
+          --timeout "${{ inputs.timeout }}" \
+          --bundle-out "${{ inputs.bundle-out }}"
