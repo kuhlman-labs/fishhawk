@@ -15,6 +15,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("POST /v0/runs", s.handleCreateRun)
 	mux.HandleFunc("GET /v0/runs/{run_id}", s.handleGetRun)
+	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
 }
 
 type healthResponse struct {

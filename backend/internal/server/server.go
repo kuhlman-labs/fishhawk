@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // Config holds the values needed to construct a Server. Zero-valued
@@ -36,6 +37,16 @@ type Config struct {
 	// Tests inject in-memory fakes; production wires the Postgres
 	// adapter (run.NewPostgresRepository).
 	RunRepo run.Repository
+
+	// GitHubWebhookSecret is the shared secret GitHub uses to
+	// HMAC-sign webhook deliveries. Empty disables the
+	// /webhooks/github endpoint (handler returns 503).
+	GitHubWebhookSecret []byte
+
+	// WebhookDeliveries dedups GitHub webhook deliveries by their
+	// X-GitHub-Delivery UUID across the GitHub retry window. nil
+	// disables the /webhooks/github endpoint.
+	WebhookDeliveries webhook.DeliveryStore
 }
 
 // Server wraps an http.Server with the routes and middleware stack

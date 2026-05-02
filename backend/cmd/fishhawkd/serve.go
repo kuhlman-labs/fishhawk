@@ -9,11 +9,14 @@ import (
 	"os/signal"
 	"syscall"
 
+	"time"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // runServe boots the HTTP server with graceful SIGINT/SIGTERM
@@ -24,6 +27,9 @@ func runServe(args []string, logSink io.Writer) int {
 	addr := fs.String("addr", envOr("FISHHAWKD_ADDR", ":8080"), "listen address")
 	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""),
 		"postgres URL; when empty, /v0/runs endpoints respond 503")
+	webhookSecret := fs.String("github-webhook-secret",
+		envOr("FISHHAWKD_GITHUB_WEBHOOK_SECRET", ""),
+		"shared secret GitHub uses to HMAC-sign webhook deliveries; when empty, /webhooks/github responds 503")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -49,6 +55,18 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Info("run repository configured", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs endpoints will respond 503")
+	}
+
+	// Webhook receiver wiring. Secret + delivery store both need
+	// to be configured for /webhooks/github to accept deliveries.
+	// 24h TTL covers GitHub's ~3h retry window with comfortable
+	// margin without growing unboundedly.
+	if *webhookSecret != "" {
+		cfg.GitHubWebhookSecret = []byte(*webhookSecret)
+		cfg.WebhookDeliveries = webhook.NewMemoryStore(24 * time.Hour)
+		logger.Info("github webhook receiver configured")
+	} else {
+		logger.Warn("FISHHAWKD_GITHUB_WEBHOOK_SECRET not set; /webhooks/github will respond 503")
 	}
 
 	srv := server.New(cfg)
