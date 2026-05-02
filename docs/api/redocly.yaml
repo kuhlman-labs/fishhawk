@@ -1,0 +1,9 @@
+extends:
+  - recommended
+
+rules:
+  # OAuth login/callback intentionally redirect (302) and have no 2XX response.
+  # The recommended rule wants both a 2XX and a 4XX; we get 4XX from the 500/302.
+  operation-2xx-response: off
+  # Localhost dev server URL is intentional for local-loop testing.
+  no-server-example.com: off

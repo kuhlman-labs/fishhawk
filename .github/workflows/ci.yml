@@ -20,6 +20,7 @@ jobs:
     outputs:
       go: ${{ steps.filter.outputs.go }}
       ts: ${{ steps.filter.outputs.ts }}
+      openapi: ${{ steps.filter.outputs.openapi }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
@@ -43,6 +44,9 @@ jobs:
               - '.eslintrc*'
               - 'eslint.config.*'
               - '.prettierrc*'
+              - '.github/workflows/ci.yml'
+            openapi:
+              - 'docs/api/**'
               - '.github/workflows/ci.yml'
 
   go:
@@ -140,13 +144,29 @@ jobs:
           echo "::notice::TypeScript pipeline lands with E7.1 (frontend scaffold, issue #37)."
           echo "Until then this job is a placeholder so the path filter is exercised."
 
+  openapi:
+    name: OpenAPI (lint)
+    needs: detect
+    if: ${{ needs.detect.outputs.openapi == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Lint OpenAPI spec
+        run: |
+          npx -y @redocly/cli@latest lint \
+            --config docs/api/redocly.yaml \
+            docs/api/v0.openapi.yaml
+
   # Rollup gate. The repo ruleset requires only this job; it inherits
   # the result of every job listed in `needs`. Add new jobs to that
   # list and they automatically become part of the gate without
   # touching the ruleset.
   ci-pass:
     name: CI Pass
-    needs: [detect, go, ts]
+    needs: [detect, go, ts, openapi]
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,972 @@
+openapi: 3.1.0
+info:
+  title: Fishhawk Backend API
+  version: 0.1.0
+  description: |
+    The HTTP surface that the Fishhawk backend (`fishhawkd`) exposes to its
+    three classes of caller:
+
+    1. **The Web UI and CLI** — humans driving plan review, approval, audit
+       search, and run management.
+    2. **The runner** — `kuhlman-labs/fishhawk/runner@vX.Y` running on the
+       customer's CI, requesting per-run signing keys and shipping signed
+       trace bundles.
+    3. **GitHub webhooks** — the customer's GitHub App installation pushing
+       issue / PR / check events that drive workflow dispatch.
+
+    Per ADR (#46) and `MVP_SPEC.md` §5.1.1, every customer-facing endpoint is
+    prefixed with `/v0`. The `v0` prefix is **unstable** by design — the
+    surface is allowed to change before v1. Once the v1 surface is published
+    (post-Day 21), `/v0` and `/v1` coexist for one minor version cycle to
+    let clients migrate, and `/v0` is then retired.
+
+    Webhook ingestion (`/webhooks/github`) is unversioned because GitHub
+    controls the request shape; the backend adapts as GitHub's webhook
+    schema evolves.
+
+  contact:
+    name: Fishhawk
+    url: https://github.com/kuhlman-labs/fishhawk
+  license:
+    name: Apache-2.0
+    url: https://github.com/kuhlman-labs/fishhawk/blob/main/LICENSE
+
+servers:
+  - url: https://api.fishhawk.dev
+    description: Production
+  - url: http://localhost:8080
+    description: Local dev (docker compose up)
+
+# ---------------------------------------------------------------------------
+# Security schemes — three auth models for three caller classes (ADR-005).
+# ---------------------------------------------------------------------------
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: fishhawk_session
+      description: |
+        HTTP-only `Secure; SameSite=Lax` session cookie set by the OAuth
+        callback. Same-origin SPA requests are auto-included; CSRF
+        protection on state-changing endpoints requires an
+        `X-CSRF-Token` header that matches the `__Host-csrf` cookie.
+
+    bearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: |
+        Scoped server-issued token (NOT a JWT). Index into the
+        `api_tokens` table; revocation is immediate. Used by the CLI
+        and any programmatic caller.
+
+    githubOIDC:
+      type: http
+      scheme: bearer
+      bearerFormat: jwt
+      description: |
+        GitHub Actions OIDC token for runner authentication. Verified
+        by the backend against GitHub's JWKS per request; no server-
+        side state. Required by `POST /v0/runs/{run_id}/signing-key`.
+
+  # -------------------------------------------------------------------------
+  # Shared schemas. Detailed property schemas grow as endpoints are
+  # implemented — what's frozen here is the envelope shape and the
+  # canonical types every endpoint returns.
+  # -------------------------------------------------------------------------
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                Stable, machine-readable code. Snake-case identifier;
+                clients switch on this. New codes are additive; codes
+                are never repurposed.
+              example: run_not_found
+            message:
+              type: string
+              description: |
+                Human-readable description. May change between
+                versions; clients should not parse it.
+              example: "No run with id 11111111-…"
+            details:
+              type: object
+              additionalProperties: true
+              description: |
+                Optional code-specific structured fields. The keys
+                under `details` are part of the contract for that
+                specific code.
+      examples:
+        - error:
+            code: run_not_found
+            message: No run with id 11111111-2222-3333-4444-555555555555
+
+    Pagination:
+      type: object
+      description: |
+        Cursor-based pagination envelope wrapped around list endpoints.
+        `next_cursor` is null when the caller has reached the end. The
+        cursor is opaque; clients pass it back unmodified.
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {}
+        next_cursor:
+          type: [string, "null"]
+
+    UUID:
+      type: string
+      format: uuid
+
+    Run:
+      type: object
+      description: |
+        A workflow run record. State follows the explicit transition
+        table in `backend/internal/run/transition.go`.
+      required:
+        [id, repo, workflow_id, workflow_sha, trigger_source, state,
+         created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        repo:
+          type: string
+          example: kuhlman-labs/fishhawk
+        workflow_id:
+          type: string
+          example: feature_change
+          description: Matches a top-level key in `.fishhawk/workflows.yaml`.
+        workflow_sha:
+          type: string
+          description: Git SHA of `.fishhawk/workflows.yaml` at run time.
+        trigger_source:
+          type: string
+          enum: [github_issue, cli, ui]
+        trigger_ref:
+          type: [string, "null"]
+          example: "issue:1247"
+        state:
+          type: string
+          enum: [pending, running, succeeded, failed, cancelled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Stage:
+      type: object
+      required:
+        [id, run_id, sequence, type, executor, state, created_at,
+         updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        run_id: { $ref: '#/components/schemas/UUID' }
+        sequence:
+          type: integer
+          minimum: 0
+        type:
+          type: string
+          enum: [plan, implement, review]
+        executor:
+          type: object
+          description: Exactly one of agent or human.
+          properties:
+            kind:
+              type: string
+              enum: [agent, human]
+            ref:
+              type: string
+              example: claude-code
+        state:
+          type: string
+          enum:
+            [pending, dispatched, running, awaiting_approval, succeeded,
+             failed, cancelled]
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        ended_at:
+          type: [string, "null"]
+          format: date-time
+        failure_category:
+          type: [string, "null"]
+          enum: [A, B, C, D, null]
+          description: |
+            Set on failed transitions per MVP_SPEC §6.
+            A: agent failure, B: constraint/policy, C: infrastructure,
+            D: approval timeout.
+        failure_reason:
+          type: [string, "null"]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Artifact:
+      type: object
+      required: [id, stage_id, kind, content_hash, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        kind:
+          type: string
+          enum: [plan, pull_request]
+        schema_version:
+          type: [string, "null"]
+          example: standard_v1
+        content_hash:
+          type: string
+          description: Hex sha256 of canonical content bytes.
+        content:
+          description: |
+            JSON content of the artifact. For kind=plan validated
+            against the standard_v1 schema in
+            docs/spec/plan-standard-v1.schema.json.
+        created_at:
+          type: string
+          format: date-time
+
+    AuditEntry:
+      type: object
+      description: |
+        One line in the append-only audit log. Entries form a per-run
+        chain via prev_hash → entry_hash; see backend/internal/audit
+        and verifier/internal/audit for the canonical algorithm.
+      required:
+        [id, sequence, run_id, ts, category, payload, entry_hash]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        run_id: { $ref: '#/components/schemas/UUID' }
+        stage_id:
+          oneOf:
+            - $ref: '#/components/schemas/UUID'
+            - type: "null"
+        ts:
+          type: string
+          format: date-time
+        category:
+          type: string
+          example: plan_generated
+        actor_kind:
+          type: [string, "null"]
+          enum: [agent, user, system, null]
+        actor_subject:
+          type: [string, "null"]
+        payload:
+          description: Event-specific JSON object.
+        prev_hash:
+          type: [string, "null"]
+          description: Hex sha256 of the prior entry's entry_hash; null on the first entry of a run.
+        entry_hash:
+          type: string
+          description: Hex sha256 of the canonical hash inputs.
+
+    User:
+      type: object
+      required: [id, github_login, name]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        github_login:
+          type: string
+          example: kuhlman-labs
+        name:
+          type: string
+          example: Brett Kuhlman
+        email:
+          type: [string, "null"]
+
+    ApiToken:
+      type: object
+      required: [id, scopes, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        scopes:
+          type: array
+          items:
+            type: string
+        last_used_at:
+          type: [string, "null"]
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+
+  responses:
+    BadRequest:
+      description: Request body or query parameters were invalid.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Authentication missing or invalid.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated identity lacks permission for this operation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Referenced resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Request conflicts with current resource state.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+# ---------------------------------------------------------------------------
+# Default security: cookie OR bearer for all UI/CLI endpoints. Runner-
+# facing and webhook endpoints override this individually.
+# ---------------------------------------------------------------------------
+security:
+  - sessionCookie: []
+  - bearerToken: []
+
+paths:
+  # ---------------------------------------------------------------------
+  # Liveness — public, unversioned
+  # ---------------------------------------------------------------------
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe
+      description: |
+        Lightweight check used by load balancers, ECS health checks, and
+        local smoke tests. Returns build version so operators can confirm
+        a deploy reached the instance. Implemented in
+        `backend/internal/server/handlers.go`.
+      security: []
+      tags: [diagnostics]
+      responses:
+        '200':
+          description: Process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: dev
+        '503':
+          description: Process is shutting down or otherwise not ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------------
+  # Auth — sign in via GitHub OAuth, manage scoped tokens
+  # ---------------------------------------------------------------------
+  /v0/auth/github/login:
+    get:
+      operationId: githubLogin
+      summary: Begin GitHub OAuth sign-in
+      description: |
+        Redirects the browser to GitHub's OAuth authorize endpoint with a
+        backend-generated state value. The state is bound to the browser
+        via a temporary cookie and verified on callback.
+      security: []
+      tags: [auth]
+      responses:
+        '302':
+          description: Redirect to GitHub's OAuth authorize URL.
+        '500':
+          description: OAuth state could not be issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/auth/github/callback:
+    get:
+      operationId: githubCallback
+      summary: GitHub OAuth callback
+      description: |
+        Verifies the state, exchanges the code for a GitHub access token,
+        looks up or creates the user, and sets the `fishhawk_session`
+        cookie. Redirects to the SPA on success.
+      security: []
+      tags: [auth]
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '302':
+          description: Redirect to the SPA root with session cookie set.
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v0/auth/me:
+    get:
+      operationId: getMe
+      summary: Current user
+      description: Returns the authenticated user, or 401 if unauthenticated.
+      tags: [auth]
+      responses:
+        '200':
+          description: The authenticated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v0/auth/logout:
+    post:
+      operationId: logout
+      summary: Sign out
+      description: Invalidates the current session.
+      tags: [auth]
+      responses:
+        '204':
+          description: Session destroyed.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v0/tokens:
+    get:
+      operationId: listTokens
+      summary: List API tokens for the current user
+      tags: [auth]
+      responses:
+        '200':
+          description: Active tokens. Token strings are NOT returned.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/ApiToken' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createToken
+      summary: Mint a new scoped API token
+      description: |
+        Returns the freshly-minted token string ONCE in the response body.
+        The token is not retrievable later; if lost, revoke and re-issue.
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scopes]
+              properties:
+                scopes:
+                  type: array
+                  items: { type: string }
+      responses:
+        '201':
+          description: Token created. The plaintext value is in the response.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiToken'
+                  - type: object
+                    required: [token]
+                    properties:
+                      token:
+                        type: string
+                        description: |
+                          The bearer token. Store immediately — not
+                          retrievable later.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v0/tokens/{token_id}:
+    delete:
+      operationId: revokeToken
+      summary: Revoke an API token
+      tags: [auth]
+      parameters:
+        - { name: token_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '204':
+          description: Token revoked.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------------
+  # Runs
+  # ---------------------------------------------------------------------
+  /v0/runs:
+    get:
+      operationId: listRuns
+      summary: List workflow runs
+      description: |
+        Cursor-paginated list ordered by `created_at` descending. Filter
+        parameters are additive; multiple query values AND together.
+      tags: [runs]
+      parameters:
+        - { name: repo, in: query, schema: { type: string } }
+        - { name: workflow_id, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string, enum: [pending, running, succeeded, failed, cancelled] } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Page of runs.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createRun
+      summary: Create a workflow run
+      description: |
+        Creates a `runs` row in the `pending` state and dispatches a
+        `workflow_dispatch` event to the customer's repo. The runner
+        action picks it up and proceeds through the configured stages.
+      tags: [runs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo, workflow_id, workflow_sha, trigger_source]
+              properties:
+                repo:
+                  type: string
+                  example: kuhlman-labs/fishhawk
+                workflow_id:
+                  type: string
+                  example: feature_change
+                workflow_sha:
+                  type: string
+                trigger_source:
+                  type: string
+                  enum: [github_issue, cli, ui]
+                trigger_ref:
+                  type: [string, "null"]
+      responses:
+        '201':
+          description: Run created and dispatched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v0/runs/{run_id}:
+    get:
+      operationId: getRun
+      summary: Get a run
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Run details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v0/runs/{run_id}/cancel:
+    post:
+      operationId: cancelRun
+      summary: Cancel a run
+      description: |
+        Transitions the run and any non-terminal stages to `cancelled`.
+        Idempotent — calling on an already-cancelled or already-terminal
+        run returns 409 unless `state` already equals `cancelled`.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Run cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v0/runs/{run_id}/stages:
+    get:
+      operationId: listRunStages
+      summary: List stages for a run
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Stages ordered by sequence ascending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Stage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v0/runs/{run_id}/audit:
+    get:
+      operationId: listRunAudit
+      summary: List audit entries for a run
+      description: |
+        Cursor-paginated, sequence-ascending. Used by the run-detail UI
+        and (eventually) the compliance export.
+      tags: [audit]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: category, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Page of audit entries.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/AuditEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------------
+  # Stages, artifacts, approvals
+  # ---------------------------------------------------------------------
+  /v0/stages/{stage_id}:
+    get:
+      operationId: getStage
+      summary: Get a stage
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Stage details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v0/stages/{stage_id}/artifacts:
+    get:
+      operationId: listStageArtifacts
+      summary: List artifacts for a stage
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Artifacts, ordered by created_at ascending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Artifact' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v0/stages/{stage_id}/approvals:
+    post:
+      operationId: submitApproval
+      summary: Approve or reject the gate on a stage
+      description: |
+        The authenticated user must resolve to a role listed in the
+        gate's `approvers` block. Submitting an `approve` decision
+        transitions the gate to passed; `reject` fails the stage as
+        category D.
+      tags: [approvals]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approve, reject]
+                comment:
+                  type: string
+      responses:
+        '200':
+          description: Approval recorded; stage state advanced.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v0/artifacts/{artifact_id}:
+    get:
+      operationId: getArtifact
+      summary: Get an artifact
+      tags: [artifacts]
+      parameters:
+        - { name: artifact_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Artifact with content.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Artifact' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------------
+  # Runner-facing endpoints
+  # ---------------------------------------------------------------------
+  /v0/runs/{run_id}/signing-key:
+    post:
+      operationId: issueSigningKey
+      summary: Issue a per-run Ed25519 signing key
+      description: |
+        Called by the runner at job start. The backend mints a fresh
+        Ed25519 keypair, persists the public half in `signing_keys`,
+        and returns the private half in the response body. The private
+        key is never persisted server-side and never returned to anyone
+        else. Auth is GitHub Actions OIDC token, verified per request.
+        See ADR-008 (#72).
+      tags: [runner]
+      security:
+        - githubOIDC: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl_seconds:
+                  type: integer
+                  description: |
+                    Optional override for the default TTL (1800s).
+                    Backend may cap to a maximum.
+                  minimum: 60
+                  maximum: 3600
+      responses:
+        '201':
+          description: Keypair issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, public_key, private_key, issued_at, expires_at]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  public_key:
+                    type: string
+                    description: Base64-encoded 32-byte Ed25519 public key.
+                  private_key:
+                    type: string
+                    description: |
+                      Base64-encoded 64-byte Ed25519 private key. The
+                      runner stores this in process memory only and
+                      discards it after trace upload.
+                  issued_at:
+                    type: string
+                    format: date-time
+                  expires_at:
+                    type: string
+                    format: date-time
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Run does not exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: A signing key has already been issued for this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/trace:
+    post:
+      operationId: shipTrace
+      summary: Upload a signed trace bundle
+      description: |
+        Called by the runner after a stage completes. The bundle bytes
+        (`application/gzip`, JSON Lines) are uploaded as the request body;
+        the signature comes via the `X-Fishhawk-Signature` header. The
+        backend verifies the signature against the run's stored public
+        key, stores the bundle in S3 (per ADR-003 #67), and writes the
+        corresponding audit entry. Auth is the signature itself; no
+        Bearer or cookie required.
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: variant
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [raw, redacted]
+        - name: X-Fishhawk-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+            description: |
+              Hex-encoded 64-byte Ed25519 signature over
+              sha256(raw_bundle_bytes).
+      requestBody:
+        required: true
+        content:
+          application/gzip:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '202':
+          description: Bundle accepted, signature verified.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, stage_id, variant, content_hash]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  stage_id: { $ref: '#/components/schemas/UUID' }
+                  variant: { type: string, enum: [raw, redacted] }
+                  content_hash:
+                    type: string
+                    description: Hex sha256 of the uploaded bundle bytes.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Signature invalid or no signing key for this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------------
+  # Webhook ingestion (unversioned; GitHub controls request shape)
+  # ---------------------------------------------------------------------
+  /webhooks/github:
+    post:
+      operationId: receiveGithubWebhook
+      summary: GitHub App webhook receiver
+      description: |
+        Inbound from the customer's GitHub App installation. Events
+        include issues, pull requests, check runs, push, and the
+        Marketplace billing events. The backend signature-verifies via
+        the GitHub App webhook secret, deduplicates by delivery ID,
+        and translates relevant events into workflow run dispatches.
+        See E3.7 (#47).
+      tags: [webhooks]
+      security: []
+      parameters:
+        - name: X-GitHub-Event
+          in: header
+          required: true
+          schema: { type: string }
+        - name: X-GitHub-Delivery
+          in: header
+          required: true
+          schema: { type: string }
+        - name: X-Hub-Signature-256
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '202':
+          description: Event accepted.
+        '401':
+          description: Webhook signature invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '400':
+          description: Malformed event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+tags:
+  - name: diagnostics
+    description: Liveness, readiness, build info.
+  - name: auth
+    description: GitHub OAuth flow + scoped API tokens (ADR-005).
+  - name: runs
+    description: Workflow run lifecycle.
+  - name: stages
+    description: Stage details + artifacts.
+  - name: approvals
+    description: Human-in-the-loop gate decisions.
+  - name: artifacts
+    description: Plans and pull-request references emitted by stages.
+  - name: audit
+    description: Append-only audit log read paths.
+  - name: runner
+    description: Endpoints called by the fishhawk/runner GitHub Action.
+  - name: webhooks
+    description: Inbound from GitHub App installations.
