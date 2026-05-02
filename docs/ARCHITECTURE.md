@@ -160,6 +160,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | HTTP middleware order / context keys | `backend/internal/server/middleware.go` |
 | Run CRUD handlers (POST/GET) | `backend/internal/server/runs.go`; wired in `backend/cmd/fishhawkd/serve.go` from `FISHHAWKD_DATABASE_URL` |
 | Signing-key issuance handler | `backend/internal/server/signing.go` wraps `signing.Repository.Issue`; OIDC auth pending (#112) |
+| Trace upload handler | `backend/internal/server/trace.go`; verifies signature, calls `tracestore.Put` + `audit.AppendChained`. S3 wired in `serve.go` from `FISHHAWKD_S3_BUCKET`/`_REGION`/`_ENDPOINT`. |
 | GitHub webhook receiver | `backend/internal/webhook/` (HMAC + dedup) and `backend/internal/server/webhook.go`; secret from `FISHHAWKD_GITHUB_WEBHOOK_SECRET` |
 | How a new Go module gets added | `CLAUDE.md` "Adding a Go module" |
 

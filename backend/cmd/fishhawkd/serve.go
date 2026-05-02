@@ -11,11 +11,16 @@ import (
 
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -31,6 +36,12 @@ func runServe(args []string, logSink io.Writer) int {
 	webhookSecret := fs.String("github-webhook-secret",
 		envOr("FISHHAWKD_GITHUB_WEBHOOK_SECRET", ""),
 		"shared secret GitHub uses to HMAC-sign webhook deliveries; when empty, /webhooks/github responds 503")
+	s3Bucket := fs.String("s3-bucket", envOr("FISHHAWKD_S3_BUCKET", ""),
+		"S3 bucket for trace bundle storage; when empty, /v0/runs/{id}/trace responds 503")
+	s3Region := fs.String("s3-region", envOr("FISHHAWKD_S3_REGION", "us-east-1"),
+		"AWS region for the trace bundle bucket")
+	s3Endpoint := fs.String("s3-endpoint", envOr("FISHHAWKD_S3_ENDPOINT", ""),
+		"override the S3 endpoint (e.g. http://minio:9000 in dev); empty uses the AWS default")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -54,9 +65,35 @@ func runServe(args []string, logSink io.Writer) int {
 		defer pool.Close()
 		cfg.RunRepo = runpkg.NewPostgresRepository(pool)
 		cfg.SigningRepo = signing.NewPostgresRepository(pool)
-		logger.Info("run + signing repositories configured", slog.String("driver", "postgres"))
+		cfg.AuditRepo = audit.NewPostgresRepository(pool)
+		logger.Info("run + signing + audit repositories configured", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
+	}
+
+	// Trace storage wiring. The S3 client uses path-style requests
+	// so the same code works against AWS S3 and MinIO. An empty
+	// bucket leaves /v0/runs/{id}/trace at 503.
+	if *s3Bucket != "" {
+		awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+			awsconfig.WithRegion(*s3Region))
+		if err != nil {
+			logger.Error("aws config failed", slog.String("error", err.Error()))
+			return exitFailure
+		}
+		client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+			if *s3Endpoint != "" {
+				o.BaseEndpoint = aws.String(*s3Endpoint)
+			}
+			o.UsePathStyle = true
+		})
+		cfg.TraceStore = tracestore.NewS3Storage(client, *s3Bucket)
+		logger.Info("trace store configured",
+			slog.String("bucket", *s3Bucket),
+			slog.String("region", *s3Region),
+			slog.String("endpoint", *s3Endpoint))
+	} else {
+		logger.Warn("FISHHAWKD_S3_BUCKET not set; /v0/runs/{id}/trace will respond 503")
 	}
 
 	// Webhook receiver wiring. Secret + delivery store both need
