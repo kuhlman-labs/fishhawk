@@ -10,11 +10,13 @@ branding:
 # and pass the inputs below. The composite action checks out a Go
 # toolchain and invokes ./cmd/fishhawk-runner from this directory.
 #
-# E5.1 (#52) ships the scaffold: the Go binary parses its inputs and
-# exits 0. The agent invocation, trace capture, signing, and trace
-# shipping arrive in E5.2–E5.6. Customers pinning v0.1 see a no-op
-# success until those land — useful for exercising the dispatch
-# path early.
+# E5.1 (#52) shipped the scaffold; E5.2 (#29) added the Claude Code
+# invocation harness. With prompt-file unset the runner still
+# exits 0 after the startup log line, preserving the v0.1
+# dispatch-path probe. With prompt-file set, the runner invokes
+# Claude Code, captures the trace, and emits it as JSON Lines on
+# stdout. Trace bundling (E5.3) and signed shipping to the backend
+# (E5.6) replace stdout emission later.
 
 inputs:
   run-id:
@@ -29,6 +31,26 @@ inputs:
   stage:
     description: 'Stage ID within the workflow (e.g. plan, implement, review).'
     required: true
+  prompt-file:
+    description: 'Path to a UTF-8 file containing the prompt. When unset, the runner exits 0 without invoking the agent.'
+    required: false
+    default: ''
+  working-dir:
+    description: "Agent CWD; defaults to the runner's CWD."
+    required: false
+    default: ''
+  max-tokens:
+    description: 'Hard cap on agent tokens (input + output). 0 means no cap.'
+    required: false
+    default: '0'
+  timeout:
+    description: 'Wall-clock cap on the agent invocation (Go duration string, e.g. 15m).'
+    required: false
+    default: '15m'
+  anthropic-api-key:
+    description: 'API key forwarded to Claude Code as ANTHROPIC_API_KEY. Customers populate this from a GitHub Secret.'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -42,9 +64,15 @@ runs:
     - name: Run fishhawk-runner
       shell: bash
       working-directory: ${{ github.action_path }}
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
       run: |
         go run ./cmd/fishhawk-runner \
           --run-id "${{ inputs.run-id }}" \
           --backend-url "${{ inputs.backend-url }}" \
           --workflow "${{ inputs.workflow }}" \
-          --stage "${{ inputs.stage }}"
+          --stage "${{ inputs.stage }}" \
+          --prompt-file "${{ inputs.prompt-file }}" \
+          --working-dir "${{ inputs.working-dir }}" \
+          --max-tokens "${{ inputs.max-tokens }}" \
+          --timeout "${{ inputs.timeout }}"
