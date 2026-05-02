@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
@@ -29,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 const (
@@ -42,6 +44,20 @@ const (
 // non-test code; tests reassign and restore it via t.Cleanup.
 var newInvoker = func(apiKey string) agent.Invoker {
 	return claudecode.New(apiKey)
+}
+
+// uploadClient is the test seam for the backend HTTP client.
+// Tests substitute a fake to drive ShipTrace / IssueKey without
+// standing up an httptest.Server.
+type uploadClient interface {
+	IssueKey(ctx context.Context, runID string, ttl time.Duration) (*upload.IssuedKey, error)
+	ShipTrace(ctx context.Context, args upload.ShipArgs) (*upload.ShipResult, error)
+}
+
+// newUploadClient returns the production uploadClient for the
+// given backend URL. Overridable by tests.
+var newUploadClient = func(baseURL string) uploadClient {
+	return upload.New(baseURL)
 }
 
 func main() {
@@ -124,18 +140,58 @@ func run(args []string, logSink io.Writer) int {
 		}
 	}
 
+	// Bundle building is shared by --bundle-out and --upload-trace.
+	// We build once into memory, then write to disk and/or upload.
+	// When neither is configured, fall back to stdout JSONL so
+	// callers exercising --prompt-file alone can still inspect.
+	var bundleBytes []byte
+	if cfg.bundleOut != "" || cfg.uploadTrace {
+		bytesData, _, err := bundle.PackBytes(bundle.PackInputs{
+			RunID:   cfg.runID,
+			StageID: bundleStageID(cfg),
+			Agent:   "claude-code",
+		}, res.Events)
+		if err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"bundle_pack","detail":%q}`+"\n", err.Error())
+			logCompletion(logSink, res, invokeErr)
+			return exitFailure
+		}
+		bundleBytes = bytesData
+	}
+
 	if cfg.bundleOut != "" {
-		if err := writeBundle(cfg, res); err != nil {
+		// 0o600 — bundle may carry redacted credentials in raw events
+		// until E2.4 redaction is wired upstream of the bundler. The
+		// runner's filesystem is ephemeral, but defense in depth is
+		// cheap.
+		if err := os.WriteFile(cfg.bundleOut, bundleBytes, 0o600); err != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"bundle_write","detail":%q}`+"\n", err.Error())
 			logCompletion(logSink, res, invokeErr)
 			return exitFailure
 		}
-	} else {
-		// No bundle path configured — fall back to JSONL on stdout
-		// so callers exercising --prompt-file alone can still
-		// inspect the captured trace. E5.6 will replace this with
-		// signed upload to the backend.
+	}
+
+	if cfg.uploadTrace {
+		if err := uploadTrace(cfg, bundleBytes, logSink); err != nil {
+			// Upload failures are MVP_SPEC §6 category-C (infra).
+			// We DON'T overwrite an earlier A/B failure category;
+			// only stamp C when the agent itself succeeded.
+			if res.OK {
+				res.OK = false
+				res.FailureCategory = "C"
+				res.FailureReason = err.Error()
+				invokeErr = err
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"trace_upload","detail":%q}`+"\n", err.Error())
+			logCompletion(logSink, res, invokeErr)
+			return exitFailure
+		}
+	}
+
+	if bundleBytes == nil {
 		emitEvents(os.Stdout, res.Events)
 	}
 
@@ -147,27 +203,53 @@ func run(args []string, logSink io.Writer) int {
 	return exitOK
 }
 
-// writeBundle packs the captured events into the ADR-007 wire
-// format and writes the gzipped bytes to cfg.bundleOut. Returns the
-// storage hash via a side channel — for now we just log it in
-// logCompletion when a bundle was written; E5.6 will hand it to the
-// signing layer + backend upload.
-func writeBundle(cfg config, res agent.Result) error {
-	data, _, err := bundle.PackBytes(bundle.PackInputs{
-		RunID:   cfg.runID,
-		StageID: cfg.stage, // stage UUID not yet plumbed; v0.x replaces with cfg.stageID
-		Agent:   "claude-code",
-	}, res.Events)
+// bundleStageID returns the value passed to bundle.PackBytes for
+// the stage identifier. We prefer the UUID form (--stage-id) when
+// supplied, otherwise fall back to the workflow-spec stage name
+// (--stage). Bundling tolerates either; the upload path needs the
+// UUID.
+func bundleStageID(cfg config) string {
+	if cfg.stageID != "" {
+		return cfg.stageID
+	}
+	return cfg.stage
+}
+
+// uploadTrace issues a signing key, signs the bundle bytes, and
+// POSTs to the backend's trace endpoint. Returns nil on accepted,
+// non-nil on any failure (key issuance, signing, network, signature
+// rejection). The caller is responsible for translating the error
+// into the right category-C audit narrative.
+func uploadTrace(cfg config, bundleBytes []byte, logSink io.Writer) error {
+	if cfg.stageID == "" {
+		return errors.New("upload: --stage-id required with --upload-trace")
+	}
+	client := newUploadClient(cfg.backendURL)
+	ctx := context.Background()
+
+	issued, err := client.IssueKey(ctx, cfg.runID, 0)
 	if err != nil {
-		return fmt.Errorf("pack: %w", err)
+		return fmt.Errorf("issue key: %w", err)
 	}
-	// 0o600 — bundle may carry redacted credentials in raw events
-	// until E2.4 redaction is wired upstream of the bundler. The
-	// runner's filesystem is ephemeral, but defense in depth is
-	// cheap.
-	if err := os.WriteFile(cfg.bundleOut, data, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", cfg.bundleOut, err)
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"signing_key_issued","run_id":%q,"expires_at":%q}`+"\n",
+		issued.RunID, issued.ExpiresAt.Format(time.RFC3339),
+	)
+
+	res, err := client.ShipTrace(ctx, upload.ShipArgs{
+		RunID:      cfg.runID,
+		StageID:    cfg.stageID,
+		Variant:    cfg.variant,
+		Bundle:     bundleBytes,
+		PrivateKey: issued.PrivateKey,
+	})
+	if err != nil {
+		return fmt.Errorf("ship trace: %w", err)
 	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"trace_uploaded","run_id":%q,"stage_id":%q,"variant":%q,"content_hash":%q}`+"\n",
+		res.RunID, res.StageID, res.Variant, res.ContentHash,
+	)
 	return nil
 }
 
