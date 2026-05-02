@@ -59,6 +59,18 @@ inputs:
     description: 'Path the agent writes its plan artifact to. When set, the runner validates against standard_v1 after a successful agent invocation.'
     required: false
     default: ''
+  upload-trace:
+    description: 'After the agent succeeds, issue a signing key from backend-url and POST the bundle to /v0/runs/{run_id}/trace.'
+    required: false
+    default: 'false'
+  stage-id:
+    description: 'Stage UUID for trace upload (distinct from stage which is the workflow-spec stage name). Required with upload-trace.'
+    required: false
+    default: ''
+  variant:
+    description: 'Trace bundle variant for upload: raw or redacted.'
+    required: false
+    default: 'raw'
   constraints-file:
     description: 'Path to a JSON file describing the stage constraints (forbidden_paths, allowed_paths, max_files_changed, required_outcomes).'
     required: false
@@ -95,4 +107,7 @@ runs:
           --bundle-out "${{ inputs.bundle-out }}" \
           --plan-out "${{ inputs.plan-out }}" \
           --constraints-file "${{ inputs.constraints-file }}" \
-          --check-base-ref "${{ inputs.check-base-ref }}"
+          --check-base-ref "${{ inputs.check-base-ref }}" \
+          $(if [ "${{ inputs.upload-trace }}" = "true" ]; then echo --upload-trace; fi) \
+          --stage-id "${{ inputs.stage-id }}" \
+          --variant "${{ inputs.variant }}"

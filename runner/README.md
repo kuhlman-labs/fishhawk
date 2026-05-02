@@ -16,13 +16,13 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/runner`) 
 - `internal/plan/` — plan-artifact validator against `standard_v1` (E1.5 schema; embedded copy under `schemas/`).
 - `internal/constraint/` — workflow-spec constraint evaluator (`forbidden_paths`, `allowed_paths`, `max_files_changed`, `required_outcomes`).
 - `internal/gitdiff/` — thin shim around `git diff --name-status -z` producing a `constraint.Diff`.
+- `internal/upload/` — HTTP client for the backend's signing-key + trace endpoints; signs the bundle and POSTs.
 - `internal/version/` — build-version package; set via `-ldflags` at release time.
 
 ## Status
 
-E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation harness. E5.3 (#30) added trace bundling. E5.4 (#31) added plan-artifact validation. E5.5 (#53) added post-hoc constraint enforcement: with `--constraints-file` and `--check-base-ref`, the runner runs `git diff --name-status -z` against the base ref and evaluates `forbidden_paths` / `allowed_paths` / `max_files_changed` / `required_outcomes` against the diff. Any violation demotes the run to category-B and emits one `policy_event` per violation into the bundle.
+E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation harness. E5.3 (#30) added trace bundling. E5.4 (#31) added plan validation. E5.5 (#53) added constraint enforcement. E5.6 (#32) added signed trace shipping: with `--upload-trace` and `--stage-id`, the runner calls `POST /v0/runs/{run_id}/signing-key` to obtain an Ed25519 key, signs `sha256(bundle)`, and POSTs to `POST /v0/runs/{run_id}/trace`. Upload failures map to category-C (infrastructure) per MVP_SPEC §6 — and never override an earlier category-A or category-B failure.
 
-- E5.6 (#32) — signed trace shipping to backend (uses `backend/internal/signing` + `backend/internal/tracestore`)
 - E5.7 (#54) — versioned, signed releases of `fishhawk/runner` with SBOM
 
 ## Inputs (action.yml)
@@ -41,6 +41,9 @@ E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation har
 | `plan-out` | no | Path the agent writes its plan artifact to. When set, the runner validates the file against `standard_v1` after a successful agent invocation; a malformed plan demotes the run to category-B failure. |
 | `constraints-file` | no | Path to a JSON file with the stage's constraints (`forbidden_paths`, `allowed_paths`, `max_files_changed`, `required_outcomes`, `ci_green`). |
 | `check-base-ref` | no | Git ref to diff against for constraint evaluation. Constraints run only when both `constraints-file` and `check-base-ref` are set. |
+| `upload-trace` | no | After the agent succeeds, issue a signing key from `backend-url` and POST the bundle to `/v0/runs/{run_id}/trace`. |
+| `stage-id` | no | Stage UUID for trace upload (distinct from `stage` which is the workflow-spec stage name). Required with `upload-trace`. |
+| `variant` | no | Trace bundle variant: `raw` or `redacted`. Defaults to `raw`. |
 
 The Claude Code API key is supplied via the `ANTHROPIC_API_KEY` environment variable, which customers populate from their GitHub Secrets. v0.x will replace this with a Fishhawk-issued ephemeral key (MVP_SPEC §5.3).
 

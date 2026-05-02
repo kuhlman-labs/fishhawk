@@ -31,6 +31,9 @@ type config struct {
 	planOut         string
 	constraintsFile string
 	checkBaseRef    string
+	uploadTrace     bool
+	stageID         string
+	variant         string
 }
 
 // parseFlags reads args and populates a config. Returns a usage
@@ -67,6 +70,12 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"path to a JSON file describing the stage's constraints (forbidden_paths, allowed_paths, max_files_changed, required_outcomes); requires --check-base-ref to be useful")
 	fs.StringVar(&cfg.checkBaseRef, "check-base-ref", "",
 		"git ref to diff against for constraint evaluation (e.g. origin/main); when set together with --constraints-file the runner enforces post-hoc")
+	fs.BoolVar(&cfg.uploadTrace, "upload-trace", false,
+		"after the agent succeeds, issue a signing key from --backend-url and POST the bundle to /v0/runs/{run_id}/trace")
+	fs.StringVar(&cfg.stageID, "stage-id", "",
+		"stage UUID for trace upload (distinct from --stage which is the workflow-spec stage name); required with --upload-trace")
+	fs.StringVar(&cfg.variant, "variant", "raw",
+		"bundle variant for trace upload: raw or redacted")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
