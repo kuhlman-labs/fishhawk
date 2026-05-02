@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // Config holds the values needed to construct a Server. Zero-valued
@@ -28,6 +30,12 @@ type Config struct {
 	// ShutdownTimeout caps Shutdown's wait for in-flight requests to
 	// drain before forcing closure.
 	ShutdownTimeout time.Duration
+
+	// RunRepo persists workflow runs and stages. Wired by the
+	// /v0/runs handlers; nil leaves those handlers returning 503.
+	// Tests inject in-memory fakes; production wires the Postgres
+	// adapter (run.NewPostgresRepository).
+	RunRepo run.Repository
 }
 
 // Server wraps an http.Server with the routes and middleware stack

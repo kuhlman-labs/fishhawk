@@ -158,6 +158,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | Trace bundle wire format (`*.jsonl.gz`) | `runner/internal/bundle/bundle.go` (pack + open) — implements ADR-007 (#71) |
 | Constraint evaluation (forbidden_paths, max_files_changed, required_outcomes) | `runner/internal/constraint/constraint.go` (post-hoc, runner-side) |
 | HTTP middleware order / context keys | `backend/internal/server/middleware.go` |
+| Run CRUD handlers (POST/GET) | `backend/internal/server/runs.go`; wired in `backend/cmd/fishhawkd/serve.go` from `FISHHAWKD_DATABASE_URL` |
 | How a new Go module gets added | `CLAUDE.md` "Adding a Go module" |
 
 ## 11. Open work
