@@ -13,8 +13,10 @@ import (
 // per docs/api/v0.openapi.yaml.
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /v0/runs", s.handleListRuns)
 	mux.HandleFunc("POST /v0/runs", s.handleCreateRun)
 	mux.HandleFunc("GET /v0/runs/{run_id}", s.handleGetRun)
+	mux.HandleFunc("POST /v0/runs/{run_id}/cancel", s.handleCancelRun)
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", s.handleListRunStages)
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", s.handleListRunAudit)
 	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", s.handleIssueSigningKey)

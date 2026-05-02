@@ -159,7 +159,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | Runner → backend trace upload | `runner/internal/upload/` (HTTP client, retries, signing) — wired into runner main behind `--upload-trace` |
 | Constraint evaluation (forbidden_paths, max_files_changed, required_outcomes) | `runner/internal/constraint/constraint.go` (post-hoc, runner-side) |
 | HTTP middleware order / context keys | `backend/internal/server/middleware.go` |
-| Run CRUD handlers (POST/GET) | `backend/internal/server/runs.go`; wired in `backend/cmd/fishhawkd/serve.go` from `FISHHAWKD_DATABASE_URL` |
+| Run CRUD handlers (POST/GET/list/cancel) | `backend/internal/server/runs.go`; wired in `backend/cmd/fishhawkd/serve.go` from `FISHHAWKD_DATABASE_URL` |
 | Stage + audit read handlers (`/runs/{id}/stages`, `/runs/{id}/audit`) | `backend/internal/server/reads.go`; cursor pagination via `pageOffset`/`encodeOffsetCursor` |
 | Signing-key issuance handler | `backend/internal/server/signing.go` wraps `signing.Repository.Issue`; OIDC auth pending (#112) |
 | Trace upload handler | `backend/internal/server/trace.go`; verifies signature, calls `tracestore.Put` + `audit.AppendChained`. S3 wired in `serve.go` from `FISHHAWKD_S3_BUCKET`/`_REGION`/`_ENDPOINT`. |

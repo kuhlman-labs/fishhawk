@@ -67,6 +67,31 @@ func (r *postgresRepo) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return rowToRun(row), nil
 }
 
+func (r *postgresRepo) ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, error) {
+	if f.Limit <= 0 {
+		return nil, fmt.Errorf("list runs: limit must be > 0")
+	}
+	if f.Offset < 0 {
+		return nil, fmt.Errorf("list runs: offset must be >= 0")
+	}
+	q := rundb.New(r.pool)
+	rows, err := q.ListRuns(ctx, rundb.ListRunsParams{
+		Repo:       f.Repo,
+		WorkflowID: f.WorkflowID,
+		State:      f.State,
+		Lim:        int32(f.Limit),
+		Off:        int32(f.Offset),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list runs: %w", err)
+	}
+	out := make([]*Run, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToRun(row))
+	}
+	return out, nil
+}
+
 func (r *postgresRepo) TransitionRun(ctx context.Context, id uuid.UUID, to State) (*Run, error) {
 	var result *Run
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {

@@ -39,6 +39,17 @@ type StageCompletion struct {
 	FailureReason   *string
 }
 
+// ListRunsFilter scopes a ListRuns query. Empty strings mean "no
+// constraint" — same convention as the underlying SQL. Limit must
+// be > 0; Offset must be >= 0.
+type ListRunsFilter struct {
+	Repo       string
+	WorkflowID string
+	State      string
+	Limit      int
+	Offset     int
+}
+
 // Repository persists runs and stages and applies state-machine
 // transitions atomically.
 //
@@ -49,6 +60,11 @@ type StageCompletion struct {
 type Repository interface {
 	CreateRun(ctx context.Context, p CreateRunParams) (*Run, error)
 	GetRun(ctx context.Context, id uuid.UUID) (*Run, error)
+
+	// ListRuns returns runs matching filter, ordered created_at
+	// DESC with an id tiebreak. Caller is responsible for the
+	// pagination math; this method just hands back the page.
+	ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, error)
 
 	// TransitionRun moves a run to the target state. Returns
 	// InvalidTransitionError if the run is in a state from which
