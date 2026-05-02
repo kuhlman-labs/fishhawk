@@ -12,13 +12,13 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/runner`) 
 - `cmd/fishhawk-runner/` — the binary entrypoint. Flag parsing in `flags.go`, dispatch in `main.go`.
 - `internal/agent/` — the agent abstraction (`Invoker`, `Invocation`, `Result`, `Event`).
 - `internal/agent/claudecode/` — adapter for Anthropic's Claude Code CLI.
+- `internal/bundle/` — `*.jsonl.gz` trace bundle pack/unpack per ADR-007 (#71).
 - `internal/version/` — build-version package; set via `-ldflags` at release time.
 
 ## Status
 
-E5.1 (#52) shipped the scaffold. E5.2 (#29) wires the Claude Code invocation harness: when `prompt-file` is supplied, the runner invokes Claude Code with `--print --output-format stream-json`, captures each event, and emits the trace as JSON Lines on stdout. Trace bundling and signed upload land later:
+E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation harness. E5.3 (#30) added trace bundling: when `--prompt-file` and `--bundle-out` are supplied together, the runner invokes Claude Code, packs the captured events into the ADR-007 `*.jsonl.gz` format (manifest first, trailer last with content hash), and writes the gzipped bundle to disk. Without `--bundle-out` the runner falls back to JSONL on stdout for ad-hoc inspection. Signed upload lands in E5.6.
 
-- E5.3 (#30) — full trace capture + bundling (replaces stdout JSONL with `*.jsonl.gz` + manifest/trailer)
 - E5.4 (#31) — plan validation against `standard_v1` (reuses `backend/internal/plan`)
 - E5.5 (#53) — post-hoc constraint enforcement on stage output
 - E5.6 (#32) — signed trace shipping to backend (uses `backend/internal/signing` + `backend/internal/tracestore`)
@@ -36,6 +36,7 @@ E5.1 (#52) shipped the scaffold. E5.2 (#29) wires the Claude Code invocation har
 | `working-dir` | no | Agent working directory; defaults to the runner's CWD. |
 | `max-tokens` | no | Hard cap on agent tokens (input + output); 0 means no cap. |
 | `timeout` | no | Wall-clock cap on the agent invocation, e.g. `15m`. Default 15m. |
+| `bundle-out` | no | Path to write the gzipped trace bundle. When set the runner produces an ADR-007 `*.jsonl.gz` artifact instead of JSONL on stdout. |
 
 The Claude Code API key is supplied via the `ANTHROPIC_API_KEY` environment variable, which customers populate from their GitHub Secrets. v0.x will replace this with a Fishhawk-issued ephemeral key (MVP_SPEC §5.3).
 
@@ -62,7 +63,7 @@ The same binary the action runs can be invoked locally for development:
       --workflow feature_change \
       --stage plan
 
-    # With the Claude Code harness (E5.2+)
+    # With the Claude Code harness (E5.2+) and bundled output (E5.3+)
     echo "Summarize the README" > /tmp/prompt.txt
     ANTHROPIC_API_KEY=sk-... go run ./cmd/fishhawk-runner \
       --run-id 11111111-2222-3333-4444-555555555555 \
@@ -71,9 +72,13 @@ The same binary the action runs can be invoked locally for development:
       --stage plan \
       --prompt-file /tmp/prompt.txt \
       --max-tokens 50000 \
-      --timeout 5m
+      --timeout 5m \
+      --bundle-out /tmp/trace.jsonl.gz
 
-When `--prompt-file` is set the runner emits one JSON event per stdout line; the structured runner log lines (`runner_started`, `runner_completed`) go to stderr.
+    # Inspect the bundle: manifest first, trailer last (with content hash).
+    gunzip -c /tmp/trace.jsonl.gz | jq -c .
+
+When `--prompt-file` is set the runner invokes Claude Code; the structured runner log lines (`runner_started`, `runner_completed`) go to stderr. With `--bundle-out`, captured events are packed into `*.jsonl.gz` per ADR-007. Without it, events fall back to JSONL on stdout.
 
 ## See also
 

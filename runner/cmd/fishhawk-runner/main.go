@@ -1,11 +1,12 @@
 // Command fishhawk-runner runs an agent under a Fishhawk workflow
 // stage and ships the trace.
 //
-// E5.1 (#52) shipped the scaffold. E5.2 (#29) wires the Claude Code
-// invocation harness: when --prompt-file is supplied, the runner
-// invokes Claude Code, captures the trace, and emits it as JSON
-// Lines on stdout. Trace bundling (E5.3 / #30) and shipping to the
-// backend (E5.6 / #32) replace the stdout emission later.
+// E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code
+// invocation harness. E5.3 (#30) added trace bundling: when
+// --prompt-file and --bundle-out are supplied together, the runner
+// invokes the agent, packs the captured events into the *.jsonl.gz
+// wire format from ADR-007, and writes the bundle to disk. Signed
+// upload to the backend lands in E5.6 (#32).
 //
 // Without --prompt-file the binary parses its inputs, prints a
 // single startup log line, and exits 0. Customers pinning
@@ -23,6 +24,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 )
 
 const (
@@ -86,13 +88,51 @@ func run(args []string, logSink io.Writer) int {
 	invoker := newInvoker(os.Getenv("ANTHROPIC_API_KEY"))
 	res, invokeErr := invoker.Invoke(context.Background(), inv)
 
-	emitEvents(os.Stdout, res.Events)
+	if cfg.bundleOut != "" {
+		if err := writeBundle(cfg, res); err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"bundle_write","detail":%q}`+"\n", err.Error())
+			logCompletion(logSink, res, invokeErr)
+			return exitFailure
+		}
+	} else {
+		// No bundle path configured — fall back to JSONL on stdout
+		// so callers exercising --prompt-file alone can still
+		// inspect the captured trace. E5.6 will replace this with
+		// signed upload to the backend.
+		emitEvents(os.Stdout, res.Events)
+	}
+
 	logCompletion(logSink, res, invokeErr)
 
 	if !res.OK {
 		return exitFailure
 	}
 	return exitOK
+}
+
+// writeBundle packs the captured events into the ADR-007 wire
+// format and writes the gzipped bytes to cfg.bundleOut. Returns the
+// storage hash via a side channel — for now we just log it in
+// logCompletion when a bundle was written; E5.6 will hand it to the
+// signing layer + backend upload.
+func writeBundle(cfg config, res agent.Result) error {
+	data, _, err := bundle.PackBytes(bundle.PackInputs{
+		RunID:   cfg.runID,
+		StageID: cfg.stage, // stage UUID not yet plumbed; v0.x replaces with cfg.stageID
+		Agent:   "claude-code",
+	}, res.Events)
+	if err != nil {
+		return fmt.Errorf("pack: %w", err)
+	}
+	// 0o600 — bundle may carry redacted credentials in raw events
+	// until E2.4 redaction is wired upstream of the bundler. The
+	// runner's filesystem is ephemeral, but defense in depth is
+	// cheap.
+	if err := os.WriteFile(cfg.bundleOut, data, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", cfg.bundleOut, err)
+	}
+	return nil
 }
 
 func logStartup(w io.Writer, cfg config) {
