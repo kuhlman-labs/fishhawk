@@ -41,13 +41,14 @@ func NewPostgresRepository(pool *pgxpool.Pool) Repository {
 func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, error) {
 	q := rundb.New(r.pool)
 	row, err := q.CreateRun(ctx, rundb.CreateRunParams{
-		ID:            uuid.New(),
-		Repo:          p.Repo,
-		WorkflowID:    p.WorkflowID,
-		WorkflowSha:   p.WorkflowSHA,
-		TriggerSource: string(p.TriggerSource),
-		TriggerRef:    p.TriggerRef,
-		State:         string(StatePending),
+		ID:             uuid.New(),
+		Repo:           p.Repo,
+		WorkflowID:     p.WorkflowID,
+		WorkflowSha:    p.WorkflowSHA,
+		TriggerSource:  string(p.TriggerSource),
+		TriggerRef:     p.TriggerRef,
+		State:          string(StatePending),
+		InstallationID: p.InstallationID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -239,15 +240,16 @@ func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to Sta
 
 func rowToRun(r rundb.Run) *Run {
 	return &Run{
-		ID:            r.ID,
-		Repo:          r.Repo,
-		WorkflowID:    r.WorkflowID,
-		WorkflowSHA:   r.WorkflowSha,
-		TriggerSource: TriggerSource(r.TriggerSource),
-		TriggerRef:    r.TriggerRef,
-		State:         State(r.State),
-		CreatedAt:     r.CreatedAt.Time,
-		UpdatedAt:     r.UpdatedAt.Time,
+		ID:             r.ID,
+		Repo:           r.Repo,
+		WorkflowID:     r.WorkflowID,
+		WorkflowSHA:    r.WorkflowSha,
+		TriggerSource:  TriggerSource(r.TriggerSource),
+		TriggerRef:     r.TriggerRef,
+		InstallationID: r.InstallationID,
+		State:          State(r.State),
+		CreatedAt:      r.CreatedAt.Time,
+		UpdatedAt:      r.UpdatedAt.Time,
 	}
 }
 

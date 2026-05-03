@@ -14,11 +14,12 @@ var ErrNotFound = errors.New("not found")
 
 // CreateRunParams are the inputs needed to insert a new run.
 type CreateRunParams struct {
-	Repo          string
-	WorkflowID    string
-	WorkflowSHA   string
-	TriggerSource TriggerSource
-	TriggerRef    *string
+	Repo           string
+	WorkflowID     string
+	WorkflowSHA    string
+	TriggerSource  TriggerSource
+	TriggerRef     *string
+	InstallationID *int64
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

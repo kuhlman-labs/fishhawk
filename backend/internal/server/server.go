@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -67,6 +68,12 @@ type Config struct {
 	// Wired by GET /v0/stages/{id}/artifacts and
 	// GET /v0/artifacts/{id}; nil leaves both 503.
 	ArtifactRepo artifact.Repository
+
+	// Orchestrator advances a run's stages after a gate passes.
+	// The approval handler calls Advance(runID) after transitioning
+	// a stage to succeeded; without an orchestrator the run stalls
+	// at "first stage succeeded, no next stage dispatched."
+	Orchestrator *orchestrator.Orchestrator
 
 	// GitHubWebhookSecret is the shared secret GitHub uses to
 	// HMAC-sign webhook deliveries. Empty disables the

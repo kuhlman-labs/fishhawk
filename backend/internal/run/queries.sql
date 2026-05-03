@@ -3,8 +3,8 @@
 -- into ./db per the config in /backend/sqlc.yaml.
 
 -- name: CreateRun :one
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
 -- name: GetRun :one

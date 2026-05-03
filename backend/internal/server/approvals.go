@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -126,6 +127,26 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.writeApprovalAudit(r, stage, res.Approval)
+
+		// On approve, hand off to the orchestrator to dispatch
+		// the next stage (or transition the run to succeeded if
+		// this was the last stage). On reject we don't advance —
+		// the run is over and the orchestrator would no-op
+		// against the now-terminal state anyway.
+		if decision == approval.DecisionApprove && s.cfg.Orchestrator != nil {
+			if _, err := s.cfg.Orchestrator.Advance(r.Context(), stage.RunID); err != nil {
+				// Don't fail the approval: the gate did pass,
+				// the audit row is in place. Surface the
+				// orchestration failure in logs and let a
+				// follow-up call recover.
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+					"orchestrator advance failed",
+					slog.String("run_id", stage.RunID.String()),
+					slog.String("stage_id", stage.ID.String()),
+					slog.String("error", err.Error()),
+				)
+			}
+		}
 	}
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(stage))

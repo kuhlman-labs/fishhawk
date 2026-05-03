@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -424,6 +425,208 @@ func TestSubmitApproval_NilDeps_503(t *testing.T) {
 				t.Errorf("status = %d, want 503", w.Code)
 			}
 		})
+	}
+}
+
+// orchestratorRepo is a run.Repository that supports both the
+// approval handler (GetStage, TransitionStage) AND the orchestrator
+// (GetRun, ListStagesForRun, TransitionRun, TransitionStage). Built
+// inline so the orchestrator-on-approval tests can run end-to-end
+// without interface gymnastics.
+type orchestratorRepo struct {
+	mu            sync.Mutex
+	runs          map[uuid.UUID]*run.Run
+	stagesByID    map[uuid.UUID]*run.Stage
+	stagesByRunID map[uuid.UUID][]*run.Stage
+}
+
+func newOrchestratorRepo() *orchestratorRepo {
+	return &orchestratorRepo{
+		runs:          map[uuid.UUID]*run.Run{},
+		stagesByID:    map[uuid.UUID]*run.Stage{},
+		stagesByRunID: map[uuid.UUID][]*run.Stage{},
+	}
+}
+
+func (r *orchestratorRepo) seedRun() *run.Run {
+	id := uuid.New()
+	rr := &run.Run{
+		ID: id, Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI, State: run.StateRunning,
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	r.mu.Lock()
+	r.runs[id] = rr
+	r.mu.Unlock()
+	return rr
+}
+
+func (r *orchestratorRepo) seedStage(runID uuid.UUID, seq int, state run.StageState) *run.Stage {
+	st := &run.Stage{
+		ID: uuid.New(), RunID: runID, Sequence: seq,
+		Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		State: state, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	r.mu.Lock()
+	r.stagesByID[st.ID] = st
+	r.stagesByRunID[runID] = append(r.stagesByRunID[runID], st)
+	r.mu.Unlock()
+	return st
+}
+
+func (r *orchestratorRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rr, ok := r.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	return rr, nil
+}
+
+func (r *orchestratorRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stagesByRunID[runID], nil
+}
+
+func (r *orchestratorRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stagesByID[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	return s, nil
+}
+
+func (r *orchestratorRepo) TransitionRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rr := r.runs[id]
+	if rr == nil {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidRunTransition(rr.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "run", From: string(rr.State), To: string(to)}
+	}
+	rr.State = to
+	return rr, nil
+}
+
+func (r *orchestratorRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stagesByID[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidStageTransition(s.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
+	}
+	s.State = to
+	if c != nil {
+		s.FailureCategory = c.FailureCategory
+		s.FailureReason = c.FailureReason
+	}
+	return s, nil
+}
+
+// Unused.
+func (r *orchestratorRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *orchestratorRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *orchestratorRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
+func TestSubmitApproval_OrchestratorAdvancesNextStage(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	first := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	second := rr.seedStage(r.ID, 1, run.StageStatePending)
+
+	ar := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr} // no GitHub: dispatch skipped, transition still happens
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: ar,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+	})
+
+	w := submitApproval(t, s, first.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	// First stage transitioned by approval handler.
+	if first.State != run.StageStateSucceeded {
+		t.Errorf("first.State = %q, want succeeded", first.State)
+	}
+	// Second stage transitioned by orchestrator.
+	if second.State != run.StageStateDispatched {
+		t.Errorf("second.State = %q, want dispatched (orchestrator should have advanced)",
+			second.State)
+	}
+}
+
+func TestSubmitApproval_NoOrchestrator_LeavesNextStagePending(t *testing.T) {
+	// Without an orchestrator wired, the approval handler still
+	// completes the gate but the next stage stays in pending.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	first := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	second := rr.seedStage(r.ID, 1, run.StageStatePending)
+
+	ar := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: au,
+	})
+
+	w := submitApproval(t, s, first.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if first.State != run.StageStateSucceeded {
+		t.Errorf("first.State = %q", first.State)
+	}
+	if second.State != run.StageStatePending {
+		t.Errorf("second.State = %q, want pending (no orchestrator)", second.State)
+	}
+}
+
+func TestSubmitApproval_Reject_DoesntTriggerOrchestrator(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	first := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	second := rr.seedStage(r.ID, 1, run.StageStatePending)
+
+	ar := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
+		AuditRepo: au, Orchestrator: o,
+	})
+
+	w := submitApproval(t, s, first.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if first.State != run.StageStateFailed {
+		t.Errorf("first.State = %q, want failed", first.State)
+	}
+	if second.State != run.StageStatePending {
+		t.Errorf("second.State = %q, want pending (reject shouldn't advance)", second.State)
 	}
 }
 
