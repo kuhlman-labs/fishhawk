@@ -9,6 +9,16 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type Approval struct {
+	ID              uuid.UUID          `json:"id"`
+	StageID         uuid.UUID          `json:"stage_id"`
+	ApproverSubject string             `json:"approver_subject"`
+	Decision        string             `json:"decision"`
+	Comment         *string            `json:"comment"`
+	Surface         string             `json:"surface"`
+	SubmittedAt     pgtype.Timestamptz `json:"submitted_at"`
+}
+
 type Artifact struct {
 	ID            uuid.UUID          `json:"id"`
 	StageID       uuid.UUID          `json:"stage_id"`
