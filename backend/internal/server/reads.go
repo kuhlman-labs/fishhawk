@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -96,6 +97,125 @@ func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
 		items = append(items, toStageResponse(st))
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{"items": items})
+}
+
+// handleGetStage implements GET /v0/stages/{stage_id}. Returns
+// the canonical Stage shape from docs/api/v0.openapi.yaml.
+func (s *Server) handleGetStage(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RunRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
+			"stage endpoint requires a configured run repository", nil)
+		return
+	}
+	stageID, err := uuid.Parse(r.PathValue("stage_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"stage_id must be a valid UUID",
+			map[string]any{"field": "stage_id", "got": r.PathValue("stage_id")})
+		return
+	}
+	got, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "stage_not_found",
+				"no stage with that id", map[string]any{"stage_id": stageID.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, toStageResponse(got))
+}
+
+// artifactResponse mirrors docs/api/v0.openapi.yaml's `Artifact`
+// schema. Like the Stage / AuditEntry envelopes, this is built
+// explicitly rather than json-tagged on the internal type.
+type artifactResponse struct {
+	ID            uuid.UUID       `json:"id"`
+	StageID       uuid.UUID       `json:"stage_id"`
+	Kind          string          `json:"kind"`
+	SchemaVersion *string         `json:"schema_version"`
+	ContentHash   string          `json:"content_hash"`
+	Content       json.RawMessage `json:"content,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
+func toArtifactResponse(a *artifact.Artifact) artifactResponse {
+	return artifactResponse{
+		ID:            a.ID,
+		StageID:       a.StageID,
+		Kind:          string(a.Kind),
+		SchemaVersion: a.SchemaVersion,
+		ContentHash:   a.ContentHash,
+		Content:       a.Content,
+		CreatedAt:     a.CreatedAt,
+	}
+}
+
+// handleListStageArtifacts implements GET /v0/stages/{stage_id}/artifacts.
+// Returns artifacts ordered by created_at ascending. We don't 404
+// when the stage exists but has zero artifacts — empty list is the
+// honest answer.
+//
+// We do NOT verify the stage exists first; ListForStage returns an
+// empty slice for unknown IDs and the round-trip-saving wins. If
+// callers care about the distinction they can hit GET /stages/{id}.
+func (s *Server) handleListStageArtifacts(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.ArtifactRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "artifact_repo_unconfigured",
+			"artifacts endpoint requires a configured artifact repository", nil)
+		return
+	}
+	stageID, err := uuid.Parse(r.PathValue("stage_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"stage_id must be a valid UUID",
+			map[string]any{"field": "stage_id", "got": r.PathValue("stage_id")})
+		return
+	}
+	rows, err := s.cfg.ArtifactRepo.ListForStage(r.Context(), stageID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list artifacts failed", map[string]any{"error": err.Error()})
+		return
+	}
+	items := make([]artifactResponse, 0, len(rows))
+	for _, a := range rows {
+		items = append(items, toArtifactResponse(a))
+	}
+	s.writeJSON(w, r, http.StatusOK, map[string]any{"items": items})
+}
+
+// handleGetArtifact implements GET /v0/artifacts/{artifact_id}.
+// Returns the artifact (including content) or 404. v0.x will add a
+// "?include=metadata-only" query for clients that don't want the
+// content payload.
+func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.ArtifactRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "artifact_repo_unconfigured",
+			"artifact endpoint requires a configured artifact repository", nil)
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("artifact_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"artifact_id must be a valid UUID",
+			map[string]any{"field": "artifact_id", "got": r.PathValue("artifact_id")})
+		return
+	}
+	got, err := s.cfg.ArtifactRepo.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, artifact.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "artifact_not_found",
+				"no artifact with that id", map[string]any{"artifact_id": id.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get artifact failed", map[string]any{"error": err.Error()})
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, toArtifactResponse(got))
 }
 
 // auditEntryResponse mirrors docs/api/v0.openapi.yaml's

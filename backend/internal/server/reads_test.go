@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -143,6 +144,311 @@ func TestListRunStages_RepoError(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
 	req := httptest.NewRequest(http.MethodGet,
 		fmt.Sprintf("/v0/runs/%s/stages", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+// --- Stage detail handler ---
+
+func TestGetStage_HappyPath(t *testing.T) {
+	repo := newStagesRunRepo()
+	runID := uuid.New()
+	now := time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)
+	stageID := uuid.New()
+	repo.stages[runID] = []*run.Stage{{
+		ID: stageID, RunID: runID, Sequence: 0, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		State: run.StageStateAwaitingApproval, CreatedAt: now, UpdatedAt: now,
+	}}
+	// stagesRunRepo's GetStage isn't implemented; extend the
+	// fake by direct map lookup. Build a small adapter.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s", stageID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var got stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != stageID {
+		t.Errorf("ID = %s", got.ID)
+	}
+	if got.State != string(run.StageStateAwaitingApproval) {
+		t.Errorf("State = %q", got.State)
+	}
+}
+
+// stageGetRepo extends stagesRunRepo with a working GetStage so the
+// handler test can resolve stages.
+type stageGetRepo struct {
+	*stagesRunRepo
+}
+
+func (r *stageGetRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	for _, list := range r.stages {
+		for _, st := range list {
+			if st.ID == id {
+				return st, nil
+			}
+		}
+	}
+	return nil, run.ErrNotFound
+}
+
+func TestGetStage_NotFound(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: newStagesRunRepo()}})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestGetStage_BadUUID(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: newStagesRunRepo()}})
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/not-a-uuid", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestGetStage_NilRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+// --- Artifact handlers ---
+
+// fakeArtifactRepo is the in-memory artifact.Repository for handler
+// tests. The other Repository methods (Create, GetByHash) aren't
+// touched by the read handlers, so they return "not used" errors.
+type fakeArtifactRepo struct {
+	mu       sync.Mutex
+	all      []*artifact.Artifact
+	listErr  error
+	getErr   error
+	notFound bool
+}
+
+func newFakeArtifactRepo() *fakeArtifactRepo {
+	return &fakeArtifactRepo{}
+}
+
+func (f *fakeArtifactRepo) Create(_ context.Context, _ artifact.CreateParams) (*artifact.Artifact, error) {
+	return nil, errors.New("not used")
+}
+
+func (f *fakeArtifactRepo) Get(_ context.Context, id uuid.UUID) (*artifact.Artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if f.notFound {
+		return nil, artifact.ErrNotFound
+	}
+	for _, a := range f.all {
+		if a.ID == id {
+			return a, nil
+		}
+	}
+	return nil, artifact.ErrNotFound
+}
+
+func (f *fakeArtifactRepo) ListForStage(_ context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var out []*artifact.Artifact
+	for _, a := range f.all {
+		if a.StageID == stageID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeArtifactRepo) GetByHash(_ context.Context, _ uuid.UUID, _ string) (*artifact.Artifact, error) {
+	return nil, errors.New("not used")
+}
+
+func samplePlanArtifact(stageID uuid.UUID) *artifact.Artifact {
+	v := "standard_v1"
+	return &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       stageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       json.RawMessage(`{"plan_version":"standard_v1"}`),
+		ContentHash:   "abc123",
+		CreatedAt:     time.Now().UTC(),
+	}
+}
+
+func TestListStageArtifacts_HappyPath(t *testing.T) {
+	repo := newFakeArtifactRepo()
+	stageID := uuid.New()
+	repo.all = []*artifact.Artifact{samplePlanArtifact(stageID), samplePlanArtifact(stageID)}
+	s := New(Config{Addr: "127.0.0.1:0", ArtifactRepo: repo})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/artifacts", stageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got struct {
+		Items []artifactResponse `json:"items"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if len(got.Items) != 2 {
+		t.Errorf("items = %d, want 2", len(got.Items))
+	}
+}
+
+func TestListStageArtifacts_EmptyForUnknownStage(t *testing.T) {
+	// We don't 404 — empty list is the honest answer (stage might
+	// exist but have produced nothing yet).
+	repo := newFakeArtifactRepo()
+	s := New(Config{Addr: "127.0.0.1:0", ArtifactRepo: repo})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/artifacts", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+}
+
+func TestListStageArtifacts_BadUUID(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", ArtifactRepo: newFakeArtifactRepo()})
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/not-a-uuid/artifacts", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestListStageArtifacts_NilRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/artifacts", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+func TestListStageArtifacts_RepoError(t *testing.T) {
+	repo := newFakeArtifactRepo()
+	repo.listErr = errors.New("db down")
+	s := New(Config{Addr: "127.0.0.1:0", ArtifactRepo: repo})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/artifacts", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+func TestGetArtifact_HappyPath(t *testing.T) {
+	repo := newFakeArtifactRepo()
+	a := samplePlanArtifact(uuid.New())
+	repo.all = []*artifact.Artifact{a}
+	s := New(Config{Addr: "127.0.0.1:0", ArtifactRepo: repo})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/artifacts/%s", a.ID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got artifactResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != a.ID {
+		t.Errorf("ID = %s", got.ID)
+	}
+	if got.Kind != string(artifact.KindPlan) {
+		t.Errorf("Kind = %q", got.Kind)
+	}
+	if got.SchemaVersion == nil || *got.SchemaVersion != "standard_v1" {
+		t.Errorf("SchemaVersion = %v", got.SchemaVersion)
+	}
+	if !strings.Contains(string(got.Content), "standard_v1") {
+		t.Errorf("Content not preserved: %s", got.Content)
+	}
+}
+
+func TestGetArtifact_NotFound(t *testing.T) {
+	repo := newFakeArtifactRepo()
+	repo.notFound = true
+	s := New(Config{Addr: "127.0.0.1:0", ArtifactRepo: repo})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/artifacts/%s", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"artifact_not_found"`) {
+		t.Errorf("body missing artifact_not_found: %s", w.Body.String())
+	}
+}
+
+func TestGetArtifact_BadUUID(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", ArtifactRepo: newFakeArtifactRepo()})
+	req := httptest.NewRequest(http.MethodGet, "/v0/artifacts/not-a-uuid", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestGetArtifact_NilRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/artifacts/%s", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+func TestGetArtifact_RepoError(t *testing.T) {
+	repo := newFakeArtifactRepo()
+	repo.getErr = errors.New("db down")
+	s := New(Config{Addr: "127.0.0.1:0", ArtifactRepo: repo})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/artifacts/%s", uuid.New()), nil)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusInternalServerError {
