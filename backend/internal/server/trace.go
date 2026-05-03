@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
@@ -165,12 +167,63 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Advance the stage so the approval handler can act on it.
+	// The state machine requires dispatched → running →
+	// awaiting_approval; we walk both transitions here because
+	// the runner's trace upload IS the "started executing"
+	// signal in v0 (the runner doesn't separately check in).
+	//
+	// v0 hardcodes every agent stage as gated (per MVP_SPEC
+	// §4.2's example); the gateless case (running → succeeded
+	// directly) lands when the workflow spec carries a
+	// per-stage `gates: []` signal.
+	//
+	// We only attempt transitions when the RunRepo is wired —
+	// trace upload doesn't strictly require it (signing +
+	// tracestore are the load-bearing deps), so a deployment
+	// that's not yet on Postgres still accepts uploads.
+	//
+	// Failures here are logged but don't unwind the upload: the
+	// trace is already stored + audited; a stuck stage is
+	// surface-able via GET /v0/runs/{id}/stages and recoverable
+	// via a follow-up call once the orchestrator wraps this.
+	if s.cfg.RunRepo != nil {
+		s.advanceStageAfterTrace(r, runID, stageID)
+	}
+
 	s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
 		RunID:       runID,
 		StageID:     stageID,
 		Variant:     string(variant),
 		ContentHash: contentHash,
 	})
+}
+
+// advanceStageAfterTrace walks dispatched → running →
+// awaiting_approval. Each step is idempotent (the state machine
+// allows same-state re-application), so a redelivered trace upload
+// or a parallel transition path doesn't fault. Errors at either
+// step log but don't unwind.
+func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUID) {
+	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
+		run.StageStateRunning, nil); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"trace upload: transition to running failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
+		run.StageStateAwaitingApproval, nil); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"trace upload: transition to awaiting_approval failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 func sha256Hex(b []byte) string {

@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
@@ -406,6 +407,68 @@ func TestShipTrace_NilDepsConfigured(t *testing.T) {
 				t.Errorf("status = %d, want 503", w.Code)
 			}
 		})
+	}
+}
+
+func TestShipTrace_TransitionsStageToAwaitingApproval(t *testing.T) {
+	// Wire a RunRepo seeded with a stage in dispatched, ship a
+	// trace, and confirm the stage advanced to awaiting_approval
+	// so the approval handler can act on it next.
+	s, sf, _, _ := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	s.cfg.RunRepo = rr // inject after construction; New is the only setup we needed
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if rr.stages[stage.ID].State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval",
+			rr.stages[stage.ID].State)
+	}
+	// Two-step walk: dispatched → running → awaiting_approval.
+	if len(rr.transitions) != 2 {
+		t.Fatalf("transitions = %d, want 2:\n%+v", len(rr.transitions), rr.transitions)
+	}
+	if rr.transitions[0].To != run.StageStateRunning ||
+		rr.transitions[1].To != run.StageStateAwaitingApproval {
+		t.Errorf("transitions = %+v, want [running, awaiting_approval]", rr.transitions)
+	}
+}
+
+func TestShipTrace_TransitionFailureDoesntUnwindUpload(t *testing.T) {
+	// If the post-upload transition errors (e.g., stage already
+	// terminal because of a concurrent path), we log + return 202
+	// — the trace itself is already stored and audited. A stuck
+	// stage is surface-able via GET /v0/runs/{id}/stages.
+	s, sf, _, _ := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	rr.transitionErr = errors.New("state machine refusal")
+	stage := rr.seedStage(run.StageStateDispatched)
+	s.cfg.RunRepo = rr
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	if w.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want 202 (transition failure must not unwind)", w.Code)
+	}
+}
+
+func TestShipTrace_NoRunRepo_StillAccepts(t *testing.T) {
+	// A backend deployed without a Postgres run repository should
+	// still accept trace uploads; only the post-upload transition
+	// gets skipped. This keeps the trace endpoint useful for
+	// minimal smoke deployments before run-state is wired.
+	s, sf, _, _ := newTraceServer(t)
+	// Don't wire RunRepo.
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+	w := shipRequest(t, s, runID, stageID, "raw", priv, []byte("b"), "")
+	if w.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want 202", w.Code)
 	}
 }
 
