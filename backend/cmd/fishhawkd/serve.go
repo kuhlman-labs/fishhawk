@@ -18,6 +18,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -143,7 +144,8 @@ func runServe(args []string, logSink io.Writer) int {
 			return exitFailure
 		}
 		cfg.GitHubTokens = githubapp.NewCachedProvider(githubapp.NewClient(signer))
-		logger.Info("github app installation-token provider configured",
+		cfg.GitHub = githubclient.New(cfg.GitHubTokens)
+		logger.Info("github app + REST client configured",
 			slog.Int64("app_id", appID))
 	} else {
 		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
