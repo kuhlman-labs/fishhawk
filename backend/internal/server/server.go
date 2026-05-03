@@ -67,6 +67,12 @@ type Config struct {
 	// disables the /webhooks/github endpoint.
 	WebhookDeliveries webhook.DeliveryStore
 
+	// WebhookDispatcher translates accepted webhook deliveries
+	// into Run records and workflow_dispatch firings. nil leaves
+	// the receiver in "log + 202" mode (handy for early dev
+	// against a backend that hasn't been wired to GitHub yet).
+	WebhookDispatcher *webhook.Dispatcher
+
 	// GitHubTokens issues per-installation tokens for backend-side
 	// GitHub interactions (workflow_dispatch, fetching workflow
 	// spec contents, opening PRs). nil disables anything that

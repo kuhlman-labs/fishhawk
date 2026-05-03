@@ -118,6 +118,22 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("FISHHAWKD_GITHUB_WEBHOOK_SECRET not set; /webhooks/github will respond 503")
 	}
 
+	// Webhook dispatcher requires both the GitHub REST client (for
+	// fetching the workflow spec + firing workflow_dispatch) and a
+	// run repository (for creating Run records). Without either,
+	// the webhook receiver still accepts deliveries but they
+	// don't produce runs — useful for early dev against a backend
+	// that hasn't been GitHub-wired yet.
+	if cfg.GitHub != nil && cfg.RunRepo != nil && cfg.AuditRepo != nil {
+		cfg.WebhookDispatcher = &webhook.Dispatcher{
+			GitHub: cfg.GitHub,
+			Runs:   cfg.RunRepo,
+			Audit:  cfg.AuditRepo,
+			Logger: logger,
+		}
+		logger.Info("webhook dispatcher configured")
+	}
+
 	// GitHub App installation-token provider. Both ID and key file
 	// must be set; either alone is a misconfiguration. Currently
 	// no handlers consume cfg.GitHubTokens — the dispatcher (#109)

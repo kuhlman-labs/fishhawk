@@ -154,6 +154,17 @@ type Event struct {
 	// the event. Empty when the payload doesn't include one.
 	Sender string
 
+	// SenderType is the kind of actor — typically "User" or "Bot".
+	// Used to gate dispatch on bot-authored events without parsing
+	// login suffixes.
+	SenderType string
+
+	// InstallationID identifies the GitHub App installation the
+	// event belongs to. Required for any backend → GitHub action
+	// (fetching the workflow spec, firing workflow_dispatch).
+	// Zero when the event isn't installation-scoped.
+	InstallationID int64
+
 	// RawBody is the original payload, kept for downstream handlers
 	// that need event-specific fields not surfaced here.
 	RawBody []byte
@@ -169,7 +180,11 @@ type minimal struct {
 	} `json:"repository,omitempty"`
 	Sender struct {
 		Login string `json:"login,omitempty"`
+		Type  string `json:"type,omitempty"`
 	} `json:"sender,omitempty"`
+	Installation struct {
+		ID int64 `json:"id,omitempty"`
+	} `json:"installation,omitempty"`
 }
 
 // ParseEvent extracts the headers and decodes the common fields
@@ -198,6 +213,8 @@ func ParseEvent(eventType, deliveryID string, body []byte) (Event, error) {
 		ev.Action = m.Action
 		ev.Repo = m.Repository.FullName
 		ev.Sender = m.Sender.Login
+		ev.SenderType = m.Sender.Type
+		ev.InstallationID = m.Installation.ID
 	}
 	return ev, nil
 }
