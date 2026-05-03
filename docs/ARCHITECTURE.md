@@ -157,6 +157,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | HTTP API contract (endpoints, auth, errors) | `docs/api/v0.openapi.yaml` (source of truth) + `docs/api/v0.md` (companion) |
 | Trace bundle wire format (`*.jsonl.gz`) | `runner/internal/bundle/bundle.go` (pack + open) — implements ADR-007 (#71) |
 | Runner → backend trace upload | `runner/internal/upload/` (HTTP client, retries, signing) — wired into runner main behind `--upload-trace` |
+| CLI → backend HTTP client | `cli/internal/httpclient/` (typed wrappers); CLI subcommands in `cli/cmd/fishhawk/` |
 | Constraint evaluation (forbidden_paths, max_files_changed, required_outcomes) | `runner/internal/constraint/constraint.go` (post-hoc, runner-side) |
 | HTTP middleware order / context keys | `backend/internal/server/middleware.go` |
 | Run CRUD handlers (POST/GET/list/cancel) | `backend/internal/server/runs.go`; wired in `backend/cmd/fishhawkd/serve.go` from `FISHHAWKD_DATABASE_URL` |
