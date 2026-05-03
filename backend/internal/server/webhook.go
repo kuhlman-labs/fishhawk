@@ -91,9 +91,19 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		slog.String("sender", ev.Sender),
 	)
 
-	// Run dispatch from webhook events lands in a follow-up PR — it
-	// needs a GitHub API client to resolve `.fishhawk/workflows.yaml`'s
-	// SHA at the event's repo + ref. For now we acknowledge the
-	// delivery and stop.
+	// Dispatch the event when a dispatcher is configured. Skips
+	// (no installation id, unrecognized event, bot author, etc.)
+	// are the dispatcher's responsibility — Handle returns nil
+	// for the non-transient cases and we acknowledge with 202.
+	// A non-nil error here is a transient infrastructure failure;
+	// 5xx tells GitHub to retry.
+	if s.cfg.WebhookDispatcher != nil {
+		if err := s.cfg.WebhookDispatcher.Handle(r.Context(), ev); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"webhook dispatch failed", map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }
