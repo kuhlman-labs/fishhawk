@@ -1,0 +1,73 @@
+# Fishhawk self-execution workflow.
+#
+# This is the customer-side GitHub Actions workflow that backend
+# fires `workflow_dispatch` against (per
+# backend/internal/webhook/dispatcher.go's DefaultActionsWorkflowFile
+# = "fishhawk.yml"). When a Fishhawk-labeled issue lands or a
+# customer comments `/fishhawk run`, the backend creates a Run +
+# Stages, then dispatches this workflow with the run/stage UUIDs
+# as inputs.
+#
+# Per docs/METHODOLOGY.md, starting Day 21 every change to this
+# repository must flow through Fishhawk itself — this workflow IS
+# the path. Until Day 21 it's also a useful smoke test of the
+# end-to-end demo loop.
+#
+# References:
+#   - runner/action.yml — the composite action this workflow calls
+#   - backend/internal/webhook/dispatcher.go — what fires this
+#   - docs/MVP_SPEC.md §5.2 — the lifecycle this implements
+name: Fishhawk
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Workflow run UUID (supplied by backend dispatcher)'
+        required: true
+        type: string
+      stage_id:
+        description: 'Stage UUID for this dispatch'
+        required: true
+        type: string
+      workflow_id:
+        description: 'Workflow ID from .fishhawk/workflows.yaml (e.g. feature_change)'
+        required: true
+        type: string
+      stage:
+        description: 'Stage executor ref (e.g. claude-code) — informational'
+        required: false
+        type: string
+        default: claude-code
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: Run Fishhawk stage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # The runner action below is referenced by `@main` for
+      # self-execution on this repo until E5.7 (#54) cuts a
+      # versioned tag. External customers should pin a tag once
+      # one is published.
+      - name: Run Fishhawk runner
+        uses: ./runner
+        with:
+          run-id: ${{ inputs.run_id }}
+          stage-id: ${{ inputs.stage_id }}
+          backend-url: ${{ vars.FISHHAWK_BACKEND_URL || 'http://localhost:8080' }}
+          workflow: ${{ inputs.workflow_id }}
+          stage: ${{ inputs.stage }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          upload-trace: 'true'
+          variant: raw
+          # prompt-file unset → runner exits 0 after dispatch-path
+          # probe; the rest of the loop runs (signing key, trace
+          # upload, audit, orchestrator) but no agent invocation.
+          # E3.12 (#128) wires per-stage prompt construction so
+          # the runner actually calls Claude Code.
