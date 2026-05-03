@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -73,6 +74,12 @@ type Config struct {
 	// it directly today; the webhook dispatcher (#109) is the
 	// first planned reader.
 	GitHubTokens githubapp.TokenProvider
+
+	// GitHub is the typed REST wrapper consumers use for repo
+	// operations (fetching the workflow spec, firing
+	// workflow_dispatch). Built on top of GitHubTokens. Nil when
+	// GitHubTokens is nil.
+	GitHub *githubclient.Client
 }
 
 // Server wraps an http.Server with the routes and middleware stack
