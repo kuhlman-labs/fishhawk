@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -254,10 +256,16 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	}
 
 	// Step 3: confirm the requested workflow_id exists.
-	if _, ok := parsed.Workflows[m.WorkflowID]; !ok {
+	workflow, ok := parsed.Workflows[m.WorkflowID]
+	if !ok {
 		d.writeSpecRejectionAudit(ctx, ev, m, specFile.SHA,
 			fmt.Errorf("workflow_id %q not defined in .fishhawk/workflows.yaml",
 				m.WorkflowID), now)
+		return nil
+	}
+	if len(workflow.Stages) == 0 {
+		d.writeSpecRejectionAudit(ctx, ev, m, specFile.SHA,
+			fmt.Errorf("workflow_id %q has no stages", m.WorkflowID), now)
 		return nil
 	}
 
@@ -276,21 +284,53 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		return fmt.Errorf("dispatcher: create run: %w", err)
 	}
 
-	// Step 5: fire workflow_dispatch on the customer-side Actions
-	// workflow. Inputs carry run_id + workflow_id so the runner
-	// action can call /v0/runs/{run_id}/signing-key with a known
-	// identity.
+	// Step 5: create one Stage row per stage definition in the
+	// spec. All stages start in pending; the first transitions to
+	// dispatched when we fire workflow_dispatch below. Subsequent
+	// stages move forward as the runner reports completion through
+	// the trace upload + state-machine endpoints.
+	stages, err := d.createStages(ctx, created.ID, workflow.Stages)
+	if err != nil {
+		return fmt.Errorf("dispatcher: create stages: %w", err)
+	}
+
+	// Step 6: fire workflow_dispatch on the customer-side Actions
+	// workflow. Inputs carry run_id, stage_id, and workflow_id so
+	// the runner action can call /v0/runs/{run_id}/signing-key with
+	// a known identity AND the trace endpoint with a stage UUID.
 	actionsFile := d.ActionsWorkflowFile
 	if actionsFile == "" {
 		actionsFile = DefaultActionsWorkflowFile
 	}
+	firstStage := stages[0]
 	dispatchErr := d.GitHub.DispatchWorkflow(ctx, ev.InstallationID, repo,
 		actionsFile, ref, githubclient.DispatchInputs{
 			"run_id":      created.ID.String(),
+			"stage_id":    firstStage.ID.String(),
 			"workflow_id": m.WorkflowID,
+			"stage":       firstStage.ExecutorRef, // workflow-spec stage name vs stage UUID
 		})
 
-	// Step 6: audit. Whether dispatch succeeded or not, this
+	// Step 7: transition the first stage to dispatched once the
+	// dispatch call returned (regardless of success — we tried to
+	// move it, the audit row records the outcome). Skip on failure
+	// so the next dispatch attempt sees the stage in pending.
+	if dispatchErr == nil {
+		if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,
+			run.StageStateDispatched, nil); err != nil {
+			// Don't fail the request — the stage is already
+			// associated with the run, the runner will
+			// eventually pick it up.
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"transition stage to dispatched failed",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("stage_id", firstStage.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+
+	// Step 8: audit. Whether dispatch succeeded or not, this
 	// delivery produced a Run row, so the audit log gets an entry
 	// pinning it to the trigger.
 	d.writeDispatchAudit(ctx, ev, m, created, specFile.SHA, dispatchErr, now)
@@ -394,6 +434,51 @@ func (d *Dispatcher) writeDispatchAudit(ctx context.Context, ev Event, m Match,
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// createStages translates the workflow spec's stage definitions
+// into Stage rows (in StagePending). Returns the created stages
+// in spec order so callers can address the first one.
+//
+// Mapping decisions:
+//   - sequence is the position in the spec's stages array (0-based).
+//   - executorKind comes from spec.Executor: agent → ExecutorAgent,
+//     human → ExecutorHuman.
+//   - executorRef is the agent name for agent stages and a
+//     conventional "human" string for human stages — the field is
+//     non-nullable in the DB schema, and we never read it for human
+//     stages. v0.x can swap to using the role name once approvals
+//     are wired (E3.5 / #45).
+func (d *Dispatcher) createStages(ctx context.Context, runID uuid.UUID, defs []spec.Stage) ([]*run.Stage, error) {
+	out := make([]*run.Stage, 0, len(defs))
+	for i, def := range defs {
+		execKind, execRef := mapExecutor(def)
+		stage, err := d.Runs.CreateStage(ctx, run.CreateStageParams{
+			RunID:        runID,
+			Sequence:     i,
+			Type:         run.StageType(def.Type),
+			ExecutorKind: execKind,
+			ExecutorRef:  execRef,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create stage %d (%s): %w", i, def.ID, err)
+		}
+		out = append(out, stage)
+	}
+	return out, nil
+}
+
+// mapExecutor projects a spec.Executor onto the run-package
+// executor enum. Per the schema, exactly one of Agent / Human is
+// set; we trust that here rather than reasserting it.
+func mapExecutor(s spec.Stage) (run.ExecutorKind, string) {
+	if s.Executor.Human {
+		// Stage is human-driven. ExecutorRef is informational
+		// only for human stages; the run state machine doesn't
+		// dispatch them to a runner.
+		return run.ExecutorHuman, "human"
+	}
+	return run.ExecutorAgent, s.Executor.Agent
 }
 
 // parseRepo splits "owner/name" into a githubclient.RepoRef. Empty

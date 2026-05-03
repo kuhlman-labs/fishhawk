@@ -165,7 +165,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | Signing-key issuance handler | `backend/internal/server/signing.go` wraps `signing.Repository.Issue`; OIDC auth pending (#112) |
 | Trace upload handler | `backend/internal/server/trace.go`; verifies signature, calls `tracestore.Put` + `audit.AppendChained`. S3 wired in `serve.go` from `FISHHAWKD_S3_BUCKET`/`_REGION`/`_ENDPOINT`. |
 | GitHub webhook receiver | `backend/internal/webhook/` (HMAC + dedup) and `backend/internal/server/webhook.go`; secret from `FISHHAWKD_GITHUB_WEBHOOK_SECRET` |
-| Webhook event dispatcher (events → runs) | `backend/internal/webhook/dispatcher.go` (`MatchEvent` pure + `Dispatcher.Handle` orchestrator); wired via `cfg.WebhookDispatcher` |
+| Webhook event dispatcher (events → runs + stages) | `backend/internal/webhook/dispatcher.go` (`MatchEvent` pure + `Dispatcher.Handle` orchestrator); wired via `cfg.WebhookDispatcher`. Creates one `Stage` row per spec-stage definition; first stage transitions to `dispatched` on workflow_dispatch. |
 | GitHub App installation tokens | `backend/internal/githubapp/` (RS256 signer + client + TTL cache + telemetry); App ID + key file from `FISHHAWKD_GITHUB_APP_ID` / `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE` |
 | GitHub REST operations (read workflow spec, fire workflow_dispatch) | `backend/internal/githubclient/`; consumes `githubapp.TokenProvider` |
 | How a new Go module gets added | `CLAUDE.md` "Adding a Go module" |

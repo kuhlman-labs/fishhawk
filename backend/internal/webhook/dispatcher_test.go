@@ -197,12 +197,23 @@ func (s *stubGitHub) DispatchWorkflow(_ context.Context, _ int64,
 	return s.dispatchErr
 }
 
-// stubRuns is a tiny in-memory run.Repository covering only the
-// methods Dispatcher.Handle uses (CreateRun).
+// stubRuns is a tiny in-memory run.Repository covering the
+// methods Dispatcher.Handle uses: CreateRun, CreateStage,
+// TransitionStage. Other methods stay "not used" so accidental
+// reads in the dispatcher path are loud.
 type stubRuns struct {
-	mu        sync.Mutex
-	created   []*run.Run
-	createErr error
+	mu             sync.Mutex
+	created        []*run.Run
+	createdStages  []*run.Stage
+	transitions    []stubStageTransition
+	createErr      error
+	createStageErr error
+	transitionErr  error
+}
+
+type stubStageTransition struct {
+	StageID uuid.UUID
+	To      run.StageState
 }
 
 func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run, error) {
@@ -226,6 +237,43 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 	return r, nil
 }
 
+func (s *stubRuns) CreateStage(_ context.Context, p run.CreateStageParams) (*run.Stage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.createStageErr != nil {
+		return nil, s.createStageErr
+	}
+	st := &run.Stage{
+		ID:           uuid.New(),
+		RunID:        p.RunID,
+		Sequence:     p.Sequence,
+		Type:         p.Type,
+		ExecutorKind: p.ExecutorKind,
+		ExecutorRef:  p.ExecutorRef,
+		State:        run.StageStatePending,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+	}
+	s.createdStages = append(s.createdStages, st)
+	return st, nil
+}
+
+func (s *stubRuns) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.transitionErr != nil {
+		return nil, s.transitionErr
+	}
+	s.transitions = append(s.transitions, stubStageTransition{StageID: id, To: to})
+	for _, st := range s.createdStages {
+		if st.ID == id {
+			st.State = to
+			return st, nil
+		}
+	}
+	return nil, run.ErrNotFound
+}
+
 func (s *stubRuns) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
@@ -235,16 +283,10 @@ func (s *stubRuns) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, er
 func (s *stubRuns) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
-func (s *stubRuns) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
-	return nil, errors.New("not used")
-}
 func (s *stubRuns) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
 func (s *stubRuns) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
-}
-func (s *stubRuns) TransitionStage(context.Context, uuid.UUID, run.StageState, *run.StageCompletion) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
 
@@ -394,6 +436,232 @@ func TestHandle_HappyPath_CreatesRunAndDispatches(t *testing.T) {
 	}
 	if !strings.Contains(string(au.appended[0].Payload), `"outcome":"dispatched"`) {
 		t.Errorf("audit payload outcome wrong: %s", au.appended[0].Payload)
+	}
+}
+
+func TestHandle_HappyPath_CreatesStagesAndDispatchesFirst(t *testing.T) {
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// One stage created (the validSpec defines plan only).
+	if len(runs.createdStages) != 1 {
+		t.Fatalf("stages = %d, want 1", len(runs.createdStages))
+	}
+	st := runs.createdStages[0]
+	if st.Sequence != 0 {
+		t.Errorf("Sequence = %d, want 0", st.Sequence)
+	}
+	if st.Type != run.StageTypePlan {
+		t.Errorf("Type = %q, want plan", st.Type)
+	}
+	if st.ExecutorKind != run.ExecutorAgent || st.ExecutorRef != "claude-code" {
+		t.Errorf("Executor = %q/%q", st.ExecutorKind, st.ExecutorRef)
+	}
+
+	// dispatch_inputs carry the stage UUID.
+	if gh.dispatchCall.args["stage_id"] != st.ID.String() {
+		t.Errorf("stage_id input = %q, want %q",
+			gh.dispatchCall.args["stage_id"], st.ID)
+	}
+	if gh.dispatchCall.args["run_id"] == "" {
+		t.Error("run_id input missing")
+	}
+
+	// The first stage transitioned to dispatched after workflow_dispatch.
+	if len(runs.transitions) != 1 {
+		t.Fatalf("transitions = %d, want 1", len(runs.transitions))
+	}
+	tr := runs.transitions[0]
+	if tr.StageID != st.ID {
+		t.Errorf("transitioned stage = %s, want %s", tr.StageID, st.ID)
+	}
+	if tr.To != run.StageStateDispatched {
+		t.Errorf("transition to = %q, want dispatched", tr.To)
+	}
+}
+
+func TestHandle_MultiStageSpec_OnlyFirstDispatched(t *testing.T) {
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.specContent = []byte(`version: "0.1"
+roles:
+  tech_lead:
+    members: ["@x"]
+workflows:
+  feature_change:
+    description: multi-stage
+    stages:
+      - id: plan
+        type: plan
+        executor: {agent: claude-code}
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers: {any_of: [tech_lead]}
+            sla: 4_business_hours
+      - id: implement
+        type: implement
+        executor: {agent: claude-code}
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 30
+      - id: review
+        type: review
+        executor: {human: true}
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers: {any_of: [tech_lead]}
+`)
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// All three stages exist.
+	if len(runs.createdStages) != 3 {
+		t.Fatalf("stages = %d, want 3", len(runs.createdStages))
+	}
+	// Sequence 0 is plan (agent), 1 is implement (agent), 2 is review (human).
+	want := []struct {
+		seq      int
+		typ      run.StageType
+		execKind run.ExecutorKind
+	}{
+		{0, run.StageTypePlan, run.ExecutorAgent},
+		{1, run.StageTypeImplement, run.ExecutorAgent},
+		{2, run.StageTypeReview, run.ExecutorHuman},
+	}
+	for i, w := range want {
+		got := runs.createdStages[i]
+		if got.Sequence != w.seq || got.Type != w.typ || got.ExecutorKind != w.execKind {
+			t.Errorf("stage %d: got (seq=%d type=%q kind=%q), want (seq=%d type=%q kind=%q)",
+				i, got.Sequence, got.Type, got.ExecutorKind, w.seq, w.typ, w.execKind)
+		}
+	}
+
+	// Only the FIRST stage was transitioned.
+	if len(runs.transitions) != 1 {
+		t.Errorf("transitions = %d, want 1 (only first stage)", len(runs.transitions))
+	}
+	if runs.transitions[0].StageID != runs.createdStages[0].ID {
+		t.Errorf("transitioned stage = %s, want first stage %s",
+			runs.transitions[0].StageID, runs.createdStages[0].ID)
+	}
+}
+
+func TestHandle_HumanStage_ExecutorRefIsConventional(t *testing.T) {
+	// Two-stage spec: implement (agent) → review (human). The review
+	// stage's from_stage reference must resolve, so we keep both
+	// stages and assert the human one's executor mapping.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.specContent = []byte(`version: "0.1"
+roles:
+  tech_lead:
+    members: ["@x"]
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor: {agent: claude-code}
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 30
+      - id: review
+        type: review
+        executor: {human: true}
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers: {any_of: [tech_lead]}
+`)
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.createdStages) != 2 {
+		t.Fatalf("stages = %d, want 2", len(runs.createdStages))
+	}
+	human := runs.createdStages[1]
+	if human.ExecutorKind != run.ExecutorHuman || human.ExecutorRef != "human" {
+		t.Errorf("human stage executor = %q/%q, want human/human",
+			human.ExecutorKind, human.ExecutorRef)
+	}
+}
+
+func TestHandle_StageCreateError_ReturnsErrorForRetry(t *testing.T) {
+	d, _, runs, au := newDispatcherWithStubs(t)
+	runs.createStageErr = errors.New("db down")
+
+	err := d.Handle(context.Background(), issueLabeledEvent(t))
+	if err == nil {
+		t.Fatal("expected error on stage create failure")
+	}
+	// Run was created but stages weren't — that's a transient state
+	// the next retry will fix (CreateStage is idempotent enough at
+	// the SQL layer that the retry repopulates).
+	if len(runs.created) != 1 {
+		t.Errorf("run created = %d, want 1", len(runs.created))
+	}
+	// No audit row because we didn't reach the dispatch step.
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0", len(au.appended))
+	}
+}
+
+func TestHandle_TransitionFailure_DoesntFailDispatch(t *testing.T) {
+	// The dispatch already fired; failing to transition the stage
+	// to dispatched is a non-fatal state-machine issue we log but
+	// don't unwind on. The runner picks the stage up either way.
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	runs.transitionErr = errors.New("state machine refusal")
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if gh.dispatchCalls != 1 {
+		t.Errorf("dispatch calls = %d, want 1 (transition error mustn't unwind)", gh.dispatchCalls)
+	}
+	// Audit still records the dispatch outcome.
+	if len(au.appended) != 1 {
+		t.Errorf("audit entries = %d, want 1", len(au.appended))
+	}
+}
+
+func TestHandle_EmptyStagesSpec_NoRun(t *testing.T) {
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	// A workflow with no stages — schema requires at least one,
+	// but defense-in-depth: the dispatcher refuses rather than
+	// dispatching with no work to do.
+	gh.specContent = []byte(`version: "0.1"
+workflows:
+  feature_change:
+    description: empty
+    stages: []
+`)
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("created run despite empty stages: %d", len(runs.created))
 	}
 }
 
