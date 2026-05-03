@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -61,6 +62,11 @@ type Config struct {
 	// ApprovalRepo persists gate decisions. Wired by
 	// POST /v0/stages/{id}/approvals; nil leaves it 503.
 	ApprovalRepo approval.Repository
+
+	// ArtifactRepo persists typed stage outputs (plans, PR refs).
+	// Wired by GET /v0/stages/{id}/artifacts and
+	// GET /v0/artifacts/{id}; nil leaves both 503.
+	ArtifactRepo artifact.Repository
 
 	// GitHubWebhookSecret is the shared secret GitHub uses to
 	// HMAC-sign webhook deliveries. Empty disables the
