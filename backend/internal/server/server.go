@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -56,6 +57,10 @@ type Config struct {
 	// state change. Wired by the trace-upload handler; nil leaves
 	// it 503.
 	AuditRepo audit.Repository
+
+	// ApprovalRepo persists gate decisions. Wired by
+	// POST /v0/stages/{id}/approvals; nil leaves it 503.
+	ApprovalRepo approval.Repository
 
 	// GitHubWebhookSecret is the shared secret GitHub uses to
 	// HMAC-sign webhook deliveries. Empty disables the

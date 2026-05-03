@@ -21,6 +21,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", s.handleListRunAudit)
 	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", s.handleIssueSigningKey)
 	mux.HandleFunc("POST /v0/runs/{run_id}/trace", s.handleShipTrace)
+	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", s.handleSubmitApproval)
 	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
 }
 

@@ -1,0 +1,461 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+)
+
+// fakeApprovalRepo is the in-memory approval.Repository for handler
+// tests. It enforces the same idempotency contract as the postgres
+// adapter: a re-submission for the same (stage_id, approver_subject)
+// returns the existing row with Inserted=false.
+type fakeApprovalRepo struct {
+	mu        sync.Mutex
+	all       []*approval.Approval
+	submitErr error
+}
+
+func newFakeApprovalRepo() *fakeApprovalRepo {
+	return &fakeApprovalRepo{}
+}
+
+func (f *fakeApprovalRepo) Submit(_ context.Context, p approval.SubmitParams) (*approval.SubmitResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.submitErr != nil {
+		return nil, f.submitErr
+	}
+	for _, a := range f.all {
+		if a.StageID == p.StageID && a.ApproverSubject == p.ApproverSubject {
+			return &approval.SubmitResult{Approval: a, Inserted: false}, nil
+		}
+	}
+	a := &approval.Approval{
+		ID:              uuid.New(),
+		StageID:         p.StageID,
+		ApproverSubject: p.ApproverSubject,
+		Decision:        p.Decision,
+		Comment:         p.Comment,
+		Surface:         p.Surface,
+		SubmittedAt:     time.Now().UTC(),
+	}
+	f.all = append(f.all, a)
+	return &approval.SubmitResult{Approval: a, Inserted: true}, nil
+}
+
+func (f *fakeApprovalRepo) ListForStage(_ context.Context, stageID uuid.UUID) ([]*approval.Approval, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*approval.Approval
+	for _, a := range f.all {
+		if a.StageID == stageID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+// approvalRunRepo is a focused run.Repository for the approval
+// tests: GetStage returns the seeded stage, TransitionStage records
+// the transition.
+type approvalRunRepo struct {
+	mu             sync.Mutex
+	stages         map[uuid.UUID]*run.Stage
+	getErr         error
+	transitionErr  error
+	transitions    []approvalTransition
+	rejectionFails bool
+}
+
+type approvalTransition struct {
+	StageID    uuid.UUID
+	To         run.StageState
+	Completion *run.StageCompletion
+}
+
+func newApprovalRunRepo() *approvalRunRepo {
+	return &approvalRunRepo{stages: map[uuid.UUID]*run.Stage{}}
+}
+
+func (r *approvalRunRepo) seedStage(state run.StageState) *run.Stage {
+	st := &run.Stage{
+		ID:           uuid.New(),
+		RunID:        uuid.New(),
+		Sequence:     0,
+		Type:         run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+		State:        state,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+	}
+	r.mu.Lock()
+	r.stages[st.ID] = st
+	r.mu.Unlock()
+	return st
+}
+
+func (r *approvalRunRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.getErr != nil {
+		return nil, r.getErr
+	}
+	st, ok := r.stages[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	return st, nil
+}
+
+func (r *approvalRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.transitionErr != nil {
+		return nil, r.transitionErr
+	}
+	st, ok := r.stages[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidStageTransition(st.State, to) {
+		return nil, run.InvalidTransitionError{
+			Kind: "stage", From: string(st.State), To: string(to),
+		}
+	}
+	st.State = to
+	if c != nil {
+		st.FailureCategory = c.FailureCategory
+		st.FailureReason = c.FailureReason
+	}
+	st.UpdatedAt = time.Now().UTC()
+	r.transitions = append(r.transitions, approvalTransition{
+		StageID: id, To: to, Completion: c,
+	})
+	return st, nil
+}
+
+// Stub the rest of run.Repository — the approval handler doesn't
+// touch them.
+func (r *approvalRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *approvalRunRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *approvalRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *approvalRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *approvalRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+func (r *approvalRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
+// approvalAuditFake records AppendChained calls so tests assert
+// audit-entry shape and category.
+type approvalAuditFake struct {
+	mu        sync.Mutex
+	appended  []audit.ChainAppendParams
+	appendErr error
+}
+
+func newApprovalAuditFake() *approvalAuditFake { return &approvalAuditFake{} }
+
+func (a *approvalAuditFake) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (a *approvalAuditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.appendErr != nil {
+		return nil, a.appendErr
+	}
+	a.appended = append(a.appended, p)
+	return &audit.Entry{ID: uuid.New(), RunID: p.RunID}, nil
+}
+func (a *approvalAuditFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (a *approvalAuditFake) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (a *approvalAuditFake) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (a *approvalAuditFake) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+
+// newApprovalServer builds a Server wired to all three fakes,
+// returning each so tests can assert on captured state.
+func newApprovalServer(t *testing.T) (*Server, *fakeApprovalRepo, *approvalRunRepo, *approvalAuditFake) {
+	t.Helper()
+	ar := newFakeApprovalRepo()
+	rr := newApprovalRunRepo()
+	au := newApprovalAuditFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: ar,
+		RunRepo:      rr,
+		AuditRepo:    au,
+	})
+	return s, ar, rr, au
+}
+
+func submitApproval(t *testing.T, s *Server, stageID uuid.UUID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	url := fmt.Sprintf("/v0/stages/%s/approvals", stageID)
+	req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+func TestSubmitApproval_Approve_AdvancesStage(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var got stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != string(run.StageStateSucceeded) {
+		t.Errorf("State = %q, want succeeded", got.State)
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("approvals = %d, want 1", len(ar.all))
+	}
+	if ar.all[0].Decision != approval.DecisionApprove {
+		t.Errorf("Decision = %q", ar.all[0].Decision)
+	}
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateSucceeded {
+		t.Errorf("transitions = %+v", rr.transitions)
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != "approval_submitted" {
+		t.Errorf("audit = %+v", au.appended)
+	}
+}
+
+func TestSubmitApproval_Reject_FailsCategoryD(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject","comment":"plan looks risky"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var got stageResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.State != string(run.StageStateFailed) {
+		t.Errorf("State = %q, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != "D" {
+		t.Errorf("FailureCategory = %v, want D", got.FailureCategory)
+	}
+	if len(rr.transitions) != 1 {
+		t.Fatalf("transitions = %d, want 1", len(rr.transitions))
+	}
+	tr := rr.transitions[0]
+	if tr.Completion == nil || tr.Completion.FailureCategory == nil ||
+		*tr.Completion.FailureCategory != run.FailureD {
+		t.Errorf("transition completion = %+v", tr.Completion)
+	}
+	if len(au.appended) != 1 {
+		t.Errorf("audit entries = %d, want 1", len(au.appended))
+	}
+}
+
+func TestSubmitApproval_BadDecision(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"maybe"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"validation_failed"`) {
+		t.Errorf("body missing validation_failed: %s", w.Body.String())
+	}
+}
+
+func TestSubmitApproval_BadJSON(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	w := submitApproval(t, s, stage.ID, `{not json`)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestSubmitApproval_BadUUID(t *testing.T) {
+	s, _, _, _ := newApprovalServer(t)
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/stages/not-a-uuid/approvals",
+		strings.NewReader(`{"decision":"approve"}`))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestSubmitApproval_StageNotFound(t *testing.T) {
+	s, _, _, _ := newApprovalServer(t)
+	w := submitApproval(t, s, uuid.New(), `{"decision":"approve"}`)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestSubmitApproval_Idempotent_SameApprover(t *testing.T) {
+	// Second submission from the same approver returns 200 with
+	// the prior decision; no second transition, no second audit
+	// entry. First decision wins.
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	if w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`); w.Code != http.StatusOK {
+		t.Fatalf("first status = %d", w.Code)
+	}
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want 200 (idempotent)", w.Code)
+	}
+	if len(rr.transitions) != 1 {
+		t.Errorf("transitions = %d, want 1 (no second transition on idempotent submit)", len(rr.transitions))
+	}
+	if len(au.appended) != 1 {
+		t.Errorf("audit = %d, want 1 (no second audit on idempotent submit)", len(au.appended))
+	}
+}
+
+func TestSubmitApproval_TerminalStage_Conflict(t *testing.T) {
+	// A stage already in a terminal state can't transition to a
+	// different terminal state. Reject-after-succeeded is the
+	// canonical case: the gate already passed, but a late
+	// approver tries to flip it.
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateSucceeded)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"invalid_state_transition"`) {
+		t.Errorf("body missing invalid_state_transition: %s", w.Body.String())
+	}
+}
+
+func TestSubmitApproval_TerminalStage_SameDecisionIdempotent(t *testing.T) {
+	// approve-after-succeeded is a same-state transition the
+	// state machine treats as idempotent; the handler returns
+	// 200 with the unchanged stage.
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateSucceeded)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (same-state idempotent): %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSubmitApproval_RepoSubmitError(t *testing.T) {
+	s, ar, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	ar.submitErr = errors.New("db down")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+func TestSubmitApproval_TransitionError_Internal(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.transitionErr = errors.New("db locked")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+func TestSubmitApproval_NilDeps_503(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{"missing approval", Config{Addr: "127.0.0.1:0", RunRepo: newApprovalRunRepo(), AuditRepo: newApprovalAuditFake()}},
+		{"missing run", Config{Addr: "127.0.0.1:0", ApprovalRepo: newFakeApprovalRepo(), AuditRepo: newApprovalAuditFake()}},
+		{"missing audit", Config{Addr: "127.0.0.1:0", ApprovalRepo: newFakeApprovalRepo(), RunRepo: newApprovalRunRepo()}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(tc.cfg)
+			w := submitApproval(t, s, uuid.New(), `{"decision":"approve"}`)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want 503", w.Code)
+			}
+		})
+	}
+}
+
+func TestSubmitApproval_CommentOptional(t *testing.T) {
+	s, ar, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if ar.all[0].Comment != nil {
+		t.Errorf("Comment = %v, want nil", ar.all[0].Comment)
+	}
+}
+
+func TestSubmitApproval_CommentForwarded(t *testing.T) {
+	s, ar, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"lgtm"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if ar.all[0].Comment == nil || *ar.all[0].Comment != "lgtm" {
+		t.Errorf("Comment = %v", ar.all[0].Comment)
+	}
+}
+
+func TestSubmitApproval_UnknownField(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","extra":true}`)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 on unknown field", w.Code)
+	}
+}

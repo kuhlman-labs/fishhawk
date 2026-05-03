@@ -166,6 +166,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | Trace upload handler | `backend/internal/server/trace.go`; verifies signature, calls `tracestore.Put` + `audit.AppendChained`. S3 wired in `serve.go` from `FISHHAWKD_S3_BUCKET`/`_REGION`/`_ENDPOINT`. |
 | GitHub webhook receiver | `backend/internal/webhook/` (HMAC + dedup) and `backend/internal/server/webhook.go`; secret from `FISHHAWKD_GITHUB_WEBHOOK_SECRET` |
 | Webhook event dispatcher (events → runs + stages) | `backend/internal/webhook/dispatcher.go` (`MatchEvent` pure + `Dispatcher.Handle` orchestrator); wired via `cfg.WebhookDispatcher`. Creates one `Stage` row per spec-stage definition; first stage transitions to `dispatched` on workflow_dispatch. |
+| Approval state management (`POST /v0/stages/{id}/approvals`) | `backend/internal/approval/` + `backend/internal/server/approvals.go`. approve → succeeded; reject → failed-D. Idempotent on (stage_id, approver_subject). SLA timeout deferred to #123. |
 | GitHub App installation tokens | `backend/internal/githubapp/` (RS256 signer + client + TTL cache + telemetry); App ID + key file from `FISHHAWKD_GITHUB_APP_ID` / `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE` |
 | GitHub REST operations (read workflow spec, fire workflow_dispatch) | `backend/internal/githubclient/`; consumes `githubapp.TokenProvider` |
 | How a new Go module gets added | `CLAUDE.md` "Adding a Go module" |
