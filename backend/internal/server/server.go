@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -64,6 +65,14 @@ type Config struct {
 	// X-GitHub-Delivery UUID across the GitHub retry window. nil
 	// disables the /webhooks/github endpoint.
 	WebhookDeliveries webhook.DeliveryStore
+
+	// GitHubTokens issues per-installation tokens for backend-side
+	// GitHub interactions (workflow_dispatch, fetching workflow
+	// spec contents, opening PRs). nil disables anything that
+	// requires acting on a customer's repo. No handler consumes
+	// it directly today; the webhook dispatcher (#109) is the
+	// first planned reader.
+	GitHubTokens githubapp.TokenProvider
 }
 
 // Server wraps an http.Server with the routes and middleware stack
