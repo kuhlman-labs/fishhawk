@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -136,6 +137,19 @@ func runServe(args []string, logSink io.Writer) int {
 			Logger: logger,
 		}
 		logger.Info("webhook dispatcher configured")
+	}
+
+	// Orchestrator wires the run repository to the GitHub client
+	// to dispatch subsequent stages after a gate passes. Same
+	// dependencies as the dispatcher; without them the approval
+	// handler succeeds but the next stage stays in pending.
+	if cfg.RunRepo != nil {
+		cfg.Orchestrator = &orchestrator.Orchestrator{
+			Runs:   cfg.RunRepo,
+			GitHub: cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
+			Logger: logger,
+		}
+		logger.Info("stage orchestrator configured")
 	}
 
 	// GitHub App installation-token provider. Both ID and key file

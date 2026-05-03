@@ -273,12 +273,14 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// — stable per content, so two refs at the same content hash
 	// resolve to the same row's foreign key target.
 	triggerRef := m.TriggerRef
+	installationID := ev.InstallationID
 	created, err := d.Runs.CreateRun(ctx, run.CreateRunParams{
-		Repo:          ev.Repo,
-		WorkflowID:    m.WorkflowID,
-		WorkflowSHA:   specFile.SHA,
-		TriggerSource: m.TriggerSource,
-		TriggerRef:    &triggerRef,
+		Repo:           ev.Repo,
+		WorkflowID:     m.WorkflowID,
+		WorkflowSHA:    specFile.SHA,
+		TriggerSource:  m.TriggerSource,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installationID,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create run: %w", err)

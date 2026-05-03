@@ -119,15 +119,16 @@ const (
 
 // Run is the persisted record of a workflow execution.
 type Run struct {
-	ID            uuid.UUID
-	Repo          string
-	WorkflowID    string // e.g. "feature_change", matches a key under workflows in the spec
-	WorkflowSHA   string // git SHA of .fishhawk/workflows.yaml at run time
-	TriggerSource TriggerSource
-	TriggerRef    *string // e.g. "issue:1247" or nil for ad-hoc runs
-	State         State
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID             uuid.UUID
+	Repo           string
+	WorkflowID     string // e.g. "feature_change", matches a key under workflows in the spec
+	WorkflowSHA    string // git SHA of .fishhawk/workflows.yaml at run time
+	TriggerSource  TriggerSource
+	TriggerRef     *string // e.g. "issue:1247" or nil for ad-hoc runs
+	InstallationID *int64  // GitHub App installation that owns the repo; nil for non-GitHub triggers
+	State          State
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Stage is one ordered unit of work within a run.
