@@ -14,8 +14,20 @@ changes don't pay the install/test cost.
 - `src/main.tsx` — entry; mounts `<App />` inside `<BrowserRouter>`.
 - `src/App.tsx` — route table.
 - `src/routes/` — one file per route (`root` is the app shell;
-  `login` is rendered outside the shell; `runs` and `audit` are
-  child routes of `root`; `not-found` catches the rest).
+  `login` is rendered outside the shell; `runs` lists workflow runs,
+  `run-detail` drills into one, `stage-detail` renders the plan;
+  `audit` is still a stub; `not-found` catches the rest).
+- `src/auth/` — auth context, provider, `RequireAuth` gate, hook.
+  The provider fetches `/v0/auth/me`; routes inside `<Root />` are
+  gated behind it.
+- `src/api/` — typed wrappers around the v0 REST surface
+  (`client.ts`), TS mirrors of the OpenAPI schemas (`types.ts`,
+  `plan.ts`), and a small `useAsync` hook for component-level
+  data loading.
+- `src/plan/` — the plan-document renderer (`plan-document.tsx`)
+  and its section primitives (`sections.tsx`). Each `standard_v1`
+  field is its own section so the side nav anchors line up
+  one-to-one.
 - `src/components/ui/` — shadcn-copied primitives (currently just
   `Button`; add more on demand, never as a library dep).
 - `src/lib/cn.ts` — `clsx + tailwind-merge` class helper.
@@ -42,12 +54,15 @@ the browser's perspective. Override the proxy target by editing
 
 ## What's stubbed
 
-E7.1 (this issue) is scaffolding only. Real surfaces ship in:
+The plan-review vertical slice (E7.1 → E7.2 → E7.3) is in. Still
+to come:
 
-- **E7.2 (#38)** — wire the Login button to `/v0/auth/github/login`,
-  read the `fishhawk_session` cookie, expose an auth context.
-- **E7.3 (#56)** — render `standard_v1` plans as documents.
-- **E7.4 (#57)** — approval action against `POST /v0/stages/{id}/approvals`.
+- **E7.4 (#57)** — wire the Approve / Regenerate buttons in the plan
+  document to `POST /v0/stages/{id}/approvals`. Today they render
+  but are disabled.
+- **Audit search** under `/audit` is still a placeholder.
+- **Pagination on `/runs`** ([#155](https://github.com/kuhlman-labs/fishhawk/issues/155)) — the list is capped at the
+  first 50 runs; cursor controls land separately.
 
 ## See also
 
