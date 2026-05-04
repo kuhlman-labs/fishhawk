@@ -6,13 +6,14 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 
 ## Layout
 
-- `cmd/fishhawk/` — the binary entrypoint. Subcommand dispatch in `main.go`, per-command flags in `run.go`.
+- `cmd/fishhawk/` — the binary entrypoint. Subcommand dispatch in `main.go`, per-command flags in `run.go`, validate logic in `validate.go`.
 - `internal/httpclient/` — typed wrapper around the backend API. Marshals `CreateRunInput`, decodes `Run`, surfaces `*APIError` for non-2xx responses.
+- `internal/spec/` — workflow-spec validator. Embeds `workflow-v0.schema.json` (mirrored from `docs/spec/`; the schema-sync diff in CI fails if the copies drift) and runs JSON Schema validation locally so users iterate on errors before opening a PR.
 - `internal/version/` — build-version package; set via `-ldflags` at release time.
 
 ## Status
 
-E6.1 (#55), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`. E6.2 (#33) `fishhawk validate` is intentionally absent from the initial PR — it requires a local copy of the workflow-spec parser, which currently lives under `backend/internal/spec` and can't be imported across modules. Tracking issue forthcoming.
+E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`.
 
 ## Subcommands
 
@@ -22,6 +23,7 @@ fishhawk run status <run-id>
 fishhawk run list   [--repo R] [--workflow W] [--state S] [--limit N] [--cursor C]
 fishhawk run cancel <run-id>
 fishhawk run open   <run-id> [--print-url]
+fishhawk validate   [path]                   # default: .fishhawk/workflows.yaml
 fishhawk version
 ```
 

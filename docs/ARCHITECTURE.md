@@ -19,7 +19,7 @@ Five surfaces, deployed independently. Each maps to a directory in this monorepo
 | **Backend control plane** (`fishhawkd`) | `/backend` | Workflow state machine, policy evaluator, approval state, audit writer, REST API, GitHub App webhook receiver. | E3 (#3) |
 | **Runner action** (`fishhawk/runner`) | `/runner` | GitHub Action published as `kuhlman-labs/fishhawk/runner@runner/vX.Y.Z`. Runs on the customer's CI: invokes the agent, captures trace, validates the produced plan, signs and ships the bundle. Self-execution in this repo uses `./runner` (the local path); external customers pin a release tag. Versioned, cosign-signed releases via `.github/workflows/runner-release.yml`. | E5 (#5) |
 | **Web UI** | `/frontend` (planned) | Authenticated SPA — plan review, approval, audit search, run visualization. | E7 (#7) |
-| **CLI** (`fishhawk`) | `/cli` (planned) | Validate workflow specs locally; trigger and inspect runs from the terminal. Plan review and approval explicitly stay in the UI. | E6 (#6) |
+| **CLI** (`fishhawk`) | `/cli` | Validate workflow specs locally (`fishhawk validate`); trigger and inspect runs from the terminal. Plan review and approval explicitly stay in the UI. | E6 (#6) |
 | **GitHub App** | (registered with GitHub; manifest in repo) | Per-installation tokens for repo access; OAuth provider for user sign-in; webhook source for triggers. | E4 (#4) |
 
 Plus the canonical artifact, **`.fishhawk/workflows.yaml`**, which lives in the customer's repo (and in this repo for self-execution starting Day 21).
