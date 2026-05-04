@@ -2,16 +2,15 @@
 // versions:
 //   sqlc v1.31.1
 
-package rundb
+package webhookdb
 
 import (
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Approval struct {
-	ID              uuid.UUID          `json:"id"`
-	StageID         uuid.UUID          `json:"stage_id"`
+	ID              pgtype.UUID        `json:"id"`
+	StageID         pgtype.UUID        `json:"stage_id"`
 	ApproverSubject string             `json:"approver_subject"`
 	Decision        string             `json:"decision"`
 	Comment         *string            `json:"comment"`
@@ -20,8 +19,8 @@ type Approval struct {
 }
 
 type Artifact struct {
-	ID            uuid.UUID          `json:"id"`
-	StageID       uuid.UUID          `json:"stage_id"`
+	ID            pgtype.UUID        `json:"id"`
+	StageID       pgtype.UUID        `json:"stage_id"`
 	Kind          string             `json:"kind"`
 	SchemaVersion *string            `json:"schema_version"`
 	Content       []byte             `json:"content"`
@@ -30,10 +29,10 @@ type Artifact struct {
 }
 
 type AuditEntry struct {
-	ID           uuid.UUID          `json:"id"`
+	ID           pgtype.UUID        `json:"id"`
 	Sequence     int64              `json:"sequence"`
-	RunID        uuid.UUID          `json:"run_id"`
-	StageID      *uuid.UUID         `json:"stage_id"`
+	RunID        pgtype.UUID        `json:"run_id"`
+	StageID      pgtype.UUID        `json:"stage_id"`
 	Ts           pgtype.Timestamptz `json:"ts"`
 	Category     string             `json:"category"`
 	ActorKind    *string            `json:"actor_kind"`
@@ -44,7 +43,7 @@ type AuditEntry struct {
 }
 
 type Run struct {
-	ID             uuid.UUID          `json:"id"`
+	ID             pgtype.UUID        `json:"id"`
 	Repo           string             `json:"repo"`
 	WorkflowID     string             `json:"workflow_id"`
 	WorkflowSha    string             `json:"workflow_sha"`
@@ -57,15 +56,15 @@ type Run struct {
 }
 
 type SigningKey struct {
-	RunID     uuid.UUID          `json:"run_id"`
+	RunID     pgtype.UUID        `json:"run_id"`
 	PublicKey []byte             `json:"public_key"`
 	IssuedAt  pgtype.Timestamptz `json:"issued_at"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
 type Stage struct {
-	ID              uuid.UUID          `json:"id"`
-	RunID           uuid.UUID          `json:"run_id"`
+	ID              pgtype.UUID        `json:"id"`
+	RunID           pgtype.UUID        `json:"run_id"`
 	Sequence        int32              `json:"sequence"`
 	StageType       string             `json:"stage_type"`
 	ExecutorKind    string             `json:"executor_kind"`

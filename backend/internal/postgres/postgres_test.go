@@ -202,19 +202,27 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0006 only drops the
-	// stages.gate_sla column, not a table. Confirm: the column is
-	// gone, but every table from earlier migrations (including
-	// approvals from 0004) is still present.
-	var gateSLACol, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0007 drops the
+	// webhook_deliveries table. Confirm: the table is gone, but
+	// every table / column from earlier migrations is still
+	// present (gate_sla from 0006, approvals from 0004, etc.).
+	var deliveriesCount, gateSLACol, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'webhook_deliveries'`,
+	).Scan(&deliveriesCount); err != nil {
+		t.Fatalf("query webhook_deliveries table: %v", err)
+	}
+	if deliveriesCount != 0 {
+		t.Errorf("webhook_deliveries count after MigrateDown = %d, want 0 (most-recent migration rolled back)", deliveriesCount)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'stages' AND column_name = 'gate_sla'`,
 	).Scan(&gateSLACol); err != nil {
 		t.Fatalf("query gate_sla column: %v", err)
 	}
-	if gateSLACol != 0 {
-		t.Errorf("stages.gate_sla column count after MigrateDown = %d, want 0 (most-recent migration rolled back)", gateSLACol)
+	if gateSLACol != 1 {
+		t.Errorf("stages.gate_sla column count after MigrateDown = %d, want 1 (0006 still applied)", gateSLACol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'approvals'`,

@@ -120,12 +120,28 @@ func runServe(args []string, logSink io.Writer) int {
 
 	// Webhook receiver wiring. Secret + delivery store both need
 	// to be configured for /webhooks/github to accept deliveries.
-	// 24h TTL covers GitHub's ~3h retry window with comfortable
-	// margin without growing unboundedly.
+	// 24h retention covers GitHub's ~3h retry window with
+	// comfortable margin without growing unboundedly.
+	//
+	// Prefer the Postgres-backed store when a DB pool is available:
+	// dedup state survives restarts and is shared across instances
+	// (a hard requirement for any horizontally-scaled deploy). Fall
+	// back to MemoryStore only when no DB is configured, with a
+	// noisy warning so an operator running multi-instance with
+	// memory dedup can spot the hazard.
+	const webhookRetention = 24 * time.Hour
+	var webhookEvictor *webhook.PostgresStore
 	if *webhookSecret != "" {
 		cfg.GitHubWebhookSecret = []byte(*webhookSecret)
-		cfg.WebhookDeliveries = webhook.NewMemoryStore(24 * time.Hour)
-		logger.Info("github webhook receiver configured")
+		if pool != nil {
+			pgStore := webhook.NewPostgresStore(pool)
+			cfg.WebhookDeliveries = pgStore
+			webhookEvictor = pgStore
+			logger.Info("github webhook receiver configured (postgres dedup)")
+		} else {
+			cfg.WebhookDeliveries = webhook.NewMemoryStore(webhookRetention)
+			logger.Warn("github webhook receiver using memory dedup — NOT safe for multi-instance deploys; set FISHHAWKD_DATABASE_URL")
+		}
 	} else {
 		logger.Warn("FISHHAWKD_GITHUB_WEBHOOK_SECRET not set; /webhooks/github will respond 503")
 	}
@@ -197,6 +213,16 @@ func runServe(args []string, logSink io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Start the webhook dedup evictor when the Postgres store is
+	// in use. 1h tick is fine for 24h retention — eviction lag of
+	// up to an hour past TTL is harmless (rows just sit a bit
+	// longer; dedup behavior is unchanged).
+	if webhookEvictor != nil {
+		go runWebhookEvictor(ctx, logger, webhookEvictor, webhookRetention)
+		logger.Info("webhook dedup evictor started",
+			slog.Duration("retention", webhookRetention))
+	}
+
 	// Start the approval SLA timeout ticker if requested. Requires
 	// run + audit repos; we skip with a warn if either is missing
 	// rather than failing the boot, so a partial deploy still
@@ -236,6 +262,46 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 	logger.Info("shutdown complete")
 	return exitOK
+}
+
+// runWebhookEvictor periodically deletes webhook_deliveries rows
+// older than retention. 1h tick is fine for 24h retention — a row
+// sitting up to an hour past TTL is harmless because dedup
+// behavior is unchanged (the row was already evictable; we just
+// haven't reclaimed space yet). Exits when ctx is cancelled.
+func runWebhookEvictor(ctx context.Context, logger *slog.Logger, store *webhook.PostgresStore, retention time.Duration) {
+	const interval = time.Hour
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	evict := func() {
+		evictCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		n, err := store.Evict(evictCtx, time.Now().UTC().Add(-retention))
+		if err != nil {
+			logger.LogAttrs(ctx, slog.LevelWarn, "webhook evict failed",
+				slog.String("error", err.Error()))
+			return
+		}
+		if n > 0 {
+			logger.LogAttrs(ctx, slog.LevelInfo, "webhook evict",
+				slog.Int64("rows", n),
+				slog.Duration("retention", retention))
+		}
+	}
+
+	// Fire once at startup so a long-lived deployment that just
+	// restarted catches up on accumulated rows without waiting the
+	// full interval.
+	evict()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			evict()
+		}
+	}
 }
 
 // slaTickerConfig wraps the inputs sla.Ticker needs so serve.go
