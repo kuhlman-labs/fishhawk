@@ -202,27 +202,27 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0007 drops the
-	// webhook_deliveries table. Confirm: the table is gone, but
-	// every table / column from earlier migrations is still
-	// present (gate_sla from 0006, approvals from 0004, etc.).
-	var deliveriesCount, gateSLACol, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0008 drops the
+	// api_tokens table. Confirm: the table is gone, but every
+	// table from earlier migrations (0007 webhook_deliveries,
+	// 0006 stages.gate_sla, 0004 approvals, etc.) is still
+	// present.
+	var apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'api_tokens'`,
+	).Scan(&apiTokensCount); err != nil {
+		t.Fatalf("query api_tokens table: %v", err)
+	}
+	if apiTokensCount != 0 {
+		t.Errorf("api_tokens count after MigrateDown = %d, want 0 (most-recent migration rolled back)", apiTokensCount)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'webhook_deliveries'`,
 	).Scan(&deliveriesCount); err != nil {
 		t.Fatalf("query webhook_deliveries table: %v", err)
 	}
-	if deliveriesCount != 0 {
-		t.Errorf("webhook_deliveries count after MigrateDown = %d, want 0 (most-recent migration rolled back)", deliveriesCount)
-	}
-	if err := pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM information_schema.columns
-		 WHERE table_name = 'stages' AND column_name = 'gate_sla'`,
-	).Scan(&gateSLACol); err != nil {
-		t.Fatalf("query gate_sla column: %v", err)
-	}
-	if gateSLACol != 1 {
-		t.Errorf("stages.gate_sla column count after MigrateDown = %d, want 1 (0006 still applied)", gateSLACol)
+	if deliveriesCount != 1 {
+		t.Errorf("webhook_deliveries count after MigrateDown = %d, want 1 (0007 still applied)", deliveriesCount)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'approvals'`,

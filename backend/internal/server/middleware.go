@@ -6,8 +6,18 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 )
+
+// apitokenAuthenticator is the slice of apitoken.Repository
+// bearerAuth uses. Defining the interface here lets tests inject
+// a stub directly without pulling in the whole repository.
+type apitokenAuthenticator interface {
+	Authenticate(ctx context.Context, plaintext string) (*apitoken.Token, error)
+}
 
 // ctxKey is unexported so callers must use the accessors below to
 // pull values out of a request context.
@@ -18,13 +28,26 @@ const (
 	ctxKeyIdentity
 )
 
-// Identity is the authenticated principal for a request.
+// Identity is the authenticated principal for a request. Subject
+// is the only field every code path can rely on; TokenID + Scopes
+// are populated when the request authenticated via an API token,
+// and the OAuth-session path (E4.2) will fill TokenID with the
+// session id once it lands.
 //
-// Until E4 (#4) lands real auth, the authStub always sets
-// Identity{Subject: "anonymous"}. Downstream code that switches on
-// Subject must tolerate that value.
+// Subject "anonymous" means no auth header was presented (or the
+// presented credential didn't validate). Handlers that require an
+// authenticated user check for that value and return 401.
 type Identity struct {
 	Subject string
+	TokenID string
+	Scopes  []string
+}
+
+// IsAnonymous reports whether i represents an unauthenticated
+// caller. Equivalent to i.Subject == "" || i.Subject == "anonymous"
+// — wrapping the check so every handler agrees on the convention.
+func (i Identity) IsAnonymous() bool {
+	return i.Subject == "" || i.Subject == "anonymous"
 }
 
 // RequestIDFrom returns the request ID set by the requestID middleware,
@@ -129,12 +152,50 @@ func recovery(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// authStub is a placeholder until E4 (#4) lands real authentication.
-// It tags every request with an anonymous Identity so downstream code
-// can be written assuming an Identity is always present in context.
-func authStub(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := context.WithValue(r.Context(), ctxKeyIdentity, Identity{Subject: "anonymous"})
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+// bearerAuth resolves Authorization: Bearer <fhk_...> tokens to an
+// Identity via the configured apitoken.Repository. Tokens that
+// don't match any active row, or whose strings don't have the
+// product prefix, fall through to the anonymous identity — the
+// middleware does NOT 401 on its own. Per-handler logic decides
+// whether anonymous is acceptable; this keeps the trace upload +
+// signing-key endpoints (which use their own auth schemes) from
+// being collateral-damaged.
+//
+// repo is allowed to be nil — the bootstrap path can run without a
+// DB-backed token store, in which case every request is anonymous.
+//
+// The OAuth session path (E4.2) will layer on top of this: a
+// session cookie also resolves to a non-anonymous Identity. Both
+// auth methods set the same Identity shape so handlers don't need
+// to know which one ran.
+func bearerAuth(repo apitokenAuthenticator) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id := Identity{Subject: "anonymous"}
+			if tok, ok := tokenFromHeader(r); ok && repo != nil {
+				if rec, err := repo.Authenticate(r.Context(), tok); err == nil {
+					id = Identity{
+						Subject: rec.Subject,
+						TokenID: rec.ID.String(),
+						Scopes:  append([]string(nil), rec.Scopes...),
+					}
+				}
+			}
+			ctx := context.WithValue(r.Context(), ctxKeyIdentity, id)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// tokenFromHeader extracts a Fishhawk bearer token from the
+// Authorization header. Returns ("", false) when no Bearer header
+// is present or the scheme isn't "Bearer". Token shape (prefix,
+// length) is the Authenticate path's job to validate.
+func tokenFromHeader(r *http.Request) (string, bool) {
+	h := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(h, prefix) {
+		return "", false
+	}
+	return h[len(prefix):], true
 }

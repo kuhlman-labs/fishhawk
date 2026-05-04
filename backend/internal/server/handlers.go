@@ -26,6 +26,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", s.handleGetStagePrompt)
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", s.handleSubmitApproval)
 	mux.HandleFunc("GET /v0/artifacts/{artifact_id}", s.handleGetArtifact)
+	mux.HandleFunc("GET /v0/tokens", s.handleListTokens)
+	mux.HandleFunc("POST /v0/tokens", s.handleCreateToken)
+	mux.HandleFunc("DELETE /v0/tokens/{token_id}", s.handleRevokeToken)
 	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
 }
 

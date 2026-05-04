@@ -36,6 +36,8 @@ func run(args []string, logSink io.Writer) int {
 		return runServe(rest, logSink)
 	case "migrate":
 		return runMigrate(rest, logSink)
+	case "token":
+		return runToken(rest, logSink)
 	case "-h", "--help", "help":
 		printUsage(logSink)
 		return exitOK
@@ -61,12 +63,13 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate] [flags]",
+		"Usage: fishhawkd [serve|migrate|token] [flags]",
 		"",
 		"Subcommands:",
 		"  serve         Run the HTTP server (default).",
 		"  migrate up    Apply pending DB migrations.",
 		"  migrate down  Roll back the most recent migration (dev only).",
+		"  token issue   Mint a bootstrap API token for an identity.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}
