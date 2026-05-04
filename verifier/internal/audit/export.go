@@ -42,10 +42,15 @@ type SigningKey struct {
 // Entry mirrors backend's audit_entries row in JSON-friendly
 // shape. Field types align with HashInputs so we can reconstruct
 // the hash inputs from a parsed entry.
+//
+// RunID is *uuid.UUID (E2.7): nil for global-chain entries.
+// JSON decoders set it to nil when the wire payload has
+// `"run_id": null` and to a non-nil pointer when it's a UUID
+// string.
 type Entry struct {
 	ID           uuid.UUID       `json:"id"`
 	Sequence     int64           `json:"sequence"`
-	RunID        uuid.UUID       `json:"run_id"`
+	RunID        *uuid.UUID      `json:"run_id"`
 	StageID      *uuid.UUID      `json:"stage_id"`
 	Timestamp    time.Time       `json:"ts"`
 	Category     string          `json:"category"`

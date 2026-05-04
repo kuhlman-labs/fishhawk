@@ -36,7 +36,7 @@ func validExport(t *testing.T) *audit.Export {
 	runID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
 	payload := json.RawMessage(`{"event":"start"}`)
 	hash, err := audit.ComputeEntryHash(audit.HashInputs{
-		RunID:     runID,
+		RunID:     &runID,
 		Timestamp: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
 		Category:  "start",
 		Payload:   payload,
@@ -52,7 +52,7 @@ func validExport(t *testing.T) *audit.Export {
 					{
 						ID:        uuid.New(),
 						Sequence:  1,
-						RunID:     runID,
+						RunID:     &runID,
 						Timestamp: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
 						Category:  "start",
 						Payload:   payload,

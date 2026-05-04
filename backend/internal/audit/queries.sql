@@ -30,3 +30,19 @@ LIMIT 1;
 SELECT * FROM audit_entries
 WHERE run_id = $1 AND category = $2
 ORDER BY sequence ASC;
+
+-- name: GetLastGlobalAuditEntry :one
+-- Mirror of GetLastAuditEntryForRun for the global chain partition
+-- (E2.7 / #138). Used by AppendGlobalChained to fetch prev_hash for
+-- the next non-run event (token issue/revoke, OAuth sign-in, etc.).
+SELECT * FROM audit_entries
+ WHERE run_id IS NULL
+ ORDER BY sequence DESC
+ LIMIT 1;
+
+-- name: ListGlobalAuditEntries :many
+-- Used by compliance exports + the verifier to walk the global
+-- chain in append order.
+SELECT * FROM audit_entries
+ WHERE run_id IS NULL
+ ORDER BY sequence ASC;

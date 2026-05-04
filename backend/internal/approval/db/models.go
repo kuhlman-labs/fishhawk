@@ -42,7 +42,7 @@ type Artifact struct {
 type AuditEntry struct {
 	ID           uuid.UUID          `json:"id"`
 	Sequence     int64              `json:"sequence"`
-	RunID        uuid.UUID          `json:"run_id"`
+	RunID        *uuid.UUID         `json:"run_id"`
 	StageID      *uuid.UUID         `json:"stage_id"`
 	Ts           pgtype.Timestamptz `json:"ts"`
 	Category     string             `json:"category"`

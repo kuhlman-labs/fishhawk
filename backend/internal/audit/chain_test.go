@@ -16,8 +16,9 @@ import (
 // --- ComputeEntryHash: pure unit tests, no DB ---
 
 func TestComputeEntryHash_Deterministic(t *testing.T) {
+	runID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 	in := audit.HashInputs{
-		RunID:     uuid.MustParse("11111111-2222-3333-4444-555555555555"),
+		RunID:     &runID,
 		Timestamp: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
 		Category:  "plan_generated",
 		Payload:   json.RawMessage(`{"summary":"x"}`),
@@ -40,8 +41,9 @@ func TestComputeEntryHash_Deterministic(t *testing.T) {
 }
 
 func TestComputeEntryHash_DiffersWhenAnyFieldChanges(t *testing.T) {
+	baseRun := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 	base := audit.HashInputs{
-		RunID:     uuid.MustParse("11111111-2222-3333-4444-555555555555"),
+		RunID:     &baseRun,
 		Timestamp: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
 		Category:  "plan_generated",
 		Payload:   json.RawMessage(`{"summary":"x"}`),
@@ -63,7 +65,7 @@ func TestComputeEntryHash_DiffersWhenAnyFieldChanges(t *testing.T) {
 		{"category", func(in *audit.HashInputs) { in.Category = "different" }},
 		{"timestamp", func(in *audit.HashInputs) { in.Timestamp = in.Timestamp.Add(time.Second) }},
 		{"payload", func(in *audit.HashInputs) { in.Payload = json.RawMessage(`{"summary":"y"}`) }},
-		{"run_id", func(in *audit.HashInputs) { in.RunID = uuid.New() }},
+		{"run_id", func(in *audit.HashInputs) { newID := uuid.New(); in.RunID = &newID }},
 		{"stage_id added", func(in *audit.HashInputs) { in.StageID = &otherStage }},
 		{"actor_kind added", func(in *audit.HashInputs) { in.ActorKind = &otherKind }},
 		{"actor_subject added", func(in *audit.HashInputs) { in.ActorSubject = &otherSubj }},
@@ -160,8 +162,9 @@ func TestPostgres_AppendChained_HashMatchesComputeEntryHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rid := runID
 	want, err := audit.ComputeEntryHash(audit.HashInputs{
-		RunID:     runID,
+		RunID:     &rid,
 		Timestamp: ts,
 		Category:  "plan_generated",
 		Payload:   body,
@@ -217,8 +220,9 @@ func TestPostgres_AppendChained_AllOptionalFields(t *testing.T) {
 	// External recompute of the hash with the same inputs should
 	// match — validates that AppendChained passed every field
 	// through ComputeEntryHash.
+	rid2 := runID
 	want, err := audit.ComputeEntryHash(audit.HashInputs{
-		RunID:        runID,
+		RunID:        &rid2,
 		StageID:      &stage,
 		Timestamp:    ts,
 		Category:     "trace_shipped",

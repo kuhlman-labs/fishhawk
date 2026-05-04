@@ -311,7 +311,15 @@ func (s *stubAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 		return nil, s.appendErr
 	}
 	s.appended = append(s.appended, p)
-	return &audit.Entry{ID: uuid.New(), RunID: p.RunID}, nil
+	rid := p.RunID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
+}
+
+func (s *stubAudit) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (s *stubAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
 }
 func (s *stubAudit) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")

@@ -24,16 +24,25 @@ func (f *fakeAuditRepo) Append(ctx context.Context, p audit.AppendParams) (*audi
 	return nil, errors.New("not implemented")
 }
 
+func (f *fakeAuditRepo) AppendGlobalChained(ctx context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeAuditRepo) ListGlobal(ctx context.Context) ([]*audit.Entry, error) {
+	return nil, nil
+}
+
 func (f *fakeAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	f.called++
 	f.captured = p
 	if f.appendChainedErr != nil {
 		return nil, f.appendChainedErr
 	}
+	rid := p.RunID
 	return &audit.Entry{
 		ID:        uuid.New(),
 		Sequence:  1,
-		RunID:     p.RunID,
+		RunID:     &rid,
 		StageID:   p.StageID,
 		Timestamp: p.Timestamp,
 		Category:  p.Category,

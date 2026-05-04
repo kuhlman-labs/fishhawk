@@ -202,19 +202,29 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0008 drops the
-	// api_tokens table. Confirm: the table is gone, but every
-	// table from earlier migrations (0007 webhook_deliveries,
-	// 0006 stages.gate_sla, 0004 approvals, etc.) is still
-	// present.
+	// MigrateDown rolls back one step. 0009 makes audit_entries.run_id
+	// nullable; rolling back restores NOT NULL. Confirm: the column
+	// is back to NOT NULL, but every table from earlier migrations
+	// (api_tokens from 0008, webhook_deliveries from 0007, gate_sla
+	// from 0006, approvals from 0004, etc.) is still present.
 	var apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	var auditRunIDNullable string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT is_nullable FROM information_schema.columns
+		 WHERE table_name = 'audit_entries' AND column_name = 'run_id'`,
+	).Scan(&auditRunIDNullable); err != nil {
+		t.Fatalf("query audit_entries.run_id is_nullable: %v", err)
+	}
+	if auditRunIDNullable != "NO" {
+		t.Errorf("audit_entries.run_id is_nullable after MigrateDown = %q, want NO (0009 rolled back)", auditRunIDNullable)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'api_tokens'`,
 	).Scan(&apiTokensCount); err != nil {
 		t.Fatalf("query api_tokens table: %v", err)
 	}
-	if apiTokensCount != 0 {
-		t.Errorf("api_tokens count after MigrateDown = %d, want 0 (most-recent migration rolled back)", apiTokensCount)
+	if apiTokensCount != 1 {
+		t.Errorf("api_tokens count after MigrateDown = %d, want 1 (0008 still applied)", apiTokensCount)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'webhook_deliveries'`,

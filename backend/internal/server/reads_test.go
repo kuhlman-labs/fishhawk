@@ -478,6 +478,12 @@ func (a *auditReadFake) Append(context.Context, audit.AppendParams) (*audit.Entr
 func (a *auditReadFake) AppendChained(context.Context, audit.ChainAppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+func (a *auditReadFake) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (a *auditReadFake) ListGlobal(context.Context) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
 func (a *auditReadFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
@@ -502,12 +508,13 @@ func (a *auditReadFake) ListForRunByCategory(_ context.Context, _ uuid.UUID, cat
 }
 
 func makeAuditEntries(n int) []*audit.Entry {
+	rid := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 	out := make([]*audit.Entry, n)
 	for i := range out {
 		out[i] = &audit.Entry{
 			ID:        uuid.New(),
 			Sequence:  int64(i + 1),
-			RunID:     uuid.MustParse("11111111-2222-3333-4444-555555555555"),
+			RunID:     &rid,
 			Timestamp: time.Date(2026, 5, 2, 12, 0, i, 0, time.UTC),
 			Category:  "trace_uploaded",
 			Payload:   json.RawMessage(`{}`),

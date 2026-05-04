@@ -17,8 +17,9 @@ import (
 // code; this fixture is the drift-detection mechanism. If you
 // change either implementation, update both fixtures.
 func TestComputeEntryHash_CanonicalFixture(t *testing.T) {
+	runID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
 	in := audit.HashInputs{
-		RunID:     uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+		RunID:     &runID,
 		Timestamp: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
 		Category:  "plan_generated",
 		Payload:   json.RawMessage(`{"summary":"canonical"}`),

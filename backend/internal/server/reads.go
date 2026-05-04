@@ -221,9 +221,11 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 // auditEntryResponse mirrors docs/api/v0.openapi.yaml's
 // `AuditEntry` schema.
 type auditEntryResponse struct {
-	ID           uuid.UUID       `json:"id"`
-	Sequence     int64           `json:"sequence"`
-	RunID        uuid.UUID       `json:"run_id"`
+	ID       uuid.UUID `json:"id"`
+	Sequence int64     `json:"sequence"`
+	// RunID is null for global-chain entries (E2.7): token issue/
+	// revoke and similar non-run events.
+	RunID        *uuid.UUID      `json:"run_id"`
 	StageID      *uuid.UUID      `json:"stage_id"`
 	Timestamp    time.Time       `json:"ts"`
 	Category     string          `json:"category"`

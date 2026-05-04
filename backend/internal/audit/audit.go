@@ -23,9 +23,13 @@ import (
 // Entry is one line in the audit log. Sequence is the monotonic
 // per-table position assigned by Postgres at INSERT time.
 type Entry struct {
-	ID           uuid.UUID
-	Sequence     int64
-	RunID        uuid.UUID
+	ID       uuid.UUID
+	Sequence int64
+	// RunID is nil for global-chain entries (E2.7): token issue/
+	// revoke, OAuth events, GitHub App install/uninstall, anything
+	// that isn't tied to a workflow run. Per-run entries always
+	// have a non-nil RunID.
+	RunID        *uuid.UUID
 	StageID      *uuid.UUID
 	Timestamp    time.Time
 	Category     string

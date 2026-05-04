@@ -139,7 +139,16 @@ func (a *auditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 	a.mu.Lock()
 	a.appended = append(a.appended, p)
 	a.mu.Unlock()
-	return &audit.Entry{ID: uuid.New(), RunID: p.RunID}, nil
+	rid := p.RunID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
+}
+
+func (a *auditFake) AppendGlobalChained(_ context.Context, _ audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("auditFake: AppendGlobalChained not used")
+}
+
+func (a *auditFake) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
+	return nil, errors.New("auditFake: ListGlobal not used")
 }
 func (a *auditFake) Get(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("auditFake: Get not used")

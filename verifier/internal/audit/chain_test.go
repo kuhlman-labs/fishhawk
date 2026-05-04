@@ -13,12 +13,13 @@ import (
 // verifier/internal/audit. If you change either implementation, the
 // other side's test must change too — that's the drift-detection
 // mechanism.
+var canonicalRunID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
 var canonicalFixture = struct {
 	in       HashInputs
 	wantHash string
 }{
 	in: HashInputs{
-		RunID:     uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+		RunID:     &canonicalRunID,
 		Timestamp: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
 		Category:  "plan_generated",
 		Payload:   json.RawMessage(`{"summary":"canonical"}`),

@@ -142,12 +142,19 @@ func (a *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 		return nil, a.appendErr
 	}
 	a.appended = append(a.appended, p)
-	return &audit.Entry{ID: uuid.New(), RunID: p.RunID}, nil
+	rid := p.RunID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
+}
+func (a *fakeAudit) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
 }
 func (a *fakeAudit) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, audit.ErrNotFound
 }
 func (a *fakeAudit) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
+func (a *fakeAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
 func (a *fakeAudit) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {

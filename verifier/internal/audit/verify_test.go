@@ -35,8 +35,9 @@ func makeChain(t *testing.T, runID uuid.UUID) []audit.Entry {
 	for i := range entries {
 		ts := now.Add(time.Duration(i) * time.Second)
 		payload := mkPayload(string(rune('a' + i)))
+		rid := runID
 		hash, err := audit.ComputeEntryHash(audit.HashInputs{
-			RunID:     runID,
+			RunID:     &rid,
 			Timestamp: ts,
 			Category:  "step",
 			Payload:   payload,
@@ -48,7 +49,7 @@ func makeChain(t *testing.T, runID uuid.UUID) []audit.Entry {
 		entries[i] = audit.Entry{
 			ID:        uuid.New(),
 			Sequence:  int64(i + 1),
-			RunID:     runID,
+			RunID:     &rid,
 			Timestamp: ts,
 			Category:  "step",
 			Payload:   payload,

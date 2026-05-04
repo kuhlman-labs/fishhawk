@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 )
 
 // apiTokenResponse mirrors the OpenAPI `ApiToken` schema. The
@@ -162,15 +163,15 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// logTokenEvent emits a structured slog line for token issuance /
+// logTokenEvent emits both a structured slog line and a chained
+// audit entry on the global chain (E2.7) for token issuance /
 // revocation. The plaintext is NEVER included — only the token id,
 // subject, and scopes.
 //
-// We don't write to the audit log because audit_entries enforces
-// run_id NOT NULL (chained per-run integrity); token events aren't
-// tied to a run. A future "global audit chain" feature can land
-// these as auditable rows; until then, structured logs are the
-// compliance trail. Tracked separately.
+// Audit append failures log a warning but don't unwind the token
+// state change: by this point the row is already created or
+// revoked. A missing audit row is a regression signal, not a
+// reason to keep the caller from completing the request.
 func (s *Server) logTokenEvent(r *http.Request, event string, tok *apitoken.Token, actor Identity) {
 	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, event,
 		slog.String("token_id", tok.ID.String()),
@@ -180,4 +181,31 @@ func (s *Server) logTokenEvent(r *http.Request, event string, tok *apitoken.Toke
 		slog.String("actor_token_id", actor.TokenID),
 		slog.String("request_id", RequestIDFrom(r.Context())),
 	)
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"token_id":       tok.ID.String(),
+		"subject":        tok.Subject,
+		"scopes":         tok.Scopes,
+		"actor":          actor.Subject,
+		"actor_token_id": actor.TokenID,
+		"request_id":     RequestIDFrom(r.Context()),
+	})
+	actorKind := audit.ActorUser
+	actorSubject := actor.Subject
+	if _, err := s.cfg.AuditRepo.AppendGlobalChained(r.Context(), audit.GlobalChainAppendParams{
+		Timestamp:    time.Now().UTC(),
+		Category:     event,
+		ActorKind:    &actorKind,
+		ActorSubject: &actorSubject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"audit append failed for token event",
+			slog.String("event", event),
+			slog.String("token_id", tok.ID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
