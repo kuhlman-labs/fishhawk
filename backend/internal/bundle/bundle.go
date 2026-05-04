@@ -1,0 +1,156 @@
+// Package bundle reads the *.jsonl.gz trace bundle wire format
+// produced by runner/internal/bundle. The runner's package owns
+// pack semantics; this package owns the read side, kept narrow to
+// what backend handlers actually need.
+//
+// We deliberately don't import the runner package: backend and
+// runner are separate Go modules, and the read-side surface is
+// small enough (~100 lines) that the duplication is cheaper than
+// promoting bundle to a shared module.
+//
+// The reader doesn't verify integrity — the trace upload handler
+// already verified the Ed25519 signature over the raw bundle bytes
+// before this package sees them. That signature commits to every
+// byte we're about to parse; a tamper between sig-verify and
+// extract is implausible without something like a library bug.
+package bundle
+
+import (
+	"bufio"
+	"compress/gzip"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
+)
+
+// EventKindGitDiff is the event the runner emits ahead of policy
+// evaluation. The backend's policy re-evaluation path reads from
+// this event rather than re-running git on the customer's filesystem
+// (which the backend doesn't have access to).
+const EventKindGitDiff = "git_diff"
+
+// Errors callers may want to switch on.
+var (
+	// ErrBadGzip means the bundle's gzip frame couldn't be opened
+	// (truncated, wrong magic). Distinct from a parse error so the
+	// upload handler can surface "your trace bundle is corrupt"
+	// rather than "your event stream is malformed."
+	ErrBadGzip = errors.New("bundle: gzip frame invalid")
+
+	// ErrNoDiffEvent means the bundle parsed cleanly but contained
+	// no git_diff event. Returned by ExtractDiff so the caller can
+	// distinguish "bundle had no diff" (skip policy re-eval) from
+	// "bundle was malformed."
+	ErrNoDiffEvent = errors.New("bundle: no git_diff event found")
+)
+
+// Line is the on-the-wire envelope for one JSONL line. Mirrors
+// the runner's bundle.Line shape; we redefine here to avoid the
+// cross-module import.
+type Line struct {
+	Seq       int             `json:"seq"`
+	Timestamp time.Time       `json:"ts"`
+	Kind      string          `json:"kind"`
+	Data      json.RawMessage `json:"data,omitempty"`
+}
+
+// gitDiffPayload mirrors the runner's payload struct exactly.
+// Adding fields requires both sides to agree.
+type gitDiffPayload struct {
+	Kind     string         `json:"kind"`
+	BaseRef  string         `json:"base_ref"`
+	Files    []gitDiffEntry `json:"files"`
+	NumFiles int            `json:"num_files"`
+}
+
+type gitDiffEntry struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+// ReadEvents decompresses bundleBytes and returns every JSONL line
+// (manifest, events, trailer) as a Line. Use ExtractDiff for the
+// policy re-eval path; this function is for tests / future readers.
+func ReadEvents(bundleBytes []byte) ([]Line, error) {
+	zr, err := gzip.NewReader(byteReader(bundleBytes))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadGzip, err)
+	}
+	defer func() { _ = zr.Close() }()
+
+	var out []Line
+	scanner := bufio.NewScanner(zr)
+	// Bundle lines can carry diffs / model output bigger than the
+	// default 64 KiB scanner buffer. Cap at 4 MiB per line, which
+	// is well over the practical event size and well under the
+	// bundle's overall MaxBundleBytes.
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		var line Line
+		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
+			return nil, fmt.Errorf("bundle: parse line: %w", err)
+		}
+		out = append(out, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("bundle: read: %w", err)
+	}
+	return out, nil
+}
+
+// ExtractDiff returns the policy.Diff carried in the bundle's
+// git_diff event, or ErrNoDiffEvent if the bundle didn't include
+// one. A bundle without a git_diff event isn't an error — the
+// backend's policy re-eval path treats that as "no diff to
+// evaluate; skip re-eval, proceed to awaiting_approval."
+func ExtractDiff(bundleBytes []byte) (policy.Diff, error) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return policy.Diff{}, err
+	}
+	for _, line := range lines {
+		if line.Kind != EventKindGitDiff {
+			continue
+		}
+		var payload gitDiffPayload
+		if err := json.Unmarshal(line.Data, &payload); err != nil {
+			return policy.Diff{}, fmt.Errorf("bundle: parse git_diff payload: %w", err)
+		}
+		out := policy.Diff{
+			ChangedFiles: make([]policy.ChangedFile, 0, len(payload.Files)),
+		}
+		for _, f := range payload.Files {
+			out.ChangedFiles = append(out.ChangedFiles, policy.ChangedFile{
+				Path:   f.Path,
+				Status: policy.Status(f.Status),
+			})
+		}
+		return out, nil
+	}
+	return policy.Diff{}, ErrNoDiffEvent
+}
+
+// byteReader is the smallest io.Reader over a []byte that
+// gzip.NewReader needs. Avoids pulling in bytes.Reader for one
+// line of glue.
+func byteReader(b []byte) io.Reader {
+	return &readerOverBytes{b: b}
+}
+
+type readerOverBytes struct {
+	b   []byte
+	off int
+}
+
+func (r *readerOverBytes) Read(p []byte) (int, error) {
+	if r.off >= len(r.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[r.off:])
+	r.off += n
+	return n, nil
+}

@@ -440,22 +440,33 @@ func enforceConstraints(cfg config) ([]agent.Event, error) {
 		}}, fmt.Errorf("constraints: %w", err)
 	}
 
+	// Emit a git_diff event ahead of policy evaluation so the
+	// backend can re-evaluate constraints independently (E3.13).
+	// The runner is operating on a customer machine; the backend's
+	// re-evaluation is the auditable source of truth for whether a
+	// stage's output passes policy.
+	diffEvent := makeGitDiffEvent(cfg.checkBaseRef, d)
+
 	violations := constraint.Evaluate(d, c)
 	if len(violations) == 0 {
-		return []agent.Event{{
-			Kind: "policy_event",
-			Payload: agent.MakePayload(map[string]any{
-				"check":         "constraints",
-				"outcome":       "valid",
-				"files_checked": len(d.ChangedFiles),
-			}),
-		}}, nil
+		return []agent.Event{
+			diffEvent,
+			{
+				Kind: "policy_event",
+				Payload: agent.MakePayload(map[string]any{
+					"check":         "constraints",
+					"outcome":       "valid",
+					"files_checked": len(d.ChangedFiles),
+				}),
+			},
+		}, nil
 	}
 
 	// One policy_event per violation keeps the bundle structured —
 	// audit consumers can group / filter by Constraint without
-	// parsing free-text.
-	var evs []agent.Event
+	// parsing free-text. The git_diff event leads so a single-pass
+	// backend reader can pull the file list before the violations.
+	evs := []agent.Event{diffEvent}
 	var summary []string
 	for _, v := range violations {
 		evs = append(evs, agent.Event{
@@ -471,6 +482,45 @@ func enforceConstraints(cfg config) ([]agent.Event, error) {
 		summary = append(summary, v.String())
 	}
 	return evs, fmt.Errorf("constraint violations: %s", strings.Join(summary, "; "))
+}
+
+// gitDiffFile mirrors constraint.ChangedFile but with json tags
+// pinned for the bundle's wire format. The backend's reader
+// decodes into the same shape.
+type gitDiffFile struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+// gitDiffPayload is the body of a git_diff event in the bundle.
+// `kind` lets a single bundle support multiple diff variants in
+// the future (e.g. base-vs-head, stage-vs-stage); for v0 it's
+// always "name_status" — the parsed `git diff --name-status`
+// output.
+type gitDiffPayload struct {
+	Kind     string        `json:"kind"`
+	BaseRef  string        `json:"base_ref"`
+	Files    []gitDiffFile `json:"files"`
+	NumFiles int           `json:"num_files"`
+}
+
+// makeGitDiffEvent converts a constraint.Diff into the bundle event
+// the backend's policy re-evaluation reads. Kind is "git_diff";
+// payload schema is gitDiffPayload (above).
+func makeGitDiffEvent(baseRef string, d constraint.Diff) agent.Event {
+	files := make([]gitDiffFile, 0, len(d.ChangedFiles))
+	for _, f := range d.ChangedFiles {
+		files = append(files, gitDiffFile{Path: f.Path, Status: string(f.Status)})
+	}
+	return agent.Event{
+		Kind: "git_diff",
+		Payload: agent.MakePayload(gitDiffPayload{
+			Kind:     "name_status",
+			BaseRef:  baseRef,
+			Files:    files,
+			NumFiles: len(files),
+		}),
+	}
 }
 
 // validatePlan reads the plan artifact at path and validates it

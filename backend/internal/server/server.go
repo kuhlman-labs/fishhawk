@@ -132,6 +132,10 @@ type Server struct {
 	// standing up a fake api.github.com. nil in production; the
 	// handler then resolves through cfg.GitHub.
 	promptIssueGetterOverride issueGetter
+
+	// traceWorkflowSpecOverride is the same test seam for the
+	// trace handler's policy re-eval path. nil in production.
+	traceWorkflowSpecOverride workflowSpecFetcher
 }
 
 // New builds a Server. It does not start listening; call Start.

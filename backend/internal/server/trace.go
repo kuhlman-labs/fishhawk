@@ -2,10 +2,12 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,8 +16,12 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
 
@@ -187,8 +193,21 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	// trace is already stored + audited; a stuck stage is
 	// surface-able via GET /v0/runs/{id}/stages and recoverable
 	// via a follow-up call once the orchestrator wraps this.
+	// Re-evaluate policy on the diff carried in the bundle. The
+	// runner already evaluated client-side; the backend's verdict
+	// is the auditable source of truth (per MVP_SPEC §4.4 +
+	// E3.13). On violations the stage transitions to failed-B
+	// instead of awaiting_approval.
+	policyPassed := true
 	if s.cfg.RunRepo != nil {
-		s.advanceStageAfterTrace(r, runID, stageID)
+		policyPassed = s.reEvaluatePolicy(r, runID, stageID, body)
+	}
+	if s.cfg.RunRepo != nil {
+		if policyPassed {
+			s.advanceStageAfterTrace(r, runID, stageID)
+		} else {
+			s.failStageCategoryB(r, runID, stageID, "policy violations on backend re-evaluation")
+		}
 	}
 
 	s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
@@ -223,6 +242,215 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
+	}
+}
+
+// reEvaluatePolicy is the backend's source-of-truth re-evaluation
+// of the closed-set constraints (E3.13). Returns true (policy
+// passed) when:
+//
+//   - the bundle has no git_diff event (older runner / stage type
+//     that doesn't produce a diff — skip re-eval, preserve existing
+//     awaiting_approval behavior)
+//   - the spec lookup fails (best-effort: we don't black-hole a
+//     stage because GitHub flapped, just log and proceed)
+//   - the stage type isn't in the parsed spec
+//   - constraints for this stage are empty (no policy applies)
+//   - EmitEvaluation returns no violations
+//
+// Returns false only when EmitEvaluation produces one or more
+// violations. The caller transitions the stage accordingly.
+//
+// EmitEvaluation writes its own chained policy_evaluated audit
+// entry; this helper doesn't audit on the skip paths because there's
+// nothing to evaluate.
+func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bundleBytes []byte) bool {
+	ctx := r.Context()
+	logger := s.cfg.Logger
+
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "policy: get stage failed",
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return true
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "policy: get run failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return true
+	}
+
+	diff, err := bundle.ExtractDiff(bundleBytes)
+	if err != nil {
+		if errors.Is(err, bundle.ErrNoDiffEvent) {
+			// Older runner or constraint-free stage: nothing to
+			// re-evaluate. Not an error.
+			return true
+		}
+		logger.LogAttrs(ctx, slog.LevelWarn, "policy: extract diff failed",
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return true
+	}
+
+	constraints, err := s.fetchStageConstraints(ctx, runRow, string(stage.Type))
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "policy: fetch constraints failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_type", string(stage.Type)),
+			slog.String("error", err.Error()))
+		return true
+	}
+	if isEmptyConstraints(constraints) {
+		// No constraints configured for this stage — nothing to
+		// fail; proceed to awaiting_approval.
+		return true
+	}
+
+	violations, err := policy.EmitEvaluation(ctx, s.cfg.AuditRepo,
+		runID, stageID, string(stage.Type), diff, constraints, nil)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "policy: emit evaluation failed",
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return true
+	}
+	return len(violations) == 0
+}
+
+// workflowSpecFetcher is the slice of githubclient.Client the
+// policy re-eval path consumes. Defining the interface here lets
+// tests substitute a stub without standing up a fake api.github.com.
+type workflowSpecFetcher interface {
+	GetWorkflowSpec(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, ref string) (*githubclient.FileContent, error)
+}
+
+// workflowSpecFetcher resolves the configured fetcher (test
+// override takes precedence over cfg.GitHub).
+func (s *Server) workflowSpecFetcher() workflowSpecFetcher {
+	if s.traceWorkflowSpecOverride != nil {
+		return s.traceWorkflowSpecOverride
+	}
+	if s.cfg.GitHub == nil {
+		return nil
+	}
+	return s.cfg.GitHub
+}
+
+// fetchStageConstraints fetches the workflow spec at the run's
+// pinned SHA, finds the workflow + stage definition, and merges the
+// stage's constraint list into a single policy.Constraints. Returns
+// a zero-value Constraints (no rules) when the stage has no
+// constraints block — the caller treats that as "no policy applies."
+func (s *Server) fetchStageConstraints(ctx context.Context, runRow *run.Run, stageType string) (policy.Constraints, error) {
+	github := s.workflowSpecFetcher()
+	if github == nil {
+		return policy.Constraints{}, errors.New("github client not configured")
+	}
+	if runRow.InstallationID == nil {
+		return policy.Constraints{}, errors.New("run missing installation_id")
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		return policy.Constraints{}, err
+	}
+
+	// Use the workflow_sha as the ref so we re-parse exactly the
+	// spec the dispatcher validated at run-create time. Stable
+	// across rebases of main.
+	ref := runRow.WorkflowSHA
+	if ref == "" {
+		ref = "main"
+	}
+	specFile, err := github.GetWorkflowSpec(ctx, *runRow.InstallationID, repo, ref)
+	if err != nil {
+		return policy.Constraints{}, fmt.Errorf("get workflow spec: %w", err)
+	}
+	parsed, err := spec.ParseBytes(specFile.Content)
+	if err != nil {
+		return policy.Constraints{}, fmt.Errorf("parse workflow spec: %w", err)
+	}
+
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return policy.Constraints{}, fmt.Errorf("workflow %q not in spec", runRow.WorkflowID)
+	}
+	for _, stg := range wf.Stages {
+		if string(stg.Type) == stageType {
+			return mergeConstraints(stg.Constraints), nil
+		}
+	}
+	return policy.Constraints{}, fmt.Errorf("stage_type %q not in workflow %q", stageType, runRow.WorkflowID)
+}
+
+// mergeConstraints folds the spec's []spec.Constraint (each entry a
+// single-rule object per the schema's maxProperties:1) into one
+// policy.Constraints. Repeated rules are unioned at the slice level
+// (forbidden_paths from multiple entries concatenate); scalar rules
+// (max_files_changed) take the most restrictive when more than one
+// is set.
+func mergeConstraints(in []spec.Constraint) policy.Constraints {
+	var out policy.Constraints
+	for _, c := range in {
+		if len(c.ForbiddenPaths) > 0 {
+			out.ForbiddenPaths = append(out.ForbiddenPaths, c.ForbiddenPaths...)
+		}
+		if len(c.AllowedPaths) > 0 {
+			out.AllowedPaths = append(out.AllowedPaths, c.AllowedPaths...)
+		}
+		if c.MaxFilesChanged > 0 {
+			if out.MaxFilesChanged == 0 || c.MaxFilesChanged < out.MaxFilesChanged {
+				out.MaxFilesChanged = c.MaxFilesChanged
+			}
+		}
+		if len(c.RequiredOutcomes) > 0 {
+			out.RequiredOutcomes = append(out.RequiredOutcomes, c.RequiredOutcomes...)
+		}
+	}
+	return out
+}
+
+func isEmptyConstraints(c policy.Constraints) bool {
+	return len(c.ForbiddenPaths) == 0 &&
+		len(c.AllowedPaths) == 0 &&
+		c.MaxFilesChanged == 0 &&
+		len(c.RequiredOutcomes) == 0
+}
+
+// failStageCategoryB transitions the stage to failed with category
+// B (constraint/policy violation per MVP_SPEC §6) and skips the
+// awaiting_approval path. The state machine requires
+// dispatched → running → failed, so we walk both transitions.
+// Failures here are logged but don't unwind — the policy_evaluated
+// audit entry is the primary signal; a stuck-at-running stage is
+// recoverable.
+func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, reason string) {
+	logger := s.cfg.Logger
+	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
+		run.StageStateRunning, nil); err != nil {
+		logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"trace upload: transition to running before fail-B failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	failureB := run.FailureB
+	reasonStr := reason
+	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
+		run.StageStateFailed, &run.StageCompletion{
+			FailureCategory: &failureB,
+			FailureReason:   &reasonStr,
+		}); err != nil {
+		logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"trace upload: transition to failed-B failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
 	}
 }
 
