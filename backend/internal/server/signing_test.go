@@ -17,6 +17,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
@@ -279,5 +281,265 @@ func TestIssueSigningKey_PrivateKeySigsVerifyAgainstPublic(t *testing.T) {
 	sig := ed25519.Sign(priv, msg)
 	if !ed25519.Verify(pub, msg, sig) {
 		t.Error("signature did not verify against returned public key")
+	}
+}
+
+// stubOIDCVerifier is the test seam for githuboidc.Verifier. Tests
+// drive the verdict (claims or error) through fields rather than
+// running real RSA verification — that's covered exhaustively in
+// the githuboidc package tests.
+type stubOIDCVerifier struct {
+	claims    *githuboidc.Claims
+	err       error
+	gotToken  string
+	gotExp    githuboidc.Expectations
+	callCount int
+}
+
+func (s *stubOIDCVerifier) Verify(_ context.Context, token string, exp githuboidc.Expectations) (*githuboidc.Claims, error) {
+	s.callCount++
+	s.gotToken = token
+	s.gotExp = exp
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.claims, nil
+}
+
+// fakeOIDCRunRepo provides GetRun for OIDC claim binding. Other
+// run.Repository methods panic so accidental calls are loud.
+type fakeOIDCRunRepo struct {
+	runRow *run.Run
+	getErr error
+}
+
+func (r *fakeOIDCRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	if r.getErr != nil {
+		return nil, r.getErr
+	}
+	if r.runRow != nil && r.runRow.ID == id {
+		return r.runRow, nil
+	}
+	return nil, run.ErrNotFound
+}
+func (r *fakeOIDCRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *fakeOIDCRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *fakeOIDCRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *fakeOIDCRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+func (r *fakeOIDCRunRepo) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+func (r *fakeOIDCRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+func (r *fakeOIDCRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+func (r *fakeOIDCRunRepo) TransitionStage(context.Context, uuid.UUID, run.StageState, *run.StageCompletion) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
+func newOIDCSigningServer(t *testing.T, verifier githuboidc.Verifier, runRepo run.Repository) *Server {
+	t.Helper()
+	return New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  newFakeSigningRepo(),
+		RunRepo:      runRepo,
+		OIDCVerifier: verifier,
+		OIDCAudience: "https://fishhawk.example.com",
+	})
+}
+
+func issueRequestWithAuth(t *testing.T, s *Server, runID uuid.UUID, authHeader string) *httptest.ResponseRecorder {
+	t.Helper()
+	url := fmt.Sprintf("/v0/runs/%s/signing-key", runID)
+	req := httptest.NewRequest(http.MethodPost, url, nil)
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+func TestIssueSigningKey_OIDC_HappyPath(t *testing.T) {
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{
+		runRow: &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change"},
+	}
+	verifier := &stubOIDCVerifier{
+		claims: &githuboidc.Claims{Repository: "kuhlman-labs/example", Workflow: "feature_change"},
+	}
+	s := newOIDCSigningServer(t, verifier, runRepo)
+
+	w := issueRequestWithAuth(t, s, runID, "Bearer eyJhbGciOiJSUzI1NiJ9.fake.signature")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if verifier.callCount != 1 {
+		t.Errorf("Verify called %d times, want 1", verifier.callCount)
+	}
+	if verifier.gotExp.Repository != "kuhlman-labs/example" {
+		t.Errorf("Expectations.Repository = %q", verifier.gotExp.Repository)
+	}
+	if verifier.gotExp.Workflow != "feature_change" {
+		t.Errorf("Expectations.Workflow = %q", verifier.gotExp.Workflow)
+	}
+	if verifier.gotExp.Audience != "https://fishhawk.example.com" {
+		t.Errorf("Expectations.Audience = %q", verifier.gotExp.Audience)
+	}
+	if verifier.gotToken != "eyJhbGciOiJSUzI1NiJ9.fake.signature" {
+		t.Errorf("token = %q", verifier.gotToken)
+	}
+}
+
+func TestIssueSigningKey_OIDC_MissingHeader(t *testing.T) {
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{runRow: &run.Run{ID: runID, Repo: "x/y", WorkflowID: "w"}}
+	s := newOIDCSigningServer(t, &stubOIDCVerifier{}, runRepo)
+
+	w := issueRequestWithAuth(t, s, runID, "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"oidc_missing"`) {
+		t.Errorf("body missing oidc_missing code: %s", w.Body.String())
+	}
+}
+
+func TestIssueSigningKey_OIDC_NonBearerScheme(t *testing.T) {
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{runRow: &run.Run{ID: runID, Repo: "x/y", WorkflowID: "w"}}
+	s := newOIDCSigningServer(t, &stubOIDCVerifier{}, runRepo)
+
+	w := issueRequestWithAuth(t, s, runID, "Basic dXNlcjpwYXNz")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"oidc_invalid"`) {
+		t.Errorf("body missing oidc_invalid: %s", w.Body.String())
+	}
+}
+
+func TestIssueSigningKey_OIDC_InvalidToken(t *testing.T) {
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{runRow: &run.Run{ID: runID, Repo: "x/y", WorkflowID: "w"}}
+	verifier := &stubOIDCVerifier{err: githuboidc.ErrInvalidToken}
+	s := newOIDCSigningServer(t, verifier, runRepo)
+
+	w := issueRequestWithAuth(t, s, runID, "Bearer bogus")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"oidc_invalid"`) {
+		t.Errorf("body missing oidc_invalid: %s", w.Body.String())
+	}
+}
+
+func TestIssueSigningKey_OIDC_TokenExpired(t *testing.T) {
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{runRow: &run.Run{ID: runID, Repo: "x/y", WorkflowID: "w"}}
+	verifier := &stubOIDCVerifier{err: githuboidc.ErrTokenExpired}
+	s := newOIDCSigningServer(t, verifier, runRepo)
+
+	w := issueRequestWithAuth(t, s, runID, "Bearer expired")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "expired") {
+		t.Errorf("body missing 'expired': %s", w.Body.String())
+	}
+}
+
+func TestIssueSigningKey_OIDC_ClaimMismatch(t *testing.T) {
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{runRow: &run.Run{ID: runID, Repo: "x/y", WorkflowID: "w"}}
+	verifier := &stubOIDCVerifier{err: githuboidc.ErrClaimMismatch}
+	s := newOIDCSigningServer(t, verifier, runRepo)
+
+	w := issueRequestWithAuth(t, s, runID, "Bearer mismatched")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "bind") {
+		t.Errorf("body missing 'bind': %s", w.Body.String())
+	}
+}
+
+func TestIssueSigningKey_OIDC_UnknownKID(t *testing.T) {
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{runRow: &run.Run{ID: runID, Repo: "x/y", WorkflowID: "w"}}
+	verifier := &stubOIDCVerifier{err: githuboidc.ErrUnknownKID}
+	s := newOIDCSigningServer(t, verifier, runRepo)
+
+	w := issueRequestWithAuth(t, s, runID, "Bearer rotated")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "unknown key") {
+		t.Errorf("body missing 'unknown key': %s", w.Body.String())
+	}
+}
+
+func TestIssueSigningKey_OIDC_RunNotFound(t *testing.T) {
+	runRepo := &fakeOIDCRunRepo{} // no runRow
+	verifier := &stubOIDCVerifier{}
+	s := newOIDCSigningServer(t, verifier, runRepo)
+
+	w := issueRequestWithAuth(t, s, uuid.New(), "Bearer something")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+	if verifier.callCount != 0 {
+		t.Errorf("Verifier shouldn't have been called when run lookup fails")
+	}
+}
+
+func TestIssueSigningKey_OIDC_NoVerifier_FallsBackOpen(t *testing.T) {
+	// Without a configured verifier the endpoint is unauthenticated
+	// (v0 self-execution posture). Useful for the demo and for dev,
+	// the operator opts into OIDC by wiring it.
+	repo := newFakeSigningRepo()
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: repo})
+	w := issueRequest(t, s, uuid.New(), nil)
+	if w.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201 (no verifier → unauthenticated)", w.Code)
+	}
+}
+
+func TestIssueSigningKey_OIDC_VerifierWithoutAudience(t *testing.T) {
+	runRepo := &fakeOIDCRunRepo{runRow: &run.Run{ID: uuid.New(), Repo: "x/y", WorkflowID: "w"}}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  newFakeSigningRepo(),
+		RunRepo:      runRepo,
+		OIDCVerifier: &stubOIDCVerifier{},
+		// OIDCAudience deliberately empty — config error
+	})
+	w := issueRequestWithAuth(t, s, runRepo.runRow.ID, "Bearer x")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+func TestIssueSigningKey_OIDC_VerifierWithoutRunRepo(t *testing.T) {
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  newFakeSigningRepo(),
+		OIDCVerifier: &stubOIDCVerifier{},
+		OIDCAudience: "https://fishhawk.example.com",
+		// RunRepo deliberately nil — config error
+	})
+	w := issueRequestWithAuth(t, s, uuid.New(), "Bearer x")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
 	}
 }
