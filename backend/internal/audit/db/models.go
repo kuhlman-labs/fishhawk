@@ -66,6 +66,17 @@ type Run struct {
 	InstallationID *int64             `json:"installation_id"`
 }
 
+type Session struct {
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	TokenHash         string             `json:"token_hash"`
+	IssuedAt          pgtype.Timestamptz `json:"issued_at"`
+	LastUsedAt        pgtype.Timestamptz `json:"last_used_at"`
+	SlidingExpiresAt  pgtype.Timestamptz `json:"sliding_expires_at"`
+	AbsoluteExpiresAt pgtype.Timestamptz `json:"absolute_expires_at"`
+	RevokedAt         pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type SigningKey struct {
 	RunID     uuid.UUID          `json:"run_id"`
 	PublicKey []byte             `json:"public_key"`
@@ -88,6 +99,16 @@ type Stage struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	GateSla         *string            `json:"gate_sla"`
+}
+
+type User struct {
+	ID           uuid.UUID          `json:"id"`
+	GithubUserID int64              `json:"github_user_id"`
+	GithubLogin  string             `json:"github_login"`
+	Name         string             `json:"name"`
+	Email        *string            `json:"email"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
 type WebhookDelivery struct {

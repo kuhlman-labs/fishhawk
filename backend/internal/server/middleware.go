@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 )
 
 // apitokenAuthenticator is the slice of apitoken.Repository
@@ -17,6 +18,13 @@ import (
 // a stub directly without pulling in the whole repository.
 type apitokenAuthenticator interface {
 	Authenticate(ctx context.Context, plaintext string) (*apitoken.Token, error)
+}
+
+// sessionAuthenticator is the slice of auth.Repository the
+// resolver uses for browser cookie-backed sessions. Same test-seam
+// convention as apitokenAuthenticator.
+type sessionAuthenticator interface {
+	Authenticate(ctx context.Context, plaintext string) (*auth.User, *auth.Session, error)
 }
 
 // ctxKey is unexported so callers must use the accessors below to
@@ -29,18 +37,24 @@ const (
 )
 
 // Identity is the authenticated principal for a request. Subject
-// is the only field every code path can rely on; TokenID + Scopes
-// are populated when the request authenticated via an API token,
-// and the OAuth-session path (E4.2) will fill TokenID with the
-// session id once it lands.
+// is the only field every code path can rely on. The other fields
+// vary by auth source:
 //
-// Subject "anonymous" means no auth header was presented (or the
-// presented credential didn't validate). Handlers that require an
+//   - Bearer-token (CLI) flow: TokenID + Scopes are set; UserID +
+//     SessionID stay empty.
+//   - Cookie session (browser, E4.2) flow: UserID + SessionID
+//     are set; Subject is "github:<login>"; TokenID + Scopes
+//     stay empty.
+//
+// Subject "anonymous" means no auth credential was presented (or
+// the presented one didn't validate). Handlers that require an
 // authenticated user check for that value and return 401.
 type Identity struct {
-	Subject string
-	TokenID string
-	Scopes  []string
+	Subject   string
+	TokenID   string
+	Scopes    []string
+	UserID    string
+	SessionID string
 }
 
 // IsAnonymous reports whether i represents an unauthenticated
@@ -152,35 +166,51 @@ func recovery(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// bearerAuth resolves Authorization: Bearer <fhk_...> tokens to an
-// Identity via the configured apitoken.Repository. Tokens that
-// don't match any active row, or whose strings don't have the
-// product prefix, fall through to the anonymous identity — the
-// middleware does NOT 401 on its own. Per-handler logic decides
-// whether anonymous is acceptable; this keeps the trace upload +
-// signing-key endpoints (which use their own auth schemes) from
-// being collateral-damaged.
+// bearerAuth resolves either a session cookie (browser flow,
+// E4.2) or an Authorization: Bearer <fhk_...> token (CLI flow,
+// E4.5) to an Identity. Tries the cookie first — if a browser is
+// somehow carrying both, the cookie wins because it's bound to
+// the user's GitHub identity rather than a long-lived secret.
+// Absent / invalid credentials fall through to the anonymous
+// identity; the middleware does NOT 401 on its own. Per-handler
+// logic decides whether anonymous is acceptable.
 //
-// repo is allowed to be nil — the bootstrap path can run without a
-// DB-backed token store, in which case every request is anonymous.
-//
-// The OAuth session path (E4.2) will layer on top of this: a
-// session cookie also resolves to a non-anonymous Identity. Both
-// auth methods set the same Identity shape so handlers don't need
-// to know which one ran.
-func bearerAuth(repo apitokenAuthenticator) func(http.Handler) http.Handler {
+// Either repo may be nil — the bootstrap path can run without
+// either backend, in which case the corresponding credential
+// never resolves.
+func bearerAuth(tokens apitokenAuthenticator, sessions sessionAuthenticator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id := Identity{Subject: "anonymous"}
-			if tok, ok := tokenFromHeader(r); ok && repo != nil {
-				if rec, err := repo.Authenticate(r.Context(), tok); err == nil {
-					id = Identity{
-						Subject: rec.Subject,
-						TokenID: rec.ID.String(),
-						Scopes:  append([]string(nil), rec.Scopes...),
+
+			// Cookie session first. Tied to a real GitHub user,
+			// so handlers that index on Subject get a stable
+			// "github:<login>" value.
+			if sessions != nil {
+				if c, err := r.Cookie(auth.SessionCookieName); err == nil && c.Value != "" {
+					if user, sess, err := sessions.Authenticate(r.Context(), c.Value); err == nil {
+						id = Identity{
+							Subject:   "github:" + user.GitHubLogin,
+							UserID:    user.ID,
+							SessionID: sess.ID,
+						}
 					}
 				}
 			}
+
+			// Bearer token, only if no session resolved.
+			if id.IsAnonymous() && tokens != nil {
+				if tok, ok := tokenFromHeader(r); ok {
+					if rec, err := tokens.Authenticate(r.Context(), tok); err == nil {
+						id = Identity{
+							Subject: rec.Subject,
+							TokenID: rec.ID.String(),
+							Scopes:  append([]string(nil), rec.Scopes...),
+						}
+					}
+				}
+			}
+
 			ctx := context.WithValue(r.Context(), ctxKeyIdentity, id)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

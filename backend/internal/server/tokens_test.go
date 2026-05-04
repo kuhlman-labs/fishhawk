@@ -322,7 +322,7 @@ func TestBearerAuth_ValidToken_ResolvesIdentity(t *testing.T) {
 	tok, _ := repo.Issue(context.Background(), "github:42", []string{"runs:read"})
 
 	var captured Identity
-	h := bearerAuth(repo)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := bearerAuth(repo, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -346,7 +346,7 @@ func TestBearerAuth_ValidToken_ResolvesIdentity(t *testing.T) {
 func TestBearerAuth_InvalidToken_FallsBackToAnonymous(t *testing.T) {
 	repo := newFakeTokenRepo()
 	var captured Identity
-	h := bearerAuth(repo)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := bearerAuth(repo, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -363,7 +363,7 @@ func TestBearerAuth_InvalidToken_FallsBackToAnonymous(t *testing.T) {
 func TestBearerAuth_NonBearerScheme_Anonymous(t *testing.T) {
 	repo := newFakeTokenRepo()
 	var captured Identity
-	h := bearerAuth(repo)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := bearerAuth(repo, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -377,7 +377,7 @@ func TestBearerAuth_NonBearerScheme_Anonymous(t *testing.T) {
 
 func TestBearerAuth_NilRepo_Anonymous(t *testing.T) {
 	var captured Identity
-	h := bearerAuth(nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := bearerAuth(nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)

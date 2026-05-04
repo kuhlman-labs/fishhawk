@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -71,6 +72,18 @@ func runServe(args []string, logSink io.Writer) int {
 	oidcJWKSURL := fs.String("oidc-jwks-url",
 		envOr("FISHHAWKD_OIDC_JWKS_URL", ""),
 		"override the JWKS URL (defaults to GitHub's published endpoint); useful for testing")
+	oauthClientID := fs.String("oauth-client-id",
+		envOr("FISHHAWKD_OAUTH_CLIENT_ID", ""),
+		"GitHub OAuth App client_id for the /v0/auth/* sign-in flow; empty disables the endpoints")
+	oauthClientSecret := fs.String("oauth-client-secret",
+		envOr("FISHHAWKD_OAUTH_CLIENT_SECRET", ""),
+		"GitHub OAuth App client_secret; required when --oauth-client-id is set")
+	oauthCallbackURL := fs.String("oauth-callback-url",
+		envOr("FISHHAWKD_OAUTH_CALLBACK_URL", ""),
+		"public URL of /v0/auth/github/callback; required when --oauth-client-id is set")
+	oauthRedirectAfterLogin := fs.String("oauth-redirect-after-login",
+		envOr("FISHHAWKD_OAUTH_REDIRECT_AFTER_LOGIN", "/"),
+		"URL the callback handler redirects to on successful sign-in (must be a relative path)")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -98,7 +111,8 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
 		cfg.APITokenRepo = apitoken.NewPostgresRepository(pool)
-		logger.Info("repositories configured (run + signing + audit + approval + artifact + apitoken)", slog.String("driver", "postgres"))
+		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
+		logger.Info("repositories configured (run + signing + audit + approval + artifact + apitoken + auth)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
 	}
@@ -248,6 +262,25 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Info("role resolver configured")
 	} else {
 		logger.Warn("role resolver not configured: approval handler will accept any authenticated subject")
+	}
+
+	// GitHub OAuth sign-in (E4.2). All three of client_id +
+	// client_secret + callback_url must be set; mismatched
+	// configuration logs an error and exits rather than running
+	// half-configured.
+	if *oauthClientID != "" || *oauthClientSecret != "" || *oauthCallbackURL != "" {
+		if *oauthClientID == "" || *oauthClientSecret == "" || *oauthCallbackURL == "" {
+			logger.Error("oauth misconfigured: --oauth-client-id, --oauth-client-secret, --oauth-callback-url must all be set")
+			return exitFailure
+		}
+		cfg.GitHubOAuth = authpkg.NewGitHubOAuth(
+			*oauthClientID, *oauthClientSecret, *oauthCallbackURL, authpkg.OAuthURLs{})
+		cfg.AuthRedirectAfterLogin = *oauthRedirectAfterLogin
+		logger.Info("github oauth sign-in configured",
+			slog.String("callback_url", *oauthCallbackURL),
+			slog.String("redirect_after_login", *oauthRedirectAfterLogin))
+	} else {
+		logger.Warn("FISHHAWKD_OAUTH_CLIENT_ID not set; /v0/auth/github/* endpoints respond 503")
 	}
 
 	srv := server.New(cfg)
