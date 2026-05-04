@@ -1,0 +1,102 @@
+# fishhawkd container build (E13.3 / #60).
+#
+# Triggered by push to main when backend code (or this workflow
+# itself) changes. Publishes:
+#   ghcr.io/kuhlman-labs/fishhawkd:main
+#   ghcr.io/kuhlman-labs/fishhawkd:sha-<short>
+#
+# Tagged releases use a separate workflow (backend-release.yml)
+# that mirrors the runner-release pattern: re-runs lint+tests at
+# the tag, signs the image, and publishes :vX.Y.Z + :latest.
+#
+# Both workflows produce the same image artifact + cosign
+# signature; the split is just about trigger semantics. Verify
+# downstream:
+#
+#   cosign verify ghcr.io/kuhlman-labs/fishhawkd:<tag> \
+#     --certificate-identity-regexp '\.github/workflows/backend-(build|release)\.yml@.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+name: Backend Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'go.work'
+      - 'go.work.sum'
+      - 'runner/go.mod'
+      - 'runner/go.sum'
+      - 'cli/go.mod'
+      - 'cli/go.sum'
+      - 'verifier/go.mod'
+      - 'verifier/go.sum'
+      - '.github/workflows/backend-build.yml'
+      - '.dockerignore'
+
+permissions:
+  contents: read
+  packages: write    # push to ghcr.io
+  id-token: write    # cosign keyless signing via GitHub OIDC
+
+jobs:
+  build-and-push:
+    name: Build, sign, and push fishhawkd image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/kuhlman-labs/fishhawkd
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=fishhawkd
+            org.opencontainers.image.description=Fishhawk backend control plane.
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=sha-${{ github.sha }}
+          cache-from: type=gha,scope=backend-build
+          cache-to: type=gha,mode=max,scope=backend-build
+          provenance: true
+          sbom: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          # Sign by digest so the signature stays attached to the
+          # exact image bytes — re-tagging doesn't break verify.
+          cosign sign --yes "ghcr.io/kuhlman-labs/fishhawkd@${DIGEST}"
