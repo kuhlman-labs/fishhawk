@@ -172,6 +172,72 @@ func (c *Client) GetWorkflowSpec(ctx context.Context, installationID int64, repo
 	return c.GetFile(ctx, installationID, repo, WorkflowSpecPath, ref)
 }
 
+// Issue is the slice of an issue payload Fishhawk surfaces for
+// prompt construction. We deliberately don't expose the full
+// GitHub Issue type — adding fields here is opt-in as new prompt
+// templates need them.
+type Issue struct {
+	Number int
+	Title  string
+	Body   string
+	State  string
+}
+
+// GetIssue fetches a single issue by number.
+//
+//	GET /repos/{owner}/{repo}/issues/{number}
+//
+// Used by the prompt-construction handler to build the
+// agent-facing prompt from the originating issue. Returns
+// ErrNotFound if the issue or repo isn't visible to the
+// installation.
+func (c *Client) GetIssue(ctx context.Context, installationID int64, repo RepoRef, number int) (*Issue, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: issue number must be > 0")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/issues/" + url.PathEscape(fmt.Sprintf("%d", number)))
+
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: get issue: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("get issue", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		Body   string `json:"body"`
+		State  string `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode issue: %w", err)
+	}
+	return &Issue{
+		Number: body.Number,
+		Title:  body.Title,
+		Body:   body.Body,
+		State:  body.State,
+	}, nil
+}
+
 // DispatchInputs is the JSON body of a workflow_dispatch event.
 // Per GitHub's contract, inputs is a flat map[string]string —
 // non-string values must be JSON-encoded by the caller.
