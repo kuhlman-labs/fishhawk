@@ -79,3 +79,8 @@ type Stage struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	GateSla         *string            `json:"gate_sla"`
 }
+
+type WebhookDelivery struct {
+	DeliveryID string             `json:"delivery_id"`
+	ReceivedAt pgtype.Timestamptz `json:"received_at"`
+}
