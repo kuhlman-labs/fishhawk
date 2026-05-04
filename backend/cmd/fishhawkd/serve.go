@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -95,7 +96,8 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.AuditRepo = audit.NewPostgresRepository(pool)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
-		logger.Info("repositories configured (run + signing + audit + approval + artifact)", slog.String("driver", "postgres"))
+		cfg.APITokenRepo = apitoken.NewPostgresRepository(pool)
+		logger.Info("repositories configured (run + signing + audit + approval + artifact + apitoken)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
 	}

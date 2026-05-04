@@ -69,4 +69,14 @@ Optional flags:
 - `--oidc-audience` (or `FISHHAWKD_OIDC_AUDIENCE`) — turn on GitHub Actions OIDC verification on the signing-key endpoint. Callers must present a `Bearer` token whose `aud` claim matches this value, and whose `repository` + `workflow` claims bind to the path's run. Unset = endpoint accepts any caller (v0 self-execution posture; not safe for production).
 - `--oidc-jwks-url` — override the JWKS endpoint. Defaults to GitHub's published URL; useful for testing.
 
+### Bootstrapping API tokens
+
+`/v0/tokens` requires an authenticated identity to mint a new token (a chicken-and-egg). For the first token, use the CLI:
+
+```sh
+fishhawkd token issue --subject github:42 --scopes runs:read,runs:write
+```
+
+The plaintext is printed to stdout exactly once (suitable for `... | head -n1`); only the sha256 hash is stored. Subsequent tokens can be minted via `POST /v0/tokens` once you have one bearer in hand.
+
 Larger context: `docs/MVP_SPEC.md` §5.1.1 (component) and §5.2 (execution flow); `docs/ARCHITECTURE.md` §4–§6 for the workflow lifecycle, storage model, and invariants.

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -119,6 +120,13 @@ type Config struct {
 	// (typically the backend's external URL). Empty when
 	// OIDCVerifier is nil.
 	OIDCAudience string
+
+	// APITokenRepo persists and authenticates scoped bearer
+	// tokens for the CLI / UI surfaces. Wired by the
+	// /v0/tokens handlers; nil leaves them returning 503 and
+	// `Authorization: Bearer <fhk_…>` requests resolving to the
+	// anonymous identity.
+	APITokenRepo apitoken.Repository
 }
 
 // Server wraps an http.Server with the routes and middleware stack
@@ -188,17 +196,22 @@ func (s *Server) Shutdown(ctx context.Context) error {
 //
 // Middleware order, outermost first:
 //
-//	recovery → requestID → logging → authStub → mux
+//	recovery → requestID → logging → bearerAuth → mux
 //
 // Recovery is outermost so panics in any later layer become 500s.
 // Request ID is set before logging so log lines can carry it. Auth
 // runs after logging so the request is logged even if auth rejects.
+//
+// bearerAuth resolves Authorization: Bearer fhk_… tokens via the
+// configured APITokenRepo; absent / invalid bearer headers fall
+// through to the anonymous Identity and individual handlers
+// decide whether anonymous is acceptable.
 func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
 	var h http.Handler = mux
-	h = authStub(h)
+	h = bearerAuth(s.cfg.APITokenRepo)(h)
 	h = logging(s.cfg.Logger)(h)
 	h = requestID(h)
 	h = recovery(s.cfg.Logger)(h)

@@ -8,6 +8,16 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type ApiToken struct {
+	ID         pgtype.UUID        `json:"id"`
+	Subject    string             `json:"subject"`
+	TokenHash  string             `json:"token_hash"`
+	Scopes     []string           `json:"scopes"`
+	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type Approval struct {
 	ID              pgtype.UUID        `json:"id"`
 	StageID         pgtype.UUID        `json:"stage_id"`
