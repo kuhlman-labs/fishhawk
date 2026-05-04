@@ -38,13 +38,22 @@ type fakeBackend struct {
 	receivedSig   string
 	receivedQuery string
 	calls         int
+
+	// prompt handler config
+	promptStatus       int
+	promptBody         string // canned response body; if empty, default JSON is built
+	promptErrCount     int
+	promptReceivedSig  string
+	promptReceivedPath string
+	promptCalls        int
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
-		issueStatus: http.StatusCreated,
-		shipStatus:  http.StatusAccepted,
+		issueStatus:  http.StatusCreated,
+		shipStatus:   http.StatusAccepted,
+		promptStatus: http.StatusOK,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", func(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +105,35 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 				StageID:     r.URL.Query().Get("stage_id"),
 				Variant:     r.URL.Query().Get("variant"),
 				ContentHash: hex.EncodeToString(func() []byte { d := sha256.Sum256(raw); return d[:] }()),
+			})
+		} else if body != "" {
+			_, _ = io.WriteString(w, body)
+		}
+	})
+	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.promptCalls++
+		if fb.promptErrCount > 0 {
+			fb.promptErrCount--
+			fb.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		s := fb.promptStatus
+		body := fb.promptBody
+		fb.promptReceivedSig = r.Header.Get("X-Fishhawk-Signature")
+		fb.promptReceivedPath = r.URL.Path
+		fb.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(s)
+		if s == http.StatusOK && body == "" {
+			stageID := r.PathValue("stage_id")
+			_ = json.NewEncoder(w).Encode(FetchedPrompt{
+				StageID:    stageID,
+				StageType:  "implement",
+				Prompt:     "test prompt body",
+				PromptHash: hex.EncodeToString(func() []byte { d := sha256.Sum256([]byte("test prompt body")); return d[:] }()),
 			})
 		} else if body != "" {
 			_, _ = io.WriteString(w, body)
@@ -367,6 +405,135 @@ func TestShipTrace_RejectsBadKey(t *testing.T) {
 	_, err := c.ShipTrace(context.Background(), ShipArgs{
 		RunID: "r", StageID: "s", Variant: "raw",
 		Bundle: []byte("b"), PrivateKey: ed25519.PrivateKey{0x01},
+	})
+	if err == nil || !strings.Contains(err.Error(), "private key") {
+		t.Errorf("err = %v, want private key length error", err)
+	}
+}
+
+func TestFetchPrompt_HappyPath(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.StageID != "stage-abc" {
+		t.Errorf("StageID = %q", got.StageID)
+	}
+	if got.StageType != "implement" {
+		t.Errorf("StageType = %q", got.StageType)
+	}
+	if got.Prompt == "" {
+		t.Error("Prompt empty")
+	}
+	if len(got.PromptHash) != 64 {
+		t.Errorf("PromptHash len = %d", len(got.PromptHash))
+	}
+
+	// Path was stage-bound; signature was sent.
+	if fb.promptReceivedPath != "/v0/stages/stage-abc/prompt" {
+		t.Errorf("path = %q", fb.promptReceivedPath)
+	}
+	if fb.promptReceivedSig == "" {
+		t.Error("X-Fishhawk-Signature missing")
+	}
+
+	// Signature should verify against the canonical message bytes.
+	digest := sha256.Sum256([]byte("prompt:stage-abc"))
+	sigBytes, decErr := hex.DecodeString(fb.promptReceivedSig)
+	if decErr != nil {
+		t.Fatal(decErr)
+	}
+	if !ed25519.Verify(priv.Public().(ed25519.PublicKey), digest[:], sigBytes) {
+		t.Error("signature does not verify against canonical message")
+	}
+}
+
+func TestFetchPrompt_SignatureRejected(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptStatus = http.StatusUnauthorized
+	fb.promptBody = `{"code":"signature_invalid"}`
+	c := quickClient(srv)
+
+	_, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID: "s", PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrSignatureRejected) {
+		t.Errorf("err = %v, want ErrSignatureRejected", err)
+	}
+}
+
+func TestFetchPrompt_NotFound(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptStatus = http.StatusNotFound
+	c := quickClient(srv)
+
+	_, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID: "s", PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestFetchPrompt_UnsupportedStage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptStatus = http.StatusNotImplemented
+	c := quickClient(srv)
+
+	_, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID: "s", PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrUnsupportedStage) {
+		t.Errorf("err = %v, want ErrUnsupportedStage", err)
+	}
+}
+
+func TestFetchPrompt_RetriesOn5xx(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptErrCount = 2 // two 500s, then OK
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID: "s", PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.Prompt == "" {
+		t.Error("Prompt empty after retry success")
+	}
+	if fb.promptCalls != 3 {
+		t.Errorf("expected 3 calls (2 retries + success), got %d", fb.promptCalls)
+	}
+}
+
+func TestFetchPrompt_RejectsEmptyStageID(t *testing.T) {
+	c := New("http://nowhere")
+	_, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "",
+		PrivateKey: make(ed25519.PrivateKey, ed25519.PrivateKeySize),
+	})
+	if err == nil || !strings.Contains(err.Error(), "stage id") {
+		t.Errorf("err = %v, want stage id error", err)
+	}
+}
+
+func TestFetchPrompt_RejectsBadKey(t *testing.T) {
+	c := New("http://nowhere")
+	_, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "s",
+		PrivateKey: ed25519.PrivateKey{0x01},
 	})
 	if err == nil || !strings.Contains(err.Error(), "private key") {
 		t.Errorf("err = %v, want private key length error", err)
