@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -127,6 +128,15 @@ type Config struct {
 	// `Authorization: Bearer <fhk_…>` requests resolving to the
 	// anonymous identity.
 	APITokenRepo apitoken.Repository
+
+	// RoleResolver expands `@org/team` references in the workflow
+	// spec to a GitHub-login allowlist and decides whether an
+	// approver subject is authorized for a gate. Wired by the
+	// approval handler. Nil leaves approval submissions
+	// authorization-checked only by Identity (any authenticated
+	// caller can approve), which is acceptable for the v0 demo
+	// loop but NOT safe for production.
+	RoleResolver *role.Resolver
 }
 
 // Server wraps an http.Server with the routes and middleware stack

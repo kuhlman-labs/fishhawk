@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // approvalRequest mirrors POST /v0/stages/{stage_id}/approvals's
@@ -65,9 +68,11 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Identity comes from the authStub middleware until E4 lands
-	// real auth. The stub returns "anonymous" — captured verbatim
-	// in the approval record so future audits can see the gap.
+	// Identity is set by the bearerAuth middleware (E4.5).
+	// Anonymous callers can't approve once the demo loop is past
+	// the bootstrap phase; in v0 we still accept anonymous
+	// submissions and tag them so the audit trail is honest about
+	// who acted (or didn't).
 	ident := IdentityFrom(r.Context())
 	subject := ident.Subject
 	if subject == "" {
@@ -91,6 +96,14 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"get stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Authorization: when a RoleResolver is wired, the subject
+	// must be in the gate's approvers list. Without the resolver,
+	// any authenticated subject can approve — the v0 demo posture
+	// before role resolution lands. See E4.4 (#50).
+	if !s.checkApproverAuthorization(w, r, stage, subject) {
 		return
 	}
 
@@ -173,6 +186,134 @@ func (s *Server) advanceStage(r *http.Request, stageID uuid.UUID, decision appro
 	}
 	// Unreachable — decision was validated earlier.
 	return nil, errors.New("approval: unknown decision (programmer error)")
+}
+
+// checkApproverAuthorization returns true when subject is allowed
+// to act on the stage's gate. Returns false (and writes a 403 / 500
+// response) on denial. With no RoleResolver configured the function
+// returns true — any authenticated caller can approve. That's the
+// v0 demo posture; production deployments wire a Resolver and a
+// real subject (GitHub login).
+//
+// "Allowed" means: the stage's first approval gate's approvers
+// resolve (via spec roles + GitHub teams) to a set that includes
+// subject. For all_of-style approvers, every named role must
+// contain subject.
+//
+// Lookups (spec fetch, team fetch) happen on the request path.
+// Spec fetch is one GitHub API call; team membership is cached by
+// the resolver. Acceptable for v0 traffic; a follow-up can move
+// the spec parse into a per-run cache.
+func (s *Server) checkApproverAuthorization(w http.ResponseWriter, r *http.Request, stage *run.Stage, subject string) bool {
+	if s.cfg.RoleResolver == nil {
+		return true
+	}
+	if s.cfg.RunRepo == nil || s.workflowSpecFetcher() == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "approver_check_unconfigured",
+			"role-based approver check requires RunRepo and GitHub client", nil)
+		return false
+	}
+
+	gate, err := s.fetchGateForStage(r.Context(), stage)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"approval: fetch gate failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		// Best-effort: a spec fetch failure shouldn't black-hole
+		// approvals during a GitHub flap. Allow the submission
+		// and let the trail through writeApprovalAudit reflect
+		// reality. Operators with stricter budgets can flip a
+		// follow-up flag once the spec-cache work lands.
+		return true
+	}
+	if gate == nil || gate.approvers == nil {
+		// Stage isn't gated by approval (gate type=check or no
+		// gates). Submit-anyway is consistent with the v0 demo
+		// where every agent stage carries an implicit approval.
+		return true
+	}
+
+	allowed, err := s.cfg.RoleResolver.CanApprove(r.Context(), gate.installationID, gate.approvers, gate.roles, subject)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"approval: role resolution failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("subject", subject),
+			slog.String("error", err.Error()),
+		)
+		// Same best-effort posture: don't lock up the gate when
+		// upstream is flaky.
+		return true
+	}
+	if !allowed {
+		s.writeError(w, r, http.StatusForbidden, "approver_not_authorized",
+			"subject is not in the gate's approvers list",
+			map[string]any{"subject": subject})
+		return false
+	}
+	return true
+}
+
+// gateContext carries the bits of the workflow spec the role
+// check needs: the gate's approvers, the spec's roles map, and
+// the run's installation_id (so the resolver can reach GitHub).
+type gateContext struct {
+	approvers      *spec.Approvers
+	roles          map[string]spec.Role
+	installationID int64
+}
+
+// fetchGateForStage fetches the workflow spec at the stage's
+// run.WorkflowSHA and returns the gate context. Returns
+// (nil, nil) when the stage exists in the spec but has no
+// approval gate.
+func (s *Server) fetchGateForStage(ctx context.Context, stage *run.Stage) (*gateContext, error) {
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil {
+		return nil, fmt.Errorf("get run: %w", err)
+	}
+	if runRow.InstallationID == nil {
+		return nil, errors.New("run missing installation_id")
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		return nil, err
+	}
+	ref := runRow.WorkflowSHA
+	if ref == "" {
+		ref = "main"
+	}
+	specFile, err := s.workflowSpecFetcher().GetWorkflowSpec(ctx, *runRow.InstallationID, repo, ref)
+	if err != nil {
+		return nil, fmt.Errorf("get workflow spec: %w", err)
+	}
+	parsed, err := spec.ParseBytes(specFile.Content)
+	if err != nil {
+		return nil, fmt.Errorf("parse workflow spec: %w", err)
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return nil, fmt.Errorf("workflow %q not in spec", runRow.WorkflowID)
+	}
+	for _, stg := range wf.Stages {
+		if string(stg.Type) != string(stage.Type) {
+			continue
+		}
+		for _, gate := range stg.Gates {
+			if gate.Type == spec.GateTypeApproval && gate.Approvers != nil {
+				return &gateContext{
+					approvers:      gate.Approvers,
+					roles:          parsed.Roles,
+					installationID: *runRow.InstallationID,
+				}, nil
+			}
+		}
+		// Stage exists but has no approval gate.
+		return &gateContext{roles: parsed.Roles, installationID: *runRow.InstallationID}, nil
+	}
+	return nil, fmt.Errorf("stage_type %q not in workflow %q", stage.Type, runRow.WorkflowID)
 }
 
 // writeApprovalAudit appends an entry tying the decision to the
