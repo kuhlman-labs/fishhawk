@@ -1,6 +1,8 @@
-import { NavLink, Outlet } from 'react-router';
-import { ListChecks, ScrollText } from 'lucide-react';
+import { NavLink, Outlet, useNavigate } from 'react-router';
+import { ListChecks, LogOut, ScrollText } from 'lucide-react';
 import { cn } from '@/lib/cn';
+import { Button } from '@/components/ui/button';
+import { useAuth } from '@/auth/use-auth';
 
 const navItems = [
   { to: '/runs', label: 'Runs', icon: ListChecks },
@@ -8,9 +10,17 @@ const navItems = [
 ];
 
 export function Root() {
+  const { user, signOut } = useAuth();
+  const navigate = useNavigate();
+
+  async function handleSignOut() {
+    await signOut();
+    navigate('/login', { replace: true });
+  }
+
   return (
     <div className="grid min-h-full grid-cols-[14rem_1fr]">
-      <aside className="border-r border-neutral-200 bg-neutral-100 px-3 py-4 dark:border-neutral-800 dark:bg-neutral-900">
+      <aside className="flex flex-col border-r border-neutral-200 bg-neutral-100 px-3 py-4 dark:border-neutral-800 dark:bg-neutral-900">
         <div className="px-2 pb-4 font-mono text-sm font-semibold tracking-tight">fishhawk</div>
         <nav className="flex flex-col gap-1">
           {navItems.map(({ to, label, icon: Icon }) => (
@@ -32,6 +42,25 @@ export function Root() {
             </NavLink>
           ))}
         </nav>
+        <div className="mt-auto space-y-2 border-t border-neutral-200 pt-3 dark:border-neutral-800">
+          {user && (
+            <div className="px-2 text-xs text-neutral-600 dark:text-neutral-400">
+              <div className="truncate font-medium text-neutral-800 dark:text-neutral-200">
+                {user.name || user.github_login}
+              </div>
+              <div className="truncate">@{user.github_login}</div>
+            </div>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="w-full justify-start"
+            onClick={handleSignOut}
+          >
+            <LogOut className="size-4" aria-hidden />
+            <span>Sign out</span>
+          </Button>
+        </div>
       </aside>
       <main className="px-8 py-6">
         <Outlet />
