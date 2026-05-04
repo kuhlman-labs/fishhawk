@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -104,6 +105,20 @@ type Config struct {
 	// workflow_dispatch). Built on top of GitHubTokens. Nil when
 	// GitHubTokens is nil.
 	GitHub *githubclient.Client
+
+	// OIDCVerifier authenticates GitHub Actions OIDC tokens on
+	// the signing-key endpoint per `githubOIDC` in the OpenAPI
+	// spec. Nil leaves the endpoint open (the v0 self-execution
+	// posture); the operator opts in by wiring githuboidc.New().
+	// When set, OIDCAudience MUST also be set.
+	OIDCVerifier githuboidc.Verifier
+
+	// OIDCAudience is the `aud` claim Verifier expects on tokens.
+	// Customers configure their workflow's
+	// `id-token: write` step to mint tokens with this audience
+	// (typically the backend's external URL). Empty when
+	// OIDCVerifier is nil.
+	OIDCAudience string
 }
 
 // Server wraps an http.Server with the routes and middleware stack

@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
@@ -41,13 +44,14 @@ const (
 
 // handleIssueSigningKey implements POST /v0/runs/{run_id}/signing-key.
 //
-// AUTH NOTE: per the OpenAPI contract this endpoint requires a
-// GitHub Actions OIDC token. v0 self-execution ships without OIDC
-// verification — the security boundary is currently "the run_id is
-// a UUIDv7 the caller had to learn from the dispatch path." Proper
-// OIDC verification (JWKS fetch, JWT verify, claim binding to
-// repository + workflow) is tracked separately; until it lands,
-// callers can sign for any run_id they know.
+// AUTH: per the OpenAPI contract this endpoint requires a GitHub
+// Actions OIDC token (E3.10). The configured Verifier validates
+// the JWT signature against GitHub's JWKS and binds the token's
+// `repository` + `workflow` claims to the path's run_id. When no
+// Verifier is wired (cfg.OIDCVerifier == nil) the endpoint falls
+// back to "the run_id is a UUIDv7 the caller had to learn from
+// the dispatch path" — the v0 self-execution posture. Operators
+// flip OIDC on for any non-toy deploy.
 func (s *Server) handleIssueSigningKey(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.SigningRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "signing_repo_unconfigured",
@@ -60,6 +64,10 @@ func (s *Server) handleIssueSigningKey(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"run_id must be a valid UUID",
 			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
+		return
+	}
+
+	if !s.verifyOIDC(w, r, runID) {
 		return
 	}
 
@@ -108,4 +116,91 @@ func (s *Server) handleIssueSigningKey(w http.ResponseWriter, r *http.Request) {
 		IssuedAt:   issued.IssuedAt,
 		ExpiresAt:  issued.ExpiresAt,
 	})
+}
+
+// verifyOIDC validates the Authorization: Bearer <jwt> header
+// against the configured Verifier. Binds the token's repository +
+// workflow claims to the path's run_id by looking up the run.
+//
+// Returns true on success. On failure writes the appropriate 401
+// or 503 response and returns false so the caller short-circuits.
+//
+// When cfg.OIDCVerifier is nil the check is skipped — that's the
+// v0 self-execution posture where the only auth is "the run_id is
+// hard to guess." Operators wiring OIDC also wire RunRepo so the
+// claim-binding lookup is available.
+func (s *Server) verifyOIDC(w http.ResponseWriter, r *http.Request, runID uuid.UUID) bool {
+	if s.cfg.OIDCVerifier == nil {
+		return true
+	}
+	if s.cfg.OIDCAudience == "" {
+		s.writeError(w, r, http.StatusServiceUnavailable, "oidc_misconfigured",
+			"OIDCVerifier set without OIDCAudience", nil)
+		return false
+	}
+	if s.cfg.RunRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "oidc_misconfigured",
+			"OIDC verification requires RunRepo to be configured for claim binding", nil)
+		return false
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		s.writeError(w, r, http.StatusUnauthorized, "oidc_missing",
+			"Authorization: Bearer <github-oidc-token> required", nil)
+		return false
+	}
+	const bearerPrefix = "Bearer "
+	if !strings.HasPrefix(authHeader, bearerPrefix) {
+		s.writeError(w, r, http.StatusUnauthorized, "oidc_invalid",
+			"Authorization header must use Bearer scheme", nil)
+		return false
+	}
+	rawToken := strings.TrimPrefix(authHeader, bearerPrefix)
+
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "run_not_found",
+				"no run with that id", map[string]any{"run_id": runID.String()})
+			return false
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get run failed", map[string]any{"error": err.Error()})
+		return false
+	}
+
+	exp := githuboidc.Expectations{
+		Audience:   s.cfg.OIDCAudience,
+		Repository: runRow.Repo,
+		Workflow:   runRow.WorkflowID,
+		AllowedEvents: []string{
+			"issues",
+			"issue_comment",
+			"workflow_dispatch",
+			"pull_request",
+		},
+	}
+	if _, err := s.cfg.OIDCVerifier.Verify(r.Context(), rawToken, exp); err != nil {
+		switch {
+		case errors.Is(err, githuboidc.ErrTokenExpired):
+			s.writeError(w, r, http.StatusUnauthorized, "oidc_invalid",
+				"OIDC token expired or not yet valid",
+				map[string]any{"error": err.Error()})
+		case errors.Is(err, githuboidc.ErrUnknownKID):
+			s.writeError(w, r, http.StatusUnauthorized, "oidc_invalid",
+				"OIDC token signed by unknown key",
+				map[string]any{"error": err.Error()})
+		case errors.Is(err, githuboidc.ErrClaimMismatch):
+			s.writeError(w, r, http.StatusUnauthorized, "oidc_invalid",
+				"OIDC token claims don't bind to this run",
+				map[string]any{"error": err.Error()})
+		default:
+			s.writeError(w, r, http.StatusUnauthorized, "oidc_invalid",
+				"OIDC token verification failed",
+				map[string]any{"error": err.Error()})
+		}
+		return false
+	}
+	return true
 }

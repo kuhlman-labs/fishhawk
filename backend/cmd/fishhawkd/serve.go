@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -62,6 +63,12 @@ func runServe(args []string, logSink io.Writer) int {
 	slaInterval := fs.Duration("sla-interval",
 		60*time.Second,
 		"SLA ticker scan interval; 60s default fits hour-grained SLAs comfortably")
+	oidcAudience := fs.String("oidc-audience",
+		envOr("FISHHAWKD_OIDC_AUDIENCE", ""),
+		"GitHub Actions OIDC audience the signing-key endpoint requires; when set, callers must present a valid id_token whose aud matches this value")
+	oidcJWKSURL := fs.String("oidc-jwks-url",
+		envOr("FISHHAWKD_OIDC_JWKS_URL", ""),
+		"override the JWKS URL (defaults to GitHub's published endpoint); useful for testing")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -173,6 +180,27 @@ func runServe(args []string, logSink io.Writer) int {
 			Logger: logger,
 		}
 		logger.Info("stage orchestrator configured")
+	}
+
+	// OIDC verification on the signing-key endpoint. Off when no
+	// audience is configured — that's the v0 self-execution
+	// posture. With an audience, every signing-key request must
+	// carry a GitHub-signed JWT whose claims bind to the run's
+	// repo + workflow_id.
+	if *oidcAudience != "" {
+		if *oidcJWKSURL != "" {
+			cfg.OIDCVerifier = githuboidc.NewWithJWKSURL(*oidcJWKSURL)
+			logger.Info("OIDC verifier configured (custom JWKS URL)",
+				slog.String("audience", *oidcAudience),
+				slog.String("jwks_url", *oidcJWKSURL))
+		} else {
+			cfg.OIDCVerifier = githuboidc.New()
+			logger.Info("OIDC verifier configured",
+				slog.String("audience", *oidcAudience))
+		}
+		cfg.OIDCAudience = *oidcAudience
+	} else {
+		logger.Warn("FISHHAWKD_OIDC_AUDIENCE not set; signing-key endpoint accepts unauthenticated requests")
 	}
 
 	// GitHub App installation-token provider. Both ID and key file
