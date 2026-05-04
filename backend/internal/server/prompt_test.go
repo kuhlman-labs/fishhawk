@@ -64,6 +64,9 @@ func (r *promptRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error
 func (r *promptRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *promptRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
 func (r *promptRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }

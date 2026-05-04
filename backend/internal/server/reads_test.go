@@ -53,6 +53,9 @@ func (r *stagesRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Ru
 func (r *stagesRunRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *stagesRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
 func (r *stagesRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }

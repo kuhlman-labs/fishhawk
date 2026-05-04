@@ -55,6 +55,9 @@ func (r *approvalGateRunRepo) TransitionStage(_ context.Context, id uuid.UUID, t
 func (r *approvalGateRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *approvalGateRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
 func (r *approvalGateRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }

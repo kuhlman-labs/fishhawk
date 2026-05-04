@@ -558,7 +558,24 @@ paths:
         Creates a `runs` row in the `pending` state and dispatches a
         `workflow_dispatch` event to the customer's repo. The runner
         action picks it up and proceeds through the configured stages.
+
+        Pass `Idempotency-Key: <opaque-string>` to make the call
+        retriable. If a run with the same `(repo, key)` exists, it's
+        returned with a 200 instead of creating a fresh one. The
+        scope is `(repo, key)` so two callers picking the same key
+        for different repos don't collide.
       tags: [runs]
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema:
+            type: string
+            description: |
+              Opaque caller-chosen string. Same key + same repo =
+              the existing run is returned (200). Different key OR
+              different repo = a fresh run is created (201). No
+              header = always create.
       requestBody:
         required: true
         content:
@@ -581,6 +598,11 @@ paths:
                 trigger_ref:
                   type: [string, "null"]
       responses:
+        '200':
+          description: Idempotent replay — existing run returned unchanged.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
         '201':
           description: Run created and dispatched.
           content:

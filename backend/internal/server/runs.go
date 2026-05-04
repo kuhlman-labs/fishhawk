@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -104,13 +105,43 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	created, err := s.cfg.RunRepo.CreateRun(r.Context(), run.CreateRunParams{
+	// Idempotency-Key (E8.2 / #40). When set, a previously-created
+	// run with the same (repo, key) is returned 200 instead of
+	// fresh-creating + dispatching a duplicate. Empty header is
+	// equivalent to "not idempotent" — every call mints a new run.
+	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempKey != "" {
+		existing, err := s.cfg.RunRepo.GetRunByIdempotencyKey(r.Context(), req.Repo, idempKey)
+		switch {
+		case err == nil:
+			// Replay: return the prior run with 200 (not 201).
+			// 200 is the idempotency convention — clients that
+			// react to "201 Created" by, e.g., posting a Slack
+			// notification get a chance to no-op on the replay.
+			s.writeJSON(w, r, http.StatusOK, toRunResponse(existing))
+			return
+		case errors.Is(err, run.ErrNotFound):
+			// First call with this key — fall through to create.
+		default:
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"idempotency lookup failed", map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	createParams := run.CreateRunParams{
 		Repo:          req.Repo,
 		WorkflowID:    req.WorkflowID,
 		WorkflowSHA:   req.WorkflowSHA,
 		TriggerSource: run.TriggerSource(req.TriggerSource),
 		TriggerRef:    req.TriggerRef,
-	})
+	}
+	if idempKey != "" {
+		k := idempKey
+		createParams.IdempotencyKey = &k
+	}
+
+	created, err := s.cfg.RunRepo.CreateRun(r.Context(), createParams)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"create run failed", map[string]any{"error": err.Error()})

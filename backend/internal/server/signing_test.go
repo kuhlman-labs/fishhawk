@@ -325,6 +325,9 @@ func (r *fakeOIDCRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, err
 func (r *fakeOIDCRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *fakeOIDCRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
 func (r *fakeOIDCRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }

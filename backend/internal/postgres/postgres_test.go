@@ -202,27 +202,36 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0010 drops the users +
-	// sessions tables. Confirm: those tables are gone, but every
-	// table / column from earlier migrations (audit run_id is
-	// still nullable from 0009, api_tokens from 0008, etc.) is
-	// still present.
-	var usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0011 drops the
+	// runs.idempotency_key column. Confirm: the column is gone,
+	// but every table / column from earlier migrations (users +
+	// sessions from 0010, audit run_id is still nullable from
+	// 0009, api_tokens from 0008, etc.) is still present.
+	var idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'idempotency_key'`,
+	).Scan(&idempotencyCol); err != nil {
+		t.Fatalf("query idempotency_key column: %v", err)
+	}
+	if idempotencyCol != 0 {
+		t.Errorf("runs.idempotency_key count after MigrateDown = %d, want 0 (most-recent migration rolled back)", idempotencyCol)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'sessions'`,
 	).Scan(&sessionsCount); err != nil {
 		t.Fatalf("query sessions table: %v", err)
 	}
-	if sessionsCount != 0 {
-		t.Errorf("sessions count after MigrateDown = %d, want 0 (most-recent migration rolled back)", sessionsCount)
+	if sessionsCount != 1 {
+		t.Errorf("sessions count after MigrateDown = %d, want 1 (0010 still applied)", sessionsCount)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'users'`,
 	).Scan(&usersCount); err != nil {
 		t.Fatalf("query users table: %v", err)
 	}
-	if usersCount != 0 {
-		t.Errorf("users count after MigrateDown = %d, want 0", usersCount)
+	if usersCount != 1 {
+		t.Errorf("users count after MigrateDown = %d, want 1 (0010 still applied)", usersCount)
 	}
 	var auditRunIDNullable string
 	if err := pool.QueryRow(context.Background(),

@@ -126,6 +126,12 @@ type Run struct {
 	TriggerSource  TriggerSource
 	TriggerRef     *string // e.g. "issue:1247" or nil for ad-hoc runs
 	InstallationID *int64  // GitHub App installation that owns the repo; nil for non-GitHub triggers
+	// IdempotencyKey scopes a CLI / UI trigger to be safely
+	// retriable: a duplicate POST /v0/runs with the same
+	// (repo, idempotency_key) returns the existing run instead
+	// of creating a fresh one. Nil for webhook-driven runs (the
+	// receiver dedups via X-GitHub-Delivery).
+	IdempotencyKey *string
 	State          State
 	CreatedAt      time.Time
 	UpdatedAt      time.Time

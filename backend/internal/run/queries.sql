@@ -3,12 +3,20 @@
 -- into ./db per the config in /backend/sqlc.yaml.
 
 -- name: CreateRun :one
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING *;
 
 -- name: GetRun :one
 SELECT * FROM runs WHERE id = $1;
+
+-- name: GetRunByIdempotencyKey :one
+-- Used by POST /v0/runs to resolve an Idempotency-Key header to
+-- a previously-created run. Active scope is (repo, idempotency_key);
+-- the partial unique index covers this lookup with no full scan.
+SELECT * FROM runs
+ WHERE repo = $1
+   AND idempotency_key = $2;
 
 -- name: ListRuns :many
 -- Empty string in any filter means "no constraint." created_at DESC
