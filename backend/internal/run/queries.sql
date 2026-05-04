@@ -31,8 +31,8 @@ UPDATE runs
 RETURNING *;
 
 -- name: CreateStage :one
-INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state, gate_sla)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
 -- name: GetStage :one
@@ -43,6 +43,18 @@ SELECT * FROM stages WHERE run_id = $1 ORDER BY sequence ASC;
 
 -- name: LockStageForUpdate :one
 SELECT * FROM stages WHERE id = $1 FOR UPDATE;
+
+-- name: ListStagesAwaitingApproval :many
+-- Used by the SLA ticker to find candidates for timeout. Filters
+-- to stages in awaiting_approval state with a non-null gate_sla so
+-- the ticker doesn't pay for SLA parsing on rows where it isn't
+-- applicable. Ordered by updated_at ASC: the oldest entry is the
+-- most likely to be past SLA, so the ticker can early-exit if the
+-- first row hasn't elapsed (when the parsed durations are uniform).
+SELECT * FROM stages
+ WHERE state = 'awaiting_approval'
+   AND gate_sla IS NOT NULL
+ ORDER BY updated_at ASC;
 
 -- name: UpdateStageState :one
 UPDATE stages

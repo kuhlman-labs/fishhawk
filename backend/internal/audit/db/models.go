@@ -77,4 +77,5 @@ type Stage struct {
 	FailureReason   *string            `json:"failure_reason"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	GateSla         *string            `json:"gate_sla"`
 }

@@ -25,6 +25,7 @@ import (
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	slapkg "github.com/kuhlman-labs/fishhawk/backend/internal/sla"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -55,6 +56,12 @@ func runServe(args []string, logSink io.Writer) int {
 	githubAppKeyFile := fs.String("github-app-private-key-file",
 		envOr("FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE", ""),
 		"path to the GitHub App's PEM-encoded RSA private key")
+	enableSLATimer := fs.Bool("enable-sla-timer",
+		envOr("FISHHAWKD_ENABLE_SLA_TIMER", "false") == "true",
+		"start the approval SLA timeout ticker; off by default to keep dev runs from racing with the timer")
+	slaInterval := fs.Duration("sla-interval",
+		60*time.Second,
+		"SLA ticker scan interval; 60s default fits hour-grained SLAs comfortably")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -190,6 +197,26 @@ func runServe(args []string, logSink io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Start the approval SLA timeout ticker if requested. Requires
+	// run + audit repos; we skip with a warn if either is missing
+	// rather than failing the boot, so a partial deploy still
+	// serves /healthz and read-only endpoints.
+	if *enableSLATimer {
+		if cfg.RunRepo == nil || cfg.AuditRepo == nil {
+			logger.Warn("--enable-sla-timer set but RunRepo or AuditRepo unconfigured; ticker not started")
+		} else {
+			ticker := &slaTickerConfig{
+				Repo:     cfg.RunRepo,
+				Audit:    cfg.AuditRepo,
+				Logger:   logger,
+				Interval: *slaInterval,
+			}
+			go ticker.Start(ctx)
+			logger.Info("approval SLA timeout ticker started",
+				slog.Duration("interval", *slaInterval))
+		}
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start() }()
 
@@ -209,6 +236,29 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 	logger.Info("shutdown complete")
 	return exitOK
+}
+
+// slaTickerConfig wraps the inputs sla.Ticker needs so serve.go
+// doesn't import internal/sla directly until ticker startup time.
+// Keeps the import surface narrow and avoids a serve-startup cost
+// when the feature flag is off.
+type slaTickerConfig struct {
+	Repo     runpkg.Repository
+	Audit    audit.Repository
+	Logger   *slog.Logger
+	Interval time.Duration
+}
+
+func (c *slaTickerConfig) Start(ctx context.Context) {
+	t := &slapkg.Ticker{
+		Repo:     c.Repo,
+		Audit:    c.Audit,
+		Logger:   c.Logger,
+		Interval: c.Interval,
+	}
+	if err := t.Run(ctx); err != nil {
+		c.Logger.Error("sla ticker exited with error", slog.String("error", err.Error()))
+	}
 }
 
 // newLogger returns a slog logger writing JSON to logSink with the

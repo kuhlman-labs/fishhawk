@@ -29,6 +29,11 @@ type CreateStageParams struct {
 	Type         StageType
 	ExecutorKind ExecutorKind
 	ExecutorRef  string
+	// GateSLA is the gate's `sla` string from the workflow spec at
+	// dispatch time, e.g. "4_business_hours". Nil when the stage's
+	// gate has no SLA. The SLA ticker reads it back to detect
+	// awaiting_approval timeouts.
+	GateSLA *string
 }
 
 // StageCompletion captures the optional metadata that accompanies a
@@ -76,6 +81,14 @@ type Repository interface {
 	CreateStage(ctx context.Context, p CreateStageParams) (*Stage, error)
 	GetStage(ctx context.Context, id uuid.UUID) (*Stage, error)
 	ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]*Stage, error)
+
+	// ListStagesAwaitingApproval returns every stage currently in
+	// awaiting_approval with a non-null GateSLA. The SLA ticker
+	// scans this to find timeout candidates without re-parsing the
+	// workflow spec. Order is undefined except that it is stable
+	// (Postgres adapter orders by updated_at ASC for early-exit
+	// efficiency).
+	ListStagesAwaitingApproval(ctx context.Context) ([]*Stage, error)
 
 	// TransitionStage moves a stage to the target state. completion
 	// must be non-nil and populated when transitioning to

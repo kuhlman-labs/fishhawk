@@ -202,19 +202,19 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0005 only drops the
-	// runs.installation_id column, not a table. Confirm: the
-	// column is gone, but every table from earlier migrations
-	// (including approvals from 0004) is still present.
-	var installationCol, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0006 only drops the
+	// stages.gate_sla column, not a table. Confirm: the column is
+	// gone, but every table from earlier migrations (including
+	// approvals from 0004) is still present.
+	var gateSLACol, approvalsCount, runsCount int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
-		 WHERE table_name = 'runs' AND column_name = 'installation_id'`,
-	).Scan(&installationCol); err != nil {
-		t.Fatalf("query installation_id column: %v", err)
+		 WHERE table_name = 'stages' AND column_name = 'gate_sla'`,
+	).Scan(&gateSLACol); err != nil {
+		t.Fatalf("query gate_sla column: %v", err)
 	}
-	if installationCol != 0 {
-		t.Errorf("runs.installation_id column count after MigrateDown = %d, want 0 (most-recent migration rolled back)", installationCol)
+	if gateSLACol != 0 {
+		t.Errorf("stages.gate_sla column count after MigrateDown = %d, want 0 (most-recent migration rolled back)", gateSLACol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'approvals'`,

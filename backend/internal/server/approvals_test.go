@@ -170,6 +170,9 @@ func (r *approvalRunRepo) CreateStage(context.Context, run.CreateStageParams) (*
 func (r *approvalRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (r *approvalRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 
 // approvalAuditFake records AppendChained calls so tests assert
 // audit-entry shape and category.
@@ -488,6 +491,10 @@ func (r *orchestratorRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.stagesByRunID[runID], nil
+}
+
+func (r *orchestratorRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, nil
 }
 
 func (r *orchestratorRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {

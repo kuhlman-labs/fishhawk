@@ -455,19 +455,41 @@ func (d *Dispatcher) createStages(ctx context.Context, runID uuid.UUID, defs []s
 	out := make([]*run.Stage, 0, len(defs))
 	for i, def := range defs {
 		execKind, execRef := mapExecutor(def)
-		stage, err := d.Runs.CreateStage(ctx, run.CreateStageParams{
+		params := run.CreateStageParams{
 			RunID:        runID,
 			Sequence:     i,
 			Type:         run.StageType(def.Type),
 			ExecutorKind: execKind,
 			ExecutorRef:  execRef,
-		})
+		}
+		// Persist the first approval gate's SLA string verbatim so
+		// the SLA ticker (E3.11) can scan for timeouts without
+		// re-parsing the spec at every tick. v0 stages typically
+		// carry one approval gate; if multiple are configured we
+		// take the first non-empty SLA. Empty SLA → leave nil
+		// (means "no timeout").
+		if sla := firstApprovalSLA(def.Gates); sla != "" {
+			params.GateSLA = &sla
+		}
+		stage, err := d.Runs.CreateStage(ctx, params)
 		if err != nil {
 			return nil, fmt.Errorf("create stage %d (%s): %w", i, def.ID, err)
 		}
 		out = append(out, stage)
 	}
 	return out, nil
+}
+
+// firstApprovalSLA returns the first non-empty SLA from any
+// approval gate in the stage's Gates list. Returns "" when no gate
+// has an SLA (or no approval gate exists).
+func firstApprovalSLA(gates []spec.Gate) string {
+	for _, g := range gates {
+		if g.Type == spec.GateTypeApproval && g.SLA != "" {
+			return g.SLA
+		}
+	}
+	return ""
 }
 
 // mapExecutor projects a spec.Executor onto the run-package
