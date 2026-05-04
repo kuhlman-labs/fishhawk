@@ -50,6 +50,10 @@ var (
 	ErrSignatureRejected = errors.New("upload: backend rejected signature")
 	ErrAlreadyIssued     = errors.New("upload: signing key already issued for this run")
 	ErrNotFound          = errors.New("upload: run or signing key not found")
+	// ErrUnsupportedStage means the backend has no prompt template
+	// for this stage type. Non-retryable; the runner should fail
+	// the stage rather than guess.
+	ErrUnsupportedStage = errors.New("upload: backend does not support this stage type")
 )
 
 // Client wraps a net/http.Client with a base URL. Construct via
@@ -268,6 +272,113 @@ func (c *Client) ShipTrace(ctx context.Context, args ShipArgs) (*ShipResult, err
 		}
 	}
 	return nil, fmt.Errorf("upload: ship trace exhausted retries: %w", lastErr)
+}
+
+// FetchPromptArgs collects everything FetchPrompt needs.
+type FetchPromptArgs struct {
+	StageID    string
+	PrivateKey ed25519.PrivateKey
+}
+
+// FetchedPrompt is the (stage_id, stage_type, prompt, prompt_hash)
+// tuple the backend returns. Mirrors docs/api/v0.openapi.yaml.
+type FetchedPrompt struct {
+	StageID    string `json:"stage_id"`
+	StageType  string `json:"stage_type"`
+	Prompt     string `json:"prompt"`
+	PromptHash string `json:"prompt_hash"`
+}
+
+// FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an
+// X-Fishhawk-Signature signed with the per-run signing key. The
+// canonical message is sha256("prompt:" + stage_id) — same shape
+// the backend re-derives in promptCanonicalMessage. Bound-to-stage
+// scope means a leaked signature can't be replayed against another
+// stage within the same run's TTL.
+//
+// 501 (the backend hasn't implemented a prompt template for this
+// stage type yet) and 401 (signature rejected) are non-retryable
+// and bubble up directly. 5xx are retryable up to MaxRetries with
+// the same backoff policy as ShipTrace.
+func (c *Client) FetchPrompt(ctx context.Context, args FetchPromptArgs) (*FetchedPrompt, error) {
+	if args.StageID == "" {
+		return nil, errors.New("upload: empty stage id")
+	}
+	if len(args.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("upload: invalid private key length")
+	}
+
+	digest := sha256.Sum256([]byte("prompt:" + args.StageID))
+	signature := ed25519.Sign(args.PrivateKey, digest[:])
+	sigHex := hex.EncodeToString(signature)
+
+	endpoint := fmt.Sprintf("%s/v0/stages/%s/prompt",
+		c.BaseURL, url.PathEscape(args.StageID))
+
+	maxRetries := c.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultMaxRetries
+	}
+	backoff := c.Backoff
+	if backoff == 0 {
+		backoff = DefaultBackoff
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("upload: build request: %w", err)
+		}
+		req.Header.Set("X-Fishhawk-Signature", sigHex)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("upload: fetch prompt: %w", err)
+			continue
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusOK:
+			var out FetchedPrompt
+			err := json.NewDecoder(resp.Body).Decode(&out)
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("upload: decode response: %w", err)
+			}
+			return &out, nil
+		case resp.StatusCode == http.StatusUnauthorized:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s", ErrSignatureRejected, detail)
+		case resp.StatusCode == http.StatusNotFound:
+			_ = resp.Body.Close()
+			return nil, ErrNotFound
+		case resp.StatusCode == http.StatusNotImplemented:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s", ErrUnsupportedStage, detail)
+		case resp.StatusCode >= 500:
+			lastErr = statusError("fetch prompt", resp)
+			_ = resp.Body.Close()
+			continue
+		default:
+			lastErr = statusError("fetch prompt", resp)
+			_ = resp.Body.Close()
+			return nil, lastErr
+		}
+	}
+	return nil, fmt.Errorf("upload: fetch prompt exhausted retries: %w", lastErr)
 }
 
 // readBriefBody returns the first 256 bytes of resp.Body as a

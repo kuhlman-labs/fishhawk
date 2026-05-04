@@ -8,10 +8,15 @@
 // wire format from ADR-007, and writes the bundle to disk. Signed
 // upload to the backend lands in E5.6 (#32).
 //
-// Without --prompt-file the binary parses its inputs, prints a
-// single startup log line, and exits 0. Customers pinning
-// `kuhlman-labs/fishhawk/runner@v0.1` see this no-op until the
-// downstream stages of E5 land.
+// E3.12 (#128) wired prompt construction: with --fetch-prompt and
+// --stage-id, the runner pulls the constructed prompt from the
+// backend before invoking the agent (writing it to a temp file
+// the existing --prompt-file plumbing reads). --prompt-file still
+// wins as a local override for replay / debug.
+//
+// With neither --prompt-file nor --fetch-prompt, the binary parses
+// its inputs, prints a single startup log line, and exits 0 —
+// preserving the dispatch-path probe used by early demo runs.
 package main
 
 import (
@@ -47,11 +52,12 @@ var newInvoker = func(apiKey string) agent.Invoker {
 }
 
 // uploadClient is the test seam for the backend HTTP client.
-// Tests substitute a fake to drive ShipTrace / IssueKey without
-// standing up an httptest.Server.
+// Tests substitute a fake to drive ShipTrace / IssueKey / FetchPrompt
+// without standing up an httptest.Server.
 type uploadClient interface {
 	IssueKey(ctx context.Context, runID string, ttl time.Duration) (*upload.IssuedKey, error)
 	ShipTrace(ctx context.Context, args upload.ShipArgs) (*upload.ShipResult, error)
+	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
 }
 
 // newUploadClient returns the production uploadClient for the
@@ -81,9 +87,48 @@ func run(args []string, logSink io.Writer) int {
 
 	logStartup(logSink, cfg)
 
+	// One uploadClient instance shared by fetch-prompt + upload-trace
+	// paths. Constructed lazily so the scaffold-mode short-circuit
+	// below doesn't pay for a client it never uses.
+	var client uploadClient
+	// One IssuedKey reused across fetch-prompt and upload-trace. The
+	// signing-key endpoint is one-shot (409 on second call), so we
+	// must issue exactly once per runner invocation.
+	var issuedKey *upload.IssuedKey
+
+	// If --fetch-prompt is set and no --prompt-file was supplied,
+	// pull the constructed prompt from the backend and write it to
+	// a temp file. Sets cfg.promptFile so the rest of the path is
+	// unchanged. --prompt-file always wins (local override for
+	// replay / debug). If only --fetch-prompt is set with no
+	// --stage-id, that's a config error.
+	if cfg.fetchPrompt && cfg.promptFile == "" {
+		if cfg.stageID == "" {
+			_, _ = fmt.Fprintln(logSink,
+				`{"event":"runner_failed","reason":"config","detail":"--fetch-prompt requires --stage-id"}`)
+			return exitUsage
+		}
+		client = newUploadClient(cfg.backendURL)
+		key, fetchErr := issueSigningKey(context.Background(), client, cfg, logSink)
+		if fetchErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"issue_key","detail":%q}`+"\n", fetchErr.Error())
+			return exitFailure
+		}
+		issuedKey = key
+		path, fetchErr := fetchPromptToFile(context.Background(), client, cfg, key, logSink)
+		if fetchErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
+			return exitFailure
+		}
+		cfg.promptFile = path
+	}
+
 	if cfg.promptFile == "" {
-		// Scaffold mode preserved: --prompt-file unset means
-		// "exercise the dispatch path; do not invoke the agent."
+		// Scaffold mode preserved: --prompt-file unset (and not
+		// fetched) means "exercise the dispatch path; do not invoke
+		// the agent."
 		return exitOK
 	}
 
@@ -174,7 +219,7 @@ func run(args []string, logSink io.Writer) int {
 	}
 
 	if cfg.uploadTrace {
-		if err := uploadTrace(cfg, bundleBytes, logSink); err != nil {
+		if err := uploadTrace(cfg, bundleBytes, logSink, client, issuedKey); err != nil {
 			// Upload failures are MVP_SPEC §6 category-C (infra).
 			// We DON'T overwrite an earlier A/B failure category;
 			// only stamp C when the agent itself succeeded.
@@ -215,26 +260,31 @@ func bundleStageID(cfg config) string {
 	return cfg.stage
 }
 
-// uploadTrace issues a signing key, signs the bundle bytes, and
-// POSTs to the backend's trace endpoint. Returns nil on accepted,
-// non-nil on any failure (key issuance, signing, network, signature
-// rejection). The caller is responsible for translating the error
-// into the right category-C audit narrative.
-func uploadTrace(cfg config, bundleBytes []byte, logSink io.Writer) error {
+// uploadTrace ships the bundle bytes to the backend's trace
+// endpoint. If `client` is nil, a fresh client is constructed; if
+// `issued` is nil, a signing key is issued. Both are reused from
+// the prompt-fetch path when --fetch-prompt is set, since the
+// signing-key endpoint is one-shot per run.
+//
+// Returns nil on accepted, non-nil on any failure (key issuance,
+// signing, network, signature rejection). The caller translates
+// the error into the right category-C audit narrative.
+func uploadTrace(cfg config, bundleBytes []byte, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
 	if cfg.stageID == "" {
 		return errors.New("upload: --stage-id required with --upload-trace")
 	}
-	client := newUploadClient(cfg.backendURL)
+	if client == nil {
+		client = newUploadClient(cfg.backendURL)
+	}
 	ctx := context.Background()
 
-	issued, err := client.IssueKey(ctx, cfg.runID, 0)
-	if err != nil {
-		return fmt.Errorf("issue key: %w", err)
+	if issued == nil {
+		key, err := issueSigningKey(ctx, client, cfg, logSink)
+		if err != nil {
+			return fmt.Errorf("issue key: %w", err)
+		}
+		issued = key
 	}
-	_, _ = fmt.Fprintf(logSink,
-		`{"event":"signing_key_issued","run_id":%q,"expires_at":%q}`+"\n",
-		issued.RunID, issued.ExpiresAt.Format(time.RFC3339),
-	)
 
 	res, err := client.ShipTrace(ctx, upload.ShipArgs{
 		RunID:      cfg.runID,
@@ -251,6 +301,56 @@ func uploadTrace(cfg config, bundleBytes []byte, logSink io.Writer) error {
 		res.RunID, res.StageID, res.Variant, res.ContentHash,
 	)
 	return nil
+}
+
+// issueSigningKey issues a per-run Ed25519 keypair via the backend.
+// Logs the issuance to logSink so the trace timeline shows when the
+// key was minted.
+func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSink io.Writer) (*upload.IssuedKey, error) {
+	issued, err := client.IssueKey(ctx, cfg.runID, 0)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"signing_key_issued","run_id":%q,"expires_at":%q}`+"\n",
+		issued.RunID, issued.ExpiresAt.Format(time.RFC3339),
+	)
+	return issued, nil
+}
+
+// fetchPromptToFile pulls the constructed prompt from the backend,
+// writes it to a temp file, and returns the path. The temp file is
+// 0o600 — bundle-style defense in depth, since prompts may include
+// issue bodies that the customer would prefer not to leave on the
+// runner's filesystem world-readable.
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (string, error) {
+	got, err := client.FetchPrompt(ctx, upload.FetchPromptArgs{
+		StageID:    cfg.stageID,
+		PrivateKey: key.PrivateKey,
+	})
+	if err != nil {
+		return "", err
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
+		got.StageID, got.StageType, got.PromptHash, len(got.Prompt),
+	)
+	tmp, err := os.CreateTemp("", "fishhawk-prompt-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("create prompt temp file: %w", err)
+	}
+	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("chmod prompt temp file: %w", err)
+	}
+	if _, err := tmp.WriteString(got.Prompt); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("write prompt temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("close prompt temp file: %w", err)
+	}
+	return tmp.Name(), nil
 }
 
 func logStartup(w io.Writer, cfg config) {

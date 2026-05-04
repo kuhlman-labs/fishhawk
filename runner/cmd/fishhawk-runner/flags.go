@@ -34,6 +34,7 @@ type config struct {
 	uploadTrace     bool
 	stageID         string
 	variant         string
+	fetchPrompt     bool
 }
 
 // parseFlags reads args and populates a config. Returns a usage
@@ -76,6 +77,8 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"stage UUID for trace upload (distinct from --stage which is the workflow-spec stage name); required with --upload-trace")
 	fs.StringVar(&cfg.variant, "variant", "raw",
 		"bundle variant for trace upload: raw or redacted")
+	fs.BoolVar(&cfg.fetchPrompt, "fetch-prompt", false,
+		"fetch the constructed prompt from --backend-url's /v0/stages/{stage-id}/prompt before invoking the agent; --prompt-file wins when both are set, useful for local replay")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err

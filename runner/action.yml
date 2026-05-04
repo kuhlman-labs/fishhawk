@@ -79,6 +79,10 @@ inputs:
     description: 'Git ref to diff against for constraint evaluation (e.g. origin/main). Constraints run only when both constraints-file and check-base-ref are set.'
     required: false
     default: ''
+  fetch-prompt:
+    description: 'Fetch the constructed prompt from backend-url (GET /v0/stages/{stage-id}/prompt) before invoking the agent. Requires stage-id. prompt-file wins when both are set, useful for local replay.'
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
@@ -109,5 +113,6 @@ runs:
           --constraints-file "${{ inputs.constraints-file }}" \
           --check-base-ref "${{ inputs.check-base-ref }}" \
           $(if [ "${{ inputs.upload-trace }}" = "true" ]; then echo --upload-trace; fi) \
+          $(if [ "${{ inputs.fetch-prompt }}" = "true" ]; then echo --fetch-prompt; fi) \
           --stage-id "${{ inputs.stage-id }}" \
           --variant "${{ inputs.variant }}"

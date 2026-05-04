@@ -64,10 +64,11 @@ jobs:
           workflow: ${{ inputs.workflow_id }}
           stage: ${{ inputs.stage }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # fetch-prompt: runner pulls the constructed prompt from
+          # GET /v0/stages/{stage-id}/prompt and writes it to a
+          # temp file before invoking Claude Code. The signing-key
+          # endpoint is one-shot per run, so the runner reuses the
+          # key issued here for the trace upload below.
+          fetch-prompt: 'true'
           upload-trace: 'true'
           variant: raw
-          # prompt-file unset → runner exits 0 after dispatch-path
-          # probe; the rest of the loop runs (signing key, trace
-          # upload, audit, orchestrator) but no agent invocation.
-          # E3.12 (#128) wires per-stage prompt construction so
-          # the runner actually calls Claude Code.
