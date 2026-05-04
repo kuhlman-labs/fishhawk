@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -238,6 +239,17 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
 	}
 
+	// Role resolver for the approval handler. Wired only when the
+	// GitHub client is configured — without it, ListTeamMembers
+	// can't run, and the approval handler falls back to "any
+	// authenticated subject can approve" (the v0 demo posture).
+	if cfg.GitHub != nil {
+		cfg.RoleResolver = role.NewResolver(githubTeamListerAdapter{cfg.GitHub})
+		logger.Info("role resolver configured")
+	} else {
+		logger.Warn("role resolver not configured: approval handler will accept any authenticated subject")
+	}
+
 	srv := server.New(cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -292,6 +304,26 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 	logger.Info("shutdown complete")
 	return exitOK
+}
+
+// githubTeamListerAdapter bridges *githubclient.Client (whose
+// ListTeamMembers returns []githubclient.TeamMember) and
+// role.TeamLister (whose method returns []role.TeamMember). Pure
+// type-conversion glue; the two struct shapes are byte-identical.
+type githubTeamListerAdapter struct {
+	c *githubclient.Client
+}
+
+func (a githubTeamListerAdapter) ListTeamMembers(ctx context.Context, installationID int64, org, slug string) ([]role.TeamMember, error) {
+	got, err := a.c.ListTeamMembers(ctx, installationID, org, slug)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]role.TeamMember, 0, len(got))
+	for _, m := range got {
+		out = append(out, role.TeamMember{Login: m.Login, ID: m.ID})
+	}
+	return out, nil
 }
 
 // runWebhookEvictor periodically deletes webhook_deliveries rows

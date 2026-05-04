@@ -238,6 +238,105 @@ func (c *Client) GetIssue(ctx context.Context, installationID int64, repo RepoRe
 	}, nil
 }
 
+// TeamMember is the slice of a team-membership API response we
+// surface for role resolution. Login is the canonical handle used
+// in audits and approvers comparisons; ID is preserved so future
+// callers that need a stable-across-renames key have it.
+type TeamMember struct {
+	Login string
+	ID    int64
+}
+
+// ListTeamMembers fetches the active members of a GitHub team.
+//
+//	GET /orgs/{org}/teams/{team_slug}/members?role=all
+//
+// Used by E4.4 role resolution to expand `@org/team` references
+// in the workflow spec into a username allowlist for approvers.
+//
+// Pages until exhaustion via Link headers. Returns the union of
+// "maintainers" and "members" (role=all is the documented
+// equivalent on the team-members endpoint).
+func (c *Client) ListTeamMembers(ctx context.Context, installationID int64, org, slug string) ([]TeamMember, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if org == "" || slug == "" {
+		return nil, errors.New("githubclient: org and team slug required")
+	}
+
+	pagePath := "/orgs/" + url.PathEscape(org) + "/teams/" + url.PathEscape(slug) + "/members?role=all&per_page=100"
+	endpoint := c.endpoint(pagePath)
+
+	var out []TeamMember
+	for endpoint != "" {
+		req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("githubclient: list team members: %w", err)
+		}
+		members, next, err := decodeTeamMembersPage(resp)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, members...)
+		endpoint = next
+	}
+	return out, nil
+}
+
+// decodeTeamMembersPage handles one page of team members and
+// returns the next-page URL if Link advertises one. Split out so
+// the pagination loop above stays readable.
+func decodeTeamMembersPage(resp *http.Response) ([]TeamMember, string, error) {
+	if err := classifyStatus("list team members", resp); err != nil {
+		return nil, "", err
+	}
+	var body []struct {
+		Login string `json:"login"`
+		ID    int64  `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, "", fmt.Errorf("githubclient: decode team members: %w", err)
+	}
+	out := make([]TeamMember, 0, len(body))
+	for _, m := range body {
+		out = append(out, TeamMember{Login: m.Login, ID: m.ID})
+	}
+	return out, nextPageURL(resp.Header.Get("Link")), nil
+}
+
+// nextPageURL parses GitHub's Link header for the rel="next" URL.
+// Returns "" when no further pages remain.
+func nextPageURL(link string) string {
+	for _, part := range strings.Split(link, ",") {
+		segs := strings.Split(strings.TrimSpace(part), ";")
+		if len(segs) < 2 {
+			continue
+		}
+		urlPart := strings.TrimSpace(segs[0])
+		if !strings.HasPrefix(urlPart, "<") || !strings.HasSuffix(urlPart, ">") {
+			continue
+		}
+		isNext := false
+		for _, attr := range segs[1:] {
+			if strings.TrimSpace(attr) == `rel="next"` {
+				isNext = true
+				break
+			}
+		}
+		if isNext {
+			return urlPart[1 : len(urlPart)-1]
+		}
+	}
+	return ""
+}
+
 // DispatchInputs is the JSON body of a workflow_dispatch event.
 // Per GitHub's contract, inputs is a flat map[string]string —
 // non-string values must be JSON-encoded by the caller.
