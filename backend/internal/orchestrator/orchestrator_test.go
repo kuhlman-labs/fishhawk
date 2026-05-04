@@ -106,6 +106,10 @@ func (s *stubRuns) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 	return r, nil
 }
 
+func (s *stubRuns) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
+
 func (s *stubRuns) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

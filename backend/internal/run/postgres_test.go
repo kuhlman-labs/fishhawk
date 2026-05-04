@@ -178,6 +178,90 @@ func TestPostgres_GetRun_NotFound(t *testing.T) {
 	}
 }
 
+func TestPostgres_GetRunByIdempotencyKey_HappyPath(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+
+	key := "abc123"
+	created, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:           "x/y",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef",
+		TriggerSource:  run.TriggerCLI,
+		IdempotencyKey: &key,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	got, err := repo.GetRunByIdempotencyKey(context.Background(), "x/y", key)
+	if err != nil {
+		t.Fatalf("GetRunByIdempotencyKey: %v", err)
+	}
+	if got.ID != created.ID {
+		t.Errorf("got %s, want %s", got.ID, created.ID)
+	}
+	if got.IdempotencyKey == nil || *got.IdempotencyKey != key {
+		t.Errorf("IdempotencyKey round-trip failed: %v", got.IdempotencyKey)
+	}
+}
+
+func TestPostgres_GetRunByIdempotencyKey_NotFound(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	_, err := repo.GetRunByIdempotencyKey(context.Background(), "x/y", "nope")
+	if !errors.Is(err, run.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPostgres_DuplicateIdempotencyKey_ConflictsAtDB(t *testing.T) {
+	// The unique partial index covers (repo, idempotency_key)
+	// where idempotency_key IS NOT NULL. The handler checks for
+	// the existing row before insert; this test pins the DB-level
+	// guarantee that a race between two callers can't both
+	// insert.
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+
+	key := "shared"
+	if _, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:           "x/y",
+		WorkflowID:     "w",
+		WorkflowSHA:    "s",
+		TriggerSource:  run.TriggerCLI,
+		IdempotencyKey: &key,
+	}); err != nil {
+		t.Fatalf("first CreateRun: %v", err)
+	}
+	_, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:           "x/y",
+		WorkflowID:     "w",
+		WorkflowSHA:    "s",
+		TriggerSource:  run.TriggerCLI,
+		IdempotencyKey: &key,
+	})
+	if err == nil {
+		t.Fatal("expected duplicate-key error from DB")
+	}
+}
+
+func TestPostgres_NullIdempotencyKey_DoesNotCollide(t *testing.T) {
+	// Two runs with no idempotency_key (nil) should both succeed —
+	// the partial index excludes NULLs so they don't conflict.
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	for i := 0; i < 2; i++ {
+		if _, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+			Repo:          "x/y",
+			WorkflowID:    "w",
+			WorkflowSHA:   "s",
+			TriggerSource: run.TriggerCLI,
+		}); err != nil {
+			t.Fatalf("CreateRun #%d: %v", i, err)
+		}
+	}
+}
+
 func TestPostgres_ListRuns(t *testing.T) {
 	pool := startPostgres(t)
 	repo := run.NewPostgresRepository(pool)

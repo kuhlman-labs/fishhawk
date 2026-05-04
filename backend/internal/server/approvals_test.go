@@ -158,6 +158,9 @@ func (r *approvalRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.
 func (r *approvalRunRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *approvalRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
 func (r *approvalRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }
@@ -494,6 +497,10 @@ func (r *orchestratorRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, er
 		return nil, run.ErrNotFound
 	}
 	return rr, nil
+}
+
+func (r *orchestratorRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
 }
 
 func (r *orchestratorRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {

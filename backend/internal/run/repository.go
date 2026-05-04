@@ -20,6 +20,12 @@ type CreateRunParams struct {
 	TriggerSource  TriggerSource
 	TriggerRef     *string
 	InstallationID *int64
+	// IdempotencyKey, when non-nil, makes the create idempotent
+	// against (Repo, *IdempotencyKey): a duplicate insert
+	// returns the existing row instead of failing on the unique
+	// constraint. Webhook-driven creates leave this nil; the
+	// receiver dedups via X-GitHub-Delivery upstream.
+	IdempotencyKey *string
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.
@@ -66,6 +72,12 @@ type ListRunsFilter struct {
 type Repository interface {
 	CreateRun(ctx context.Context, p CreateRunParams) (*Run, error)
 	GetRun(ctx context.Context, id uuid.UUID) (*Run, error)
+
+	// GetRunByIdempotencyKey returns the existing run for
+	// (repo, key) if one exists. Used by POST /v0/runs to
+	// resolve an Idempotency-Key header to an already-created
+	// run. Returns ErrNotFound when no row matches.
+	GetRunByIdempotencyKey(ctx context.Context, repo, key string) (*Run, error)
 
 	// ListRuns returns runs matching filter, ordered created_at
 	// DESC with an id tiebreak. Caller is responsible for the

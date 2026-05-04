@@ -110,6 +110,9 @@ func (f *fakeRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, er
 func (f *fakeRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (f *fakeRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
 func (f *fakeRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }

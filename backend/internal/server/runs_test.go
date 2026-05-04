@@ -49,15 +49,16 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 	}
 	now := time.Now().UTC()
 	r := &run.Run{
-		ID:            uuid.New(),
-		Repo:          p.Repo,
-		WorkflowID:    p.WorkflowID,
-		WorkflowSHA:   p.WorkflowSHA,
-		TriggerSource: p.TriggerSource,
-		TriggerRef:    p.TriggerRef,
-		State:         run.StatePending,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:             uuid.New(),
+		Repo:           p.Repo,
+		WorkflowID:     p.WorkflowID,
+		WorkflowSHA:    p.WorkflowSHA,
+		TriggerSource:  p.TriggerSource,
+		TriggerRef:     p.TriggerRef,
+		IdempotencyKey: p.IdempotencyKey,
+		State:          run.StatePending,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	f.runs[r.ID] = r
 	return r, nil
@@ -82,6 +83,17 @@ func (f *fakeRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 //
 // The remaining stage methods aren't exercised by these handler tests
 // but must exist so fakeRepo satisfies run.Repository.
+
+func (f *fakeRepo) GetRunByIdempotencyKey(_ context.Context, repo, key string) (*run.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, r := range f.runs {
+		if r.Repo == repo && r.IdempotencyKey != nil && *r.IdempotencyKey == key {
+			return r, nil
+		}
+	}
+	return nil, run.ErrNotFound
+}
 
 func (f *fakeRepo) TransitionRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
 	f.mu.Lock()
@@ -313,6 +325,172 @@ func TestCreateRun_NilRepoConfigured(t *testing.T) {
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
 	}
+}
+
+// -------- Idempotency-Key tests (E8.2) --------
+
+func TestCreateRun_IdempotencyKey_Replay_Returns200(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := `{
+		"repo": "x/y",
+		"workflow_id": "w",
+		"workflow_sha": "s",
+		"trigger_source": "cli"
+	}`
+
+	req1 := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", "abc123")
+	w1 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w1, req1)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201:\n%s", w1.Code, w1.Body.String())
+	}
+	var first runResponse
+	_ = json.Unmarshal(w1.Body.Bytes(), &first)
+
+	// Replay: same key, same body → 200 with the prior run.
+	req2 := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Idempotency-Key", "abc123")
+	w2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	var second runResponse
+	_ = json.Unmarshal(w2.Body.Bytes(), &second)
+	if second.ID != first.ID {
+		t.Errorf("replay returned a different run: first=%s second=%s", first.ID, second.ID)
+	}
+	if len(repo.runs) != 1 {
+		t.Errorf("repo has %d runs, want 1 (replay must not insert)", len(repo.runs))
+	}
+}
+
+func TestCreateRun_IdempotencyKey_DifferentRepo_CreatesSeparateRun(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := func(r string) string {
+		return `{"repo":"` + r + `","workflow_id":"w","workflow_sha":"s","trigger_source":"cli"}`
+	}
+
+	req1 := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body("a/x")))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", "shared")
+	w1 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w1, req1)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first status = %d", w1.Code)
+	}
+
+	// Same key, different repo → separate run.
+	req2 := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body("b/y")))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Idempotency-Key", "shared")
+	w2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("second status = %d, want 201 (different repo, no collision)", w2.Code)
+	}
+	if len(repo.runs) != 2 {
+		t.Errorf("repo has %d runs, want 2", len(repo.runs))
+	}
+}
+
+func TestCreateRun_IdempotencyKey_DifferentKey_CreatesSeparateRun(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := `{"repo":"x/y","workflow_id":"w","workflow_sha":"s","trigger_source":"cli"}`
+
+	for _, key := range []string{"k1", "k2"} {
+		req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", key)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d for key=%s", w.Code, key)
+		}
+	}
+	if len(repo.runs) != 2 {
+		t.Errorf("repo has %d runs, want 2", len(repo.runs))
+	}
+}
+
+func TestCreateRun_NoIdempotencyKey_AlwaysCreates(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := `{"repo":"x/y","workflow_id":"w","workflow_sha":"s","trigger_source":"cli"}`
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("iter %d status = %d", i, w.Code)
+		}
+	}
+	if len(repo.runs) != 3 {
+		t.Errorf("repo has %d runs, want 3 (no key = always create)", len(repo.runs))
+	}
+}
+
+func TestCreateRun_IdempotencyKey_Whitespace_Trimmed(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := `{"repo":"x/y","workflow_id":"w","workflow_sha":"s","trigger_source":"cli"}`
+
+	req1 := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", "abc")
+	w1 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w1, req1)
+
+	// Header with surrounding whitespace should match the original.
+	req2 := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Idempotency-Key", "  abc  ")
+	w2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Errorf("whitespace-padded key didn't match original: status = %d", w2.Code)
+	}
+	_ = w1
+	if len(repo.runs) != 1 {
+		t.Errorf("repo has %d runs, want 1", len(repo.runs))
+	}
+}
+
+func TestCreateRun_IdempotencyKey_LookupErrorBubbles(t *testing.T) {
+	// Use a repo whose GetRunByIdempotencyKey returns an
+	// unexpected error (not ErrNotFound). The handler should 500
+	// rather than silently fall through to create.
+	repo := &errIdempotencyRepo{}
+	s := newServer(t, repo)
+	body := `{"repo":"x/y","workflow_id":"w","workflow_sha":"s","trigger_source":"cli"}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "abc")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+// errIdempotencyRepo wraps fakeRepo to inject a non-ErrNotFound
+// error from GetRunByIdempotencyKey while behaving normally for
+// every other method. Used to exercise the handler's "unexpected
+// error" path.
+type errIdempotencyRepo struct {
+	fakeRepo
+}
+
+func (e *errIdempotencyRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, errors.New("simulated lookup error")
 }
 
 func TestGetRun_HappyPath(t *testing.T) {

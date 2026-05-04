@@ -49,9 +49,25 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		TriggerRef:     p.TriggerRef,
 		State:          string(StatePending),
 		InstallationID: p.InstallationID,
+		IdempotencyKey: p.IdempotencyKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
+	}
+	return rowToRun(row), nil
+}
+
+func (r *postgresRepo) GetRunByIdempotencyKey(ctx context.Context, repo, key string) (*Run, error) {
+	q := rundb.New(r.pool)
+	row, err := q.GetRunByIdempotencyKey(ctx, rundb.GetRunByIdempotencyKeyParams{
+		Repo:           repo,
+		IdempotencyKey: &key,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get run by idempotency_key: %w", err)
 	}
 	return rowToRun(row), nil
 }
@@ -261,6 +277,7 @@ func rowToRun(r rundb.Run) *Run {
 		TriggerSource:  TriggerSource(r.TriggerSource),
 		TriggerRef:     r.TriggerRef,
 		InstallationID: r.InstallationID,
+		IdempotencyKey: r.IdempotencyKey,
 		State:          State(r.State),
 		CreatedAt:      r.CreatedAt.Time,
 		UpdatedAt:      r.UpdatedAt.Time,

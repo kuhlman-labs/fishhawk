@@ -277,6 +277,9 @@ func (s *stubRuns) TransitionStage(_ context.Context, id uuid.UUID, to run.Stage
 func (s *stubRuns) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (s *stubRuns) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
 func (s *stubRuns) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }

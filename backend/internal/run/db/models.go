@@ -64,6 +64,7 @@ type Run struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	InstallationID *int64             `json:"installation_id"`
+	IdempotencyKey *string            `json:"idempotency_key"`
 }
 
 type Session struct {

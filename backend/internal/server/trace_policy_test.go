@@ -92,6 +92,9 @@ func (r *policyRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.
 func (r *policyRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *policyRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
 func (r *policyRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }
