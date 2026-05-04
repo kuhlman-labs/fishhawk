@@ -14,11 +14,13 @@ var ErrNotFound = errors.New("audit entry not found")
 
 // AppendParams collects the inputs needed for one raw Append. The
 // caller is responsible for computing PrevHash (= the prior entry's
-// EntryHash within the same run, or nil for the run's first entry)
-// and EntryHash. Use AppendChained for the high-level path that
-// computes both.
+// EntryHash within the same chain — either the run's chain or the
+// global chain) and EntryHash. Use AppendChained / AppendGlobalChained
+// for the high-level paths that compute both.
+//
+// RunID is nullable: nil writes a global-chain entry (E2.7).
 type AppendParams struct {
-	RunID        uuid.UUID
+	RunID        *uuid.UUID
 	StageID      *uuid.UUID
 	Timestamp    time.Time
 	Category     string
@@ -46,11 +48,22 @@ type Repository interface {
 	Append(ctx context.Context, p AppendParams) (*Entry, error)
 	AppendChained(ctx context.Context, p ChainAppendParams) (*Entry, error)
 
+	// AppendGlobalChained writes an entry to the global chain
+	// (E2.7) — events not tied to a specific workflow run.
+	// Computes PrevHash from the previous global-chain entry +
+	// EntryHash inside a transaction. RunID on the resulting
+	// Entry is nil; StageID is also nil for these entries.
+	AppendGlobalChained(ctx context.Context, p GlobalChainAppendParams) (*Entry, error)
+
 	Get(ctx context.Context, id uuid.UUID) (*Entry, error)
 
 	// ListForRun returns every entry for the run, ordered by
 	// sequence ascending. Used for run-detail UI and verification.
 	ListForRun(ctx context.Context, runID uuid.UUID) ([]*Entry, error)
+
+	// ListGlobal returns every global-chain entry in append order.
+	// Used by the compliance export and the audit verifier.
+	ListGlobal(ctx context.Context) ([]*Entry, error)
 
 	// LastForRun returns the most recently appended entry in the run,
 	// or ErrNotFound if no entries exist yet.

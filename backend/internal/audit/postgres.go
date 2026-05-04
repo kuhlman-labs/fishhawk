@@ -49,6 +49,77 @@ func (r *postgresRepo) Append(ctx context.Context, p AppendParams) (*Entry, erro
 	return rowToEntry(row), nil
 }
 
+// AppendGlobalChained writes an entry to the global chain (E2.7).
+// PrevHash links the new entry to the previous global-chain entry
+// (or nil for the first one). The whole append runs in a
+// transaction so concurrent calls can't both observe the same
+// prev_hash.
+//
+// Note: there's no per-row lock here because there's no run row
+// to lock — concurrent global writes serialize via the transaction
+// + the single chain partition. Postgres' default isolation
+// (read committed) is sufficient because GetLastGlobalAuditEntry
+// + AppendAuditEntry are run inside the same tx; a second tx
+// reading the last entry inside its own tx will see this tx's
+// committed write.
+func (r *postgresRepo) AppendGlobalChained(ctx context.Context, p GlobalChainAppendParams) (*Entry, error) {
+	var result *Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		aq := auditdb.New(tx)
+		var prev *string
+		last, err := aq.GetLastGlobalAuditEntry(ctx)
+		switch {
+		case err == nil:
+			prev = &last.EntryHash
+		case errors.Is(err, pgx.ErrNoRows):
+			// First entry in the global chain.
+		default:
+			return fmt.Errorf("audit: read last global entry: %w", err)
+		}
+
+		hash, err := ComputeEntryHash(HashInputs{
+			RunID:        nil,
+			StageID:      nil,
+			Timestamp:    p.Timestamp,
+			Category:     p.Category,
+			ActorKind:    p.ActorKind,
+			ActorSubject: p.ActorSubject,
+			Payload:      p.Payload,
+			PrevHash:     prev,
+		})
+		if err != nil {
+			return err
+		}
+
+		var actorKind *string
+		if p.ActorKind != nil {
+			s := string(*p.ActorKind)
+			actorKind = &s
+		}
+		row, err := aq.AppendAuditEntry(ctx, auditdb.AppendAuditEntryParams{
+			ID:           uuid.New(),
+			RunID:        nil,
+			StageID:      nil,
+			Ts:           pgtype.Timestamptz{Time: p.Timestamp, Valid: true},
+			Category:     p.Category,
+			ActorKind:    actorKind,
+			ActorSubject: p.ActorSubject,
+			Payload:      []byte(p.Payload),
+			PrevHash:     prev,
+			EntryHash:    hash,
+		})
+		if err != nil {
+			return fmt.Errorf("audit: append global: %w", err)
+		}
+		result = rowToEntry(row)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // AppendChained writes an entry inside a transaction that holds a
 // row-level lock on runs.id, so concurrent callers can't race on
 // reading prev_hash. PrevHash and EntryHash are computed inside this
@@ -71,7 +142,8 @@ func (r *postgresRepo) AppendChained(ctx context.Context, p ChainAppendParams) (
 		// Fetch prev_hash from the run's last entry (if any).
 		aq := auditdb.New(tx)
 		var prev *string
-		last, err := aq.GetLastAuditEntryForRun(ctx, p.RunID)
+		runIDPtr := p.RunID
+		last, err := aq.GetLastAuditEntryForRun(ctx, &runIDPtr)
 		switch {
 		case err == nil:
 			prev = &last.EntryHash
@@ -81,8 +153,9 @@ func (r *postgresRepo) AppendChained(ctx context.Context, p ChainAppendParams) (
 			return fmt.Errorf("audit: read last entry: %w", err)
 		}
 
+		runID := p.RunID
 		hash, err := ComputeEntryHash(HashInputs{
-			RunID:        p.RunID,
+			RunID:        &runID,
 			StageID:      p.StageID,
 			Timestamp:    p.Timestamp,
 			Category:     p.Category,
@@ -102,7 +175,7 @@ func (r *postgresRepo) AppendChained(ctx context.Context, p ChainAppendParams) (
 		}
 		row, err := aq.AppendAuditEntry(ctx, auditdb.AppendAuditEntryParams{
 			ID:           uuid.New(),
-			RunID:        p.RunID,
+			RunID:        &runID,
 			StageID:      p.StageID,
 			Ts:           pgtype.Timestamptz{Time: p.Timestamp, Valid: true},
 			Category:     p.Category,
@@ -138,7 +211,7 @@ func (r *postgresRepo) Get(ctx context.Context, id uuid.UUID) (*Entry, error) {
 
 func (r *postgresRepo) ListForRun(ctx context.Context, runID uuid.UUID) ([]*Entry, error) {
 	q := auditdb.New(r.pool)
-	rows, err := q.ListAuditEntriesForRun(ctx, runID)
+	rows, err := q.ListAuditEntriesForRun(ctx, &runID)
 	if err != nil {
 		return nil, fmt.Errorf("list audit entries: %w", err)
 	}
@@ -151,7 +224,7 @@ func (r *postgresRepo) ListForRun(ctx context.Context, runID uuid.UUID) ([]*Entr
 
 func (r *postgresRepo) LastForRun(ctx context.Context, runID uuid.UUID) (*Entry, error) {
 	q := auditdb.New(r.pool)
-	row, err := q.GetLastAuditEntryForRun(ctx, runID)
+	row, err := q.GetLastAuditEntryForRun(ctx, &runID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -164,11 +237,24 @@ func (r *postgresRepo) LastForRun(ctx context.Context, runID uuid.UUID) (*Entry,
 func (r *postgresRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*Entry, error) {
 	q := auditdb.New(r.pool)
 	rows, err := q.ListAuditEntriesByCategory(ctx, auditdb.ListAuditEntriesByCategoryParams{
-		RunID:    runID,
+		RunID:    &runID,
 		Category: category,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list audit entries by category: %w", err)
+	}
+	out := make([]*Entry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToEntry(row))
+	}
+	return out, nil
+}
+
+func (r *postgresRepo) ListGlobal(ctx context.Context) ([]*Entry, error) {
+	q := auditdb.New(r.pool)
+	rows, err := q.ListGlobalAuditEntries(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list global audit entries: %w", err)
 	}
 	out := make([]*Entry, 0, len(rows))
 	for _, row := range rows {

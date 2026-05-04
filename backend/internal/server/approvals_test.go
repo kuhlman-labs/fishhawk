@@ -194,7 +194,16 @@ func (a *approvalAuditFake) AppendChained(_ context.Context, p audit.ChainAppend
 		return nil, a.appendErr
 	}
 	a.appended = append(a.appended, p)
-	return &audit.Entry{ID: uuid.New(), RunID: p.RunID}, nil
+	rid := p.RunID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
+}
+
+func (a *approvalAuditFake) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+
+func (a *approvalAuditFake) ListGlobal(context.Context) ([]*audit.Entry, error) {
+	return nil, nil
 }
 func (a *approvalAuditFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")

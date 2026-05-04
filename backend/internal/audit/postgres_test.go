@@ -131,8 +131,9 @@ func entryHash(seq int64, payload []byte) string {
 func appendEntry(t *testing.T, repo audit.Repository, runID uuid.UUID, category string, prev *string) *audit.Entry {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"event": category})
+	rid := runID
 	e, err := repo.Append(context.Background(), audit.AppendParams{
-		RunID:     runID,
+		RunID:     &rid,
 		Timestamp: time.Now().UTC(),
 		Category:  category,
 		Payload:   body,
@@ -260,8 +261,9 @@ func TestPostgres_AppendWithActor(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"who": "approved"})
 	subj := "user@example.com"
 	kind := audit.ActorUser
+	rid := runID
 	e, err := repo.Append(context.Background(), audit.AppendParams{
-		RunID:        runID,
+		RunID:        &rid,
 		Timestamp:    time.Now().UTC(),
 		Category:     "approval",
 		ActorKind:    &kind,
@@ -320,5 +322,148 @@ func TestPostgres_TriggerBlocksDelete(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "append-only") {
 		t.Errorf("trigger error = %v, want 'append-only' substring", err)
+	}
+}
+
+// --- Global chain tests (E2.7) ---
+
+func TestPostgres_AppendGlobalChained_FirstEntryHasNilPrevHash(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+
+	subj := "github:42"
+	kind := audit.ActorUser
+	body, _ := json.Marshal(map[string]string{"event": "first"})
+	e, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp:    time.Now().UTC(),
+		Category:     "api_token_issued",
+		ActorKind:    &kind,
+		ActorSubject: &subj,
+		Payload:      body,
+	})
+	if err != nil {
+		t.Fatalf("AppendGlobalChained: %v", err)
+	}
+	if e.RunID != nil {
+		t.Errorf("global entry RunID = %v, want nil", e.RunID)
+	}
+	if e.StageID != nil {
+		t.Errorf("global entry StageID = %v, want nil", e.StageID)
+	}
+	if e.PrevHash != nil {
+		t.Errorf("first global entry PrevHash = %v, want nil", e.PrevHash)
+	}
+	if e.EntryHash == "" {
+		t.Error("EntryHash should be set")
+	}
+}
+
+func TestPostgres_AppendGlobalChained_LinksToPriorEntry(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+
+	first, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "api_token_issued",
+		Payload:   json.RawMessage(`{"i":1}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "api_token_revoked",
+		Payload:   json.RawMessage(`{"i":2}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.PrevHash == nil || *second.PrevHash != first.EntryHash {
+		t.Errorf("second.PrevHash = %v, want first.EntryHash %q",
+			second.PrevHash, first.EntryHash)
+	}
+}
+
+func TestPostgres_GlobalAndPerRunChainsAreIndependent(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	// Append one per-run entry.
+	runEntry, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "trace_uploaded",
+		Payload:   json.RawMessage(`{"i":1}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Append one global entry; its PrevHash must NOT be the
+	// per-run entry's hash — the chains are independent.
+	globalEntry, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "api_token_issued",
+		Payload:   json.RawMessage(`{"i":2}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if globalEntry.PrevHash != nil {
+		t.Errorf("first global entry PrevHash = %v, want nil (independent of per-run chain)", globalEntry.PrevHash)
+	}
+	// Per-run chain unaffected.
+	runLast, err := repo.LastForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runLast.ID != runEntry.ID {
+		t.Errorf("LastForRun returned %s, want %s (global append shouldn't affect run chain)", runLast.ID, runEntry.ID)
+	}
+}
+
+func TestPostgres_ListGlobal_ReturnsOnlyGlobalEntries(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	// Two global + one per-run.
+	_, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "api_token_issued",
+		Payload:   json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "api_token_revoked",
+		Payload:   json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "trace_uploaded",
+		Payload:   json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.ListGlobal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Errorf("ListGlobal returned %d entries, want 2 (per-run rows must be filtered out)", len(got))
+	}
+	for _, e := range got {
+		if e.RunID != nil {
+			t.Errorf("ListGlobal returned a row with RunID = %v, want nil", e.RunID)
+		}
 	}
 }

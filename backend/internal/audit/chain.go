@@ -18,8 +18,12 @@ import (
 // Sequence is intentionally NOT in the hash. Postgres assigns it on
 // INSERT, after the hash has been computed and committed; the
 // chain's prev_hash linkage already encodes ordering.
+//
+// RunID is nullable so global-chain entries (E2.7) hash with a JSON
+// `null` rather than the zero UUID. External verifiers MUST treat
+// the nil RunID as `"run_id": null` to match.
 type HashInputs struct {
-	RunID        uuid.UUID       `json:"run_id"`
+	RunID        *uuid.UUID      `json:"run_id"`
 	StageID      *uuid.UUID      `json:"stage_id"`
 	Timestamp    time.Time       `json:"ts"`
 	Category     string          `json:"category"`
@@ -46,12 +50,27 @@ func ComputeEntryHash(p HashInputs) (string, error) {
 }
 
 // ChainAppendParams collects the inputs callers pass to
-// AppendChained. Differs from AppendParams by omitting PrevHash and
-// EntryHash — those are computed inside the transactional
-// AppendChained call, not by the caller.
+// AppendChained for a per-run chain entry. Differs from
+// AppendParams by omitting PrevHash and EntryHash — those are
+// computed inside the transactional AppendChained call, not by
+// the caller.
 type ChainAppendParams struct {
 	RunID        uuid.UUID
 	StageID      *uuid.UUID
+	Timestamp    time.Time
+	Category     string
+	ActorKind    *ActorKind
+	ActorSubject *string
+	Payload      json.RawMessage
+}
+
+// GlobalChainAppendParams is the global-chain equivalent of
+// ChainAppendParams (E2.7). RunID is implicit (nil) because
+// global-chain events aren't tied to a workflow run; StageID is
+// also omitted for the same reason. ActorSubject is the most
+// meaningful "who did it" field for these events (e.g. the user
+// minting an API token).
+type GlobalChainAppendParams struct {
 	Timestamp    time.Time
 	Category     string
 	ActorKind    *ActorKind

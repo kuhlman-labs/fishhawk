@@ -24,7 +24,7 @@ RETURNING id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subjec
 
 type AppendAuditEntryParams struct {
 	ID           uuid.UUID          `json:"id"`
-	RunID        uuid.UUID          `json:"run_id"`
+	RunID        *uuid.UUID         `json:"run_id"`
 	StageID      *uuid.UUID         `json:"stage_id"`
 	Ts           pgtype.Timestamptz `json:"ts"`
 	Category     string             `json:"category"`
@@ -100,8 +100,37 @@ LIMIT 1
 `
 
 // Used by Append to fetch prev_hash for the next entry in the run.
-func (q *Queries) GetLastAuditEntryForRun(ctx context.Context, runID uuid.UUID) (AuditEntry, error) {
+func (q *Queries) GetLastAuditEntryForRun(ctx context.Context, runID *uuid.UUID) (AuditEntry, error) {
 	row := q.db.QueryRow(ctx, getLastAuditEntryForRun, runID)
+	var i AuditEntry
+	err := row.Scan(
+		&i.ID,
+		&i.Sequence,
+		&i.RunID,
+		&i.StageID,
+		&i.Ts,
+		&i.Category,
+		&i.ActorKind,
+		&i.ActorSubject,
+		&i.Payload,
+		&i.PrevHash,
+		&i.EntryHash,
+	)
+	return i, err
+}
+
+const getLastGlobalAuditEntry = `-- name: GetLastGlobalAuditEntry :one
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
+ WHERE run_id IS NULL
+ ORDER BY sequence DESC
+ LIMIT 1
+`
+
+// Mirror of GetLastAuditEntryForRun for the global chain partition
+// (E2.7 / #138). Used by AppendGlobalChained to fetch prev_hash for
+// the next non-run event (token issue/revoke, OAuth sign-in, etc.).
+func (q *Queries) GetLastGlobalAuditEntry(ctx context.Context) (AuditEntry, error) {
+	row := q.db.QueryRow(ctx, getLastGlobalAuditEntry)
 	var i AuditEntry
 	err := row.Scan(
 		&i.ID,
@@ -126,8 +155,8 @@ ORDER BY sequence ASC
 `
 
 type ListAuditEntriesByCategoryParams struct {
-	RunID    uuid.UUID `json:"run_id"`
-	Category string    `json:"category"`
+	RunID    *uuid.UUID `json:"run_id"`
+	Category string     `json:"category"`
 }
 
 func (q *Queries) ListAuditEntriesByCategory(ctx context.Context, arg ListAuditEntriesByCategoryParams) ([]AuditEntry, error) {
@@ -168,8 +197,48 @@ WHERE run_id = $1
 ORDER BY sequence ASC
 `
 
-func (q *Queries) ListAuditEntriesForRun(ctx context.Context, runID uuid.UUID) ([]AuditEntry, error) {
+func (q *Queries) ListAuditEntriesForRun(ctx context.Context, runID *uuid.UUID) ([]AuditEntry, error) {
 	rows, err := q.db.Query(ctx, listAuditEntriesForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditEntry
+	for rows.Next() {
+		var i AuditEntry
+		if err := rows.Scan(
+			&i.ID,
+			&i.Sequence,
+			&i.RunID,
+			&i.StageID,
+			&i.Ts,
+			&i.Category,
+			&i.ActorKind,
+			&i.ActorSubject,
+			&i.Payload,
+			&i.PrevHash,
+			&i.EntryHash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listGlobalAuditEntries = `-- name: ListGlobalAuditEntries :many
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
+ WHERE run_id IS NULL
+ ORDER BY sequence ASC
+`
+
+// Used by compliance exports + the verifier to walk the global
+// chain in append order.
+func (q *Queries) ListGlobalAuditEntries(ctx context.Context) ([]AuditEntry, error) {
+	rows, err := q.db.Query(ctx, listGlobalAuditEntries)
 	if err != nil {
 		return nil, err
 	}

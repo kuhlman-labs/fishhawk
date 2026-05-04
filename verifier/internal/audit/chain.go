@@ -41,8 +41,13 @@ const (
 // backend/internal/audit.HashInputs exactly. Treat changes here as
 // breaking — every audit log already in the wild was hashed with
 // the prior shape.
+//
+// RunID is *uuid.UUID (E2.7 / #138): nil for global-chain entries
+// (token issue/revoke, OAuth events, etc.). The JSON encoding is
+// `null` when the pointer is nil, the UUID string when set;
+// external verifiers must marshal nil pointers as `null` to match.
 type HashInputs struct {
-	RunID        uuid.UUID       `json:"run_id"`
+	RunID        *uuid.UUID      `json:"run_id"`
 	StageID      *uuid.UUID      `json:"stage_id"`
 	Timestamp    time.Time       `json:"ts"`
 	Category     string          `json:"category"`
