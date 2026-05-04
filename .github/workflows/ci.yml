@@ -84,6 +84,8 @@ jobs:
           # fails if they drift; update both in the same PR.
           diff -u docs/spec/workflow-v0.schema.json \
                   backend/internal/spec/schemas/workflow-v0.schema.json
+          diff -u docs/spec/workflow-v0.schema.json \
+                  cli/internal/spec/schemas/workflow-v0.schema.json
           diff -u docs/spec/plan-standard-v1.schema.json \
                   backend/internal/plan/schemas/plan-standard-v1.schema.json
           diff -u docs/spec/plan-standard-v1.schema.json \

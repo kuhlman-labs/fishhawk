@@ -50,6 +50,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	case "run":
 		return runRun(rest, stdout, stderr)
+	case "validate":
+		return runValidate(rest, stdout, stderr)
 	case "version", "--version":
 		_, _ = fmt.Fprintln(stdout, version.Version)
 		return exitOK
@@ -87,6 +89,7 @@ func printUsage(w io.Writer) {
 		"  run list     List runs with optional filters.",
 		"  run cancel   Cancel an in-flight run.",
 		"  run open     Open a run's detail page in the browser.",
+		"  validate     Validate a workflow spec file locally.",
 		"  version      Print the CLI version and exit.",
 		"  help         Show this help.",
 		"",
