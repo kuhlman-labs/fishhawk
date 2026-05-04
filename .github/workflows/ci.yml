@@ -142,11 +142,43 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.ts == 'true' }}
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v6
-      - run: |
-          echo "::notice::TypeScript pipeline lands with E7.1 (frontend scaffold, issue #37)."
-          echo "Until then this job is a placeholder so the path filter is exercised."
+
+      # pnpm version is pinned via `packageManager` in frontend/package.json;
+      # action-setup defaults to reading the *root* package.json, so we
+      # point it at frontend/ explicitly. Without this it errors out
+      # with "No pnpm version is specified."
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Format check
+        run: pnpm format:check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
 
   openapi:
     name: OpenAPI (lint)

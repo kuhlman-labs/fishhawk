@@ -27,7 +27,8 @@ LICENSE
 **/dist
 **/bin
 
-# Frontend (when E7 ships) — has its own pipeline.
+# Frontend has its own pipeline (CI's TS lane). The backend container
+# only needs the Go modules, so frontend bytes are wasted context.
 frontend
 node_modules
 **/*.tsbuildinfo
