@@ -17,7 +17,7 @@ Five surfaces, deployed independently. Each maps to a directory in this monorepo
 | Component | Path | Role | Epic |
 |---|---|---|---|
 | **Backend control plane** (`fishhawkd`) | `/backend` | Workflow state machine, policy evaluator, approval state, audit writer, REST API, GitHub App webhook receiver. | E3 (#3) |
-| **Runner action** (`fishhawk/runner`) | `/runner` | GitHub Action published as `kuhlman-labs/fishhawk/runner@vX.Y`. Runs on the customer's CI: invokes the agent, captures trace, validates the produced plan, signs and ships the bundle. Currently a scaffold (E5.1) — flag parsing only, no agent invocation yet. | E5 (#5) |
+| **Runner action** (`fishhawk/runner`) | `/runner` | GitHub Action published as `kuhlman-labs/fishhawk/runner@runner/vX.Y.Z`. Runs on the customer's CI: invokes the agent, captures trace, validates the produced plan, signs and ships the bundle. Self-execution in this repo uses `./runner` (the local path); external customers pin a release tag. Versioned, cosign-signed releases via `.github/workflows/runner-release.yml`. | E5 (#5) |
 | **Web UI** | `/frontend` (planned) | Authenticated SPA — plan review, approval, audit search, run visualization. | E7 (#7) |
 | **CLI** (`fishhawk`) | `/cli` (planned) | Validate workflow specs locally; trigger and inspect runs from the terminal. Plan review and approval explicitly stay in the UI. | E6 (#6) |
 | **GitHub App** | (registered with GitHub; manifest in repo) | Per-installation tokens for repo access; OAuth provider for user sign-in; webhook source for triggers. | E4 (#4) |
@@ -50,7 +50,7 @@ Consolidated from the resolved ADRs (#65–#73, #78). Each row links to the issu
 
 Per `docs/MVP_SPEC.md` §5.2. Concrete realization in this codebase:
 
-1. **Trigger** — GitHub issue label/assignment (webhook → backend), CLI `fishhawk run start`, or UI button. Backend validates the workflow spec at the issue's `.fishhawk/workflows.yaml` SHA, creates a `runs` row, and emits `workflow_dispatch` to the customer's repo invoking `fishhawk/runner@vX.Y`.
+1. **Trigger** — GitHub issue label/assignment (webhook → backend), CLI `fishhawk run start`, or UI button. Backend validates the workflow spec at the issue's `.fishhawk/workflows.yaml` SHA, creates a `runs` row, and emits `workflow_dispatch` to the customer's repo invoking `fishhawk/runner@runner/vX.Y.Z`.
 2. **Plan stage** — Runner checks out the repo, calls backend `POST /v0/runs/{id}/signing-key` (with GitHub OIDC token) and receives an Ed25519 private key + run metadata. Invokes Claude Code with the plan prompt. Captures full trace as JSON Lines events. Validates the plan artifact against `standard_v1` schema (E1.5 / #20). Signs `sha256(bundle)`. Ships `(bundle, sig)` to `POST /v0/runs/{id}/trace`.
 3. **Backend ingest** — Verifies signature against the stored public key for `run_id`. Stores the bundle in S3 keyed by content sha256. Persists the plan artifact in `artifacts` and renders it as a comment on the originating GitHub issue (mode: `rendered_comment`, kept in sync). Transitions stage state.
 4. **Plan approval** — Approver reads the plan in the Web UI (canonical surface) or the issue comment (read-only echo). Clicks Approve. Backend records `(approver_subject, surface, ts)` in the audit log and transitions to implement.

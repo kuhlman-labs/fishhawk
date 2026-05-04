@@ -2,9 +2,11 @@
 
 The GitHub Action that runs an agent under a Fishhawk workflow stage and ships the signed trace bundle back to the backend. Customers reference the action as:
 
-    uses: kuhlman-labs/fishhawk/runner@v0.1
+    uses: kuhlman-labs/fishhawk/runner@runner/v0.1.0
 
 This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/runner`) so it can be tagged independently of the backend and the CLI — the customer-facing version pin is on the runner alone. See [ADR-014 (#78)](https://github.com/kuhlman-labs/fishhawk/issues/78) for the multi-module rationale.
+
+Tag prefix `runner/v…` follows the Go module convention for non-root modules in a monorepo. Self-execution in this repo uses `./runner` (the local path) rather than a tag; external customers pin a release.
 
 ## Layout
 
@@ -86,6 +88,30 @@ The same binary the action runs can be invoked locally for development:
     gunzip -c /tmp/trace.jsonl.gz | jq -c .
 
 When `--prompt-file` is set the runner invokes Claude Code; the structured runner log lines (`runner_started`, `runner_completed`) go to stderr. With `--bundle-out`, captured events are packed into `*.jsonl.gz` per ADR-007. Without it, events fall back to JSONL on stdout.
+
+## Releases
+
+The release workflow at `.github/workflows/runner-release.yml` triggers on tags matching `runner/v*`. To cut a release:
+
+1. Land everything on `main`. Verify `golangci-lint run ./runner/...` and `go test -race ./runner/...` are clean.
+2. Tag the release commit: `git tag runner/v0.1.0 && git push origin runner/v0.1.0`.
+3. The workflow re-runs lint + tests at the tag, builds a `linux-amd64` binary with the version stamped via `-ldflags`, generates an SPDX-JSON SBOM (anchore/sbom-action), computes SHA-256 checksums, signs `SHA256SUMS` keyless via cosign + GitHub OIDC, and publishes a GitHub Release with all artifacts attached.
+4. Update `docs/spec/examples/` (or any sample workflow) to point at the new tag if appropriate.
+
+Verify a release locally:
+
+```sh
+# Download SHA256SUMS, SHA256SUMS.sig, SHA256SUMS.pem from the GitHub Release.
+cosign verify-blob \
+  --certificate-identity-regexp 'https://github.com/kuhlman-labs/fishhawk/\.github/workflows/runner-release\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --signature SHA256SUMS.sig \
+  --certificate SHA256SUMS.pem \
+  SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+The verify-identity is the workflow file's path; that's the URL Fulcio embeds in the cert when keyless-signing from a GitHub Action.
 
 ## See also
 
