@@ -1,0 +1,37 @@
+# Keep Docker build context narrow + deterministic.
+#
+# The Dockerfile only consumes go.work + the four module trees,
+# so anything outside of those is wasted bytes in the build
+# context. Listing modules + go.work explicitly via COPY also
+# means we don't accidentally bundle local dev artifacts (.env,
+# editor caches, IDE files) into the image.
+
+# VCS / CI / docs / scripts — never needed in the image.
+.git
+.github
+docs
+scripts
+README.md
+LICENSE
+
+# Dev / agent caches.
+.claude
+.cursor
+.vscode
+.idea
+*.swp
+
+# Test / coverage artifacts.
+**/coverage.out
+**/coverage.html
+**/dist
+**/bin
+
+# Frontend (when E7 ships) — has its own pipeline.
+frontend
+node_modules
+**/*.tsbuildinfo
+
+# Loose junk.
+.DS_Store
+*.log

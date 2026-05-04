@@ -1,0 +1,140 @@
+# fishhawkd release workflow (E13.3 / #60).
+#
+# Triggered by a tag push matching `backend/v*` (mirrors the
+# runner module-tag convention from E5.7). The workflow:
+#
+#  1. Re-runs lint + tests at the tag's commit (catches a tag
+#     pushed from a dirty branch).
+#  2. Builds the multi-stage Dockerfile with -ldflags=-X stamping
+#     the tag version into internal/version.Version.
+#  3. Pushes ghcr.io/kuhlman-labs/fishhawkd:vX.Y.Z + :latest.
+#  4. Signs the resulting image digest with cosign keyless.
+#  5. Generates an SPDX-JSON SBOM as a downloadable artifact.
+#  6. Publishes a GitHub Release with the SBOM + image-digest
+#     reference. (No separate binary asset — the image IS the
+#     release; tag-only operators can pull it from GHCR.)
+#
+# Versioning convention: `backend/vX.Y.Z`. Path-prefixed tags are
+# the Go-module convention for non-root modules in a monorepo.
+
+name: Backend Release
+
+on:
+  push:
+    tags:
+      - 'backend/v*'
+
+permissions:
+  contents: write    # create release + upload assets
+  packages: write    # push to ghcr.io
+  id-token: write    # cosign keyless signing via GitHub OIDC
+
+jobs:
+  release:
+    name: Build, sign, and publish fishhawkd release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
+
+      - name: Verify the tagged commit passes lint + tests
+        run: |
+          set -eu
+          GOLANGCI_LINT="$(go env GOPATH)/bin/golangci-lint"
+          (
+            cd backend
+            "$GOLANGCI_LINT" run ./...
+            go build ./...
+            go test -race ./...
+          )
+
+      - name: Compute version
+        id: ver
+        run: |
+          set -eu
+          # refs/tags/backend/v0.1.0 → v0.1.0
+          version="${GITHUB_REF#refs/tags/backend/}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/kuhlman-labs/fishhawkd
+          tags: |
+            type=match,pattern=backend/(v.+),group=1
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=fishhawkd
+            org.opencontainers.image.description=Fishhawk backend control plane.
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          cache-from: type=gha,scope=backend-release
+          cache-to: type=gha,mode=max,scope=backend-release
+          provenance: true
+          sbom: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          cosign sign --yes "ghcr.io/kuhlman-labs/fishhawkd@${DIGEST}"
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/kuhlman-labs/fishhawkd@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: ./fishhawkd-${{ steps.ver.outputs.version }}.sbom.spdx.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: fishhawkd ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          body_path: .github/release-notes/backend.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            ./fishhawkd-${{ steps.ver.outputs.version }}.sbom.spdx.json

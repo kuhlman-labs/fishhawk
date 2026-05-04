@@ -179,6 +179,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | GitHub App installation tokens | `backend/internal/githubapp/` (RS256 signer + client + TTL cache + telemetry); App ID + key file from `FISHHAWKD_GITHUB_APP_ID` / `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE` |
 | GitHub REST operations (read workflow spec, fire workflow_dispatch) | `backend/internal/githubclient/`; consumes `githubapp.TokenProvider` |
 | How a new Go module gets added | `CLAUDE.md` "Adding a Go module" |
+| `fishhawkd` container image | `backend/Dockerfile` (multi-stage → distroless static, ~28 MB; `-X version.Version` stamped from `VERSION` build-arg). `.github/workflows/backend-build.yml` builds + pushes `ghcr.io/kuhlman-labs/fishhawkd:main` and `:sha-<commit>` on every push to `main`; `.github/workflows/backend-release.yml` fires on `backend/v*` tags, attaches an SPDX-JSON SBOM, cuts a GitHub Release. Both are signed keylessly via cosign + GHA OIDC; verify with the regex in `.github/release-notes/backend.md`. ECS task-definition + IAM scaffolding (per ADR-009) tracked separately in [#148](https://github.com/kuhlman-labs/fishhawk/issues/148). |
 
 ## 11. Open work
 

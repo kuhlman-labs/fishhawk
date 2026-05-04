@@ -81,4 +81,33 @@ fishhawkd token issue --subject github:42 --scopes runs:read,runs:write
 
 The plaintext is printed to stdout exactly once (suitable for `... | head -n1`); only the sha256 hash is stored. Subsequent tokens can be minted via `POST /v0/tokens` once you have one bearer in hand.
 
+## Container image
+
+`fishhawkd` ships as a distroless static-binary image at
+`ghcr.io/kuhlman-labs/fishhawkd`. Two tag streams:
+
+- `:main` and `:sha-<commit>` — pushed by `.github/workflows/backend-build.yml` on every merge to `main`.
+- `:v<version>` and `:latest` — pushed by `.github/workflows/backend-release.yml` on `backend/v*` tags. Tagged releases also attach an SPDX-JSON SBOM to the GitHub Release.
+
+Both streams are signed keylessly with [cosign](https://docs.sigstore.dev/cosign/overview/) via GitHub Actions OIDC. To verify before pulling:
+
+```sh
+cosign verify ghcr.io/kuhlman-labs/fishhawkd:<tag> \
+  --certificate-identity-regexp '\.github/workflows/backend-(build|release)\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+To build locally (matches the CI build, including version stamping):
+
+```sh
+docker build \
+  --build-arg VERSION=$(git rev-parse --short HEAD) \
+  -f backend/Dockerfile \
+  -t fishhawkd:dev .
+```
+
+The image's entrypoint is `/fishhawkd serve`; override with the `migrate` subcommand to apply migrations: `docker run … fishhawkd:dev migrate up`. Hosted deploy (ECS Fargate task definition + IAM scaffolding per [ADR-009](https://github.com/kuhlman-labs/fishhawk/issues/73)) is tracked separately in [#148](https://github.com/kuhlman-labs/fishhawk/issues/148).
+
+## See also
+
 Larger context: `docs/MVP_SPEC.md` §5.1.1 (component) and §5.2 (execution flow); `docs/ARCHITECTURE.md` §4–§6 for the workflow lifecycle, storage model, and invariants.
