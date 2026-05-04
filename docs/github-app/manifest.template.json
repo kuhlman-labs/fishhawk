@@ -1,0 +1,30 @@
+{
+  "name": "Fishhawk",
+  "url": "{{BACKEND_URL}}",
+  "description": "Workflow + governance layer for AI-driven software changes. See https://github.com/kuhlman-labs/fishhawk.",
+  "public": false,
+  "redirect_url": "{{BACKEND_URL}}/v0/auth/github/manifest-callback",
+  "callback_urls": [
+    "{{BACKEND_URL}}/v0/auth/github/callback"
+  ],
+  "request_oauth_on_install": false,
+  "setup_on_update": false,
+  "default_permissions": {
+    "contents": "write",
+    "issues": "write",
+    "pull_requests": "write",
+    "checks": "write",
+    "workflows": "write",
+    "members": "read",
+    "metadata": "read"
+  },
+  "default_events": [
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "push",
+    "workflow_run",
+    "check_run",
+    "check_suite"
+  ]
+}
