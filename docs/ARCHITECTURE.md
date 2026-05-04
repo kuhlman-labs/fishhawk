@@ -18,7 +18,7 @@ Five surfaces, deployed independently. Each maps to a directory in this monorepo
 |---|---|---|---|
 | **Backend control plane** (`fishhawkd`) | `/backend` | Workflow state machine, policy evaluator, approval state, audit writer, REST API, GitHub App webhook receiver. | E3 (#3) |
 | **Runner action** (`fishhawk/runner`) | `/runner` | GitHub Action published as `kuhlman-labs/fishhawk/runner@runner/vX.Y.Z`. Runs on the customer's CI: invokes the agent, captures trace, validates the produced plan, signs and ships the bundle. Self-execution in this repo uses `./runner` (the local path); external customers pin a release tag. Versioned, cosign-signed releases via `.github/workflows/runner-release.yml`. | E5 (#5) |
-| **Web UI** | `/frontend` (planned) | Authenticated SPA — plan review, approval, audit search, run visualization. | E7 (#7) |
+| **Web UI** | `/frontend` | Authenticated SPA — plan review, approval, audit search, run visualization. | E7 (#7) |
 | **CLI** (`fishhawk`) | `/cli` | Validate workflow specs locally (`fishhawk validate`); trigger and inspect runs from the terminal. Plan review and approval explicitly stay in the UI. | E6 (#6) |
 | **GitHub App** | `docs/github-app/manifest.template.json` (registered with GitHub from this template) | Per-installation tokens for repo access; OAuth provider for user sign-in; webhook source for triggers. Render via `scripts/render-github-app-manifest.sh <backend-url>`; setup docs in `docs/github-app/README.md`. | E4 (#4) |
 
@@ -39,7 +39,8 @@ Consolidated from the resolved ADRs (#65–#73, #78). Each row links to the issu
 | Trace bundle format | JSON Lines + gzip (`*.jsonl.gz`); one event per line with manifest + trailer | #71 |
 | Trace signing | Ed25519 over `sha256(raw_bundle_bytes)`; per-run ephemeral keys, 30-min TTL | #72 |
 | Cloud | AWS (RDS Postgres, S3, ECS Fargate, ALB, Secrets Manager, CloudWatch) | #65, #73 |
-| Frontend framework | Vite + React Router (SPA) | session decision (CLAUDE.md) |
+| Frontend framework | Vite 6 + React 19 + React Router 7 (SPA); pnpm 10 | session decision (CLAUDE.md) |
+| Frontend test runner | Vitest 3 + @testing-library/react + jsdom | E7.1 (#37) |
 | Frontend styling | Tailwind CSS v4 + shadcn/ui (copied components) + Radix primitives + lucide-react icons | #68 |
 | Browser auth | HTTP-only `fishhawk_session` cookie (server-side state); CSRF token in `__Host-csrf` cookie for state-changing endpoints | #69 |
 | CLI / API auth | Scoped opaque bearer tokens; revocable; audit-logged on issue/use/revoke | #69 (E4.5 #51) |
@@ -180,6 +181,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | GitHub REST operations (read workflow spec, fire workflow_dispatch) | `backend/internal/githubclient/`; consumes `githubapp.TokenProvider` |
 | How a new Go module gets added | `CLAUDE.md` "Adding a Go module" |
 | `fishhawkd` container image | `backend/Dockerfile` (multi-stage → distroless static, ~28 MB; `-X version.Version` stamped from `VERSION` build-arg). `.github/workflows/backend-build.yml` builds + pushes `ghcr.io/kuhlman-labs/fishhawkd:main` and `:sha-<commit>` on every push to `main`; `.github/workflows/backend-release.yml` fires on `backend/v*` tags, attaches an SPDX-JSON SBOM, cuts a GitHub Release. Both are signed keylessly via cosign + GHA OIDC; verify with the regex in `.github/release-notes/backend.md`. ECS task-definition + IAM scaffolding (per ADR-009) tracked separately in [#148](https://github.com/kuhlman-labs/fishhawk/issues/148). |
+| Frontend scaffold + dev loop | `frontend/` is a pnpm package, decoupled from `go.work`. Entry `src/main.tsx` mounts `<App />` inside `<BrowserRouter>`; route table in `src/App.tsx`. Tailwind v4 via `@tailwindcss/vite` (config-as-CSS in `src/index.css`); shadcn/ui components live under `src/components/ui/` and are copied (not installed) per ADR-004. ESLint flat config + Prettier; Vitest + jsdom for tests. CI's TS lane (`.github/workflows/ci.yml`) runs `pnpm install --frozen-lockfile`, `format:check`, `lint`, `typecheck`, `test`, `build` against `frontend/`, path-filtered to `frontend/**`. Vite dev server proxies `/v0` → `localhost:8080` so the session cookie is same-origin during `pnpm dev`. |
 
 ## 11. Open work
 

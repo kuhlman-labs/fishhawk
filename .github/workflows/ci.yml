@@ -142,11 +142,39 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.ts == 'true' }}
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v6
-      - run: |
-          echo "::notice::TypeScript pipeline lands with E7.1 (frontend scaffold, issue #37)."
-          echo "Until then this job is a placeholder so the path filter is exercised."
+
+      # pnpm version is pinned via `packageManager` in frontend/package.json;
+      # action-setup picks it up so CI matches what's in the lockfile.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Format check
+        run: pnpm format:check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
 
   openapi:
     name: OpenAPI (lint)

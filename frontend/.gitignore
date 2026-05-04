@@ -1,0 +1,6 @@
+# Frontend-specific ignores; the root .gitignore covers node_modules
+# and the pnpm/eslint/vite caches that apply repo-wide.
+dist/
+*.tsbuildinfo
+coverage/
+.vite-cache/
