@@ -18,7 +18,12 @@ WORKDIR /src
 
 # Copy go.work + modules first so dependency-only changes hit
 # the docker layer cache instead of re-running every build.
-COPY go.work go.work.sum ./
+#
+# go.work.sum is intentionally gitignored (no external imports
+# yet, so it doesn't exist in CI's build context). The glob
+# matches go.work always and go.work.sum opportunistically once
+# external deps land — no Dockerfile change needed at that point.
+COPY go.work* ./
 COPY backend/go.mod backend/go.sum ./backend/
 COPY runner/go.mod runner/go.sum ./runner/
 COPY cli/go.mod cli/go.sum ./cli/
