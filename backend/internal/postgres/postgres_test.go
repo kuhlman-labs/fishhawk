@@ -202,12 +202,28 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0009 makes audit_entries.run_id
-	// nullable; rolling back restores NOT NULL. Confirm: the column
-	// is back to NOT NULL, but every table from earlier migrations
-	// (api_tokens from 0008, webhook_deliveries from 0007, gate_sla
-	// from 0006, approvals from 0004, etc.) is still present.
-	var apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0010 drops the users +
+	// sessions tables. Confirm: those tables are gone, but every
+	// table / column from earlier migrations (audit run_id is
+	// still nullable from 0009, api_tokens from 0008, etc.) is
+	// still present.
+	var usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'sessions'`,
+	).Scan(&sessionsCount); err != nil {
+		t.Fatalf("query sessions table: %v", err)
+	}
+	if sessionsCount != 0 {
+		t.Errorf("sessions count after MigrateDown = %d, want 0 (most-recent migration rolled back)", sessionsCount)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'users'`,
+	).Scan(&usersCount); err != nil {
+		t.Fatalf("query users table: %v", err)
+	}
+	if usersCount != 0 {
+		t.Errorf("users count after MigrateDown = %d, want 0", usersCount)
+	}
 	var auditRunIDNullable string
 	if err := pool.QueryRow(context.Background(),
 		`SELECT is_nullable FROM information_schema.columns
@@ -215,8 +231,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&auditRunIDNullable); err != nil {
 		t.Fatalf("query audit_entries.run_id is_nullable: %v", err)
 	}
-	if auditRunIDNullable != "NO" {
-		t.Errorf("audit_entries.run_id is_nullable after MigrateDown = %q, want NO (0009 rolled back)", auditRunIDNullable)
+	if auditRunIDNullable != "YES" {
+		t.Errorf("audit_entries.run_id is_nullable after MigrateDown = %q, want YES (0009 still applied)", auditRunIDNullable)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'api_tokens'`,

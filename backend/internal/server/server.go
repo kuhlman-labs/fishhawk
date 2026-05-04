@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -129,6 +130,22 @@ type Config struct {
 	// anonymous identity.
 	APITokenRepo apitoken.Repository
 
+	// AuthRepo persists users + sessions for the OAuth
+	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil
+	// leaves them returning 503 and cookie-bearing requests
+	// resolving to the anonymous identity.
+	AuthRepo auth.Repository
+
+	// GitHubOAuth is the OAuth client wrapping GitHub's
+	// authorize / token / user endpoints. Required for the
+	// login + callback handlers; nil leaves both at 503.
+	GitHubOAuth *auth.GitHubOAuth
+
+	// AuthRedirectAfterLogin is the URL the callback handler
+	// redirects to on successful sign-in (typically the SPA's
+	// root). Defaults to "/" when empty.
+	AuthRedirectAfterLogin string
+
 	// RoleResolver expands `@org/team` references in the workflow
 	// spec to a GitHub-login allowlist and decides whether an
 	// approver subject is authorized for a gate. Wired by the
@@ -221,7 +238,7 @@ func (s *Server) buildHandler() http.Handler {
 	s.registerRoutes(mux)
 
 	var h http.Handler = mux
-	h = bearerAuth(s.cfg.APITokenRepo)(h)
+	h = bearerAuth(s.cfg.APITokenRepo, s.cfg.AuthRepo)(h)
 	h = logging(s.cfg.Logger)(h)
 	h = requestID(h)
 	h = recovery(s.cfg.Logger)(h)

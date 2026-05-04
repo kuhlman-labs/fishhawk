@@ -68,6 +68,8 @@ Optional flags:
 - `--sla-interval` — scan interval; defaults to `60s`. Hour-grained SLAs need no finer cadence.
 - `--oidc-audience` (or `FISHHAWKD_OIDC_AUDIENCE`) — turn on GitHub Actions OIDC verification on the signing-key endpoint. Callers must present a `Bearer` token whose `aud` claim matches this value, and whose `repository` + `workflow` claims bind to the path's run. Unset = endpoint accepts any caller (v0 self-execution posture; not safe for production).
 - `--oidc-jwks-url` — override the JWKS endpoint. Defaults to GitHub's published URL; useful for testing.
+- `--oauth-client-id` / `--oauth-client-secret` / `--oauth-callback-url` (or `FISHHAWKD_OAUTH_CLIENT_ID` / `_CLIENT_SECRET` / `_CALLBACK_URL`) — enable the GitHub OAuth sign-in flow at `/v0/auth/github/*`. All three must be set; mismatched configuration fails fast. The callback URL is the public URL of `/v0/auth/github/callback` (the value the OAuth App is registered with).
+- `--oauth-redirect-after-login` (default `/`) — relative path the callback handler redirects to on successful sign-in. Absolute URLs and scheme-relative paths are rejected.
 
 ### Bootstrapping API tokens
 

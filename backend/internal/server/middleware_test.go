@@ -82,7 +82,7 @@ func TestRecovery_CatchesPanicAndLogs(t *testing.T) {
 
 func TestBearerAuth_NoHeader_Anonymous(t *testing.T) {
 	var captured Identity
-	h := bearerAuth(nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := bearerAuth(nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
