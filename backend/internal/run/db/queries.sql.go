@@ -61,9 +61,9 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 }
 
 const createStage = `-- name: CreateStage :one
-INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at
+INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state, gate_sla)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla
 `
 
 type CreateStageParams struct {
@@ -74,6 +74,7 @@ type CreateStageParams struct {
 	ExecutorKind string    `json:"executor_kind"`
 	ExecutorRef  string    `json:"executor_ref"`
 	State        string    `json:"state"`
+	GateSla      *string   `json:"gate_sla"`
 }
 
 func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage, error) {
@@ -85,6 +86,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 		arg.ExecutorKind,
 		arg.ExecutorRef,
 		arg.State,
+		arg.GateSla,
 	)
 	var i Stage
 	err := row.Scan(
@@ -101,6 +103,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.GateSla,
 	)
 	return i, err
 }
@@ -128,7 +131,7 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 }
 
 const getStage = `-- name: GetStage :one
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at FROM stages WHERE id = $1
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla FROM stages WHERE id = $1
 `
 
 func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
@@ -148,6 +151,7 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.GateSla,
 	)
 	return i, err
 }
@@ -209,8 +213,56 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 	return items, nil
 }
 
+const listStagesAwaitingApproval = `-- name: ListStagesAwaitingApproval :many
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla FROM stages
+ WHERE state = 'awaiting_approval'
+   AND gate_sla IS NOT NULL
+ ORDER BY updated_at ASC
+`
+
+// Used by the SLA ticker to find candidates for timeout. Filters
+// to stages in awaiting_approval state with a non-null gate_sla so
+// the ticker doesn't pay for SLA parsing on rows where it isn't
+// applicable. Ordered by updated_at ASC: the oldest entry is the
+// most likely to be past SLA, so the ticker can early-exit if the
+// first row hasn't elapsed (when the parsed durations are uniform).
+func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listStagesAwaitingApproval)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Stage
+	for rows.Next() {
+		var i Stage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Sequence,
+			&i.StageType,
+			&i.ExecutorKind,
+			&i.ExecutorRef,
+			&i.State,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.FailureCategory,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.GateSla,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStagesForRun = `-- name: ListStagesForRun :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at FROM stages WHERE run_id = $1 ORDER BY sequence ASC
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla FROM stages WHERE run_id = $1 ORDER BY sequence ASC
 `
 
 func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stage, error) {
@@ -236,6 +288,7 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 			&i.FailureReason,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.GateSla,
 		); err != nil {
 			return nil, err
 		}
@@ -270,7 +323,7 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 }
 
 const lockStageForUpdate = `-- name: LockStageForUpdate :one
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at FROM stages WHERE id = $1 FOR UPDATE
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla FROM stages WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, error) {
@@ -290,6 +343,7 @@ func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, 
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.GateSla,
 	)
 	return i, err
 }
@@ -332,7 +386,7 @@ UPDATE stages
        failure_category = $5,
        failure_reason   = $6
  WHERE id = $1
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla
 `
 
 type UpdateStageStateParams struct {
@@ -368,6 +422,7 @@ func (q *Queries) UpdateStageState(ctx context.Context, arg UpdateStageStatePara
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.GateSla,
 	)
 	return i, err
 }

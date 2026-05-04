@@ -144,6 +144,12 @@ type Stage struct {
 	EndedAt         *time.Time
 	FailureCategory *FailureCategory
 	FailureReason   *string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// GateSLA is the gate's SLA string from the workflow spec at
+	// stage-create time, e.g. "4_business_hours" or "24_hours".
+	// Nil when the stage's gate has no SLA, when the stage isn't
+	// gated, or for rows that predate the column. Parsed by the
+	// SLA ticker into a wall-clock duration via internal/sla.Parse.
+	GateSLA   *string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }

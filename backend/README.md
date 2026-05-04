@@ -62,4 +62,9 @@ Apply migrations and start the server:
 
 Override the listen address with `--addr` or `FISHHAWKD_ADDR`.
 
+Optional flags:
+
+- `--enable-sla-timer` (or `FISHHAWKD_ENABLE_SLA_TIMER=true`) — start the background goroutine that times out `awaiting_approval` stages past their gate SLA, transitioning them to failed with category D. Off by default so dev runs aren't racing the timer.
+- `--sla-interval` — scan interval; defaults to `60s`. Hour-grained SLAs need no finer cadence.
+
 Larger context: `docs/MVP_SPEC.md` §5.1.1 (component) and §5.2 (execution flow); `docs/ARCHITECTURE.md` §4–§6 for the workflow lifecycle, storage model, and invariants.

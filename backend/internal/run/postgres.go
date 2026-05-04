@@ -140,6 +140,7 @@ func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*S
 		ExecutorKind: string(p.ExecutorKind),
 		ExecutorRef:  p.ExecutorRef,
 		State:        string(StageStatePending),
+		GateSla:      p.GateSLA,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create stage: %w", err)
@@ -164,6 +165,19 @@ func (r *postgresRepo) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([
 	rows, err := q.ListStagesForRun(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("list stages: %w", err)
+	}
+	out := make([]*Stage, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToStage(row))
+	}
+	return out, nil
+}
+
+func (r *postgresRepo) ListStagesAwaitingApproval(ctx context.Context) ([]*Stage, error) {
+	q := rundb.New(r.pool)
+	rows, err := q.ListStagesAwaitingApproval(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list stages awaiting approval: %w", err)
 	}
 	out := make([]*Stage, 0, len(rows))
 	for _, row := range rows {
@@ -263,6 +277,7 @@ func rowToStage(s rundb.Stage) *Stage {
 		ExecutorRef:   s.ExecutorRef,
 		State:         StageState(s.State),
 		FailureReason: s.FailureReason,
+		GateSLA:       s.GateSla,
 		CreatedAt:     s.CreatedAt.Time,
 		UpdatedAt:     s.UpdatedAt.Time,
 	}

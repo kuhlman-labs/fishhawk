@@ -289,6 +289,9 @@ func (s *stubRuns) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
 func (s *stubRuns) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (s *stubRuns) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 
 // stubAudit captures every AppendChained call so tests can assert
 // audit-entry shape and category.

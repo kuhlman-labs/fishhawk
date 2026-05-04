@@ -150,6 +150,9 @@ func (f *fakeRepo) GetStage(_ context.Context, _ uuid.UUID) (*run.Stage, error) 
 func (f *fakeRepo) ListStagesForRun(_ context.Context, _ uuid.UUID) ([]*run.Stage, error) {
 	return nil, errors.New("fakeRepo: ListStagesForRun not implemented")
 }
+func (f *fakeRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("fakeRepo: ListStagesAwaitingApproval not implemented")
+}
 func (f *fakeRepo) TransitionStage(_ context.Context, _ uuid.UUID, _ run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
 	return nil, errors.New("fakeRepo: TransitionStage not implemented")
 }
