@@ -718,6 +718,69 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v0/stages/{stage_id}/prompt:
+    get:
+      operationId: getStagePrompt
+      summary: Fetch the constructed prompt for a stage
+      description: |
+        Returns the agent-facing prompt the runner should write to
+        a temp file and pass to the executing agent's `--prompt-file`
+        argument. Construction is server-side and deterministic so
+        that two replays of the same stage produce byte-identical
+        prompts and the audit log records exactly what the agent
+        was asked to do (see MVP_SPEC §4.4).
+
+        Auth is the same per-run signing-key scheme used by the
+        trace upload endpoint. The runner signs
+        `sha256("prompt:" + stage_id)` with the private half issued
+        at signing-key time and sends the hex signature in
+        `X-Fishhawk-Signature`.
+
+        Returns 501 when no prompt template is implemented yet for
+        the stage's type — caller should treat the stage as
+        unsupported and fail rather than guess.
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - in: header
+          name: X-Fishhawk-Signature
+          required: true
+          schema:
+            type: string
+            description: Hex-encoded Ed25519 signature of `sha256("prompt:" + stage_id)`.
+      responses:
+        '200':
+          description: Constructed prompt for the stage.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stage_id, stage_type, prompt, prompt_hash]
+                properties:
+                  stage_id: { $ref: '#/components/schemas/UUID' }
+                  stage_type:
+                    type: string
+                    description: Stage type from the workflow spec (e.g. `implement`, `plan`).
+                  prompt:
+                    type: string
+                    description: Plain-text prompt for the agent.
+                  prompt_hash:
+                    type: string
+                    description: Hex-encoded sha256 of the prompt bytes.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501':
+          description: Prompt construction not implemented for this stage type.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Backend wiring incomplete (run, signing, or GitHub repo unconfigured).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/stages/{stage_id}/approvals:
     post:
       operationId: submitApproval

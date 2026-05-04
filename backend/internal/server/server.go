@@ -111,6 +111,12 @@ type Config struct {
 type Server struct {
 	cfg  Config
 	http *http.Server
+
+	// promptIssueGetterOverride lets tests substitute a stub for
+	// the GitHub issue lookup the prompt handler depends on without
+	// standing up a fake api.github.com. nil in production; the
+	// handler then resolves through cfg.GitHub.
+	promptIssueGetterOverride issueGetter
 }
 
 // New builds a Server. It does not start listening; call Start.

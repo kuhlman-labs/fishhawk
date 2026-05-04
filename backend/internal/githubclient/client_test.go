@@ -44,6 +44,9 @@ type fakeGitHub struct {
 	dispatchStatus int
 	dispatchBody   string
 
+	getIssueStatus int
+	getIssueBody   string
+
 	gotAuth        string
 	gotPath        string
 	gotQuery       string
@@ -59,6 +62,7 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 	fg := &fakeGitHub{
 		getFileStatus:  http.StatusOK,
 		dispatchStatus: http.StatusNoContent,
+		getIssueStatus: http.StatusOK,
 	}
 	mux := http.NewServeMux()
 
@@ -89,6 +93,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.dispatchStatus)
 			if fg.dispatchBody != "" {
 				_, _ = io.WriteString(w, fg.dispatchBody)
+			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.getIssueStatus)
+			if fg.getIssueBody != "" {
+				_, _ = io.WriteString(w, fg.getIssueBody)
 			}
 		})
 
@@ -447,5 +461,65 @@ func TestReadBriefBody(t *testing.T) {
 	got2 := readBriefBody(strings.NewReader("  trim  "))
 	if got2 != "trim" {
 		t.Errorf("got = %q, want trim", got2)
+	}
+}
+
+func TestGetIssue_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getIssueBody = `{"number":42,"title":"Add foo","body":"Body text","state":"open"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.Number != 42 || got.Title != "Add foo" || got.Body != "Body text" || got.State != "open" {
+		t.Errorf("decoded issue = %+v", got)
+	}
+	if fg.gotMethod != "GET" {
+		t.Errorf("method = %q", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/issues/42" {
+		t.Errorf("path = %q", fg.gotPath)
+	}
+	if fg.gotAuth != "Bearer ghs_canned_token" {
+		t.Errorf("auth = %q", fg.gotAuth)
+	}
+}
+
+func TestGetIssue_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getIssueStatus = http.StatusNotFound
+	fg.getIssueBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetIssue_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	if _, err := c.GetIssue(context.Background(), 1, RepoRef{}, 1); err == nil {
+		t.Errorf("expected error for empty repo")
+	}
+	if _, err := c.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 0); err == nil {
+		t.Errorf("expected error for zero issue number")
+	}
+	c2 := &Client{}
+	if _, err := c2.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1); err == nil {
+		t.Errorf("expected error for missing TokenProvider")
+	}
+}
+
+func TestGetIssue_DecodeError(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getIssueBody = `not json`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
+	if err == nil {
+		t.Fatalf("expected decode error")
 	}
 }
