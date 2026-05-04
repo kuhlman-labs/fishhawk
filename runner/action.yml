@@ -6,9 +6,12 @@ branding:
   color: 'blue'
 
 # Customers reference this action as
-#   uses: kuhlman-labs/fishhawk/runner@vX.Y
-# and pass the inputs below. The composite action checks out a Go
-# toolchain and invokes ./cmd/fishhawk-runner from this directory.
+#   uses: kuhlman-labs/fishhawk/runner@runner/vX.Y.Z
+# and pass the inputs below. The `runner/v…` tag prefix follows
+# the Go module convention for non-root modules in a monorepo;
+# E5.7's release workflow publishes signed releases at that tag
+# pattern. The composite action checks out a Go toolchain and
+# invokes ./cmd/fishhawk-runner from this directory.
 #
 # E5.1 (#52) shipped the scaffold; E5.2 (#29) added the Claude Code
 # invocation harness. With prompt-file unset the runner still

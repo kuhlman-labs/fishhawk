@@ -1,0 +1,144 @@
+# Runner release workflow (E5.7 / #54).
+#
+# Triggered by a tag push matching `runner/v*` (the Go-module
+# convention for a monorepo submodule, per the Go reference). The
+# workflow:
+#
+#  1. Re-runs lint + tests at the tag's commit (catches a tag
+#     pushed from a dirty branch).
+#  2. Builds a `fishhawk-runner` binary with -ldflags=-X to inject
+#     the tag version. Customers don't actually need a binary —
+#     the published Action is composite — but the binary is
+#     useful for ad-hoc CLI invocation, supply-chain verification,
+#     and as a reference for what the Action runs.
+#  3. Generates an SPDX-JSON SBOM of the runner module via
+#     anchore/sbom-action.
+#  4. Computes SHA-256 checksums of every release artifact.
+#  5. Signs the SHA256SUMS file with cosign (keyless / OIDC) so
+#     downstream consumers can verify the artifacts were produced
+#     by this workflow on this repo, without needing a managed
+#     PGP key.
+#  6. Publishes a GitHub Release with the artifacts attached.
+#
+# Versioning convention: `runner/vX.Y.Z`. Go's module system
+# requires a path-prefixed tag for any module not at the repo
+# root; that prefix doubles as a namespace for backend / cli /
+# verifier release workflows when those land.
+
+name: Runner Release
+
+on:
+  push:
+    tags:
+      - 'runner/v*'
+
+permissions:
+  contents: write   # create release + upload assets
+  id-token: write   # cosign keyless signing via GitHub OIDC
+
+jobs:
+  release:
+    name: Build, sign, and publish runner release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Need full history so release-notes generation tools
+          # (and the version-stamping step's `git describe`) work.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
+
+      - name: Verify the tagged commit passes lint + tests
+        run: |
+          set -eu
+          GOLANGCI_LINT="$(go env GOPATH)/bin/golangci-lint"
+          (
+            cd runner
+            "$GOLANGCI_LINT" run ./...
+            go build ./...
+            go test -race ./...
+          )
+
+      - name: Compute version and build binary
+        id: build
+        run: |
+          set -eu
+          # refs/tags/runner/v0.1.0 → v0.1.0
+          version="${GITHUB_REF#refs/tags/runner/}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          cd runner
+          CGO_ENABLED=0 go build \
+            -ldflags="-s -w -X github.com/kuhlman-labs/fishhawk/runner/internal/version.Version=${version}" \
+            -o "../dist/fishhawk-runner-${version}-linux-amd64" \
+            ./cmd/fishhawk-runner
+          # Sanity-check the embedded version.
+          "../dist/fishhawk-runner-${version}-linux-amd64" --help 2>&1 | head -n 3 || true
+
+      - name: Generate SBOM (SPDX-JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./runner
+          format: spdx-json
+          output-file: ./dist/runner-${{ steps.build.outputs.version }}.sbom.spdx.json
+
+      - name: Compute checksums
+        run: |
+          set -eu
+          cd dist
+          # `./*` keeps shellcheck happy: filenames starting with `-`
+          # would otherwise be interpreted as flags.
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums (keyless)
+        run: |
+          set -eu
+          cd dist
+          # --yes opts in to signing without an interactive prompt.
+          # Keyless signing emits two artifacts: a Sigstore bundle
+          # (.sig) and the Fulcio certificate chain (.pem). Verify
+          # downstream with:
+          #
+          #   cosign verify-blob \
+          #     --certificate-identity-regexp 'https://github.com/kuhlman-labs/fishhawk/.+' \
+          #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          #     --signature SHA256SUMS.sig \
+          #     --certificate SHA256SUMS.pem \
+          #     SHA256SUMS
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Runner ${{ steps.build.outputs.version }}
+          generate_release_notes: true
+          body_path: .github/release-notes/runner.md
+          # Pre-release for any tag with a prerelease suffix
+          # (e.g. runner/v0.1.0-rc.1). softprops's prerelease
+          # flag is OR'd with the tag-name heuristic.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/fishhawk-runner-${{ steps.build.outputs.version }}-linux-amd64
+            dist/runner-${{ steps.build.outputs.version }}.sbom.spdx.json
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
