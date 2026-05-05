@@ -1,13 +1,14 @@
 # Fishhawk infra (Terraform)
 
-Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. This directory holds the foundation slice (E13.7 / [#148](https://github.com/kuhlman-labs/fishhawk/issues/148) first PR): VPC + subnets, security groups, IAM roles, Secrets Manager skeletons, CloudWatch log group.
+Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. This directory has, as of E13.7.2:
+
+- **Foundation** ([#148](https://github.com/kuhlman-labs/fishhawk/issues/148)) — VPC + subnets, security groups, IAM roles, Secrets Manager skeletons, CloudWatch log group.
+- **ECS service + ALB** ([#166](https://github.com/kuhlman-labs/fishhawk/issues/166)) — Fargate task definition pointing at the GHCR image, ECS service across both private subnets, Application Load Balancer with HTTP listener (HTTPS + ACM + Route 53 alias gated on `domain_name`).
 
 What's **not** here yet (subsequent slices):
 
-- ECS cluster + task definition + service (slice 2)
-- ALB + listeners + target group + ACM certificate (slice 2)
-- RDS Postgres (slice 3)
-- Migration runner + deploy workflow (slice 4)
+- RDS Postgres + migration runner ([#167](https://github.com/kuhlman-labs/fishhawk/issues/167))
+- `backend-deploy.yml` workflow that updates the task definition revision per release ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168))
 
 ## Prerequisites
 
@@ -70,8 +71,9 @@ terraform plan -var-file=prod.tfvars -out=plan.tfplan
 terraform apply plan.tfplan
 ```
 
-Expected resources for the foundation slice (~25):
+Expected resources after slice 2 (~40):
 
+Foundation (~25):
 - 1 VPC + 1 IGW + 1 NAT gateway + 1 EIP
 - 4 subnets (2 public, 2 private)
 - 3 route tables + 4 associations
@@ -80,6 +82,13 @@ Expected resources for the foundation slice (~25):
 - 3 IAM roles (task execution, task, GHA OIDC) + their policies
 - 1 OIDC provider (token.actions.githubusercontent.com)
 - 1 CloudWatch Log group
+
+Slice 2 (~15 more):
+- 1 ECS cluster + capacity-provider config
+- 1 ECS task definition + 1 ECS service
+- 1 ALB + 1 target group
+- 1 HTTP listener (forward when no domain; redirect-to-HTTPS otherwise)
+- When `domain_name` set: 1 ACM cert + 2 Route 53 records (validation + alias) + 1 ACM validation + 1 HTTPS listener
 
 ## Post-apply manual steps
 
@@ -105,6 +114,24 @@ aws secretsmanager put-secret-value \
 
 Configure the GitHub App's webhook URL + secret to match (the URL points at the ALB after slice 2 lands).
 
+## Smoke testing the deploy
+
+Without a domain, the ALB serves on its AWS-default hostname over plain HTTP — fine for confirming the task is running:
+
+```sh
+URL=$(terraform output -raw fishhawkd_url)
+curl -sf "$URL/healthz"
+# {"status":"ok","version":"…"}
+```
+
+Cold-start time is ~30s — Fargate task placement, image pull from GHCR, binary boot. The ECS service's circuit breaker auto-rolls-back if a new task definition fails health checks too many times in a row.
+
+To follow logs:
+
+```sh
+aws logs tail /aws/ecs/fishhawk-prod --follow
+```
+
 ## Cost notes (us-east-1, on-demand, v0 traffic)
 
 | Resource | Approx /mo |
@@ -114,9 +141,12 @@ Configure the GitHub App's webhook URL + secret to match (the URL points at the 
 | Subnets, route tables, IGW | $0 |
 | Secrets Manager (4 secrets) | ~$1.60 |
 | CloudWatch Logs (30d retention, ~5 GB ingest) | ~$3 |
-| **Total foundation** | **~$40** |
+| ECS Fargate (1 × 256 CPU / 512 MB / 24×7) | ~$9 |
+| ALB (always-on + ~5 GB) | ~$18 |
+| ACM cert + Route 53 (when configured) | ~$1 |
+| **Total through slice 2** | **~$67** |
 
-ECS Fargate + RDS + ALB land in subsequent slices and add the bulk of the deploy cost.
+RDS lands in slice 3 and adds the bulk of the remaining cost (~$15 for `db.t4g.micro`).
 
 ## See also
 

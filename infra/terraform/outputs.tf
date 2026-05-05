@@ -55,3 +55,32 @@ output "secret_arns" {
   value       = local.secret_arns
   description = "Secrets Manager ARNs the task definition references in its `secrets` array."
 }
+
+# --- ECS / ALB outputs (E13.7.2) ---
+
+output "ecs_cluster_name" {
+  value = aws_ecs_cluster.main.name
+}
+
+output "ecs_service_name" {
+  value = aws_ecs_service.fishhawkd.name
+}
+
+output "task_definition_family" {
+  value       = aws_ecs_task_definition.fishhawkd.family
+  description = "Task definition family. The deploy workflow registers a new revision in this family per release."
+}
+
+output "alb_dns_name" {
+  value       = aws_lb.fishhawkd.dns_name
+  description = "AWS-default ALB hostname. Smoke-test against this when var.domain_name is empty."
+}
+
+output "alb_zone_id" {
+  value       = aws_lb.fishhawkd.zone_id
+  description = "Route 53 zone ID for ALB alias records (when wiring a domain in another module)."
+}
+
+output "fishhawkd_url" {
+  value = var.domain_name == "" ? "http://${aws_lb.fishhawkd.dns_name}" : "https://${var.domain_name}"
+}
