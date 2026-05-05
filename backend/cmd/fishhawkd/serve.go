@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -66,6 +67,15 @@ func runServe(args []string, logSink io.Writer) int {
 	slaInterval := fs.Duration("sla-interval",
 		60*time.Second,
 		"SLA ticker scan interval; 60s default fits hour-grained SLAs comfortably")
+	enableDispatchWatchdog := fs.Bool("enable-dispatch-watchdog",
+		envOr("FISHHAWKD_ENABLE_DISPATCH_WATCHDOG", "false") == "true",
+		"start the dispatch watchdog ticker (E8.4); fails category-C any stage stuck in 'dispatched' past --dispatch-watchdog-timeout. Off by default for the same dev-loop reason as --enable-sla-timer")
+	dispatchWatchdogTimeout := fs.Duration("dispatch-watchdog-timeout",
+		1*time.Hour,
+		"how long a stage may stay in 'dispatched' before the watchdog fails it as infrastructure failure; 1h default covers GitHub Actions dispatch + queue + first checkin")
+	dispatchWatchdogInterval := fs.Duration("dispatch-watchdog-interval",
+		60*time.Second,
+		"dispatch watchdog scan interval")
 	oidcAudience := fs.String("oidc-audience",
 		envOr("FISHHAWKD_OIDC_AUDIENCE", ""),
 		"GitHub Actions OIDC audience the signing-key endpoint requires; when set, callers must present a valid id_token whose aud matches this value")
@@ -315,6 +325,31 @@ func runServe(args []string, logSink io.Writer) int {
 			go ticker.Start(ctx)
 			logger.Info("approval SLA timeout ticker started",
 				slog.Duration("interval", *slaInterval))
+		}
+	}
+
+	// Same off-by-default story for the dispatch watchdog (E8.4).
+	// Stages stuck in 'dispatched' past --dispatch-watchdog-timeout
+	// are transitioned to failed-C and an audit entry is appended.
+	if *enableDispatchWatchdog {
+		if cfg.RunRepo == nil || cfg.AuditRepo == nil {
+			logger.Warn("--enable-dispatch-watchdog set but RunRepo or AuditRepo unconfigured; ticker not started")
+		} else {
+			ticker := &dispatchwatchdog.Ticker{
+				Repo:     cfg.RunRepo,
+				Audit:    cfg.AuditRepo,
+				Logger:   logger,
+				Interval: *dispatchWatchdogInterval,
+				Timeout:  *dispatchWatchdogTimeout,
+			}
+			go func() {
+				if err := ticker.Run(ctx); err != nil {
+					logger.Error("dispatch watchdog exited with error", slog.String("error", err.Error()))
+				}
+			}()
+			logger.Info("dispatch watchdog started",
+				slog.Duration("interval", *dispatchWatchdogInterval),
+				slog.Duration("timeout", *dispatchWatchdogTimeout))
 		}
 	}
 

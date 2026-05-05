@@ -177,6 +177,10 @@ func (r *approvalRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.St
 	return nil, errors.New("not used")
 }
 
+func (r *approvalRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 // approvalAuditFake records AppendChained calls so tests assert
 // audit-entry shape and category.
 type approvalAuditFake struct {
@@ -510,6 +514,10 @@ func (r *orchestratorRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) 
 }
 
 func (r *orchestratorRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
+func (r *orchestratorRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
 

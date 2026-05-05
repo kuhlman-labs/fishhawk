@@ -299,6 +299,52 @@ func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, erro
 	return items, nil
 }
 
+const listStagesDispatched = `-- name: ListStagesDispatched :many
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla FROM stages
+ WHERE state = 'dispatched'
+ ORDER BY updated_at ASC
+`
+
+// Used by the dispatch watchdog (E8.4) to find stages stuck at
+// 'dispatched' past a configurable timeout. Ordered by updated_at
+// ASC so the oldest stuck stage is processed first; lets the
+// watchdog early-exit once it sees one that's still within the
+// window.
+func (q *Queries) ListStagesDispatched(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listStagesDispatched)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Stage
+	for rows.Next() {
+		var i Stage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Sequence,
+			&i.StageType,
+			&i.ExecutorKind,
+			&i.ExecutorRef,
+			&i.State,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.FailureCategory,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.GateSla,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStagesForRun = `-- name: ListStagesForRun :many
 SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla FROM stages WHERE run_id = $1 ORDER BY sequence ASC
 `

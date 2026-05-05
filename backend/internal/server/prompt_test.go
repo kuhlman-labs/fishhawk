@@ -82,6 +82,10 @@ func (r *promptRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Sta
 func (r *promptRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+
+func (r *promptRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
 func (r *promptRunRepo) TransitionStage(context.Context, uuid.UUID, run.StageState, *run.StageCompletion) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }

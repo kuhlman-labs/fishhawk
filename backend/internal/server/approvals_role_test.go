@@ -74,6 +74,10 @@ func (r *approvalGateRunRepo) ListStagesAwaitingApproval(context.Context) ([]*ru
 	return nil, errors.New("not used")
 }
 
+func (r *approvalGateRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 // stubTeamLister satisfies role.TeamLister for the resolver in
 // these tests. teamMembers is keyed "org/slug".
 type stubTeamLister struct {

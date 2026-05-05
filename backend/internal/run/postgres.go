@@ -202,6 +202,19 @@ func (r *postgresRepo) ListStagesAwaitingApproval(ctx context.Context) ([]*Stage
 	return out, nil
 }
 
+func (r *postgresRepo) ListStagesDispatched(ctx context.Context) ([]*Stage, error) {
+	q := rundb.New(r.pool)
+	rows, err := q.ListStagesDispatched(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list stages dispatched: %w", err)
+	}
+	out := make([]*Stage, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToStage(row))
+	}
+	return out, nil
+}
+
 func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion) (*Stage, error) {
 	if to == StageStateFailed && (completion == nil || completion.FailureCategory == nil) {
 		return nil, errors.New("transition to failed requires StageCompletion with FailureCategory")

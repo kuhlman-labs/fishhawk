@@ -64,6 +64,16 @@ SELECT * FROM stages
    AND gate_sla IS NOT NULL
  ORDER BY updated_at ASC;
 
+-- name: ListStagesDispatched :many
+-- Used by the dispatch watchdog (E8.4) to find stages stuck at
+-- 'dispatched' past a configurable timeout. Ordered by updated_at
+-- ASC so the oldest stuck stage is processed first; lets the
+-- watchdog early-exit once it sees one that's still within the
+-- window.
+SELECT * FROM stages
+ WHERE state = 'dispatched'
+ ORDER BY updated_at ASC;
+
 -- name: UpdateStageState :one
 UPDATE stages
    SET state            = $2,
