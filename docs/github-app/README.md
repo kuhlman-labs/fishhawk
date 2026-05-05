@@ -9,7 +9,7 @@ Fishhawk runs as a GitHub App. The App provides:
 This directory ships:
 
 - [`manifest.template.json`](./manifest.template.json) — the App manifest with placeholder `{{BACKEND_URL}}` markers. Templates the URLs the operator fills in for their deploy.
-- [`../../scripts/render-github-app-manifest.sh`](../../scripts/render-github-app-manifest.sh) — a 30-line bash wrapper that renders the template for a given backend URL.
+- [`../../scripts/render-github-app-manifest.sh`](../../scripts/render-github-app-manifest.sh) — bash wrapper that renders the template for a given backend URL + webhook URL.
 
 ## Permissions
 
@@ -118,12 +118,17 @@ Pick one. Manifest flow is faster and removes manual scope-typo risk; manual set
 
 GitHub's manifest flow takes a one-shot JSON payload and creates the App in your account or org. The rendered manifest carries the right scopes + events; you only fill in the App name and confirm.
 
-1. Render the manifest with your backend's public URL:
+1. Render the manifest with your backend's public URL and webhook URL. In production they're typically the same host:
 
    ```sh
-   ./scripts/render-github-app-manifest.sh https://api.fishhawk.example.com > /tmp/fishhawk-app.json
+   ./scripts/render-github-app-manifest.sh \
+     https://api.fishhawk.example.com \
+     https://api.fishhawk.example.com/webhooks/github \
+     > /tmp/fishhawk-app.json
    jq . /tmp/fishhawk-app.json   # optional sanity check
    ```
+
+   For local dev, see the **Local development** section above — the backend URL is `http://localhost:8080` and the webhook URL is your smee.io forwarder.
 
 2. Open one of these URLs in a browser. Replace `<owner>` with your GitHub user or org name:
 
