@@ -32,6 +32,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /v0/tokens/{token_id}", s.handleRevokeToken)
 	mux.HandleFunc("GET /v0/auth/github/login", s.handleGitHubLogin)
 	mux.HandleFunc("GET /v0/auth/github/callback", s.handleGitHubCallback)
+	mux.HandleFunc("GET /v0/auth/github/manifest-flow-start", s.handleGitHubManifestFlowStart)
+	mux.HandleFunc("GET /v0/auth/github/manifest-callback", s.handleGitHubManifestCallback)
 	mux.HandleFunc("GET /v0/auth/me", s.handleGetMe)
 	mux.HandleFunc("POST /v0/auth/logout", s.handleLogout)
 	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
