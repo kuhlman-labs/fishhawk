@@ -1,0 +1,17 @@
+# Local state files (we use the S3 backend in real envs; the
+# default-local backend is the dev fallback). Never commit either.
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+crash.log
+
+# Per-environment variable files carry account IDs, OAuth client IDs,
+# etc. — values are not secrets, but they're per-account and don't
+# belong in git. Use prod.tfvars.example as the template.
+*.tfvars
+!*.tfvars.example
+
+# The backend.tf is per-account (S3 bucket name is account-scoped);
+# committed copy is .example, the live file is local.
+backend.tf

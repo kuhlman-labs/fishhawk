@@ -1,0 +1,14 @@
+# Copy to prod.tfvars and edit. .gitignore'd by default — these are
+# the per-environment knobs that change between dev / staging / prod.
+
+environment = "prod"
+region      = "us-east-1"
+project     = "fishhawk"
+
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# Tighten this once the deploy workflow lands so the OIDC trust is
+# scoped to a specific branch / tag rather than the whole repo.
+github_repo = "kuhlman-labs/fishhawk"
+
+log_retention_days = 30
