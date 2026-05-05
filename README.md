@@ -71,6 +71,8 @@ for m in $(go work edit -json | jq -r '.Use[].DiskPath'); do
 done
 ```
 
+Without a GitHub App configured, the backend logs warnings on startup and the OAuth + webhook endpoints respond 503 — runs, plans, and the audit log still work. To wire up Web UI sign-in and GitHub events, see the **Local development** section in [`docs/github-app/README.md`](docs/github-app/README.md).
+
 Per-component details live in each subdirectory's README:
 
 | Component | README |
