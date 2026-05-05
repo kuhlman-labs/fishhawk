@@ -37,37 +37,33 @@ Prerequisites:
 - [Docker](https://www.docker.com/) (for the local Postgres + MinIO stack)
 - Optional: [`golangci-lint v2`](https://golangci-lint.run/) for linting; `actionlint` for workflow files
 
-Bring up the dependencies — Postgres on `:5432`, MinIO on `:9000`/`:9001` ([`docker-compose.yml`](docker-compose.yml) for credentials):
+The repository ships a [`Makefile`](Makefile) that wraps the common loops. Run `make help` to see every target. The quickstart:
+
+```sh
+make up                     # docker compose: Postgres :5432, MinIO :9000/:9001
+make migrate                # apply backend migrations
+make dev-backend            # run fishhawkd on :8080
+make dev-frontend           # in another terminal: Web UI on :5173 (proxies /v0)
+make validate               # validate .fishhawk/workflows.yaml with the CLI
+make test                   # all Go modules (-race) + Web UI vitest
+make lint                   # golangci-lint v2 + eslint + tsc --noEmit
+make coverage               # reproduce the CI 80% gate
+```
+
+If you'd rather run things by hand, the Makefile targets are thin wrappers over these commands:
 
 ```sh
 docker compose up -d
-```
-
-Run the backend:
-
-```sh
 export FISHHAWKD_DATABASE_URL='postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable'
 go run ./backend/cmd/fishhawkd migrate up
-go run ./backend/cmd/fishhawkd serve
-# http://localhost:8080/healthz
-```
+go run ./backend/cmd/fishhawkd serve   # http://localhost:8080/healthz
 
-Run the Web UI in another terminal — the dev server proxies `/v0` to `localhost:8080`:
+cd frontend && pnpm install && pnpm dev   # http://localhost:5173
 
-```sh
-cd frontend
-pnpm install
-pnpm dev
-# http://localhost:5173
-```
-
-Validate a workflow spec with the CLI:
-
-```sh
 go run ./cli/cmd/fishhawk validate ./.fishhawk/workflows.yaml
 ```
 
-Run the full Go test suite — the workspace has multiple modules, so a plain `go test ./...` from the root won't work. Use the loop:
+A plain `go test ./...` from the root won't work — the repo is a multi-module Go workspace. The Makefile's `test-go` target loops over every module in `go.work`; the equivalent loop:
 
 ```sh
 for m in $(go work edit -json | jq -r '.Use[].DiskPath'); do
