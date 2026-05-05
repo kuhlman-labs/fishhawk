@@ -36,6 +36,80 @@ Webhook events:
 | `workflow_run` | Observe customer-side runner job state. |
 | `check_run`, `check_suite` | Required-status visibility on review-stage gates. |
 
+## Local development
+
+GitHub can't reach `localhost`, and OAuth callback URLs are matched exactly — so local dev splits into three modes. Pick the simplest that unblocks the work in front of you:
+
+| Mode | What works | What doesn't | Setup |
+|---|---|---|---|
+| **A. No App** | API + Web UI in dev mode (warnings are non-fatal; OAuth and webhook endpoints respond 503) | UI sign-in; receiving GitHub events | None — `make dev-backend` is enough |
+| **B. App with OAuth, no webhooks** | UI sign-in; manual run dispatch via the CLI | Receiving GitHub events (issues / PRs) | Register an App with a `localhost` callback; ignore webhooks |
+| **C. Full App with tunneled webhooks** | Everything | — | Register an App; expose `:8080` via smee.io or cloudflared |
+
+Most local UI work fits in Mode B. Reach for Mode C only when iterating on the webhook receiver itself.
+
+### Mode A — no App
+
+Run `make dev-backend` without setting any of the `FISHHAWKD_GITHUB_*` or `FISHHAWKD_OAUTH_*` env vars. The startup logs will warn that:
+
+- `/webhooks/github` responds 503,
+- `/v0/auth/github/*` responds 503,
+- the role resolver is disabled (the approval handler accepts any authenticated subject — fine for local testing).
+
+Everything else — runs, plans, audit log, retries — works against the local stack.
+
+### Mode B — App with OAuth, no webhooks
+
+1. Register an App on a personal account: <https://github.com/settings/apps/new>. Match the permissions and events table above. For the URLs:
+
+   - **Callback URL**: `http://localhost:8080/v0/auth/github/callback`
+   - **Webhook URL**: any placeholder (e.g. `http://localhost:9999/unused`); uncheck **Active**.
+
+2. On the App's settings page, generate a webhook secret, generate and download a private key (`.pem`), and note the App ID + OAuth Client ID + Client secret.
+
+3. Drop the credentials into a local `.env` (gitignored — already covered by `.env*` in `.gitignore`):
+
+   ```sh
+   FISHHAWKD_GITHUB_APP_ID=123456
+   FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE=/abs/path/fishhawk-app.private-key.pem
+   FISHHAWKD_GITHUB_WEBHOOK_SECRET=whatever-you-set
+   FISHHAWKD_OAUTH_CLIENT_ID=Iv1.xxxx
+   FISHHAWKD_OAUTH_CLIENT_SECRET=xxxx
+   FISHHAWKD_OAUTH_CALLBACK_URL=http://localhost:8080/v0/auth/github/callback
+   ```
+
+4. Run the backend with the env loaded:
+
+   ```sh
+   set -a; source .env; set +a
+   make dev-backend
+   ```
+
+The frontend dev server proxies `/v0` to `:8080`, so `http://localhost:5173` → "sign in" will round-trip through GitHub OAuth back to the UI.
+
+### Mode C — full App with tunneled webhooks
+
+Add a tunnel in front of `:8080`. Two common options:
+
+- **smee.io** (zero install): visit <https://smee.io/new> for a forwarding URL, then run a client that forwards to localhost:
+
+  ```sh
+  npx smee-client -u https://smee.io/abc123 -t http://localhost:8080/webhooks/github
+  ```
+
+  Set the App's **Webhook URL** to the smee URL. Leave the OAuth callback on `http://localhost:8080/v0/auth/github/callback` (browsers handle the redirect; only GitHub-originated webhook traffic needs the tunnel).
+
+- **cloudflared** (real HTTPS hostname for the duration of the tunnel):
+
+  ```sh
+  brew install cloudflared
+  cloudflared tunnel --url http://localhost:8080
+  ```
+
+  Use the printed `https://*.trycloudflare.com` URL for both the App's webhook URL **and** OAuth callback URL — and set `FISHHAWKD_OAUTH_CALLBACK_URL` to match.
+
+Set the same env vars as Mode B. After the tunnel is up, `Redeliver` a webhook from the App's **Advanced** tab to verify the round-trip.
+
 ## Registration paths
 
 Pick one. Manifest flow is faster and removes manual scope-typo risk; manual setup is the fallback when something in the manifest doesn't resolve cleanly (rare).
