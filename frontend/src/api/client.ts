@@ -1,3 +1,4 @@
+import { getCookie } from '@/lib/cookie';
 import type {
   ApiError,
   ApprovalRequest,
@@ -7,6 +8,15 @@ import type {
   Run,
   Stage,
 } from './types';
+
+/*
+ * CSRF cookie + header names (mirrors backend/internal/server/csrf.go).
+ * Exported so tests can assert against the constants directly.
+ */
+export const CSRF_COOKIE_NAME = '__Host-csrf';
+export const CSRF_HEADER_NAME = 'X-CSRF-Token';
+
+const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 /*
  * Thin fetch wrapper. Same-origin (Vite proxies /v0 → fishhawkd in
@@ -31,10 +41,26 @@ export class ApiClientError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // Auto-attach the CSRF token on state-changing methods. The
+  // backend's csrf middleware (E4.6) requires X-CSRF-Token to match
+  // __Host-csrf for cookie-authed requests; bearer-token callers
+  // (CLI, server-to-server) bypass server-side, so missing the
+  // cookie just means we don't add the header. Caller-provided
+  // headers win — letting an explicit override reach the server is
+  // useful in tests.
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (STATE_CHANGING_METHODS.has(method)) {
+    const csrf = getCookie(CSRF_COOKIE_NAME);
+    if (csrf) {
+      headers[CSRF_HEADER_NAME] = csrf;
+    }
+  }
+
   const res = await fetch(path, {
     credentials: 'include',
-    headers: { Accept: 'application/json' },
     ...init,
+    headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
   });
 
   if (!res.ok) {

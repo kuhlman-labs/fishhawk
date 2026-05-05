@@ -210,10 +210,13 @@ func TestGitHubCallback_HappyPath(t *testing.T) {
 	}
 
 	// Session cookie should be set; user record should exist.
-	var sessCookie *http.Cookie
+	var sessCookie, csrfCookie *http.Cookie
 	for _, c := range w.Result().Cookies() {
-		if c.Name == auth.SessionCookieName {
+		switch c.Name {
+		case auth.SessionCookieName:
 			sessCookie = c
+		case CSRFCookieName:
+			csrfCookie = c
 		}
 	}
 	if sessCookie == nil {
@@ -227,6 +230,22 @@ func TestGitHubCallback_HappyPath(t *testing.T) {
 	}
 	if !strings.HasPrefix(sessCookie.Value, auth.SessionTokenPrefix) {
 		t.Errorf("session cookie value missing prefix: %q", sessCookie.Value)
+	}
+
+	// E4.6: CSRF cookie minted alongside the session. JS reads it
+	// (HttpOnly: false) and mirrors the value back as X-CSRF-Token
+	// on state-changing requests.
+	if csrfCookie == nil {
+		t.Fatal("CSRF cookie not set")
+	}
+	if csrfCookie.HttpOnly {
+		t.Error("CSRF cookie must be readable from JS (HttpOnly false)")
+	}
+	if !csrfCookie.Secure || csrfCookie.SameSite != http.SameSiteStrictMode || csrfCookie.Path != "/" {
+		t.Errorf("CSRF cookie attributes: Secure=%v SameSite=%v Path=%q", csrfCookie.Secure, csrfCookie.SameSite, csrfCookie.Path)
+	}
+	if len(csrfCookie.Value) != 2*csrfTokenBytes {
+		t.Errorf("CSRF cookie value length = %d, want %d (hex of %d bytes)", len(csrfCookie.Value), 2*csrfTokenBytes, csrfTokenBytes)
 	}
 
 	// User row created.
@@ -329,6 +348,12 @@ func TestLogout_HappyPath(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v0/auth/logout", nil)
 	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: sess.PlainText})
+	// E4.6 #152: session-cookie-authed POST must double-submit the
+	// CSRF token. Issue one freshly here — the OAuth callback path
+	// is what mints it for real callers.
+	const csrfTok = "deadbeef"
+	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: csrfTok})
+	req.Header.Set(CSRFHeaderName, csrfTok)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 

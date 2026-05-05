@@ -49,8 +49,12 @@ components:
       description: |
         HTTP-only `Secure; SameSite=Lax` session cookie set by the OAuth
         callback. Same-origin SPA requests are auto-included; CSRF
-        protection on state-changing endpoints requires an
-        `X-CSRF-Token` header that matches the `__Host-csrf` cookie.
+        protection on state-changing endpoints (POST/PUT/PATCH/DELETE)
+        requires an `X-CSRF-Token` request header whose value matches
+        the `__Host-csrf` cookie issued alongside the session cookie.
+        Mismatched / missing token → `403 csrf_required`. Bearer-token
+        clients (see `bearerToken`) are immune to CSRF and bypass the
+        header check.
 
     bearerToken:
       type: http
@@ -322,7 +326,12 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Forbidden:
-      description: Authenticated identity lacks permission for this operation.
+      description: |
+        Authenticated identity lacks permission for the operation
+        (`error: forbidden`), or — on state-changing methods from a
+        session-cookie identity — the `X-CSRF-Token` header didn't
+        match the `__Host-csrf` cookie (`error: csrf_required`).
+        Bearer-token clients bypass the CSRF check.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -451,6 +460,7 @@ paths:
         '204':
           description: Session destroyed.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /v0/tokens:
     get:
@@ -506,6 +516,7 @@ paths:
                           The bearer token. Store immediately — not
                           retrievable later.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /v0/tokens/{token_id}:
     delete:
@@ -518,6 +529,7 @@ paths:
         '204':
           description: Token revoked.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   # ---------------------------------------------------------------------
@@ -610,6 +622,7 @@ paths:
               schema: { $ref: '#/components/schemas/Run' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /v0/runs/{run_id}:
     get:
@@ -645,6 +658,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
