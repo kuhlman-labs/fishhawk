@@ -60,9 +60,6 @@ to come:
 - **Audit search** under `/audit` is still a placeholder. The
   per-run audit list at `/runs/:id#audit` is wired (E7.4) but the
   global search across runs is later in E7.
-- **Pagination on `/runs`** and per-run audit lists
-  ([#155](https://github.com/kuhlman-labs/fishhawk/issues/155)) — both call with `limit=50`; cursor controls land
-  separately.
 - **Regenerate** in the plan-review header
   ([#146](https://github.com/kuhlman-labs/fishhawk/issues/146)) — renders disabled until E8.3 wires re-execution.
 

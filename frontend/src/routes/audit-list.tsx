@@ -1,55 +1,62 @@
 import { api } from '@/api/client';
-import { useAsync } from '@/api/use-async';
+import { usePaginated } from '@/api/use-paginated';
 import type { AuditEntry } from '@/api/types';
+import { Pagination } from '@/components/pagination';
 
 const AUDIT_PAGE_SIZE = 50;
 
 /*
- * The per-run audit list. Renders the most-recent entries chained
- * by the per-run sequence; the chain integrity guarantees from
- * E2 are not surfaced here visually beyond exposing entry_hash
- * (truncated) — verifying integrity is the verifier CLI's job.
+ * The per-run audit list. Renders entries chained by the per-run
+ * sequence; the chain integrity guarantees from E2 are not surfaced
+ * here visually beyond exposing entry_hash (truncated) — verifying
+ * integrity is the verifier CLI's job.
  *
- * Pagination beyond the first page is the same gap as on /runs;
- * tracked under E7.3.1 (#155) as the broader paginate-everything
- * follow-up.
+ * Cursor pagination via usePaginated (E7.3.1 #155); the backend's
+ * /v0/runs/{id}/audit endpoint already speaks limit/cursor.
  */
 export function RunAuditList({ runId }: { runId: string }) {
-  const result = useAsync(
-    (signal) =>
-      api.listRunAudit(runId, { limit: AUDIT_PAGE_SIZE }).then((r) => {
-        if (signal.aborted) return r;
-        return r;
-      }),
+  const { state, hasNext, hasPrev, next, prev, pageIndex } = usePaginated(
+    (cursor) => api.listRunAudit(runId, { limit: AUDIT_PAGE_SIZE, cursor: cursor ?? undefined }),
     [runId],
   );
 
-  if (result.status === 'loading') {
+  if (state.status === 'loading') {
     return <p className="text-sm text-neutral-500">Loading audit log…</p>;
   }
-  if (result.status === 'error') {
+  if (state.status === 'error') {
     return (
       <div
         role="alert"
         className="rounded-md border border-rose-300 bg-rose-50 p-4 text-sm text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200"
       >
         <div className="font-medium">Couldn&apos;t load audit log.</div>
-        <div className="mt-1 font-mono text-xs">{result.error.message}</div>
+        <div className="mt-1 font-mono text-xs">{state.error.message}</div>
       </div>
     );
   }
 
-  const entries = result.data.items;
-  if (entries.length === 0) {
+  const entries = state.data.items;
+  if (entries.length === 0 && pageIndex === 0) {
     return <p className="text-sm text-neutral-500">No audit entries for this run yet.</p>;
   }
 
   return (
-    <ol className="overflow-hidden rounded-md border border-neutral-200 dark:border-neutral-800">
-      {entries.map((entry) => (
-        <AuditRow key={entry.id} entry={entry} />
-      ))}
-    </ol>
+    <div className="space-y-3">
+      <ol className="overflow-hidden rounded-md border border-neutral-200 dark:border-neutral-800">
+        {entries.map((entry) => (
+          <AuditRow key={entry.id} entry={entry} />
+        ))}
+      </ol>
+      {(hasPrev || hasNext) && (
+        <Pagination
+          pageIndex={pageIndex}
+          hasPrev={hasPrev}
+          hasNext={hasNext}
+          onPrev={prev}
+          onNext={next}
+        />
+      )}
+    </div>
   );
 }
 
