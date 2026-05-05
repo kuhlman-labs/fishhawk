@@ -23,7 +23,8 @@ output "private_subnet_ids" {
 }
 
 output "alb_security_group_id" {
-  value = aws_security_group.alb.id
+  value       = var.enable_alb ? aws_security_group.alb[0].id : ""
+  description = "Empty string when enable_alb=false (bare-minimum dev)."
 }
 
 output "app_security_group_id" {
@@ -72,17 +73,22 @@ output "task_definition_family" {
 }
 
 output "alb_dns_name" {
-  value       = aws_lb.fishhawkd.dns_name
-  description = "AWS-default ALB hostname. Smoke-test against this when var.domain_name is empty."
+  value       = var.enable_alb ? aws_lb.fishhawkd[0].dns_name : ""
+  description = "AWS-default ALB hostname. Smoke-test against this when var.domain_name is empty. Empty when enable_alb=false (bare-minimum dev)."
 }
 
 output "alb_zone_id" {
-  value       = aws_lb.fishhawkd.zone_id
-  description = "Route 53 zone ID for ALB alias records (when wiring a domain in another module)."
+  value       = var.enable_alb ? aws_lb.fishhawkd[0].zone_id : ""
+  description = "Route 53 zone ID for ALB alias records. Empty when enable_alb=false."
 }
 
 output "fishhawkd_url" {
-  value = var.domain_name == "" ? "http://${aws_lb.fishhawkd.dns_name}" : "https://${var.domain_name}"
+  description = "URL operators curl to smoke-test. When the ALB is provisioned: ALB DNS or var.domain_name. When not (bare-minimum dev): empty — reach the task at its ENI public IP via aws ecs describe-tasks."
+  value = (
+    var.enable_alb
+    ? (var.domain_name == "" ? "http://${aws_lb.fishhawkd[0].dns_name}" : "https://${var.domain_name}")
+    : ""
+  )
 }
 
 # --- RDS / migrations (E13.7.3) ---

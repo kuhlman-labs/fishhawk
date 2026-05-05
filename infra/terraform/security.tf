@@ -13,6 +13,7 @@
 # ALB listener (added in slice 2); we still allow :80 here so the
 # redirect works.
 resource "aws_security_group" "alb" {
+  count       = var.enable_alb ? 1 : 0
   name_prefix = "${var.project}-${var.environment}-alb-"
   description = "fishhawkd ALB ingress"
   vpc_id      = aws_vpc.main.id
@@ -50,19 +51,35 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# App-facing SG: only the ALB can reach :8080. Bound to the Fargate
-# task ENI in slice 2.
+# App-facing SG: ingress depends on the deploy mode. When the ALB
+# is in front, only the ALB SG can reach :8080. In bare-minimum
+# dev (no ALB; tasks have public IPs), :8080 is open to the
+# internet so an operator can hit /healthz directly.
 resource "aws_security_group" "app" {
   name_prefix = "${var.project}-${var.environment}-app-"
   description = "fishhawkd Fargate task ingress"
   vpc_id      = aws_vpc.main.id
 
-  ingress {
-    description     = "HTTP from ALB"
-    from_port       = 8080
-    to_port         = 8080
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+  dynamic "ingress" {
+    for_each = var.enable_alb ? [1] : []
+    content {
+      description     = "HTTP from ALB"
+      from_port       = 8080
+      to_port         = 8080
+      protocol        = "tcp"
+      security_groups = [aws_security_group.alb[0].id]
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = var.enable_alb ? [] : [1]
+    content {
+      description = "HTTP from internet (dev mode — no ALB)"
+      from_port   = 8080
+      to_port     = 8080
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
   }
 
   egress {

@@ -11,9 +11,10 @@
  */
 
 resource "aws_lb" "fishhawkd" {
+  count              = var.enable_alb ? 1 : 0
   name               = "${var.project}-${var.environment}"
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
+  security_groups    = [aws_security_group.alb[0].id]
   subnets            = aws_subnet.public[*].id
 
   # Idle timeout matches a long-poll-friendly profile; v0 doesn't
@@ -34,6 +35,7 @@ resource "aws_lb" "fishhawkd" {
 # Target group: tasks register here when the ECS service places
 # them; the ALB load-balances across them.
 resource "aws_lb_target_group" "fishhawkd" {
+  count       = var.enable_alb ? 1 : 0
   name        = "${var.project}-${var.environment}"
   port        = 8080
   protocol    = "HTTP"
@@ -68,7 +70,8 @@ resource "aws_lb_target_group" "fishhawkd" {
 # name. When a domain IS configured, this redirects to HTTPS;
 # dns.tf adds the actual HTTPS listener.
 resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.fishhawkd.arn
+  count             = var.enable_alb ? 1 : 0
+  load_balancer_arn = aws_lb.fishhawkd[0].arn
   port              = 80
   protocol          = "HTTP"
 
@@ -79,7 +82,7 @@ resource "aws_lb_listener" "http" {
       for_each = var.domain_name == "" ? [1] : []
       content {
         target_group {
-          arn = aws_lb_target_group.fishhawkd.arn
+          arn = aws_lb_target_group.fishhawkd[0].arn
         }
       }
     }

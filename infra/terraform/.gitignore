@@ -12,6 +12,9 @@ crash.log
 *.tfvars
 !*.tfvars.example
 
-# The backend.tf is per-account (S3 bucket name is account-scoped);
-# committed copy is .example, the live file is local.
-backend.tf
+# Operator-supplied per-env backend configs (e.g. backend.dev.hcl,
+# backend.prod.hcl) for local-machine plans. CI passes the same
+# values via `-backend-config=...` from GitHub-environment
+# variables; the committed `backend.tf` is the partial-config
+# stub that both flows initialize against.
+backend.*.hcl

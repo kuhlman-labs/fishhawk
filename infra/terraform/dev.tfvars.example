@@ -1,0 +1,50 @@
+# Bare-minimum dev environment.
+#
+# Drops the NAT gateway and the ALB to land at ~$15/mo (RDS only).
+# ECS tasks run in the public subnets with public IPs and the app
+# security group widens to 0.0.0.0/0 on :8080. Operators reach
+# /healthz at the task ENI public IP, which they look up via:
+#
+#   aws ecs describe-tasks \
+#     --cluster fishhawk-dev \
+#     --tasks $(aws ecs list-tasks --cluster fishhawk-dev --query 'taskArns[0]' --output text) \
+#     --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
+#     --output text \
+#   | xargs -I {} aws ec2 describe-network-interfaces \
+#     --network-interface-ids {} \
+#     --query 'NetworkInterfaces[0].Association.PublicIp' --output text
+#
+# Don't run any of this configuration in production.
+
+environment = "dev"
+region      = "us-east-1"
+project     = "fishhawk"
+
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+github_repo        = "kuhlman-labs/fishhawk"
+log_retention_days = 7
+
+# Cost-cutting toggles — all three flip together. NAT off forces
+# task_assign_public_ip on; the ALB has nothing to front so it's
+# off too. The variable validation in variables.tf enforces the
+# NAT-vs-public-IP relationship.
+enable_nat_gateway    = false
+enable_alb            = false
+task_assign_public_ip = true
+
+# Smaller container — dev has no real traffic.
+image_tag          = "main"
+task_cpu           = 256
+task_memory        = 512
+task_desired_count = 1
+
+# DNS + TLS skipped automatically when enable_alb=false.
+
+# RDS — the smallest the engine supports.
+db_instance_class        = "db.t4g.micro"
+db_allocated_storage     = 20
+db_max_allocated_storage = 50
+db_backup_retention_days = 1
+db_multi_az              = false
+db_deletion_protection   = false

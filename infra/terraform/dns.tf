@@ -15,11 +15,15 @@
  */
 
 locals {
-  oauth_callback_url = var.domain_name == "" ? "" : "https://${var.domain_name}/v0/auth/github/callback"
+  # DNS + TLS resources are doubly gated — they need both a domain
+  # AND an ALB to point at. enable_alb=false (bare-minimum dev)
+  # disables DNS regardless of var.domain_name.
+  dns_enabled        = var.domain_name != "" && var.enable_alb
+  oauth_callback_url = local.dns_enabled ? "https://${var.domain_name}/v0/auth/github/callback" : ""
 }
 
 resource "aws_acm_certificate" "fishhawkd" {
-  count = var.domain_name == "" ? 0 : 1
+  count = local.dns_enabled ? 1 : 0
 
   domain_name       = var.domain_name
   validation_method = "DNS"
@@ -56,7 +60,7 @@ resource "aws_route53_record" "cert_validation" {
 }
 
 resource "aws_acm_certificate_validation" "fishhawkd" {
-  count = var.domain_name == "" ? 0 : 1
+  count = local.dns_enabled ? 1 : 0
 
   certificate_arn         = aws_acm_certificate.fishhawkd[0].arn
   validation_record_fqdns = [for r in aws_route53_record.cert_validation : r.fqdn]
@@ -67,15 +71,15 @@ resource "aws_acm_certificate_validation" "fishhawkd" {
 # from caring about the ALB's IPs (which can change) at a small
 # Route 53 query-cost discount.
 resource "aws_route53_record" "fishhawkd" {
-  count = var.domain_name == "" ? 0 : 1
+  count = local.dns_enabled ? 1 : 0
 
   zone_id = var.hosted_zone_id
   name    = var.domain_name
   type    = "A"
 
   alias {
-    name                   = aws_lb.fishhawkd.dns_name
-    zone_id                = aws_lb.fishhawkd.zone_id
+    name                   = aws_lb.fishhawkd[0].dns_name
+    zone_id                = aws_lb.fishhawkd[0].zone_id
     evaluate_target_health = true
   }
 }
@@ -83,9 +87,9 @@ resource "aws_route53_record" "fishhawkd" {
 # HTTPS listener. Bound to the validated cert; forwards to the
 # same target group the HTTP listener (in alb.tf) redirects to.
 resource "aws_lb_listener" "https" {
-  count = var.domain_name == "" ? 0 : 1
+  count = local.dns_enabled ? 1 : 0
 
-  load_balancer_arn = aws_lb.fishhawkd.arn
+  load_balancer_arn = aws_lb.fishhawkd[0].arn
   port              = 443
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
@@ -93,6 +97,6 @@ resource "aws_lb_listener" "https" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.fishhawkd.arn
+    target_group_arn = aws_lb_target_group.fishhawkd[0].arn
   }
 }
