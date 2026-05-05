@@ -122,6 +122,12 @@ export const api = {
     });
   },
 
+  retryStage(stageId: string): Promise<Stage> {
+    return request(`/v0/stages/${encodeURIComponent(stageId)}/retry`, {
+      method: 'POST',
+    });
+  },
+
   listRunAudit(
     runId: string,
     params?: { limit?: number; cursor?: string; category?: string },

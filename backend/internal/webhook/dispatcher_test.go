@@ -300,6 +300,10 @@ func (s *stubRuns) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
 
+func (s *stubRuns) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 // stubAudit captures every AppendChained call so tests can assert
 // audit-entry shape and category.
 type stubAudit struct {

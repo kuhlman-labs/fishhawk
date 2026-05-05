@@ -151,6 +151,28 @@ func (m *memRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
 
+// RetryStage validates the retry-only transition table and clears
+// the stage's failure metadata, mirroring postgresRepo's behaviour.
+// retry_test.go's RetryStage helper tests rely on this happening
+// in-memory.
+func (m *memRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.stages[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidStageRetryTransition(s.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
+	}
+	s.State = to
+	s.FailureCategory = nil
+	s.FailureReason = nil
+	s.EndedAt = nil
+	cp := *s
+	return &cp, nil
+}
+
 func newStage(state run.StageState) *run.Stage {
 	now := time.Now().UTC()
 	return &run.Stage{

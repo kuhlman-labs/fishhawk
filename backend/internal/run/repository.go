@@ -113,4 +113,14 @@ type Repository interface {
 	// must be non-nil and populated when transitioning to
 	// StageStateFailed; nil otherwise.
 	TransitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion) (*Stage, error)
+
+	// RetryStage is the explicit override path off a terminal state —
+	// today only failed → awaiting_approval per the
+	// stageRetryTransitions table in transition.go. Clears the
+	// stage's failure_category, failure_reason, and ended_at; the
+	// updated_at trigger restarts any timer keyed off it (SLA in
+	// particular). The high-level run.RetryStage helper calls this
+	// after deciding the retry is applicable; direct callers must
+	// already hold that decision.
+	RetryStage(ctx context.Context, id uuid.UUID, to StageState) (*Stage, error)
 }

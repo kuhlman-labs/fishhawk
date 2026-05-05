@@ -181,6 +181,33 @@ func (r *approvalRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, e
 	return nil, nil
 }
 
+// RetryStage mirrors postgresRepo: validates the retry-only
+// transition table and clears the stage's failure metadata so the
+// retry handler tests can drive the full happy-path flow.
+func (r *approvalRunRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.transitionErr != nil {
+		return nil, r.transitionErr
+	}
+	st, ok := r.stages[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidStageRetryTransition(st.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(st.State), To: string(to)}
+	}
+	st.State = to
+	st.FailureCategory = nil
+	st.FailureReason = nil
+	st.EndedAt = nil
+	r.transitions = append(r.transitions, approvalTransition{
+		StageID: id,
+		To:      to,
+	})
+	return st, nil
+}
+
 // approvalAuditFake records AppendChained calls so tests assert
 // audit-entry shape and category.
 type approvalAuditFake struct {
@@ -519,6 +546,10 @@ func (r *orchestratorRepo) ListStagesAwaitingApproval(context.Context) ([]*run.S
 
 func (r *orchestratorRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
+}
+
+func (r *orchestratorRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
 }
 
 func (r *orchestratorRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {

@@ -127,6 +127,10 @@ func (s *stubRuns) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
 
+func (s *stubRuns) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (s *stubRuns) TransitionRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

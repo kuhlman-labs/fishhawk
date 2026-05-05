@@ -90,6 +90,10 @@ func (f *fakeRepo) ListStagesDispatched(_ context.Context) ([]*run.Stage, error)
 	return nil, nil
 }
 
+func (f *fakeRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (f *fakeRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

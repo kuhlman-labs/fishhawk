@@ -115,6 +115,10 @@ func (r *policyRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, err
 	return nil, nil
 }
 
+func (r *policyRunRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 // makeTestBundle builds a *.jsonl.gz with a manifest, an optional
 // git_diff event, and a trailer. Used to drive the trace handler
 // end-to-end without depending on the runner package.
