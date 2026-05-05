@@ -109,3 +109,47 @@ variable "hosted_zone_id" {
     error_message = "hosted_zone_id must look like a Route 53 zone id (Z followed by uppercase alphanumerics)."
   }
 }
+
+# --- RDS knobs (E13.7.3) ---
+
+variable "db_engine_version" {
+  description = "Postgres major.minor for the RDS instance. AWS gates instance class availability on engine version; bump deliberately when AWS publishes a new minor."
+  type        = string
+  default     = "16.4"
+}
+
+variable "db_instance_class" {
+  description = "RDS instance class. db.t4g.micro is the cheapest Graviton tier (~$15/mo); production should bump to db.t4g.small or db.m6g.large depending on traffic."
+  type        = string
+  default     = "db.t4g.micro"
+}
+
+variable "db_allocated_storage" {
+  description = "Provisioned storage in GB. Auto-scales up to db_max_allocated_storage when full (no downtime; the auto-scaler bumps in 10% chunks)."
+  type        = number
+  default     = 20
+}
+
+variable "db_max_allocated_storage" {
+  description = "Auto-scaling ceiling in GB. 100 keeps us well clear of v0 traffic without runaway risk on a misbehaving migration."
+  type        = number
+  default     = 100
+}
+
+variable "db_backup_retention_days" {
+  description = "Daily-snapshot retention. 7 days covers \"oh shit\" recovery without paying for archival storage; production may bump to 30."
+  type        = number
+  default     = 7
+}
+
+variable "db_multi_az" {
+  description = "Enable Multi-AZ failover. Doubles RDS cost and flips us to synchronous replication. v0 ships single-AZ; bump for production once a partner relies on the deployment."
+  type        = bool
+  default     = false
+}
+
+variable "db_deletion_protection" {
+  description = "Block accidental `terraform destroy` of the RDS instance. Prod should set this to true and disable explicitly when truly tearing down."
+  type        = bool
+  default     = false
+}

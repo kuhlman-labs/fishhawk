@@ -29,3 +29,12 @@ task_desired_count = 1
 #
 # domain_name    = "fishhawk.example.dev"
 # hosted_zone_id = "Z0123456789ABCDEF"
+
+# RDS sizing. db.t4g.micro fits v0 traffic; bump db_instance_class
+# and flip db_multi_az + db_deletion_protection for production.
+db_instance_class        = "db.t4g.micro"
+db_allocated_storage     = 20
+db_max_allocated_storage = 100
+db_backup_retention_days = 7
+db_multi_az              = false
+db_deletion_protection   = false

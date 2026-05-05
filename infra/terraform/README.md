@@ -1,14 +1,14 @@
 # Fishhawk infra (Terraform)
 
-Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. This directory has, as of E13.7.2:
+Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. This directory has, as of E13.7.3:
 
 - **Foundation** ([#148](https://github.com/kuhlman-labs/fishhawk/issues/148)) — VPC + subnets, security groups, IAM roles, Secrets Manager skeletons, CloudWatch log group.
 - **ECS service + ALB** ([#166](https://github.com/kuhlman-labs/fishhawk/issues/166)) — Fargate task definition pointing at the GHCR image, ECS service across both private subnets, Application Load Balancer with HTTP listener (HTTPS + ACM + Route 53 alias gated on `domain_name`).
+- **RDS Postgres + migration task** ([#167](https://github.com/kuhlman-labs/fishhawk/issues/167)) — `db.t4g.micro` Postgres 16 in the private subnets with TLS forced and the master password RDS-managed; Terraform reads it and assembles the libpq URL into the existing `database_url` secret. Dedicated migration task definition for `fishhawkd migrate up`.
 
-What's **not** here yet (subsequent slices):
+What's **not** here yet:
 
-- RDS Postgres + migration runner ([#167](https://github.com/kuhlman-labs/fishhawk/issues/167))
-- `backend-deploy.yml` workflow that updates the task definition revision per release ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168))
+- `backend-deploy.yml` workflow that registers a new task-definition revision per release and runs the migration task before swapping the service ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168))
 
 ## Prerequisites
 
@@ -71,7 +71,7 @@ terraform plan -var-file=prod.tfvars -out=plan.tfplan
 terraform apply plan.tfplan
 ```
 
-Expected resources after slice 2 (~40):
+Expected resources through slice 3 (~50):
 
 Foundation (~25):
 - 1 VPC + 1 IGW + 1 NAT gateway + 1 EIP
@@ -89,6 +89,11 @@ Slice 2 (~15 more):
 - 1 ALB + 1 target group
 - 1 HTTP listener (forward when no domain; redirect-to-HTTPS otherwise)
 - When `domain_name` set: 1 ACM cert + 2 Route 53 records (validation + alias) + 1 ACM validation + 1 HTTPS listener
+
+Slice 3 (~5 more):
+- 1 RDS subnet group + 1 parameter group + 1 RDS instance (Postgres 16, single-AZ db.t4g.micro by default)
+- 1 dedicated migration task definition (`fishhawkd migrate up`)
+- 1 Secrets Manager *version* — Terraform reads the RDS-managed master password and writes the libpq URL into the existing `database_url` secret
 
 ## Post-apply manual steps
 
@@ -132,6 +137,32 @@ To follow logs:
 aws logs tail /aws/ecs/fishhawk-prod --follow
 ```
 
+## Running migrations
+
+The migration task definition (slice 3) runs `fishhawkd migrate up` against the RDS instance. Slice 4's deploy workflow will fire it on every release; until then, operators run it by hand on first apply and after every PR that touches `backend/internal/postgres/migrations/`:
+
+```sh
+CLUSTER=$(terraform output -raw ecs_cluster_name)
+TASKDEF=$(terraform output -raw migrate_task_definition_family)
+SUBNETS=$(terraform output -json private_subnet_ids | jq -r '.|join(",")')
+APP_SG=$(terraform output -raw app_security_group_id)
+
+TASK_ARN=$(aws ecs run-task \
+  --cluster "$CLUSTER" \
+  --task-definition "$TASKDEF" \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$APP_SG],assignPublicIp=DISABLED}" \
+  --query 'tasks[0].taskArn' --output text)
+
+aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+
+# Read exit code:
+aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+  --query 'tasks[0].containers[0].exitCode' --output text
+```
+
+A non-zero exit means the migration failed; check `awslogs-stream-prefix=migrate` in the CloudWatch group for the error.
+
 ## Cost notes (us-east-1, on-demand, v0 traffic)
 
 | Resource | Approx /mo |
@@ -139,14 +170,15 @@ aws logs tail /aws/ecs/fishhawk-prod --follow
 | NAT gateway (single AZ, ~10 GB egress) | ~$35 |
 | EIP (attached) | $0 |
 | Subnets, route tables, IGW | $0 |
-| Secrets Manager (4 secrets) | ~$1.60 |
+| Secrets Manager (4 secrets + 1 RDS-managed) | ~$2 |
 | CloudWatch Logs (30d retention, ~5 GB ingest) | ~$3 |
 | ECS Fargate (1 × 256 CPU / 512 MB / 24×7) | ~$9 |
 | ALB (always-on + ~5 GB) | ~$18 |
 | ACM cert + Route 53 (when configured) | ~$1 |
-| **Total through slice 2** | **~$67** |
+| RDS db.t4g.micro single-AZ + 20 GB gp3 + 7d backups | ~$17 |
+| **Total through slice 3** | **~$85** |
 
-RDS lands in slice 3 and adds the bulk of the remaining cost (~$15 for `db.t4g.micro`).
+Multi-AZ doubles RDS cost (~$32/mo). The deploy workflow (slice 4) adds zero infrastructure cost.
 
 ## See also
 

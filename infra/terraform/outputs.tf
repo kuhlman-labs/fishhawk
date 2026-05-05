@@ -84,3 +84,25 @@ output "alb_zone_id" {
 output "fishhawkd_url" {
   value = var.domain_name == "" ? "http://${aws_lb.fishhawkd.dns_name}" : "https://${var.domain_name}"
 }
+
+# --- RDS / migrations (E13.7.3) ---
+
+output "db_instance_address" {
+  value       = aws_db_instance.main.address
+  description = "RDS endpoint hostname. The task already reads this via the database_url secret; exposed here for ad-hoc psql + monitoring."
+}
+
+output "db_instance_port" {
+  value = aws_db_instance.main.port
+}
+
+output "db_master_user_secret_arn" {
+  value       = aws_db_instance.main.master_user_secret[0].secret_arn
+  description = "AWS-managed Secrets Manager ARN holding the master password. The libpq URL in `aws_secretsmanager_secret.database_url` is assembled from this."
+  sensitive   = true
+}
+
+output "migrate_task_definition_family" {
+  value       = aws_ecs_task_definition.migrate.family
+  description = "Task definition family for `fishhawkd migrate up`. Run via `aws ecs run-task --task-definition <family>` (latest revision) before promoting a new service revision."
+}
