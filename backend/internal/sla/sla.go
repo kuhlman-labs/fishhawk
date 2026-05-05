@@ -205,11 +205,7 @@ func (t *Ticker) handleStage(ctx context.Context, logger *slog.Logger, now time.
 	}
 	elapsed := now.Sub(s.UpdatedAt)
 	reason := fmt.Sprintf("sla_timeout: %s elapsed (deadline %s)", elapsed.Round(time.Second), d)
-	failureD := run.FailureD
-	if _, err := t.Repo.TransitionStage(ctx, s.ID, run.StageStateFailed, &run.StageCompletion{
-		FailureCategory: &failureD,
-		FailureReason:   &reason,
-	}); err != nil {
+	if _, err := run.FailStage(ctx, t.Repo, s.ID, run.FailureD, reason); err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "sla: transition failed",
 			slog.String("stage_id", s.ID.String()),
 			slog.String("error", err.Error()),

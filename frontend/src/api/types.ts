@@ -34,6 +34,24 @@ export type StageType = 'plan' | 'implement' | 'review';
 export type ExecutorKind = 'agent' | 'human';
 export type FailureCategory = 'A' | 'B' | 'C' | 'D';
 
+/**
+ * Mirrors backend/internal/run.FailureCategory.Description(). Keep
+ * the two in sync — the audit log and the UI must agree on wording.
+ * Update both sides together; there is no schema-sync CI for the
+ * Go-vs-TS string here, so drift is silent.
+ */
+export const FAILURE_DESCRIPTIONS: Record<FailureCategory, string> = {
+  A: 'agent failure',
+  B: 'constraint or policy violation',
+  C: 'infrastructure failure',
+  D: 'approval timeout or rejection',
+};
+
+export function describeFailure(cat: FailureCategory | null | undefined): string | null {
+  if (!cat) return null;
+  return FAILURE_DESCRIPTIONS[cat] ?? cat;
+}
+
 export interface Stage {
   id: string;
   run_id: string;

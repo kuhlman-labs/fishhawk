@@ -1,6 +1,7 @@
 import { Link, useParams } from 'react-router';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
+import { describeFailure } from '@/api/types';
 import type { Run, Stage, StageState } from '@/api/types';
 import { cn } from '@/lib/cn';
 import { RunAuditList } from './audit-list';
@@ -92,8 +93,16 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
               <span className="font-mono text-xs text-neutral-500">
                 {stage.executor.kind}:{stage.executor.ref}
               </span>
-              <span className={cn('ml-auto font-mono text-xs', stageStateStyles[stage.state])}>
-                {stage.state}
+              <span className="ml-auto flex items-center gap-2 font-mono text-xs">
+                {stage.state === 'failed' && stage.failure_category && (
+                  <span
+                    className="rounded bg-rose-100 px-1.5 py-0.5 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300"
+                    title={describeFailure(stage.failure_category) ?? undefined}
+                  >
+                    {stage.failure_category}
+                  </span>
+                )}
+                <span className={cn(stageStateStyles[stage.state])}>{stage.state}</span>
               </span>
             </li>
           ))}
