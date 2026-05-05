@@ -123,6 +123,10 @@ func (s *stubRuns) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, er
 	return nil, nil
 }
 
+func (s *stubRuns) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 func (s *stubRuns) TransitionRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -147,6 +147,10 @@ func (m *memRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, err
 	return nil, errors.New("not used")
 }
 
+func (m *memRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 func newStage(state run.StageState) *run.Stage {
 	now := time.Now().UTC()
 	return &run.Stage{

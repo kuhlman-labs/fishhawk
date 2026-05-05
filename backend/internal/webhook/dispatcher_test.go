@@ -296,6 +296,10 @@ func (s *stubRuns) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, er
 	return nil, errors.New("not used")
 }
 
+func (s *stubRuns) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 // stubAudit captures every AppendChained call so tests can assert
 // audit-entry shape and category.
 type stubAudit struct {

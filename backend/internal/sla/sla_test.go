@@ -83,6 +83,13 @@ func (f *fakeRepo) ListStagesAwaitingApproval(_ context.Context) ([]*run.Stage, 
 	return out, nil
 }
 
+// ListStagesDispatched supports run.Repository for the dispatch
+// watchdog tests in their own package (E8.4); SLA tests don't
+// exercise it directly.
+func (f *fakeRepo) ListStagesDispatched(_ context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 func (f *fakeRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

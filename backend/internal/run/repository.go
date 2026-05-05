@@ -102,6 +102,13 @@ type Repository interface {
 	// efficiency).
 	ListStagesAwaitingApproval(ctx context.Context) ([]*Stage, error)
 
+	// ListStagesDispatched returns every stage currently in
+	// 'dispatched' state. The dispatch watchdog (E8.4 #158) scans
+	// this to find stages stuck past a configurable timeout — the
+	// runner never reported in (action timeout, GitHub-side
+	// dispatch failure, network partition). Ordered updated_at ASC.
+	ListStagesDispatched(ctx context.Context) ([]*Stage, error)
+
 	// TransitionStage moves a stage to the target state. completion
 	// must be non-nil and populated when transitioning to
 	// StageStateFailed; nil otherwise.

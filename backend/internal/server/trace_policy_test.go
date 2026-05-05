@@ -111,6 +111,10 @@ func (r *policyRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stag
 	return nil, errors.New("not used")
 }
 
+func (r *policyRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 // makeTestBundle builds a *.jsonl.gz with a manifest, an optional
 // git_diff event, and a trailer. Used to drive the trace handler
 // end-to-end without depending on the runner package.

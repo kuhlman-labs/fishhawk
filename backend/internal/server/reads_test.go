@@ -46,6 +46,10 @@ func (r *stagesRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stag
 	return nil, errors.New("not used")
 }
 
+func (r *stagesRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 // Unused methods on run.Repository — the handler doesn't touch them.
 func (r *stagesRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
