@@ -9,6 +9,10 @@
   ],
   "request_oauth_on_install": false,
   "setup_on_update": false,
+  "hook_attributes": {
+    "url": "{{WEBHOOK_URL}}",
+    "active": true
+  },
   "default_permissions": {
     "contents": "write",
     "issues": "write",

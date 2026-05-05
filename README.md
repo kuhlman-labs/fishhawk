@@ -40,6 +40,7 @@ Prerequisites:
 The repository ships a [`Makefile`](Makefile) that wraps the common loops. Run `make help` to see every target. The quickstart:
 
 ```sh
+cp .env.example .env        # populate later for GitHub App / OAuth (see below)
 make up                     # docker compose: Postgres :5432, MinIO :9000/:9001
 make migrate                # apply backend migrations
 make dev-backend            # run fishhawkd on :8080
@@ -49,6 +50,8 @@ make test                   # all Go modules (-race) + Web UI vitest
 make lint                   # golangci-lint v2 + eslint + tsc --noEmit
 make coverage               # reproduce the CI 80% gate
 ```
+
+The Makefile auto-loads `.env` if present, so credentials and overrides flow into `make dev-backend` without manual `source` plumbing.
 
 If you'd rather run things by hand, the Makefile targets are thin wrappers over these commands:
 

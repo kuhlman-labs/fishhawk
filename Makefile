@@ -6,7 +6,15 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := help
 
-DATABASE_URL ?= postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable
+# Auto-load .env if present so `make dev-backend` picks up GitHub App
+# credentials etc. without `set -a; source .env; set +a` plumbing.
+# .env is gitignored; copy .env.example to get started.
+ifneq (,$(wildcard .env))
+include .env
+export
+endif
+
+DATABASE_URL ?= $(or $(FISHHAWKD_DATABASE_URL),postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable)
 COVERAGE_THRESHOLD ?= 80
 
 GO_MODULES := $(shell go work edit -json | jq -r '.Use[].DiskPath')
