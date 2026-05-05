@@ -1,5 +1,5 @@
 import { Github } from 'lucide-react';
-import { Navigate } from 'react-router';
+import { Navigate, useSearchParams } from 'react-router';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/auth/use-auth';
 
@@ -12,13 +12,25 @@ import { useAuth } from '@/auth/use-auth';
  * If a user lands here while already authenticated (back-button after
  * sign-out, deep link, etc.) we send them home instead of showing
  * a useless "sign in" form.
+ *
+ * E7.2.1 (#153): a ?next= query param flows from <RequireAuth> when
+ * an unauthenticated visitor was trying to reach a deep link. We
+ * forward it to /v0/auth/github/login so the backend can route the
+ * user back there post-callback. The backend re-validates, so a
+ * tampered or absolute URL can't become an open-redirect.
  */
 export function Login() {
   const { status } = useAuth();
+  const [params] = useSearchParams();
+  const next = params.get('next');
 
   if (status === 'authenticated') {
-    return <Navigate to="/" replace />;
+    return <Navigate to={next && next.startsWith('/') ? next : '/'} replace />;
   }
+
+  const oauthStart = next
+    ? `/v0/auth/github/login?next=${encodeURIComponent(next)}`
+    : '/v0/auth/github/login';
 
   return (
     <div className="flex min-h-full items-center justify-center px-4">
@@ -30,7 +42,7 @@ export function Login() {
           </p>
         </div>
         <Button asChild className="w-full">
-          <a href="/v0/auth/github/login">
+          <a href={oauthStart}>
             <Github className="size-4" aria-hidden />
             <span>Continue with GitHub</span>
           </a>

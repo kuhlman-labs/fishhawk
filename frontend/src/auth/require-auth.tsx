@@ -1,4 +1,4 @@
-import { Navigate } from 'react-router';
+import { Navigate, useLocation } from 'react-router';
 import type { ReactNode } from 'react';
 import { useAuth } from './use-auth';
 
@@ -11,9 +11,16 @@ interface Props {
  * minimal placeholder rather than nothing, so refresh on a deep
  * link doesn't cause the shell to flash empty before the redirect
  * decision is made.
+ *
+ * On unauthenticated, the current path+search is forwarded to
+ * /login as ?next= so the post-sign-in handler can route the user
+ * back to where they were trying to go (E7.2.1 #153). The hash is
+ * deliberately dropped — the OAuth callback's 302 response strips
+ * fragments anyway.
  */
 export function RequireAuth({ children }: Props) {
   const { status } = useAuth();
+  const location = useLocation();
 
   if (status === 'loading') {
     return (
@@ -28,7 +35,10 @@ export function RequireAuth({ children }: Props) {
   }
 
   if (status === 'unauthenticated') {
-    return <Navigate to="/login" replace />;
+    const intent = location.pathname + location.search;
+    const target =
+      intent && intent !== '/' ? `/login?next=${encodeURIComponent(intent)}` : '/login';
+    return <Navigate to={target} replace />;
   }
 
   return <>{children}</>;
