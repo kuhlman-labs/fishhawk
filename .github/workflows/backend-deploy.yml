@@ -1,0 +1,219 @@
+# Deploys fishhawkd to ECS Fargate (E13.7.4 / #168). Closes the
+# Day-21 deploy chain — once a tag triggers backend-release.yml
+# and that completes successfully, this workflow:
+#
+#  1. Resolves the image tag (the release's tag, or an explicit
+#     workflow_dispatch input for rollback).
+#  2. Renders + registers a new task-definition revision in the
+#     migrate family with the new image, runs it as a one-shot
+#     Fargate task, waits for completion, and fails loudly on a
+#     non-zero exit (logs are surfaced).
+#  3. Renders + registers a new revision of the serve family and
+#     calls amazon-ecs-deploy-task-definition; that action waits
+#     for the ECS service to converge on the new revision. The
+#     service's circuit-breaker (slice 2) auto-rolls-back on
+#     unhealthy task starts; this workflow's wait will surface
+#     the rollback as a failure.
+#
+# Operator setup (one-time per environment):
+#
+#  - GitHub repo variable AWS_DEPLOY_ROLE_ARN — output from
+#    Terraform: `terraform output -raw github_actions_deploy_role_arn`.
+#    Stored as a Variable, not a Secret, because role ARNs aren't
+#    sensitive (no rotation story).
+#
+# The workflow assumes a single prod environment for v0; v1+
+# multi-env deploys can templatize AWS_ENV.
+name: backend-deploy
+
+on:
+  workflow_run:
+    workflows: [backend-release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (e.g. v0.1.0, sha-abc123, main)"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+  id-token: write # OIDC for AWS role assumption
+
+# Serialize deploys to a single environment so concurrent tag
+# pushes don't fight each other through aws ecs update-service.
+# cancel-in-progress: false because killing a partial migration
+# is worse than queueing.
+concurrency:
+  group: backend-deploy-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ENV: prod
+  PROJECT: fishhawk
+  IMAGE_REPO: ghcr.io/kuhlman-labs/fishhawkd
+
+jobs:
+  resolve:
+    # On workflow_run, abort cleanly if backend-release.yml didn't
+    # succeed — no point deploying a release that didn't build.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+    steps:
+      - id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.image_tag }}
+          # head_branch on a tag-triggered run is the bare tag name
+          # (no refs/tags/ prefix). backend-release fires on
+          # backend/v* tags so the value here is e.g. backend/v0.1.0.
+          RUN_HEAD: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${INPUT_TAG}"
+          else
+            tag="${RUN_HEAD#backend/}"
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::Could not resolve image tag"
+            exit 1
+          fi
+          echo "Resolved image tag: $tag"
+          echo "image_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  migrate:
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Register new migrate task definition
+        id: register-migrate
+        run: |
+          set -eu
+          FAMILY="${PROJECT}-${AWS_ENV}-migrate"
+          IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
+
+          aws ecs describe-task-definition --task-definition "$FAMILY" \
+            --query taskDefinition > current.json
+
+          # Mutate image; strip the read-only fields that
+          # register-task-definition rejects on round-trip.
+          jq --arg image "$IMAGE" '
+            .containerDefinitions[0].image = $image
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+          ' current.json > new.json
+
+          NEW_TD=$(aws ecs register-task-definition \
+            --cli-input-json file://new.json \
+            --query taskDefinition.taskDefinitionArn --output text)
+          echo "Registered migrate task def: $NEW_TD"
+          echo "task_def_arn=${NEW_TD}" >> "$GITHUB_OUTPUT"
+
+      - name: Run migrations
+        run: |
+          set -eu
+          CLUSTER="${PROJECT}-${AWS_ENV}"
+          SERVICE="${PROJECT}-${AWS_ENV}"
+          TD="${{ steps.register-migrate.outputs.task_def_arn }}"
+
+          # Reuse the serve service's network config — same
+          # subnets + SG + assignPublicIp setting.
+          NET=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].networkConfiguration')
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$TD" \
+            --launch-type FARGATE \
+            --network-configuration "$NET" \
+            --query 'tasks[0].taskArn' --output text)
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "::error::run-task did not return a task ARN"
+            exit 1
+          fi
+          echo "Migration task: $TASK_ARN"
+
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::Migration failed (exit=$EXIT_CODE). Recent logs:"
+            aws logs tail "/aws/ecs/${PROJECT}-${AWS_ENV}" \
+              --log-stream-name-prefix migrate --since 10m || true
+            exit 1
+          fi
+          echo "Migrations applied cleanly."
+
+  deploy:
+    needs: [resolve, migrate]
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Render new serve task definition
+        id: render-serve
+        run: |
+          set -eu
+          FAMILY="${PROJECT}-${AWS_ENV}"
+          IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
+
+          aws ecs describe-task-definition --task-definition "$FAMILY" \
+            --query taskDefinition > current.json
+
+          jq --arg image "$IMAGE" '
+            .containerDefinitions[0].image = $image
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+          ' current.json > new.json
+
+          echo "task_definition_path=new.json" >> "$GITHUB_OUTPUT"
+
+      # Registers the new revision and waits for the service to
+      # converge. Times out after 10 min — Fargate cold-start is
+      # ~30s per task, so a 1-replica rolling deploy fits easily.
+      # The ECS service's deployment circuit breaker (slice 2)
+      # auto-rolls-back if the new tasks fail health checks; this
+      # action surfaces the resulting failure as a workflow error.
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-serve.outputs.task_definition_path }}
+          service: ${{ env.PROJECT }}-${{ env.AWS_ENV }}
+          cluster: ${{ env.PROJECT }}-${{ env.AWS_ENV }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Smoke test
+        run: |
+          set -eu
+          # Pull the ALB DNS from the service's load balancer config
+          # rather than hard-coding it; if the operator wired a
+          # custom domain, hit the service-stability check above
+          # and trust that — the public domain may have its own
+          # caching / propagation lag.
+          DNS=$(aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?LoadBalancerName=='${PROJECT}-${AWS_ENV}'].DNSName" \
+            --output text)
+          if [ -z "$DNS" ]; then
+            echo "::warning::ALB DNS lookup failed; skipping smoke test."
+            exit 0
+          fi
+          echo "Hitting http://${DNS}/healthz"
+          curl -fsS --max-time 10 "http://${DNS}/healthz" | tee response.json
+          echo
+          echo "Healthz reachable."
