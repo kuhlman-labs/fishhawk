@@ -12,3 +12,20 @@ availability_zones = ["us-east-1a", "us-east-1b"]
 github_repo = "kuhlman-labs/fishhawk"
 
 log_retention_days = 30
+
+# Container image. The deploy workflow (slice 4) overrides this
+# per release; manual applies use the default branch image.
+image_tag = "main"
+
+# Task sizing. 256/512 is the Fargate floor and fits v0 traffic.
+# Bump task_desired_count to 2 once slice 3 lands RDS Multi-AZ
+# for honest HA.
+task_cpu           = 256
+task_memory        = 512
+task_desired_count = 1
+
+# DNS + TLS. Leave both empty for a smoke deploy on the AWS-default
+# ALB hostname (HTTP only). Set both for production.
+#
+# domain_name    = "fishhawk.example.dev"
+# hosted_zone_id = "Z0123456789ABCDEF"
