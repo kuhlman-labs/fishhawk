@@ -548,8 +548,25 @@ func (r *orchestratorRepo) ListStagesDispatched(context.Context) ([]*run.Stage, 
 	return nil, nil
 }
 
-func (r *orchestratorRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
-	return nil, errors.New("not used")
+// RetryStage validates against the retry-only transition table
+// and clears failure metadata + ended_at. Mirrors postgresRepo so
+// the retry handler tests in retry_test.go can drive the full
+// orchestrator handoff.
+func (r *orchestratorRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, ok := r.stagesByID[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidStageRetryTransition(st.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(st.State), To: string(to)}
+	}
+	st.State = to
+	st.FailureCategory = nil
+	st.FailureReason = nil
+	st.EndedAt = nil
+	return st, nil
 }
 
 func (r *orchestratorRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {

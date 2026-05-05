@@ -17,11 +17,10 @@ import (
 // "try again later".
 var ErrRetryNotApplicable = errors.New("retry not applicable")
 
-// ErrRetryNotImplemented is returned for failure categories whose
-// retry path needs work that hasn't shipped yet (today: A and C,
-// which require orchestrator-driven re-dispatch — tracked under
-// follow-up issues). Handlers map to 501 so a caller can tell
-// "we'll get to it" from "this can never be retried."
+// ErrRetryNotImplemented was returned for category-A and -C
+// retries before E8.6 (#173) wired the orchestrator. Kept around
+// for callers that switch on it (the handler still maps it to
+// 501) but no path in this package returns it as of E8.6.
 var ErrRetryNotImplemented = errors.New("retry not implemented")
 
 // RetryDecision summarizes what RetryStage did, for the audit
@@ -44,26 +43,33 @@ type RetryDecision struct {
 // RetryStage re-opens a failed stage when the current failure
 // category supports it. Per MVP_SPEC §6:
 //
-//	A (agent failure)            → re-dispatch the runner. NOT YET
-//	                               IMPLEMENTED — needs orchestrator
-//	                               work; returns ErrRetryNotImplemented.
+//	A (agent failure)            → failed → pending. Caller hands
+//	                               off to the orchestrator, which
+//	                               walks pending → dispatched and
+//	                               fires workflow_dispatch.
 //	B (constraint/policy)        → not retriable; the workflow
 //	                               or spec needs to change first.
 //	                               Returns ErrRetryNotApplicable.
-//	C (infrastructure)           → re-dispatch. NOT YET IMPLEMENTED;
-//	                               same orchestrator dependency as A.
-//	D, sla_timeout sub-reason    → re-open the gate (failed →
-//	                               awaiting_approval). updated_at
-//	                               restarts implicitly via the
+//	C (infrastructure)           → failed → pending. Same handoff
+//	                               as A — fresh runner instance,
+//	                               fresh signing key.
+//	D, sla_timeout sub-reason    → failed → awaiting_approval.
+//	                               updated_at restarts via the
 //	                               trigger; SLA ticker measures
-//	                               from the new value.
+//	                               from the new value. No
+//	                               orchestrator handoff needed.
 //	D, gate-rejected sub-reason  → not retriable; the approver
 //	                               said no, a fresh run is the
 //	                               right next step.
 //
-// On success returns the new Stage and the prior failure detail
+// On success returns the new Stage (in pending for A/C, in
+// awaiting_approval for D-timeout) and the prior failure detail
 // for the caller to put in the audit entry. On a non-retriable
-// case returns ErrRetryNotApplicable / ErrRetryNotImplemented.
+// case returns ErrRetryNotApplicable.
+//
+// The orchestrator handoff for A/C lives in the handler, not here:
+// run depends on nothing external; orchestrator depends on run.
+// Inverting that would create a cycle.
 func RetryStage(ctx context.Context, repo Repository, stageID uuid.UUID) (*RetryDecision, error) {
 	stage, err := repo.GetStage(ctx, stageID)
 	if err != nil {
@@ -86,8 +92,21 @@ func RetryStage(ctx context.Context, repo Repository, stageID uuid.UUID) (*Retry
 
 	switch priorCat {
 	case FailureA, FailureC:
-		return nil, fmt.Errorf("%w: category %s retry needs orchestrator re-dispatch (E8.3 follow-up)",
-			ErrRetryNotImplemented, priorCat)
+		// Re-dispatch path: state-machine moves stage back to
+		// pending, then the handler invokes the orchestrator,
+		// which transitions pending → dispatched and fires
+		// workflow_dispatch. Same flow whether the prior failure
+		// was an agent crash (A) or an infra timeout (C); both
+		// produce a fresh runner with a fresh signing key.
+		updated, err := repo.RetryStage(ctx, stageID, StageStatePending)
+		if err != nil {
+			return nil, fmt.Errorf("RetryStage: failed → pending: %w", err)
+		}
+		return &RetryDecision{
+			PriorCategory: priorCat,
+			PriorReason:   priorReason,
+			Stage:         updated,
+		}, nil
 	case FailureB:
 		return nil, fmt.Errorf("%w: category B failures (constraint/policy) require a spec or workflow change, not a retry",
 			ErrRetryNotApplicable)

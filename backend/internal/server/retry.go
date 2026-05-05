@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -21,13 +22,17 @@ const CategoryStageRetried = "stage_retried"
 
 // handleRetryStage implements POST /v0/stages/{stage_id}/retry.
 //
-// Per E8.3 (#146), the per-category retry semantics are:
+// Per-category retry semantics (E8.3 #146 + E8.6 #173):
 //
-//	A (agent failure)            → 501; orchestrator re-dispatch
-//	                               not yet implemented (E8.3 follow-up).
+//	A (agent failure)            → 200; failed → pending →
+//	                               (orchestrator) → dispatched.
+//	                               workflow_dispatch fires for the
+//	                               same workflow_id + workflow_sha.
 //	B (constraint/policy)        → 422; the workflow or spec
 //	                               needs to change first.
-//	C (infrastructure)           → 501; same orchestrator gap as A.
+//	C (infrastructure)           → 200; same flow as A — fresh
+//	                               runner instance with a fresh
+//	                               signing key.
 //	D, sla_timeout sub-reason    → 200; failed → awaiting_approval,
 //	                               failure metadata cleared,
 //	                               updated_at trigger restarts the
@@ -37,8 +42,13 @@ const CategoryStageRetried = "stage_retried"
 //	                               fresh run is the right next
 //	                               step.
 //
-// The high-level decision-tree lives in run.RetryStage; this
-// handler is the HTTP shim around it.
+// The high-level decision tree lives in run.RetryStage; this
+// handler is the HTTP shim around it. For A/C the handler also
+// invokes the orchestrator after the state transition (and after
+// the audit write) to fire the actual workflow_dispatch.
+// Orchestrator failures are logged but don't fail the request:
+// the audit row is in place, the stage is in pending, an operator
+// can re-fire Advance manually if needed.
 func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "retry_unconfigured",
@@ -62,6 +72,8 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 				"no stage with that id", nil)
 			return
 		case errors.Is(err, run.ErrRetryNotImplemented):
+			// No path returns this as of E8.6, but keep the mapping
+			// so callers that switch on it stay sane.
 			s.writeError(w, r, http.StatusNotImplemented, "retry_not_implemented",
 				err.Error(), nil)
 			return
@@ -75,7 +87,36 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Audit first so the retry intent is recorded even if the
+	// orchestrator handoff below fails. Same posture as the
+	// approvals handler (E7.4 / approvals.go).
 	s.writeRetryAudit(r, dec)
+
+	// A/C retries land the stage in pending; hand off to the
+	// orchestrator to walk pending → dispatched and fire
+	// workflow_dispatch. D-timeout retries land at
+	// awaiting_approval and don't need the orchestrator (no
+	// dispatch to fire — the gate just re-opens).
+	if dec.Stage.State == run.StageStatePending && s.cfg.Orchestrator != nil {
+		if _, err := s.cfg.Orchestrator.Advance(r.Context(), dec.Stage.RunID); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+				"orchestrator advance failed for retry",
+				slog.String("run_id", dec.Stage.RunID.String()),
+				slog.String("stage_id", dec.Stage.ID.String()),
+				slog.String("error", err.Error()))
+			// Don't fail the request: the audit row recorded the
+			// retry intent and the stage is in pending. Operator
+			// can re-fire Advance manually. Re-fetch the stage so
+			// the response reflects whatever state the orchestrator
+			// did manage to reach before failing.
+		}
+		// Re-fetch the stage post-orchestrator so the response
+		// reflects dispatched / awaiting_approval, not pending.
+		if updated, err := s.cfg.RunRepo.GetStage(r.Context(), dec.Stage.ID); err == nil {
+			dec.Stage = updated
+		}
+	}
+
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
 }
 

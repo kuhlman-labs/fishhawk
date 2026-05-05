@@ -71,7 +71,7 @@ describe('FailureBanner', () => {
     }
   });
 
-  it('omits the Retry button when failure category is not D-timeout', () => {
+  it('omits the Retry button for category B (not retriable)', () => {
     render(
       <FailureBanner
         stage={stage({
@@ -99,6 +99,36 @@ describe('FailureBanner', () => {
       />,
     );
     expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
+  });
+
+  it('renders the Retry button for category A (E8.6)', () => {
+    render(
+      <FailureBanner
+        stage={stage({
+          state: 'failed',
+          failure_category: 'A',
+          failure_reason: 'agent crashed: SIGSEGV',
+        })}
+        onStageUpdate={vi.fn()}
+        onStageRollback={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole('button', { name: /retry/i })).toBeEnabled();
+  });
+
+  it('renders the Retry button for category C (E8.6)', () => {
+    render(
+      <FailureBanner
+        stage={stage({
+          state: 'failed',
+          failure_category: 'C',
+          failure_reason: 'dispatch_watchdog: 70m elapsed',
+        })}
+        onStageUpdate={vi.fn()}
+        onStageRollback={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole('button', { name: /retry/i })).toBeEnabled();
   });
 
   it('omits the Retry button when callbacks are not supplied', () => {
@@ -158,6 +188,50 @@ describe('FailureBanner', () => {
     const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/retry'));
     expect(call).toBeDefined();
     expect((call?.[1] as RequestInit | undefined)?.method).toBe('POST');
+  });
+
+  it('uses pending as the optimistic state for category-A retries (E8.6)', async () => {
+    const dispatched: Stage = stage({
+      state: 'dispatched', // server returns dispatched after orchestrator advance
+      failure_category: null,
+      failure_reason: null,
+    });
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify(dispatched), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const onStageUpdate = vi.fn();
+    const onStageRollback = vi.fn();
+    const aStage = stage({
+      state: 'failed',
+      failure_category: 'A',
+      failure_reason: 'agent crashed: SIGSEGV',
+    });
+    render(
+      <FailureBanner
+        stage={aStage}
+        onStageUpdate={onStageUpdate}
+        onStageRollback={onStageRollback}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+
+    await waitFor(() => expect(onStageUpdate).toHaveBeenCalledTimes(2));
+    // Optimistic update fires `pending` (not awaiting_approval)
+    // because A retries go through the orchestrator's re-dispatch
+    // path.
+    expect(onStageUpdate.mock.calls[0][0]).toMatchObject({
+      state: 'pending',
+      failure_category: null,
+    });
+    // Server response replaces it with the post-orchestrator state.
+    expect(onStageUpdate.mock.calls[1][0]).toEqual(dispatched);
   });
 
   it('rolls back the optimistic update and surfaces the error on backend rejection', async () => {

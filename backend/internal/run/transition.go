@@ -84,18 +84,24 @@ func ValidStageTransition(from, to StageState) bool {
 // off the normal state machine — moves out of a terminal state
 // that the regular ValidStageTransition refuses.
 //
-// Today only the D-timeout retry path lives here: a stage that
-// failed because the SLA elapsed (failure_reason starts with
-// "sla_timeout") can re-open back to awaiting_approval; the
-// updated_at trigger restarts the SLA clock.
+// Two retry paths live here:
 //
-// A and C retries (re-dispatch the runner) need orchestrator
-// changes and live on their own follow-up issues. B and D-rejected
-// are deliberately not retriable — the spec / approver said no,
-// the answer doesn't change without a fresh run.
+//   - failed → awaiting_approval is the D-timeout retry: the SLA
+//     elapsed but no plan needs to be regenerated, just re-open
+//     the gate. The updated_at trigger restarts the SLA clock.
+//   - failed → pending is the A/C retry (E8.6 #173): the agent
+//     crashed (A) or the runner never reported in (C); we want
+//     a fresh dispatch. The handler hands off to the orchestrator
+//     after the transition; the orchestrator walks pending →
+//     dispatched and fires workflow_dispatch.
+//
+// B and D-rejected are deliberately not retriable — the spec or
+// the approver said no, the answer doesn't change without a fresh
+// run.
 var stageRetryTransitions = map[StageState]map[StageState]struct{}{
 	StageStateFailed: {
 		StageStateAwaitingApproval: {},
+		StageStatePending:          {},
 	},
 }
 

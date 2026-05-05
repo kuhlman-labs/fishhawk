@@ -25,13 +25,44 @@ interface Props {
   onStageRollback?: (prev: Stage) => void;
 }
 
-function isDTimeout(stage: Stage): boolean {
-  return (
-    stage.state === 'failed' &&
-    stage.failure_category === 'D' &&
-    typeof stage.failure_reason === 'string' &&
-    stage.failure_reason.startsWith('sla_timeout')
-  );
+/*
+ * Retriable failure categories per MVP_SPEC §6 + the backend's
+ * /retry handler:
+ *
+ *   - D-timeout (failure_reason starts with "sla_timeout"):
+ *     re-opens the gate; updated_at trigger restarts the SLA
+ *     clock. No orchestrator handoff.
+ *   - A (agent failure) and C (infrastructure failure):
+ *     re-dispatch via the orchestrator. The handler fires
+ *     workflow_dispatch and the runner produces a fresh trace.
+ *
+ * D-rejected and B are deliberately not retriable — the approver
+ * said no / the spec needs to change first; no Retry button there.
+ */
+function isRetriable(stage: Stage): boolean {
+  if (stage.state !== 'failed') return false;
+  switch (stage.failure_category) {
+    case 'A':
+    case 'C':
+      return true;
+    case 'D':
+      return (
+        typeof stage.failure_reason === 'string' && stage.failure_reason.startsWith('sla_timeout')
+      );
+  }
+  return false;
+}
+
+// optimisticRetryState returns the state the stage will hold while
+// the retry round-trip is in flight. The server returns the
+// canonical post-retry stage; the optimistic value is just for the
+// few-hundred-ms window where the request is on the wire.
+function optimisticRetryState(stage: Stage): Stage['state'] {
+  // D-timeout retries re-open the gate (awaiting_approval).
+  // A/C retries fall back to pending until the orchestrator's
+  // dispatch lands; the response replaces it with dispatched.
+  if (stage.failure_category === 'D') return 'awaiting_approval';
+  return 'pending';
 }
 
 type Phase = { kind: 'idle' } | { kind: 'submitting' } | { kind: 'errored'; message: string };
@@ -44,17 +75,19 @@ export function FailureBanner({ stage, onStageUpdate, onStageRollback }: Props) 
   }
 
   const description = describeFailure(stage.failure_category);
-  const canRetry = isDTimeout(stage) && onStageUpdate != null && onStageRollback != null;
+  const canRetry = isRetriable(stage) && onStageUpdate != null && onStageRollback != null;
 
   async function retry() {
     if (!onStageUpdate || !onStageRollback) return;
     const previous = stage;
     setPhase({ kind: 'submitting' });
-    // Optimistic — reflect the awaiting_approval state immediately;
-    // the server response replaces it on success.
+    // Optimistic update — reflect the post-retry state immediately;
+    // the server response replaces it on success. Target depends
+    // on category (D-timeout → awaiting_approval; A/C → pending,
+    // then dispatched once the orchestrator runs).
     onStageUpdate({
       ...stage,
-      state: 'awaiting_approval',
+      state: optimisticRetryState(stage),
       failure_category: null,
       failure_reason: null,
       ended_at: null,
