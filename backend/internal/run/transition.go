@@ -80,6 +80,34 @@ func ValidStageTransition(from, to StageState) bool {
 	return ok
 }
 
+// stageRetryTransitions enumerates the explicit retry overrides
+// off the normal state machine — moves out of a terminal state
+// that the regular ValidStageTransition refuses.
+//
+// Today only the D-timeout retry path lives here: a stage that
+// failed because the SLA elapsed (failure_reason starts with
+// "sla_timeout") can re-open back to awaiting_approval; the
+// updated_at trigger restarts the SLA clock.
+//
+// A and C retries (re-dispatch the runner) need orchestrator
+// changes and live on their own follow-up issues. B and D-rejected
+// are deliberately not retriable — the spec / approver said no,
+// the answer doesn't change without a fresh run.
+var stageRetryTransitions = map[StageState]map[StageState]struct{}{
+	StageStateFailed: {
+		StageStateAwaitingApproval: {},
+	},
+}
+
+// ValidStageRetryTransition reports whether `from` is allowed to
+// retry into `to`. The retry path is intentionally narrow —
+// callers that want a regular transition should keep using
+// ValidStageTransition + TransitionStage.
+func ValidStageRetryTransition(from, to StageState) bool {
+	_, ok := stageRetryTransitions[from][to]
+	return ok
+}
+
 // InvalidTransitionError describes a refused state transition.
 // Callers can errors.Is/As against it to surface a 409 Conflict at
 // the HTTP layer.

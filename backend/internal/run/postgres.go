@@ -279,6 +279,50 @@ func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to Sta
 	return result, nil
 }
 
+// RetryStage is the explicit override out of a terminal state. The
+// failure_category, failure_reason, and ended_at fields are
+// cleared; the updated_at trigger fires on the row update so any
+// timer keyed off it (notably the SLA ticker) restarts.
+func (r *postgresRepo) RetryStage(ctx context.Context, id uuid.UUID, to StageState) (*Stage, error) {
+	var result *Stage
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		current, err := q.LockStageForUpdate(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock stage: %w", err)
+		}
+		from := StageState(current.State)
+		if !ValidStageRetryTransition(from, to) {
+			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(to)}
+		}
+
+		// Clear failure metadata + ended_at by passing nil pointers
+		// and an invalid timestamptz — sqlc's UpdateStageState
+		// writes them through.
+		params := rundb.UpdateStageStateParams{
+			ID:              id,
+			State:           string(to),
+			FailureCategory: nil,
+			FailureReason:   nil,
+			EndedAt:         pgtype.Timestamptz{Valid: false},
+		}
+
+		updated, err := q.UpdateStageState(ctx, params)
+		if err != nil {
+			return fmt.Errorf("update stage state: %w", err)
+		}
+		result = rowToStage(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // --- Conversions between DB and domain types ---
 
 func rowToRun(r rundb.Run) *Run {

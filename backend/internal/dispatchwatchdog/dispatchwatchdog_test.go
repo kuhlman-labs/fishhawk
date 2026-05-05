@@ -74,6 +74,10 @@ func (f *fakeRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.Stage
 	return nil, run.ErrNotFound
 }
 
+func (f *fakeRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 // Stub out the rest of run.Repository so fakeRepo satisfies the interface.
 func (f *fakeRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")

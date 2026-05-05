@@ -78,6 +78,10 @@ func (r *approvalGateRunRepo) ListStagesDispatched(context.Context) ([]*run.Stag
 	return nil, nil
 }
 
+func (r *approvalGateRunRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 // stubTeamLister satisfies role.TeamLister for the resolver in
 // these tests. teamMembers is keyed "org/slug".
 type stubTeamLister struct {

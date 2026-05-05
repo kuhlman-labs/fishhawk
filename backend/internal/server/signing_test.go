@@ -350,6 +350,10 @@ func (r *fakeOIDCRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.St
 func (r *fakeOIDCRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
+
+func (r *fakeOIDCRunRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 func (r *fakeOIDCRunRepo) TransitionStage(context.Context, uuid.UUID, run.StageState, *run.StageCompletion) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }

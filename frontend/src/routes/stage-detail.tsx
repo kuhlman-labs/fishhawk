@@ -73,7 +73,7 @@ function StageDetailView({
         </Link>
       </div>
 
-      <FailureBanner stage={stage} />
+      <FailureBanner stage={stage} onStageUpdate={setStage} onStageRollback={setStage} />
 
       {stage.type === 'plan' && planArtifact ? (
         <PlanArtifact

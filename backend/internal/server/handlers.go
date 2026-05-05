@@ -25,6 +25,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", s.handleListStageArtifacts)
 	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", s.handleGetStagePrompt)
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", s.handleSubmitApproval)
+	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", s.handleRetryStage)
 	mux.HandleFunc("GET /v0/artifacts/{artifact_id}", s.handleGetArtifact)
 	mux.HandleFunc("GET /v0/tokens", s.handleListTokens)
 	mux.HandleFunc("POST /v0/tokens", s.handleCreateToken)

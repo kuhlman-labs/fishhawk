@@ -50,6 +50,10 @@ func (r *stagesRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, err
 	return nil, nil
 }
 
+func (r *stagesRunRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 // Unused methods on run.Repository — the handler doesn't touch them.
 func (r *stagesRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
