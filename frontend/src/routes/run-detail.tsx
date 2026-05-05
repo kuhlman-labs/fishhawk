@@ -3,6 +3,7 @@ import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import type { Run, Stage, StageState } from '@/api/types';
 import { cn } from '@/lib/cn';
+import { RunAuditList } from './audit-list';
 
 const stageStateStyles: Record<StageState, string> = {
   pending: 'text-neutral-500',
@@ -97,6 +98,13 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
             </li>
           ))}
         </ol>
+      </div>
+
+      <div id="audit" className="scroll-mt-8 space-y-2">
+        <h2 className="text-sm font-medium tracking-wide text-neutral-600 uppercase dark:text-neutral-400">
+          Audit log
+        </h2>
+        <RunAuditList runId={run.id} />
       </div>
     </section>
   );

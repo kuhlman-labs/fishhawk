@@ -66,6 +66,29 @@ export interface PaginatedList<T> {
   next_cursor: string | null;
 }
 
+export type AuditActorKind = 'agent' | 'user' | 'system';
+
+export interface AuditEntry {
+  id: string;
+  sequence: number;
+  run_id: string;
+  stage_id: string | null;
+  ts: string;
+  category: string;
+  actor_kind: AuditActorKind | null;
+  actor_subject: string | null;
+  payload: unknown;
+  prev_hash: string | null;
+  entry_hash: string;
+}
+
+export type ApprovalDecision = 'approve' | 'reject';
+
+export interface ApprovalRequest {
+  decision: ApprovalDecision;
+  comment?: string;
+}
+
 export interface ApiError {
   error: string;
   message?: string;

@@ -1,6 +1,6 @@
-import { Check, RefreshCw } from 'lucide-react';
 import type { StandardV1Plan } from '@/api/plan';
-import { Button } from '@/components/ui/button';
+import type { Stage } from '@/api/types';
+import { ApprovalPanel } from './approval-panel';
 import {
   ApproachSection,
   GeneratedBySection,
@@ -31,13 +31,21 @@ function buildNav(plan: StandardV1Plan): NavItem[] {
   return nav;
 }
 
+interface Props {
+  plan: StandardV1Plan;
+  stage: Stage;
+  runId: string;
+  onStageUpdate: (next: Stage) => void;
+  onStageRollback: (prev: Stage) => void;
+}
+
 /*
- * The marquee surface. Plans-as-documents (Brand Foundations §6):
- * structured fields with anchors, not chat. Approve / regenerate
- * sit at the top of the doc, present but inert until E7.4 (#57)
- * wires them to POST /v0/stages/{id}/approvals.
+ * Plans-as-documents (Brand Foundations §6): structured fields with
+ * anchors, not chat. The approval panel sits at the top of the doc
+ * — the only state-changing surface; everything below it is the
+ * read-only document the reviewer is acting on.
  */
-export function PlanDocument({ plan }: { plan: StandardV1Plan }) {
+export function PlanDocument({ plan, stage, runId, onStageUpdate, onStageRollback }: Props) {
   const nav = buildNav(plan);
 
   return (
@@ -64,16 +72,12 @@ export function PlanDocument({ plan }: { plan: StandardV1Plan }) {
             </p>
             <h1 className="mt-1 text-2xl font-semibold tracking-tight">Review plan</h1>
           </div>
-          <div className="flex gap-2">
-            <Button variant="outline" size="sm" disabled title="Wires up in E7.4 (#57)">
-              <RefreshCw className="size-4" aria-hidden />
-              <span>Regenerate</span>
-            </Button>
-            <Button size="sm" disabled title="Wires up in E7.4 (#57)">
-              <Check className="size-4" aria-hidden />
-              <span>Approve</span>
-            </Button>
-          </div>
+          <ApprovalPanel
+            stage={stage}
+            runId={runId}
+            onUpdate={onStageUpdate}
+            onRollback={onStageRollback}
+          />
         </header>
 
         <TicketSection ticket={plan.ticket_reference} />
