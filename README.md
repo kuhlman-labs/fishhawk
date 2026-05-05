@@ -6,17 +6,19 @@ Agents do the work. Your team approves the work. Fishhawk holds the record.
 
 ## Status
 
-Very early. This repository is public from day one as a deliberate commitment to the methodology described in [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md): Fishhawk is built using Fishhawk, and the record of how it gets built is open.
+Pre-alpha, but the v0 build is largely landed:
 
-There is no working software here yet. The repository currently contains:
+- **Backend control plane (`fishhawkd`)** — REST API, run/stage state machine on Postgres, signed audit log, policy evaluator, approval gating with SLA timeouts, retry semantics, GitHub App webhook receiver. ([`backend/`](backend/README.md))
+- **Runner action (`fishhawk/runner`)** — published as `kuhlman-labs/fishhawk/runner@runner/vX.Y.Z`. Cosign-signed releases with SBOMs. ([`runner/`](runner/README.md))
+- **CLI (`fishhawk`)** — `validate`, `run start`, `run status`, `run open`. ([`cli/`](cli/README.md))
+- **Web UI** — plan review, approval, audit log per run, retry on failures. ([`frontend/`](frontend/README.md))
+- **Audit-log verifier** — standalone binary that re-verifies an exported chain offline. ([`verifier/`](verifier/README.md))
+- **Hosted infrastructure (Terraform)** — VPC, RDS, ECS Fargate, ALB, OIDC-based deploys. Two cost profiles: dev (~$15/mo, no NAT/no ALB) and prod (~$85/mo, full HA-eligible). ([`infra/terraform/`](infra/terraform/README.md))
+- **CI/CD** — every push to `main` builds + signs the backend image; tagged releases auto-deploy via GitHub Actions OIDC.
 
-- The v0 specification: [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md)
-- The current technical architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- The brand foundations: [`docs/BRAND_FOUNDATIONS.md`](docs/BRAND_FOUNDATIONS.md)
-- The methodology Fishhawk holds itself to: [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md)
-- The (placeholder) workflow spec for Fishhawk's own development: [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml)
+What's still ahead is the methodology commitment in [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md): on Day 21 of the v0 build (~2026-05-20), Fishhawk starts shipping its *own* changes through Fishhawk. Until then, the workflow spec at [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml) is a public commitment, not yet a running system. Day 21 is the gating event after which every PR carries a link to its workflow run and audit log.
 
-The 90-day plan in [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md) targets day 21 as the milestone where Fishhawk begins shipping its own changes through Fishhawk. Until then, the workflow spec is a public commitment, not a running system.
+For the canonical scope and the technical realization, see [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## What Fishhawk is
 
@@ -25,6 +27,64 @@ An opinionated workflow engine for agent-driven software changes, a policy enfor
 ## What Fishhawk is not
 
 A coding agent. A project management tool. A CI/CD platform. A general-purpose workflow engine. See [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md) §1 for the full framing.
+
+## Running locally
+
+Prerequisites:
+
+- [Go 1.25+](https://go.dev/dl/) (the workspace targets `~> 1.25`)
+- [Node 22+](https://nodejs.org/) and [pnpm 10+](https://pnpm.io/) (for the Web UI)
+- [Docker](https://www.docker.com/) (for the local Postgres + MinIO stack)
+- Optional: [`golangci-lint v2`](https://golangci-lint.run/) for linting; `actionlint` for workflow files
+
+Bring up the dependencies — Postgres on `:5432`, MinIO on `:9000`/`:9001` ([`docker-compose.yml`](docker-compose.yml) for credentials):
+
+```sh
+docker compose up -d
+```
+
+Run the backend:
+
+```sh
+export FISHHAWKD_DATABASE_URL='postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable'
+go run ./backend/cmd/fishhawkd migrate up
+go run ./backend/cmd/fishhawkd serve
+# http://localhost:8080/healthz
+```
+
+Run the Web UI in another terminal — the dev server proxies `/v0` to `localhost:8080`:
+
+```sh
+cd frontend
+pnpm install
+pnpm dev
+# http://localhost:5173
+```
+
+Validate a workflow spec with the CLI:
+
+```sh
+go run ./cli/cmd/fishhawk validate ./.fishhawk/workflows.yaml
+```
+
+Run the full Go test suite — the workspace has multiple modules, so a plain `go test ./...` from the root won't work. Use the loop:
+
+```sh
+for m in $(go work edit -json | jq -r '.Use[].DiskPath'); do
+  (cd "$m" && go test -race ./...)
+done
+```
+
+Per-component details live in each subdirectory's README:
+
+| Component | README |
+|---|---|
+| Backend (`fishhawkd`) | [`backend/README.md`](backend/README.md) — `serve`, `migrate`, `token issue`, env-var reference |
+| Web UI | [`frontend/README.md`](frontend/README.md) — `pnpm dev`, route layout, OAuth wiring |
+| Runner action | [`runner/README.md`](runner/README.md) — used in GitHub Actions, not typically run locally |
+| CLI | [`cli/README.md`](cli/README.md) — `fishhawk validate`, `fishhawk run start/status/open` |
+| Verifier | [`verifier/README.md`](verifier/README.md) — `fishhawk-verify` against an exported audit log |
+| Infrastructure | [`infra/terraform/README.md`](infra/terraform/README.md) — bootstrap, dev vs prod profiles, CI deploy flow |
 
 ## Following along
 
@@ -41,3 +101,7 @@ Please report vulnerabilities responsibly. See [`SECURITY.md`](SECURITY.md).
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+---
+
+Built in Lithia, Florida.
