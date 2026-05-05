@@ -198,6 +198,37 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	// is the auditable source of truth (per MVP_SPEC §4.4 +
 	// E3.13). On violations the stage transitions to failed-B
 	// instead of awaiting_approval.
+	// Read the manifest's agent_failed signal (E8.5). When the
+	// runner stamped a category-A failure, fail the stage as A and
+	// skip both the policy re-evaluation (no plan exists yet, by
+	// definition) and the awaiting_approval path (no plan to
+	// review). Best-effort: a missing or unparsable manifest falls
+	// through to the existing policy + advance flow rather than
+	// 500ing the upload — the bundle is already stored, the audit
+	// row is already written, and a stuck stage is recoverable.
+	if s.cfg.RunRepo != nil {
+		if manifest, err := bundle.ExtractManifest(body); err == nil && manifest.AgentFailed {
+			reason := manifest.AgentFailureReason
+			if reason == "" {
+				reason = "agent invocation failed (no reason supplied)"
+			}
+			if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureA, reason); err != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"trace upload: transition to failed-A failed",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", err.Error()))
+			}
+			s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
+				RunID:       runID,
+				StageID:     stageID,
+				Variant:     string(variant),
+				ContentHash: contentHash,
+			})
+			return
+		}
+	}
+
 	policyPassed := true
 	if s.cfg.RunRepo != nil {
 		policyPassed = s.reEvaluatePolicy(r, runID, stageID, body)

@@ -49,13 +49,23 @@ const MaxBundleBytes = 64 * 1024 * 1024 // 64 MiB
 
 // ManifestData is the payload of the first line of every bundle.
 // Fields align with ADR-007's manifest record.
+//
+// AgentFailed is set by the runner when the agent invocation
+// returned a category-A failure (process crash, non-zero exit
+// without producing a plan, etc.). The backend's trace handler
+// reads this field and routes to FailStage(stageID, FailureA, …)
+// instead of the policy-evaluation path. omitempty keeps older
+// bundles (without the field) parsing as AgentFailed=false.
+// (E8.5 #163)
 type ManifestData struct {
-	BundleSchema string    `json:"bundle_schema"`
-	RunID        string    `json:"run_id"`
-	StageID      string    `json:"stage_id"`
-	Agent        string    `json:"agent"`
-	Model        string    `json:"model,omitempty"`
-	GeneratedAt  time.Time `json:"generated_at"`
+	BundleSchema       string    `json:"bundle_schema"`
+	RunID              string    `json:"run_id"`
+	StageID            string    `json:"stage_id"`
+	Agent              string    `json:"agent"`
+	Model              string    `json:"model,omitempty"`
+	GeneratedAt        time.Time `json:"generated_at"`
+	AgentFailed        bool      `json:"agent_failed,omitempty"`
+	AgentFailureReason string    `json:"agent_failure_reason,omitempty"`
 }
 
 // TrailerData is the payload of the last line of every bundle. The
@@ -83,6 +93,14 @@ type PackInputs struct {
 	StageID string
 	Agent   string // e.g. "claude-code"
 	Model   string // optional; "" omits the field
+
+	// AgentFailed flags a category-A failure originating in the
+	// agent invocation. The runner sets this when agent.Result.OK
+	// is false and the FailureCategory is "A". Backend's trace
+	// handler routes the stage to FailStage(FailureA, …) when
+	// this is true.
+	AgentFailed        bool
+	AgentFailureReason string
 
 	// Now returns the manifest's GeneratedAt timestamp. Default
 	// time.Now; overridable for deterministic tests.
@@ -128,12 +146,14 @@ func Pack(w io.Writer, in PackInputs, events []agent.Event) (int, error) {
 	// and the size cap enforceable.
 	var raw bytes.Buffer
 	manifestPayload, err := json.Marshal(ManifestData{
-		BundleSchema: SchemaV1,
-		RunID:        in.RunID,
-		StageID:      in.StageID,
-		Agent:        in.Agent,
-		Model:        in.Model,
-		GeneratedAt:  now(),
+		BundleSchema:       SchemaV1,
+		RunID:              in.RunID,
+		StageID:            in.StageID,
+		Agent:              in.Agent,
+		Model:              in.Model,
+		GeneratedAt:        now(),
+		AgentFailed:        in.AgentFailed,
+		AgentFailureReason: in.AgentFailureReason,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("bundle: marshal manifest: %w", err)

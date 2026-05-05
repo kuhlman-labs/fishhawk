@@ -189,12 +189,25 @@ func run(args []string, logSink io.Writer) int {
 	// We build once into memory, then write to disk and/or upload.
 	// When neither is configured, fall back to stdout JSONL so
 	// callers exercising --prompt-file alone can still inspect.
+	//
+	// Category-A is the only failure class the runner stamps in the
+	// bundle manifest (E8.5): agent process failure. B is decided by
+	// the backend's authoritative re-evaluation; C originates inside
+	// the upload itself (no bundle to stamp); D never reaches the
+	// runner.
 	var bundleBytes []byte
 	if cfg.bundleOut != "" || cfg.uploadTrace {
+		agentFailed := res.FailureCategory == "A"
+		agentFailureReason := ""
+		if agentFailed {
+			agentFailureReason = res.FailureReason
+		}
 		bytesData, _, err := bundle.PackBytes(bundle.PackInputs{
-			RunID:   cfg.runID,
-			StageID: bundleStageID(cfg),
-			Agent:   "claude-code",
+			RunID:              cfg.runID,
+			StageID:            bundleStageID(cfg),
+			Agent:              "claude-code",
+			AgentFailed:        agentFailed,
+			AgentFailureReason: agentFailureReason,
 		}, res.Events)
 		if err != nil {
 			_, _ = fmt.Fprintf(logSink,
