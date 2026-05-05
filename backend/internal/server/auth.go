@@ -22,6 +22,13 @@ type userResponse struct {
 // handleGitHubLogin implements GET /v0/auth/github/login. Mints a
 // state value, stores it in a short-lived browser cookie, and
 // redirects to GitHub's authorize URL.
+//
+// Optionally accepts ?next=<relative-path>. When a valid relative
+// path is supplied, it's stored in fishhawk_oauth_next so the
+// callback can route the user back to the page they originally
+// asked for (E7.2.1 #153). Anything that fails the open-redirect
+// validation is dropped silently — the configured default applies
+// instead.
 func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.GitHubOAuth == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "oauth_unconfigured",
@@ -44,6 +51,20 @@ func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 		Expires:  time.Now().Add(auth.StateCookieTTL),
 		MaxAge:   int(auth.StateCookieTTL.Seconds()),
 	})
+
+	if next := r.URL.Query().Get("next"); next != "" && isSafeRelativeRedirect(next) {
+		http.SetCookie(w, &http.Cookie{
+			Name:     auth.NextCookieName,
+			Value:    next,
+			Path:     "/v0/auth/github/",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+			Expires:  time.Now().Add(auth.StateCookieTTL),
+			MaxAge:   int(auth.StateCookieTTL.Seconds()),
+		})
+	}
+
 	http.Redirect(w, r, s.cfg.GitHubOAuth.AuthorizeURL(state), http.StatusFound)
 }
 
@@ -74,6 +95,24 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		Secure:   true,
 		MaxAge:   -1,
 	})
+
+	// E7.2.1: read the post-login redirect target the SPA stashed
+	// at /login time. Re-validate (defense in depth) and clear; if
+	// missing or invalid, the configured default applies.
+	var nextRedirect string
+	if c, err := r.Cookie(auth.NextCookieName); err == nil && c.Value != "" {
+		if isSafeRelativeRedirect(c.Value) {
+			nextRedirect = c.Value
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     auth.NextCookieName,
+			Value:    "",
+			Path:     "/v0/auth/github/",
+			HttpOnly: true,
+			Secure:   true,
+			MaxAge:   -1,
+		})
+	}
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
@@ -138,6 +177,12 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		// configured. The redirect target is operator-set; we
 		// validate to keep config typos from becoming a vector.
 		redirect = "/"
+	}
+	// Per-request next overrides the operator-configured default.
+	// Already validated above; nextRedirect is empty when the
+	// validation rejected it.
+	if nextRedirect != "" {
+		redirect = nextRedirect
 	}
 
 	s.cfg.Logger.Info("oauth sign-in",

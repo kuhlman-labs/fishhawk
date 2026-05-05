@@ -38,10 +38,13 @@ import (
 
 // Cookie names. The session cookie is HttpOnly + Secure +
 // SameSite=Lax per ADR-005. The state cookie is short-lived and
-// cleared on callback completion.
+// cleared on callback completion. The next cookie carries the
+// post-sign-in redirect target across the GitHub round-trip
+// (E7.2.1 #153); also short-lived and cleared at callback.
 const (
 	SessionCookieName = "fishhawk_session"
 	StateCookieName   = "fishhawk_oauth_state"
+	NextCookieName    = "fishhawk_oauth_next"
 )
 
 // SessionTTL bounds (per ADR-005).

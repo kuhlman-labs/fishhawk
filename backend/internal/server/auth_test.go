@@ -266,6 +266,108 @@ func TestGitHubCallback_StateMismatch_400(t *testing.T) {
 	}
 }
 
+// E7.2.1 (#153): /login carries forward an optional ?next= query
+// param so post-sign-in routing lands on the page the user actually
+// asked for. The cookie is short-lived, single-use, and the value
+// must pass the same open-redirect validation as the operator-set
+// default.
+
+func TestGitHubLogin_StoresValidNextInCookie(t *testing.T) {
+	s, _ := newAuthServer(t)
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/auth/github/login?next=/runs/abc", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	var next *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == auth.NextCookieName {
+			next = c
+		}
+	}
+	if next == nil || next.Value != "/runs/abc" {
+		t.Fatalf("next cookie = %+v, want value /runs/abc", next)
+	}
+	if !next.HttpOnly || !next.Secure {
+		t.Errorf("next cookie missing HttpOnly/Secure: %+v", next)
+	}
+}
+
+func TestGitHubLogin_DropsUnsafeNext(t *testing.T) {
+	cases := []string{
+		"https://evil.example.com/x",
+		"//evil.example.com/x",
+		`/\evil.example.com/x`,
+		"javascript:alert(1)",
+		"app://x",
+		"runs/abc", // no leading slash → not a relative path
+		"",
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			s, _ := newAuthServer(t)
+			url := "/v0/auth/github/login"
+			if in != "" {
+				url += "?next=" + in
+			}
+			req := httptest.NewRequest(http.MethodGet, url, nil)
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, req)
+			for _, c := range w.Result().Cookies() {
+				if c.Name == auth.NextCookieName {
+					t.Errorf("next cookie set with unsafe value %q: %+v", in, c)
+				}
+			}
+		})
+	}
+}
+
+func TestGitHubCallback_RedirectsToNextWhenSet(t *testing.T) {
+	s, _ := newAuthServer(t)
+	state := "state-next"
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/auth/github/callback?code=abc&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+	req.AddCookie(&http.Cookie{Name: auth.NextCookieName, Value: "/audit"})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "/audit" {
+		t.Errorf("Location = %q, want /audit (overrides /app default)", loc)
+	}
+	// Cookie must be cleared on use (single-use).
+	var cleared bool
+	for _, c := range w.Result().Cookies() {
+		if c.Name == auth.NextCookieName && c.MaxAge == -1 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("next cookie not cleared on callback")
+	}
+}
+
+func TestGitHubCallback_DropsUnsafeNextCookieValue(t *testing.T) {
+	// A tampered cookie value (e.g., from a malicious extension) must
+	// not become an open-redirect vector. The callback re-validates
+	// before honoring.
+	s, _ := newAuthServer(t)
+	state := "state-evil"
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/auth/github/callback?code=abc&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+	req.AddCookie(&http.Cookie{Name: auth.NextCookieName, Value: "//evil.example.com/"})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if loc := w.Header().Get("Location"); loc != "/app" {
+		t.Errorf("Location = %q, want /app (default; tampered cookie ignored)", loc)
+	}
+}
+
 func TestGitHubCallback_StateCookieMissing_400(t *testing.T) {
 	s, _ := newAuthServer(t)
 	req := httptest.NewRequest(http.MethodGet,

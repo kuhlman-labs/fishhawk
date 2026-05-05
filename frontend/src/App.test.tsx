@@ -135,6 +135,34 @@ describe('App routing + auth', () => {
       ).toBeInTheDocument();
     });
 
+    // E7.2.1 #153: deep-link routing intent must survive the OAuth
+    // round-trip. RequireAuth encodes the original path as ?next=
+    // when redirecting to /login; the Login route then forwards it
+    // to the backend's OAuth start endpoint.
+    it('forwards the original path to the OAuth start as ?next=', async () => {
+      renderAt('/runs/abc-123');
+      const link = await screen.findByRole('link', { name: /continue with github/i });
+      expect(link).toHaveAttribute(
+        'href',
+        '/v0/auth/github/login?next=' + encodeURIComponent('/runs/abc-123'),
+      );
+    });
+
+    it('preserves query params in the next intent', async () => {
+      renderAt('/audit?category=approval_submitted');
+      const link = await screen.findByRole('link', { name: /continue with github/i });
+      const expected =
+        '/v0/auth/github/login?next=' + encodeURIComponent('/audit?category=approval_submitted');
+      expect(link).toHaveAttribute('href', expected);
+    });
+
+    it('omits ?next= when redirected from the index path', async () => {
+      // Hitting "/" is the default landing target; no point round-tripping it.
+      renderAt('/');
+      const link = await screen.findByRole('link', { name: /continue with github/i });
+      expect(link).toHaveAttribute('href', '/v0/auth/github/login');
+    });
+
     it('renders a not-found page for unknown public routes', async () => {
       renderAt('/does-not-exist');
       expect(await screen.findByRole('heading', { name: /not found/i })).toBeInTheDocument();
