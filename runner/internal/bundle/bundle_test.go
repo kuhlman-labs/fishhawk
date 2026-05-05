@@ -103,6 +103,59 @@ func TestPack_RoundTrip(t *testing.T) {
 	}
 }
 
+// E8.5 (#163): the runner stamps category-A failures into the
+// bundle manifest so the backend's trace handler can route to
+// FailStage(FailureA, …) without re-running the agent. Round-trip
+// the new fields through Pack + Open.
+func TestPack_AgentFailedFlagRoundTrips(t *testing.T) {
+	in := PackInputs{
+		RunID:              "11111111-2222-3333-4444-555555555555",
+		StageID:            "22222222-3333-4444-5555-666666666666",
+		Agent:              "claude-code",
+		AgentFailed:        true,
+		AgentFailureReason: "agent process exited with status 137 (OOM)",
+		Now:                frozenNow(),
+	}
+	data, _, err := PackBytes(in, sampleEvents())
+	if err != nil {
+		t.Fatalf("PackBytes: %v", err)
+	}
+	manifest, _, _, err := Open(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !manifest.AgentFailed {
+		t.Error("manifest.AgentFailed = false, want true")
+	}
+	if manifest.AgentFailureReason != in.AgentFailureReason {
+		t.Errorf("manifest.AgentFailureReason = %q, want %q",
+			manifest.AgentFailureReason, in.AgentFailureReason)
+	}
+}
+
+func TestPack_AgentFailedDefaultsFalseAndOmitsField(t *testing.T) {
+	// omitempty keeps older bundles (without the field) parsing as
+	// AgentFailed=false. Lock that in by checking the on-the-wire
+	// JSON of a bundle packed without AgentFailed set.
+	in := PackInputs{
+		RunID:   "11111111-2222-3333-4444-555555555555",
+		StageID: "22222222-3333-4444-5555-666666666666",
+		Agent:   "claude-code",
+		Now:     frozenNow(),
+	}
+	data, _, err := PackBytes(in, sampleEvents())
+	if err != nil {
+		t.Fatalf("PackBytes: %v", err)
+	}
+	manifest, _, _, err := Open(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if manifest.AgentFailed {
+		t.Error("manifest.AgentFailed = true on a no-failure bundle")
+	}
+}
+
 func TestPack_StorageHashIsDeterministic(t *testing.T) {
 	// Same inputs + same Now produce byte-identical output and
 	// thus the same storage hash. Required for content-addressed

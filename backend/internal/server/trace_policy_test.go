@@ -324,6 +324,71 @@ func TestShipTrace_PolicyReEval_SpecFetchFails_ProceedsToAwaitingApproval(t *tes
 	}
 }
 
+// E8.5 (#163): a bundle whose manifest carries `agent_failed: true`
+// flips the stage to failed-A — bypassing both the policy
+// re-evaluation and the awaiting_approval advance.
+func TestShipTrace_AgentFailed_TransitionsToFailedA(t *testing.T) {
+	s, sf, repo, _, _ := newPolicyTraceServer(t, nil)
+	bundleBytes := makeTestBundleAgentFailed(t, "agent process exited 137 (OOM)")
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	if repo.stage.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", repo.stage.State)
+	}
+	if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureA {
+		t.Errorf("FailureCategory = %v, want A", repo.stage.FailureCategory)
+	}
+	if repo.stage.FailureReason == nil || *repo.stage.FailureReason != "agent process exited 137 (OOM)" {
+		t.Errorf("FailureReason = %v", repo.stage.FailureReason)
+	}
+}
+
+func TestShipTrace_AgentFailedNoReason_StampsFallbackString(t *testing.T) {
+	s, sf, repo, _, _ := newPolicyTraceServer(t, nil)
+	bundleBytes := makeTestBundleAgentFailed(t, "") // no reason supplied
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if repo.stage.FailureReason == nil || *repo.stage.FailureReason == "" {
+		t.Errorf("FailureReason should fall back to a non-empty string when reason is omitted")
+	}
+}
+
+// makeTestBundleAgentFailed builds a *.jsonl.gz with a manifest
+// stamped with agent_failed=true (E8.5). No git_diff event — when
+// the agent fails, no plan exists to evaluate.
+func makeTestBundleAgentFailed(t *testing.T, reason string) []byte {
+	t.Helper()
+	manifestPayload := map[string]any{
+		"bundle_schema": "v1",
+		"agent_failed":  true,
+	}
+	if reason != "" {
+		manifestPayload["agent_failure_reason"] = reason
+	}
+	mp, _ := json.Marshal(manifestPayload)
+	manifestLine, _ := json.Marshal(map[string]any{
+		"seq": 1, "kind": "manifest", "data": json.RawMessage(mp),
+	})
+	var raw bytes.Buffer
+	raw.Write(manifestLine)
+	raw.WriteByte('\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
 func TestMergeConstraints(t *testing.T) {
 	in := []spec.Constraint{
 		{ForbiddenPaths: []string{"infra/**"}},

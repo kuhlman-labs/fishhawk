@@ -33,6 +33,28 @@ import (
 // (which the backend doesn't have access to).
 const EventKindGitDiff = "git_diff"
 
+// EventKindManifest is the bundle's first line. Carries
+// ManifestData; the trace handler reads it for the agent_failed
+// signal and the bundle schema version.
+const EventKindManifest = "manifest"
+
+// Manifest mirrors runner/internal/bundle.ManifestData. Backend
+// owns the read side; agreeing field-by-field with the runner is
+// the contract — there's no schema-sync CI for this format
+// (it's the wire format, not a JSON Schema), so add fields on
+// both sides in lockstep. (E8.5 #163 added AgentFailed +
+// AgentFailureReason.)
+type Manifest struct {
+	BundleSchema       string `json:"bundle_schema"`
+	RunID              string `json:"run_id"`
+	StageID            string `json:"stage_id"`
+	Agent              string `json:"agent"`
+	Model              string `json:"model,omitempty"`
+	GeneratedAt        string `json:"generated_at"`
+	AgentFailed        bool   `json:"agent_failed,omitempty"`
+	AgentFailureReason string `json:"agent_failure_reason,omitempty"`
+}
+
 // Errors callers may want to switch on.
 var (
 	// ErrBadGzip means the bundle's gzip frame couldn't be opened
@@ -46,6 +68,12 @@ var (
 	// distinguish "bundle had no diff" (skip policy re-eval) from
 	// "bundle was malformed."
 	ErrNoDiffEvent = errors.New("bundle: no git_diff event found")
+
+	// ErrNoManifest means the bundle's first line wasn't a manifest
+	// record, or the bundle parsed but had zero lines. The trace
+	// handler treats this as a malformed upload and rejects the
+	// request rather than guessing at the missing context.
+	ErrNoManifest = errors.New("bundle: manifest line missing or first line had wrong kind")
 )
 
 // Line is the on-the-wire envelope for one JSONL line. Mirrors
@@ -100,6 +128,28 @@ func ReadEvents(bundleBytes []byte) ([]Line, error) {
 		return nil, fmt.Errorf("bundle: read: %w", err)
 	}
 	return out, nil
+}
+
+// ExtractManifest returns the parsed first-line manifest. Used by
+// the trace handler to read the agent_failed flag (E8.5) before
+// deciding whether to enter the policy-evaluation path or route
+// to FailStage(FailureA, …).
+//
+// Returns ErrBadGzip on a corrupt frame and ErrNoManifest when the
+// bundle is empty or the first line isn't a manifest record.
+func ExtractManifest(bundleBytes []byte) (Manifest, error) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if len(lines) == 0 || lines[0].Kind != EventKindManifest {
+		return Manifest{}, ErrNoManifest
+	}
+	var m Manifest
+	if err := json.Unmarshal(lines[0].Data, &m); err != nil {
+		return Manifest{}, fmt.Errorf("bundle: parse manifest: %w", err)
+	}
+	return m, nil
 }
 
 // ExtractDiff returns the policy.Diff carried in the bundle's

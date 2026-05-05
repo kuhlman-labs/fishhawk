@@ -55,6 +55,108 @@ func makeDiffLine(t *testing.T, baseRef string, entries ...[2]string) Line {
 	return Line{Seq: 2, Kind: EventKindGitDiff, Data: payload}
 }
 
+// E8.5 (#163): the manifest carries the runner's category-A
+// signal. ExtractManifest is the read-side surface the trace
+// handler uses to branch on it.
+
+func TestExtractManifest_HappyPath(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{
+			"bundle_schema":"v1",
+			"run_id":"run-1",
+			"stage_id":"stage-1",
+			"agent":"claude-code",
+			"agent_failed":true,
+			"agent_failure_reason":"agent process exited 137 (OOM)"
+		}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractManifest(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractManifest: %v", err)
+	}
+	if got.RunID != "run-1" {
+		t.Errorf("RunID = %q", got.RunID)
+	}
+	if !got.AgentFailed {
+		t.Error("AgentFailed = false, want true")
+	}
+	if got.AgentFailureReason != "agent process exited 137 (OOM)" {
+		t.Errorf("AgentFailureReason = %q", got.AgentFailureReason)
+	}
+}
+
+func TestExtractManifest_OlderBundleParsesAgentFailedAsFalse(t *testing.T) {
+	// Bundles packed before E8.5 don't carry the field at all.
+	// omitempty on the runner side keeps them on-the-wire-clean;
+	// the read side must default to AgentFailed=false.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{
+			"bundle_schema":"v1",
+			"run_id":"run-1",
+			"stage_id":"stage-1",
+			"agent":"claude-code"
+		}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractManifest(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractManifest: %v", err)
+	}
+	if got.AgentFailed {
+		t.Error("AgentFailed = true on a bundle without the field")
+	}
+}
+
+func TestExtractManifest_EmptyBundle(t *testing.T) {
+	_, err := ExtractManifest(packLines(t, nil))
+	if !errors.Is(err, ErrNoManifest) {
+		t.Errorf("err = %v, want ErrNoManifest", err)
+	}
+}
+
+func TestExtractManifest_FirstLineWrongKind(t *testing.T) {
+	// First line was somehow not the manifest. Refuse cleanly so the
+	// trace handler doesn't read garbage as the agent-failed flag.
+	lines := []Line{
+		{Seq: 1, Kind: "raw", Data: json.RawMessage(`{}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	_, err := ExtractManifest(packLines(t, lines))
+	if !errors.Is(err, ErrNoManifest) {
+		t.Errorf("err = %v, want ErrNoManifest", err)
+	}
+}
+
+func TestExtractManifest_BadJSON(t *testing.T) {
+	// Hand-craft a bundle whose manifest line has an envelope that
+	// parses but a `data` payload that doesn't. Going through
+	// json.RawMessage on the test side won't work — Marshal
+	// validates the bytes — so build the JSONL stream manually.
+	var raw bytes.Buffer
+	raw.WriteString(`{"seq":1,"kind":"manifest","data":{"bundle_schema": invalid}}`)
+	raw.WriteByte('\n')
+	raw.WriteString(`{"seq":2,"kind":"trailer","data":{}}`)
+	raw.WriteByte('\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ExtractManifest(gz.Bytes())
+	if err == nil {
+		t.Fatal("ExtractManifest returned nil error on bad-JSON manifest")
+	}
+	if errors.Is(err, ErrNoManifest) || errors.Is(err, ErrBadGzip) {
+		t.Errorf("err = %v, want a JSON parse error (not ErrNoManifest / ErrBadGzip)", err)
+	}
+}
+
 func TestExtractDiff_HappyPath(t *testing.T) {
 	lines := []Line{
 		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
