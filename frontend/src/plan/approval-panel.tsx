@@ -177,9 +177,19 @@ function ApprovalStatus({ stage, runId }: { stage: Stage; runId: string }) {
           : 'Failed'
         : stage.state;
 
+  // For non-D failures, show the category letter so the reader can
+  // tell rejection (D) apart from policy (B), agent (A), or infra (C)
+  // failure at a glance. The full description lives in <FailureBanner>
+  // above the document.
+  const showCategory =
+    stage.state === 'failed' && stage.failure_category && stage.failure_category !== 'D';
+
   return (
     <div className="flex flex-col items-end gap-1 text-right text-sm">
-      <span className="font-mono text-xs tracking-wide text-neutral-500 uppercase">{verb}</span>
+      <span className="font-mono text-xs tracking-wide text-neutral-500 uppercase">
+        {verb}
+        {showCategory && ` · category ${stage.failure_category}`}
+      </span>
       {stage.ended_at && (
         <span className="text-xs text-neutral-500">
           {new Date(stage.ended_at).toLocaleString()}

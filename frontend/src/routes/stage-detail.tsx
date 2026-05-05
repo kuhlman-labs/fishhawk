@@ -4,6 +4,7 @@ import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import { isStandardV1Plan, type StandardV1Plan } from '@/api/plan';
 import type { Artifact, Stage } from '@/api/types';
+import { FailureBanner } from '@/components/failure-banner';
 import { PlanDocument } from '@/plan/plan-document';
 
 /*
@@ -71,6 +72,8 @@ function StageDetailView({
           ← Run
         </Link>
       </div>
+
+      <FailureBanner stage={stage} />
 
       {stage.type === 'plan' && planArtifact ? (
         <PlanArtifact

@@ -166,23 +166,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 }
 
 // advanceStage applies the state-machine transition for the
-// decision: approve → succeeded, reject → failed-D. The repo's
-// TransitionStage wraps the SELECT FOR UPDATE + UPDATE in a
-// transaction, so concurrent decisions can't fork the chain.
+// decision: approve → succeeded, reject → failed-D. The reject
+// path delegates to run.FailStage so the failure pattern is
+// identical to the SLA path and the trace-time policy path
+// (E8.1 #39).
 func (s *Server) advanceStage(r *http.Request, stageID uuid.UUID, decision approval.Decision) (*run.Stage, error) {
 	switch decision {
 	case approval.DecisionApprove:
 		return s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
 			run.StageStateSucceeded, nil)
 	case approval.DecisionReject:
-		category := run.FailureD
-		reason := "gate rejected by approver"
-		return s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
-			run.StageStateFailed,
-			&run.StageCompletion{
-				FailureCategory: &category,
-				FailureReason:   &reason,
-			})
+		return run.FailStage(r.Context(), s.cfg.RunRepo, stageID,
+			run.FailureD, "gate rejected by approver")
 	}
 	// Unreachable — decision was validated earlier.
 	return nil, errors.New("approval: unknown decision (programmer error)")

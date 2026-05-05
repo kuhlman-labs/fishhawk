@@ -122,9 +122,21 @@ func (f *fakeRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Ru
 func (f *fakeRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
-func (f *fakeRepo) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
-	return nil, errors.New("not used")
+
+// GetStage backs run.FailStage's pre-flight read of the current
+// stage state. The SLA tick path always sees stages in
+// awaiting_approval, so a single-pass lookup is enough.
+func (f *fakeRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.stages {
+		if s.ID == id {
+			return s, nil
+		}
+	}
+	return nil, run.ErrNotFound
 }
+
 func (f *fakeRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }

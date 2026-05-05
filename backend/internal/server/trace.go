@@ -422,31 +422,14 @@ func isEmptyConstraints(c policy.Constraints) bool {
 }
 
 // failStageCategoryB transitions the stage to failed with category
-// B (constraint/policy violation per MVP_SPEC §6) and skips the
-// awaiting_approval path. The state machine requires
-// dispatched → running → failed, so we walk both transitions.
-// Failures here are logged but don't unwind — the policy_evaluated
-// audit entry is the primary signal; a stuck-at-running stage is
-// recoverable.
+// B (constraint/policy violation per MVP_SPEC §6). Delegates to the
+// shared run.FailStage helper, which walks dispatched → running →
+// failed if needed. Failures are logged but don't unwind — the
+// policy_evaluated audit entry is the primary signal; a stuck stage
+// is recoverable.
 func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, reason string) {
-	logger := s.cfg.Logger
-	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
-		run.StageStateRunning, nil); err != nil {
-		logger.LogAttrs(r.Context(), slog.LevelWarn,
-			"trace upload: transition to running before fail-B failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()))
-		return
-	}
-	failureB := run.FailureB
-	reasonStr := reason
-	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
-		run.StageStateFailed, &run.StageCompletion{
-			FailureCategory: &failureB,
-			FailureReason:   &reasonStr,
-		}); err != nil {
-		logger.LogAttrs(r.Context(), slog.LevelWarn,
+	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureB, reason); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"trace upload: transition to failed-B failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),

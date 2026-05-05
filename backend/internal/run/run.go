@@ -106,6 +106,36 @@ const (
 	FailureD FailureCategory = "D" // approval timeout
 )
 
+// Valid reports whether c is one of the four canonical categories.
+// Empty / unknown values fail this check, which the FailStage
+// helper enforces at the call site so a typo can't write a
+// non-conforming category to a stage row.
+func (c FailureCategory) Valid() bool {
+	switch c {
+	case FailureA, FailureB, FailureC, FailureD:
+		return true
+	}
+	return false
+}
+
+// Description returns a single-line human label for c. Stable
+// across calls; the frontend mirrors this map in TypeScript so the
+// audit log and the UI agree on the wording. Unknown categories
+// surface as the literal value so we don't silently mask bad data.
+func (c FailureCategory) Description() string {
+	switch c {
+	case FailureA:
+		return "agent failure"
+	case FailureB:
+		return "constraint or policy violation"
+	case FailureC:
+		return "infrastructure failure"
+	case FailureD:
+		return "approval timeout or rejection"
+	}
+	return string(c)
+}
+
 // TriggerSource identifies where a run originated.
 type TriggerSource string
 
