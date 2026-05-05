@@ -1,0 +1,45 @@
+# PR-time check on infra/terraform/**. fmt + validate only — no
+# AWS credentials required. The apply path lives in
+# infra-apply.yml, gated by GitHub environments.
+#
+# We deliberately don't run `terraform plan` here:
+#  - plan needs AWS read access; the GHA OIDC role is currently
+#    locked to main + tags (the apply path), and loosening it for
+#    PR contexts would widen the blast radius;
+#  - plan also needs the per-env state, and loading that from a
+#    fork-PR context is unsafe.
+# Operators preview changes locally with `terraform plan` against
+# their own credentials.
+name: infra-check
+
+on:
+  pull_request:
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/infra-*.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: infra/terraform
+
+jobs:
+  fmt-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform validate

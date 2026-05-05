@@ -48,6 +48,47 @@ variable "log_retention_days" {
   default     = 30
 }
 
+# --- Dev cost-cutting toggles ---
+#
+# A bare-minimum dev deploy turns both off. NAT gateway is the
+# single biggest line item (~$32/mo); the ALB is the next
+# (~$18/mo). Flipping both saves ~$50/mo, leaving RDS as the
+# remaining floor at ~$15/mo.
+#
+#  - enable_nat_gateway=false → ECS tasks lose private outbound.
+#    They run in the public subnets with assign_public_ip=true,
+#    talking to GHCR / Anthropic / Secrets Manager directly via
+#    the IGW. Acceptable for dev; never for prod.
+#  - enable_alb=false        → no public ingress at all. The
+#    container has its own ENI public IP (when NAT is also off);
+#    operators reach it via aws ecs describe-tasks → eni public IP.
+#    Or stand up a temporary tunnel (cloudflared, ngrok) for
+#    interactive testing.
+
+variable "enable_nat_gateway" {
+  description = "Provision the single-AZ NAT gateway + EIP. Off for bare-minimum dev: ECS tasks land in the public subnets with task_assign_public_ip=true instead. Saves ~$32/mo."
+  type        = bool
+  default     = true
+}
+
+variable "enable_alb" {
+  description = "Provision the Application Load Balancer + target group + HTTP/HTTPS listeners. Off for bare-minimum dev. Saves ~$18/mo."
+  type        = bool
+  default     = true
+}
+
+variable "task_assign_public_ip" {
+  description = "Place ECS tasks in the public subnets with public IPs. Required when enable_nat_gateway=false (no other path to the internet). The app security group's ingress widens to 0.0.0.0/0 in this mode so an operator can hit /healthz on the task ENI directly. Dev only — production should always run with this off."
+  type        = bool
+  default     = false
+
+  # Cross-variable validation isn't allowed in Terraform 1.5
+  # variable blocks (it landed in 1.9). The expected pairing —
+  # task_assign_public_ip=true ⇔ enable_nat_gateway=false — is
+  # documented inline in dev.tfvars.example and enforced via the
+  # null_resource precondition in the network module below.
+}
+
 # --- ECS task / service knobs (E13.7.2) ---
 
 variable "image_tag" {

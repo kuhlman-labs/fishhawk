@@ -150,22 +150,29 @@ resource "aws_ecs_service" "fishhawkd" {
   desired_count   = var.task_desired_count
   launch_type     = "FARGATE"
 
-  # Wait this long after a new task starts before the ALB target
-  # group counts unhealthy starts against the rollout. fishhawkd
-  # boots quickly; 60s is generous enough for cold-start DB +
-  # GitHub auth + S3 region resolution.
-  health_check_grace_period_seconds = 60
+  # Health check grace period only matters when the ALB is in
+  # front; without one, ECS doesn't have an external health source.
+  health_check_grace_period_seconds = var.enable_alb ? 60 : 0
 
   network_configuration {
-    subnets          = aws_subnet.private[*].id
+    # Public subnets + public IPs in dev (no NAT to reach the
+    # internet otherwise); private subnets in prod where NAT and
+    # the ALB sit between the task and the world.
+    subnets          = var.task_assign_public_ip ? aws_subnet.public[*].id : aws_subnet.private[*].id
     security_groups  = [aws_security_group.app.id]
-    assign_public_ip = false
+    assign_public_ip = var.task_assign_public_ip
   }
 
-  load_balancer {
-    target_group_arn = aws_lb_target_group.fishhawkd.arn
-    container_name   = local.fishhawkd_container_name
-    container_port   = 8080
+  # ALB → service binding only when the ALB is provisioned. In
+  # bare-minimum dev (no ALB), there's no target group; operators
+  # reach the task at its ENI public IP.
+  dynamic "load_balancer" {
+    for_each = var.enable_alb ? [1] : []
+    content {
+      target_group_arn = aws_lb_target_group.fishhawkd[0].arn
+      container_name   = local.fishhawkd_container_name
+      container_port   = 8080
+    }
   }
 
   # Circuit breaker auto-rolls-back when too many consecutive task
@@ -181,8 +188,9 @@ resource "aws_ecs_service" "fishhawkd" {
     type = "ECS"
   }
 
-  # Force the dependency from listener to service so HTTPS / HTTP
-  # is up before the service tries to register targets.
+  # Force the dependency from listener to service when present, so
+  # HTTPS / HTTP is up before the service tries to register
+  # targets. The ALB-less branch has no listener to wait on.
   depends_on = [
     aws_lb_listener.http,
   ]

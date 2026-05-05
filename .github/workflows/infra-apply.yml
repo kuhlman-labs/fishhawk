@@ -1,0 +1,90 @@
+# Applies infra/terraform/ to a chosen environment. Two triggers:
+#
+#  - push to main with infra changes → auto-applies dev
+#    (a quick guard against drift on the dev stack);
+#  - workflow_dispatch with environment input → applies that env
+#    explicitly. Prod is gated by the `prod` GitHub environment's
+#    required-reviewers protection rule.
+#
+# OIDC: each environment carries its own AWS_DEPLOY_ROLE_ARN
+# variable (output from `terraform output -raw github_actions_deploy_role_arn`
+# after the first manual apply per env). Operator sets the
+# environment vars via the repo Settings → Environments UI, or
+# via gh api as documented in infra/terraform/README.md.
+#
+# Concurrency: one apply per environment in flight at a time.
+# cancel-in-progress=false because killing terraform apply
+# mid-flight leaves the state lock held until the dynamodb-table
+# entry expires (~20 minutes).
+name: infra-apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/infra-apply.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to apply (dev or prod)"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, prod]
+
+permissions:
+  contents: read
+  id-token: write # OIDC for AWS role assumption
+
+defaults:
+  run:
+    working-directory: infra/terraform
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    # Push-to-main always targets dev; workflow_dispatch picks the
+    # env explicitly. The `environment` reference here gates the
+    # job on the GitHub environment's protection rules (prod has
+    # required reviewers; dev is wide-open).
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+    concurrency:
+      group: infra-apply-${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform init
+        env:
+          ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+        run: |
+          set -eu
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${ENV}/terraform.tfstate" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+
+      - name: terraform plan
+        env:
+          ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+        run: |
+          terraform plan \
+            -var-file="${ENV}.tfvars" \
+            -out=plan.tfplan \
+            -input=false
+
+      - name: terraform apply
+        run: terraform apply -input=false -auto-approve plan.tfplan

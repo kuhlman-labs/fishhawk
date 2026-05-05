@@ -47,28 +47,76 @@ aws dynamodb create-table \
   --billing-mode PAY_PER_REQUEST
 ```
 
-Then create the local `backend.tf`:
+## Environments
+
+Two environments share this directory:
+
+| Env | Profile | Cost | Purpose |
+|---|---|---|---|
+| `dev` | bare-minimum: no NAT, no ALB, single replica, public-IP tasks | ~$15/mo | follow-main, integration testing |
+| `prod` | full HA-eligible profile | ~$85/mo (single-AZ NAT/RDS), $135+/mo (multi-AZ) | release tags |
+
+`backend.tf` is committed as a partial-config stub — `terraform { backend "s3" {} }`. Per-env bucket / key / lock-table are passed at `init` time, so the same root module deploys both environments without file edits.
+
+## Per-environment vars
 
 ```sh
-cp backend.tf.example backend.tf
-# Edit backend.tf: replace <account-id> with $ACCOUNT_ID, set <env>
-# (use "prod" for the first production stack).
-```
-
-Create the per-environment vars file:
-
-```sh
+cp dev.tfvars.example  dev.tfvars
 cp prod.tfvars.example prod.tfvars
-# Edit prod.tfvars to taste (region, AZs, github_repo).
+# Edit each to taste (region, AZs, github_repo).
 ```
 
-## Apply
+`dev.tfvars` ships with the cost-cutting toggles set:
+
+```hcl
+enable_nat_gateway    = false
+enable_alb            = false
+task_assign_public_ip = true
+```
+
+A `precondition` in `network.tf` rejects an apply where `enable_nat_gateway=false` and `task_assign_public_ip=false` (tasks would have no path to the internet). Don't set the public-IP toggle in prod.
+
+## Local apply (dev or prod)
 
 ```sh
-terraform init
-terraform plan -var-file=prod.tfvars -out=plan.tfplan
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ENV=dev   # or prod
+
+terraform init \
+  -backend-config="bucket=fishhawk-tfstate-${ACCOUNT_ID}" \
+  -backend-config="key=${ENV}/terraform.tfstate" \
+  -backend-config="dynamodb_table=fishhawk-tfstate-lock" \
+  -backend-config="region=us-east-1" \
+  -backend-config="encrypt=true"
+
+terraform plan  -var-file=${ENV}.tfvars -out=plan.tfplan
 terraform apply plan.tfplan
 ```
+
+To avoid retyping the backend args, save them to `backend.dev.hcl` (gitignored) and run `terraform init -backend-config=backend.dev.hcl`.
+
+## CI apply
+
+Two GitHub Actions workflows run apply against the cloud:
+
+- **`.github/workflows/infra-check.yml`** — every PR touching `infra/terraform/**` runs `terraform fmt -check` + `terraform validate`. No AWS credentials required; PR authors don't need access to the AWS account.
+- **`.github/workflows/infra-apply.yml`** — push to main with infra changes auto-applies **dev**. `workflow_dispatch` with an environment input applies **dev** or **prod** explicitly.
+
+Both apply paths assume the per-environment OIDC role (`vars.AWS_DEPLOY_ROLE_ARN` from the active GitHub environment), so:
+
+1. The first apply per env happens **locally** with admin AWS creds — that's what creates the `<project>-<env>-gha-deploy` role.
+2. After that first apply, copy `terraform output -raw github_actions_deploy_role_arn` into the GitHub environment's `AWS_DEPLOY_ROLE_ARN` variable; CI takes over.
+
+Each GitHub environment carries four variables (set via repo Settings → Environments → New variable):
+
+| Variable | Value |
+|---|---|
+| `AWS_DEPLOY_ROLE_ARN` | from `terraform output -raw github_actions_deploy_role_arn` |
+| `AWS_REGION` | e.g. `us-east-1` |
+| `TF_STATE_BUCKET` | `fishhawk-tfstate-<account-id>` |
+| `TF_LOCK_TABLE` | `fishhawk-tfstate-lock` |
+
+The `prod` environment also gets a **required-reviewers** protection rule in the same Settings → Environments page; `dev` is wide-open for the auto-deploy-on-main path.
 
 Expected resources through slice 3 (~50):
 
