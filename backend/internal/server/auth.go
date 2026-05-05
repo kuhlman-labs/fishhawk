@@ -117,6 +117,18 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(time.Until(sess.AbsoluteExpiresAt).Seconds()),
 	})
 
+	// Mint a CSRF token alongside the session cookie. The SPA reads
+	// __Host-csrf via document.cookie and mirrors it back as the
+	// X-CSRF-Token header on state-changing requests; the csrf
+	// middleware enforces the double-submit comparison. (E4.6 #152)
+	csrfTok, err := generateCSRFToken()
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not mint CSRF token", map[string]any{"error": err.Error()})
+		return
+	}
+	setCSRFCookie(w, csrfTok)
+
 	redirect := s.cfg.AuthRedirectAfterLogin
 	if redirect == "" {
 		redirect = "/"
@@ -192,7 +204,10 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 			"revoke session failed", map[string]any{"error": err.Error()})
 		return
 	}
-	// Clear the cookie so the browser stops sending it.
+	// Clear both cookies so the browser stops sending them. The CSRF
+	// cookie is cleared even though logout itself was authorized
+	// against the session-bound CSRF (E4.6 #152) — once revoke
+	// succeeds, neither cookie is meaningful.
 	http.SetCookie(w, &http.Cookie{
 		Name:     auth.SessionCookieName,
 		Value:    "",
@@ -201,6 +216,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Secure:   true,
 		MaxAge:   -1,
 	})
+	clearCSRFCookie(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 

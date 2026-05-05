@@ -24,6 +24,12 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
+    // jsdom's default URL is http://localhost/ — tough-cookie rejects
+    // __Host-prefixed cookies there because Secure isn't really
+    // enforceable. Browsers treat localhost as a secure context (per
+    // Secure Contexts spec) so __Host- works in dev; jsdom doesn't.
+    // Use https://localhost/ for tests so cookie semantics match prod.
+    environmentOptions: { jsdom: { url: 'https://localhost/' } },
     globals: true,
     setupFiles: ['./src/test-setup.ts'],
     css: true,

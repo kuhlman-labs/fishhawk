@@ -223,7 +223,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 //
 // Middleware order, outermost first:
 //
-//	recovery → requestID → logging → bearerAuth → mux
+//	recovery → requestID → logging → bearerAuth → csrf → mux
 //
 // Recovery is outermost so panics in any later layer become 500s.
 // Request ID is set before logging so log lines can carry it. Auth
@@ -233,11 +233,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // configured APITokenRepo; absent / invalid bearer headers fall
 // through to the anonymous Identity and individual handlers
 // decide whether anonymous is acceptable.
+//
+// csrf enforces the double-submit token pattern (E4.6 #152) for
+// state-changing methods on session-cookie-authed requests. It
+// runs after bearerAuth so it can branch on the resolved Identity:
+// bearer tokens and anonymous requests bypass the check.
 func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
 	var h http.Handler = mux
+	h = s.csrf(h)
 	h = bearerAuth(s.cfg.APITokenRepo, s.cfg.AuthRepo)(h)
 	h = logging(s.cfg.Logger)(h)
 	h = requestID(h)
