@@ -62,21 +62,41 @@ func TestRetryStage_BNotApplicable(t *testing.T) {
 	}
 }
 
-func TestRetryStage_AReturnsNotImplemented(t *testing.T) {
+// E8.6: A and C retries now transition the stage back to pending
+// and let the caller (the handler) hand off to the orchestrator
+// for re-dispatch. The decision tree itself just does the
+// state-machine move.
+
+func TestRetryStage_ATransitionsToPending(t *testing.T) {
 	repo, stage := failedStage(t, run.FailureA, "agent crashed: SIGSEGV")
 
-	_, err := run.RetryStage(context.Background(), repo, stage.ID)
-	if !errors.Is(err, run.ErrRetryNotImplemented) {
-		t.Errorf("err = %v, want ErrRetryNotImplemented", err)
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID)
+	if err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	if dec.PriorCategory != run.FailureA {
+		t.Errorf("PriorCategory = %q, want A", dec.PriorCategory)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-retry state = %q, want pending", dec.Stage.State)
+	}
+	if dec.Stage.FailureCategory != nil || dec.Stage.FailureReason != nil {
+		t.Errorf("post-retry stage still carries failure metadata: %+v", dec.Stage)
 	}
 }
 
-func TestRetryStage_CReturnsNotImplemented(t *testing.T) {
+func TestRetryStage_CTransitionsToPending(t *testing.T) {
 	repo, stage := failedStage(t, run.FailureC, "dispatch_watchdog: 70m elapsed (deadline 60m)")
 
-	_, err := run.RetryStage(context.Background(), repo, stage.ID)
-	if !errors.Is(err, run.ErrRetryNotImplemented) {
-		t.Errorf("err = %v, want ErrRetryNotImplemented", err)
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID)
+	if err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	if dec.PriorCategory != run.FailureC {
+		t.Errorf("PriorCategory = %q, want C", dec.PriorCategory)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-retry state = %q, want pending", dec.Stage.State)
 	}
 }
 

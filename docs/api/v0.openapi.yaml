@@ -864,12 +864,16 @@ paths:
         - **D, sla_timeout**: transitions failed → awaiting_approval,
           clears failure metadata, restarts the SLA clock implicitly
           via the `updated_at` trigger. Returns 200 with the updated stage.
+        - **A** / **C**: transitions failed → pending, then the
+          orchestrator walks pending → dispatched and fires
+          workflow_dispatch. Returns 200 with the post-orchestrator
+          stage (typically `dispatched`). Orchestrator failures are
+          logged but don't fail the request — the stage stays at
+          pending and an operator can re-fire Advance manually.
         - **D, gate-rejected**: 422 (`retry_not_applicable`) — the
           approver said no; create a fresh run instead.
         - **B**: 422 (`retry_not_applicable`) — the workflow or spec
           needs to change before a retry would behave differently.
-        - **A** / **C**: 501 (`retry_not_implemented`) — these need
-          orchestrator-driven re-dispatch (E8.3 follow-up).
 
         Writes a `stage_retried` audit entry on success with the prior
         category and reason in the payload.
@@ -890,13 +894,6 @@ paths:
             Retry not applicable for the stage's current state /
             failure category. Body's `error` is `retry_not_applicable`
             and `message` explains the specific reason.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '501':
-          description: |
-            Retry path for this category isn't implemented yet
-            (`retry_not_implemented`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
