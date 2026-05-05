@@ -114,12 +114,22 @@ data "aws_iam_policy_document" "github_actions_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Scope to the project's repo. Restrict further (e.g. branch /
-    # tag patterns) once a deploy workflow lands in slice 4.
+    # Tightened in slice 4 (E13.7.4): only the main branch and
+    # backend release tags can assume this role. Pull-request
+    # contexts (sub = "repo:.../pull/N/merge") and feature
+    # branches (sub = "repo:.../ref:refs/heads/<branch>") match
+    # neither pattern and so cannot deploy.
+    #
+    # workflow_dispatch from main-branch context produces
+    # "repo:<repo>:ref:refs/heads/main", which the first pattern
+    # covers — so manual rollback works from the Actions UI.
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values = [
+        "repo:${var.github_repo}:ref:refs/heads/main",
+        "repo:${var.github_repo}:ref:refs/tags/backend/v*",
+      ]
     }
   }
 }

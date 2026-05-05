@@ -1,14 +1,13 @@
 # Fishhawk infra (Terraform)
 
-Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. This directory has, as of E13.7.3:
+Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. This directory has, as of E13.7.4:
 
 - **Foundation** ([#148](https://github.com/kuhlman-labs/fishhawk/issues/148)) — VPC + subnets, security groups, IAM roles, Secrets Manager skeletons, CloudWatch log group.
 - **ECS service + ALB** ([#166](https://github.com/kuhlman-labs/fishhawk/issues/166)) — Fargate task definition pointing at the GHCR image, ECS service across both private subnets, Application Load Balancer with HTTP listener (HTTPS + ACM + Route 53 alias gated on `domain_name`).
 - **RDS Postgres + migration task** ([#167](https://github.com/kuhlman-labs/fishhawk/issues/167)) — `db.t4g.micro` Postgres 16 in the private subnets with TLS forced and the master password RDS-managed; Terraform reads it and assembles the libpq URL into the existing `database_url` secret. Dedicated migration task definition for `fishhawkd migrate up`.
+- **CI deploy workflow** ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168)) — `.github/workflows/backend-deploy.yml` runs after `backend-release.yml` on `backend/v*` tags, or via `workflow_dispatch` for rollback. Registers a new task-definition revision, runs the migration task to completion, then swaps the service via `aws-actions/amazon-ecs-deploy-task-definition`. Operator wires up the GitHub repo variable `AWS_DEPLOY_ROLE_ARN` once.
 
-What's **not** here yet:
-
-- `backend-deploy.yml` workflow that registers a new task-definition revision per release and runs the migration task before swapping the service ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168))
+The full deploy chain is in. Day-21 self-execution can run end-to-end against this stack.
 
 ## Prerequisites
 
@@ -95,6 +94,8 @@ Slice 3 (~5 more):
 - 1 dedicated migration task definition (`fishhawkd migrate up`)
 - 1 Secrets Manager *version* — Terraform reads the RDS-managed master password and writes the libpq URL into the existing `database_url` secret
 
+Slice 4 has zero net-new AWS resources; it's purely the GitHub Actions workflow plus a tightening of the OIDC role's trust policy (`sub` now restricts to `main` branch + `backend/v*` tags).
+
 ## Post-apply manual steps
 
 The Secrets Manager entries are created **empty**. Populate them with real values before slice 2 brings up the ECS service:
@@ -137,9 +138,21 @@ To follow logs:
 aws logs tail /aws/ecs/fishhawk-prod --follow
 ```
 
-## Running migrations
+## Releasing
 
-The migration task definition (slice 3) runs `fishhawkd migrate up` against the RDS instance. Slice 4's deploy workflow will fire it on every release; until then, operators run it by hand on first apply and after every PR that touches `backend/internal/postgres/migrations/`:
+Once the stack is up, the deploy workflow handles the loop:
+
+1. Cut a tag: `git tag backend/v0.1.0 && git push --tags`. `backend-release.yml` builds + signs + publishes the image; `backend-deploy.yml` fires on its completion.
+2. The deploy workflow assumes the `<project>-<env>-gha-deploy` OIDC role (foundation slice's `iam.tf`), registers a new task-definition revision in both the serve and migrate families, runs the migration task, then `aws-actions/amazon-ecs-deploy-task-definition` waits for the ECS service to converge.
+3. The service's circuit breaker (slice 2) auto-rolls-back on health-check failures. The workflow surfaces the rollback as a workflow failure so the operator notices.
+
+**One-time per environment**: set the GitHub repo variable `AWS_DEPLOY_ROLE_ARN` from `terraform output -raw github_actions_deploy_role_arn`. ARN, not secret — repo variables are correct here.
+
+**Rollback**: trigger the deploy workflow manually with `workflow_dispatch` and an explicit older `image_tag` (e.g. `v0.0.9`).
+
+## Running migrations manually
+
+Slice 4's deploy workflow runs migrations on every release. Operators only need this runbook for ad-hoc cases — bringing up a fresh stack the first time, or recovering from a botched release that's wedged the workflow.
 
 ```sh
 CLUSTER=$(terraform output -raw ecs_cluster_name)
