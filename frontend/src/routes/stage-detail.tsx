@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
@@ -10,6 +11,9 @@ import { PlanDocument } from '@/plan/plan-document';
  * artifact and renders it via PlanDocument. Other stage types get
  * a minimal placeholder for now — implement and review surfaces
  * are out of scope for E7.3.
+ *
+ * Stage state lives in component state so the approval panel can
+ * apply optimistic updates and roll them back on failure (E7.4).
  */
 export function StageDetail() {
   const { runId, stageId } = useParams<{ runId: string; stageId: string }>();
@@ -34,18 +38,28 @@ function StageDetailLoaded({ runId, stageId }: { runId: string; stageId: string 
     return <ErrorBox label="artifacts" error={artifacts.error} />;
   }
 
-  return <StageDetailView runId={runId} stage={stage.data} artifacts={artifacts.data.items} />;
+  return (
+    <StageDetailView runId={runId} initialStage={stage.data} artifacts={artifacts.data.items} />
+  );
 }
 
 function StageDetailView({
   runId,
-  stage,
+  initialStage,
   artifacts,
 }: {
   runId: string;
-  stage: Stage;
+  initialStage: Stage;
   artifacts: Artifact[];
 }) {
+  const [stage, setStage] = useState<Stage>(initialStage);
+
+  // Re-sync if the loader returns a different stage row (e.g., the
+  // user navigated to a different stage without a full route remount).
+  useEffect(() => {
+    setStage(initialStage);
+  }, [initialStage]);
+
   const planArtifact = artifacts.find(
     (a) => a.kind === 'plan' && a.schema_version === 'standard_v1',
   );
@@ -59,7 +73,13 @@ function StageDetailView({
       </div>
 
       {stage.type === 'plan' && planArtifact ? (
-        <PlanArtifact artifactId={planArtifact.id} />
+        <PlanArtifact
+          artifactId={planArtifact.id}
+          stage={stage}
+          runId={runId}
+          onStageUpdate={setStage}
+          onStageRollback={setStage}
+        />
       ) : stage.type === 'plan' ? (
         <p className="text-sm text-neutral-500">
           No standard_v1 plan artifact attached to this stage yet.
@@ -76,7 +96,21 @@ function StageDetailView({
   );
 }
 
-function PlanArtifact({ artifactId }: { artifactId: string }) {
+interface PlanArtifactProps {
+  artifactId: string;
+  stage: Stage;
+  runId: string;
+  onStageUpdate: (next: Stage) => void;
+  onStageRollback: (prev: Stage) => void;
+}
+
+function PlanArtifact({
+  artifactId,
+  stage,
+  runId,
+  onStageUpdate,
+  onStageRollback,
+}: PlanArtifactProps) {
   const result = useAsync(() => api.getArtifact<unknown>(artifactId), [artifactId]);
 
   if (result.status === 'loading') {
@@ -101,7 +135,15 @@ function PlanArtifact({ artifactId }: { artifactId: string }) {
     );
   }
 
-  return <PlanDocument plan={content as StandardV1Plan} />;
+  return (
+    <PlanDocument
+      plan={content as StandardV1Plan}
+      stage={stage}
+      runId={runId}
+      onStageUpdate={onStageUpdate}
+      onStageRollback={onStageRollback}
+    />
+  );
 }
 
 function ErrorBox({ label, error }: { label: string; error: Error }) {

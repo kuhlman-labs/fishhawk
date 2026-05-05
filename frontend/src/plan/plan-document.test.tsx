@@ -1,8 +1,24 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { PlanDocument } from './plan-document';
 import type { StandardV1Plan } from '@/api/plan';
+import type { Stage } from '@/api/types';
+
+const sampleStage: Stage = {
+  id: '00000000-0000-0000-0000-0000000000aa',
+  run_id: '00000000-0000-0000-0000-0000000000ab',
+  sequence: 0,
+  type: 'plan',
+  executor: { kind: 'agent', ref: 'claude-code' },
+  state: 'awaiting_approval',
+  started_at: '2026-05-04T20:00:00Z',
+  ended_at: null,
+  failure_category: null,
+  failure_reason: null,
+  created_at: '2026-05-04T20:00:00Z',
+  updated_at: '2026-05-04T20:00:00Z',
+};
 
 const samplePlan: StandardV1Plan = {
   plan_version: 'standard_v1',
@@ -36,10 +52,16 @@ const samplePlan: StandardV1Plan = {
   risks_and_assumptions: ['Assumes /v0/artifacts/{id} returns the plan as inline JSON.'],
 };
 
-function renderPlan(plan: StandardV1Plan = samplePlan) {
+function renderPlan(plan: StandardV1Plan = samplePlan, stage: Stage = sampleStage) {
   return render(
     <MemoryRouter>
-      <PlanDocument plan={plan} />
+      <PlanDocument
+        plan={plan}
+        stage={stage}
+        runId={stage.run_id}
+        onStageUpdate={vi.fn()}
+        onStageRollback={vi.fn()}
+      />
     </MemoryRouter>,
   );
 }
@@ -110,11 +132,26 @@ describe('PlanDocument', () => {
     expect(link).toHaveAttribute('href', 'https://github.com/kuhlman-labs/fishhawk/issues/56');
   });
 
-  it('renders Approve and Regenerate buttons but keeps them disabled until E7.4', () => {
+  it('renders Approve and Reject buttons enabled while awaiting_approval; Regenerate stays disabled until E8.3', () => {
     renderPlan();
     const approve = screen.getByRole('button', { name: /^approve$/i });
+    const reject = screen.getByRole('button', { name: /^reject$/i });
     const regen = screen.getByRole('button', { name: /^regenerate$/i });
-    expect(approve).toBeDisabled();
+    expect(approve).toBeEnabled();
+    expect(reject).toBeEnabled();
     expect(regen).toBeDisabled();
+  });
+
+  it('exposes a "View audit log" link to the run-detail audit anchor', () => {
+    renderPlan();
+    const link = screen.getByRole('link', { name: /view audit log/i });
+    expect(link).toHaveAttribute('href', `/runs/${sampleStage.run_id}#audit`);
+  });
+
+  it('shows a terminal status header instead of action buttons once the gate has passed', () => {
+    renderPlan(samplePlan, { ...sampleStage, state: 'succeeded' });
+    expect(screen.queryByRole('button', { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^reject$/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/approved/i)).toBeInTheDocument();
   });
 });

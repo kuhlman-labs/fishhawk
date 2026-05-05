@@ -1,4 +1,12 @@
-import type { Artifact, ApiError, PaginatedList, Run, Stage } from './types';
+import type {
+  ApiError,
+  ApprovalRequest,
+  Artifact,
+  AuditEntry,
+  PaginatedList,
+  Run,
+  Stage,
+} from './types';
 
 /*
  * Thin fetch wrapper. Same-origin (Vite proxies /v0 → fishhawkd in
@@ -78,5 +86,25 @@ export const api = {
 
   getArtifact<C = unknown>(artifactId: string): Promise<Artifact<C>> {
     return request(`/v0/artifacts/${encodeURIComponent(artifactId)}`);
+  },
+
+  submitApproval(stageId: string, body: ApprovalRequest): Promise<Stage> {
+    return request(`/v0/stages/${encodeURIComponent(stageId)}/approvals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  },
+
+  listRunAudit(
+    runId: string,
+    params?: { limit?: number; cursor?: string; category?: string },
+  ): Promise<PaginatedList<AuditEntry>> {
+    const q = new URLSearchParams();
+    if (params?.limit) q.set('limit', String(params.limit));
+    if (params?.cursor) q.set('cursor', params.cursor);
+    if (params?.category) q.set('category', params.category);
+    const qs = q.toString();
+    return request(`/v0/runs/${encodeURIComponent(runId)}/audit${qs ? `?${qs}` : ''}`);
   },
 };

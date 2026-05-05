@@ -57,12 +57,14 @@ the browser's perspective. Override the proxy target by editing
 The plan-review vertical slice (E7.1 → E7.2 → E7.3) is in. Still
 to come:
 
-- **E7.4 (#57)** — wire the Approve / Regenerate buttons in the plan
-  document to `POST /v0/stages/{id}/approvals`. Today they render
-  but are disabled.
-- **Audit search** under `/audit` is still a placeholder.
-- **Pagination on `/runs`** ([#155](https://github.com/kuhlman-labs/fishhawk/issues/155)) — the list is capped at the
-  first 50 runs; cursor controls land separately.
+- **Audit search** under `/audit` is still a placeholder. The
+  per-run audit list at `/runs/:id#audit` is wired (E7.4) but the
+  global search across runs is later in E7.
+- **Pagination on `/runs`** and per-run audit lists
+  ([#155](https://github.com/kuhlman-labs/fishhawk/issues/155)) — both call with `limit=50`; cursor controls land
+  separately.
+- **Regenerate** in the plan-review header
+  ([#146](https://github.com/kuhlman-labs/fishhawk/issues/146)) — renders disabled until E8.3 wires re-execution.
 
 ## See also
 
