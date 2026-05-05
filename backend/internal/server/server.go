@@ -141,6 +141,12 @@ type Config struct {
 	// login + callback handlers; nil leaves both at 503.
 	GitHubOAuth *auth.GitHubOAuth
 
+	// GitHubManifest converts the one-shot `code` GitHub returns from
+	// the manifest-flow redirect into App credentials. Required for
+	// the manifest-flow start + callback handlers (E4.7); nil leaves
+	// both at 503.
+	GitHubManifest *auth.GitHubManifest
+
 	// AuthRedirectAfterLogin is the URL the callback handler
 	// redirects to on successful sign-in (typically the SPA's
 	// root). Defaults to "/" when empty.

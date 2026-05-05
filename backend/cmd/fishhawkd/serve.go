@@ -290,8 +290,14 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("callback_url", *oauthCallbackURL),
 			slog.String("redirect_after_login", *oauthRedirectAfterLogin))
 	} else {
-		logger.Warn("FISHHAWKD_OAUTH_CLIENT_ID not set; /v0/auth/github/* endpoints respond 503")
+		logger.Warn("FISHHAWKD_OAUTH_CLIENT_ID not set; /v0/auth/github/login + /callback respond 503")
 	}
+
+	// GitHub App manifest-flow client (E4.7). No credentials needed —
+	// the conversions endpoint accepts the one-shot `code` and
+	// returns App credentials in one shot. Always wired so operators
+	// can self-register an App from a fresh install.
+	cfg.GitHubManifest = authpkg.NewGitHubManifest(authpkg.ManifestURLs{})
 
 	srv := server.New(cfg)
 

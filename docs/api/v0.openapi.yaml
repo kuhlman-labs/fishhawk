@@ -436,6 +436,105 @@ paths:
           description: Redirect to the SPA root with session cookie set.
         '400': { $ref: '#/components/responses/BadRequest' }
 
+  /v0/auth/github/manifest-flow-start:
+    get:
+      operationId: githubManifestFlowStart
+      summary: Begin GitHub App manifest registration
+      description: |
+        Mints a manifest-flow state value, sets it in a short-lived
+        cookie, and renders an HTML page with a self-submitting form
+        that POSTs the App manifest to GitHub. After the operator
+        confirms the App's name on GitHub's side, GitHub redirects
+        back to `/v0/auth/github/manifest-callback` with a one-shot
+        `code`.
+
+        Designed to be opened directly in a browser; the response is
+        HTML, not JSON.
+      security: []
+      tags: [auth]
+      parameters:
+        - name: backend_url
+          in: query
+          required: true
+          description: Absolute base URL of fishhawkd (e.g. `http://localhost:8080`).
+          schema: { type: string, format: uri }
+        - name: webhook_url
+          in: query
+          required: true
+          description: |
+            Destination GitHub will deliver webhooks to. For local dev
+            this is typically a smee.io forwarding URL since GitHub
+            cannot reach `localhost`.
+          schema: { type: string, format: uri }
+        - name: owner
+          in: query
+          description: |
+            GitHub user or org login. When set, the form posts to
+            `https://github.com/organizations/<owner>/settings/apps/new`
+            instead of the operator's personal account.
+          schema: { type: string }
+        - name: name
+          in: query
+          description: App name override. Defaults to "Fishhawk".
+          schema: { type: string }
+      responses:
+        '200':
+          description: HTML form that auto-submits to GitHub.
+          content:
+            text/html:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '503':
+          description: Manifest flow not configured on this backend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/auth/github/manifest-callback:
+    get:
+      operationId: githubManifestCallback
+      summary: Receive GitHub App manifest-flow callback
+      description: |
+        Verifies the manifest-flow state, exchanges the one-shot
+        `code` with `https://api.github.com/app-manifests/{code}/conversions`,
+        and renders an HTML success page that displays the freshly
+        minted App ID, OAuth client ID + secret, webhook secret, and
+        PEM private key once. The backend does not persist these —
+        the operator copies them out into `.env` (local dev) or the
+        configured secrets backend (hosted, deferred).
+
+        The conversion code is single-use and good for ten minutes;
+        on `502` the operator must restart from
+        `/v0/auth/github/manifest-flow-start`.
+      security: []
+      tags: [auth]
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: HTML success page with one-time-visible credentials.
+          content:
+            text/html:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '502':
+          description: GitHub rejected the conversion code (expired, reused, or invalid).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Manifest flow not configured on this backend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/auth/me:
     get:
       operationId: getMe

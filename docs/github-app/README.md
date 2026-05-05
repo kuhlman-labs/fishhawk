@@ -110,42 +110,59 @@ Add a tunnel in front of `:8080`. Two common options:
 
 Set the same env vars as Mode B. After the tunnel is up, `Redeliver` a webhook from the App's **Advanced** tab to verify the round-trip.
 
+### Faster Mode B / C: drive registration through the backend
+
+Once `fishhawkd` is running, the manifest flow + credential fetch can be done end-to-end without leaving the browser. Visit:
+
+```
+http://localhost:8080/v0/auth/github/manifest-flow-start?backend_url=http://localhost:8080&webhook_url=https://smee.io/<id>
+```
+
+The backend mints state, the page auto-submits to GitHub, GitHub creates the App and redirects back, and the callback page renders the App ID + secrets + PEM in one go. Copy the `.env` block out before closing the tab.
+
+For Mode B (OAuth-only), use a placeholder webhook URL (e.g. `https://smee.io/anything-unique` even if you don't run the smee client). For Mode C, use the smee URL you'll actually forward.
+
 ## Registration paths
 
 Pick one. Manifest flow is faster and removes manual scope-typo risk; manual setup is the fallback when something in the manifest doesn't resolve cleanly (rare).
 
-### A. Manifest flow (recommended)
+### A. Manifest flow via the backend (recommended)
 
-GitHub's manifest flow takes a one-shot JSON payload and creates the App in your account or org. The rendered manifest carries the right scopes + events; you only fill in the App name and confirm.
+`fishhawkd` ships two endpoints (E4.7) that drive the whole flow end-to-end:
 
-1. Render the manifest with your backend's public URL and webhook URL. In production they're typically the same host:
+1. **`GET /v0/auth/github/manifest-flow-start`** mints a state value, sets a short-lived cookie, and returns an auto-submitting form pointing at GitHub.
+2. **`GET /v0/auth/github/manifest-callback`** verifies state, exchanges the one-shot conversion `code` with `api.github.com`, and renders an HTML page with the App ID, OAuth client ID + secret, webhook secret, and PEM. **Secrets are shown once.** Copy them into `.env` (local dev) or your secrets backend before closing the tab.
 
-   ```sh
-   ./scripts/render-github-app-manifest.sh \
-     https://api.fishhawk.example.com \
-     https://api.fishhawk.example.com/webhooks/github \
-     > /tmp/fishhawk-app.json
-   jq . /tmp/fishhawk-app.json   # optional sanity check
-   ```
+To start the flow, hit:
 
-   For local dev, see the **Local development** section above — the backend URL is `http://localhost:8080` and the webhook URL is your smee.io forwarder.
+```
+http://localhost:8080/v0/auth/github/manifest-flow-start?backend_url=<URL>&webhook_url=<URL>
+```
 
-2. Open one of these URLs in a browser. Replace `<owner>` with your GitHub user or org name:
+Required query parameters:
 
-   - **Personal account**: `https://github.com/settings/apps/new`
-   - **Organization**: `https://github.com/organizations/<owner>/settings/apps/new`
+- `backend_url` — absolute base URL of `fishhawkd` (e.g. `http://localhost:8080`, `https://api.fishhawk.example.com`).
+- `webhook_url` — destination GitHub will deliver webhooks to. In production, this is `<backend_url>/webhooks/github`. For local dev, use a [smee.io](https://smee.io/new) forwarding URL (GitHub can't reach `localhost`).
 
-3. Submit the rendered JSON via curl to the manifest-conversion endpoint:
+Optional:
 
-   ```sh
-   # GitHub responds with HTML carrying a `code` you'll need next.
-   # The manifest-flow URL must include `state` so GitHub redirects
-   # back to your backend with the conversion code.
-   curl -X POST -H "Content-Type: application/json" \
-     "https://api.github.com/app-manifests/CODE/conversions"
-   ```
+- `owner=<user-or-org>` — register on an org instead of the personal account.
+- `name=<App name>` — override the default "Fishhawk".
 
-   In practice most teams use the **GitHub-hosted manifest form**: paste the JSON from step 1, follow the redirects, accept the prompt. GitHub creates the App, generates the App ID, webhook secret, and private key, and downloads everything in one shot.
+The page POSTs to GitHub on load. After you confirm the App's name on GitHub's side, GitHub redirects back to `<backend_url>/v0/auth/github/manifest-callback?code=…&state=…`, the backend exchanges the code, and you land on the credentials page.
+
+### A'. Manifest rendering by hand
+
+If you'd rather build the manifest yourself (e.g. to register without the backend running, or to script it from CI), the same template is exposed via a CLI helper:
+
+```sh
+./scripts/render-github-app-manifest.sh \
+  https://api.fishhawk.example.com \
+  https://api.fishhawk.example.com/webhooks/github \
+  > /tmp/fishhawk-app.json
+```
+
+You'd then POST that JSON to `https://github.com/settings/apps/new` (or `/organizations/<owner>/settings/apps/new`) yourself, and convert the resulting `code` against `https://api.github.com/app-manifests/<code>/conversions` within ten minutes. The backend flow above does both steps for you.
 
 ### B. Manual setup
 
