@@ -215,6 +215,12 @@ func buildManifest(backendURL, webhookURL, name string) map[string]any {
 			"active": true,
 		},
 		"default_permissions": map[string]string{
+			// actions:write is required to fire workflow_dispatch
+			// (POST /repos/.../actions/workflows/{file}/dispatches).
+			// workflows:write below is a separate scope — it lets
+			// the App edit .github/workflows/*.yml files but does
+			// NOT include the dispatch endpoint. Both are needed.
+			"actions":       "write",
 			"contents":      "write",
 			"issues":        "write",
 			"pull_requests": "write",
