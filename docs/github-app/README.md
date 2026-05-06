@@ -17,11 +17,12 @@ Per `MVP_SPEC.md` §5.1.5:
 
 | Permission | Level | Purpose |
 |---|---|---|
+| `actions` | rw | Fire `workflow_dispatch` to invoke the runner action (`POST /repos/.../actions/workflows/{file}/dispatches`). Distinct from `workflows`, which only covers editing workflow files. |
 | `contents` | rw | Read `.fishhawk/workflows.yaml` from the customer's repo; push branches for the implement stage. |
 | `issues` | rw | Read the originating issue's body for prompt construction; comment back with the rendered plan. |
 | `pull_requests` | rw | Open PRs from the runner's pushed branch. |
 | `checks` | rw | Surface stage outcomes as a check run on the PR. |
-| `workflows` | w | Fire `workflow_dispatch` to invoke the runner action. |
+| `workflows` | w | Edit `.github/workflows/*.yml` (e.g. install-time provisioning of the customer's `fishhawk.yml`). Does NOT cover the dispatch endpoint — see `actions` above. |
 | `members` | r | Resolve `@org/team` references in role definitions to GitHub-login allowlists for approver checks (E4.4 / #50). |
 | `metadata` | r | Always granted; required for any read access. |
 
