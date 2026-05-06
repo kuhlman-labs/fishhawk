@@ -22,6 +22,14 @@ import (
 // wired for prompt construction. The handler maps this to HTTP 501.
 var ErrUnsupportedStage = errors.New("prompt: unsupported stage type")
 
+// PlanArtifactPath is the absolute path the runner expects to find
+// the agent's plan artifact at after a plan-stage invocation. It's
+// embedded in the prompt template (so the agent knows where to
+// write) and matched by the runner's --plan-out flag (so it knows
+// where to read). Hardcoded for v0; v0.x can lift this into a
+// per-stage variable if multi-tenancy demands isolation.
+const PlanArtifactPath = "/tmp/fishhawk-plan.json"
+
 // Trigger captures the bits of the originating event needed to
 // construct an issue-driven prompt. Empty IssueTitle / IssueBody
 // for non-issue triggers; for v0, those triggers all come from
@@ -86,7 +94,12 @@ func buildPlan(t Trigger) string {
 
 	writeIssueContext(&b, t)
 
-	b.WriteString("Your task: produce a `standard_v1` plan artifact describing the change. Do not modify source files in this stage — the implement stage that follows will execute the plan.\n")
+	b.WriteString("Your task: produce a `standard_v1` plan artifact describing the change. ")
+	b.WriteString("Write the plan as a single JSON object to `")
+	b.WriteString(PlanArtifactPath)
+	b.WriteString("`. The schema is documented at docs/spec/plan-standard-v1.md and required fields are: plan_version (\"standard_v1\"), ticket_reference, generated_by, summary, scope, approach, verification. ")
+	b.WriteString("Do not echo the plan in your final response — only write it to the file. ")
+	b.WriteString("Do not modify source files in this stage — the implement stage that follows will execute the plan.\n")
 	return b.String()
 }
 

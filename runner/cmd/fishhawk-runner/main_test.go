@@ -62,12 +62,14 @@ type fakeUploader struct {
 	issueErr  error
 	shipErr   error
 	promptErr error
+	planErr   error
 
 	// Recorded calls.
 	gotIssueRunID string
 	gotIssueCount int
 	gotShipArgs   *upload.ShipArgs
 	gotPromptArgs *upload.FetchPromptArgs
+	gotPlanArgs   *upload.ShipPlanArgs
 
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
@@ -132,6 +134,20 @@ func (f *fakeUploader) ShipTrace(_ context.Context, args upload.ShipArgs) (*uplo
 		StageID:     args.StageID,
 		Variant:     args.Variant,
 		ContentHash: "deadbeef",
+	}, nil
+}
+
+func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*upload.ShipPlanResult, error) {
+	a := args
+	f.gotPlanArgs = &a
+	if f.planErr != nil {
+		return nil, f.planErr
+	}
+	return &upload.ShipPlanResult{
+		ID:            "00000000-0000-0000-0000-000000000aaa",
+		StageID:       args.StageID,
+		ContentHash:   "deadbeef",
+		SchemaVersion: "standard_v1",
 	}, nil
 }
 
@@ -1101,5 +1117,151 @@ func TestRun_FetchPrompt_PlusUploadTrace_OnlyOneIssueKeyCall(t *testing.T) {
 	}
 	if fu.gotShipArgs == nil {
 		t.Error("ShipTrace not called")
+	}
+}
+
+func TestRun_UploadPlan_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planPath, []byte(validPlanJSON()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	withFakeUploader(t, fu)
+
+	stageID := "22222222-3333-4444-5555-666666666666"
+	runID := "11111111-2222-3333-4444-555555555555"
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID, "--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--prompt-file", promptPath,
+		"--plan-out", planPath,
+		"--upload-trace",
+		"--stage-id", stageID,
+		"--variant", "raw",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	// Both trace and plan should have been shipped, in that order.
+	if fu.gotShipArgs == nil {
+		t.Fatal("ShipTrace not called")
+	}
+	if fu.gotPlanArgs == nil {
+		t.Fatal("ShipPlan not called")
+	}
+	if fu.gotPlanArgs.StageID != stageID {
+		t.Errorf("ShipPlan stage_id = %q, want %q", fu.gotPlanArgs.StageID, stageID)
+	}
+	if fu.gotPlanArgs.RunID != runID {
+		t.Errorf("ShipPlan run_id = %q, want %q", fu.gotPlanArgs.RunID, runID)
+	}
+	if !strings.HasPrefix(string(fu.gotPlanArgs.Plan), `{`) {
+		t.Errorf("ShipPlan plan body should be JSON, got prefix %q", string(fu.gotPlanArgs.Plan)[:1])
+	}
+
+	// Single-issue: signing-key issued exactly once across the whole
+	// run (prompt fetch / trace upload / plan upload share it).
+	if fu.gotIssueCount != 1 {
+		t.Errorf("IssueKey called %d times, want 1", fu.gotIssueCount)
+	}
+
+	if !strings.Contains(stderr.String(), `"event":"plan_uploaded"`) {
+		t.Errorf("missing plan_uploaded log:\n%s", stderr.String())
+	}
+}
+
+func TestRun_UploadPlan_NetworkError_CategoryC(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	_ = os.WriteFile(promptPath, []byte("p"), 0o600)
+	_ = os.WriteFile(planPath, []byte(validPlanJSON()), 0o600)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.planErr = errors.New("ship plan: connection refused")
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--plan-out", planPath,
+		"--upload-trace",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--variant", "raw",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"reason":"plan_upload"`) {
+		t.Errorf("missing plan_upload reason:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"C"`) {
+		t.Errorf("expected category-C on network error, got:\n%s", stderr.String())
+	}
+}
+
+func TestRun_UploadPlan_PlanInvalid_CategoryB(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	_ = os.WriteFile(promptPath, []byte("p"), 0o600)
+	_ = os.WriteFile(planPath, []byte(validPlanJSON()), 0o600)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.planErr = upload.ErrPlanInvalid
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--plan-out", planPath,
+		"--upload-trace",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--variant", "raw",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B on schema reject, got:\n%s", stderr.String())
+	}
+}
+
+func TestRun_UploadPlan_NotShippedWithoutPlanOut(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	_ = os.WriteFile(promptPath, []byte("p"), 0o600)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u",
+		"--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--upload-trace",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--variant", "raw",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK", got)
+	}
+	if fu.gotPlanArgs != nil {
+		t.Error("ShipPlan should not be called without --plan-out")
 	}
 }

@@ -57,6 +57,7 @@ var newInvoker = func(apiKey string) agent.Invoker {
 type uploadClient interface {
 	IssueKey(ctx context.Context, runID string, ttl time.Duration) (*upload.IssuedKey, error)
 	ShipTrace(ctx context.Context, args upload.ShipArgs) (*upload.ShipResult, error)
+	ShipPlan(ctx context.Context, args upload.ShipPlanArgs) (*upload.ShipPlanResult, error)
 	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
 }
 
@@ -232,6 +233,30 @@ func run(args []string, logSink io.Writer) int {
 	}
 
 	if cfg.uploadTrace {
+		// Hoist signing-key issuance so trace + plan share the same
+		// key. The /v0/runs/{id}/signing-key endpoint is one-shot per
+		// run; without this, plan upload issues a second key and the
+		// backend's idempotent-issuance check responds 409.
+		if issuedKey == nil {
+			if client == nil {
+				client = newUploadClient(cfg.backendURL)
+			}
+			key, err := issueSigningKey(context.Background(), client, cfg, logSink)
+			if err != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"issue_key","detail":%q}`+"\n", err.Error())
+				if res.OK {
+					res.OK = false
+					res.FailureCategory = "C"
+					res.FailureReason = err.Error()
+					invokeErr = err
+				}
+				logCompletion(logSink, res, invokeErr)
+				return exitFailure
+			}
+			issuedKey = key
+		}
+
 		if err := uploadTrace(cfg, bundleBytes, logSink, client, issuedKey); err != nil {
 			// Upload failures are MVP_SPEC §6 category-C (infra).
 			// We DON'T overwrite an earlier A/B failure category;
@@ -246,6 +271,30 @@ func run(args []string, logSink io.Writer) int {
 				`{"event":"runner_failed","reason":"trace_upload","detail":%q}`+"\n", err.Error())
 			logCompletion(logSink, res, invokeErr)
 			return exitFailure
+		}
+
+		// Plan upload follows trace upload so they share the signing
+		// key and the audit log carries the trace event before the
+		// plan_generated entry. Only fires when the agent succeeded
+		// AND --plan-out was set (E5.X / #191). A failed plan upload
+		// is category-C unless the backend rejected the body as
+		// schema-invalid (ErrPlanInvalid) — that's category-B since
+		// it's the agent's output that's bad, not the network.
+		if res.OK && cfg.planOut != "" {
+			if err := uploadPlan(cfg, logSink, client, issuedKey); err != nil {
+				res.OK = false
+				if errors.Is(err, upload.ErrPlanInvalid) {
+					res.FailureCategory = "B"
+				} else {
+					res.FailureCategory = "C"
+				}
+				res.FailureReason = err.Error()
+				invokeErr = err
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"plan_upload","detail":%q}`+"\n", err.Error())
+				logCompletion(logSink, res, invokeErr)
+				return exitFailure
+			}
 		}
 	}
 
@@ -312,6 +361,53 @@ func uploadTrace(cfg config, bundleBytes []byte, logSink io.Writer, client uploa
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"trace_uploaded","run_id":%q,"stage_id":%q,"variant":%q,"content_hash":%q}`+"\n",
 		res.RunID, res.StageID, res.Variant, res.ContentHash,
+	)
+	return nil
+}
+
+// uploadPlan ships the validated plan-out file to /v0/runs/{run_id}/plan.
+// Reuses the signing key issued earlier in the run (during prompt
+// fetch or by uploadTrace). Returns nil on 201/200.
+//
+// The plan is read fresh from disk rather than handed in; the
+// upstream call site already validated the file and we want one
+// canonical source of bytes for the signature.
+func uploadPlan(cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
+	if cfg.stageID == "" {
+		return errors.New("upload: --stage-id required with --plan-out + --upload-trace")
+	}
+	if client == nil {
+		client = newUploadClient(cfg.backendURL)
+	}
+	ctx := context.Background()
+
+	if issued == nil {
+		// One-shot per run; if neither --fetch-prompt nor uploadTrace
+		// have run, this branch is the issuer.
+		key, err := issueSigningKey(ctx, client, cfg, logSink)
+		if err != nil {
+			return fmt.Errorf("issue key: %w", err)
+		}
+		issued = key
+	}
+
+	planBytes, err := os.ReadFile(cfg.planOut)
+	if err != nil {
+		return fmt.Errorf("read plan: %w", err)
+	}
+
+	res, err := client.ShipPlan(ctx, upload.ShipPlanArgs{
+		RunID:      cfg.runID,
+		StageID:    cfg.stageID,
+		Plan:       planBytes,
+		PrivateKey: issued.PrivateKey,
+	})
+	if err != nil {
+		return fmt.Errorf("ship plan: %w", err)
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"plan_uploaded","run_id":%q,"stage_id":%q,"artifact_id":%q,"content_hash":%q,"idempotent":%t}`+"\n",
+		cfg.runID, res.StageID, res.ID, res.ContentHash, res.Idempotent,
 	)
 	return nil
 }

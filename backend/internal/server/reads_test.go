@@ -253,22 +253,39 @@ func TestGetStage_NilRepo(t *testing.T) {
 // --- Artifact handlers ---
 
 // fakeArtifactRepo is the in-memory artifact.Repository for handler
-// tests. The other Repository methods (Create, GetByHash) aren't
-// touched by the read handlers, so they return "not used" errors.
+// tests. Backs both the read handlers and the plan-upload handler;
+// Create + GetByHash are usable so plan_test.go can exercise the
+// idempotent re-upload path without standing up Postgres.
 type fakeArtifactRepo struct {
-	mu       sync.Mutex
-	all      []*artifact.Artifact
-	listErr  error
-	getErr   error
-	notFound bool
+	mu        sync.Mutex
+	all       []*artifact.Artifact
+	listErr   error
+	getErr    error
+	createErr error
+	notFound  bool
 }
 
 func newFakeArtifactRepo() *fakeArtifactRepo {
 	return &fakeArtifactRepo{}
 }
 
-func (f *fakeArtifactRepo) Create(_ context.Context, _ artifact.CreateParams) (*artifact.Artifact, error) {
-	return nil, errors.New("not used")
+func (f *fakeArtifactRepo) Create(_ context.Context, p artifact.CreateParams) (*artifact.Artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	a := &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       p.StageID,
+		Kind:          p.Kind,
+		SchemaVersion: p.SchemaVersion,
+		Content:       p.Content,
+		ContentHash:   p.ContentHash,
+		CreatedAt:     time.Now().UTC(),
+	}
+	f.all = append(f.all, a)
+	return a, nil
 }
 
 func (f *fakeArtifactRepo) Get(_ context.Context, id uuid.UUID) (*artifact.Artifact, error) {
@@ -303,8 +320,15 @@ func (f *fakeArtifactRepo) ListForStage(_ context.Context, stageID uuid.UUID) ([
 	return out, nil
 }
 
-func (f *fakeArtifactRepo) GetByHash(_ context.Context, _ uuid.UUID, _ string) (*artifact.Artifact, error) {
-	return nil, errors.New("not used")
+func (f *fakeArtifactRepo) GetByHash(_ context.Context, stageID uuid.UUID, contentHash string) (*artifact.Artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, a := range f.all {
+		if a.StageID == stageID && a.ContentHash == contentHash {
+			return a, nil
+		}
+	}
+	return nil, artifact.ErrNotFound
 }
 
 func samplePlanArtifact(stageID uuid.UUID) *artifact.Artifact {
