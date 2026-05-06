@@ -665,3 +665,88 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 	}
 	return nil, fmt.Errorf("upload: ship pull-request exhausted retries: %w", lastErr)
 }
+
+// FetchInstallationTokenArgs collects the inputs for FetchInstallationToken.
+type FetchInstallationTokenArgs struct {
+	RunID      string
+	StageID    string
+	PrivateKey ed25519.PrivateKey
+}
+
+// FetchInstallationTokenResult is the (token) tuple the backend
+// echoes. v0 is just the string; v1+ may add expires_at if the
+// runner ever needs to plan around it.
+type FetchInstallationTokenResult struct {
+	Token string `json:"token"`
+}
+
+// FetchInstallationToken POSTs an empty body to /v0/runs/{run_id}/installation-token
+// and returns the App's installation token for the run's repo. Used
+// by the runner's implement-stage flow so push and PR creation
+// happen under the App's identity rather than the workflow's
+// GITHUB_TOKEN — drops the "Allow Actions to create PRs" repo-level
+// dependency from customer onboarding (E5.X / #197).
+//
+// Single-attempt: token issuance is cheap on the backend (cached),
+// and a transient failure here should surface so the caller can
+// abort the implement stage cleanly rather than racing a partial
+// state. Permanent failures bubble up via ErrSignatureRejected /
+// ErrNotFound.
+func (c *Client) FetchInstallationToken(ctx context.Context, args FetchInstallationTokenArgs) (*FetchInstallationTokenResult, error) {
+	if args.RunID == "" || args.StageID == "" {
+		return nil, errors.New("upload: run_id and stage_id required")
+	}
+	if len(args.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("upload: invalid private key length")
+	}
+
+	// Empty body — the URL path's run_id is the scoping mechanism;
+	// signing over the empty bytes still produces a valid signature
+	// the backend can verify against the run's stored public key.
+	body := []byte{}
+	digest := sha256.Sum256(body)
+	signature := ed25519.Sign(args.PrivateKey, digest[:])
+	sigHex := hex.EncodeToString(signature)
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/installation-token?stage_id=%s",
+		c.BaseURL,
+		url.PathEscape(args.RunID),
+		url.PathEscape(args.StageID),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("upload: build installation-token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Fishhawk-Signature", sigHex)
+	req.Header.Set("Accept", "application/json")
+	req.ContentLength = 0
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upload: fetch installation token: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusCreated:
+		var out FetchInstallationTokenResult
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return nil, fmt.Errorf("upload: decode installation-token response: %w", err)
+		}
+		if out.Token == "" {
+			return nil, errors.New("upload: installation-token response missing token")
+		}
+		return &out, nil
+	case http.StatusUnauthorized:
+		detail := readBriefBody(resp)
+		return nil, fmt.Errorf("%w: %s", ErrSignatureRejected, detail)
+	case http.StatusNotFound:
+		return nil, ErrNotFound
+	case http.StatusBadGateway:
+		return nil, fmt.Errorf("upload: installation-token: GitHub rejected App JWT or installation: %s", readBriefBody(resp))
+	default:
+		return nil, statusError("fetch installation token", resp)
+	}
+}

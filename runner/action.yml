@@ -88,11 +88,13 @@ inputs:
     default: 'false'
   github-token:
     description: |
-      GitHub token used for the implement-stage `git push` and PR
-      creation. Defaults to the workflow's GITHUB_TOKEN; the workflow
-      must grant `permissions: contents: write, pull-requests: write`
-      for the runner to use it. Customers can override with a
-      narrower scoped token if they prefer.
+      Deprecated; unused as of #197. The runner fetches the Fishhawk
+      App's installation token from the backend for `git push` and
+      PR creation, so the workflow's GITHUB_TOKEN no longer needs
+      `contents: write` or `pull-requests: write` and the repo does
+      NOT need the "Allow Actions to create and approve pull
+      requests" toggle. Kept as an input for API compatibility; will
+      be removed in a future version.
     required: false
     default: ${{ github.token }}
 
@@ -125,7 +127,9 @@ runs:
       working-directory: ${{ github.action_path }}
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
-        GITHUB_TOKEN: ${{ inputs.github-token }}
+        # GITHUB_TOKEN no longer read by the runner (#197). Left
+        # here unset; the runner pulls the App's installation token
+        # from the backend at implement-stage time.
       run: |
         go run ./cmd/fishhawk-runner \
           --run-id "${{ inputs.run-id }}" \

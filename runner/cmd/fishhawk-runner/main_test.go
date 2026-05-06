@@ -60,19 +60,21 @@ func withFakeInvoker(t *testing.T, fake *fakeInvoker) {
 // assertions can confirm the runner wired the right
 // run/stage/variant/bundle.
 type fakeUploader struct {
-	issueErr  error
-	shipErr   error
-	promptErr error
-	planErr   error
-	prErr     error
+	issueErr     error
+	shipErr      error
+	promptErr    error
+	planErr      error
+	prErr        error
+	instTokenErr error
 
 	// Recorded calls.
-	gotIssueRunID string
-	gotIssueCount int
-	gotShipArgs   *upload.ShipArgs
-	gotPromptArgs *upload.FetchPromptArgs
-	gotPlanArgs   *upload.ShipPlanArgs
-	gotPRArgs     *upload.ShipPullRequestArgs
+	gotIssueRunID    string
+	gotIssueCount    int
+	gotShipArgs      *upload.ShipArgs
+	gotPromptArgs    *upload.FetchPromptArgs
+	gotPlanArgs      *upload.ShipPlanArgs
+	gotPRArgs        *upload.ShipPullRequestArgs
+	gotInstTokenArgs *upload.FetchInstallationTokenArgs
 
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
@@ -171,6 +173,15 @@ func (f *fakeUploader) ShipPullRequest(_ context.Context, args upload.ShipPullRe
 		PRURL:       "https://github.com/x/y/pull/42",
 		HeadSHA:     "abc",
 	}, nil
+}
+
+func (f *fakeUploader) FetchInstallationToken(_ context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error) {
+	a := args
+	f.gotInstTokenArgs = &a
+	if f.instTokenErr != nil {
+		return nil, f.instTokenErr
+	}
+	return &upload.FetchInstallationTokenResult{Token: "ghs_app_token"}, nil
 }
 
 // withFakeUploader swaps newUploadClient. Caller restores via
@@ -1345,16 +1356,18 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 }
 
 // implementEnv sets the env vars the implement-stage flow reads
-// from the Actions environment. Restored via t.Cleanup.
-func implementEnv(t *testing.T, token, repo, ref string) {
+// from the Actions environment. The App-token migration (#197) made
+// GITHUB_TOKEN unused; we keep setting it for parity with the live
+// Actions environment (the runner doesn't read it any more).
+// Restored via t.Cleanup.
+func implementEnv(t *testing.T, repo, ref string) {
 	t.Helper()
-	t.Setenv("GITHUB_TOKEN", token)
 	t.Setenv("GITHUB_REPOSITORY", repo)
 	t.Setenv("GITHUB_REF_NAME", ref)
 }
 
 func TestRun_ImplementStage_HappyPath(t *testing.T) {
-	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
@@ -1390,8 +1403,8 @@ func TestRun_ImplementStage_HappyPath(t *testing.T) {
 	if !strings.HasPrefix(fp.gotArgs.Branch, "fishhawk/run-11111111/stage-22222222") {
 		t.Errorf("branch = %q, want fishhawk/run-<short>/stage-<short>", fp.gotArgs.Branch)
 	}
-	if fp.gotArgs.Token != "ghs_xyz" {
-		t.Errorf("Token = %q", fp.gotArgs.Token)
+	if fp.gotArgs.Token != "ghs_app_token" {
+		t.Errorf("Token = %q, want ghs_app_token (the App installation token, not GITHUB_TOKEN)", fp.gotArgs.Token)
 	}
 	if fp.gotArgs.RemoteURL != "https://github.com/kuhlman-labs/fishhawk" {
 		t.Errorf("RemoteURL = %q", fp.gotArgs.RemoteURL)
@@ -1406,8 +1419,8 @@ func TestRun_ImplementStage_HappyPath(t *testing.T) {
 	if fpr.gotArgs.Base != "main" {
 		t.Errorf("base = %q", fpr.gotArgs.Base)
 	}
-	if fpr.gotToken != "ghs_xyz" {
-		t.Errorf("PROpener token = %q", fpr.gotToken)
+	if fpr.gotToken != "ghs_app_token" {
+		t.Errorf("PROpener token = %q, want ghs_app_token (the App installation token)", fpr.gotToken)
 	}
 
 	if fu.gotPRArgs == nil {
@@ -1430,7 +1443,7 @@ func TestRun_ImplementStage_HappyPath(t *testing.T) {
 }
 
 func TestRun_ImplementStage_NoChanges_SkipsPRAndShip(t *testing.T) {
-	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
@@ -1467,7 +1480,7 @@ func TestRun_ImplementStage_NoChanges_SkipsPRAndShip(t *testing.T) {
 }
 
 func TestRun_ImplementStage_PushError_CategoryC(t *testing.T) {
-	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
@@ -1497,7 +1510,7 @@ func TestRun_ImplementStage_PushError_CategoryC(t *testing.T) {
 }
 
 func TestRun_ImplementStage_ShipPRInvalid_CategoryB(t *testing.T) {
-	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
@@ -1531,7 +1544,7 @@ func TestRun_ImplementStage_PlanOutWithImplementStage_DoesNotValidatePlan(t *tes
 	// implement stage there's no plan file at that path. The
 	// runner must not fail-by-default — it should skip plan
 	// validation entirely.
-	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
@@ -1559,5 +1572,43 @@ func TestRun_ImplementStage_PlanOutWithImplementStage_DoesNotValidatePlan(t *tes
 	}
 	if fu.gotPlanArgs != nil {
 		t.Error("ShipPlan should not be called for implement stage")
+	}
+}
+
+func TestRun_ImplementStage_InstallationTokenFetchFails_CategoryC(t *testing.T) {
+	// Backend returns 502 (or any error) when fetching the App
+	// token. The implement stage should abort with category-C
+	// before any git push or PR is attempted.
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	fu.instTokenErr = errors.New("backend: installation_token_issuance_failed")
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"C"`) {
+		t.Errorf("expected category-C on token-fetch error, got:\n%s", stderr.String())
+	}
+	if fp.gotArgs != nil {
+		t.Error("CommitAndPush should not be called when token fetch fails")
 	}
 }

@@ -203,6 +203,13 @@ Per ADR-005 (#69) and E13.4 (#61) the production secrets path is AWS Secrets Man
 
 Customer-side: visit `https://github.com/apps/fishhawk` (or the App's settings page during private testing), pick the repo to install on, and grant access. Their installation triggers the backend's webhook receiver and is ready to run.
 
+**Installing the App is the only repo-side dependency.** Specifically, customers do **not** need to:
+
+- Enable **Settings → Actions → General → Workflow permissions → "Allow GitHub Actions to create and approve pull requests"**. The runner uses the App's installation token for push and PR creation (per #197), not the workflow's `GITHUB_TOKEN`.
+- Grant write permissions to the workflow's `GITHUB_TOKEN`. The shipped `.github/workflows/fishhawk.yml` declares `permissions: contents: read` and that's enough — `actions/checkout` reads the repo, the runner does its writes via the App.
+
+The trade-off: PRs are authored by the Fishhawk App rather than the customer's automation account, which is the correct attribution per `BRAND_FOUNDATIONS.md` §5 ("Fishhawk holds the record").
+
 ## See also
 
 - `docs/MVP_SPEC.md` §5.1.5 — App component definition.
