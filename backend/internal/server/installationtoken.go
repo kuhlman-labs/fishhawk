@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -87,50 +88,67 @@ func (s *Server) handleIssueInstallationToken(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	sigHeader := r.Header.Get("X-Fishhawk-Signature")
-	if sigHeader == "" {
-		s.writeError(w, r, http.StatusUnauthorized, "signature_missing",
-			"X-Fishhawk-Signature header is required", nil)
-		return
-	}
-	signature, err := hex.DecodeString(sigHeader)
-	if err != nil {
-		s.writeError(w, r, http.StatusUnauthorized, "signature_invalid",
-			"X-Fishhawk-Signature is not valid hex",
-			map[string]any{"error": err.Error()})
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxInstallationTokenRequestBytes+1))
-	if err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"could not read request body", map[string]any{"error": err.Error()})
-		return
-	}
-	if len(body) > maxInstallationTokenRequestBytes {
-		s.writeError(w, r, http.StatusRequestEntityTooLarge, "body_too_large",
-			"request body exceeds size cap",
-			map[string]any{"limit_bytes": maxInstallationTokenRequestBytes})
-		return
-	}
-
-	message := signing.ComputeMessage(body)
-	if err := s.cfg.SigningRepo.Verify(r.Context(), runID, message, signature); err != nil {
-		switch {
-		case errors.Is(err, signing.ErrNotFound):
-			s.writeError(w, r, http.StatusNotFound, "signing_key_not_found",
-				"no signing key issued for this run", map[string]any{"run_id": runID.String()})
-		case errors.Is(err, signing.ErrExpired):
-			s.writeError(w, r, http.StatusUnauthorized, "signing_key_expired",
-				"signing key TTL has passed", map[string]any{"run_id": runID.String()})
-		case errors.Is(err, signing.ErrSignatureInvalid):
-			s.writeError(w, r, http.StatusUnauthorized, "signature_invalid",
-				"signature does not match the run's stored public key", nil)
-		default:
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"signature verification failed", map[string]any{"error": err.Error()})
+	// Dual auth (#201): the runner's runtime call signs with the
+	// per-run Ed25519 key (X-Fishhawk-Signature). The pre-checkout
+	// auth action presents a GitHub Actions OIDC token via
+	// `Authorization: Bearer <jwt>` — the same scheme the
+	// signing-key endpoint uses. We pick the path based on which
+	// header is present; OIDC wins when both are supplied.
+	authMethod := "ed25519"
+	bearerHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(bearerHeader, "Bearer ") {
+		// OIDC path. verifyOIDC handles 401/404/503 responses
+		// internally and returns false on any failure.
+		if !s.verifyOIDC(w, r, runID) {
+			return
 		}
-		return
+		authMethod = "oidc"
+	} else {
+		sigHeader := r.Header.Get("X-Fishhawk-Signature")
+		if sigHeader == "" {
+			s.writeError(w, r, http.StatusUnauthorized, "auth_required",
+				"either X-Fishhawk-Signature (Ed25519) or Authorization: Bearer <oidc-jwt> required", nil)
+			return
+		}
+		signature, err := hex.DecodeString(sigHeader)
+		if err != nil {
+			s.writeError(w, r, http.StatusUnauthorized, "signature_invalid",
+				"X-Fishhawk-Signature is not valid hex",
+				map[string]any{"error": err.Error()})
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxInstallationTokenRequestBytes+1))
+		if err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"could not read request body", map[string]any{"error": err.Error()})
+			return
+		}
+		if len(body) > maxInstallationTokenRequestBytes {
+			s.writeError(w, r, http.StatusRequestEntityTooLarge, "body_too_large",
+				"request body exceeds size cap",
+				map[string]any{"limit_bytes": maxInstallationTokenRequestBytes})
+			return
+		}
+
+		message := signing.ComputeMessage(body)
+		if err := s.cfg.SigningRepo.Verify(r.Context(), runID, message, signature); err != nil {
+			switch {
+			case errors.Is(err, signing.ErrNotFound):
+				s.writeError(w, r, http.StatusNotFound, "signing_key_not_found",
+					"no signing key issued for this run", map[string]any{"run_id": runID.String()})
+			case errors.Is(err, signing.ErrExpired):
+				s.writeError(w, r, http.StatusUnauthorized, "signing_key_expired",
+					"signing key TTL has passed", map[string]any{"run_id": runID.String()})
+			case errors.Is(err, signing.ErrSignatureInvalid):
+				s.writeError(w, r, http.StatusUnauthorized, "signature_invalid",
+					"signature does not match the run's stored public key", nil)
+			default:
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"signature verification failed", map[string]any{"error": err.Error()})
+			}
+			return
+		}
 	}
 
 	token, err := s.cfg.GitHubTokens.Token(r.Context(), *runRow.InstallationID)
@@ -151,6 +169,7 @@ func (s *Server) handleIssueInstallationToken(w http.ResponseWriter, r *http.Req
 		"stage_id":        stageID.String(),
 		"installation_id": *runRow.InstallationID,
 		"token_sha256":    hex.EncodeToString(tokenHash[:]),
+		"auth_method":     authMethod,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{

@@ -1,0 +1,99 @@
+name: 'Fishhawk Auth'
+description: 'Mint a Fishhawk App installation token via GitHub Actions OIDC; pass to actions/checkout and the Fishhawk runner.'
+author: 'Fishhawk'
+branding:
+  icon: 'key'
+  color: 'blue'
+
+# Customers reference this action as
+#   uses: kuhlman-labs/fishhawk/auth@auth/vX.Y.Z
+# at the start of their fishhawk.yml workflow, before
+# actions/checkout. The single token output is then passed to
+# `actions/checkout`'s `token:` input AND to the runner action's
+# `github-token:` input — every git operation against the customer
+# repo flows through this one App-attributed token.
+#
+# The audit trail records exactly one `installation_token_issued`
+# event per stage, with `auth_method=oidc`, bound to the OIDC
+# claims for repository + workflow.
+#
+# Workflow requirement: `permissions: id-token: write` (otherwise
+# the OIDC token request fails). #201.
+
+inputs:
+  run-id:
+    description: 'Workflow run UUID supplied by the backend dispatcher.'
+    required: true
+  stage-id:
+    description: 'Stage UUID for this dispatch.'
+    required: true
+  backend-url:
+    description: 'Fishhawk backend base URL (e.g. https://api.fishhawk.example.com).'
+    required: true
+  oidc-audience:
+    description: |
+      Audience claim the backend's OIDC verifier expects. Must
+      match the backend's FISHHAWKD_OIDC_AUDIENCE. Defaults to
+      the backend URL itself, which is the convention.
+    required: false
+    default: ''
+
+outputs:
+  token:
+    description: 'GitHub App installation token. Pass to actions/checkout `token:` and the runner action `github-token:`.'
+    value: ${{ steps.fetch.outputs.token }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Fetch App installation token via OIDC
+      id: fetch
+      shell: bash
+      env:
+        FISHHAWK_RUN_ID: ${{ inputs.run-id }}
+        FISHHAWK_STAGE_ID: ${{ inputs.stage-id }}
+        FISHHAWK_BACKEND_URL: ${{ inputs.backend-url }}
+        FISHHAWK_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+      run: |
+        set -euo pipefail
+
+        # Audience defaults to backend URL when not explicitly set.
+        AUD="${FISHHAWK_OIDC_AUDIENCE:-$FISHHAWK_BACKEND_URL}"
+
+        # Step 1: ask GitHub Actions for an OIDC ID token bound to
+        # this workflow run.
+        if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+          echo "::error::OIDC env vars missing — set 'permissions: id-token: write' on the workflow." >&2
+          exit 1
+        fi
+        OIDC_RESP="$(curl -sS -f \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$(printf '%s' "$AUD" | jq -sRr @uri)")"
+        OIDC_JWT="$(printf '%s' "$OIDC_RESP" | jq -r .value)"
+        if [[ -z "$OIDC_JWT" || "$OIDC_JWT" == "null" ]]; then
+          echo "::error::OIDC ID token fetch returned empty value: $OIDC_RESP" >&2
+          exit 1
+        fi
+
+        # Step 2: exchange the OIDC token for an App installation
+        # token at the Fishhawk backend.
+        ENDPOINT="${FISHHAWK_BACKEND_URL%/}/v0/runs/${FISHHAWK_RUN_ID}/installation-token?stage_id=${FISHHAWK_STAGE_ID}"
+        BACKEND_RESP="$(curl -sS -f -X POST \
+          -H "Authorization: Bearer ${OIDC_JWT}" \
+          -H "Content-Type: application/json" \
+          --data '{}' \
+          "${ENDPOINT}")"
+        TOKEN="$(printf '%s' "$BACKEND_RESP" | jq -r .token)"
+        if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+          echo "::error::Backend response missing token: $BACKEND_RESP" >&2
+          exit 1
+        fi
+
+        # Mask the token in any subsequent log output and emit it
+        # as a step output. ::add-mask:: replaces matches with *
+        # in the log; ::set-output (via $GITHUB_OUTPUT) is the
+        # supported way to expose a value to downstream steps.
+        echo "::add-mask::${TOKEN}"
+        printf 'token=%s\n' "${TOKEN}" >> "${GITHUB_OUTPUT}"
+
+        echo "Fetched Fishhawk App installation token (sha256: $(printf '%s' "$TOKEN" | shasum -a 256 | awk '{print $1}'))"

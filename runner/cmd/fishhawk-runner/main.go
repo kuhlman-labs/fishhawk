@@ -756,10 +756,21 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 
 	ctx := context.Background()
 
-	// Fetch the App's installation token from the backend. This is
-	// the only repo-side dependency on the customer: install the
-	// Fishhawk App, you're done. No "Allow Actions to create PRs"
-	// toggle, no GITHUB_TOKEN with elevated permissions. (#197.)
+	// Always mint a fresh App installation token at this point in
+	// the stage, even if the auth pre-step's OIDC-minted token is
+	// available via FISHHAWK_GITHUB_TOKEN. App tokens have a ~1-hour
+	// TTL and a long agent run can outlive the original (the
+	// pre-step minted at T+0s, the agent might finish at T+50min).
+	// Backend's githubapp.CachedProvider returns the cached token
+	// when it's still valid (with refresh-lead headroom) and mints
+	// a fresh one otherwise — either way the runner gets a token
+	// with maximum remaining life right when it needs to push.
+	//
+	// Audit gets two `installation_token_issued` events per
+	// implement stage: the OIDC one at workflow start (used by
+	// actions/checkout) and the Ed25519 one here (used by push +
+	// PR). Both attribute to the App; auth_method on each entry
+	// identifies which path served. (#201.)
 	tokenRes, err := client.FetchInstallationToken(ctx, upload.FetchInstallationTokenArgs{
 		RunID:      cfg.runID,
 		StageID:    cfg.stageID,
@@ -770,7 +781,7 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 	}
 	token := tokenRes.Token
 	_, _ = fmt.Fprintf(logSink,
-		`{"event":"installation_token_fetched","run_id":%q,"stage_id":%q}`+"\n",
+		`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"backend"}`+"\n",
 		cfg.runID, cfg.stageID,
 	)
 
@@ -805,8 +816,13 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 		RepoDir:       repoDir,
 		Branch:        branch,
 		CommitMessage: commitMessage,
-		Token:         token,
 		RemoteURL:     fmt.Sprintf("https://github.com/%s/%s", owner, repoName),
+		// Refresh the local extraheader with the freshly-minted
+		// token before push. Handles the long-running-stage case
+		// where the auth pre-step's token (set by actions/checkout)
+		// has expired by the time the agent finishes. See the
+		// FetchInstallationToken call above.
+		PushToken: token,
 	})
 	if err != nil {
 		return fmt.Errorf("commit+push: %w", err)

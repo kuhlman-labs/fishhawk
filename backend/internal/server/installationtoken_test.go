@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -171,5 +172,141 @@ func TestIssueInstallationToken_Unconfigured_503(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+// newInstTokenServerWithOIDC builds a server wired for OIDC bearer
+// auth on the installation-token endpoint, mirroring the production
+// posture used by the auth pre-step (#201).
+func newInstTokenServerWithOIDC(t *testing.T, runID, stageID uuid.UUID, instID *int64, verifier *stubOIDCVerifier) (*Server, *auditFake, *promptRunRepo, *fakeTokenProvider) {
+	t.Helper()
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID}
+	rr.getRuns[runID] = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		InstallationID: instID,
+	}
+	tp := &fakeTokenProvider{tok: "ghs_xyz"}
+
+	var provider githubapp.TokenProvider = tp
+	s := New(Config{
+		Addr: "127.0.0.1:0",
+		// SigningRepo intentionally nil — OIDC path doesn't touch it.
+		SigningRepo:  newSigningFake(),
+		AuditRepo:    au,
+		RunRepo:      rr,
+		GitHubTokens: provider,
+		OIDCVerifier: verifier,
+		OIDCAudience: "fishhawk-dev",
+	})
+	return s, au, rr, tp
+}
+
+func issueTokenOIDCRequest(t *testing.T, s *Server, runID, stageID uuid.UUID, bearer string) *httptest.ResponseRecorder {
+	t.Helper()
+	url := fmt.Sprintf("/v0/runs/%s/installation-token?stage_id=%s", runID, stageID)
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+func TestIssueInstallationToken_OIDC_HappyPath(t *testing.T) {
+	verifier := &stubOIDCVerifier{
+		claims: &githuboidc.Claims{Repository: "kuhlman-labs/fishhawk", Workflow: "feature_change"},
+	}
+	runID, stageID := uuid.New(), uuid.New()
+	s, au, _, tp := newInstTokenServerWithOIDC(t, runID, stageID, ptrInt64(123456), verifier)
+
+	w := issueTokenOIDCRequest(t, s, runID, stageID, "fake-jwt")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp installationTokenResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Token != "ghs_xyz" {
+		t.Errorf("token = %q", resp.Token)
+	}
+	if tp.gotInst != 123456 {
+		t.Errorf("installationID = %d", tp.gotInst)
+	}
+	if verifier.callCount != 1 {
+		t.Errorf("OIDC Verify called %d times, want 1", verifier.callCount)
+	}
+	if verifier.gotToken != "fake-jwt" {
+		t.Errorf("OIDC token forwarded = %q", verifier.gotToken)
+	}
+	if verifier.gotExp.Repository != "kuhlman-labs/fishhawk" {
+		t.Errorf("OIDC expectations.Repository = %q", verifier.gotExp.Repository)
+	}
+
+	// Audit must record auth_method=oidc.
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(au.appended[0].Payload, &payload)
+	if got, _ := payload["auth_method"].(string); got != "oidc" {
+		t.Errorf("auth_method = %q, want oidc", got)
+	}
+}
+
+func TestIssueInstallationToken_OIDC_ClaimMismatch_401(t *testing.T) {
+	verifier := &stubOIDCVerifier{err: githuboidc.ErrClaimMismatch}
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, _, _ := newInstTokenServerWithOIDC(t, runID, stageID, ptrInt64(42), verifier)
+
+	w := issueTokenOIDCRequest(t, s, runID, stageID, "fake-jwt")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestIssueInstallationToken_OIDC_AuthMethodPreferredOverEd25519(t *testing.T) {
+	// When both Authorization: Bearer AND X-Fishhawk-Signature are
+	// present, OIDC wins and the audit reflects that.
+	verifier := &stubOIDCVerifier{
+		claims: &githuboidc.Claims{Repository: "kuhlman-labs/fishhawk", Workflow: "feature_change"},
+	}
+	runID, stageID := uuid.New(), uuid.New()
+	s, au, _, _ := newInstTokenServerWithOIDC(t, runID, stageID, ptrInt64(42), verifier)
+
+	url := fmt.Sprintf("/v0/runs/%s/installation-token?stage_id=%s", runID, stageID)
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer some-jwt")
+	req.Header.Set("X-Fishhawk-Signature", "deadbeef") // intentionally invalid hex-ish; OIDC should win first
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (OIDC should win):\n%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(au.appended[0].Payload, &payload)
+	if got, _ := payload["auth_method"].(string); got != "oidc" {
+		t.Errorf("auth_method = %q, want oidc", got)
+	}
+}
+
+func TestIssueInstallationToken_NoAuth_401(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, _, _, _ := newInstTokenServer(t, runID, stageID, ptrInt64(42))
+
+	url := fmt.Sprintf("/v0/runs/%s/installation-token?stage_id=%s", runID, stageID)
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
 	}
 }

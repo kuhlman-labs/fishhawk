@@ -1403,12 +1403,12 @@ func TestRun_ImplementStage_HappyPath(t *testing.T) {
 	if !strings.HasPrefix(fp.gotArgs.Branch, "fishhawk/run-11111111/stage-22222222") {
 		t.Errorf("branch = %q, want fishhawk/run-<short>/stage-<short>", fp.gotArgs.Branch)
 	}
-	if fp.gotArgs.Token != "ghs_app_token" {
-		t.Errorf("Token = %q, want ghs_app_token (the App installation token, not GITHUB_TOKEN)", fp.gotArgs.Token)
-	}
 	if fp.gotArgs.RemoteURL != "https://github.com/kuhlman-labs/fishhawk" {
 		t.Errorf("RemoteURL = %q", fp.gotArgs.RemoteURL)
 	}
+	// Push auth flows through actions/checkout's extraheader (set
+	// by the auth pre-step in the workflow per #201), not through
+	// gitops args.
 
 	if fpr.gotArgs == nil {
 		t.Fatal("OpenPR not called")
@@ -1610,5 +1610,56 @@ func TestRun_ImplementStage_InstallationTokenFetchFails_CategoryC(t *testing.T) 
 	}
 	if fp.gotArgs != nil {
 		t.Error("CommitAndPush should not be called when token fetch fails")
+	}
+}
+
+func TestRun_ImplementStage_AlwaysFetchesFreshTokenBeforePush(t *testing.T) {
+	// Even with FISHHAWK_GITHUB_TOKEN set in env (the auth pre-
+	// step's pass-through), the runner always mints a fresh token
+	// before push so a long agent run can outlive the original
+	// token's 1-hour TTL. The audit chain gets two
+	// installation_token_issued events per implement stage: the
+	// OIDC one at workflow start, the Ed25519 one here.
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", "stale-pre-step-token")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// Always-fetch invariant: the runner called FetchInstallationToken
+	// regardless of FISHHAWK_GITHUB_TOKEN being set in env.
+	if fu.gotInstTokenArgs == nil {
+		t.Error("FetchInstallationToken must be called every implement stage to get a non-expired token")
+	}
+	// The fresh token from the backend (not the env one) reaches
+	// gitops as PushToken and the PR opener.
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	if fp.gotArgs.PushToken != "ghs_app_token" {
+		t.Errorf("PushToken = %q, want ghs_app_token (the fresh backend-minted token, NOT the stale env token)", fp.gotArgs.PushToken)
+	}
+	if fpr.gotToken != "ghs_app_token" {
+		t.Errorf("PROpener token = %q, want ghs_app_token", fpr.gotToken)
 	}
 }
