@@ -1403,12 +1403,12 @@ func TestRun_ImplementStage_HappyPath(t *testing.T) {
 	if !strings.HasPrefix(fp.gotArgs.Branch, "fishhawk/run-11111111/stage-22222222") {
 		t.Errorf("branch = %q, want fishhawk/run-<short>/stage-<short>", fp.gotArgs.Branch)
 	}
-	if fp.gotArgs.Token != "ghs_app_token" {
-		t.Errorf("Token = %q, want ghs_app_token (the App installation token, not GITHUB_TOKEN)", fp.gotArgs.Token)
-	}
 	if fp.gotArgs.RemoteURL != "https://github.com/kuhlman-labs/fishhawk" {
 		t.Errorf("RemoteURL = %q", fp.gotArgs.RemoteURL)
 	}
+	// Push auth flows through actions/checkout's extraheader (set
+	// by the auth pre-step in the workflow per #201), not through
+	// gitops args.
 
 	if fpr.gotArgs == nil {
 		t.Fatal("OpenPR not called")
@@ -1610,5 +1610,48 @@ func TestRun_ImplementStage_InstallationTokenFetchFails_CategoryC(t *testing.T) 
 	}
 	if fp.gotArgs != nil {
 		t.Error("CommitAndPush should not be called when token fetch fails")
+	}
+}
+
+func TestRun_ImplementStage_TokenFromEnvSkipsFetch(t *testing.T) {
+	// When FISHHAWK_GITHUB_TOKEN is set (production path: auth
+	// pre-step minted via OIDC, passed through as the runner
+	// action's `github-token` input), the runner uses it directly
+	// for PR creation and skips the fallback FetchInstallationToken
+	// round-trip.
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", "ghs_oidc_minted")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fu.gotInstTokenArgs != nil {
+		t.Error("FetchInstallationToken should NOT be called when FISHHAWK_GITHUB_TOKEN is set in env")
+	}
+	if fpr.gotToken != "ghs_oidc_minted" {
+		t.Errorf("PROpener got token = %q, want ghs_oidc_minted (from env)", fpr.gotToken)
+	}
+	if !strings.Contains(stderr.String(), `"source":"env"`) {
+		t.Errorf("expected installation_token_received with source=env, got:\n%s", stderr.String())
 	}
 }

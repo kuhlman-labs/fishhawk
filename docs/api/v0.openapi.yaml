@@ -1367,13 +1367,21 @@ paths:
         and approve pull requests" in their repo settings, and the PR
         is correctly attributed to the App.
 
-        Auth: per-run Ed25519 signature in `X-Fishhawk-Signature`,
-        same scheme as `/trace`, `/plan`, `/pull-request`. The
-        signed body is empty (the URL path's `run_id` provides
-        scoping).
+        Dual auth (#201):
+        - **OIDC (canonical)** — `Authorization: Bearer <github-actions-oidc-jwt>`.
+          Verified against the run row's repository + workflow
+          claims via `cfg.OIDCVerifier`. Used by the auth pre-step
+          before `actions/checkout` so the App token is what
+          authenticates the initial clone too.
+        - **Ed25519 (fallback)** — `X-Fishhawk-Signature: <hex>`
+          over sha256 of the request body. Used by the runner's
+          runtime fallback path when no auth pre-step ran (local
+          dev, non-Actions environments).
 
-        Backend reads the run row's `installation_id` and calls the
-        cached `githubapp.TokenProvider`; tokens are GitHub-default
+        OIDC wins when both are present. Audit payload's
+        `auth_method` field records which path was taken. Backend
+        reads the run row's `installation_id` and calls the cached
+        `githubapp.TokenProvider`; tokens are GitHub-default
         ~1 hour. Issuance is audited (`installation_token_issued`)
         with a sha256 of the token, never the token itself.
       tags: [runner]
@@ -1381,14 +1389,25 @@ paths:
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
         - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: Authorization
+          in: header
+          required: false
+          schema:
+            type: string
+            description: |
+              `Bearer <github-actions-oidc-jwt>`. Required for the
+              OIDC auth path. Mutually exclusive with
+              X-Fishhawk-Signature; OIDC wins when both are sent.
         - name: X-Fishhawk-Signature
           in: header
-          required: true
+          required: false
           schema:
             type: string
             description: |
               Hex-encoded 64-byte Ed25519 signature over sha256 of
-              the request body (typically empty).
+              the request body (typically empty). Required for the
+              Ed25519 auth path. Mutually exclusive with
+              Authorization.
       requestBody:
         required: false
         content:

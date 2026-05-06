@@ -5,21 +5,25 @@
 // is opinionated about author identity, branch naming, and the
 // shape of the resulting pull-request artifact.
 //
-// v0 uses the workflow's GITHUB_TOKEN for both push (HTTPS basic
-// auth with x-access-token:$TOKEN) and PR creation (REST). The PR's
-// author attribution will resolve to the GitHub Actions bot rather
-// than the Fishhawk App; v0.x can swap to the App's installation
-// token once the runner is allowed to call back to the backend for
-// it. See issue #195.
+// Push auth is the calling environment's responsibility. In the
+// hosted Actions flow (#201) `actions/checkout` is called with the
+// Fishhawk App's installation token, which sets a local
+// `http.<host>.extraheader` that subsequent git operations
+// (including this package's push) authenticate with. We don't
+// embed credentials in the URL or set our own extraheader — both
+// approaches caused failure modes in #199 / #200 (the URL-embedded
+// path was overridden by actions/checkout's existing extraheader,
+// and `-c http.<host>.extraheader=…` produced a duplicate
+// Authorization header because git's extraheader is multi-valued).
+// PR creation (OpenPR) takes its token directly because GitHub's
+// REST API needs an explicit `Authorization: Bearer <token>`.
 package gitops
 
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"net/url"
 	"os/exec"
 	"strings"
 )
@@ -69,11 +73,11 @@ type CommitAndPushArgs struct {
 	// Remote is the git remote name. Empty defaults to DefaultRemote.
 	Remote string
 
-	// Token is the GitHub token used for HTTPS push auth. Required.
-	Token string
-
-	// RemoteURL is the original origin URL (e.g.
-	// "https://github.com/owner/repo"). Required for token rewrite.
+	// RemoteURL is the URL `git push` targets. Required.
+	// Authentication is the caller's job — actions/checkout's
+	// extraheader handles HTTPS auth in the canonical Actions
+	// flow; for local-dev / bare-repo tests, file-path remotes
+	// don't need auth at all.
 	RemoteURL string
 }
 
@@ -97,17 +101,16 @@ type CommitAndPushResult struct {
 
 // CommitAndPush configures a bot author, creates Branch, stages
 // every change in RepoDir, commits with CommitMessage, and pushes
-// via HTTPS using Token. Returns NoChanges=true with no other side
-// effects when the working tree is clean.
+// to RemoteURL. Push authentication is the caller's responsibility
+// (typically via actions/checkout's pre-set extraheader). Returns
+// NoChanges=true with no other side effects when the working tree
+// is clean.
 func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*CommitAndPushResult, error) {
 	if args.RepoDir == "" {
 		return nil, errors.New("gitops: RepoDir required")
 	}
 	if args.Branch == "" {
 		return nil, errors.New("gitops: Branch required")
-	}
-	if args.Token == "" {
-		return nil, errors.New("gitops: Token required for push auth")
 	}
 	if args.RemoteURL == "" {
 		return nil, errors.New("gitops: RemoteURL required")
@@ -161,28 +164,7 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 	headSHA = strings.TrimSpace(headSHA)
 
-	// actions/checkout sets a global `http.https://github.com/.extraheader`
-	// pointing at the workflow's GITHUB_TOKEN. That header wins over
-	// any URL-embedded credential on the push (any `Authorization`
-	// header on the request supersedes basic-auth via x-access-token
-	// in the URL). We replace the extraheader for THIS push only via
-	// `-c`, so the customer's other workflow steps still see the
-	// actions/checkout config they expect.
-	pushAuthHeader, headerHost, err := pushExtraHeader(args.RemoteURL, args.Token)
-	if err != nil {
-		return nil, fmt.Errorf("gitops: build push auth header: %w", err)
-	}
-	pushArgs := []string{}
-	if pushAuthHeader != "" {
-		// `-c http.<host>.extraheader=<header>` is per-invocation.
-		pushArgs = append(pushArgs,
-			"-c", "http."+headerHost+".extraheader="+pushAuthHeader,
-		)
-	}
-	pushArgs = append(pushArgs,
-		"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch),
-	)
-	if err := p.run(ctx, args.RepoDir, pushArgs...); err != nil {
+	if err := p.run(ctx, args.RepoDir, "push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)); err != nil {
 		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
 	}
 
@@ -190,31 +172,6 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		HeadSHA: headSHA,
 		BaseSHA: baseSHA,
 	}, nil
-}
-
-// pushExtraHeader returns the `AUTHORIZATION: basic <base64>` value
-// suitable for `git -c http.<host>.extraheader=…` to authenticate
-// the push, plus the `<host>` (scheme://host[:port]) it scopes to.
-// Mirrors actions/checkout's auth model exactly so we override its
-// existing extraheader cleanly rather than racing it.
-//
-// Empty header + empty host → caller skips the `-c` and pushes
-// unauthenticated. We return (empty, empty) for non-HTTPS remotes
-// (SSH, local file paths) since those use their own auth model.
-func pushExtraHeader(remoteURL, token string) (header, host string, err error) {
-	if !strings.HasPrefix(remoteURL, "https://") {
-		return "", "", nil
-	}
-	u, err := url.Parse(remoteURL)
-	if err != nil {
-		return "", "", err
-	}
-	// `<scheme>://<host>` — git config keys are scoped at the host
-	// level, e.g. `http.https://github.com/.extraheader`.
-	host = u.Scheme + "://" + u.Host + "/"
-	encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
-	header = "AUTHORIZATION: basic " + encoded
-	return header, host, nil
 }
 
 // run invokes git with cwd=dir, returning a wrapped error including

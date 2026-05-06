@@ -41,11 +41,14 @@ on:
         default: claude-code
 
 permissions:
-  # contents: read — actions/checkout uses GITHUB_TOKEN to fetch the
-  # repo. Push + PR creation flow through the Fishhawk App's
-  # installation token (#197), so the workflow's GITHUB_TOKEN does
-  # not need write permissions and the repo does not need the
-  # "Allow Actions to create and approve pull requests" toggle.
+  # id-token: write — the auth pre-step (#201) mints a GitHub
+  # Actions OIDC token to exchange for the Fishhawk App's
+  # installation token at the backend. The exchanged token is what
+  # actions/checkout, push, and PR creation all authenticate with —
+  # no long-lived secret needed in the workflow, no repo-level
+  # "Allow Actions to create PRs" toggle, no write permissions on
+  # the workflow's GITHUB_TOKEN.
+  id-token: write
   contents: read
 
 jobs:
@@ -53,13 +56,56 @@ jobs:
     name: Run Fishhawk stage
     runs-on: ubuntu-latest
     steps:
+      # Mint the Fishhawk App installation token via OIDC before
+      # any git operation runs. The same token then flows into
+      # actions/checkout AND the runner action (passed as
+      # github-token), so push + PR creation authenticate as the
+      # App rather than the workflow's GITHUB_TOKEN. Single
+      # `installation_token_issued` audit entry per stage with
+      # auth_method=oidc. (E5.X / #201.)
+      #
+      # Inlined here rather than referencing ./auth because ./auth
+      # would itself require a prior checkout (chicken-and-egg).
+      # Customers consuming the published runner can use
+      # `kuhlman-labs/fishhawk/auth@auth/vX.Y.Z` directly without
+      # this bootstrap concern.
+      - name: Fishhawk auth (mint App installation token via OIDC)
+        id: fishhawk-auth
+        shell: bash
+        env:
+          BACKEND_URL: ${{ vars.FISHHAWK_BACKEND_URL || 'http://localhost:8080' }}
+          RUN_ID: ${{ inputs.run_id }}
+          STAGE_ID: ${{ inputs.stage_id }}
+        run: |
+          set -euo pipefail
+          AUD="$BACKEND_URL"
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+            echo "::error::OIDC env vars missing — needs 'permissions: id-token: write' on the workflow." >&2
+            exit 1
+          fi
+          OIDC_RESP="$(curl -sS -f \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$(printf '%s' "$AUD" | jq -sRr @uri)")"
+          OIDC_JWT="$(printf '%s' "$OIDC_RESP" | jq -r .value)"
+          ENDPOINT="${BACKEND_URL%/}/v0/runs/${RUN_ID}/installation-token?stage_id=${STAGE_ID}"
+          BACKEND_RESP="$(curl -sS -f -X POST \
+            -H "Authorization: Bearer ${OIDC_JWT}" \
+            -H "Content-Type: application/json" \
+            --data '{}' \
+            "${ENDPOINT}")"
+          TOKEN="$(printf '%s' "$BACKEND_RESP" | jq -r .token)"
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "::error::Backend response missing token: $BACKEND_RESP" >&2
+            exit 1
+          fi
+          echo "::add-mask::${TOKEN}"
+          printf 'token=%s\n' "${TOKEN}" >> "${GITHUB_OUTPUT}"
+
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          token: ${{ steps.fishhawk-auth.outputs.token }}
 
-      # The runner action below is referenced by `@main` for
-      # self-execution on this repo until E5.7 (#54) cuts a
-      # versioned tag. External customers should pin a tag once
-      # one is published.
       - name: Run Fishhawk runner
         uses: ./runner
         with:
@@ -69,6 +115,7 @@ jobs:
           workflow: ${{ inputs.workflow_id }}
           stage: ${{ inputs.stage }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ steps.fishhawk-auth.outputs.token }}
           # fetch-prompt: runner pulls the constructed prompt from
           # GET /v0/stages/{stage-id}/prompt and writes it to a
           # temp file before invoking Claude Code. The signing-key

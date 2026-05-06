@@ -88,15 +88,21 @@ inputs:
     default: 'false'
   github-token:
     description: |
-      Deprecated; unused as of #197. The runner fetches the Fishhawk
-      App's installation token from the backend for `git push` and
-      PR creation, so the workflow's GITHUB_TOKEN no longer needs
-      `contents: write` or `pull-requests: write` and the repo does
-      NOT need the "Allow Actions to create and approve pull
-      requests" toggle. Kept as an input for API compatibility; will
-      be removed in a future version.
+      The Fishhawk App's installation token, minted via OIDC by the
+      auth pre-step (see kuhlman-labs/fishhawk/auth or the inline
+      OIDC exchange in the canonical fishhawk.yml workflow). Used
+      directly for the runner's PR-creation REST call. When unset,
+      the runner falls back to fetching the token from the backend
+      itself via the per-run signing key (#197 path); fallback is
+      kept for local-dev / non-Actions environments and should not
+      be relied on in production.
+
+      Push auth is handled by actions/checkout's pre-set
+      extraheader (which uses the same App token when the
+      canonical workflow is followed) — gitops doesn't read this
+      input directly. (#201.)
     required: false
-    default: ${{ github.token }}
+    default: ''
 
 runs:
   using: 'composite'
@@ -127,9 +133,12 @@ runs:
       working-directory: ${{ github.action_path }}
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
-        # GITHUB_TOKEN no longer read by the runner (#197). Left
-        # here unset; the runner pulls the App's installation token
-        # from the backend at implement-stage time.
+        # FISHHAWK_GITHUB_TOKEN: when supplied by the auth
+        # pre-step (#201), the runner uses it directly for PR
+        # creation and skips the runtime FetchInstallationToken
+        # round-trip. Push auth comes from actions/checkout's
+        # extraheader (set by the same token).
+        FISHHAWK_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         go run ./cmd/fishhawk-runner \
           --run-id "${{ inputs.run-id }}" \

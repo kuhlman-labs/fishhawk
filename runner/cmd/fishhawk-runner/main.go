@@ -756,23 +756,35 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 
 	ctx := context.Background()
 
-	// Fetch the App's installation token from the backend. This is
-	// the only repo-side dependency on the customer: install the
-	// Fishhawk App, you're done. No "Allow Actions to create PRs"
-	// toggle, no GITHUB_TOKEN with elevated permissions. (#197.)
-	tokenRes, err := client.FetchInstallationToken(ctx, upload.FetchInstallationTokenArgs{
-		RunID:      cfg.runID,
-		StageID:    cfg.stageID,
-		PrivateKey: issued.PrivateKey,
-	})
-	if err != nil {
-		return fmt.Errorf("fetch installation token: %w", err)
+	// Get the App installation token. Two paths:
+	//  - Production (#201): the auth pre-step minted it via OIDC
+	//    and the workflow passed it through as FISHHAWK_GITHUB_TOKEN
+	//    on the runner action's env. Use directly; no backend call.
+	//  - Fallback (#197): no token in env. Round-trip to the backend
+	//    using the per-run signing key. Kept for local-dev / non-
+	//    Actions environments.
+	var token string
+	if envToken := os.Getenv("FISHHAWK_GITHUB_TOKEN"); envToken != "" {
+		token = envToken
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"env"}`+"\n",
+			cfg.runID, cfg.stageID,
+		)
+	} else {
+		tokenRes, err := client.FetchInstallationToken(ctx, upload.FetchInstallationTokenArgs{
+			RunID:      cfg.runID,
+			StageID:    cfg.stageID,
+			PrivateKey: issued.PrivateKey,
+		})
+		if err != nil {
+			return fmt.Errorf("fetch installation token: %w", err)
+		}
+		token = tokenRes.Token
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"backend"}`+"\n",
+			cfg.runID, cfg.stageID,
+		)
 	}
-	token := tokenRes.Token
-	_, _ = fmt.Fprintf(logSink,
-		`{"event":"installation_token_fetched","run_id":%q,"stage_id":%q}`+"\n",
-		cfg.runID, cfg.stageID,
-	)
 
 	repoSlug := os.Getenv("GITHUB_REPOSITORY") // "owner/name"
 	if repoSlug == "" {
@@ -805,8 +817,11 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 		RepoDir:       repoDir,
 		Branch:        branch,
 		CommitMessage: commitMessage,
-		Token:         token,
 		RemoteURL:     fmt.Sprintf("https://github.com/%s/%s", owner, repoName),
+		// Push auth comes from actions/checkout's pre-set
+		// extraheader (the App's installation token, set by the
+		// auth pre-step in the workflow per #201). gitops doesn't
+		// configure auth itself.
 	})
 	if err != nil {
 		return fmt.Errorf("commit+push: %w", err)
