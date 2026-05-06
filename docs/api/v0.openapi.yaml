@@ -218,6 +218,59 @@ components:
           type: string
           format: date-time
 
+    PullRequestArtifactBody:
+      type: object
+      description: |
+        Wire shape the runner POSTs to /v0/runs/{run_id}/pull-request.
+        Stored verbatim as the artifact's content; v0 doesn't carry a
+        schema_version because the field shape isn't yet schema-stable.
+      required: [pr_number, pr_url, branch, head_sha, base_sha, title, files_changed_count]
+      properties:
+        pr_number:
+          type: integer
+          minimum: 1
+          example: 42
+        pr_url:
+          type: string
+          format: uri
+          example: https://github.com/kuhlman-labs/fishhawk/pull/42
+        branch:
+          type: string
+          example: fishhawk/run-aaa/stage-bbb
+        head_sha:
+          type: string
+          example: 1111111111111111111111111111111111111111
+        base_sha:
+          type: string
+          example: 2222222222222222222222222222222222222222
+        title:
+          type: string
+          example: "Fishhawk: implement stage 22222222"
+        body:
+          type: string
+          description: Optional PR body (markdown).
+        files_changed_count:
+          type: integer
+          minimum: 0
+          example: 3
+
+    PullRequestUploadResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/pull-request`. `idempotent`
+        is true when the upload matched an existing artifact.
+      required: [id, stage_id, content_hash, pr_number, pr_url, head_sha, idempotent]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        content_hash:
+          type: string
+          description: Hex sha256 of the canonical bytes shipped.
+        pr_number: { type: integer }
+        pr_url: { type: string, format: uri }
+        head_sha: { type: string }
+        idempotent: { type: boolean }
+
     PlanUploadResponse:
       type: object
       description: |
@@ -1229,6 +1282,74 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '413':
           description: Plan body exceeds the per-stage size cap (256 KiB).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/pull-request:
+    post:
+      operationId: shipPullRequest
+      summary: Upload a pull-request artifact for an implement stage
+      description: |
+        Called by the runner after a successful implement-stage run
+        that produced a real GitHub pull request. The body carries
+        `{ pr_number, pr_url, branch, head_sha, base_sha, title,
+        body?, files_changed_count }`. Auth is the per-run Ed25519
+        signature in `X-Fishhawk-Signature` (same scheme as
+        `/v0/runs/{run_id}/trace` and `/v0/runs/{run_id}/plan`).
+
+        Idempotent on (stage_id, content_hash): re-running a runner
+        job that pushed the same commits returns the existing
+        artifact unchanged rather than inserting a duplicate.
+
+        v0 has no formal JSON Schema for the body — required-field
+        checks happen in the handler. v1+ may graduate this to a
+        versioned `pull_request_v1` schema.
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: X-Fishhawk-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+            description: Hex-encoded 64-byte Ed25519 signature over sha256(body).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PullRequestArtifactBody' }
+      responses:
+        '201':
+          description: Pull-request accepted; new artifact row created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PullRequestUploadResponse' }
+        '200':
+          description: |
+            A pull-request artifact with this content_hash already
+            exists for the stage. Idempotent re-upload returns the
+            existing artifact unchanged.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PullRequestUploadResponse' }
+        '400':
+          description: |
+            Body missing required fields (`code: pull_request_invalid`)
+            or path/query parameters were malformed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Signature invalid or no signing key for this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: Pull-request body exceeds the per-stage size cap (32 KiB).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
