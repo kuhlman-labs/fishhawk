@@ -17,6 +17,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -63,6 +64,7 @@ type fakeUploader struct {
 	shipErr   error
 	promptErr error
 	planErr   error
+	prErr     error
 
 	// Recorded calls.
 	gotIssueRunID string
@@ -70,6 +72,7 @@ type fakeUploader struct {
 	gotShipArgs   *upload.ShipArgs
 	gotPromptArgs *upload.FetchPromptArgs
 	gotPlanArgs   *upload.ShipPlanArgs
+	gotPRArgs     *upload.ShipPullRequestArgs
 
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
@@ -116,8 +119,11 @@ func (f *fakeUploader) FetchPrompt(_ context.Context, args upload.FetchPromptArg
 		return &r, nil
 	}
 	return &upload.FetchedPrompt{
-		StageID:    args.StageID,
-		StageType:  "implement",
+		StageID:   args.StageID,
+		StageType: "plan", // default to a non-implement stage so the
+		// PR-upload branch in run() doesn't fire on every test that
+		// touches FetchPrompt. Implement-specific tests override via
+		// fu.promptResp.StageType = "implement".
 		Prompt:     "fake prompt body for stage " + args.StageID,
 		PromptHash: "deadbeef",
 	}, nil
@@ -148,6 +154,22 @@ func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*u
 		StageID:       args.StageID,
 		ContentHash:   "deadbeef",
 		SchemaVersion: "standard_v1",
+	}, nil
+}
+
+func (f *fakeUploader) ShipPullRequest(_ context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error) {
+	a := args
+	f.gotPRArgs = &a
+	if f.prErr != nil {
+		return nil, f.prErr
+	}
+	return &upload.ShipPullRequestResult{
+		ID:          "00000000-0000-0000-0000-000000000bbb",
+		StageID:     args.StageID,
+		ContentHash: "cafebabe",
+		PRNumber:    42,
+		PRURL:       "https://github.com/x/y/pull/42",
+		HeadSHA:     "abc",
 	}, nil
 }
 
@@ -1263,5 +1285,279 @@ func TestRun_UploadPlan_NotShippedWithoutPlanOut(t *testing.T) {
 	}
 	if fu.gotPlanArgs != nil {
 		t.Error("ShipPlan should not be called without --plan-out")
+	}
+}
+
+// fakePusher captures CommitAndPush args and returns canned results.
+type fakePusher struct {
+	gotArgs *gitops.CommitAndPushArgs
+	result  *gitops.CommitAndPushResult
+	err     error
+}
+
+func (f *fakePusher) CommitAndPush(_ context.Context, args gitops.CommitAndPushArgs) (*gitops.CommitAndPushResult, error) {
+	a := args
+	f.gotArgs = &a
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.result != nil {
+		return f.result, nil
+	}
+	return &gitops.CommitAndPushResult{
+		HeadSHA: "head-sha-abc",
+		BaseSHA: "base-sha-def",
+	}, nil
+}
+
+// fakePROpener captures OpenPR args and returns canned results.
+type fakePROpener struct {
+	gotArgs  *gitops.OpenPRArgs
+	gotToken string
+	result   *gitops.OpenPRResult
+	err      error
+}
+
+func (f *fakePROpener) OpenPR(_ context.Context, args gitops.OpenPRArgs) (*gitops.OpenPRResult, error) {
+	a := args
+	f.gotArgs = &a
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.result != nil {
+		return f.result, nil
+	}
+	return &gitops.OpenPRResult{
+		PRNumber: 42,
+		PRURL:    "https://github.com/x/y/pull/42",
+	}, nil
+}
+
+func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
+	t.Helper()
+	origP, origO := newPusher, newPROpener
+	newPusher = func() pusher { return fp }
+	newPROpener = func(token string) prOpener {
+		fpr.gotToken = token
+		return fpr
+	}
+	t.Cleanup(func() { newPusher = origP; newPROpener = origO })
+}
+
+// implementEnv sets the env vars the implement-stage flow reads
+// from the Actions environment. Restored via t.Cleanup.
+func implementEnv(t *testing.T, token, repo, ref string) {
+	t.Helper()
+	t.Setenv("GITHUB_TOKEN", token)
+	t.Setenv("GITHUB_REPOSITORY", repo)
+	t.Setenv("GITHUB_REF_NAME", ref)
+}
+
+func TestRun_ImplementStage_HappyPath(t *testing.T) {
+	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	runID := "11111111-2222-3333-4444-555555555555"
+	stageID := "22222222-3333-4444-5555-666666666666"
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt",
+		"--upload-trace",
+		"--variant", "raw",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	if !strings.HasPrefix(fp.gotArgs.Branch, "fishhawk/run-11111111/stage-22222222") {
+		t.Errorf("branch = %q, want fishhawk/run-<short>/stage-<short>", fp.gotArgs.Branch)
+	}
+	if fp.gotArgs.Token != "ghs_xyz" {
+		t.Errorf("Token = %q", fp.gotArgs.Token)
+	}
+	if fp.gotArgs.RemoteURL != "https://github.com/kuhlman-labs/fishhawk" {
+		t.Errorf("RemoteURL = %q", fp.gotArgs.RemoteURL)
+	}
+
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR not called")
+	}
+	if fpr.gotArgs.Owner != "kuhlman-labs" || fpr.gotArgs.Repo != "fishhawk" {
+		t.Errorf("owner/repo = %q/%q", fpr.gotArgs.Owner, fpr.gotArgs.Repo)
+	}
+	if fpr.gotArgs.Base != "main" {
+		t.Errorf("base = %q", fpr.gotArgs.Base)
+	}
+	if fpr.gotToken != "ghs_xyz" {
+		t.Errorf("PROpener token = %q", fpr.gotToken)
+	}
+
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest not called")
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &sent); err != nil {
+		t.Fatalf("decode shipped body: %v", err)
+	}
+	for _, want := range []string{"pr_number", "pr_url", "branch", "head_sha", "base_sha", "title"} {
+		if _, ok := sent[want]; !ok {
+			t.Errorf("shipped body missing %q: %+v", want, sent)
+		}
+	}
+
+	if !strings.Contains(stderr.String(), `"event":"pull_request_opened"`) ||
+		!strings.Contains(stderr.String(), `"event":"pull_request_uploaded"`) {
+		t.Errorf("missing pr lifecycle log lines:\n%s", stderr.String())
+	}
+}
+
+func TestRun_ImplementStage_NoChanges_SkipsPRAndShip(t *testing.T) {
+	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR should not be called when there are no changes")
+	}
+	if fu.gotPRArgs != nil {
+		t.Error("ShipPullRequest should not be called when there are no changes")
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_no_changes"`) {
+		t.Errorf("missing implement_no_changes log:\n%s", stderr.String())
+	}
+}
+
+func TestRun_ImplementStage_PushError_CategoryC(t *testing.T) {
+	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: errors.New("push: bad credentials")}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"C"`) {
+		t.Errorf("expected category-C on push error, got:\n%s", stderr.String())
+	}
+}
+
+func TestRun_ImplementStage_ShipPRInvalid_CategoryB(t *testing.T) {
+	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	fu.prErr = upload.ErrPullRequestInvalid
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B on schema reject, got:\n%s", stderr.String())
+	}
+}
+
+func TestRun_ImplementStage_PlanOutWithImplementStage_DoesNotValidatePlan(t *testing.T) {
+	// Workflow file passes plan-out unconditionally; for an
+	// implement stage there's no plan file at that path. The
+	// runner must not fail-by-default — it should skip plan
+	// validation entirely.
+	implementEnv(t, "ghs_xyz", "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	dir := t.TempDir()
+	missingPlan := filepath.Join(dir, "no-such-plan.json")
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+		"--plan-out", missingPlan, // file doesn't exist; would fail validation pre-fix
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (plan validation should be skipped for implement stage):\n%s", got, stderr.String())
+	}
+	if fu.gotPlanArgs != nil {
+		t.Error("ShipPlan should not be called for implement stage")
 	}
 }

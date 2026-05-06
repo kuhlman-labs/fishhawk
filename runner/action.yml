@@ -86,6 +86,15 @@ inputs:
     description: 'Fetch the constructed prompt from backend-url (GET /v0/stages/{stage-id}/prompt) before invoking the agent. Requires stage-id. prompt-file wins when both are set, useful for local replay.'
     required: false
     default: 'false'
+  github-token:
+    description: |
+      GitHub token used for the implement-stage `git push` and PR
+      creation. Defaults to the workflow's GITHUB_TOKEN; the workflow
+      must grant `permissions: contents: write, pull-requests: write`
+      for the runner to use it. Customers can override with a
+      narrower scoped token if they prefer.
+    required: false
+    default: ${{ github.token }}
 
 runs:
   using: 'composite'
@@ -116,6 +125,7 @@ runs:
       working-directory: ${{ github.action_path }}
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         go run ./cmd/fishhawk-runner \
           --run-id "${{ inputs.run-id }}" \

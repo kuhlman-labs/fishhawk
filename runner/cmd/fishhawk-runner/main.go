@@ -34,6 +34,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
@@ -58,6 +59,7 @@ type uploadClient interface {
 	IssueKey(ctx context.Context, runID string, ttl time.Duration) (*upload.IssuedKey, error)
 	ShipTrace(ctx context.Context, args upload.ShipArgs) (*upload.ShipResult, error)
 	ShipPlan(ctx context.Context, args upload.ShipPlanArgs) (*upload.ShipPlanResult, error)
+	ShipPullRequest(ctx context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error)
 	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
 }
 
@@ -97,6 +99,13 @@ func run(args []string, logSink io.Writer) int {
 	// must issue exactly once per runner invocation.
 	var issuedKey *upload.IssuedKey
 
+	// stageType comes from the fetch-prompt response. Drives
+	// per-stage post-processing: plan validation + upload for
+	// "plan", commit/push/PR for "implement". Empty when --fetch-
+	// prompt is unset (local replay) — both branches simply skip,
+	// preserving the existing local-replay behavior.
+	var stageType string
+
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
 	// a temp file. Sets cfg.promptFile so the rest of the path is
@@ -117,13 +126,14 @@ func run(args []string, logSink io.Writer) int {
 			return exitFailure
 		}
 		issuedKey = key
-		path, fetchErr := fetchPromptToFile(context.Background(), client, cfg, key, logSink)
+		path, sType, fetchErr := fetchPromptToFile(context.Background(), client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
 			return exitFailure
 		}
 		cfg.promptFile = path
+		stageType = sType
 	}
 
 	if cfg.promptFile == "" {
@@ -159,7 +169,13 @@ func run(args []string, logSink io.Writer) int {
 	// agent already failed. A plan-validation failure overrides
 	// res.OK and demotes the run to category-B (constraint /
 	// policy violation per MVP_SPEC §6).
-	if res.OK && cfg.planOut != "" {
+	//
+	// Gated on stageType to skip implement / review stages where
+	// the agent legitimately produces no plan file. Empty
+	// stageType (local replay without --fetch-prompt) preserves
+	// the historical behavior: operator's --plan-out flag drives
+	// validation directly.
+	if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
 		if ev, demote := validatePlan(cfg.planOut); demote != nil {
 			res.Events = append(res.Events, ev)
 			res.OK = false
@@ -276,11 +292,12 @@ func run(args []string, logSink io.Writer) int {
 		// Plan upload follows trace upload so they share the signing
 		// key and the audit log carries the trace event before the
 		// plan_generated entry. Only fires when the agent succeeded
-		// AND --plan-out was set (E5.X / #191). A failed plan upload
-		// is category-C unless the backend rejected the body as
-		// schema-invalid (ErrPlanInvalid) — that's category-B since
-		// it's the agent's output that's bad, not the network.
-		if res.OK && cfg.planOut != "" {
+		// AND --plan-out was set (E5.X / #191) AND the stage actually
+		// produced a plan (i.e. not implement / review). A failed
+		// plan upload is category-C unless the backend rejected the
+		// body as schema-invalid (ErrPlanInvalid) — that's category-B
+		// since it's the agent's output that's bad, not the network.
+		if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
 			if err := uploadPlan(cfg, logSink, client, issuedKey); err != nil {
 				res.OK = false
 				if errors.Is(err, upload.ErrPlanInvalid) {
@@ -292,6 +309,29 @@ func run(args []string, logSink io.Writer) int {
 				invokeErr = err
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"plan_upload","detail":%q}`+"\n", err.Error())
+				logCompletion(logSink, res, invokeErr)
+				return exitFailure
+			}
+		}
+
+		// Implement-stage post-processing: commit + push + open PR
+		// + ship the pull_request artifact. (E5.X / #195.) Mirrors
+		// the plan-stage upload chain: same signing key, same
+		// failure-classification rules. ErrPullRequestInvalid is
+		// category-B (we shipped the wrong shape); everything else
+		// is category-C (network, git, GitHub API).
+		if res.OK && stageType == "implement" {
+			if err := openPRAndShipArtifact(cfg, logSink, client, issuedKey); err != nil {
+				res.OK = false
+				if errors.Is(err, upload.ErrPullRequestInvalid) {
+					res.FailureCategory = "B"
+				} else {
+					res.FailureCategory = "C"
+				}
+				res.FailureReason = err.Error()
+				invokeErr = err
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"pull_request_upload","detail":%q}`+"\n", err.Error())
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
 			}
@@ -428,17 +468,20 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 }
 
 // fetchPromptToFile pulls the constructed prompt from the backend,
-// writes it to a temp file, and returns the path. The temp file is
-// 0o600 — bundle-style defense in depth, since prompts may include
-// issue bodies that the customer would prefer not to leave on the
-// runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (string, error) {
+// writes it to a temp file, and returns the path plus the stage
+// type from the response. stageType drives per-stage post-processing
+// (plan validation + upload for plan stages, commit+push+PR upload
+// for implement stages). The temp file is 0o600 — bundle-style
+// defense in depth, since prompts may include issue bodies that the
+// customer would prefer not to leave on the runner's filesystem
+// world-readable.
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (string, string, error) {
 	got, err := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -446,20 +489,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, err := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if err != nil {
-		return "", fmt.Errorf("create prompt temp file: %w", err)
+		return "", "", fmt.Errorf("create prompt temp file: %w", err)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), nil
+	return tmp.Name(), got.StageType, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -667,4 +710,158 @@ func emitEvents(w io.Writer, events []agent.Event) {
 	for _, ev := range events {
 		_ = enc.Encode(ev)
 	}
+}
+
+// pusher abstracts gitops.Pusher for tests.
+type pusher interface {
+	CommitAndPush(ctx context.Context, args gitops.CommitAndPushArgs) (*gitops.CommitAndPushResult, error)
+}
+
+// prOpener abstracts gitops.OpenPRClient for tests. Both seams
+// are package-level vars so tests can swap the production
+// implementations without changing every call site.
+type prOpener interface {
+	OpenPR(ctx context.Context, args gitops.OpenPRArgs) (*gitops.OpenPRResult, error)
+}
+
+// newPusher / newPROpener are test seams. Production code
+// returns the real gitops types; tests substitute fakes via
+// withFakeGitOps().
+var (
+	newPusher = func() pusher { return &gitops.Pusher{} }
+
+	newPROpener = func(token string) prOpener {
+		return &gitops.OpenPRClient{Token: token}
+	}
+)
+
+// openPRAndShipArtifact is the implement-stage post-processing
+// chain. It commits the agent's edits, pushes a fresh branch via
+// HTTPS, opens a PR via the GitHub REST API, and ships a
+// pull_request artifact to the backend.
+//
+// Skips with an early return when the working tree is clean (no
+// commit → no PR → no artifact). The agent producing zero edits
+// is a real workflow signal but not necessarily a failure; we emit
+// a policy_event into the trace via a follow-up bundle so the
+// approver sees "agent decided no changes were needed."
+func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
+	if cfg.runID == "" || cfg.stageID == "" {
+		return errors.New("upload: --run-id and --stage-id required for implement stage")
+	}
+	if issued == nil {
+		return errors.New("upload: signing key not issued (caller must hoist IssueKey before openPRAndShipArtifact)")
+	}
+
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		return errors.New("upload: GITHUB_TOKEN env var is required for implement-stage push + PR")
+	}
+	repoSlug := os.Getenv("GITHUB_REPOSITORY") // "owner/name"
+	if repoSlug == "" {
+		return errors.New("upload: GITHUB_REPOSITORY env var is required for implement-stage push + PR")
+	}
+	owner, repoName, ok := strings.Cut(repoSlug, "/")
+	if !ok || owner == "" || repoName == "" {
+		return fmt.Errorf("upload: GITHUB_REPOSITORY %q is not owner/name", repoSlug)
+	}
+	baseRef := os.Getenv("GITHUB_REF_NAME")
+	if baseRef == "" {
+		baseRef = "main"
+	}
+
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	branch := fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
+	title := fmt.Sprintf("Fishhawk: implement stage %s", shortID(cfg.stageID))
+	body := fmt.Sprintf(
+		"Opened by Fishhawk for run `%s`, stage `%s`.\n\n"+
+			"Branch: `%s`\n"+
+			"Audit log: see `%s/v0/runs/%s/audit`.\n",
+		cfg.runID, cfg.stageID, branch, strings.TrimRight(cfg.backendURL, "/"), cfg.runID,
+	)
+	commitMessage := title + "\n\n" + body
+
+	ctx := context.Background()
+	cap, err := newPusher().CommitAndPush(ctx, gitops.CommitAndPushArgs{
+		RepoDir:       repoDir,
+		Branch:        branch,
+		CommitMessage: commitMessage,
+		Token:         token,
+		RemoteURL:     fmt.Sprintf("https://github.com/%s/%s", owner, repoName),
+	})
+	if err != nil {
+		return fmt.Errorf("commit+push: %w", err)
+	}
+	if cap.NoChanges {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"implement_no_changes","run_id":%q,"stage_id":%q,"base_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, cap.BaseSHA,
+		)
+		// No PR to open; no artifact to ship. The stage still
+		// counts as succeeded — the agent decided no edits were
+		// needed. Reviewer will see the empty trace + this log.
+		return nil
+	}
+
+	prRes, err := newPROpener(token).OpenPR(ctx, gitops.OpenPRArgs{
+		Owner: owner,
+		Repo:  repoName,
+		Head:  branch,
+		Base:  baseRef,
+		Title: title,
+		Body:  body,
+	})
+	if err != nil {
+		return fmt.Errorf("open PR: %w", err)
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pull_request_opened","run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q}`+"\n",
+		cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, cap.HeadSHA,
+	)
+
+	// Diff size: count files via gitdiff against the base ref.
+	// Best-effort; failure here doesn't block the artifact upload.
+	filesChanged := 0
+	if d, err := (&gitdiff.Runner{}).Run(ctx, baseRef, repoDir); err == nil {
+		filesChanged = len(d.ChangedFiles)
+	}
+
+	artifactBody, _ := json.Marshal(map[string]any{
+		"pr_number":           prRes.PRNumber,
+		"pr_url":              prRes.PRURL,
+		"branch":              branch,
+		"head_sha":            cap.HeadSHA,
+		"base_sha":            cap.BaseSHA,
+		"title":               title,
+		"body":                body,
+		"files_changed_count": filesChanged,
+	})
+
+	shipRes, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+		RunID:      cfg.runID,
+		StageID:    cfg.stageID,
+		Body:       artifactBody,
+		PrivateKey: issued.PrivateKey,
+	})
+	if err != nil {
+		return fmt.Errorf("ship pull-request: %w", err)
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pull_request_uploaded","run_id":%q,"stage_id":%q,"artifact_id":%q,"content_hash":%q,"idempotent":%t}`+"\n",
+		cfg.runID, cfg.stageID, shipRes.ID, shipRes.ContentHash, shipRes.Idempotent,
+	)
+	return nil
+}
+
+// shortID returns the first 8 characters of a UUID-shaped string,
+// for use in branch names and titles. Non-UUID strings round-trip
+// up to 8 chars.
+func shortID(id string) string {
+	if len(id) < 8 {
+		return id
+	}
+	return id[:8]
 }

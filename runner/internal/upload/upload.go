@@ -53,9 +53,14 @@ var (
 	// validation rejects the plan body. Permanent at the protocol
 	// layer — re-shipping the same bytes won't help; the agent's
 	// output is bad.
-	ErrPlanInvalid   = errors.New("upload: plan rejected as schema-invalid")
-	ErrAlreadyIssued = errors.New("upload: signing key already issued for this run")
-	ErrNotFound      = errors.New("upload: run or signing key not found")
+	ErrPlanInvalid = errors.New("upload: plan rejected as schema-invalid")
+	// ErrPullRequestInvalid surfaces when the backend rejects the
+	// pull-request body for missing required fields or wrong shape.
+	// Permanent at the protocol layer — the runner shipped the
+	// wrong fields; retrying won't help.
+	ErrPullRequestInvalid = errors.New("upload: pull-request rejected as invalid")
+	ErrAlreadyIssued      = errors.New("upload: signing key already issued for this run")
+	ErrNotFound           = errors.New("upload: run or signing key not found")
 	// ErrUnsupportedStage means the backend has no prompt template
 	// for this stage type. Non-retryable; the runner should fail
 	// the stage rather than guess.
@@ -536,4 +541,127 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 		}
 	}
 	return nil, fmt.Errorf("upload: ship plan exhausted retries: %w", lastErr)
+}
+
+// ShipPullRequestArgs collects everything ShipPullRequest needs.
+// Body is the JSON-encoded artifact (the runner serializes the
+// PullRequestPayload before signing so the bytes the backend
+// verifies against are the same bytes it stores).
+type ShipPullRequestArgs struct {
+	RunID      string
+	StageID    string
+	Body       []byte
+	PrivateKey ed25519.PrivateKey
+}
+
+// ShipPullRequestResult is what the backend echoes back. Idempotent
+// is true when the upload matched an existing artifact (same
+// stage + content_hash) and no new row was inserted.
+type ShipPullRequestResult struct {
+	ID          string `json:"id"`
+	StageID     string `json:"stage_id"`
+	ContentHash string `json:"content_hash"`
+	PRNumber    int    `json:"pr_number"`
+	PRURL       string `json:"pr_url"`
+	HeadSHA     string `json:"head_sha"`
+	Idempotent  bool   `json:"idempotent"`
+}
+
+// ShipPullRequest signs the body and POSTs it to
+// /v0/runs/{run_id}/pull-request?stage_id=…. Retries 5xx with
+// exponential backoff. Permanent failures bubble up:
+//
+//   - 400 pull_request_invalid → ErrPullRequestInvalid (runner shipped wrong shape)
+//   - 401 signature_*          → ErrSignatureRejected
+//   - 404 stage/key            → ErrNotFound
+//
+// On 201 the backend created a fresh artifact; on 200 the upload
+// matched an existing one (Result.Idempotent==true).
+func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) (*ShipPullRequestResult, error) {
+	if len(args.Body) == 0 {
+		return nil, errors.New("upload: empty pull-request body")
+	}
+	if len(args.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("upload: invalid private key length")
+	}
+
+	digest := sha256.Sum256(args.Body)
+	signature := ed25519.Sign(args.PrivateKey, digest[:])
+	sigHex := hex.EncodeToString(signature)
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/pull-request?stage_id=%s",
+		c.BaseURL,
+		url.PathEscape(args.RunID),
+		url.PathEscape(args.StageID),
+	)
+
+	maxRetries := c.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultMaxRetries
+	}
+	backoff := c.Backoff
+	if backoff == 0 {
+		backoff = DefaultBackoff
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(args.Body))
+		if err != nil {
+			return nil, fmt.Errorf("upload: build pull-request request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Fishhawk-Signature", sigHex)
+		req.Header.Set("Accept", "application/json")
+		req.ContentLength = int64(len(args.Body))
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("upload: ship pull-request: %w", err)
+			continue
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK:
+			var out ShipPullRequestResult
+			err := json.NewDecoder(resp.Body).Decode(&out)
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("upload: decode pull-request response: %w", err)
+			}
+			return &out, nil
+		case resp.StatusCode == http.StatusBadRequest:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			if strings.Contains(detail, "pull_request_invalid") {
+				return nil, fmt.Errorf("%w: %s", ErrPullRequestInvalid, detail)
+			}
+			return nil, fmt.Errorf("upload: ship pull-request: 400: %s", detail)
+		case resp.StatusCode == http.StatusUnauthorized:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s", ErrSignatureRejected, detail)
+		case resp.StatusCode == http.StatusNotFound:
+			_ = resp.Body.Close()
+			return nil, ErrNotFound
+		case resp.StatusCode >= 500:
+			lastErr = statusError("ship pull-request", resp)
+			_ = resp.Body.Close()
+			continue
+		default:
+			lastErr = statusError("ship pull-request", resp)
+			_ = resp.Body.Close()
+			return nil, lastErr
+		}
+	}
+	return nil, fmt.Errorf("upload: ship pull-request exhausted retries: %w", lastErr)
 }
