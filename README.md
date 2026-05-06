@@ -42,6 +42,7 @@ The repository ships a [`Makefile`](Makefile) that wraps the common loops. Run `
 ```sh
 cp .env.example .env        # populate later for GitHub App / OAuth (see below)
 make up                     # docker compose: Postgres :5432, MinIO :9000/:9001
+make minio-init             # one-time per fresh stack: create the fishhawk-traces bucket
 make migrate                # apply backend migrations
 make dev-backend            # run fishhawkd on :8080
 make dev-frontend           # in another terminal: Web UI on :5173 (proxies /v0)

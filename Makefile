@@ -38,6 +38,15 @@ down: ## Stop the local stack (preserves volumes).
 nuke: ## Stop the local stack AND drop volumes (destroys data).
 	docker compose down -v
 
+.PHONY: minio-init
+minio-init: ## Create the MinIO trace bucket on the local stack (idempotent).
+	@docker compose exec -T minio mc alias set local http://localhost:9000 fishhawk fishhawk-dev-secret >/dev/null
+	@if docker compose exec -T minio mc ls local/fishhawk-traces >/dev/null 2>&1; then \
+		echo "bucket fishhawk-traces already exists; nothing to do"; \
+	else \
+		docker compose exec -T minio mc mb local/fishhawk-traces; \
+	fi
+
 .PHONY: migrate
 migrate: ## Apply backend Postgres migrations.
 	FISHHAWKD_DATABASE_URL='$(DATABASE_URL)' go run ./backend/cmd/fishhawkd migrate up
