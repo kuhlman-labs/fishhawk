@@ -22,8 +22,10 @@ package gitops
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"os/exec"
 	"strings"
 )
@@ -79,6 +81,18 @@ type CommitAndPushArgs struct {
 	// flow; for local-dev / bare-repo tests, file-path remotes
 	// don't need auth at all.
 	RemoteURL string
+
+	// PushToken, when non-empty, is configured as the local
+	// `http.<host>.extraheader` for an HTTPS RemoteURL immediately
+	// before push, replacing any existing value (--replace-all).
+	// Use this to refresh a stale extraheader from the workflow's
+	// initial actions/checkout — App installation tokens have a
+	// ~1-hour TTL and a long agent run can outlive the token that
+	// was minted at workflow start.
+	//
+	// Empty value (the default) means "use ambient auth" — caller
+	// trusts whatever extraheader the environment set up.
+	PushToken string
 }
 
 // CommitAndPushResult captures the SHAs the runner needs to populate
@@ -164,6 +178,25 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 	headSHA = strings.TrimSpace(headSHA)
 
+	// Refresh the local extraheader if the caller supplied a fresh
+	// PushToken. This is the long-running-stage path: the workflow's
+	// initial actions/checkout set an extraheader with the auth
+	// pre-step's token, but App installation tokens are ~1-hour
+	// TTL — agents that take >55min outlive the original. The
+	// runner pre-fetches a fresh token and hands it here so the
+	// push always authenticates with a non-expired credential.
+	if args.PushToken != "" && strings.HasPrefix(args.RemoteURL, "https://") {
+		host, err := pushHost(args.RemoteURL)
+		if err != nil {
+			return nil, fmt.Errorf("gitops: parse remote URL: %w", err)
+		}
+		header := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+args.PushToken))
+		if err := p.run(ctx, args.RepoDir, "config", "--local", "--replace-all",
+			"http."+host+".extraheader", header); err != nil {
+			return nil, fmt.Errorf("gitops: refresh extraheader: %w", err)
+		}
+	}
+
 	if err := p.run(ctx, args.RepoDir, "push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)); err != nil {
 		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
 	}
@@ -172,6 +205,18 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		HeadSHA: headSHA,
 		BaseSHA: baseSHA,
 	}, nil
+}
+
+// pushHost extracts the `<scheme>://<host>/` string git config keys
+// scope extraheader to. Mirrors actions/checkout's convention exactly
+// so a `--replace-all` overwrites the existing entry rather than
+// appending a duplicate.
+func pushHost(remoteURL string) (string, error) {
+	u, err := url.Parse(remoteURL)
+	if err != nil {
+		return "", err
+	}
+	return u.Scheme + "://" + u.Host + "/", nil
 }
 
 // run invokes git with cwd=dir, returning a wrapped error including

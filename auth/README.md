@@ -56,6 +56,10 @@ GitHub Actions can mint short-lived OIDC ID tokens bound to the running workflow
 
 The alternative (workflow's `GITHUB_TOKEN`) would force customers to enable the repo-level "Allow GitHub Actions to create and approve pull requests" toggle and grant `pull-requests: write` on `GITHUB_TOKEN`. Installing the Fishhawk App is the only repo-side dependency under the OIDC flow. See #201 for the design rationale.
 
+## Token TTL and long-running stages
+
+App installation tokens have a ~1-hour TTL. The token this action mints is used by `actions/checkout` for the initial clone; the Fishhawk runner action then mints a **second** App token immediately before its `git push` so an agent run that takes longer than ~55 minutes doesn't fail at the push step on a stale credential. The audit log records both issuances: the OIDC one (this step) and the Ed25519 one (signed by the per-run signing key right before push), each with `auth_method` recorded so the trail is unambiguous about which credential authenticated which git operation.
+
 ## Failure modes
 
 - `OIDC env vars missing — set 'permissions: id-token: write'` — workflow doesn't have the right permissions block.

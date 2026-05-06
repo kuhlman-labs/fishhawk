@@ -1613,14 +1613,15 @@ func TestRun_ImplementStage_InstallationTokenFetchFails_CategoryC(t *testing.T) 
 	}
 }
 
-func TestRun_ImplementStage_TokenFromEnvSkipsFetch(t *testing.T) {
-	// When FISHHAWK_GITHUB_TOKEN is set (production path: auth
-	// pre-step minted via OIDC, passed through as the runner
-	// action's `github-token` input), the runner uses it directly
-	// for PR creation and skips the fallback FetchInstallationToken
-	// round-trip.
+func TestRun_ImplementStage_AlwaysFetchesFreshTokenBeforePush(t *testing.T) {
+	// Even with FISHHAWK_GITHUB_TOKEN set in env (the auth pre-
+	// step's pass-through), the runner always mints a fresh token
+	// before push so a long agent run can outlive the original
+	// token's 1-hour TTL. The audit chain gets two
+	// installation_token_issued events per implement stage: the
+	// OIDC one at workflow start, the Ed25519 one here.
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	t.Setenv("FISHHAWK_GITHUB_TOKEN", "ghs_oidc_minted")
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", "stale-pre-step-token")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
@@ -1645,13 +1646,20 @@ func TestRun_ImplementStage_TokenFromEnvSkipsFetch(t *testing.T) {
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
 	}
-	if fu.gotInstTokenArgs != nil {
-		t.Error("FetchInstallationToken should NOT be called when FISHHAWK_GITHUB_TOKEN is set in env")
+	// Always-fetch invariant: the runner called FetchInstallationToken
+	// regardless of FISHHAWK_GITHUB_TOKEN being set in env.
+	if fu.gotInstTokenArgs == nil {
+		t.Error("FetchInstallationToken must be called every implement stage to get a non-expired token")
 	}
-	if fpr.gotToken != "ghs_oidc_minted" {
-		t.Errorf("PROpener got token = %q, want ghs_oidc_minted (from env)", fpr.gotToken)
+	// The fresh token from the backend (not the env one) reaches
+	// gitops as PushToken and the PR opener.
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
 	}
-	if !strings.Contains(stderr.String(), `"source":"env"`) {
-		t.Errorf("expected installation_token_received with source=env, got:\n%s", stderr.String())
+	if fp.gotArgs.PushToken != "ghs_app_token" {
+		t.Errorf("PushToken = %q, want ghs_app_token (the fresh backend-minted token, NOT the stale env token)", fp.gotArgs.PushToken)
+	}
+	if fpr.gotToken != "ghs_app_token" {
+		t.Errorf("PROpener token = %q, want ghs_app_token", fpr.gotToken)
 	}
 }

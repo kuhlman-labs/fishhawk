@@ -88,19 +88,21 @@ inputs:
     default: 'false'
   github-token:
     description: |
-      The Fishhawk App's installation token, minted via OIDC by the
-      auth pre-step (see kuhlman-labs/fishhawk/auth or the inline
-      OIDC exchange in the canonical fishhawk.yml workflow). Used
-      directly for the runner's PR-creation REST call. When unset,
-      the runner falls back to fetching the token from the backend
-      itself via the per-run signing key (#197 path); fallback is
-      kept for local-dev / non-Actions environments and should not
-      be relied on in production.
+      Threaded through to the runner process for completeness, but
+      not directly consumed by the runner's git or PR logic — the
+      runner always mints a fresh App installation token at
+      push-time via the backend's installation-token endpoint.
+      That refresh handles the long-running-stage case: App
+      installation tokens have a ~1-hour TTL and an agent run can
+      outlive the token the auth pre-step minted at workflow
+      start. (#201, with the always-fetch refresh added in the
+      same PR.)
 
-      Push auth is handled by actions/checkout's pre-set
-      extraheader (which uses the same App token when the
-      canonical workflow is followed) — gitops doesn't read this
-      input directly. (#201.)
+      Customers should still pass this value (typically the
+      `${{ steps.fishhawk-auth.outputs.token }}` from the auth
+      pre-step) to `actions/checkout`'s `token:` input in the
+      calling workflow — that's what authenticates the initial
+      clone.
     required: false
     default: ''
 
@@ -133,12 +135,6 @@ runs:
       working-directory: ${{ github.action_path }}
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
-        # FISHHAWK_GITHUB_TOKEN: when supplied by the auth
-        # pre-step (#201), the runner uses it directly for PR
-        # creation and skips the runtime FetchInstallationToken
-        # round-trip. Push auth comes from actions/checkout's
-        # extraheader (set by the same token).
-        FISHHAWK_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         go run ./cmd/fishhawk-runner \
           --run-id "${{ inputs.run-id }}" \
