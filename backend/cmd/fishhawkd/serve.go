@@ -180,6 +180,40 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("FISHHAWKD_GITHUB_WEBHOOK_SECRET not set; /webhooks/github will respond 503")
 	}
 
+	// GitHub App installation-token provider. Both ID and key file
+	// must be set; either alone is a misconfiguration. Wired before
+	// the webhook dispatcher / orchestrator below because both
+	// capture cfg.GitHub at construction time — initializing them
+	// before the App is set produces a silently-degraded backend
+	// that accepts webhooks but never creates Run records.
+	if *githubAppIDStr != "" || *githubAppKeyFile != "" {
+		if *githubAppIDStr == "" || *githubAppKeyFile == "" {
+			logger.Error("github app misconfigured: both --github-app-id and --github-app-private-key-file required")
+			return exitFailure
+		}
+		appID, err := strconv.ParseInt(*githubAppIDStr, 10, 64)
+		if err != nil || appID <= 0 {
+			logger.Error("github app id invalid", slog.String("got", *githubAppIDStr))
+			return exitFailure
+		}
+		keyBytes, err := os.ReadFile(*githubAppKeyFile)
+		if err != nil {
+			logger.Error("github app key read failed", slog.String("error", err.Error()))
+			return exitFailure
+		}
+		signer, err := githubapp.NewSignerFromPEM(appID, keyBytes)
+		if err != nil {
+			logger.Error("github app key parse failed", slog.String("error", err.Error()))
+			return exitFailure
+		}
+		cfg.GitHubTokens = githubapp.NewCachedProvider(githubapp.NewClient(signer))
+		cfg.GitHub = githubclient.New(cfg.GitHubTokens)
+		logger.Info("github app + REST client configured",
+			slog.Int64("app_id", appID))
+	} else {
+		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
+	}
+
 	// Webhook dispatcher requires both the GitHub REST client (for
 	// fetching the workflow spec + firing workflow_dispatch) and a
 	// run repository (for creating Run records). Without either,
@@ -228,39 +262,6 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.OIDCAudience = *oidcAudience
 	} else {
 		logger.Warn("FISHHAWKD_OIDC_AUDIENCE not set; signing-key endpoint accepts unauthenticated requests")
-	}
-
-	// GitHub App installation-token provider. Both ID and key file
-	// must be set; either alone is a misconfiguration. Currently
-	// no handlers consume cfg.GitHubTokens — the dispatcher (#109)
-	// will pick it up — but wire it now so future handlers find it
-	// already constructed.
-	if *githubAppIDStr != "" || *githubAppKeyFile != "" {
-		if *githubAppIDStr == "" || *githubAppKeyFile == "" {
-			logger.Error("github app misconfigured: both --github-app-id and --github-app-private-key-file required")
-			return exitFailure
-		}
-		appID, err := strconv.ParseInt(*githubAppIDStr, 10, 64)
-		if err != nil || appID <= 0 {
-			logger.Error("github app id invalid", slog.String("got", *githubAppIDStr))
-			return exitFailure
-		}
-		keyBytes, err := os.ReadFile(*githubAppKeyFile)
-		if err != nil {
-			logger.Error("github app key read failed", slog.String("error", err.Error()))
-			return exitFailure
-		}
-		signer, err := githubapp.NewSignerFromPEM(appID, keyBytes)
-		if err != nil {
-			logger.Error("github app key parse failed", slog.String("error", err.Error()))
-			return exitFailure
-		}
-		cfg.GitHubTokens = githubapp.NewCachedProvider(githubapp.NewClient(signer))
-		cfg.GitHub = githubclient.New(cfg.GitHubTokens)
-		logger.Info("github app + REST client configured",
-			slog.Int64("app_id", appID))
-	} else {
-		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
 	}
 
 	// Role resolver for the approval handler. Wired only when the
