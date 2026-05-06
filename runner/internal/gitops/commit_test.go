@@ -313,3 +313,98 @@ func TestCommitAndPush_PushPassesExtraHeader(t *testing.T) {
 		}
 	}
 }
+
+// TestCommitAndPush_UnsetsStaleExtraHeaderBeforePush replays the
+// failure mode from production: actions/checkout sets a --local
+// http.<host>.extraheader pointing at the workflow's GITHUB_TOKEN,
+// our `-c` override stacks rather than replaces, and GitHub
+// rejects with "Duplicate header: Authorization". The fix unsets
+// the existing local entry first; this test asserts the unset
+// call happens BEFORE the push.
+func TestCommitAndPush_UnsetsStaleExtraHeaderBeforePush(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "init")
+
+	// Simulate actions/checkout setting the local extraheader.
+	mustGit(t, repo, "config", "--local",
+		"http.https://github.com/.extraheader",
+		"AUTHORIZATION: basic stale-token-value")
+
+	// Capture every command's args without changing behavior.
+	var captured [][]string
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			capturedArgs := append([]string{name}, args...)
+			captured = append(captured, capturedArgs)
+			return exec.CommandContext(ctx, name, args...)
+		},
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Push will fail (no real remote); we only care about the
+	// invocation order before the push.
+	_, _ = p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/test",
+		CommitMessage: "test",
+		Token:         "ghs_xyz",
+		RemoteURL:     "https://github.com/owner/repo",
+	})
+
+	// Find the first push invocation and the unset invocation.
+	pushIdx, unsetIdx := -1, -1
+	for i, c := range captured {
+		// Skip past `git`, look at the rest.
+		args := c[1:]
+		// Push has "push" as a top-level (post `-c` flags) arg.
+		for j, a := range args {
+			if a == "push" {
+				pushIdx = i
+				_ = j
+				break
+			}
+		}
+		// Unset matches `config --local --unset-all
+		// http.<host>.extraheader`.
+		if len(args) >= 4 && args[0] == "config" && args[1] == "--local" &&
+			args[2] == "--unset-all" && strings.HasPrefix(args[3], "http.") &&
+			strings.HasSuffix(args[3], ".extraheader") {
+			unsetIdx = i
+		}
+	}
+
+	if unsetIdx < 0 {
+		t.Errorf("expected an `unset-all extraheader` call before push, none found:\n%v", captured)
+	}
+	if pushIdx < 0 {
+		t.Fatalf("push command not captured:\n%v", captured)
+	}
+	if unsetIdx >= pushIdx {
+		t.Errorf("unset must precede push: unsetIdx=%d, pushIdx=%d", unsetIdx, pushIdx)
+	}
+
+	// Final repo state: actions/checkout's stale extraheader should
+	// be gone (the unset took effect on disk).
+	out, _ := exec.Command("git", "-C", repo, "config", "--local", "--get-all",
+		"http.https://github.com/.extraheader").Output()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("stale extraheader still present after CommitAndPush: %q", out)
+	}
+}

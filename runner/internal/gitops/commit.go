@@ -161,20 +161,29 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 	headSHA = strings.TrimSpace(headSHA)
 
-	// actions/checkout sets a global `http.https://github.com/.extraheader`
-	// pointing at the workflow's GITHUB_TOKEN. That header wins over
-	// any URL-embedded credential on the push (any `Authorization`
-	// header on the request supersedes basic-auth via x-access-token
-	// in the URL). We replace the extraheader for THIS push only via
-	// `-c`, so the customer's other workflow steps still see the
-	// actions/checkout config they expect.
+	// actions/checkout sets a `http.https://github.com/.extraheader` at
+	// LOCAL scope pointing at the workflow's GITHUB_TOKEN. That header
+	// wins over any URL-embedded credential on the push.
+	//
+	// `extraheader` is a multi-valued config key — `-c` ADDS an entry
+	// rather than replacing the existing one, which gets us two
+	// `Authorization` headers on the request and a 400 "Duplicate
+	// header" from GitHub. So we have to clear the existing local
+	// entry first, then `-c` ours on the push call.
+	//
+	// Unset is best-effort: returns non-zero when no value matches,
+	// which is fine for non-Actions environments where the setting
+	// was never there to begin with.
 	pushAuthHeader, headerHost, err := pushExtraHeader(args.RemoteURL, args.Token)
 	if err != nil {
 		return nil, fmt.Errorf("gitops: build push auth header: %w", err)
 	}
+	if pushAuthHeader != "" {
+		_ = p.run(ctx, args.RepoDir, "config", "--local", "--unset-all",
+			"http."+headerHost+".extraheader")
+	}
 	pushArgs := []string{}
 	if pushAuthHeader != "" {
-		// `-c http.<host>.extraheader=<header>` is per-invocation.
 		pushArgs = append(pushArgs,
 			"-c", "http."+headerHost+".extraheader="+pushAuthHeader,
 		)
