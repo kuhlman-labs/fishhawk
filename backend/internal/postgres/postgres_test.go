@@ -202,20 +202,32 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0011 drops the
-	// runs.idempotency_key column. Confirm: the column is gone,
-	// but every table / column from earlier migrations (users +
-	// sessions from 0010, audit run_id is still nullable from
-	// 0009, api_tokens from 0008, etc.) is still present.
-	var idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0012 added a synthetic id
+	// column on signing_keys (and dropped the run_id PRIMARY KEY
+	// constraint). Down restores the prior shape: the id column
+	// is gone, run_id is the PK again. Confirm both, plus that
+	// every table / column from earlier migrations is still there
+	// (e.g. runs.idempotency_key from 0011, users + sessions from
+	// 0010, audit run_id nullability from 0009, api_tokens from
+	// 0008, etc.).
+	var signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'signing_keys' AND column_name = 'id'`,
+	).Scan(&signingIDCol); err != nil {
+		t.Fatalf("query signing_keys.id column: %v", err)
+	}
+	if signingIDCol != 0 {
+		t.Errorf("signing_keys.id count after MigrateDown = %d, want 0 (0012 rolled back)", signingIDCol)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'runs' AND column_name = 'idempotency_key'`,
 	).Scan(&idempotencyCol); err != nil {
 		t.Fatalf("query idempotency_key column: %v", err)
 	}
-	if idempotencyCol != 0 {
-		t.Errorf("runs.idempotency_key count after MigrateDown = %d, want 0 (most-recent migration rolled back)", idempotencyCol)
+	if idempotencyCol != 1 {
+		t.Errorf("runs.idempotency_key count after MigrateDown = %d, want 1 (0011 still applied)", idempotencyCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'sessions'`,

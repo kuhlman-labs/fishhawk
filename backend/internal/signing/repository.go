@@ -13,9 +13,10 @@ import (
 type Repository interface {
 	// Issue mints a fresh Ed25519 keypair, stores the public half
 	// keyed by runID with the given TTL window, and returns both
-	// halves plus the timestamps. Returns ErrAlreadyIssued if a key
-	// already exists for the run; in v0 each run gets exactly one
-	// key.
+	// halves plus the timestamps. Multi-call: every Issue inserts a
+	// new row (per migration 0012), so each stage's GitHub Actions
+	// runner can issue its own private key independently. Verify
+	// uses the latest unexpired key for the run.
 	//
 	// The caller is responsible for delivering IssuedKey.PrivateKey
 	// to the runner (typically over the response body of the

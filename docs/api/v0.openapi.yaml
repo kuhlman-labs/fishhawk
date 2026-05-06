@@ -1041,11 +1041,19 @@ paths:
       summary: Issue a per-run Ed25519 signing key
       description: |
         Called by the runner at job start. The backend mints a fresh
-        Ed25519 keypair, persists the public half in `signing_keys`,
-        and returns the private half in the response body. The private
-        key is never persisted server-side and never returned to anyone
+        Ed25519 keypair, appends a new row in `signing_keys`, and
+        returns the private half in the response body. The private key
+        is never persisted server-side and never returned to anyone
         else. Auth is GitHub Actions OIDC token, verified per request.
         See ADR-008 (#72).
+
+        Multi-call: each invocation appends a new row so each stage's
+        fresh GitHub Actions runner process can issue its own key
+        without coordinating with prior stages. `Verify` (used by the
+        trace and plan upload endpoints) picks the latest unexpired
+        key for the run; older rows remain so the standalone audit
+        verifier can replay any signature that was valid at upload
+        time. Migration 0012.
       tags: [runner]
       security:
         - githubOIDC: []
@@ -1093,11 +1101,6 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: Run does not exist.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '409':
-          description: A signing key has already been issued for this run.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

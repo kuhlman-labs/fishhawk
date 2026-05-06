@@ -97,15 +97,8 @@ func (s *Server) handleIssueSigningKey(w http.ResponseWriter, r *http.Request) {
 
 	issued, err := s.cfg.SigningRepo.Issue(r.Context(), runID, ttl)
 	if err != nil {
-		switch {
-		case errors.Is(err, signing.ErrAlreadyIssued):
-			s.writeError(w, r, http.StatusConflict, "signing_key_already_issued",
-				"a signing key has already been issued for this run",
-				map[string]any{"run_id": runID.String()})
-		default:
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"issue signing key failed", map[string]any{"error": err.Error()})
-		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"issue signing key failed", map[string]any{"error": err.Error()})
 		return
 	}
 

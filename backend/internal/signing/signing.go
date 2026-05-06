@@ -52,8 +52,14 @@ var (
 	// ErrNotFound means no signing key exists for the given run.
 	ErrNotFound = errors.New("signing key not found")
 
-	// ErrAlreadyIssued means a key was already issued for this run.
-	// Re-issuance is not supported in v0; a run gets exactly one key.
+	// ErrAlreadyIssued was returned from Issue() prior to migration
+	// 0012 when a row already existed for the run. Kept for
+	// backwards compatibility with callers that still test for it
+	// (notably runner/internal/upload), but the postgres adapter
+	// no longer returns it — Issue is multi-call, each invocation
+	// inserts a new row, and Verify uses the latest unexpired key.
+	//
+	// Deprecated: never returned by the production repository.
 	ErrAlreadyIssued = errors.New("signing key already issued for this run")
 
 	// ErrExpired means the stored key's expires_at is in the past.

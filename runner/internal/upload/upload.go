@@ -110,9 +110,14 @@ type signingKeyResponse struct {
 // IssueKey calls POST /v0/runs/{run_id}/signing-key and returns the
 // decoded key material.
 //
-// Single-attempt: signing-key issuance is not idempotent (a second
-// call returns 409 ErrAlreadyIssued), so a transient failure here
-// must be surfaced rather than silently retried.
+// Multi-call against backends with migration 0012+: each call inserts
+// a new row, every stage's fresh runner process gets its own private
+// key, the backend's Verify uses the latest unexpired key. Older
+// backends return 409 ErrAlreadyIssued for the second call; we keep
+// that mapping as a defensive shim (callers shouldn't see it in
+// practice). Single-attempt either way — IssueKey doesn't retry on
+// transient errors so the caller can decide whether to abort or
+// surface them.
 func (c *Client) IssueKey(ctx context.Context, runID string, ttl time.Duration) (*IssuedKey, error) {
 	body := struct {
 		TTLSeconds int `json:"ttl_seconds,omitempty"`
