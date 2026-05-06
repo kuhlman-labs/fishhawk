@@ -105,6 +105,17 @@ jobs:
         uses: actions/checkout@v6
         with:
           token: ${{ steps.fishhawk-auth.outputs.token }}
+          # persist-credentials: false — actions/checkout sets the
+          # http.<host>.extraheader via an includeIf'd external
+          # credentials file, not the local config directly. With
+          # the default (true), the runner's `git config --local
+          # --replace-all` before push only overrides the local
+          # entry; the includeIf'd one still loads, both
+          # Authorization headers go on the request, GitHub
+          # returns 400 "Duplicate header". Setting this to false
+          # tells checkout to clean up after the initial fetch so
+          # the runner is the sole source of push auth.
+          persist-credentials: false
 
       - name: Run Fishhawk runner
         uses: ./runner
