@@ -23,6 +23,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/trace", s.handleShipTrace)
 	mux.HandleFunc("POST /v0/runs/{run_id}/plan", s.handleShipPlan)
 	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", s.handleShipPullRequest)
+	mux.HandleFunc("POST /v0/runs/{run_id}/installation-token", s.handleIssueInstallationToken)
 	mux.HandleFunc("GET /v0/stages/{stage_id}", s.handleGetStage)
 	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", s.handleListStageArtifacts)
 	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", s.handleGetStagePrompt)

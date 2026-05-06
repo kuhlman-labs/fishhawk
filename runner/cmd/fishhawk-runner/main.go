@@ -61,6 +61,7 @@ type uploadClient interface {
 	ShipPlan(ctx context.Context, args upload.ShipPlanArgs) (*upload.ShipPlanResult, error)
 	ShipPullRequest(ctx context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error)
 	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
+	FetchInstallationToken(ctx context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error)
 }
 
 // newUploadClient returns the production uploadClient for the
@@ -753,10 +754,26 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 		return errors.New("upload: signing key not issued (caller must hoist IssueKey before openPRAndShipArtifact)")
 	}
 
-	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" {
-		return errors.New("upload: GITHUB_TOKEN env var is required for implement-stage push + PR")
+	ctx := context.Background()
+
+	// Fetch the App's installation token from the backend. This is
+	// the only repo-side dependency on the customer: install the
+	// Fishhawk App, you're done. No "Allow Actions to create PRs"
+	// toggle, no GITHUB_TOKEN with elevated permissions. (#197.)
+	tokenRes, err := client.FetchInstallationToken(ctx, upload.FetchInstallationTokenArgs{
+		RunID:      cfg.runID,
+		StageID:    cfg.stageID,
+		PrivateKey: issued.PrivateKey,
+	})
+	if err != nil {
+		return fmt.Errorf("fetch installation token: %w", err)
 	}
+	token := tokenRes.Token
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"installation_token_fetched","run_id":%q,"stage_id":%q}`+"\n",
+		cfg.runID, cfg.stageID,
+	)
+
 	repoSlug := os.Getenv("GITHUB_REPOSITORY") // "owner/name"
 	if repoSlug == "" {
 		return errors.New("upload: GITHUB_REPOSITORY env var is required for implement-stage push + PR")
@@ -784,7 +801,6 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 	)
 	commitMessage := title + "\n\n" + body
 
-	ctx := context.Background()
 	cap, err := newPusher().CommitAndPush(ctx, gitops.CommitAndPushArgs{
 		RepoDir:       repoDir,
 		Branch:        branch,

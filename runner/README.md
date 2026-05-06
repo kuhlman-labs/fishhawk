@@ -51,7 +51,7 @@ The Claude Code API key is supplied via the `ANTHROPIC_API_KEY` environment vari
 
 The composite action installs Claude Code (`@anthropic-ai/claude-code` from npm) on every run via Node 22. Hosted Actions runners don't ship with it, and the runner adapter invokes the `claude` binary by name. Cold-cache install adds ~15s; pinning a version is deferred (v1+).
 
-For implement stages the runner additionally commits the agent's edits, pushes a fresh branch, opens a PR, and ships a `pull_request` artifact to the backend. The push and PR creation use the workflow's `GITHUB_TOKEN` — set the calling workflow's `permissions:` to `contents: write` and `pull-requests: write`. Branch name is `fishhawk/run-<short>/stage-<short>`. A clean working tree (agent decided no changes were needed) skips push + PR cleanly without failing the stage; the trace records an `implement_no_changes` event so the approver can see why. Issue #195.
+For implement stages the runner additionally commits the agent's edits, pushes a fresh branch, opens a PR, and ships a `pull_request` artifact to the backend. **Push and PR creation use the Fishhawk App's installation token** (fetched from `POST /v0/runs/{run_id}/installation-token` per #197) — installing the App is the only repo-side dependency. The workflow's `GITHUB_TOKEN` doesn't need elevated permissions, and the customer doesn't need to enable "Allow Actions to create and approve pull requests" in repo settings. Branch name is `fishhawk/run-<short>/stage-<short>`. A clean working tree (agent decided no changes were needed) skips push + PR cleanly without failing the stage; the trace records an `implement_no_changes` event so the approver can see why.
 
 ## Build and test
 

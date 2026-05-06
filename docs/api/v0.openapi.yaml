@@ -1354,6 +1354,88 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/installation-token:
+    post:
+      operationId: issueInstallationToken
+      summary: Mint a GitHub App installation token for the run's repo
+      description: |
+        Returns the Fishhawk App's installation token for the
+        repository the run is operating on. Lets the runner do its
+        implement-stage `git push` and PR creation under the App's
+        identity rather than the workflow's `GITHUB_TOKEN` — which
+        means customers don't need to enable "Allow Actions to create
+        and approve pull requests" in their repo settings, and the PR
+        is correctly attributed to the App.
+
+        Auth: per-run Ed25519 signature in `X-Fishhawk-Signature`,
+        same scheme as `/trace`, `/plan`, `/pull-request`. The
+        signed body is empty (the URL path's `run_id` provides
+        scoping).
+
+        Backend reads the run row's `installation_id` and calls the
+        cached `githubapp.TokenProvider`; tokens are GitHub-default
+        ~1 hour. Issuance is audited (`installation_token_issued`)
+        with a sha256 of the token, never the token itself.
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: X-Fishhawk-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+            description: |
+              Hex-encoded 64-byte Ed25519 signature over sha256 of
+              the request body (typically empty).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Empty in v0; reserved for future fields.
+      responses:
+        '201':
+          description: Installation token issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token:
+                    type: string
+                    description: |
+                      Opaque GitHub installation token. Use as
+                      `x-access-token:<token>` for HTTPS git push,
+                      or `Authorization: Bearer <token>` for REST
+                      API calls. ~1-hour TTL; runner discards
+                      after stage completes.
+        '400':
+          description: |
+            run_id / stage_id malformed, stage doesn't belong to
+            run, or the run has no `installation_id` (was created
+            without a webhook-attributed installation).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Signature invalid or no signing key for this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502':
+          description: |
+            Backend's App JWT was rejected, or the installation no
+            longer exists. Runner should abort the implement stage
+            and report category-C.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   # ---------------------------------------------------------------------
   # Webhook ingestion (unversioned; GitHub controls request shape)
   # ---------------------------------------------------------------------
