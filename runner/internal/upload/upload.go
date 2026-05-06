@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -48,8 +49,13 @@ var (
 // signature, retrying with the same bytes won't help.
 var (
 	ErrSignatureRejected = errors.New("upload: backend rejected signature")
-	ErrAlreadyIssued     = errors.New("upload: signing key already issued for this run")
-	ErrNotFound          = errors.New("upload: run or signing key not found")
+	// ErrPlanInvalid surfaces when the backend's standard_v1 schema
+	// validation rejects the plan body. Permanent at the protocol
+	// layer — re-shipping the same bytes won't help; the agent's
+	// output is bad.
+	ErrPlanInvalid   = errors.New("upload: plan rejected as schema-invalid")
+	ErrAlreadyIssued = errors.New("upload: signing key already issued for this run")
+	ErrNotFound      = errors.New("upload: run or signing key not found")
 	// ErrUnsupportedStage means the backend has no prompt template
 	// for this stage type. Non-retryable; the runner should fail
 	// the stage rather than guess.
@@ -401,4 +407,128 @@ func statusError(op string, resp *http.Response) error {
 	}
 	return fmt.Errorf("upload: %s: %s: %s",
 		op, strconv.Itoa(resp.StatusCode), body)
+}
+
+// ShipPlanArgs collects everything ShipPlan needs.
+type ShipPlanArgs struct {
+	RunID   string
+	StageID string
+	// Plan is the JSON bytes of the standard_v1 plan artifact.
+	// Caller is responsible for reading the file from --plan-out
+	// and validating it locally before shipping.
+	Plan       []byte
+	PrivateKey ed25519.PrivateKey
+}
+
+// ShipPlanResult is the (run, stage, content_hash, idempotent) tuple
+// the backend echoes on 201 / 200. Idempotent=true means a plan
+// with this content_hash already existed for this stage; the backend
+// returned it unchanged and didn't insert a duplicate row.
+type ShipPlanResult struct {
+	ID            string `json:"id"`
+	StageID       string `json:"stage_id"`
+	ContentHash   string `json:"content_hash"`
+	SchemaVersion string `json:"schema_version"`
+	Idempotent    bool   `json:"idempotent"`
+}
+
+// ShipPlan signs the plan bytes and POSTs them to
+// /v0/runs/{run_id}/plan?stage_id=…. Retries transient failures
+// (5xx, network errors). Permanent failures bubble up:
+//
+//   - 400 plan_invalid → ErrPlanInvalid (agent produced a non-schema plan)
+//   - 401 signature_*  → ErrSignatureRejected
+//   - 404 stage/key    → ErrNotFound
+//
+// On 201 the backend created a fresh artifact; on 200 the upload
+// matched an existing one (Result.Idempotent==true).
+func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResult, error) {
+	if len(args.Plan) == 0 {
+		return nil, errors.New("upload: empty plan")
+	}
+	if len(args.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("upload: invalid private key length")
+	}
+
+	digest := sha256.Sum256(args.Plan)
+	signature := ed25519.Sign(args.PrivateKey, digest[:])
+	sigHex := hex.EncodeToString(signature)
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/plan?stage_id=%s",
+		c.BaseURL,
+		url.PathEscape(args.RunID),
+		url.PathEscape(args.StageID),
+	)
+
+	maxRetries := c.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultMaxRetries
+	}
+	backoff := c.Backoff
+	if backoff == 0 {
+		backoff = DefaultBackoff
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(args.Plan))
+		if err != nil {
+			return nil, fmt.Errorf("upload: build plan request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Fishhawk-Signature", sigHex)
+		req.Header.Set("Accept", "application/json")
+		req.ContentLength = int64(len(args.Plan))
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("upload: ship plan: %w", err)
+			continue
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK:
+			var out ShipPlanResult
+			err := json.NewDecoder(resp.Body).Decode(&out)
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("upload: decode plan response: %w", err)
+			}
+			return &out, nil
+		case resp.StatusCode == http.StatusBadRequest:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			// 400s are permanent; the body distinguishes plan_invalid
+			// (schema fail) from validation_failed (path/query issues).
+			if strings.Contains(detail, "plan_invalid") {
+				return nil, fmt.Errorf("%w: %s", ErrPlanInvalid, detail)
+			}
+			return nil, fmt.Errorf("upload: ship plan: 400: %s", detail)
+		case resp.StatusCode == http.StatusUnauthorized:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s", ErrSignatureRejected, detail)
+		case resp.StatusCode == http.StatusNotFound:
+			_ = resp.Body.Close()
+			return nil, ErrNotFound
+		case resp.StatusCode >= 500:
+			lastErr = statusError("ship plan", resp)
+			_ = resp.Body.Close()
+			continue
+		default:
+			lastErr = statusError("ship plan", resp)
+			_ = resp.Body.Close()
+			return nil, lastErr
+		}
+	}
+	return nil, fmt.Errorf("upload: ship plan exhausted retries: %w", lastErr)
 }

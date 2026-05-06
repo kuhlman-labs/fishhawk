@@ -218,6 +218,25 @@ components:
           type: string
           format: date-time
 
+    PlanUploadResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/plan`. `idempotent` is true
+        when the upload matched an existing artifact for the stage and
+        no new row was inserted.
+      required: [id, stage_id, content_hash, schema_version, idempotent]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        content_hash:
+          type: string
+          description: Hex sha256 of the canonical plan bytes.
+        schema_version:
+          type: string
+          example: standard_v1
+        idempotent:
+          type: boolean
+
     Artifact:
       type: object
       required: [id, stage_id, kind, content_hash, created_at]
@@ -1143,6 +1162,73 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v0/runs/{run_id}/plan:
+    post:
+      operationId: shipPlan
+      summary: Upload a standard_v1 plan artifact
+      description: |
+        Called by the runner after a successful plan-stage agent
+        invocation. The body is the agent-produced JSON validated
+        against `docs/spec/plan-standard-v1.schema.json`. Auth is the
+        per-run Ed25519 signature in `X-Fishhawk-Signature` (same
+        scheme as `/v0/runs/{run_id}/trace`).
+
+        Idempotent on (stage_id, content_hash): re-uploading the same
+        plan bytes returns 200 with the existing artifact rather than
+        inserting a duplicate row.
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: X-Fishhawk-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+            description: |
+              Hex-encoded 64-byte Ed25519 signature over
+              sha256(plan_bytes).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Validated against plan-standard-v1.schema.json.
+      responses:
+        '201':
+          description: Plan accepted; new artifact row created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlanUploadResponse' }
+        '200':
+          description: |
+            Plan with this content_hash already exists for the stage.
+            The body returns the existing artifact unchanged (idempotent
+            re-upload).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlanUploadResponse' }
+        '400':
+          description: |
+            Body did not validate against `standard_v1` (`code: plan_invalid`)
+            or path/query parameters were malformed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Signature invalid or no signing key for this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: Plan body exceeds the per-stage size cap (256 KiB).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   # ---------------------------------------------------------------------
   # Webhook ingestion (unversioned; GitHub controls request shape)

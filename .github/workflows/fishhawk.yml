@@ -68,7 +68,13 @@ jobs:
           # GET /v0/stages/{stage-id}/prompt and writes it to a
           # temp file before invoking Claude Code. The signing-key
           # endpoint is one-shot per run, so the runner reuses the
-          # key issued here for the trace upload below.
+          # key issued here for the trace and plan uploads below.
           fetch-prompt: 'true'
           upload-trace: 'true'
           variant: raw
+          # plan-out: matches prompt.PlanArtifactPath in the backend.
+          # When the agent produces a standard_v1 plan at this path,
+          # the runner validates locally and POSTs to /v0/runs/{id}/plan
+          # so the artifact lands in the artifacts table and the UI
+          # can render it for approval. (E5.X / #191.)
+          plan-out: '/tmp/fishhawk-plan.json'
