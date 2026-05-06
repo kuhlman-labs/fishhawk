@@ -6,7 +6,7 @@
 // ANTHROPIC_API_KEY env var on the child. Centralized issuance
 // (Fishhawk-managed ephemeral keys) is a v0.x story, not v0.
 //
-// The adapter spawns `claude --print --output-format stream-json -p
+// The adapter spawns `claude --print --verbose --output-format stream-json -p
 // <prompt>` and reads one JSON event per line from stdout. Each
 // line becomes an agent.Event; if the line carries a `usage` block
 // we update the running token total and enforce the budget. A
@@ -96,7 +96,13 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		},
 	}
 
-	args := []string{"--print", "--output-format", "stream-json", "-p", inv.Prompt}
+	// Claude Code requires --verbose when --print is combined with
+	// --output-format=stream-json (validated by `claude` itself with
+	// "Error: When using --print, --output-format=stream-json requires
+	// --verbose"). --verbose forces emission of intermediate events
+	// alongside the final result, which is exactly what the trace
+	// bundle wants anyway.
+	args := []string{"--print", "--verbose", "--output-format", "stream-json", "-p", inv.Prompt}
 	cmd := cmdFn(ctx, binary, args...)
 	cmd.Dir = inv.WorkingDir
 	// Compose env so a Cmd builder (e.g. tests) can pre-set
