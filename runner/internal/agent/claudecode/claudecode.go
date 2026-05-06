@@ -6,7 +6,8 @@
 // ANTHROPIC_API_KEY env var on the child. Centralized issuance
 // (Fishhawk-managed ephemeral keys) is a v0.x story, not v0.
 //
-// The adapter spawns `claude --print --verbose --output-format stream-json -p
+// The adapter spawns `claude --print --verbose --output-format
+// stream-json --dangerously-skip-permissions --add-dir /tmp -p
 // <prompt>` and reads one JSON event per line from stdout. Each
 // line becomes an agent.Event; if the line carries a `usage` block
 // we update the running token total and enforce the budget. A
@@ -102,7 +103,28 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 	// --verbose"). --verbose forces emission of intermediate events
 	// alongside the final result, which is exactly what the trace
 	// bundle wants anyway.
-	args := []string{"--print", "--verbose", "--output-format", "stream-json", "-p", inv.Prompt}
+	//
+	// --dangerously-skip-permissions: --print is a non-interactive
+	// invocation, so Claude's "may I read / write / run X?" prompts
+	// have no human to answer them and every tool call returns
+	// "permissions not granted". The whole point of running under
+	// the Fishhawk runner is that the audit log captures every tool
+	// call after-the-fact; an interactive permission gate is not an
+	// additional safety boundary in that model. The trace bundle is
+	// the authoritative record.
+	//
+	// --add-dir /tmp: Claude restricts writes to the working
+	// directory tree by default. The runner needs the agent to write
+	// its plan artifact to /tmp/fishhawk-plan.json (matched by
+	// backend/internal/prompt.PlanArtifactPath); /tmp is outside the
+	// customer's repo checkout so we explicitly expand the allowlist.
+	args := []string{
+		"--print", "--verbose",
+		"--output-format", "stream-json",
+		"--dangerously-skip-permissions",
+		"--add-dir", "/tmp",
+		"-p", inv.Prompt,
+	}
 	cmd := cmdFn(ctx, binary, args...)
 	cmd.Dir = inv.WorkingDir
 	// Compose env so a Cmd builder (e.g. tests) can pre-set
