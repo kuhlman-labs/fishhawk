@@ -91,17 +91,14 @@ inputs:
       Threaded through to the runner process for completeness, but
       not directly consumed by the runner's git or PR logic — the
       runner always mints a fresh App installation token at
-      push-time via the backend's installation-token endpoint.
-      That refresh handles the long-running-stage case: App
-      installation tokens have a ~1-hour TTL and an agent run can
-      outlive the token the auth pre-step minted at workflow
-      start. (#201, with the always-fetch refresh added in the
-      same PR.)
+      push-time via the backend installation-token endpoint. That
+      refresh handles the long-running-stage case: App installation
+      tokens have a ~1-hour TTL and an agent run can outlive the
+      token the auth pre-step minted at workflow start. See #201.
 
-      Customers should still pass this value (typically the
-      `${{ steps.fishhawk-auth.outputs.token }}` from the auth
-      pre-step) to `actions/checkout`'s `token:` input in the
-      calling workflow — that's what authenticates the initial
+      Customers should still pass this value (typically the auth
+      pre-step's token output) to actions/checkout's token input in
+      the calling workflow — that's what authenticates the initial
       clone.
     required: false
     default: ''
