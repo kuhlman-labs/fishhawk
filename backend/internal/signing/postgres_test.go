@@ -189,17 +189,32 @@ func TestPostgres_Issue_RejectsZeroTTL(t *testing.T) {
 	}
 }
 
-func TestPostgres_Issue_RejectsRepeated(t *testing.T) {
+func TestPostgres_Issue_AllowsRotation(t *testing.T) {
+	// Per migration 0012 each Issue call inserts a new row so a
+	// later stage's runner process can sign with its own key. The
+	// second key's public half must differ from the first, and Get
+	// returns the latest.
 	pool := startContainer(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
-	if _, err := repo.Issue(context.Background(), runID, signing.DefaultTTL); err != nil {
+	first, err := repo.Issue(context.Background(), runID, signing.DefaultTTL)
+	if err != nil {
 		t.Fatalf("first Issue: %v", err)
 	}
-	_, err := repo.Issue(context.Background(), runID, signing.DefaultTTL)
-	if !errors.Is(err, signing.ErrAlreadyIssued) {
-		t.Errorf("err = %v, want ErrAlreadyIssued", err)
+	second, err := repo.Issue(context.Background(), runID, signing.DefaultTTL)
+	if err != nil {
+		t.Fatalf("second Issue: %v", err)
+	}
+	if string(first.PublicKey) == string(second.PublicKey) {
+		t.Error("rotation should yield a fresh public key, got the same as the first")
+	}
+	got, err := repo.Get(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got.PublicKey) != string(second.PublicKey) {
+		t.Error("Get should return the latest issued key")
 	}
 }
 
@@ -207,14 +222,11 @@ func TestPostgres_Issue_RunNotFound(t *testing.T) {
 	pool := startContainer(t)
 	repo := signing.NewPostgresRepository(pool)
 
-	// Run row does not exist; FK violation should bubble up as
-	// some non-nil error (not specifically ErrAlreadyIssued).
+	// Run row does not exist; FK violation should bubble up as a
+	// non-nil error.
 	_, err := repo.Issue(context.Background(), uuid.New(), signing.DefaultTTL)
 	if err == nil {
 		t.Fatal("Issue against missing run should error")
-	}
-	if errors.Is(err, signing.ErrAlreadyIssued) {
-		t.Errorf("err = %v, should not classify FK violation as already-issued", err)
 	}
 }
 

@@ -47,9 +47,9 @@ func (f *fakeSigningRepo) Issue(_ context.Context, runID uuid.UUID, ttl time.Dur
 	if f.issueErr != nil {
 		return nil, f.issueErr
 	}
-	if _, ok := f.keys[runID]; ok {
-		return nil, signing.ErrAlreadyIssued
-	}
+	// Multi-call per migration 0012: every Issue gets a fresh key;
+	// any prior key for the same run is superseded but Verify still
+	// uses the latest, so the runner doesn't see a 409.
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
@@ -218,20 +218,30 @@ func TestIssueSigningKey_UnknownField(t *testing.T) {
 	}
 }
 
-func TestIssueSigningKey_AlreadyIssued(t *testing.T) {
+func TestIssueSigningKey_RotatesOnSecondCall(t *testing.T) {
+	// Multi-stage runs (per migration 0012) require each stage's
+	// fresh runner process to issue its own key. The second Issue
+	// must succeed and yield a key whose public half differs from
+	// the first; older keys remain in the table for history.
 	repo := newFakeSigningRepo()
 	s := newSigningServer(t, repo)
 	runID := uuid.New()
 
-	if w := issueRequest(t, s, runID, nil); w.Code != http.StatusCreated {
-		t.Fatalf("first issue: status = %d", w.Code)
+	first := issueRequest(t, s, runID, nil)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first issue: status = %d", first.Code)
 	}
-	w := issueRequest(t, s, runID, nil)
-	if w.Code != http.StatusConflict {
-		t.Errorf("second issue: status = %d, want 409", w.Code)
+	var firstResp map[string]string
+	_ = json.NewDecoder(first.Body).Decode(&firstResp)
+
+	second := issueRequest(t, s, runID, nil)
+	if second.Code != http.StatusCreated {
+		t.Errorf("second issue: status = %d, want 201", second.Code)
 	}
-	if !strings.Contains(w.Body.String(), `"signing_key_already_issued"`) {
-		t.Errorf("body missing code: %s", w.Body.String())
+	var secondResp map[string]string
+	_ = json.NewDecoder(second.Body).Decode(&secondResp)
+	if firstResp["public_key"] == secondResp["public_key"] {
+		t.Error("second issue should yield a new public_key, got the same")
 	}
 }
 

@@ -83,6 +83,7 @@ type SigningKey struct {
 	PublicKey []byte             `json:"public_key"`
 	IssuedAt  pgtype.Timestamptz `json:"issued_at"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	ID        uuid.UUID          `json:"id"`
 }
 
 type Stage struct {

@@ -12,18 +12,22 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const getSigningKey = `-- name: GetSigningKey :one
-SELECT run_id, public_key, issued_at, expires_at FROM signing_keys WHERE run_id = $1
+const getLatestSigningKey = `-- name: GetLatestSigningKey :one
+SELECT run_id, public_key, issued_at, expires_at, id FROM signing_keys
+WHERE run_id = $1
+ORDER BY issued_at DESC
+LIMIT 1
 `
 
-func (q *Queries) GetSigningKey(ctx context.Context, runID uuid.UUID) (SigningKey, error) {
-	row := q.db.QueryRow(ctx, getSigningKey, runID)
+func (q *Queries) GetLatestSigningKey(ctx context.Context, runID uuid.UUID) (SigningKey, error) {
+	row := q.db.QueryRow(ctx, getLatestSigningKey, runID)
 	var i SigningKey
 	err := row.Scan(
 		&i.RunID,
 		&i.PublicKey,
 		&i.IssuedAt,
 		&i.ExpiresAt,
+		&i.ID,
 	)
 	return i, err
 }
@@ -32,7 +36,7 @@ const issueSigningKey = `-- name: IssueSigningKey :one
 
 INSERT INTO signing_keys (run_id, public_key, issued_at, expires_at)
 VALUES ($1, $2, $3, $4)
-RETURNING run_id, public_key, issued_at, expires_at
+RETURNING run_id, public_key, issued_at, expires_at, id
 `
 
 type IssueSigningKeyParams struct {
@@ -45,6 +49,12 @@ type IssueSigningKeyParams struct {
 // Signing-key queries consumed by the postgres adapter for the
 // signing.Repository interface (E2.3 / #24). Append-only — no Update
 // or Delete queries; the schema's triggers backstop that.
+//
+// Migration 0012 dropped the (run_id) PRIMARY KEY constraint so
+// multiple keys can exist per run (one per Issue call from a fresh
+// Actions-runner process). GetLatestSigningKey returns the most
+// recently issued key — Verify uses this so the runner doesn't have
+// to track which key signed which payload across stages.
 func (q *Queries) IssueSigningKey(ctx context.Context, arg IssueSigningKeyParams) (SigningKey, error) {
 	row := q.db.QueryRow(ctx, issueSigningKey,
 		arg.RunID,
@@ -58,6 +68,42 @@ func (q *Queries) IssueSigningKey(ctx context.Context, arg IssueSigningKeyParams
 		&i.PublicKey,
 		&i.IssuedAt,
 		&i.ExpiresAt,
+		&i.ID,
 	)
 	return i, err
+}
+
+const listSigningKeysForRun = `-- name: ListSigningKeysForRun :many
+SELECT run_id, public_key, issued_at, expires_at, id FROM signing_keys
+WHERE run_id = $1
+ORDER BY issued_at ASC
+`
+
+// Used by the standalone verifier to walk every key that was
+// active during a run's lifetime, since a single run may have
+// shipped traces signed by different keys at different stages.
+func (q *Queries) ListSigningKeysForRun(ctx context.Context, runID uuid.UUID) ([]SigningKey, error) {
+	rows, err := q.db.Query(ctx, listSigningKeysForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SigningKey
+	for rows.Next() {
+		var i SigningKey
+		if err := rows.Scan(
+			&i.RunID,
+			&i.PublicKey,
+			&i.IssuedAt,
+			&i.ExpiresAt,
+			&i.ID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

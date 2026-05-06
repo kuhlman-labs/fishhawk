@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,6 +40,13 @@ func NewPostgresRepositoryWithClock(pool *pgxpool.Pool, now func() time.Time) Re
 	return &postgresRepo{pool: pool, now: now}
 }
 
+// Issue mints a new signing key for the run. Multi-call:
+// each invocation appends a new row (per migration 0012), so each
+// stage's GitHub Actions runner can issue its own private key
+// without coordinating with prior stages. Verify always uses the
+// latest unexpired key; older rows remain in the table so the
+// standalone verifier can replay any signature that was valid at
+// upload time.
 func (r *postgresRepo) Issue(ctx context.Context, runID uuid.UUID, ttl time.Duration) (*IssuedKey, error) {
 	if ttl <= 0 {
 		return nil, fmt.Errorf("signing: ttl must be positive")
@@ -61,11 +67,6 @@ func (r *postgresRepo) Issue(ctx context.Context, runID uuid.UUID, ttl time.Dura
 		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
 	})
 	if err != nil {
-		// Primary key conflict surfaces as a Postgres unique-
-		// violation. Map to ErrAlreadyIssued for callers.
-		if isUniqueViolation(err) {
-			return nil, ErrAlreadyIssued
-		}
 		return nil, fmt.Errorf("signing: issue: %w", err)
 	}
 	return &IssuedKey{
@@ -77,9 +78,14 @@ func (r *postgresRepo) Issue(ctx context.Context, runID uuid.UUID, ttl time.Dura
 	}, nil
 }
 
+// Get returns the latest signing key issued for the run. Used by
+// Verify; external callers (e.g. the standalone verifier) that
+// need the full history should use a different query — Get is
+// intentionally narrow because every uploader path wants the
+// "current" key.
 func (r *postgresRepo) Get(ctx context.Context, runID uuid.UUID) (*Key, error) {
 	q := signingdb.New(r.pool)
-	row, err := q.GetSigningKey(ctx, runID)
+	row, err := q.GetLatestSigningKey(ctx, runID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -103,20 +109,6 @@ func (r *postgresRepo) Verify(ctx context.Context, runID uuid.UUID, message, sig
 		return ErrExpired
 	}
 	return VerifyWith(key.PublicKey, message, signature)
-}
-
-// isUniqueViolation reports whether err is a Postgres
-// "unique_violation" (SQLSTATE 23505), which fires when Issue is
-// called twice for the same run_id (the table's PRIMARY KEY
-// constraint).
-func isUniqueViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	// pgx wraps SQLSTATE codes in *pgconn.PgError. Avoiding the
-	// import keeps the dependency surface tight; string-match is
-	// fine for the small set of codes we care about.
-	return strings.Contains(err.Error(), "SQLSTATE 23505")
 }
 
 // Compile-time check that postgresRepo implements Repository.
