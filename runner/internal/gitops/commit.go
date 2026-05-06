@@ -16,6 +16,7 @@ package gitops
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
@@ -160,11 +161,28 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 	headSHA = strings.TrimSpace(headSHA)
 
-	pushURL, err := tokenizedPushURL(args.RemoteURL, args.Token)
+	// actions/checkout sets a global `http.https://github.com/.extraheader`
+	// pointing at the workflow's GITHUB_TOKEN. That header wins over
+	// any URL-embedded credential on the push (any `Authorization`
+	// header on the request supersedes basic-auth via x-access-token
+	// in the URL). We replace the extraheader for THIS push only via
+	// `-c`, so the customer's other workflow steps still see the
+	// actions/checkout config they expect.
+	pushAuthHeader, headerHost, err := pushExtraHeader(args.RemoteURL, args.Token)
 	if err != nil {
-		return nil, fmt.Errorf("gitops: tokenize remote URL: %w", err)
+		return nil, fmt.Errorf("gitops: build push auth header: %w", err)
 	}
-	if err := p.run(ctx, args.RepoDir, "push", pushURL, fmt.Sprintf("HEAD:%s", args.Branch)); err != nil {
+	pushArgs := []string{}
+	if pushAuthHeader != "" {
+		// `-c http.<host>.extraheader=<header>` is per-invocation.
+		pushArgs = append(pushArgs,
+			"-c", "http."+headerHost+".extraheader="+pushAuthHeader,
+		)
+	}
+	pushArgs = append(pushArgs,
+		"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch),
+	)
+	if err := p.run(ctx, args.RepoDir, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
 	}
 
@@ -174,23 +192,29 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}, nil
 }
 
-// tokenizedPushURL rewrites an HTTPS GitHub URL to embed the token
-// for basic auth. The `x-access-token` username is GitHub's public
-// convention for App / Actions tokens.
+// pushExtraHeader returns the `AUTHORIZATION: basic <base64>` value
+// suitable for `git -c http.<host>.extraheader=…` to authenticate
+// the push, plus the `<host>` (scheme://host[:port]) it scopes to.
+// Mirrors actions/checkout's auth model exactly so we override its
+// existing extraheader cleanly rather than racing it.
 //
-// Inputs that aren't HTTPS URLs (SSH remotes, local paths) round-
-// trip unchanged — we only authenticate HTTPS pushes; the customer's
-// SSH config is their concern.
-func tokenizedPushURL(remoteURL, token string) (string, error) {
+// Empty header + empty host → caller skips the `-c` and pushes
+// unauthenticated. We return (empty, empty) for non-HTTPS remotes
+// (SSH, local file paths) since those use their own auth model.
+func pushExtraHeader(remoteURL, token string) (header, host string, err error) {
 	if !strings.HasPrefix(remoteURL, "https://") {
-		return remoteURL, nil
+		return "", "", nil
 	}
 	u, err := url.Parse(remoteURL)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	u.User = url.UserPassword("x-access-token", token)
-	return u.String(), nil
+	// `<scheme>://<host>` — git config keys are scoped at the host
+	// level, e.g. `http.https://github.com/.extraheader`.
+	host = u.Scheme + "://" + u.Host + "/"
+	encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	header = "AUTHORIZATION: basic " + encoded
+	return header, host, nil
 }
 
 // run invokes git with cwd=dir, returning a wrapped error including

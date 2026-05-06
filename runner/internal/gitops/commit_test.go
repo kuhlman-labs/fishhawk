@@ -13,8 +13,8 @@ import (
 // runReal initializes a git repo on disk and exercises CommitAndPush
 // end-to-end, with origin pointed at a bare local repo so push
 // actually completes. Production code targets HTTPS origin URLs;
-// the tokenizedPushURL branch that handles that is unit-tested
-// separately below.
+// the pushExtraHeader branch that handles auth for HTTPS remotes is
+// unit-tested separately below.
 func TestCommitAndPush_RealRepo_HappyPath(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -148,41 +148,58 @@ func TestCommitAndPush_RejectsBadInputs(t *testing.T) {
 	}
 }
 
-func TestTokenizedPushURL(t *testing.T) {
+func TestPushExtraHeader(t *testing.T) {
+	// "AUTHORIZATION: basic " + base64("x-access-token:secret")
+	const wantAuth = "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0"
+
 	cases := []struct {
-		name string
-		in   string
-		want string
+		name       string
+		in         string
+		wantHeader string
+		wantHost   string
 	}{
 		{
-			name: "github https rewrite",
-			in:   "https://github.com/owner/repo",
-			want: "https://x-access-token:secret@github.com/owner/repo",
+			name:       "github https",
+			in:         "https://github.com/owner/repo",
+			wantHeader: wantAuth,
+			wantHost:   "https://github.com/",
 		},
 		{
-			name: "trailing .git preserved",
-			in:   "https://github.com/owner/repo.git",
-			want: "https://x-access-token:secret@github.com/owner/repo.git",
+			name:       "trailing .git preserved",
+			in:         "https://github.com/owner/repo.git",
+			wantHeader: wantAuth,
+			wantHost:   "https://github.com/",
 		},
 		{
-			name: "ssh remote untouched",
-			in:   "git@github.com:owner/repo.git",
-			want: "git@github.com:owner/repo.git",
+			name:       "GHES host",
+			in:         "https://ghe.example.com/owner/repo",
+			wantHeader: wantAuth,
+			wantHost:   "https://ghe.example.com/",
 		},
 		{
-			name: "local path untouched",
-			in:   "/tmp/origin.git",
-			want: "/tmp/origin.git",
+			name:       "ssh remote skips auth",
+			in:         "git@github.com:owner/repo.git",
+			wantHeader: "",
+			wantHost:   "",
+		},
+		{
+			name:       "local path skips auth",
+			in:         "/tmp/origin.git",
+			wantHeader: "",
+			wantHost:   "",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := tokenizedPushURL(tc.in, "secret")
+			gotHeader, gotHost, err := pushExtraHeader(tc.in, "secret")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
+			if gotHeader != tc.wantHeader {
+				t.Errorf("header = %q, want %q", gotHeader, tc.wantHeader)
+			}
+			if gotHost != tc.wantHost {
+				t.Errorf("host = %q, want %q", gotHost, tc.wantHost)
 			}
 		})
 	}
@@ -201,3 +218,98 @@ func mustGit(t *testing.T, dir string, args ...string) {
 // Make sure `errors` is used so a refactor that drops the import
 // stays caught by go vet/imports tooling.
 var _ = errors.New
+
+// TestCommitAndPush_PushPassesExtraHeader replays the production
+// command path through a fake exec so we can assert the push goes
+// out with `-c http.<host>.extraheader=…`. This is the regression
+// guard for the issue where actions/checkout's extraheader was
+// winning over our URL-embedded credential and the runner was
+// pushing as github-actions[bot] instead of the App.
+func TestCommitAndPush_PushPassesExtraHeader(t *testing.T) {
+	// Use a fake exec hook so we capture every `git ...` invocation
+	// and can synthesize a succeeding HEAD-rev / status / etc.
+	// without touching disk.
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "init")
+	mustGit(t, repo, "init", "--bare", bare)
+
+	// Capture every command's args without changing behavior.
+	var captured [][]string
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			capturedArgs := append([]string{name}, args...)
+			captured = append(captured, capturedArgs)
+			return exec.CommandContext(ctx, name, args...)
+		},
+	}
+
+	// Modify the working tree so there's something to commit + push.
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	httpsRemote := "https://github.com/owner/repo"
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/test",
+		CommitMessage: "test",
+		Token:         "ghs_xyz",
+		RemoteURL:     httpsRemote, // not actually pushed; bare-repo test above covers real push
+	})
+	// We expect an error from the push (network call to github.com
+	// from a unit test would actually try to authenticate), but the
+	// args MUST have included our extraheader.
+	if err == nil {
+		t.Logf("CommitAndPush succeeded unexpectedly (no network?): captured=%v", captured)
+	}
+
+	// Find the push invocation.
+	var pushCmd []string
+	for _, c := range captured {
+		// `git -c ... push ...` — find the one with "push" in it.
+		for _, a := range c {
+			if a == "push" {
+				pushCmd = c
+				break
+			}
+		}
+	}
+	if pushCmd == nil {
+		t.Fatalf("push command not captured among %d invocations", len(captured))
+	}
+
+	// Expect: git -c http.https://github.com/.extraheader=AUTHORIZATION: basic <b64> push https://github.com/owner/repo HEAD:fishhawk/test
+	wantHeaderPrefix := "http.https://github.com/.extraheader=AUTHORIZATION: basic "
+	gotHeaderArg := false
+	for i, a := range pushCmd {
+		if a == "-c" && i+1 < len(pushCmd) && strings.HasPrefix(pushCmd[i+1], wantHeaderPrefix) {
+			gotHeaderArg = true
+			break
+		}
+	}
+	if !gotHeaderArg {
+		t.Errorf("push args did not include `-c %s…`: %v", wantHeaderPrefix, pushCmd)
+	}
+	// Remote URL must NOT have credentials embedded in it (we moved
+	// off the x-access-token-in-URL approach).
+	for _, a := range pushCmd {
+		if strings.Contains(a, "x-access-token:") {
+			t.Errorf("push command leaked credentials in URL: %q", a)
+		}
+	}
+}
