@@ -96,6 +96,21 @@ runs:
         go-version: '1.25'
         cache: false
 
+    # Claude Code is an npm-distributed CLI. Hosted Actions runners
+    # don't ship with it, and the runner adapter (claudecode.go)
+    # invokes the `claude` binary by name. Install it before the Go
+    # entrypoint runs. v0 pulls latest; pinning is a v1+ concern.
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    - name: Install Claude Code CLI
+      shell: bash
+      run: |
+        npm install -g @anthropic-ai/claude-code
+        claude --version
+
     - name: Run fishhawk-runner
       shell: bash
       working-directory: ${{ github.action_path }}

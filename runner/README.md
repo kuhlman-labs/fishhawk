@@ -49,6 +49,8 @@ E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation har
 
 The Claude Code API key is supplied via the `ANTHROPIC_API_KEY` environment variable, which customers populate from their GitHub Secrets. v0.x will replace this with a Fishhawk-issued ephemeral key (MVP_SPEC §5.3).
 
+The composite action installs Claude Code (`@anthropic-ai/claude-code` from npm) on every run via Node 22. Hosted Actions runners don't ship with it, and the runner adapter invokes the `claude` binary by name. Cold-cache install adds ~15s; pinning a version is deferred (v1+).
+
 ## Build and test
 
 From the repo root (workspace-aware):
