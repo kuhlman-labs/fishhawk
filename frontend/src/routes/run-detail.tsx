@@ -1,4 +1,5 @@
 import { Link, useParams } from 'react-router';
+import { ChevronRight } from 'lucide-react';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import { describeFailure } from '@/api/types';
@@ -71,29 +72,34 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
           {stages.map((stage) => (
             <li
               key={stage.id}
-              className="flex items-center gap-4 border-b border-neutral-200 px-4 py-3 last:border-b-0 hover:bg-neutral-50 dark:border-neutral-800 dark:hover:bg-neutral-900/50"
+              className="border-b border-neutral-200 last:border-b-0 dark:border-neutral-800"
             >
-              <span className="font-mono text-xs text-neutral-500">#{stage.sequence}</span>
               <Link
                 to={`/runs/${run.id}/stages/${stage.id}`}
-                className="font-mono text-sm font-medium hover:underline"
+                aria-label={`Review ${stage.type} stage`}
+                className="flex items-center gap-4 px-4 py-3 hover:bg-neutral-50 focus-visible:bg-neutral-50 focus-visible:ring-1 focus-visible:ring-neutral-400 focus-visible:outline-none dark:hover:bg-neutral-900/50 dark:focus-visible:bg-neutral-900/50"
               >
-                {stage.type}
+                <span className="font-mono text-xs text-neutral-500">#{stage.sequence}</span>
+                <span className="font-mono text-sm font-medium">{stage.type}</span>
+                <span className="font-mono text-xs text-neutral-500">
+                  {stage.executor.kind}:{stage.executor.ref}
+                </span>
+                <span className="ml-auto flex items-center gap-2 font-mono text-xs">
+                  {stage.state === 'failed' && stage.failure_category && (
+                    <span
+                      className="rounded bg-rose-100 px-1.5 py-0.5 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300"
+                      title={describeFailure(stage.failure_category) ?? undefined}
+                    >
+                      {stage.failure_category}
+                    </span>
+                  )}
+                  {stage.state === 'awaiting_approval' && (
+                    <span className="text-amber-700 dark:text-amber-300">Review →</span>
+                  )}
+                  <StageStateBadge state={stage.state} />
+                </span>
+                <ChevronRight className="size-4 text-neutral-400" aria-hidden />
               </Link>
-              <span className="font-mono text-xs text-neutral-500">
-                {stage.executor.kind}:{stage.executor.ref}
-              </span>
-              <span className="ml-auto flex items-center gap-2 font-mono text-xs">
-                {stage.state === 'failed' && stage.failure_category && (
-                  <span
-                    className="rounded bg-rose-100 px-1.5 py-0.5 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300"
-                    title={describeFailure(stage.failure_category) ?? undefined}
-                  >
-                    {stage.failure_category}
-                  </span>
-                )}
-                <StageStateBadge state={stage.state} />
-              </span>
             </li>
           ))}
         </ol>
