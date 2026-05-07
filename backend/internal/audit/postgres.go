@@ -263,6 +263,22 @@ func (r *postgresRepo) ListGlobal(ctx context.Context) ([]*Entry, error) {
 	return out, nil
 }
 
+func (r *postgresRepo) ListAll(ctx context.Context, p ListAllParams) ([]*Entry, error) {
+	q := auditdb.New(r.pool)
+	rows, err := q.ListAuditEntriesAll(ctx, auditdb.ListAuditEntriesAllParams{
+		Category: p.Category,
+		RunID:    p.RunID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list audit entries: %w", err)
+	}
+	out := make([]*Entry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToEntry(row))
+	}
+	return out, nil
+}
+
 func rowToEntry(r auditdb.AuditEntry) *Entry {
 	out := &Entry{
 		ID:           r.ID,

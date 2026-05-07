@@ -32,6 +32,10 @@ func (f *fakeAuditRepo) ListGlobal(ctx context.Context) ([]*audit.Entry, error) 
 	return nil, nil
 }
 
+func (f *fakeAuditRepo) ListAll(ctx context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
+	return nil, nil
+}
+
 func (f *fakeAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	f.called++
 	f.captured = p

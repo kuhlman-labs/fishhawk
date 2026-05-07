@@ -497,10 +497,11 @@ func TestGetArtifact_RepoError(t *testing.T) {
 
 // auditReadFake is the read-side audit.Repository fake.
 type auditReadFake struct {
-	mu      sync.Mutex
-	all     []*audit.Entry
-	byCat   map[string][]*audit.Entry
-	listErr error
+	mu        sync.Mutex
+	all       []*audit.Entry
+	byCat     map[string][]*audit.Entry
+	listErr   error
+	listAllFn func(audit.ListAllParams) ([]*audit.Entry, error)
 }
 
 func newAuditReadFake() *auditReadFake {
@@ -518,6 +519,17 @@ func (a *auditReadFake) AppendGlobalChained(context.Context, audit.GlobalChainAp
 }
 func (a *auditReadFake) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
+}
+func (a *auditReadFake) ListAll(_ context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.listAllFn != nil {
+		return a.listAllFn(p)
+	}
+	if a.listErr != nil {
+		return nil, a.listErr
+	}
+	return a.all, nil
 }
 func (a *auditReadFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
@@ -775,5 +787,198 @@ func TestParseLimit(t *testing.T) {
 		if !c.wantErr && got != c.want {
 			t.Errorf("parseLimit(%q) = %d, want %d", c.raw, got, c.want)
 		}
+	}
+}
+
+// makeGlobalAuditEntries returns n entries split across the per-run
+// chain (RunID set) and the global chain (RunID nil) so ListAll
+// tests can verify both partitions show up.
+func makeGlobalAuditEntries(n int) []*audit.Entry {
+	rid := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	out := make([]*audit.Entry, n)
+	for i := range out {
+		var runID *uuid.UUID
+		var stageID *uuid.UUID
+		category := "trace_uploaded"
+		if i%2 == 1 {
+			// Odd entries are global-chain (token issuance, etc.).
+			category = "installation_token_issued"
+		} else {
+			runID = &rid
+			sid := uuid.New()
+			stageID = &sid
+		}
+		out[i] = &audit.Entry{
+			ID:        uuid.New(),
+			Sequence:  int64(i + 1),
+			RunID:     runID,
+			StageID:   stageID,
+			Timestamp: time.Date(2026, 5, 2, 12, 0, n-i, 0, time.UTC),
+			Category:  category,
+			Payload:   json.RawMessage(`{}`),
+			EntryHash: fmt.Sprintf("hash-%d", i),
+		}
+	}
+	return out
+}
+
+func TestListGlobalAudit_HappyPath_MixesBothChains(t *testing.T) {
+	a := newAuditReadFake()
+	a.all = makeGlobalAuditEntries(4)
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items      []auditEntryResponse `json:"items"`
+		NextCursor string               `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 4 {
+		t.Fatalf("items = %d, want 4 (both chains in one feed)", len(got.Items))
+	}
+	hasRun, hasGlobal := false, false
+	for _, e := range got.Items {
+		if e.RunID != nil {
+			hasRun = true
+		} else {
+			hasGlobal = true
+		}
+	}
+	if !hasRun || !hasGlobal {
+		t.Errorf("ListAll feed missed a chain: run=%v global=%v", hasRun, hasGlobal)
+	}
+}
+
+func TestListGlobalAudit_NilRepo_503(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when AuditRepo nil", w.Code)
+	}
+}
+
+func TestListGlobalAudit_BadLimit_400(t *testing.T) {
+	a := newAuditReadFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit?limit=999999", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestListGlobalAudit_BadCursor_400(t *testing.T) {
+	a := newAuditReadFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit?cursor=garbage", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestListGlobalAudit_BadRunID_400(t *testing.T) {
+	a := newAuditReadFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit?run_id=not-a-uuid", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestListGlobalAudit_RunIDFilter_PassesThrough(t *testing.T) {
+	// The handler shouldn't itself filter; it should hand the
+	// run_id to the repo via ListAllParams. Capture the params
+	// to verify the wire-up.
+	a := newAuditReadFake()
+	var captured audit.ListAllParams
+	a.listAllFn = func(p audit.ListAllParams) ([]*audit.Entry, error) {
+		captured = p
+		return nil, nil
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	rid := uuid.New()
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/audit?run_id=%s&category=plan_generated", rid), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if captured.RunID == nil || *captured.RunID != rid {
+		t.Errorf("RunID = %v, want %v", captured.RunID, rid)
+	}
+	if captured.Category == nil || *captured.Category != "plan_generated" {
+		t.Errorf("Category = %v, want plan_generated", captured.Category)
+	}
+}
+
+func TestListGlobalAudit_RepoError_500(t *testing.T) {
+	a := newAuditReadFake()
+	a.listErr = errors.New("db down")
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+func TestListGlobalAudit_PaginationCursor(t *testing.T) {
+	a := newAuditReadFake()
+	a.all = makeGlobalAuditEntries(5)
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit?limit=2", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	var page1 struct {
+		Items      []auditEntryResponse `json:"items"`
+		NextCursor string               `json:"next_cursor"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &page1)
+	if len(page1.Items) != 2 || page1.NextCursor == "" {
+		t.Fatalf("page1: items=%d cursor=%q", len(page1.Items), page1.NextCursor)
+	}
+
+	req = httptest.NewRequest(http.MethodGet,
+		"/v0/audit?limit=2&cursor="+page1.NextCursor, nil)
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	var page2 struct {
+		Items      []auditEntryResponse `json:"items"`
+		NextCursor string               `json:"next_cursor"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &page2)
+	if len(page2.Items) != 2 || page2.NextCursor == "" {
+		t.Fatalf("page2: items=%d cursor=%q", len(page2.Items), page2.NextCursor)
+	}
+	// Last page: 1 entry, no cursor.
+	req = httptest.NewRequest(http.MethodGet,
+		"/v0/audit?limit=2&cursor="+page2.NextCursor, nil)
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	var page3 struct {
+		Items      []auditEntryResponse `json:"items"`
+		NextCursor string               `json:"next_cursor"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &page3)
+	if len(page3.Items) != 1 || page3.NextCursor != "" {
+		t.Errorf("page3: items=%d cursor=%q (want 1, empty)", len(page3.Items), page3.NextCursor)
 	}
 }

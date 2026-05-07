@@ -467,3 +467,126 @@ func TestPostgres_ListGlobal_ReturnsOnlyGlobalEntries(t *testing.T) {
 		}
 	}
 }
+
+func TestPostgres_ListAll_MixesBothChainsTimeDesc(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	// Append in mixed order; ListAll's contract is ts DESC, not
+	// insert order.
+	earlier := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	later := time.Date(2026, 5, 2, 12, 30, 0, 0, time.UTC)
+
+	if _, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: earlier,
+		Category:  "api_token_issued",
+		Payload:   json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: later,
+		Category:  "trace_uploaded",
+		Payload:   json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.ListAll(context.Background(), audit.ListAllParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListAll returned %d entries, want 2 (mix of chains)", len(got))
+	}
+	if !got[0].Timestamp.After(got[1].Timestamp) && !got[0].Timestamp.Equal(got[1].Timestamp) {
+		t.Errorf("ListAll order: %v then %v; want time-descending",
+			got[0].Timestamp, got[1].Timestamp)
+	}
+	if got[0].RunID == nil {
+		t.Errorf("ListAll[0] RunID = nil, want the per-run entry (later ts) on top")
+	}
+	if got[1].RunID != nil {
+		t.Errorf("ListAll[1] RunID = %v, want the global entry (earlier ts) on bottom", got[1].RunID)
+	}
+}
+
+func TestPostgres_ListAll_FiltersByCategory(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	// Two distinct categories on the run chain.
+	if _, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "trace_uploaded",
+		Payload:   json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "approval_granted",
+		Payload:   json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cat := "approval_granted"
+	got, err := repo.ListAll(context.Background(), audit.ListAllParams{Category: &cat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListAll(category=approval_granted) returned %d, want 1", len(got))
+	}
+	if got[0].Category != "approval_granted" {
+		t.Errorf("filter leaked: got category %q", got[0].Category)
+	}
+}
+
+func TestPostgres_ListAll_FiltersByRunID(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+	runIDA := makeRun(t, pool)
+	runIDB := makeRun(t, pool)
+
+	if _, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runIDA,
+		Timestamp: time.Now().UTC(),
+		Category:  "trace_uploaded",
+		Payload:   json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runIDB,
+		Timestamp: time.Now().UTC(),
+		Category:  "trace_uploaded",
+		Payload:   json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "api_token_issued",
+		Payload:   json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.ListAll(context.Background(), audit.ListAllParams{RunID: &runIDA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListAll(run_id=A) returned %d, want 1 (other run + global filtered out)", len(got))
+	}
+	if got[0].RunID == nil || *got[0].RunID != runIDA {
+		t.Errorf("filter leaked: got RunID %v", got[0].RunID)
+	}
+}

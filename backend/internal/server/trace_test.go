@@ -151,6 +151,9 @@ func (a *auditFake) AppendGlobalChained(_ context.Context, _ audit.GlobalChainAp
 func (a *auditFake) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("auditFake: ListGlobal not used")
 }
+func (a *auditFake) ListAll(_ context.Context, _ audit.ListAllParams) ([]*audit.Entry, error) {
+	return nil, errors.New("auditFake: ListAll not used")
+}
 func (a *auditFake) Get(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("auditFake: Get not used")
 }

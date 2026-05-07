@@ -1,6 +1,6 @@
 import { api } from '@/api/client';
 import { usePaginated } from '@/api/use-paginated';
-import type { AuditEntry } from '@/api/types';
+import { AuditEntryRow } from '@/components/audit-entry-row';
 import { Pagination } from '@/components/pagination';
 
 const AUDIT_PAGE_SIZE = 50;
@@ -44,7 +44,7 @@ export function RunAuditList({ runId }: { runId: string }) {
     <div className="space-y-3">
       <ol className="overflow-hidden rounded-md border border-neutral-200 dark:border-neutral-800">
         {entries.map((entry) => (
-          <AuditRow key={entry.id} entry={entry} />
+          <AuditEntryRow key={entry.id} entry={entry} />
         ))}
       </ol>
       {(hasPrev || hasNext) && (
@@ -57,24 +57,5 @@ export function RunAuditList({ runId }: { runId: string }) {
         />
       )}
     </div>
-  );
-}
-
-function AuditRow({ entry }: { entry: AuditEntry }) {
-  return (
-    <li className="grid grid-cols-[3rem_8rem_8rem_1fr_8rem] items-center gap-3 border-b border-neutral-200 px-3 py-2 font-mono text-xs last:border-b-0 dark:border-neutral-800">
-      <span className="text-neutral-500">#{entry.sequence}</span>
-      <span className="truncate">{entry.category}</span>
-      <span className="truncate text-neutral-500">
-        {entry.actor_kind ?? '—'}
-        {entry.actor_subject ? ` · ${entry.actor_subject}` : ''}
-      </span>
-      <span className="truncate text-neutral-600 dark:text-neutral-400">
-        {new Date(entry.ts).toLocaleString()}
-      </span>
-      <span className="truncate text-neutral-400" title={entry.entry_hash}>
-        {entry.entry_hash.slice(0, 12)}…
-      </span>
-    </li>
   );
 }

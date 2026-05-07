@@ -139,4 +139,25 @@ export const api = {
     const qs = q.toString();
     return request(`/v0/runs/${encodeURIComponent(runId)}/audit${qs ? `?${qs}` : ''}`);
   },
+
+  /**
+   * Cross-chain audit search (#211). Returns per-run rows AND
+   * global-chain rows in one time-descending feed; pagination and
+   * filter envelope mirror listRunAudit so the same usePaginated
+   * hook drives either page.
+   */
+  listGlobalAudit(params?: {
+    limit?: number;
+    cursor?: string;
+    category?: string;
+    runId?: string;
+  }): Promise<PaginatedList<AuditEntry>> {
+    const q = new URLSearchParams();
+    if (params?.limit) q.set('limit', String(params.limit));
+    if (params?.cursor) q.set('cursor', params.cursor);
+    if (params?.category) q.set('category', params.category);
+    if (params?.runId) q.set('run_id', params.runId);
+    const qs = q.toString();
+    return request(`/v0/audit${qs ? `?${qs}` : ''}`);
+  },
 };

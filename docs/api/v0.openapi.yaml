@@ -884,6 +884,48 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v0/audit:
+    get:
+      operationId: listGlobalAudit
+      summary: Search the cross-chain audit log
+      description: |
+        Cross-chain feed for the audit-log search surface (#211): returns
+        per-run rows AND global-chain rows (token issuance, OAuth sign-in,
+        etc.) merged into one **time-descending** page. Same cursor +
+        limit envelope as `/v0/runs/{run_id}/audit`. Optional `category`
+        and `run_id` filters; combine for "show me approvals on this run."
+
+        Distinct from `/v0/runs/{run_id}/audit` (sequence-ascending,
+        scoped to one run, used by the run-detail audit list and the
+        per-run verifier path). The global-chain partition specifically
+        is the verifier's input — not exposed over HTTP for now.
+      tags: [audit]
+      parameters:
+        - { name: category, in: query, schema: { type: string } }
+        - { name: run_id, in: query, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Page of audit entries, time-descending across both chains.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/AuditEntry' }
+        '400':
+          description: |
+            `validation_failed` — `limit` out of range or `run_id` not a UUID;
+            `cursor_invalid` — opaque cursor failed to decode.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: Audit repository not configured on this instance.
+
   # ---------------------------------------------------------------------
   # Stages, artifacts, approvals
   # ---------------------------------------------------------------------
