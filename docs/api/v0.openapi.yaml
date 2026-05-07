@@ -211,12 +211,58 @@ components:
             D: approval timeout.
         failure_reason:
           type: [string, "null"]
+        gate:
+          oneOf:
+            - type: "null"
+            - $ref: '#/components/schemas/StageGate'
+          description: |
+            The persisted shape of the stage's workflow-spec gate.
+            Null/omitted when the stage has no gate. Per migration
+            0014 / #213 — the review-stage UI reads this to render
+            blocking_checks and decide whether to surface the
+            approval panel.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    StageGate:
+      type: object
+      description: |
+        Workflow-spec gate snapshot stored on the stage row. Mirrors
+        spec.Gate but flattened — `type` distinguishes approval-vs-
+        check, blocking_checks lists the named checks the gate
+        depends on, approvers is set only for approval gates.
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [approval, check]
+        blocking_checks:
+          type: array
+          items: { type: string }
+          description: |
+            Named checks (e.g. `ci_pass`, `fishhawk_audit_complete`)
+            that must pass before the gate clears. v0 doesn't yet
+            persist per-stage check states; the review UI renders
+            the names with a "not tracked yet" placeholder until a
+            follow-up issue lands ingestion.
+        approvers:
+          oneOf:
+            - type: "null"
+            - type: object
+              description: |
+                Roles whose members can satisfy the gate. Exactly
+                one of any_of / all_of is set when populated.
+              properties:
+                any_of:
+                  type: array
+                  items: { type: string }
+                all_of:
+                  type: array
+                  items: { type: string }
 
     PullRequestArtifactBody:
       type: object

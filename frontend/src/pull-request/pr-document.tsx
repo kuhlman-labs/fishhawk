@@ -1,10 +1,11 @@
-import { ArrowUpRight, FileClock, GitBranch } from 'lucide-react';
+import { ArrowUpRight, FileClock } from 'lucide-react';
 import { Link } from 'react-router';
 import type { PullRequestArtifactBody } from '@/api/pull-request';
 import type { Stage } from '@/api/types';
 import { Section } from '@/plan/sections';
 import { ApprovalPanel } from '@/plan/approval-panel';
 import { StageStateBadge } from '@/components/stage-state-badge';
+import { PullRequestSummary } from './pr-summary';
 
 /*
  * Implement-stage detail (#205): renders the `pull_request` artifact
@@ -29,10 +30,6 @@ interface Props {
   runId: string;
   onStageUpdate: (next: Stage) => void;
   onStageRollback: (prev: Stage) => void;
-}
-
-function shortSha(sha: string): string {
-  return sha.length > 7 ? sha.slice(0, 7) : sha;
 }
 
 export function PullRequestDocument({
@@ -83,35 +80,7 @@ export function PullRequestDocument({
         )}
       </header>
 
-      <Section id="pull-request" title="Pull request">
-        <div className="space-y-3 rounded-md border border-neutral-200 p-4 dark:border-neutral-800">
-          <div className="flex items-center gap-2">
-            <GitBranch className="size-4 text-neutral-500" aria-hidden />
-            <span className="font-mono text-sm">{artifact.branch}</span>
-          </div>
-          <dl className="grid grid-cols-[8rem_1fr] gap-y-1 text-sm">
-            <dt className="text-neutral-500">Head</dt>
-            <dd className="font-mono text-xs" title={artifact.head_sha}>
-              {shortSha(artifact.head_sha)}
-            </dd>
-            <dt className="text-neutral-500">Base</dt>
-            <dd className="font-mono text-xs" title={artifact.base_sha}>
-              {shortSha(artifact.base_sha)}
-            </dd>
-            <dt className="text-neutral-500">Files changed</dt>
-            <dd className="font-mono text-sm">{artifact.files_changed_count}</dd>
-          </dl>
-          <a
-            href={artifact.pr_url}
-            rel="noopener noreferrer"
-            target="_blank"
-            className="inline-flex items-center gap-1 text-sm font-medium text-blue-700 hover:underline dark:text-blue-300"
-          >
-            View on GitHub
-            <ArrowUpRight className="size-3.5" aria-hidden />
-          </a>
-        </div>
-      </Section>
+      <PullRequestSummary artifact={artifact} />
 
       {artifact.body && artifact.body.trim() !== '' && (
         <Section id="body" title="Description">

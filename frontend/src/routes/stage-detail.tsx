@@ -8,12 +8,14 @@ import type { Artifact, Stage } from '@/api/types';
 import { FailureBanner } from '@/components/failure-banner';
 import { PlanDocument } from '@/plan/plan-document';
 import { PullRequestDocument } from '@/pull-request/pr-document';
+import { ReviewDocument } from '@/review/review-document';
 
 /*
  * Stage detail. Dispatches on stage.type:
  *   - plan      → PlanDocument fed the most-recent standard_v1 plan artifact
  *   - implement → PullRequestDocument fed the most-recent pull_request artifact (#205)
- *   - other     → placeholder (review and later stage types land in their own issues)
+ *   - review    → ReviewDocument fed the implement stage's pull_request artifact (#213)
+ *   - other     → placeholder
  *
  * Stage state lives in component state so the approval panel can
  * apply optimistic updates and roll them back on failure (E7.4).
@@ -115,7 +117,16 @@ function StageDetailView({
           </p>
         ))}
 
-      {stage.type !== 'plan' && stage.type !== 'implement' && (
+      {stage.type === 'review' && (
+        <ReviewArtifact
+          stage={stage}
+          runId={runId}
+          onStageUpdate={setStage}
+          onStageRollback={setStage}
+        />
+      )}
+
+      {stage.type !== 'plan' && stage.type !== 'implement' && stage.type !== 'review' && (
         <article className="space-y-2">
           <h1 className="font-mono text-lg font-semibold tracking-tight">Stage · {stage.type}</h1>
           <p className="text-sm text-neutral-500">
@@ -218,6 +229,136 @@ function PullRequestArtifact({
 
   return (
     <PullRequestDocument
+      artifact={content as PullRequestArtifactBody}
+      stage={stage}
+      runId={runId}
+      onStageUpdate={onStageUpdate}
+      onStageRollback={onStageRollback}
+    />
+  );
+}
+
+interface ReviewArtifactProps {
+  stage: Stage;
+  runId: string;
+  onStageUpdate: (next: Stage) => void;
+  onStageRollback: (prev: Stage) => void;
+}
+
+/*
+ * Loader for the review-stage page (#213). The review stage's
+ * "input" is the pull_request artifact emitted by the upstream
+ * implement stage — review doesn't produce its own artifact. The
+ * loader chains: list this run's stages → pick the implement stage
+ * → list its artifacts → fetch the pull_request one. Handed off to
+ * ReviewDocument when found; surfaces a clear empty/error state
+ * otherwise.
+ *
+ * It's a few round-trips, but the page renders once per
+ * navigation; no need for batched loaders or caching at v0 scale.
+ */
+function ReviewArtifact({ stage, runId, onStageUpdate, onStageRollback }: ReviewArtifactProps) {
+  const stages = useAsync(() => api.listRunStages(runId), [runId]);
+
+  const implementStage =
+    stages.status === 'ok' ? stages.data.items.find((s) => s.type === 'implement') : null;
+  const implementId = implementStage?.id ?? null;
+
+  // Two-phase fetch: only request artifacts once we know the
+  // implement stage id. useAsync eagerly fires on every dep change;
+  // a null id short-circuits to a synthetic empty list so the hook
+  // stays stable across renders.
+  const artifacts = useAsync(
+    () =>
+      implementId
+        ? api.listStageArtifacts(implementId)
+        : Promise.resolve({ items: [] as Artifact[] }),
+    [implementId],
+  );
+
+  if (stages.status === 'loading') {
+    return <div className="text-sm text-neutral-500">Loading run stages…</div>;
+  }
+  if (stages.status === 'error') {
+    return <ErrorBox label="run stages" error={stages.error} />;
+  }
+  if (!implementStage) {
+    return (
+      <p className="text-sm text-neutral-500">
+        No implement stage found on this run; review surface depends on its pull-request artifact.
+      </p>
+    );
+  }
+
+  if (artifacts.status === 'loading') {
+    return <div className="text-sm text-neutral-500">Loading pull request…</div>;
+  }
+  if (artifacts.status === 'error') {
+    return <ErrorBox label="implement-stage artifacts" error={artifacts.error} />;
+  }
+
+  const prArtifact = artifacts.data.items
+    .filter((a) => a.kind === 'pull_request')
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+
+  if (!prArtifact) {
+    return (
+      <p className="text-sm text-neutral-500">
+        Implement stage has no pull-request artifact yet — review surface unlocks once it ships.
+      </p>
+    );
+  }
+
+  return (
+    <ReviewArtifactContent
+      artifactId={prArtifact.id}
+      stage={stage}
+      runId={runId}
+      onStageUpdate={onStageUpdate}
+      onStageRollback={onStageRollback}
+    />
+  );
+}
+
+function ReviewArtifactContent({
+  artifactId,
+  stage,
+  runId,
+  onStageUpdate,
+  onStageRollback,
+}: {
+  artifactId: string;
+  stage: Stage;
+  runId: string;
+  onStageUpdate: (next: Stage) => void;
+  onStageRollback: (prev: Stage) => void;
+}) {
+  const result = useAsync(() => api.getArtifact<unknown>(artifactId), [artifactId]);
+
+  if (result.status === 'loading') {
+    return <div className="text-sm text-neutral-500">Loading pull request…</div>;
+  }
+  if (result.status === 'error') {
+    return <ErrorBox label="pull-request artifact" error={result.error} />;
+  }
+
+  const content = result.data.content;
+  if (!isPullRequestArtifact(content)) {
+    return (
+      <div
+        role="alert"
+        className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
+      >
+        <div className="font-medium">Unrecognized pull-request artifact shape.</div>
+        <div className="mt-1 font-mono text-xs">
+          schema_version={result.data.schema_version ?? 'null'} · kind={result.data.kind}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <ReviewDocument
       artifact={content as PullRequestArtifactBody}
       stage={stage}
       runId={runId}

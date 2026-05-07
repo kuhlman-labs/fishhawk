@@ -476,6 +476,12 @@ func (d *Dispatcher) createStages(ctx context.Context, runID uuid.UUID, defs []s
 		// post-upload transition (#207). Plan + review have one;
 		// implement does not.
 		params.RequiresApproval = hasApprovalGate(def.Gates)
+		// Persist the primary gate's full shape so the review-stage
+		// UI (and future check-state ingestion) can read
+		// blocking_checks + approvers without re-parsing the spec
+		// (#213). Primary = first approval gate, else first check
+		// gate, else nil.
+		params.Gate = primaryGate(def.Gates)
 		stage, err := d.Runs.CreateStage(ctx, params)
 		if err != nil {
 			return nil, fmt.Errorf("create stage %d (%s): %w", i, def.ID, err)
@@ -508,6 +514,48 @@ func hasApprovalGate(gates []spec.Gate) bool {
 		}
 	}
 	return false
+}
+
+// primaryGate picks the gate to persist on the stages row (#213).
+// Approval gates win over check gates so the review-stage UI can
+// always reach the approvers when they're declared. Returns nil for
+// stages with no gate.
+func primaryGate(gates []spec.Gate) *run.Gate {
+	if len(gates) == 0 {
+		return nil
+	}
+	g := pickPrimaryGate(gates)
+	if g == nil {
+		return nil
+	}
+	out := &run.Gate{
+		Kind:           run.GateKind(g.Type),
+		BlockingChecks: g.BlockingChecks,
+	}
+	if g.Approvers != nil {
+		out.Approvers = &run.GateApprovers{
+			AnyOf: g.Approvers.AnyOf,
+			AllOf: g.Approvers.AllOf,
+		}
+	}
+	return out
+}
+
+// pickPrimaryGate is the inner choice — first approval gate if any,
+// else first check gate. Split out from primaryGate so the policy
+// is unit-testable without a run.Gate round-trip.
+func pickPrimaryGate(gates []spec.Gate) *spec.Gate {
+	for i := range gates {
+		if gates[i].Type == spec.GateTypeApproval {
+			return &gates[i]
+		}
+	}
+	for i := range gates {
+		if gates[i].Type == spec.GateTypeCheck {
+			return &gates[i]
+		}
+	}
+	return nil
 }
 
 // mapExecutor projects a spec.Executor onto the run-package

@@ -31,6 +31,7 @@ type stageResponse struct {
 	EndedAt         *time.Time    `json:"ended_at"`
 	FailureCategory *string       `json:"failure_category"`
 	FailureReason   *string       `json:"failure_reason"`
+	Gate            *stageGate    `json:"gate,omitempty"`
 	CreatedAt       time.Time     `json:"created_at"`
 	UpdatedAt       time.Time     `json:"updated_at"`
 }
@@ -40,13 +41,27 @@ type stageExecutor struct {
 	Ref  string `json:"ref"`
 }
 
+// stageGate mirrors the workflow-spec gate's persisted shape so
+// review-stage UI can render blocking_checks + approvers. Persisted
+// per migration 0014 (#213). Omitted when the stage has no gate.
+type stageGate struct {
+	Type           string              `json:"type"`
+	BlockingChecks []string            `json:"blocking_checks,omitempty"`
+	Approvers      *stageGateApprovers `json:"approvers,omitempty"`
+}
+
+type stageGateApprovers struct {
+	AnyOf []string `json:"any_of,omitempty"`
+	AllOf []string `json:"all_of,omitempty"`
+}
+
 func toStageResponse(s *run.Stage) stageResponse {
 	var failureCategory *string
 	if s.FailureCategory != nil {
 		v := string(*s.FailureCategory)
 		failureCategory = &v
 	}
-	return stageResponse{
+	resp := stageResponse{
 		ID:              s.ID,
 		RunID:           s.RunID,
 		Sequence:        s.Sequence,
@@ -60,6 +75,20 @@ func toStageResponse(s *run.Stage) stageResponse {
 		CreatedAt:       s.CreatedAt,
 		UpdatedAt:       s.UpdatedAt,
 	}
+	if s.Gate != nil {
+		gate := &stageGate{
+			Type:           string(s.Gate.Kind),
+			BlockingChecks: s.Gate.BlockingChecks,
+		}
+		if s.Gate.Approvers != nil {
+			gate.Approvers = &stageGateApprovers{
+				AnyOf: s.Gate.Approvers.AnyOf,
+				AllOf: s.Gate.Approvers.AllOf,
+			}
+		}
+		resp.Gate = gate
+	}
+	return resp
 }
 
 // handleListRunStages implements GET /v0/runs/{run_id}/stages.

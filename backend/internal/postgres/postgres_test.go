@@ -202,21 +202,31 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0013 added a
-	// stages.requires_approval column. Down drops it. Confirm: the
-	// column is gone, but every prior migration's effect is still
-	// present (signing_keys.id from 0012, runs.idempotency_key
-	// from 0011, users + sessions from 0010, audit run_id
-	// nullability from 0009, etc.).
-	var requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0014 added gate_type +
+	// gate_blocking_checks + gate_approvers columns to stages
+	// (#213). Down drops them. Confirm: those columns are gone, but
+	// every prior migration's effect is still present
+	// (stages.requires_approval from 0013, signing_keys.id from 0012,
+	// runs.idempotency_key from 0011, users + sessions from 0010,
+	// audit run_id nullability from 0009, etc.).
+	var gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'stages' AND column_name = 'gate_type'`,
+	).Scan(&gateTypeCol); err != nil {
+		t.Fatalf("query stages.gate_type column: %v", err)
+	}
+	if gateTypeCol != 0 {
+		t.Errorf("stages.gate_type count after MigrateDown = %d, want 0 (0014 rolled back)", gateTypeCol)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'stages' AND column_name = 'requires_approval'`,
 	).Scan(&requiresApprovalCol); err != nil {
 		t.Fatalf("query stages.requires_approval column: %v", err)
 	}
-	if requiresApprovalCol != 0 {
-		t.Errorf("stages.requires_approval count after MigrateDown = %d, want 0 (0013 rolled back)", requiresApprovalCol)
+	if requiresApprovalCol != 1 {
+		t.Errorf("stages.requires_approval count after MigrateDown = %d, want 1 (0013 still applied)", requiresApprovalCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns

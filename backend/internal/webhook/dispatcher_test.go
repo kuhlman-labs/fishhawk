@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // --- MatchEvent table tests ---
@@ -253,6 +254,7 @@ func (s *stubRuns) CreateStage(_ context.Context, p run.CreateStageParams) (*run
 		State:            run.StageStatePending,
 		GateSLA:          p.GateSLA,
 		RequiresApproval: p.RequiresApproval,
+		Gate:             p.Gate,
 		CreatedAt:        time.Now().UTC(),
 		UpdatedAt:        time.Now().UTC(),
 	}
@@ -987,5 +989,114 @@ workflows:
 			t.Errorf("stage %d (%s) RequiresApproval = %v, want %v",
 				i, w.stageType, got.RequiresApproval, w.requiresApproval)
 		}
+	}
+}
+
+func TestHandle_PersistsGateShapePerStage(t *testing.T) {
+	// Per #213: the dispatcher writes the *primary* gate's shape
+	// (type + blocking_checks + approvers) onto each stages row so
+	// the review-stage UI can render it without re-parsing the spec.
+	// Primary = first approval gate, else first check gate, else
+	// nil. v0 stages don't usually have multiple gates, but the
+	// review-stage gate is the canonical case where blocking_checks
+	// matter.
+	const spec = `version: "0.1"
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: review gate carries blocking_checks
+    stages:
+      - id: plan
+        type: plan
+        executor: { agent: claude-code }
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers: { any_of: [founder] }
+      - id: implement
+        type: implement
+        executor: { agent: claude-code }
+        produces:
+          - artifact: pull_request
+      - id: review
+        type: review
+        executor: { human: true }
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers: { any_of: [founder] }
+            blocking_checks:
+              - ci_pass
+              - fishhawk_audit_complete
+`
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.specContent = []byte(spec)
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.createdStages) != 3 {
+		t.Fatalf("createdStages = %d, want 3", len(runs.createdStages))
+	}
+
+	plan, implement, review := runs.createdStages[0], runs.createdStages[1], runs.createdStages[2]
+
+	if plan.Gate == nil || plan.Gate.Kind != run.GateKindApproval {
+		t.Errorf("plan.Gate = %+v, want approval gate", plan.Gate)
+	}
+	if plan.Gate != nil && plan.Gate.Approvers == nil {
+		t.Errorf("plan.Gate.Approvers = nil, want any_of:[founder]")
+	}
+	if plan.Gate != nil && len(plan.Gate.BlockingChecks) != 0 {
+		t.Errorf("plan.Gate.BlockingChecks = %v, want empty (none in spec)", plan.Gate.BlockingChecks)
+	}
+
+	// implement stage has no gates: Gate must be nil.
+	if implement.Gate != nil {
+		t.Errorf("implement.Gate = %+v, want nil (no gates in spec)", implement.Gate)
+	}
+
+	// review stage carries the blocking_checks the UI needs to render.
+	if review.Gate == nil {
+		t.Fatal("review.Gate = nil, want approval gate with blocking_checks")
+	}
+	if review.Gate.Kind != run.GateKindApproval {
+		t.Errorf("review.Gate.Kind = %q, want approval", review.Gate.Kind)
+	}
+	if got := review.Gate.BlockingChecks; len(got) != 2 || got[0] != "ci_pass" || got[1] != "fishhawk_audit_complete" {
+		t.Errorf("review.Gate.BlockingChecks = %v, want [ci_pass, fishhawk_audit_complete]", got)
+	}
+	if review.Gate.Approvers == nil || len(review.Gate.Approvers.AnyOf) != 1 || review.Gate.Approvers.AnyOf[0] != "founder" {
+		t.Errorf("review.Gate.Approvers = %+v, want any_of:[founder]", review.Gate.Approvers)
+	}
+}
+
+func TestPickPrimaryGate(t *testing.T) {
+	// Approval wins over check, in any order, even if the check
+	// gate appears first in the spec — the review-stage UI's
+	// approval-vs-check decision depends on the right pick.
+	checkGate := spec.Gate{Type: spec.GateTypeCheck, BlockingChecks: []string{"ci_pass"}}
+	approvalGate := spec.Gate{Type: spec.GateTypeApproval, Approvers: &spec.Approvers{AnyOf: []string{"founder"}}}
+
+	if got := pickPrimaryGate([]spec.Gate{checkGate, approvalGate}); got == nil || got.Type != spec.GateTypeApproval {
+		t.Errorf("approval-after-check: got %+v, want approval", got)
+	}
+	if got := pickPrimaryGate([]spec.Gate{approvalGate, checkGate}); got == nil || got.Type != spec.GateTypeApproval {
+		t.Errorf("approval-before-check: got %+v, want approval", got)
+	}
+	if got := pickPrimaryGate([]spec.Gate{checkGate}); got == nil || got.Type != spec.GateTypeCheck {
+		t.Errorf("check-only: got %+v, want check", got)
+	}
+	if got := pickPrimaryGate(nil); got != nil {
+		t.Errorf("empty gates: got %+v, want nil", got)
 	}
 }
