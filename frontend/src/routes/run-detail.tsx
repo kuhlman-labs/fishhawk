@@ -2,19 +2,9 @@ import { Link, useParams } from 'react-router';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import { describeFailure } from '@/api/types';
-import type { Run, Stage, StageState } from '@/api/types';
-import { cn } from '@/lib/cn';
+import type { Run, Stage } from '@/api/types';
+import { StageStateBadge } from '@/components/stage-state-badge';
 import { RunAuditList } from './audit-list';
-
-const stageStateStyles: Record<StageState, string> = {
-  pending: 'text-neutral-500',
-  dispatched: 'text-blue-700 dark:text-blue-300',
-  running: 'text-blue-700 dark:text-blue-300',
-  awaiting_approval: 'text-amber-700 dark:text-amber-300',
-  succeeded: 'text-emerald-700 dark:text-emerald-300',
-  failed: 'text-rose-700 dark:text-rose-300',
-  cancelled: 'text-neutral-500',
-};
 
 export function RunDetail() {
   const { runId } = useParams<{ runId: string }>();
@@ -102,7 +92,7 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
                     {stage.failure_category}
                   </span>
                 )}
-                <span className={cn(stageStateStyles[stage.state])}>{stage.state}</span>
+                <StageStateBadge state={stage.state} />
               </span>
             </li>
           ))}
