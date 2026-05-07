@@ -43,9 +43,8 @@ E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation har
 | `plan-out` | no | Path the agent writes its plan artifact to. When set, the runner validates the file against `standard_v1` after a successful agent invocation; a malformed plan demotes the run to category-B failure. With `upload-trace=true` the runner also POSTs the plan to `/v0/runs/{run_id}/plan` so the backend creates an `artifacts` row visible in the UI's plan review surface. Hardcoded to `/tmp/fishhawk-plan.json` in `.github/workflows/fishhawk.yml` to match the path the backend's plan-stage prompt instructs the agent to write to. |
 | `constraints-file` | no | Path to a JSON file with the stage's constraints (`forbidden_paths`, `allowed_paths`, `max_files_changed`, `required_outcomes`, `ci_green`). |
 | `check-base-ref` | no | Git ref to diff against for constraint evaluation. Constraints run only when both `constraints-file` and `check-base-ref` are set. |
-| `upload-trace` | no | After the agent succeeds, issue a signing key from `backend-url` and POST the bundle to `/v0/runs/{run_id}/trace`. |
+| `upload-trace` | no | After the agent succeeds, issue a signing key from `backend-url` and POST the bundle to `/v0/runs/{run_id}/trace`. The runner ships **both** variants per stage: `raw` (compliance-gated) and `redacted` (default-readable; produced by `redaction.RedactDefault`). |
 | `stage-id` | no | Stage UUID for trace upload (distinct from `stage` which is the workflow-spec stage name). Required with `upload-trace`. |
-| `variant` | no | Trace bundle variant: `raw` or `redacted`. Defaults to `raw`. |
 
 The Claude Code API key is supplied via the `ANTHROPIC_API_KEY` environment variable, which customers populate from their GitHub Secrets. v0.x will replace this with a Fishhawk-issued ephemeral key (MVP_SPEC §5.3).
 

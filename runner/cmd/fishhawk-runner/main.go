@@ -204,44 +204,80 @@ func run(args []string, logSink io.Writer) int {
 	}
 
 	// Bundle building is shared by --bundle-out and --upload-trace.
-	// We build once into memory, then write to disk and/or upload.
-	// When neither is configured, fall back to stdout JSONL so
-	// callers exercising --prompt-file alone can still inspect.
+	// We build raw + redacted variants once into memory, then write
+	// to disk and/or upload. When neither is configured, fall back
+	// to stdout JSONL so callers exercising --prompt-file alone can
+	// still inspect.
+	//
+	// Both variants ship per stage (E2.4): the raw bundle stays
+	// gated by S3 Object Lock for compliance; the redacted bundle
+	// is what default-readable surfaces (the SPA transcript view
+	// from #218) read. Identical event order, identical manifest
+	// timestamps — the only difference is `redaction.RedactDefault`
+	// applied to each event's payload + the manifest's
+	// agent_failure_reason.
 	//
 	// Category-A is the only failure class the runner stamps in the
 	// bundle manifest (E8.5): agent process failure. B is decided by
 	// the backend's authoritative re-evaluation; C originates inside
 	// the upload itself (no bundle to stamp); D never reaches the
 	// runner.
-	var bundleBytes []byte
+	var rawBundle, redactedBundle []byte
 	if cfg.bundleOut != "" || cfg.uploadTrace {
 		agentFailed := res.FailureCategory == "A"
 		agentFailureReason := ""
 		if agentFailed {
 			agentFailureReason = res.FailureReason
 		}
-		bytesData, _, err := bundle.PackBytes(bundle.PackInputs{
+
+		manifestRaw := bundle.PackInputs{
 			RunID:              cfg.runID,
 			StageID:            bundleStageID(cfg),
 			Agent:              "claude-code",
 			AgentFailed:        agentFailed,
 			AgentFailureReason: agentFailureReason,
-		}, res.Events)
+		}
+		bytesData, _, err := bundle.PackBytes(manifestRaw, res.Events)
 		if err != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"bundle_pack","detail":%q}`+"\n", err.Error())
 			logCompletion(logSink, res, invokeErr)
 			return exitFailure
 		}
-		bundleBytes = bytesData
+		rawBundle = bytesData
+
+		// Redact at the source-event level so the redacted bundle's
+		// trailer hash stays consistent with its events — pack
+		// produces the trailer from whatever bytes it sees, so any
+		// post-pack rewrite would invalidate it.
+		redactedEvents, eventHits := redactEvents(res.Events)
+		redactedReason, reasonHits := redactString(agentFailureReason)
+		hits := mergeHits(eventHits, reasonHits)
+		if len(hits) > 0 {
+			hitsJSON, _ := json.Marshal(hits)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"trace_redacted","run_id":%q,"stage_id":%q,"hits":%s}`+"\n",
+				cfg.runID, cfg.stageID, hitsJSON)
+		}
+		manifestRedacted := manifestRaw
+		manifestRedacted.AgentFailureReason = redactedReason
+		redBytes, _, err := bundle.PackBytes(manifestRedacted, redactedEvents)
+		if err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"bundle_pack_redacted","detail":%q}`+"\n", err.Error())
+			logCompletion(logSink, res, invokeErr)
+			return exitFailure
+		}
+		redactedBundle = redBytes
 	}
 
 	if cfg.bundleOut != "" {
-		// 0o600 — bundle may carry redacted credentials in raw events
-		// until E2.4 redaction is wired upstream of the bundler. The
-		// runner's filesystem is ephemeral, but defense in depth is
-		// cheap.
-		if err := os.WriteFile(cfg.bundleOut, bundleBytes, 0o600); err != nil {
+		// Write the redacted variant to --bundle-out: that's what
+		// the dev/inspection flow wants by default. 0o600 because
+		// even the redacted bundle can leak the *shape* of secrets
+		// (event timing, lengths) and the runner's filesystem is
+		// ephemeral but defense in depth is cheap.
+		if err := os.WriteFile(cfg.bundleOut, redactedBundle, 0o600); err != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"bundle_write","detail":%q}`+"\n", err.Error())
 			logCompletion(logSink, res, invokeErr)
@@ -274,20 +310,31 @@ func run(args []string, logSink io.Writer) int {
 			issuedKey = key
 		}
 
-		if err := uploadTrace(cfg, bundleBytes, logSink, client, issuedKey); err != nil {
-			// Upload failures are MVP_SPEC §6 category-C (infra).
-			// We DON'T overwrite an earlier A/B failure category;
-			// only stamp C when the agent itself succeeded.
-			if res.OK {
-				res.OK = false
-				res.FailureCategory = "C"
-				res.FailureReason = err.Error()
-				invokeErr = err
+		// Ship raw first so the audit log records the unredacted
+		// bundle's content_hash before the redacted one — the
+		// raw row is the source of truth for compliance, and
+		// downstream consumers that want the redacted variant can
+		// follow the second audit entry.
+		for _, v := range []traceVariant{
+			{name: "raw", bytes: rawBundle},
+			{name: "redacted", bytes: redactedBundle},
+		} {
+			if err := uploadTrace(cfg, v.name, v.bytes, logSink, client, issuedKey); err != nil {
+				// Upload failures are MVP_SPEC §6 category-C (infra).
+				// We DON'T overwrite an earlier A/B failure category;
+				// only stamp C when the agent itself succeeded.
+				if res.OK {
+					res.OK = false
+					res.FailureCategory = "C"
+					res.FailureReason = err.Error()
+					invokeErr = err
+				}
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"trace_upload","variant":%q,"detail":%q}`+"\n",
+					v.name, err.Error())
+				logCompletion(logSink, res, invokeErr)
+				return exitFailure
 			}
-			_, _ = fmt.Fprintf(logSink,
-				`{"event":"runner_failed","reason":"trace_upload","detail":%q}`+"\n", err.Error())
-			logCompletion(logSink, res, invokeErr)
-			return exitFailure
 		}
 
 		// Plan upload follows trace upload so they share the signing
@@ -339,7 +386,7 @@ func run(args []string, logSink io.Writer) int {
 		}
 	}
 
-	if bundleBytes == nil {
+	if rawBundle == nil {
 		emitEvents(os.Stdout, res.Events)
 	}
 
@@ -372,7 +419,14 @@ func bundleStageID(cfg config) string {
 // Returns nil on accepted, non-nil on any failure (key issuance,
 // signing, network, signature rejection). The caller translates
 // the error into the right category-C audit narrative.
-func uploadTrace(cfg config, bundleBytes []byte, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
+// traceVariant pairs a variant name with the bundle bytes produced
+// for that variant. Used to drive the per-variant ShipTrace loop.
+type traceVariant struct {
+	name  string
+	bytes []byte
+}
+
+func uploadTrace(cfg config, variant string, bundleBytes []byte, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
 	if cfg.stageID == "" {
 		return errors.New("upload: --stage-id required with --upload-trace")
 	}
@@ -392,12 +446,12 @@ func uploadTrace(cfg config, bundleBytes []byte, logSink io.Writer, client uploa
 	res, err := client.ShipTrace(ctx, upload.ShipArgs{
 		RunID:      cfg.runID,
 		StageID:    cfg.stageID,
-		Variant:    cfg.variant,
+		Variant:    variant,
 		Bundle:     bundleBytes,
 		PrivateKey: issued.PrivateKey,
 	})
 	if err != nil {
-		return fmt.Errorf("ship trace: %w", err)
+		return fmt.Errorf("ship trace (%s): %w", variant, err)
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"trace_uploaded","run_id":%q,"stage_id":%q,"variant":%q,"content_hash":%q}`+"\n",

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/redaction"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/redaction"
 )
 
 // findHit returns the count for a named pattern in hits, or 0 if the
