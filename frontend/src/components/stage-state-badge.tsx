@@ -17,13 +17,7 @@ const stageStateStyles: Record<StageState, string> = {
   cancelled: 'text-neutral-500',
 };
 
-export function StageStateBadge({
-  state,
-  className,
-}: {
-  state: StageState;
-  className?: string;
-}) {
+export function StageStateBadge({ state, className }: { state: StageState; className?: string }) {
   return (
     <span className={cn('font-mono text-xs', stageStateStyles[state], className)}>{state}</span>
   );
