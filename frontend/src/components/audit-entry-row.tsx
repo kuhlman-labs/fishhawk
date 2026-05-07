@@ -24,12 +24,12 @@ export function AuditEntryRow({ entry, showRun = false }: Props) {
     <li
       className={
         showRun
-          ? 'grid grid-cols-[3rem_8rem_8rem_1fr_8rem_6rem] items-center gap-3 border-b border-neutral-200 px-3 py-2 font-mono text-xs last:border-b-0 dark:border-neutral-800'
-          : 'grid grid-cols-[3rem_8rem_8rem_1fr_8rem] items-center gap-3 border-b border-neutral-200 px-3 py-2 font-mono text-xs last:border-b-0 dark:border-neutral-800'
+          ? 'grid grid-cols-[3rem_13rem_8rem_1fr_8rem_6rem] items-center gap-3 border-b border-neutral-200 px-3 py-2 font-mono text-xs last:border-b-0 dark:border-neutral-800'
+          : 'grid grid-cols-[3rem_13rem_8rem_1fr_8rem] items-center gap-3 border-b border-neutral-200 px-3 py-2 font-mono text-xs last:border-b-0 dark:border-neutral-800'
       }
     >
       <span className="text-neutral-500">#{entry.sequence}</span>
-      <span className="truncate">{entry.category}</span>
+      <span title={entry.category}>{entry.category}</span>
       <span className="truncate text-neutral-500">
         {entry.actor_kind ?? '—'}
         {entry.actor_subject ? ` · ${entry.actor_subject}` : ''}
