@@ -70,10 +70,6 @@ inputs:
     description: 'Stage UUID for trace upload (distinct from stage which is the workflow-spec stage name). Required with upload-trace.'
     required: false
     default: ''
-  variant:
-    description: 'Trace bundle variant for upload: raw or redacted.'
-    required: false
-    default: 'raw'
   constraints-file:
     description: 'Path to a JSON file describing the stage constraints (forbidden_paths, allowed_paths, max_files_changed, required_outcomes).'
     required: false
@@ -148,5 +144,4 @@ runs:
           --check-base-ref "${{ inputs.check-base-ref }}" \
           $(if [ "${{ inputs.upload-trace }}" = "true" ]; then echo --upload-trace; fi) \
           $(if [ "${{ inputs.fetch-prompt }}" = "true" ]; then echo --fetch-prompt; fi) \
-          --stage-id "${{ inputs.stage-id }}" \
-          --variant "${{ inputs.variant }}"
+          --stage-id "${{ inputs.stage-id }}"

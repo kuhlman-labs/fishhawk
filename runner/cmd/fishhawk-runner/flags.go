@@ -33,7 +33,6 @@ type config struct {
 	checkBaseRef    string
 	uploadTrace     bool
 	stageID         string
-	variant         string
 	fetchPrompt     bool
 }
 
@@ -75,8 +74,6 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"after the agent succeeds, issue a signing key from --backend-url and POST the bundle to /v0/runs/{run_id}/trace")
 	fs.StringVar(&cfg.stageID, "stage-id", "",
 		"stage UUID for trace upload (distinct from --stage which is the workflow-spec stage name); required with --upload-trace")
-	fs.StringVar(&cfg.variant, "variant", "raw",
-		"bundle variant for trace upload: raw or redacted")
 	fs.BoolVar(&cfg.fetchPrompt, "fetch-prompt", false,
 		"fetch the constructed prompt from --backend-url's /v0/stages/{stage-id}/prompt before invoking the agent; --prompt-file wins when both are set, useful for local replay")
 

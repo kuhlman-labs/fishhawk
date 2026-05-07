@@ -134,7 +134,6 @@ jobs:
           # key issued here for the trace and plan uploads below.
           fetch-prompt: 'true'
           upload-trace: 'true'
-          variant: raw
           # plan-out: matches prompt.PlanArtifactPath in the backend.
           # When the agent produces a standard_v1 plan at this path,
           # the runner validates locally and POSTs to /v0/runs/{id}/plan

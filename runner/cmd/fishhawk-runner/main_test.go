@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -26,6 +27,18 @@ import (
 // the runner is the producer; the canonical verifier path lives in
 // /verifier (and it intentionally re-implements bundle parsing
 // rather than importing this code, per ADR-008's no-trust model).
+// gunzip is a small test helper for inspecting a runner-produced
+// bundle. The runner's wire format is gzipped JSONL; redaction
+// assertions need to look at the decompressed text.
+func gunzip(b []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = r.Close() }()
+	return io.ReadAll(r)
+}
+
 func openBundleForTest(data []byte) (bundle.ManifestData, []bundle.Line, bundle.TrailerData, error) {
 	return bundle.Open(bytes.NewReader(data))
 }
@@ -68,9 +81,16 @@ type fakeUploader struct {
 	instTokenErr error
 
 	// Recorded calls.
-	gotIssueRunID    string
-	gotIssueCount    int
-	gotShipArgs      *upload.ShipArgs
+	gotIssueRunID string
+	gotIssueCount int
+	// gotShipArgs points at the first ShipTrace call so existing
+	// tests that assert on it without caring about variant keep
+	// working — for runs that ship both raw + redacted (the v0
+	// default after E2.4) the first call is the raw upload.
+	gotShipArgs *upload.ShipArgs
+	// gotShipCalls captures every ShipTrace call in order so tests
+	// can assert that both variants ship per stage.
+	gotShipCalls     []upload.ShipArgs
 	gotPromptArgs    *upload.FetchPromptArgs
 	gotPlanArgs      *upload.ShipPlanArgs
 	gotPRArgs        *upload.ShipPullRequestArgs
@@ -133,7 +153,12 @@ func (f *fakeUploader) FetchPrompt(_ context.Context, args upload.FetchPromptArg
 
 func (f *fakeUploader) ShipTrace(_ context.Context, args upload.ShipArgs) (*upload.ShipResult, error) {
 	a := args
-	f.gotShipArgs = &a
+	f.gotShipCalls = append(f.gotShipCalls, a)
+	if f.gotShipArgs == nil {
+		// Hold onto the first call so legacy tests stay happy; the
+		// gotShipCalls slice is the canonical record of every call.
+		f.gotShipArgs = &a
+	}
 	if f.shipErr != nil {
 		return nil, f.shipErr
 	}
@@ -825,7 +850,6 @@ func TestRun_UploadTrace_HappyPath(t *testing.T) {
 		"--prompt-file", promptPath,
 		"--upload-trace",
 		"--stage-id", stageID,
-		"--variant", "raw",
 	}, &stderr)
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
@@ -847,6 +871,105 @@ func TestRun_UploadTrace_HappyPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"trace_uploaded"`) {
 		t.Errorf("missing trace_uploaded log: %s", stderr.String())
+	}
+	// Per E2.4: every stage ships *both* variants. Raw first
+	// (compliance-preferred audit ordering), redacted second (the
+	// SPA transcript reads this).
+	if len(fu.gotShipCalls) != 2 {
+		t.Fatalf("ShipTrace calls = %d, want 2 (raw + redacted)", len(fu.gotShipCalls))
+	}
+	if fu.gotShipCalls[0].Variant != "raw" {
+		t.Errorf("first call variant = %q, want raw", fu.gotShipCalls[0].Variant)
+	}
+	if fu.gotShipCalls[1].Variant != "redacted" {
+		t.Errorf("second call variant = %q, want redacted", fu.gotShipCalls[1].Variant)
+	}
+	if len(fu.gotShipCalls[1].Bundle) == 0 {
+		t.Error("redacted bundle empty")
+	}
+}
+
+func TestRun_UploadTrace_RedactsSecrets(t *testing.T) {
+	// Plant a known credential in an event payload; the redacted
+	// variant must not contain it after re-pack. This is the
+	// regression guard for E2.4 — the redacted bundle is the SPA
+	// transcript's only input, so leakage here ends up readable
+	// behind cookie auth.
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// ghp_… is in DefaultPatterns; using a 36-char alphanumeric
+	// suffix matches the regex exactly. The token bytes are
+	// deliberate — anything that wouldn't match the pattern would
+	// pass through and the test would assert against itself.
+	secret := "ghp_" + strings.Repeat("a", 36)
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{
+			OK: true,
+			Events: []agent.Event{
+				{Kind: "raw", Payload: json.RawMessage(`{"text":"saw ` + secret + ` in stderr"}`)},
+			},
+		},
+	})
+	fu := newFakeUploader(t)
+	withFakeUploader(t, fu)
+
+	stageID := "22222222-3333-4444-5555-666666666666"
+	runID := "11111111-2222-3333-4444-555555555555"
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID, "--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--prompt-file", promptPath,
+		"--upload-trace",
+		"--stage-id", stageID,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d:\n%s", got, stderr.String())
+	}
+	if len(fu.gotShipCalls) != 2 {
+		t.Fatalf("ShipTrace calls = %d, want 2", len(fu.gotShipCalls))
+	}
+
+	rawHasSecret := bytes.Contains(fu.gotShipCalls[0].Bundle, []byte(secret))
+	redactedHasSecret := bytes.Contains(fu.gotShipCalls[1].Bundle, []byte(secret))
+	if !rawHasSecret {
+		// If the secret didn't make it into raw either, the test
+		// is broken — likely the bundle's gzipped and we'd need to
+		// decompress to find it. Decompress to be robust.
+		raw, err := gunzip(fu.gotShipCalls[0].Bundle)
+		if err != nil {
+			t.Fatalf("raw bundle gunzip: %v", err)
+		}
+		if !bytes.Contains(raw, []byte(secret)) {
+			t.Fatalf("secret not in raw bundle either; test broken")
+		}
+		// Compare against decompressed bytes for redacted too.
+		redacted, err := gunzip(fu.gotShipCalls[1].Bundle)
+		if err != nil {
+			t.Fatalf("redacted bundle gunzip: %v", err)
+		}
+		if bytes.Contains(redacted, []byte(secret)) {
+			t.Errorf("secret survived redaction in decompressed redacted bundle")
+		}
+		if !bytes.Contains(redacted, []byte("[REDACTED:github-pat-classic]")) {
+			t.Errorf("redaction marker missing from redacted bundle")
+		}
+	} else if redactedHasSecret {
+		t.Errorf("secret survived redaction in redacted bundle")
+	}
+
+	// Telemetry: a trace_redacted log line with a non-empty hits
+	// list, so operators can see "the runner redacted N tokens this
+	// run" without leaking the tokens themselves.
+	if !strings.Contains(stderr.String(), `"event":"trace_redacted"`) {
+		t.Errorf("missing trace_redacted telemetry log:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"github-pat-classic"`) {
+		t.Errorf("trace_redacted log should name the matched pattern:\n%s", stderr.String())
 	}
 }
 
@@ -1137,7 +1260,6 @@ func TestRun_FetchPrompt_PlusUploadTrace_OnlyOneIssueKeyCall(t *testing.T) {
 		"--stage-id", "stage-1",
 		"--fetch-prompt",
 		"--upload-trace",
-		"--variant", "raw",
 	}, &stderr)
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
@@ -1177,7 +1299,6 @@ func TestRun_UploadPlan_HappyPath(t *testing.T) {
 		"--plan-out", planPath,
 		"--upload-trace",
 		"--stage-id", stageID,
-		"--variant", "raw",
 	}, &stderr)
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
@@ -1231,7 +1352,6 @@ func TestRun_UploadPlan_NetworkError_CategoryC(t *testing.T) {
 		"--plan-out", planPath,
 		"--upload-trace",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--variant", "raw",
 	}, &stderr)
 	if got != exitFailure {
 		t.Errorf("run = %d, want exitFailure", got)
@@ -1264,7 +1384,6 @@ func TestRun_UploadPlan_PlanInvalid_CategoryB(t *testing.T) {
 		"--plan-out", planPath,
 		"--upload-trace",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--variant", "raw",
 	}, &stderr)
 	if got != exitFailure {
 		t.Errorf("run = %d, want exitFailure", got)
@@ -1289,7 +1408,6 @@ func TestRun_UploadPlan_NotShippedWithoutPlanOut(t *testing.T) {
 		"--prompt-file", promptPath,
 		"--upload-trace",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--variant", "raw",
 	}, &stderr)
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK", got)
@@ -1391,7 +1509,6 @@ func TestRun_ImplementStage_HappyPath(t *testing.T) {
 		"--stage-id", stageID,
 		"--fetch-prompt",
 		"--upload-trace",
-		"--variant", "raw",
 	}, &stderr)
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
@@ -1463,7 +1580,7 @@ func TestRun_ImplementStage_NoChanges_SkipsPRAndShip(t *testing.T) {
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+		"--fetch-prompt", "--upload-trace",
 	}, &stderr)
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
@@ -1499,7 +1616,7 @@ func TestRun_ImplementStage_PushError_CategoryC(t *testing.T) {
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+		"--fetch-prompt", "--upload-trace",
 	}, &stderr)
 	if got != exitFailure {
 		t.Errorf("run = %d, want exitFailure", got)
@@ -1529,7 +1646,7 @@ func TestRun_ImplementStage_ShipPRInvalid_CategoryB(t *testing.T) {
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+		"--fetch-prompt", "--upload-trace",
 	}, &stderr)
 	if got != exitFailure {
 		t.Errorf("run = %d, want exitFailure", got)
@@ -1564,7 +1681,7 @@ func TestRun_ImplementStage_PlanOutWithImplementStage_DoesNotValidatePlan(t *tes
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+		"--fetch-prompt", "--upload-trace",
 		"--plan-out", missingPlan, // file doesn't exist; would fail validation pre-fix
 	}, &stderr)
 	if got != exitOK {
@@ -1600,7 +1717,7 @@ func TestRun_ImplementStage_InstallationTokenFetchFails_CategoryC(t *testing.T) 
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+		"--fetch-prompt", "--upload-trace",
 	}, &stderr)
 	if got != exitFailure {
 		t.Errorf("run = %d, want exitFailure", got)
@@ -1641,7 +1758,7 @@ func TestRun_ImplementStage_AlwaysFetchesFreshTokenBeforePush(t *testing.T) {
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+		"--fetch-prompt", "--upload-trace",
 	}, &stderr)
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
@@ -1839,7 +1956,7 @@ func TestRun_ImplementStage_PassesAgentAuthoredPRTitle(t *testing.T) {
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
-		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+		"--fetch-prompt", "--upload-trace",
 	}, &stderr)
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
