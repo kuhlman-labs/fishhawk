@@ -95,11 +95,34 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		return OutcomeNoOp, fmt.Errorf("orchestrator: list stages: %w", err)
 	}
 
+	// Walk pending → running before any stage transitions so the
+	// terminal target (succeeded / failed) is reachable. The state
+	// machine rejects pending → terminal directly; without this
+	// step every run that completes its stages stays stuck in
+	// pending. Idempotent on subsequent Advance calls (same-state
+	// transitions are no-ops at the repo layer).
+	if r.State == run.StatePending {
+		updated, err := o.Runs.TransitionRun(ctx, r.ID, run.StateRunning)
+		if err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: transition run to running: %w", err)
+		}
+		r = updated
+	}
+
 	// Find the next pending stage in sequence order. The
 	// repository returns stages ordered by sequence ascending, so
 	// we walk and pick the first non-terminal pending one.
+	//
+	// If we hit a failed or cancelled stage before finding a
+	// pending one, the run is over — completing as failed (or
+	// cancelled) is correct, and dispatching downstream stages
+	// would be wrong because the upstream output they depended on
+	// never landed.
 	var next *run.Stage
 	for _, s := range stages {
+		if s.State == run.StageStateFailed || s.State == run.StageStateCancelled {
+			return o.completeRun(ctx, r, stages)
+		}
 		if s.State == run.StageStatePending {
 			next = s
 			break
@@ -107,10 +130,8 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	}
 
 	if next == nil {
-		// Every stage has terminated. If at least one failed, the
-		// run was already transitioned to failed by whoever
-		// transitioned the stage. If they all succeeded, mark the
-		// run succeeded.
+		// Every stage has terminated successfully. completeRun
+		// transitions the run to succeeded.
 		return o.completeRun(ctx, r, stages)
 	}
 

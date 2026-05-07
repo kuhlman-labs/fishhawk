@@ -22,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -76,6 +78,12 @@ func Parse(s string) (time.Duration, error) {
 	}
 }
 
+// (No named function type — the ticker's Advance field is a
+// plain `func(ctx, runID) error` so any package can satisfy it
+// without conversion. Defining it as a named type would force
+// callers to wrap their advancer in a typed conversion at every
+// call site.)
+
 // Ticker scans for awaiting_approval stages whose SLA has elapsed
 // and transitions them to failed with category D. Run() blocks
 // until ctx is done; for production wiring start it on its own
@@ -88,6 +96,15 @@ type Ticker struct {
 	// Audit appends the approval_sla_elapsed entry per timeout.
 	// Required.
 	Audit audit.Repository
+
+	// Advance walks the run's state machine after the stage
+	// transitions to failed-D — without this, runs whose only
+	// stages have all timed out stay stuck in pending. Optional;
+	// nil skips the advancement and logs the gap (the run can
+	// still be advanced via a follow-up event). Production wires
+	// `orchestrator.Orchestrator.Advance` here via a small
+	// closure that drops its Outcome return value.
+	Advance func(ctx context.Context, runID uuid.UUID) error
 
 	// Logger receives structured warnings about parse failures and
 	// transient transition errors. nil → slog.Default().
@@ -246,4 +263,18 @@ func (t *Ticker) handleStage(ctx context.Context, logger *slog.Logger, now time.
 		slog.String("sla", *s.GateSLA),
 		slog.Duration("elapsed", elapsed),
 	)
+
+	// Walk the run's state machine. Without this the run sits in
+	// pending forever once its only awaiting_approval stage times
+	// out. The advancer's GitHub-dispatch path won't fire (the
+	// stage is terminal), so this is a pure state transition.
+	if t.Advance != nil {
+		if err := t.Advance(ctx, s.RunID); err != nil {
+			logger.LogAttrs(ctx, slog.LevelWarn, "sla: orchestrator advance failed",
+				slog.String("run_id", s.RunID.String()),
+				slog.String("stage_id", s.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 }

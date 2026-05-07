@@ -141,16 +141,16 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 
 		s.writeApprovalAudit(r, stage, res.Approval)
 
-		// On approve, hand off to the orchestrator to dispatch
-		// the next stage (or transition the run to succeeded if
-		// this was the last stage). On reject we don't advance —
-		// the run is over and the orchestrator would no-op
-		// against the now-terminal state anyway.
-		if decision == approval.DecisionApprove && s.cfg.Orchestrator != nil {
+		// Hand off to the orchestrator on both approve AND reject
+		// — approve dispatches the next stage; reject walks the
+		// run's state machine to terminal (pending → running →
+		// failed). Without the reject path the run would stay in
+		// pending forever once an approver rejected.
+		if s.cfg.Orchestrator != nil {
 			if _, err := s.cfg.Orchestrator.Advance(r.Context(), stage.RunID); err != nil {
-				// Don't fail the approval: the gate did pass,
-				// the audit row is in place. Surface the
-				// orchestration failure in logs and let a
+				// Don't fail the approval: the gate did pass /
+				// reject, the audit row is in place. Surface
+				// the orchestration failure in logs and let a
 				// follow-up call recover.
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
 					"orchestrator advance failed",

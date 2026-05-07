@@ -702,7 +702,13 @@ func TestSubmitApproval_NoOrchestrator_LeavesNextStagePending(t *testing.T) {
 	}
 }
 
-func TestSubmitApproval_Reject_DoesntTriggerOrchestrator(t *testing.T) {
+func TestSubmitApproval_Reject_AdvancesRunToFailed(t *testing.T) {
+	// Reject must hand off to the orchestrator so the run walks
+	// pending → running → failed. Without that the run stays
+	// stuck in pending forever once an approver rejects (the bug
+	// that drove this fix). Downstream stages stay pending — the
+	// orchestrator short-circuits on the failed first stage rather
+	// than dispatching anything past it.
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
 	first := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
@@ -725,7 +731,14 @@ func TestSubmitApproval_Reject_DoesntTriggerOrchestrator(t *testing.T) {
 		t.Errorf("first.State = %q, want failed", first.State)
 	}
 	if second.State != run.StageStatePending {
-		t.Errorf("second.State = %q, want pending (reject shouldn't advance)", second.State)
+		t.Errorf("second.State = %q, want pending (orchestrator shouldn't dispatch past a failed stage)", second.State)
+	}
+	got, err := rr.GetRun(t.Context(), r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != run.StateFailed {
+		t.Errorf("run.State = %q, want failed (reject should walk pending → running → failed)", got.State)
 	}
 }
 

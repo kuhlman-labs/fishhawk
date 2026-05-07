@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
@@ -326,6 +327,7 @@ func runServe(args []string, logSink io.Writer) int {
 			ticker := &slaTickerConfig{
 				Repo:     cfg.RunRepo,
 				Audit:    cfg.AuditRepo,
+				Advance:  advanceFuncFor(cfg.Orchestrator),
 				Logger:   logger,
 				Interval: *slaInterval,
 			}
@@ -345,6 +347,7 @@ func runServe(args []string, logSink io.Writer) int {
 			ticker := &dispatchwatchdog.Ticker{
 				Repo:     cfg.RunRepo,
 				Audit:    cfg.AuditRepo,
+				Advance:  advanceFuncFor(cfg.Orchestrator),
 				Logger:   logger,
 				Interval: *dispatchWatchdogInterval,
 				Timeout:  *dispatchWatchdogTimeout,
@@ -448,6 +451,7 @@ func runWebhookEvictor(ctx context.Context, logger *slog.Logger, store *webhook.
 type slaTickerConfig struct {
 	Repo     runpkg.Repository
 	Audit    audit.Repository
+	Advance  func(ctx context.Context, runID uuid.UUID) error
 	Logger   *slog.Logger
 	Interval time.Duration
 }
@@ -456,11 +460,28 @@ func (c *slaTickerConfig) Start(ctx context.Context) {
 	t := &slapkg.Ticker{
 		Repo:     c.Repo,
 		Audit:    c.Audit,
+		Advance:  c.Advance,
 		Logger:   c.Logger,
 		Interval: c.Interval,
 	}
 	if err := t.Run(ctx); err != nil {
 		c.Logger.Error("sla ticker exited with error", slog.String("error", err.Error()))
+	}
+}
+
+// advanceFuncFor wraps the orchestrator's Advance method as a plain
+// `func(ctx, runID) error` so the SLA + dispatch-watchdog tickers
+// can depend on the behaviour without forcing their packages to
+// import orchestrator.Outcome. Returns nil when the orchestrator
+// is unconfigured — the tickers tolerate a nil Advance and fall
+// back to "fail the stage and log the run-state gap."
+func advanceFuncFor(o *orchestrator.Orchestrator) func(ctx context.Context, runID uuid.UUID) error {
+	if o == nil {
+		return nil
+	}
+	return func(ctx context.Context, runID uuid.UUID) error {
+		_, err := o.Advance(ctx, runID)
+		return err
 	}
 }
 

@@ -484,3 +484,80 @@ func TestParseRepo(t *testing.T) {
 		}
 	}
 }
+
+func TestAdvance_PendingRun_WalksToRunningBeforeProcessingStages(t *testing.T) {
+	// Regression for the "runs stuck in pending" bug: every run
+	// is created in StatePending, but the state machine rejects
+	// pending → terminal directly. Without an explicit pending →
+	// running step in Advance, completeRun fails and the run is
+	// stuck forever.
+	//
+	// All-stages-succeeded path: Advance must walk pending →
+	// running → succeeded.
+	o, rs, _ := newOrchestrator(t)
+	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+	})
+	rs.runs[r.ID].State = run.StatePending // override the helper's default Running
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeRunCompleted {
+		t.Errorf("Outcome = %q, want run_completed", out)
+	}
+	if rs.runs[r.ID].State != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded (pending → running → succeeded)", rs.runs[r.ID].State)
+	}
+}
+
+func TestAdvance_PendingRun_WithFailedStage_WalksToFailed(t *testing.T) {
+	// The all-failures variant of the regression: a stage failed
+	// while the run was still in pending. Advance must walk
+	// pending → running → failed; without that, every run with a
+	// failed stage stays stuck in pending too.
+	o, rs, _ := newOrchestrator(t)
+	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateFailed},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStatePending},
+	})
+	rs.runs[r.ID].State = run.StatePending
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeRunCompleted {
+		t.Errorf("Outcome = %q, want run_completed", out)
+	}
+	if rs.runs[r.ID].State != run.StateFailed {
+		t.Errorf("run state = %q, want failed (pending → running → failed)", rs.runs[r.ID].State)
+	}
+}
+
+func TestAdvance_FailedStageBeforePending_DoesNotDispatchDownstream(t *testing.T) {
+	// When stage 0 has failed and stage 1 is still pending, the
+	// orchestrator must not dispatch stage 1 — its upstream
+	// output never landed. The run completes as failed instead.
+	// Without this short-circuit, a rejected gate or
+	// constraint-violation failure on stage 0 would still fire
+	// the implement stage's runner, wasting the run and leaving
+	// the audit log telling two contradictory stories.
+	o, rs, gh := newOrchestrator(t)
+	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateFailed},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStatePending},
+	})
+
+	if _, err := o.Advance(context.Background(), r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if rs.runs[r.ID].State != run.StateFailed {
+		t.Errorf("run state = %q, want failed", rs.runs[r.ID].State)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("orchestrator dispatched a stage past the failure: %d calls", len(gh.calls))
+	}
+}

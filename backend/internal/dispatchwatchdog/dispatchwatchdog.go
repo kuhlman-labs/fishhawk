@@ -25,6 +25,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -34,6 +36,12 @@ import (
 // to failed-C. Stable so log scrapers and the compliance export
 // can index on it.
 const CategoryDispatchWatchdogElapsed = "dispatch_watchdog_elapsed"
+
+// (Ticker.Advance is a plain `func(ctx, runID) error` rather than
+// a named type so any caller can satisfy the dependency without a
+// typed conversion. Production wires
+// `orchestrator.Orchestrator.Advance` here via a small closure that
+// drops the Outcome return value.)
 
 // Ticker scans for stages stuck in dispatched state past Timeout
 // and transitions them to failed with category C. Run() blocks
@@ -47,6 +55,12 @@ type Ticker struct {
 	// Audit appends the dispatch_watchdog_elapsed entry per
 	// timeout. Required.
 	Audit audit.Repository
+
+	// Advance walks the run's state machine after the stage
+	// transitions to failed-C. Without this the run sits in
+	// pending forever once its dispatched stage times out.
+	// Optional; nil skips the advancement and logs the gap.
+	Advance func(ctx context.Context, runID uuid.UUID) error
 
 	// Logger receives structured warnings about transient transition
 	// errors. nil → slog.Default().
@@ -177,5 +191,19 @@ func (t *Ticker) handleStage(ctx context.Context, logger *slog.Logger, now time.
 			slog.String("run_id", s.RunID.String()),
 			slog.String("error", err.Error()),
 		)
+	}
+
+	// Walk the run's state machine. Without this, runs whose only
+	// dispatched stage is now category-C-failed sit in pending
+	// forever; the watchdog is the only path that produces this
+	// failure, so the orchestrator never gets called otherwise.
+	if t.Advance != nil {
+		if err := t.Advance(ctx, s.RunID); err != nil {
+			logger.LogAttrs(ctx, slog.LevelWarn, "dispatchwatchdog: orchestrator advance failed",
+				slog.String("run_id", s.RunID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 }
