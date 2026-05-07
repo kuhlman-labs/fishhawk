@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
 
 // ErrUnsupportedStage signals the requested stage type isn't yet
@@ -61,6 +63,14 @@ type Trigger struct {
 	// Repo is the "owner/name" the run is operating on, surfaced in
 	// the prompt so the agent's reasoning can reference it.
 	Repo string
+	// ApprovedPlan is the standard_v1 plan that the human approved
+	// during the plan stage. When set on an implement-stage prompt,
+	// the plan becomes the binding instruction the agent must
+	// adhere to and the issue context drops to background.
+	// Nil means "no approved plan available" — implement falls back
+	// to the issue-only prompt and a `plan_missing_for_implement`
+	// audit entry surfaces the gap (#223).
+	ApprovedPlan *plan.Plan
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -89,10 +99,34 @@ func buildImplement(t Trigger) string {
 	b.WriteString(quoteRepo(t.Repo))
 	b.WriteString(".\n\n")
 
-	writeIssueContext(&b, t)
+	// Plan-as-contract (#223): when the plan stage produced a
+	// standard_v1 artifact and a human approved it, that plan is
+	// what the agent commits to. The issue is included afterwards
+	// as background context — useful for grounding when the plan
+	// is ambiguous, but the plan is the binding instruction the
+	// audit log records.
+	//
+	// When ApprovedPlan is nil we fall back to the historic
+	// issue-only prompt so manual / non-issue-triggered runs and
+	// edge cases (race between plan upload and implement dispatch)
+	// don't 500 the prompt fetch — the gap shows up as a
+	// `plan_missing_for_implement` audit entry on the handler side.
+	if t.ApprovedPlan != nil {
+		writeApprovedPlan(&b, t.ApprovedPlan)
+		b.WriteString("Originating issue (background context only):\n\n")
+		writeIssueContext(&b, t)
 
-	b.WriteString("Your task: implement the change described above. Make the smallest set of changes that satisfies the issue.\n")
-	b.WriteString("\n")
+		b.WriteString("Your task: implement the approved plan above. The plan is the binding instruction; the issue is included for grounding when the plan is ambiguous. Make the smallest set of changes that satisfies the plan.\n")
+		b.WriteString("\n")
+		b.WriteString("If you discover the plan is wrong or infeasible — a file it names doesn't exist, an approach step is incompatible with the current code, the verification can't be implemented as specified — stop and surface that in your final response rather than diverging silently. The right path in that case is a follow-up run that re-plans, not an off-plan implementation.\n")
+		b.WriteString("\n")
+		b.WriteString("If the repository has materially changed since the plan was approved (files in the plan's scope have been heavily refactored, an approach step references code that no longer exists), surface that and pause.\n")
+		b.WriteString("\n")
+	} else {
+		writeIssueContext(&b, t)
+		b.WriteString("Your task: implement the change described above. Make the smallest set of changes that satisfies the issue.\n")
+		b.WriteString("\n")
+	}
 
 	// PR description: write to a known path so the runner can lift
 	// it into the GitHub PR's title + body. Format is documented
@@ -137,6 +171,66 @@ func buildPlan(t Trigger) string {
 	b.WriteString("Do not echo the plan in your final response — only write it to the file. ")
 	b.WriteString("Do not modify source files in this stage — the implement stage that follows will execute the plan.\n")
 	return b.String()
+}
+
+// writeApprovedPlan renders a standard_v1 plan as readable prose so
+// the agent reads it as instructions rather than as JSON. Sections
+// mirror the schema: Summary, Files in scope, Approach, Verification,
+// Risks (when present). The rendering is deterministic (slices
+// preserve their input order) so two replays of the same stage
+// produce byte-identical prompts and the audit log records exactly
+// what the agent was asked to do.
+func writeApprovedPlan(b *strings.Builder, p *plan.Plan) {
+	b.WriteString("Approved plan (binding instruction)\n")
+	b.WriteString("===================================\n\n")
+
+	if p.Summary != "" {
+		b.WriteString("Summary:\n")
+		b.WriteString(p.Summary)
+		b.WriteString("\n\n")
+	}
+
+	if len(p.Scope.Files) > 0 {
+		b.WriteString("Files in scope:\n")
+		for _, f := range p.Scope.Files {
+			fmt.Fprintf(b, "- %s (%s)\n", f.Path, f.Operation)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(p.Approach) > 0 {
+		b.WriteString("Approach:\n")
+		for _, step := range p.Approach {
+			fmt.Fprintf(b, "%d. %s\n", step.Step, step.Description)
+		}
+		b.WriteString("\n")
+	}
+
+	// Verification fields are required by the schema but render
+	// defensively so a future schema relaxation can't crash the
+	// builder.
+	if p.Verification.TestStrategy != "" || p.Verification.RollbackPlan != "" {
+		b.WriteString("Verification:\n")
+		if p.Verification.TestStrategy != "" {
+			b.WriteString("- Test strategy: ")
+			b.WriteString(p.Verification.TestStrategy)
+			b.WriteString("\n")
+		}
+		if p.Verification.RollbackPlan != "" {
+			b.WriteString("- Rollback plan: ")
+			b.WriteString(p.Verification.RollbackPlan)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	if len(p.RisksAndAssumptions) > 0 {
+		b.WriteString("Risks & assumptions:\n")
+		for _, r := range p.RisksAndAssumptions {
+			fmt.Fprintf(b, "- %s\n", r)
+		}
+		b.WriteString("\n")
+	}
 }
 
 // writeIssueContext renders the issue title and body into the

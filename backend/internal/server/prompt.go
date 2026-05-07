@@ -3,16 +3,21 @@ package server
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -106,6 +111,24 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			s.fillIssueContext(r.Context(), github, runRow, number, &trigger)
 		}
 	}
+	// Plan-as-contract (#223): for implement stages, the approved
+	// plan is the binding instruction. Look up the run's
+	// plan-stage's most-recent standard_v1 artifact and feed it
+	// into the prompt builder. Missing plan → fall back to the
+	// issue-only template and emit `plan_missing_for_implement` so
+	// the audit log captures the gap.
+	if stage.Type == run.StageTypeImplement {
+		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"load approved plan failed", map[string]any{"error": err.Error()})
+			return
+		}
+		if approvedPlan == nil {
+			s.emitPlanMissingForImplement(r.Context(), runRow.ID, stage.ID)
+		}
+		trigger.ApprovedPlan = approvedPlan
+	}
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
@@ -185,6 +208,24 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			s.fillIssueContext(r.Context(), github, runRow, number, &trigger)
 		}
 	}
+	// Plan-as-contract (#223): for implement stages, the approved
+	// plan is the binding instruction. Look up the run's
+	// plan-stage's most-recent standard_v1 artifact and feed it
+	// into the prompt builder. Missing plan → fall back to the
+	// issue-only template and emit `plan_missing_for_implement` so
+	// the audit log captures the gap.
+	if stage.Type == run.StageTypeImplement {
+		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"load approved plan failed", map[string]any{"error": err.Error()})
+			return
+		}
+		if approvedPlan == nil {
+			s.emitPlanMissingForImplement(r.Context(), runRow.ID, stage.ID)
+		}
+		trigger.ApprovedPlan = approvedPlan
+	}
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
@@ -257,6 +298,101 @@ func PromptCanonicalMessage(stageID uuid.UUID) []byte {
 
 func promptCanonicalMessage(stageID uuid.UUID) []byte {
 	return signing.ComputeMessage([]byte("prompt:" + stageID.String()))
+}
+
+// loadApprovedPlanForRun returns the plan stage's most-recent
+// kind=plan, schema_version=standard_v1 artifact for the run, decoded
+// into a *plan.Plan. Returns (nil, nil) when no such artifact exists
+// (race between plan upload and implement dispatch, or a manual run
+// with no plan stage). The implement-stage prompt builder treats nil
+// as "no plan available" and falls back to the issue-only template.
+//
+// Errors are returned to the caller only when the underlying repo
+// IO fails — a missing or malformed plan logs and yields nil so the
+// prompt fetch stays robust against the kinds of mid-flight states
+// the runner sees during re-tries.
+func (s *Server) loadApprovedPlanForRun(ctx context.Context, runID uuid.UUID) (*plan.Plan, error) {
+	if s.cfg.ArtifactRepo == nil || s.cfg.RunRepo == nil {
+		return nil, nil
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list stages for run: %w", err)
+	}
+	var planStageID uuid.UUID
+	for _, st := range stages {
+		if st.Type == run.StageTypePlan {
+			planStageID = st.ID
+			break
+		}
+	}
+	if planStageID == uuid.Nil {
+		return nil, nil
+	}
+	arts, err := s.cfg.ArtifactRepo.ListForStage(ctx, planStageID)
+	if err != nil {
+		return nil, fmt.Errorf("list plan stage artifacts: %w", err)
+	}
+	var picked *artifact.Artifact
+	for _, a := range arts {
+		if a.Kind != artifact.KindPlan {
+			continue
+		}
+		if a.SchemaVersion == nil || *a.SchemaVersion != "standard_v1" {
+			continue
+		}
+		if picked == nil || a.CreatedAt.After(picked.CreatedAt) {
+			picked = a
+		}
+	}
+	if picked == nil {
+		return nil, nil
+	}
+	var p plan.Plan
+	if err := json.Unmarshal(picked.Content, &p); err != nil {
+		// Plan was validated at upload; a malformed read here is a
+		// backend bug, not a prompt-fetch failure. Log and fall back.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: plan unmarshal failed",
+			slog.String("run_id", runID.String()),
+			slog.String("artifact_id", picked.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, nil
+	}
+	return &p, nil
+}
+
+// emitPlanMissingForImplement records the case where an implement-
+// stage prompt was served without an approved plan. It's not an
+// error in the HTTP sense — the runner gets a usable issue-only
+// prompt — but the audit log should capture the gap so reviewers can
+// tell whether the agent was working off the plan they approved.
+//
+// Best-effort: a failure to append the audit entry doesn't unwind
+// the prompt response. Logged at warn level for operator visibility.
+func (s *Server) emitPlanMissingForImplement(ctx context.Context, runID, stageID uuid.UUID) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":   runID.String(),
+		"stage_id": stageID.String(),
+		"reason":   "no standard_v1 plan artifact found for the run's plan stage at implement-prompt fetch time",
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "plan_missing_for_implement",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: append plan_missing_for_implement failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // fillIssueContext populates the trigger's IssueTitle and IssueBody

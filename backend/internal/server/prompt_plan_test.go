@@ -1,0 +1,469 @@
+package server
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+)
+
+/*
+ * Tests for the plan-as-contract path on the implement-stage prompt
+ * (#223). These need a richer run.Repository fake than the prompt
+ * tests use today (must return real stages from ListStagesForRun)
+ * and an artifact.Repository fake — both kept local to this file so
+ * the existing prompt_test.go scaffolding stays untouched.
+ */
+
+// planPromptRunRepo extends promptRunRepo's intent with a working
+// ListStagesForRun. Two stages per run is the v0 shape (plan +
+// implement). The implement-stage prompt resolution walks
+// ListStagesForRun → finds the plan stage → reads its artifacts.
+type planPromptRunRepo struct {
+	stages    map[uuid.UUID][]*run.Stage
+	stageByID map[uuid.UUID]*run.Stage
+	runs      map[uuid.UUID]*run.Run
+	listErr   error
+}
+
+func newPlanPromptRunRepo() *planPromptRunRepo {
+	return &planPromptRunRepo{
+		stages:    map[uuid.UUID][]*run.Stage{},
+		stageByID: map[uuid.UUID]*run.Stage{},
+		runs:      map[uuid.UUID]*run.Run{},
+	}
+}
+
+func (r *planPromptRunRepo) seedRun(rn *run.Run) { r.runs[rn.ID] = rn }
+func (r *planPromptRunRepo) seedStages(runID uuid.UUID, stages ...*run.Stage) {
+	r.stages[runID] = append(r.stages[runID], stages...)
+	for _, s := range stages {
+		r.stageByID[s.ID] = s
+	}
+}
+
+func (r *planPromptRunRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	if s, ok := r.stageByID[id]; ok {
+		return s, nil
+	}
+	return nil, run.ErrNotFound
+}
+func (r *planPromptRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	if rn, ok := r.runs[id]; ok {
+		return rn, nil
+	}
+	return nil, run.ErrNotFound
+}
+func (r *planPromptRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	return r.stages[runID], nil
+}
+
+func (r *planPromptRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *planPromptRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
+	return nil, run.ErrNotFound
+}
+func (r *planPromptRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *planPromptRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (r *planPromptRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+func (r *planPromptRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+func (r *planPromptRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+func (r *planPromptRunRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+func (r *planPromptRunRepo) TransitionStage(context.Context, uuid.UUID, run.StageState, *run.StageCompletion) (*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
+// planArtifactRepo holds canned artifacts keyed by stage_id.
+type planArtifactRepo struct {
+	byStage map[uuid.UUID][]*artifact.Artifact
+	listErr error
+}
+
+func newPlanArtifactRepo() *planArtifactRepo {
+	return &planArtifactRepo{byStage: map[uuid.UUID][]*artifact.Artifact{}}
+}
+
+func (r *planArtifactRepo) seed(stageID uuid.UUID, arts ...*artifact.Artifact) {
+	r.byStage[stageID] = append(r.byStage[stageID], arts...)
+}
+
+func (r *planArtifactRepo) ListForStage(_ context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	return r.byStage[stageID], nil
+}
+
+func (r *planArtifactRepo) Get(_ context.Context, _ uuid.UUID) (*artifact.Artifact, error) {
+	return nil, errors.New("not used")
+}
+
+func (r *planArtifactRepo) GetByHash(_ context.Context, _ uuid.UUID, _ string) (*artifact.Artifact, error) {
+	return nil, artifact.ErrNotFound
+}
+
+func (r *planArtifactRepo) Create(_ context.Context, _ artifact.CreateParams) (*artifact.Artifact, error) {
+	return nil, errors.New("not used")
+}
+
+// planAuditRepo records appended entries; the implement-prompt
+// handler emits `plan_missing_for_implement` when the plan isn't
+// found, and the test asserts that.
+type planAuditRepo struct {
+	appended []audit.ChainAppendParams
+}
+
+func (a *planAuditRepo) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (a *planAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	a.appended = append(a.appended, p)
+	rid := p.RunID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
+}
+func (a *planAuditRepo) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (a *planAuditRepo) ListGlobal(context.Context) ([]*audit.Entry, error) {
+	return nil, nil
+}
+func (a *planAuditRepo) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
+	return nil, nil
+}
+func (a *planAuditRepo) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
+	return nil, audit.ErrNotFound
+}
+func (a *planAuditRepo) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
+func (a *planAuditRepo) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
+	return nil, nil
+}
+func (a *planAuditRepo) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
+	return nil, audit.ErrNotFound
+}
+
+// fixturePlanJSON returns a minimal-but-complete standard_v1 plan as
+// the bytes the artifact would carry. Mirrors the runner's upload.
+func fixturePlanJSON(t *testing.T) []byte {
+	t.Helper()
+	body := map[string]any{
+		"plan_version": "standard_v1",
+		"ticket_reference": map[string]any{
+			"type": "github_issue",
+			"url":  "https://github.com/kuhlman-labs/example/issues/42",
+			"id":   "kuhlman-labs/example#42",
+		},
+		"generated_by": map[string]any{
+			"agent":     "claude-code",
+			"model":     "claude-opus-4-7",
+			"timestamp": "2026-05-07T12:00:00Z",
+		},
+		"summary": "Add a foo helper to pkg/bar.",
+		"scope": map[string]any{
+			"files": []any{
+				map[string]any{"path": "pkg/bar/foo.go", "operation": "create"},
+				map[string]any{"path": "pkg/bar/bar.go", "operation": "modify"},
+			},
+		},
+		"approach": []any{
+			map[string]any{"step": 1, "description": "Define Foo on the bar.Service interface."},
+			map[string]any{"step": 2, "description": "Implement Foo with a table-driven test."},
+		},
+		"verification": map[string]any{
+			"test_strategy": "Unit tests in pkg/bar.",
+			"rollback_plan": "Revert the PR.",
+		},
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func newImplementPromptServer(t *testing.T) (*Server, *planPromptRunRepo, *planArtifactRepo, *planAuditRepo, *signingFake, *stubIssueGetter) {
+	t.Helper()
+	rr := newPlanPromptRunRepo()
+	ar := newPlanArtifactRepo()
+	au := &planAuditRepo{}
+	sf := newSigningFake()
+	gh := &stubIssueGetter{}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ArtifactRepo: ar,
+		AuditRepo:    au,
+		SigningRepo:  sf,
+	})
+	s.promptIssueGetterOverride = gh
+	return s, rr, ar, au, sf, gh
+}
+
+// seedRunWithStages helper: seeds a run with plan + implement stages
+// and returns their ids so tests can target either one.
+func seedRunWithStages(rr *planPromptRunRepo) (runID, planStageID, implStageID uuid.UUID, _ *run.Run) {
+	runID = uuid.New()
+	planStageID = uuid.New()
+	implStageID = uuid.New()
+	triggerRef := "issue:42"
+	installation := int64(99)
+	rn := &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+	}
+	rr.seedRun(rn)
+	rr.seedStages(runID,
+		&run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, Sequence: 0},
+		&run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement, Sequence: 1},
+	)
+	return runID, planStageID, implStageID, rn
+}
+
+func TestImplementPrompt_LeadsWithApprovedPlan(t *testing.T) {
+	s, rr, ar, au, sf, gh := newImplementPromptServer(t)
+	runID, planStageID, implStageID, _ := seedRunWithStages(rr)
+
+	// Plan artifact stored under the plan stage.
+	v := "standard_v1"
+	ar.seed(planStageID, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       fixturePlanJSON(t),
+		ContentHash:   "deadbeef",
+		CreatedAt:     time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
+	})
+
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "We need a foo helper."}
+
+	// Sign the request with the run's stored key (signature path
+	// is unchanged from #218; we're just adding plan resolution).
+	priv, _ := sf.issue(t, runID)
+	w := promptRequestForStage(t, s, runID, implStageID, priv)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Approved plan (binding instruction)",
+		"Add a foo helper to pkg/bar.",
+		"pkg/bar/foo.go (create)",
+		"1. Define Foo on the bar.Service interface.",
+		"binding instruction",
+		"diverging silently",
+		"Originating issue (background context only):",
+		"Add foo",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+	// No plan_missing_for_implement entry — the plan was found.
+	for _, e := range au.appended {
+		if e.Category == "plan_missing_for_implement" {
+			t.Errorf("audit log emitted plan_missing_for_implement when plan was present: %+v", e)
+		}
+	}
+}
+
+func TestImplementPrompt_PicksMostRecentStandardV1Plan(t *testing.T) {
+	// Plan stage retried produces multiple plan artifacts; the
+	// handler must pick the most-recent. The plan-stage UI's
+	// existing "most-recent wins" rule (frontend/routes/stage-detail
+	// .tsx) is mirrored here.
+	s, rr, ar, _, sf, gh := newImplementPromptServer(t)
+	runID, planStageID, implStageID, _ := seedRunWithStages(rr)
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "ctx"}
+
+	v := "standard_v1"
+	older := []byte(`{"plan_version":"standard_v1","summary":"OLDER PLAN","scope":{"files":[]},"approach":[],"verification":{"test_strategy":"x","rollback_plan":"y"},"ticket_reference":{"type":"github_issue","url":"u","id":"i"},"generated_by":{"agent":"a","model":"m","timestamp":"2026-05-07T12:00:00Z"}}`)
+	newer := []byte(`{"plan_version":"standard_v1","summary":"NEWER PLAN","scope":{"files":[]},"approach":[],"verification":{"test_strategy":"x","rollback_plan":"y"},"ticket_reference":{"type":"github_issue","url":"u","id":"i"},"generated_by":{"agent":"a","model":"m","timestamp":"2026-05-07T12:00:00Z"}}`)
+
+	ar.seed(planStageID,
+		&artifact.Artifact{
+			ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &v,
+			Content: older, ContentHash: "old", CreatedAt: time.Date(2026, 5, 7, 11, 0, 0, 0, time.UTC),
+		},
+		&artifact.Artifact{
+			ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &v,
+			Content: newer, ContentHash: "new", CreatedAt: time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
+		},
+	)
+
+	priv, _ := sf.issue(t, runID)
+	w := promptRequestForStage(t, s, runID, implStageID, priv)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !strings.Contains(resp.Prompt, "NEWER PLAN") {
+		t.Errorf("expected newer plan summary in prompt:\n%s", resp.Prompt)
+	}
+	if strings.Contains(resp.Prompt, "OLDER PLAN") {
+		t.Errorf("older plan leaked into prompt:\n%s", resp.Prompt)
+	}
+}
+
+func TestImplementPrompt_NoPlan_FallsBackAndAuditsTheGap(t *testing.T) {
+	// Plan stage exists but no standard_v1 artifact has been
+	// uploaded yet (race between dispatch and upload, or a
+	// non-issue-triggered run). The handler returns the
+	// issue-only prompt and emits a plan_missing_for_implement
+	// audit entry so reviewers can tell the agent worked off the
+	// issue rather than an approved plan.
+	s, rr, _, au, sf, gh := newImplementPromptServer(t)
+	runID, _, implStageID, _ := seedRunWithStages(rr)
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "context"}
+
+	priv, _ := sf.issue(t, runID)
+	w := promptRequestForStage(t, s, runID, implStageID, priv)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if strings.Contains(resp.Prompt, "Approved plan (binding instruction)") {
+		t.Errorf("plan section appeared without an artifact:\n%s", resp.Prompt)
+	}
+	if !strings.Contains(resp.Prompt, "Triggering issue: #42") {
+		t.Errorf("issue context missing from fallback prompt:\n%s", resp.Prompt)
+	}
+
+	found := false
+	for _, e := range au.appended {
+		if e.Category == "plan_missing_for_implement" {
+			found = true
+			if e.StageID == nil || *e.StageID != implStageID {
+				t.Errorf("audit StageID = %v, want implement stage %v", e.StageID, implStageID)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected plan_missing_for_implement audit entry; got %+v", au.appended)
+	}
+}
+
+func TestImplementPrompt_PlanRender_WorksWithoutSignatureRequirement(t *testing.T) {
+	// The SPA-readable /prompt-render endpoint resolves the plan
+	// the same way as the signature-authed runner endpoint. This
+	// is what the implement-stage session view (#215) shows the
+	// user — it must reflect the same approved plan.
+	s, rr, ar, _, _, gh := newImplementPromptServer(t)
+	runID, planStageID, implStageID, _ := seedRunWithStages(rr)
+	v := "standard_v1"
+	ar.seed(planStageID, &artifact.Artifact{
+		ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &v,
+		Content:   fixturePlanJSON(t),
+		CreatedAt: time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
+	})
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "ctx"}
+	_ = runID
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", implStageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !strings.Contains(resp.Prompt, "Approved plan (binding instruction)") {
+		t.Errorf("plan-render path missed the plan section:\n%s", resp.Prompt)
+	}
+}
+
+func TestImplementPrompt_BothEndpointsProduceIdenticalBody(t *testing.T) {
+	// Belt-and-suspenders for the audit story: the signature-authed
+	// runner path and the SPA-readable render path must produce
+	// byte-identical prompts. If they ever diverge, the audit log's
+	// "what the agent saw" record stops matching what reviewers
+	// inspect.
+	s, rr, ar, _, sf, gh := newImplementPromptServer(t)
+	runID, planStageID, implStageID, _ := seedRunWithStages(rr)
+	v := "standard_v1"
+	ar.seed(planStageID, &artifact.Artifact{
+		ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &v,
+		Content: fixturePlanJSON(t), CreatedAt: time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
+	})
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "context"}
+
+	priv, _ := sf.issue(t, runID)
+	signed := promptRequestForStage(t, s, runID, implStageID, priv)
+	if signed.Code != http.StatusOK {
+		t.Fatalf("signed status = %d", signed.Code)
+	}
+	rendered := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", implStageID), nil)
+	rw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rw, rendered)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("rendered status = %d", rw.Code)
+	}
+
+	var sb, rb promptResponse
+	_ = json.Unmarshal(signed.Body.Bytes(), &sb)
+	_ = json.Unmarshal(rw.Body.Bytes(), &rb)
+	if sb.Prompt != rb.Prompt {
+		t.Errorf("signed vs rendered diverged:\nsigned:\n%s\n---\nrendered:\n%s", sb.Prompt, rb.Prompt)
+	}
+	if sb.PromptHash != rb.PromptHash {
+		t.Errorf("hash diverged: %q vs %q", sb.PromptHash, rb.PromptHash)
+	}
+}
+
+// promptRequestForStage signs a GET /v0/stages/{id}/prompt request
+// with the run's private key (mirroring the runner's behavior).
+// Reuses the canonical signing message helper so the signing stays
+// in lockstep with the production path.
+func promptRequestForStage(t *testing.T, s *Server, _ uuid.UUID, stageID uuid.UUID, priv ed25519.PrivateKey) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt", stageID), nil)
+	sig := ed25519.Sign(priv, PromptCanonicalMessage(stageID))
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(sig))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
