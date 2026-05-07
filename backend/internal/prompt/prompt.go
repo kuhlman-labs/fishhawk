@@ -104,11 +104,15 @@ func buildImplement(t Trigger) string {
 	b.WriteString("\n")
 	b.WriteString("- The first line is the PR title. Write a task-specific summary of what you changed (e.g. `Add make minio-init target`). Keep it ≤72 characters and do not prefix it with `Fishhawk:` — the runner adds attribution separately.\n")
 	b.WriteString("- Leave one blank line.\n")
-	b.WriteString("- The rest is the PR body in markdown. Lead with the motivation, then describe what changed, then list anything a reviewer should test or watch for. Avoid restating the diff line by line.\n")
+	b.WriteString("- The rest is the PR body in markdown. Use these sections (and only these), in this order:\n")
+	b.WriteString("  - `## Summary` — 1–3 bullets covering the motivation and the load-bearing changes. Don't restate the diff line-by-line.\n")
+	b.WriteString("  - `## Test plan` — a checklist of how a reviewer should verify the change, written as `- [ ] …` items (unchecked; the reviewer ticks them).\n")
+	b.WriteString("  - `## Notes` — optional. Use only when there's something deferred, surprising, or non-obvious worth flagging.\n")
+	b.WriteString("- Don't add other top-level sections. Don't open the body with prose that floats above the first heading; everything narrative goes under `## Summary`.\n")
 
 	if t.IssueNumber > 0 {
 		fmt.Fprintf(&b,
-			"- Include the line `Closes #%d` somewhere in the body so merging the PR auto-closes the originating issue.\n",
+			"- End the body with `Closes #%d` on its own line so merging the PR auto-closes the originating issue.\n",
 			t.IssueNumber,
 		)
 	}

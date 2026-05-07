@@ -25,6 +25,14 @@ func TestBuild_Implement_FullContext(t *testing.T) {
 		"smallest set of changes",
 		// PR description guidance + the path the runner reads (#206).
 		PullRequestDescriptionPath,
+		// PR body section structure (matches CLAUDE.md's hand-written
+		// PR convention). Without these the agent tends to write the
+		// summary as floating prose and only head up the Test plan
+		// section, producing an orphan-prose-then-H2 layout.
+		"## Summary",
+		"## Test plan",
+		"## Notes",
+		"`- [ ] …`",
 		// `Closes #N` instruction is conditional on a non-zero issue
 		// number — without it the merge wouldn't auto-close the
 		// originating issue.
