@@ -201,6 +201,75 @@ func TestGetStage_HappyPath(t *testing.T) {
 	}
 }
 
+// TestGetStage_GateShapeOnWire verifies the persisted Gate (#213)
+// reaches the SPA via the HTTP response — this is what the
+// review-stage detail page reads to render blocking_checks +
+// approvers without re-parsing the workflow spec.
+func TestGetStage_GateShapeOnWire(t *testing.T) {
+	repo := newStagesRunRepo()
+	runID, stageID := uuid.New(), uuid.New()
+	now := time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)
+	repo.stages[runID] = []*run.Stage{{
+		ID: stageID, RunID: runID, Sequence: 0, Type: run.StageTypeReview,
+		ExecutorKind: run.ExecutorHuman, ExecutorRef: "human",
+		State: run.StageStateAwaitingApproval, CreatedAt: now, UpdatedAt: now,
+		Gate: &run.Gate{
+			Kind:           run.GateKindApproval,
+			BlockingChecks: []string{"ci_pass", "fishhawk_audit_complete"},
+			Approvers:      &run.GateApprovers{AnyOf: []string{"founder"}},
+		},
+	}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s", stageID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Gate == nil {
+		t.Fatal("response.gate = nil; want approval gate")
+	}
+	if got.Gate.Type != "approval" {
+		t.Errorf("gate.type = %q, want approval", got.Gate.Type)
+	}
+	if len(got.Gate.BlockingChecks) != 2 {
+		t.Errorf("gate.blocking_checks = %v", got.Gate.BlockingChecks)
+	}
+	if got.Gate.Approvers == nil || len(got.Gate.Approvers.AnyOf) != 1 || got.Gate.Approvers.AnyOf[0] != "founder" {
+		t.Errorf("gate.approvers = %+v", got.Gate.Approvers)
+	}
+}
+
+// TestGetStage_GateOmittedWhenNil confirms gate=nil → omitted from
+// the JSON body. The SPA's TS type makes Stage.gate optional, so a
+// non-empty `gate: null` would force every consumer to handle the
+// extra null branch unnecessarily.
+func TestGetStage_GateOmittedWhenNil(t *testing.T) {
+	repo := newStagesRunRepo()
+	runID, stageID := uuid.New(), uuid.New()
+	now := time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)
+	repo.stages[runID] = []*run.Stage{{
+		ID: stageID, RunID: runID, Sequence: 0, Type: run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		State: run.StageStateRunning, CreatedAt: now, UpdatedAt: now,
+		// Gate left nil.
+	}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s", stageID), nil)
+	s.Handler().ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if strings.Contains(body, `"gate"`) {
+		t.Errorf("body should omit gate when stage has no gate, got:\n%s", body)
+	}
+}
+
 // stageGetRepo extends stagesRunRepo with a working GetStage so the
 // handler test can resolve stages.
 type stageGetRepo struct {

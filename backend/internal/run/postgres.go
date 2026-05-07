@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -148,16 +149,36 @@ func (r *postgresRepo) TransitionRun(ctx context.Context, id uuid.UUID, to State
 
 func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*Stage, error) {
 	q := rundb.New(r.pool)
+
+	var gateType *string
+	var blockingChecks []string
+	var approversBytes []byte
+	if p.Gate != nil {
+		k := string(p.Gate.Kind)
+		gateType = &k
+		blockingChecks = p.Gate.BlockingChecks
+		if p.Gate.Approvers != nil {
+			b, err := json.Marshal(p.Gate.Approvers)
+			if err != nil {
+				return nil, fmt.Errorf("marshal gate approvers: %w", err)
+			}
+			approversBytes = b
+		}
+	}
+
 	row, err := q.CreateStage(ctx, rundb.CreateStageParams{
-		ID:               uuid.New(),
-		RunID:            p.RunID,
-		Sequence:         int32(p.Sequence),
-		StageType:        string(p.Type),
-		ExecutorKind:     string(p.ExecutorKind),
-		ExecutorRef:      p.ExecutorRef,
-		State:            string(StageStatePending),
-		GateSla:          p.GateSLA,
-		RequiresApproval: p.RequiresApproval,
+		ID:                 uuid.New(),
+		RunID:              p.RunID,
+		Sequence:           int32(p.Sequence),
+		StageType:          string(p.Type),
+		ExecutorKind:       string(p.ExecutorKind),
+		ExecutorRef:        p.ExecutorRef,
+		State:              string(StageStatePending),
+		GateSla:            p.GateSLA,
+		RequiresApproval:   p.RequiresApproval,
+		GateType:           gateType,
+		GateBlockingChecks: blockingChecks,
+		GateApprovers:      approversBytes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create stage: %w", err)
@@ -368,6 +389,26 @@ func rowToStage(s rundb.Stage) *Stage {
 	if s.FailureCategory != nil {
 		fc := FailureCategory(*s.FailureCategory)
 		out.FailureCategory = &fc
+	}
+	if s.GateType != nil {
+		// Pre-#213 rows have NULL gate_type; nil Gate is the right
+		// projection in that case (mirror dispatcher's logic that
+		// only writes Gate when the spec defines one).
+		gate := &Gate{
+			Kind:           GateKind(*s.GateType),
+			BlockingChecks: s.GateBlockingChecks,
+		}
+		if len(s.GateApprovers) > 0 {
+			var ap GateApprovers
+			// Persist failure shouldn't crash the read path — drop the
+			// approvers payload and keep the rest. The DB-side write
+			// went through json.Marshal so this should never trigger
+			// in practice.
+			if err := json.Unmarshal(s.GateApprovers, &ap); err == nil {
+				gate.Approvers = &ap
+			}
+		}
+		out.Gate = gate
 	}
 	return out
 }

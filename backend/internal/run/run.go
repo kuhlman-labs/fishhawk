@@ -198,6 +198,49 @@ type Stage struct {
 	// workflow spec on every upload. Per migration 0013 (#207).
 	RequiresApproval bool
 
+	// Gate is the workflow-spec gate shape captured at stage-create
+	// time. Nil when the stage has no gate; otherwise carries the
+	// gate's type, blocking_checks, and approvers so downstream
+	// surfaces (the review-stage detail UI, future check-state
+	// ingestion) don't need to re-parse the spec at request time.
+	// v0 stages typically carry one gate; if multiple are
+	// configured the dispatcher persists the *primary* one (first
+	// approval gate, else first check gate). Per migration 0014
+	// (#213).
+	Gate *Gate
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// GateKind names the two flavors of gate the workflow spec admits:
+// approval (humans must act) and check (named status checks must
+// pass). Mirrors spec.GateType but lives in the run package so the
+// stages row's persisted shape doesn't depend on the spec parser.
+type GateKind string
+
+// Gate kinds per the workflow spec.
+const (
+	GateKindApproval GateKind = "approval"
+	GateKindCheck    GateKind = "check"
+)
+
+// GateApprovers names the roles whose members can satisfy an approval
+// gate. Exactly one of AnyOf or AllOf is set when populated; both nil
+// means the gate has no approvers (either it's a check gate or the
+// stage isn't gated). Mirrors spec.Approvers shape on the wire.
+type GateApprovers struct {
+	AnyOf []string `json:"any_of,omitempty"`
+	AllOf []string `json:"all_of,omitempty"`
+}
+
+// Gate is the persisted shape of a stage's workflow-spec gate. The
+// review-stage UI reads it to render blocking_checks and decide
+// whether to surface the approval panel. Persisted to
+// stages.gate_type / .gate_blocking_checks / .gate_approvers per
+// migration 0014.
+type Gate struct {
+	Kind           GateKind
+	BlockingChecks []string
+	Approvers      *GateApprovers
 }

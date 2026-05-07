@@ -52,6 +52,27 @@ export function describeFailure(cat: FailureCategory | null | undefined): string
   return FAILURE_DESCRIPTIONS[cat] ?? cat;
 }
 
+/**
+ * The persisted shape of a stage's workflow-spec gate (#213). Mirrors
+ * the StageGate schema in docs/api/v0.openapi.yaml. Approval gates
+ * carry approvers; check gates don't. blocking_checks lists the
+ * named checks the gate depends on; v0 doesn't yet ingest their
+ * states (a follow-up surface), so the review UI renders the names
+ * with a "not tracked yet" placeholder.
+ */
+export type StageGateType = 'approval' | 'check';
+
+export interface StageGateApprovers {
+  any_of?: string[];
+  all_of?: string[];
+}
+
+export interface StageGate {
+  type: StageGateType;
+  blocking_checks?: string[];
+  approvers?: StageGateApprovers | null;
+}
+
 export interface Stage {
   id: string;
   run_id: string;
@@ -63,6 +84,12 @@ export interface Stage {
   ended_at: string | null;
   failure_category: FailureCategory | null;
   failure_reason: string | null;
+  /**
+   * Persisted workflow-spec gate. Omitted when the stage has no gate
+   * (e.g. implement, or pre-#213 rows). The review-stage detail page
+   * reads this to render blocking_checks + the approval panel.
+   */
+  gate?: StageGate;
   created_at: string;
   updated_at: string;
 }

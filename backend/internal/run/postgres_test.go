@@ -620,3 +620,125 @@ func TestPostgres_ListStagesForRun_OrderedBySequence(t *testing.T) {
 		}
 	}
 }
+
+func TestPostgres_StageGate_RoundTripPreservesShape(t *testing.T) {
+	// Per #213: the dispatcher writes the workflow-spec gate shape
+	// onto the stages row so the review-stage UI can render it
+	// without re-parsing the spec. Round-trip a populated Gate
+	// (kind + blocking_checks + approvers) through CreateStage +
+	// GetStage + ListStagesForRun and assert nothing's dropped.
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	r := makeRun(t, repo)
+
+	s, err := repo.CreateStage(context.Background(), run.CreateStageParams{
+		RunID:            r.ID,
+		Sequence:         0,
+		Type:             run.StageTypeReview,
+		ExecutorKind:     run.ExecutorHuman,
+		ExecutorRef:      "human",
+		RequiresApproval: true,
+		Gate: &run.Gate{
+			Kind:           run.GateKindApproval,
+			BlockingChecks: []string{"ci_pass", "fishhawk_audit_complete"},
+			Approvers: &run.GateApprovers{
+				AnyOf: []string{"founder", "tech-lead"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	if s.Gate == nil {
+		t.Fatal("CreateStage returned Gate=nil; want round-tripped shape")
+	}
+	if s.Gate.Kind != run.GateKindApproval {
+		t.Errorf("Gate.Kind = %q, want approval", s.Gate.Kind)
+	}
+	if got := s.Gate.BlockingChecks; len(got) != 2 || got[0] != "ci_pass" || got[1] != "fishhawk_audit_complete" {
+		t.Errorf("Gate.BlockingChecks = %v", got)
+	}
+	if s.Gate.Approvers == nil || len(s.Gate.Approvers.AnyOf) != 2 {
+		t.Fatalf("Gate.Approvers = %+v, want any_of with 2 entries", s.Gate.Approvers)
+	}
+
+	got, err := repo.GetStage(context.Background(), s.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.Gate == nil || got.Gate.Kind != run.GateKindApproval {
+		t.Errorf("GetStage Gate = %+v", got.Gate)
+	}
+
+	stages, err := repo.ListStagesForRun(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	if len(stages) != 1 || stages[0].Gate == nil {
+		t.Fatalf("ListStagesForRun returned %d stages; first.Gate=%+v",
+			len(stages), stages[0].Gate)
+	}
+}
+
+func TestPostgres_StageGate_NilWhenSpecHasNoGate(t *testing.T) {
+	// The dispatcher passes Gate=nil for gateless stages (e.g.
+	// implement). The persisted row's Gate must come back nil too,
+	// otherwise the UI would mis-render an "approval coming" panel
+	// for a stage that's never going to need one.
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	r := makeRun(t, repo)
+
+	s, err := repo.CreateStage(context.Background(), run.CreateStageParams{
+		RunID:        r.ID,
+		Sequence:     0,
+		Type:         run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+		// Gate omitted.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Gate != nil {
+		t.Errorf("CreateStage Gate = %+v, want nil", s.Gate)
+	}
+	got, err := repo.GetStage(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Gate != nil {
+		t.Errorf("GetStage Gate = %+v, want nil", got.Gate)
+	}
+}
+
+func TestPostgres_StageGate_CheckGateHasNoApprovers(t *testing.T) {
+	// routine_change.workflows.yaml's review stage uses a check-only
+	// gate (no approvers; just blocking_checks). The persisted Gate
+	// must reflect Kind=check and Approvers=nil so the UI can
+	// suppress the approval panel.
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	r := makeRun(t, repo)
+
+	s, err := repo.CreateStage(context.Background(), run.CreateStageParams{
+		RunID:        r.ID,
+		Sequence:     0,
+		Type:         run.StageTypeReview,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+		Gate: &run.Gate{
+			Kind:           run.GateKindCheck,
+			BlockingChecks: []string{"ci_pass"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Gate == nil || s.Gate.Kind != run.GateKindCheck {
+		t.Fatalf("Gate = %+v", s.Gate)
+	}
+	if s.Gate.Approvers != nil {
+		t.Errorf("Approvers = %+v, want nil for check gate", s.Gate.Approvers)
+	}
+}

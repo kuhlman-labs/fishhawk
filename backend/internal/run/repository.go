@@ -47,6 +47,14 @@ type CreateStageParams struct {
 	// to awaiting_approval; false → walk to succeeded directly.
 	// Per migration 0013 (#207).
 	RequiresApproval bool
+
+	// Gate captures the workflow-spec gate shape so downstream
+	// surfaces (the review-stage UI, future check-state ingestion)
+	// don't need to re-parse the spec. Per migration 0014 (#213).
+	// Nil when the stage has no gate; otherwise carries the *first*
+	// gate's type / blocking_checks / approvers (mirrors how
+	// GateSLA / RequiresApproval scope to the first approval gate).
+	Gate *Gate
 }
 
 // StageCompletion captures the optional metadata that accompanies a
