@@ -751,6 +751,71 @@ func TestListRunAudit_CategoryFilter(t *testing.T) {
 	}
 }
 
+// TestListRunAudit_StageFilter verifies the stage_id query param
+// (#215) narrows the per-run feed to entries for that stage. The
+// implement-stage session view depends on this so the activity
+// feed shows only the session's events, not sibling stages'.
+func TestListRunAudit_StageFilter(t *testing.T) {
+	stageA := uuid.New()
+	stageB := uuid.New()
+	rid := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+
+	mk := func(stageID uuid.UUID, seq int64, cat string) *audit.Entry {
+		return &audit.Entry{
+			ID:        uuid.New(),
+			Sequence:  seq,
+			RunID:     &rid,
+			StageID:   &stageID,
+			Timestamp: time.Date(2026, 5, 7, 10, 0, int(seq), 0, time.UTC),
+			Category:  cat,
+			Payload:   json.RawMessage(`{}`),
+			EntryHash: fmt.Sprintf("hash-%d", seq),
+		}
+	}
+	a := newAuditReadFake()
+	a.all = []*audit.Entry{
+		mk(stageA, 1, "stage_dispatched"),
+		mk(stageB, 2, "stage_dispatched"),
+		mk(stageA, 3, "trace_uploaded"),
+		mk(stageB, 4, "trace_uploaded"),
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?stage_id=%s", rid, stageA), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []auditEntryResponse `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("items = %d, want 2 (stageA only)", len(got.Items))
+	}
+	for _, e := range got.Items {
+		if e.StageID == nil || *e.StageID != stageA {
+			t.Errorf("filter leaked: got StageID %v, want %v", e.StageID, stageA)
+		}
+	}
+}
+
+func TestListRunAudit_BadStageID_400(t *testing.T) {
+	a := newAuditReadFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?stage_id=not-a-uuid", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 on malformed stage_id", w.Code)
+	}
+}
+
 func TestListRunAudit_BadLimit(t *testing.T) {
 	a := newAuditReadFake()
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -406,4 +407,128 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestGetStagePromptRender_HappyPath_NoSignatureRequired confirms the
+// SPA-side endpoint constructs the same prompt as the runner's path
+// without requiring X-Fishhawk-Signature (#215). Auth tracks the
+// existing stage/audit reads — no header check at the handler level.
+func TestGetStagePromptRender_HappyPath_NoSignatureRequired(t *testing.T) {
+	s, rr, _, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	installation := int64(99)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "Body text", State: "open"}
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", stageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StageType != "implement" {
+		t.Errorf("StageType = %q", resp.StageType)
+	}
+	for _, want := range []string{"Add foo", "Body text", "Triggering issue: #42"} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("prompt missing %q:\n%s", want, resp.Prompt)
+		}
+	}
+}
+
+// TestGetStagePromptRender_MatchesSignatureAuthedPath asserts both
+// endpoints produce byte-identical prompts for the same stage —
+// they have to, because the audit story depends on the SPA showing
+// the same text the runner saw.
+func TestGetStagePromptRender_MatchesSignatureAuthedPath(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	installation := int64(99)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "T", Body: "B", State: "open"}
+
+	signed := promptRequest(t, s, runID, stageID, priv, "")
+	if signed.Code != http.StatusOK {
+		t.Fatalf("signed status = %d", signed.Code)
+	}
+	rendered := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", stageID), nil)
+	rw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rw, rendered)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("rendered status = %d", rw.Code)
+	}
+
+	var signedBody, renderedBody promptResponse
+	_ = json.Unmarshal(signed.Body.Bytes(), &signedBody)
+	_ = json.Unmarshal(rw.Body.Bytes(), &renderedBody)
+	if signedBody.Prompt != renderedBody.Prompt {
+		t.Errorf("prompt diverged between signed + rendered paths:\nsigned:\n%s\n---\nrendered:\n%s",
+			signedBody.Prompt, renderedBody.Prompt)
+	}
+	if signedBody.PromptHash != renderedBody.PromptHash {
+		t.Errorf("hash diverged: %q vs %q", signedBody.PromptHash, renderedBody.PromptHash)
+	}
+}
+
+func TestGetStagePromptRender_StageNotFound(t *testing.T) {
+	s, rr, _, _ := newPromptServer(t)
+	rr.stageErr = run.ErrNotFound
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/stages/"+uuid.New().String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestGetStagePromptRender_BadStageUUID(t *testing.T) {
+	s, _, _, _ := newPromptServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/not-a-uuid/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestGetStagePromptRender_Unconfigured(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/stages/"+uuid.New().String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
 }

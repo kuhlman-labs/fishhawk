@@ -6,14 +6,16 @@ import { isStandardV1Plan, type StandardV1Plan } from '@/api/plan';
 import { isPullRequestArtifact, type PullRequestArtifactBody } from '@/api/pull-request';
 import type { Artifact, Stage } from '@/api/types';
 import { FailureBanner } from '@/components/failure-banner';
+import { ImplementSessionDocument } from '@/implement/session-document';
 import { PlanDocument } from '@/plan/plan-document';
-import { PullRequestDocument } from '@/pull-request/pr-document';
 import { ReviewDocument } from '@/review/review-document';
 
 /*
  * Stage detail. Dispatches on stage.type:
  *   - plan      → PlanDocument fed the most-recent standard_v1 plan artifact
- *   - implement → PullRequestDocument fed the most-recent pull_request artifact (#205)
+ *   - implement → ImplementSessionDocument: prompt + per-stage audit feed
+ *                 + a small PR-link footer (#215, replacing the old
+ *                 PR-card-as-page that was redundant with review)
  *   - review    → ReviewDocument fed the implement stage's pull_request artifact (#213)
  *   - other     → placeholder
  *
@@ -102,20 +104,15 @@ function StageDetailView({
           </p>
         ))}
 
-      {stage.type === 'implement' &&
-        (prArtifact ? (
-          <PullRequestArtifact
-            artifactId={prArtifact.id}
-            stage={stage}
-            runId={runId}
-            onStageUpdate={setStage}
-            onStageRollback={setStage}
-          />
-        ) : (
-          <p className="text-sm text-neutral-500">
-            No pull-request artifact attached to this stage yet.
-          </p>
-        ))}
+      {stage.type === 'implement' && (
+        <ImplementSessionArtifact
+          prArtifactId={prArtifact?.id ?? null}
+          stage={stage}
+          runId={runId}
+          onStageUpdate={setStage}
+          onStageRollback={setStage}
+        />
+      )}
 
       {stage.type === 'review' && (
         <ReviewArtifact
@@ -188,53 +185,75 @@ function PlanArtifact({
   );
 }
 
-interface PullRequestArtifactProps {
-  artifactId: string;
+interface ImplementSessionArtifactProps {
+  prArtifactId: string | null;
   stage: Stage;
   runId: string;
   onStageUpdate: (next: Stage) => void;
   onStageRollback: (prev: Stage) => void;
 }
 
-function PullRequestArtifact({
-  artifactId,
+/*
+ * Loader for the implement-stage session view (#215). The session
+ * itself (prompt + audit feed) is the page; the PR artifact is one
+ * footer row. So the loader renders the page eagerly even when no
+ * PR is available yet — early in the stage lifecycle that's the
+ * common case — and just passes pullRequest=null. When the PR
+ * artifact is present but malformed, we surface a labelled warning
+ * inline rather than blocking the whole page.
+ */
+function ImplementSessionArtifact({
+  prArtifactId,
   stage,
   runId,
   onStageUpdate,
   onStageRollback,
-}: PullRequestArtifactProps) {
-  const result = useAsync(() => api.getArtifact<unknown>(artifactId), [artifactId]);
+}: ImplementSessionArtifactProps) {
+  const result = useAsync(
+    () => (prArtifactId ? api.getArtifact<unknown>(prArtifactId) : Promise.resolve(null)),
+    [prArtifactId],
+  );
 
   if (result.status === 'loading') {
-    return <div className="text-sm text-neutral-500">Loading pull request…</div>;
+    return <div className="text-sm text-neutral-500">Loading session…</div>;
   }
   if (result.status === 'error') {
     return <ErrorBox label="pull-request artifact" error={result.error} />;
   }
 
-  const content = result.data.content;
-  if (!isPullRequestArtifact(content)) {
-    return (
-      <div
-        role="alert"
-        className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
-      >
-        <div className="font-medium">Unrecognized pull-request artifact shape.</div>
-        <div className="mt-1 font-mono text-xs">
-          schema_version={result.data.schema_version ?? 'null'} · kind={result.data.kind}
+  let pullRequest: PullRequestArtifactBody | null = null;
+  let warning: React.ReactNode = null;
+
+  if (result.data) {
+    const content = result.data.content;
+    if (isPullRequestArtifact(content)) {
+      pullRequest = content as PullRequestArtifactBody;
+    } else {
+      warning = (
+        <div
+          role="alert"
+          className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
+        >
+          <div className="font-medium">Unrecognized pull-request artifact shape.</div>
+          <div className="mt-1 font-mono text-xs">
+            schema_version={result.data.schema_version ?? 'null'} · kind={result.data.kind}
+          </div>
         </div>
-      </div>
-    );
+      );
+    }
   }
 
   return (
-    <PullRequestDocument
-      artifact={content as PullRequestArtifactBody}
-      stage={stage}
-      runId={runId}
-      onStageUpdate={onStageUpdate}
-      onStageRollback={onStageRollback}
-    />
+    <>
+      {warning}
+      <ImplementSessionDocument
+        stage={stage}
+        runId={runId}
+        pullRequest={pullRequest}
+        onStageUpdate={onStageUpdate}
+        onStageRollback={onStageRollback}
+      />
+    </>
   );
 }
 
