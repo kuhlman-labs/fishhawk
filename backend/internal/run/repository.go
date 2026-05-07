@@ -40,6 +40,13 @@ type CreateStageParams struct {
 	// gate has no SLA. The SLA ticker reads it back to detect
 	// awaiting_approval timeouts.
 	GateSLA *string
+
+	// RequiresApproval is true when the workflow-spec stage
+	// definition includes any approval-typed gate. Determines the
+	// trace-upload-handler's post-upload transition: true → walk
+	// to awaiting_approval; false → walk to succeeded directly.
+	// Per migration 0013 (#207).
+	RequiresApproval bool
 }
 
 // StageCompletion captures the optional metadata that accompanies a

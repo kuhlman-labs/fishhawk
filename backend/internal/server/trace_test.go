@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -444,6 +445,64 @@ func TestShipTrace_TransitionsStageToAwaitingApproval(t *testing.T) {
 	if rr.transitions[0].To != run.StageStateRunning ||
 		rr.transitions[1].To != run.StageStateAwaitingApproval {
 		t.Errorf("transitions = %+v, want [running, awaiting_approval]", rr.transitions)
+	}
+}
+
+func TestShipTrace_GatelessStage_TransitionsStraightToSucceeded(t *testing.T) {
+	// Implement stages have no approval gate per workflows.yaml.
+	// The trace upload handler must walk dispatched → running →
+	// succeeded directly (skipping awaiting_approval) and trigger
+	// the orchestrator so the next stage gets dispatched. Without
+	// this branch the stage hangs at awaiting_approval waiting for
+	// a human action the workflow author never specified. (#207.)
+	s, sf, _, _ := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedGatelessStage(run.StageStateDispatched)
+	s.cfg.RunRepo = rr
+	// Wire a real orchestrator (no GitHub client; dispatch is a
+	// no-op for human stages, which is fine for this assertion).
+	s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: rr}
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if rr.stages[stage.ID].State != run.StageStateSucceeded {
+		t.Errorf("gateless stage state = %q, want succeeded", rr.stages[stage.ID].State)
+	}
+	// Two-step walk: dispatched → running → succeeded. (No
+	// awaiting_approval — that's the bug we're fixing.)
+	if len(rr.transitions) < 2 {
+		t.Fatalf("transitions = %d, want at least 2:\n%+v", len(rr.transitions), rr.transitions)
+	}
+	if rr.transitions[0].To != run.StageStateRunning {
+		t.Errorf("transitions[0] = %q, want running", rr.transitions[0].To)
+	}
+	if rr.transitions[1].To != run.StageStateSucceeded {
+		t.Errorf("transitions[1] = %q, want succeeded (NOT awaiting_approval)", rr.transitions[1].To)
+	}
+}
+
+func TestShipTrace_GatelessStage_NoOrchestrator_StillTransitionsToSucceeded(t *testing.T) {
+	// Without an orchestrator wired the trace handler still
+	// transitions the stage to succeeded — the orchestrator just
+	// can't dispatch the next stage. Confirms the orchestrator
+	// invocation is best-effort, not load-bearing for the
+	// transition itself.
+	s, sf, _, _ := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedGatelessStage(run.StageStateDispatched)
+	s.cfg.RunRepo = rr
+	// No orchestrator wired.
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if rr.stages[stage.ID].State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded even without orchestrator", rr.stages[stage.ID].State)
 	}
 }
 

@@ -149,14 +149,15 @@ func (r *postgresRepo) TransitionRun(ctx context.Context, id uuid.UUID, to State
 func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*Stage, error) {
 	q := rundb.New(r.pool)
 	row, err := q.CreateStage(ctx, rundb.CreateStageParams{
-		ID:           uuid.New(),
-		RunID:        p.RunID,
-		Sequence:     int32(p.Sequence),
-		StageType:    string(p.Type),
-		ExecutorKind: string(p.ExecutorKind),
-		ExecutorRef:  p.ExecutorRef,
-		State:        string(StageStatePending),
-		GateSla:      p.GateSLA,
+		ID:               uuid.New(),
+		RunID:            p.RunID,
+		Sequence:         int32(p.Sequence),
+		StageType:        string(p.Type),
+		ExecutorKind:     string(p.ExecutorKind),
+		ExecutorRef:      p.ExecutorRef,
+		State:            string(StageStatePending),
+		GateSla:          p.GateSLA,
+		RequiresApproval: p.RequiresApproval,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create stage: %w", err)
@@ -343,17 +344,18 @@ func rowToRun(r rundb.Run) *Run {
 
 func rowToStage(s rundb.Stage) *Stage {
 	out := &Stage{
-		ID:            s.ID,
-		RunID:         s.RunID,
-		Sequence:      int(s.Sequence),
-		Type:          StageType(s.StageType),
-		ExecutorKind:  ExecutorKind(s.ExecutorKind),
-		ExecutorRef:   s.ExecutorRef,
-		State:         StageState(s.State),
-		FailureReason: s.FailureReason,
-		GateSLA:       s.GateSla,
-		CreatedAt:     s.CreatedAt.Time,
-		UpdatedAt:     s.UpdatedAt.Time,
+		ID:               s.ID,
+		RunID:            s.RunID,
+		Sequence:         int(s.Sequence),
+		Type:             StageType(s.StageType),
+		ExecutorKind:     ExecutorKind(s.ExecutorKind),
+		ExecutorRef:      s.ExecutorRef,
+		State:            StageState(s.State),
+		FailureReason:    s.FailureReason,
+		GateSLA:          s.GateSla,
+		RequiresApproval: s.RequiresApproval,
+		CreatedAt:        s.CreatedAt.Time,
+		UpdatedAt:        s.UpdatedAt.Time,
 	}
 	if s.StartedAt.Valid {
 		t := s.StartedAt.Time

@@ -101,11 +101,28 @@ func (r *approvalRunRepo) seedStage(state run.StageState) *run.Stage {
 		ExecutorKind: run.ExecutorAgent,
 		ExecutorRef:  "claude-code",
 		State:        state,
-		CreatedAt:    time.Now().UTC(),
-		UpdatedAt:    time.Now().UTC(),
+		// Default to gated (RequiresApproval=true) — matches the
+		// historical post-trace-upload semantics of every existing
+		// test that calls this helper. Use seedGatelessStage when
+		// the test specifically wants implement-stage behavior.
+		RequiresApproval: true,
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
 	}
 	r.mu.Lock()
 	r.stages[st.ID] = st
+	r.mu.Unlock()
+	return st
+}
+
+// seedGatelessStage seeds a stage whose workflow-spec definition
+// has no approval gate — implement-stage semantics. Trace upload
+// transitions these straight to succeeded. (#207)
+func (r *approvalRunRepo) seedGatelessStage(state run.StageState) *run.Stage {
+	st := r.seedStage(state)
+	r.mu.Lock()
+	st.RequiresApproval = false
+	st.Type = run.StageTypeImplement
 	r.mu.Unlock()
 	return st
 }

@@ -244,15 +244,17 @@ func (s *stubRuns) CreateStage(_ context.Context, p run.CreateStageParams) (*run
 		return nil, s.createStageErr
 	}
 	st := &run.Stage{
-		ID:           uuid.New(),
-		RunID:        p.RunID,
-		Sequence:     p.Sequence,
-		Type:         p.Type,
-		ExecutorKind: p.ExecutorKind,
-		ExecutorRef:  p.ExecutorRef,
-		State:        run.StageStatePending,
-		CreatedAt:    time.Now().UTC(),
-		UpdatedAt:    time.Now().UTC(),
+		ID:               uuid.New(),
+		RunID:            p.RunID,
+		Sequence:         p.Sequence,
+		Type:             p.Type,
+		ExecutorKind:     p.ExecutorKind,
+		ExecutorRef:      p.ExecutorRef,
+		State:            run.StageStatePending,
+		GateSLA:          p.GateSLA,
+		RequiresApproval: p.RequiresApproval,
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
 	}
 	s.createdStages = append(s.createdStages, st)
 	return st, nil
@@ -906,5 +908,81 @@ func TestStringPtr(t *testing.T) {
 	p := stringPtr("hello")
 	if p == nil || *p != "hello" {
 		t.Errorf("stringPtr broken: %v", p)
+	}
+}
+
+func TestHandle_PersistsRequiresApprovalPerStageGate(t *testing.T) {
+	// Per #207: stages with an approval-typed gate must have
+	// RequiresApproval=true at create time so the trace upload
+	// handler picks the right post-upload transition. Stages
+	// without an approval gate must have RequiresApproval=false.
+	const multiStageSpec = `version: "0.1"
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow with mixed gating
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        # NO gates — implement is a pure agent stage.
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+`
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.specContent = []byte(multiStageSpec)
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.createdStages) != 3 {
+		t.Fatalf("createdStages = %d, want 3 (plan/implement/review)", len(runs.createdStages))
+	}
+
+	want := []struct {
+		stageType        string
+		requiresApproval bool
+	}{
+		{"plan", true},       // approval gate
+		{"implement", false}, // no gate
+		{"review", true},     // approval gate
+	}
+	for i, w := range want {
+		got := runs.createdStages[i]
+		if string(got.Type) != w.stageType {
+			t.Errorf("stage %d type = %q, want %q", i, got.Type, w.stageType)
+		}
+		if got.RequiresApproval != w.requiresApproval {
+			t.Errorf("stage %d (%s) RequiresApproval = %v, want %v",
+				i, w.stageType, got.RequiresApproval, w.requiresApproval)
+		}
 	}
 }

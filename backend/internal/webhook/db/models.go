@@ -86,20 +86,21 @@ type SigningKey struct {
 }
 
 type Stage struct {
-	ID              pgtype.UUID        `json:"id"`
-	RunID           pgtype.UUID        `json:"run_id"`
-	Sequence        int32              `json:"sequence"`
-	StageType       string             `json:"stage_type"`
-	ExecutorKind    string             `json:"executor_kind"`
-	ExecutorRef     string             `json:"executor_ref"`
-	State           string             `json:"state"`
-	StartedAt       pgtype.Timestamptz `json:"started_at"`
-	EndedAt         pgtype.Timestamptz `json:"ended_at"`
-	FailureCategory *string            `json:"failure_category"`
-	FailureReason   *string            `json:"failure_reason"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
-	GateSla         *string            `json:"gate_sla"`
+	ID               pgtype.UUID        `json:"id"`
+	RunID            pgtype.UUID        `json:"run_id"`
+	Sequence         int32              `json:"sequence"`
+	StageType        string             `json:"stage_type"`
+	ExecutorKind     string             `json:"executor_kind"`
+	ExecutorRef      string             `json:"executor_ref"`
+	State            string             `json:"state"`
+	StartedAt        pgtype.Timestamptz `json:"started_at"`
+	EndedAt          pgtype.Timestamptz `json:"ended_at"`
+	FailureCategory  *string            `json:"failure_category"`
+	FailureReason    *string            `json:"failure_reason"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	GateSla          *string            `json:"gate_sla"`
+	RequiresApproval bool               `json:"requires_approval"`
 }
 
 type User struct {

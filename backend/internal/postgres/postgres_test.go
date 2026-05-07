@@ -202,23 +202,30 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0012 added a synthetic id
-	// column on signing_keys (and dropped the run_id PRIMARY KEY
-	// constraint). Down restores the prior shape: the id column
-	// is gone, run_id is the PK again. Confirm both, plus that
-	// every table / column from earlier migrations is still there
-	// (e.g. runs.idempotency_key from 0011, users + sessions from
-	// 0010, audit run_id nullability from 0009, api_tokens from
-	// 0008, etc.).
-	var signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0013 added a
+	// stages.requires_approval column. Down drops it. Confirm: the
+	// column is gone, but every prior migration's effect is still
+	// present (signing_keys.id from 0012, runs.idempotency_key
+	// from 0011, users + sessions from 0010, audit run_id
+	// nullability from 0009, etc.).
+	var requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'stages' AND column_name = 'requires_approval'`,
+	).Scan(&requiresApprovalCol); err != nil {
+		t.Fatalf("query stages.requires_approval column: %v", err)
+	}
+	if requiresApprovalCol != 0 {
+		t.Errorf("stages.requires_approval count after MigrateDown = %d, want 0 (0013 rolled back)", requiresApprovalCol)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'signing_keys' AND column_name = 'id'`,
 	).Scan(&signingIDCol); err != nil {
 		t.Fatalf("query signing_keys.id column: %v", err)
 	}
-	if signingIDCol != 0 {
-		t.Errorf("signing_keys.id count after MigrateDown = %d, want 0 (0012 rolled back)", signingIDCol)
+	if signingIDCol != 1 {
+		t.Errorf("signing_keys.id count after MigrateDown = %d, want 1 (0012 still applied)", signingIDCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
