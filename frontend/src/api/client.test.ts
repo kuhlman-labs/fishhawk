@@ -94,3 +94,40 @@ describe('api request CSRF auto-attach', () => {
     expect(init.credentials).toBe('include');
   });
 });
+
+describe('api.listGlobalAudit', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('hits /v0/audit with no query string when no params are passed', async () => {
+    const fetchMock = mockFetch();
+    await api.listGlobalAudit();
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toMatch(/\/v0\/audit$/);
+  });
+
+  it('serialises every filter into the query string (snake_case for run_id)', async () => {
+    const fetchMock = mockFetch();
+    await api.listGlobalAudit({
+      limit: 20,
+      cursor: 'abc',
+      category: 'plan_generated',
+      runId: '11111111-2222-3333-4444-555555555555',
+    });
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toContain('limit=20');
+    expect(url).toContain('cursor=abc');
+    expect(url).toContain('category=plan_generated');
+    expect(url).toContain('run_id=11111111-2222-3333-4444-555555555555');
+  });
+
+  it('omits empty / undefined params from the query string', async () => {
+    const fetchMock = mockFetch();
+    await api.listGlobalAudit({ limit: 100 });
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toContain('limit=100');
+    expect(url).not.toContain('cursor=');
+    expect(url).not.toContain('category=');
+    expect(url).not.toContain('run_id=');
+  });
+});

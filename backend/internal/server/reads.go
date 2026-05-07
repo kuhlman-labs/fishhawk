@@ -330,6 +330,72 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleListGlobalAudit implements GET /v0/audit (#211).
+//
+// Cross-chain feed for the audit-log search surface: returns entries
+// from per-run rows AND global-chain rows in one time-descending
+// page, optionally filtered by category and run_id. Same cursor +
+// limit envelope as handleListRunAudit so the SPA's usePaginated hook
+// works against either endpoint.
+//
+// Distinct from /v0/runs/{run_id}/audit (which is sequence-ascending,
+// scoped to one run, used by the run-detail audit list and the
+// per-run verifier path) and from the repository's ListGlobal (which
+// only walks the global-chain partition for export + verify).
+func (s *Server) handleListGlobalAudit(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuditRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "audit_repo_unconfigured",
+			"audit endpoint requires a configured audit repository", nil)
+		return
+	}
+	q := r.URL.Query()
+
+	limit, err := parseLimit(q.Get("limit"), auditDefaultLimit, auditMaxLimit)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			err.Error(), map[string]any{"field": "limit"})
+		return
+	}
+	offset, err := decodeOffsetCursor(q.Get("cursor"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "cursor_invalid",
+			err.Error(), nil)
+		return
+	}
+
+	params := audit.ListAllParams{}
+	if cat := q.Get("category"); cat != "" {
+		params.Category = &cat
+	}
+	if rawRun := q.Get("run_id"); rawRun != "" {
+		runID, err := uuid.Parse(rawRun)
+		if err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"run_id must be a valid UUID",
+				map[string]any{"field": "run_id", "got": rawRun})
+			return
+		}
+		params.RunID = &runID
+	}
+
+	entries, err := s.cfg.AuditRepo.ListAll(r.Context(), params)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list audit failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	page, nextCursor := pageOffset(entries, offset, limit)
+	items := make([]auditEntryResponse, 0, len(page))
+	for _, e := range page {
+		items = append(items, toAuditEntryResponse(e))
+	}
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
+		"items":       items,
+		"next_cursor": nextCursor,
+	})
+}
+
 // parseLimit reads a query value with min=1, max=hardMax, returning
 // def when the value is absent. Clamping with an explicit error
 // keeps clients honest about the contract rather than silently

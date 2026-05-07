@@ -148,6 +148,55 @@ func (q *Queries) GetLastGlobalAuditEntry(ctx context.Context) (AuditEntry, erro
 	return i, err
 }
 
+const listAuditEntriesAll = `-- name: ListAuditEntriesAll :many
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
+ WHERE ($1::text IS NULL OR category = $1::text)
+   AND ($2::uuid  IS NULL OR run_id   = $2::uuid)
+ ORDER BY ts DESC, id DESC
+`
+
+type ListAuditEntriesAllParams struct {
+	Category *string    `json:"category"`
+	RunID    *uuid.UUID `json:"run_id"`
+}
+
+// Cross-chain feed (per-run rows + global-chain rows) used by the
+// audit-log search surface (#211). Time-descending so the most-recent
+// governance event is at the top; secondary sort on (id) keeps ordering
+// deterministic when entries share a millisecond. Optional category +
+// run_id filters; sqlc.narg makes them omittable from the WHERE.
+func (q *Queries) ListAuditEntriesAll(ctx context.Context, arg ListAuditEntriesAllParams) ([]AuditEntry, error) {
+	rows, err := q.db.Query(ctx, listAuditEntriesAll, arg.Category, arg.RunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditEntry
+	for rows.Next() {
+		var i AuditEntry
+		if err := rows.Scan(
+			&i.ID,
+			&i.Sequence,
+			&i.RunID,
+			&i.StageID,
+			&i.Ts,
+			&i.Category,
+			&i.ActorKind,
+			&i.ActorSubject,
+			&i.Payload,
+			&i.PrevHash,
+			&i.EntryHash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAuditEntriesByCategory = `-- name: ListAuditEntriesByCategory :many
 SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
 WHERE run_id = $1 AND category = $2

@@ -73,4 +73,20 @@ type Repository interface {
 	// the given category. Used for "show only failures" / "show only
 	// approvals" views and for the compliance export.
 	ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*Entry, error)
+
+	// ListAll returns entries across both chains (per-run rows and
+	// global-chain rows), ordered by ts descending — the audit-log
+	// search surface (#211) feeds off this. Filters are AND-combined
+	// and any subset may be nil. Note this is *not* the same as
+	// ListGlobal: the latter is the verifier's view of the global
+	// chain partition only; ListAll mixes both chains for human
+	// search.
+	ListAll(ctx context.Context, p ListAllParams) ([]*Entry, error)
+}
+
+// ListAllParams collects the optional filters for ListAll. nil means
+// "no filter on that field".
+type ListAllParams struct {
+	Category *string
+	RunID    *uuid.UUID
 }

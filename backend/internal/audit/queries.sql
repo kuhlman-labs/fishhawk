@@ -46,3 +46,14 @@ SELECT * FROM audit_entries
 SELECT * FROM audit_entries
  WHERE run_id IS NULL
  ORDER BY sequence ASC;
+
+-- name: ListAuditEntriesAll :many
+-- Cross-chain feed (per-run rows + global-chain rows) used by the
+-- audit-log search surface (#211). Time-descending so the most-recent
+-- governance event is at the top; secondary sort on (id) keeps ordering
+-- deterministic when entries share a millisecond. Optional category +
+-- run_id filters; sqlc.narg makes them omittable from the WHERE.
+SELECT * FROM audit_entries
+ WHERE (sqlc.narg(category)::text IS NULL OR category = sqlc.narg(category)::text)
+   AND (sqlc.narg(run_id)::uuid  IS NULL OR run_id   = sqlc.narg(run_id)::uuid)
+ ORDER BY ts DESC, id DESC;

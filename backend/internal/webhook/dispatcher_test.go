@@ -334,6 +334,9 @@ func (s *stubAudit) AppendGlobalChained(context.Context, audit.GlobalChainAppend
 func (s *stubAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+func (s *stubAudit) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
 func (s *stubAudit) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }

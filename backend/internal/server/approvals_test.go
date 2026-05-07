@@ -256,6 +256,9 @@ func (a *approvalAuditFake) AppendGlobalChained(context.Context, audit.GlobalCha
 func (a *approvalAuditFake) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
+func (a *approvalAuditFake) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *approvalAuditFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
