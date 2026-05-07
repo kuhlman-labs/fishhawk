@@ -23,11 +23,33 @@ func TestBuild_Implement_FullContext(t *testing.T) {
 		"Title: Add foo",
 		"We need a foo function in pkg/bar.",
 		"smallest set of changes",
+		// PR description guidance + the path the runner reads (#206).
+		PullRequestDescriptionPath,
+		// `Closes #N` instruction is conditional on a non-zero issue
+		// number — without it the merge wouldn't auto-close the
+		// originating issue.
+		"Closes #42",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
 			t.Errorf("prompt missing %q\n---\n%s", w, got)
 		}
+	}
+}
+
+func TestBuild_Implement_NoIssueRef_OmitsClosesGuidance(t *testing.T) {
+	// Manual / non-issue-triggered runs have IssueNumber == 0;
+	// `Closes #N` is meaningless and the prompt should not include
+	// it. The PR-description path guidance still applies.
+	got, err := Build("implement", Trigger{Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Closes #") {
+		t.Errorf("prompt should not mention 'Closes #' when IssueNumber is 0:\n%s", got)
+	}
+	if !strings.Contains(got, PullRequestDescriptionPath) {
+		t.Errorf("prompt missing PR description path even without issue context:\n%s", got)
 	}
 }
 

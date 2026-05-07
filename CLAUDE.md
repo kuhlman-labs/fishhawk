@@ -43,11 +43,15 @@ done
 
 `.golangci.yml` is **v2 format** (`version: "2"` at top). Local install must be golangci-lint v2.x; v1 binaries reject this config.
 
-**Coverage gate**: aggregate ≥ 80% excluding `internal/run/db` (sqlc-generated). Tiered targets in `docs/ARCHITECTURE.md` §9. CI fails `CI Pass` if the threshold drops. Reproduce locally:
+**Coverage gate**: aggregate ≥ 80% across **all** registered modules, excluding sqlc-generated `*/db/` packages (CI uses `--exclude '/db/'` so new sqlc packages auto-skip). Tiered targets in `docs/ARCHITECTURE.md` §9. CI fails `CI Pass` if the threshold drops. Reproduce locally:
 
 ```sh
-(cd backend && go test -race -coverprofile=coverage.out -covermode=atomic ./...)
-python3 scripts/check-coverage.py --threshold 80 --exclude internal/run/db backend/coverage.out
+profiles=()
+while IFS= read -r m; do
+  (cd "$m" && go test -race -coverprofile=coverage.out -covermode=atomic ./...)
+  profiles+=("$m/coverage.out")
+done < <(go work edit -json | jq -r '.Use[].DiskPath')
+python3 scripts/check-coverage.py --threshold 80 --exclude '/db/' "${profiles[@]}"
 ```
 
 ## Adding a Go module

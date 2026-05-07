@@ -803,13 +803,7 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 		repoDir = "."
 	}
 	branch := fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
-	title := fmt.Sprintf("Fishhawk: implement stage %s", shortID(cfg.stageID))
-	body := fmt.Sprintf(
-		"Opened by Fishhawk for run `%s`, stage `%s`.\n\n"+
-			"Branch: `%s`\n"+
-			"Audit log: see `%s/v0/runs/%s/audit`.\n",
-		cfg.runID, cfg.stageID, branch, strings.TrimRight(cfg.backendURL, "/"), cfg.runID,
-	)
+	title, body := prTitleAndBody(cfg, branch, logSink)
 	commitMessage := title + "\n\n" + body
 
 	cap, err := newPusher().CommitAndPush(ctx, gitops.CommitAndPushArgs{
@@ -896,4 +890,128 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:8]
+}
+
+// pullRequestDescriptionPath mirrors prompt.PullRequestDescriptionPath
+// in the backend. Hardcoded in both places by design — the runner
+// and the backend are independent Go modules; using the shared
+// string here is the cheapest coordination. v0.x can move to a
+// per-stage env var if multi-tenancy demands isolation. (#206.)
+//
+// var (not const) so tests can swap it for a t.TempDir-scoped path
+// and avoid /tmp pollution / parallel-test races.
+var pullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
+
+// prTitleAndBody assembles the PR title and body for the implement
+// stage. Tries the agent-authored file first; falls back to the
+// generic Fishhawk template when missing or malformed.
+//
+// Either way the body gets a "Fishhawk attribution" footer appended
+// — run id, audit-log URL, branch, and the PR's own branch — so
+// auditable provenance is preserved without requiring the agent to
+// remember to include it in every PR.
+func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body string) {
+	agentTitle, agentBody, kind := loadAgentAuthoredPR(logSink)
+
+	switch kind {
+	case prSourceAgent:
+		title = agentTitle
+		body = agentBody
+	case prSourceFallback:
+		title = fmt.Sprintf("Fishhawk: implement stage %s", shortID(cfg.stageID))
+		body = fmt.Sprintf(
+			"Opened by Fishhawk for run `%s`, stage `%s`.\n\nBranch: `%s`\nAudit log: see `%s/v0/runs/%s/audit`.\n",
+			cfg.runID, cfg.stageID, branch,
+			strings.TrimRight(cfg.backendURL, "/"), cfg.runID,
+		)
+		// Footer for fallback is rolled into the body itself, so
+		// don't double up below.
+		return title, body
+	}
+
+	// Agent-authored path: append the attribution footer so
+	// reviewers can find the run + audit log even when the agent's
+	// body doesn't mention them.
+	footer := fmt.Sprintf(
+		"\n\n---\n_Opened by [Fishhawk](https://github.com/kuhlman-labs/fishhawk) for run `%s`, stage `%s`._\n_Branch: `%s` · Audit log: `%s/v0/runs/%s/audit`._\n",
+		cfg.runID, cfg.stageID, branch,
+		strings.TrimRight(cfg.backendURL, "/"), cfg.runID,
+	)
+	return title, body + footer
+}
+
+// prSource categorizes where the PR title + body came from. Lets
+// callers branch on "agent wrote it" vs "we synthesized a fallback"
+// without inspecting the strings.
+type prSource int
+
+const (
+	prSourceFallback prSource = iota
+	prSourceAgent
+)
+
+// loadAgentAuthoredPR tries to read the agent-authored PR file and
+// parse it into a (title, body) pair. Returns prSourceFallback when
+// the file is absent or malformed; prSourceAgent on success.
+//
+// Format (#206):
+//   - First line is the title (≤72 chars; we don't enforce, GitHub
+//     handles overflow gracefully).
+//   - Blank line.
+//   - Remaining lines are the body (markdown).
+//
+// Malformed cases (logged as a `pr_template_invalid` policy event
+// but non-fatal):
+//   - Empty file.
+//   - First line empty.
+//   - No blank line separating title from body.
+func loadAgentAuthoredPR(logSink io.Writer) (title, body string, kind prSource) {
+	raw, err := os.ReadFile(pullRequestDescriptionPath)
+	if err != nil {
+		// File absent is the common no-op path (agent didn't follow
+		// the instruction, or we're in a stage type that doesn't
+		// produce a PR). Don't log; just fall back.
+		return "", "", prSourceFallback
+	}
+
+	text := strings.TrimRight(string(raw), "\n")
+	if text == "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
+			"empty file", pullRequestDescriptionPath)
+		return "", "", prSourceFallback
+	}
+
+	// Split into title (first line) + body (rest after blank line).
+	// We tolerate either CRLF or LF; normalize to LF for the body.
+	lines := strings.SplitN(text, "\n", 2)
+	title = strings.TrimSpace(lines[0])
+	if title == "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
+			"empty title line", pullRequestDescriptionPath)
+		return "", "", prSourceFallback
+	}
+
+	if len(lines) < 2 {
+		// Title-only file is treated as a body-less PR — that's
+		// allowed; GitHub accepts an empty PR body. Still log so
+		// the operator can spot agents that aren't writing bodies.
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
+			"title-only (no body)", pullRequestDescriptionPath)
+		return title, "", prSourceAgent
+	}
+
+	rest := strings.TrimLeft(lines[1], "\n")
+	// The format calls for a blank line between title and body, but
+	// agents are sloppy. Trim leading newlines and let it through;
+	// only flag truly malformed cases (no separator at all).
+	if !strings.HasPrefix(lines[1], "\n") {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
+			"no blank line between title and body", pullRequestDescriptionPath)
+	}
+
+	return title, rest, prSourceAgent
 }
