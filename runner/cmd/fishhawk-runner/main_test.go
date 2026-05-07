@@ -1663,3 +1663,210 @@ func TestRun_ImplementStage_AlwaysFetchesFreshTokenBeforePush(t *testing.T) {
 		t.Errorf("PROpener token = %q, want ghs_app_token", fpr.gotToken)
 	}
 }
+
+// withPRDescriptionPath redirects pullRequestDescriptionPath to a
+// temp dir for the duration of the test, restoring the production
+// value via t.Cleanup. Tests that write to the file should call
+// this before writing.
+func withPRDescriptionPath(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fishhawk-pr.md")
+	orig := pullRequestDescriptionPath
+	pullRequestDescriptionPath = path
+	t.Cleanup(func() { pullRequestDescriptionPath = orig })
+	return path
+}
+
+func TestPRTitleAndBody_AgentAuthored_HappyPath(t *testing.T) {
+	path := withPRDescriptionPath(t)
+	if err := os.WriteFile(path, []byte("Add make minio-init target\n\n## Why\n\nLocal stack needed a bucket-init step.\n\nCloses #184\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		backendURL: "https://api.fishhawk.test",
+	}
+	var stderr strings.Builder
+	title, body := prTitleAndBody(cfg, "fishhawk/run-x/stage-y", &stderr)
+	if title != "Add make minio-init target" {
+		t.Errorf("title = %q, want agent's first line", title)
+	}
+	if !strings.Contains(body, "## Why") {
+		t.Errorf("body should preserve agent markdown, got:\n%s", body)
+	}
+	if !strings.Contains(body, "Closes #184") {
+		t.Errorf("body should include the Closes line, got:\n%s", body)
+	}
+	// Footer must be appended for audit-trail provenance.
+	if !strings.Contains(body, "Audit log:") || !strings.Contains(body, cfg.runID) {
+		t.Errorf("body missing Fishhawk attribution footer:\n%s", body)
+	}
+	// No template-warning logs on the happy path.
+	if strings.Contains(stderr.String(), "pr_template_invalid") || strings.Contains(stderr.String(), "pr_template_warning") {
+		t.Errorf("happy path should produce no template warnings, got:\n%s", stderr.String())
+	}
+}
+
+func TestPRTitleAndBody_AgentAuthored_TitleOnly(t *testing.T) {
+	path := withPRDescriptionPath(t)
+	if err := os.WriteFile(path, []byte("Just the title\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	title, body := prTitleAndBody(config{
+		runID: "r", stageID: "s", backendURL: "https://x",
+	}, "branch", &stderr)
+	if title != "Just the title" {
+		t.Errorf("title = %q", title)
+	}
+	// Body is empty + footer; the title-only case is allowed.
+	if !strings.Contains(body, "Audit log:") {
+		t.Errorf("footer should still be appended, got:\n%s", body)
+	}
+	// Should warn (not error) because title-only is non-canonical.
+	if !strings.Contains(stderr.String(), "pr_template_warning") {
+		t.Errorf("expected pr_template_warning for title-only, got:\n%s", stderr.String())
+	}
+}
+
+func TestPRTitleAndBody_AgentAuthored_NoBlankLine(t *testing.T) {
+	path := withPRDescriptionPath(t)
+	// Title and body separated only by a single \n (no blank line).
+	if err := os.WriteFile(path, []byte("Title here\nBody starts immediately.\nMore body.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	title, body := prTitleAndBody(config{
+		runID: "r", stageID: "s", backendURL: "https://x",
+	}, "branch", &stderr)
+	if title != "Title here" {
+		t.Errorf("title = %q", title)
+	}
+	if !strings.Contains(body, "Body starts immediately.") {
+		t.Errorf("body missing first line:\n%s", body)
+	}
+	// Should warn but still parse successfully.
+	if !strings.Contains(stderr.String(), "pr_template_warning") {
+		t.Errorf("expected pr_template_warning for missing blank line, got:\n%s", stderr.String())
+	}
+}
+
+func TestPRTitleAndBody_FallbackWhenFileMissing(t *testing.T) {
+	// withPRDescriptionPath points at a temp file, but we don't
+	// write it. Helper must fall back silently.
+	withPRDescriptionPath(t)
+	var stderr strings.Builder
+	title, body := prTitleAndBody(config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		backendURL: "https://api.fishhawk.test",
+	}, "fishhawk/run-x/stage-y", &stderr)
+	if !strings.HasPrefix(title, "Fishhawk: implement stage") {
+		t.Errorf("fallback title should use the generic template, got %q", title)
+	}
+	if !strings.Contains(body, "Opened by Fishhawk for run") {
+		t.Errorf("fallback body should use the generic template:\n%s", body)
+	}
+	// Missing file is the common no-op path; no warning logged.
+	if strings.Contains(stderr.String(), "pr_template_") {
+		t.Errorf("missing file should be silent, got:\n%s", stderr.String())
+	}
+}
+
+func TestPRTitleAndBody_FallbackWhenFileEmpty(t *testing.T) {
+	path := withPRDescriptionPath(t)
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	title, _ := prTitleAndBody(config{
+		runID: "r", stageID: "s", backendURL: "https://x",
+	}, "branch", &stderr)
+	if !strings.HasPrefix(title, "Fishhawk:") {
+		t.Errorf("empty file should fall back, got title %q", title)
+	}
+	if !strings.Contains(stderr.String(), "pr_template_invalid") {
+		t.Errorf("empty file should produce pr_template_invalid log, got:\n%s", stderr.String())
+	}
+}
+
+func TestPRTitleAndBody_FallbackWhenTitleEmpty(t *testing.T) {
+	path := withPRDescriptionPath(t)
+	// First line is whitespace; that's not a usable title.
+	if err := os.WriteFile(path, []byte("   \n\nbody only\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	title, _ := prTitleAndBody(config{
+		runID: "r", stageID: "s", backendURL: "https://x",
+	}, "branch", &stderr)
+	if !strings.HasPrefix(title, "Fishhawk:") {
+		t.Errorf("empty-title file should fall back, got title %q", title)
+	}
+	if !strings.Contains(stderr.String(), "pr_template_invalid") {
+		t.Errorf("expected pr_template_invalid on empty title, got:\n%s", stderr.String())
+	}
+}
+
+func TestRun_ImplementStage_PassesAgentAuthoredPRTitle(t *testing.T) {
+	// End-to-end: agent wrote /tmp/fishhawk-pr.md (via the
+	// PullRequestDescriptionPath constant in the prompt), the
+	// runner reads it, and the agent's title + body land on the
+	// gitops.OpenPRArgs and on the shipped pull_request artifact.
+	prPath := withPRDescriptionPath(t)
+	if err := os.WriteFile(prPath, []byte("Add make minio-init target\n\nThis adds an idempotent make target for the local MinIO bucket.\n\nCloses #184\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace", "--variant", "raw",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR not called")
+	}
+	if fpr.gotArgs.Title != "Add make minio-init target" {
+		t.Errorf("OpenPR title = %q, want agent-authored title", fpr.gotArgs.Title)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "Closes #184") {
+		t.Errorf("OpenPR body should preserve agent's Closes line, got:\n%s", fpr.gotArgs.Body)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "Audit log:") {
+		t.Errorf("OpenPR body should append Fishhawk attribution footer, got:\n%s", fpr.gotArgs.Body)
+	}
+
+	// And the shipped artifact body must reflect the same title.
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest not called")
+	}
+	var shipped map[string]any
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &shipped); err != nil {
+		t.Fatal(err)
+	}
+	if got := shipped["title"]; got != "Add make minio-init target" {
+		t.Errorf("shipped artifact title = %v, want agent-authored", got)
+	}
+}

@@ -30,6 +30,17 @@ var ErrUnsupportedStage = errors.New("prompt: unsupported stage type")
 // per-stage variable if multi-tenancy demands isolation.
 const PlanArtifactPath = "/tmp/fishhawk-plan.json"
 
+// PullRequestDescriptionPath is the absolute path the runner expects
+// to find the agent-authored PR description at after an
+// implement-stage invocation. Format: first line = title (≤72 chars),
+// blank line, then markdown body. The runner reads this and forwards
+// the title + body to GitHub's pulls API; if missing or malformed
+// the runner falls back to a generic Fishhawk template, so v0 stays
+// robust against agents that ignore the instruction.
+//
+// Hardcoded for v0 — same rationale as PlanArtifactPath. (#206.)
+const PullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
+
 // Trigger captures the bits of the originating event needed to
 // construct an issue-driven prompt. Empty IssueTitle / IssueBody
 // for non-issue triggers; for v0, those triggers all come from
@@ -82,7 +93,28 @@ func buildImplement(t Trigger) string {
 
 	b.WriteString("Your task: implement the change described above. Make the smallest set of changes that satisfies the issue.\n")
 	b.WriteString("\n")
-	b.WriteString("When you're done, the runner will collect the diff and ship the trace bundle to Fishhawk for review.\n")
+
+	// PR description: write to a known path so the runner can lift
+	// it into the GitHub PR's title + body. Format is documented
+	// here in the prompt itself (rather than a separate spec doc)
+	// because the agent reads the prompt and nothing else.
+	b.WriteString("When you're done, write a pull-request description to `")
+	b.WriteString(PullRequestDescriptionPath)
+	b.WriteString("`. Format:\n")
+	b.WriteString("\n")
+	b.WriteString("- The first line is the PR title. Write a task-specific summary of what you changed (e.g. `Add make minio-init target`). Keep it ≤72 characters and do not prefix it with `Fishhawk:` — the runner adds attribution separately.\n")
+	b.WriteString("- Leave one blank line.\n")
+	b.WriteString("- The rest is the PR body in markdown. Lead with the motivation, then describe what changed, then list anything a reviewer should test or watch for. Avoid restating the diff line by line.\n")
+
+	if t.IssueNumber > 0 {
+		fmt.Fprintf(&b,
+			"- Include the line `Closes #%d` somewhere in the body so merging the PR auto-closes the originating issue.\n",
+			t.IssueNumber,
+		)
+	}
+
+	b.WriteString("\n")
+	b.WriteString("When the runner finishes, it will collect the diff, ship the trace bundle to Fishhawk, push your changes to a branch, and open the PR using the title + body you wrote.\n")
 	return b.String()
 }
 
