@@ -219,6 +219,12 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 					slog.String("stage_id", stageID.String()),
 					slog.String("error", err.Error()))
 			}
+			// Advance so the orchestrator walks the run to its
+			// terminal state — without this the run stays in
+			// pending forever once a stage fails. Best-effort:
+			// the audit row for the failed stage is the canonical
+			// signal; a stuck run is recoverable.
+			s.advanceAfterFailure(r, runID, stageID)
 			s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
 				RunID:       runID,
 				StageID:     stageID,
@@ -497,6 +503,10 @@ func isEmptyConstraints(c policy.Constraints) bool {
 // failed if needed. Failures are logged but don't unwind — the
 // policy_evaluated audit entry is the primary signal; a stuck stage
 // is recoverable.
+//
+// After the stage transitions to failed, advance the run so the
+// orchestrator walks pending → running → failed. Without this the
+// run stays in pending forever once any stage fails.
 func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, reason string) {
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureB, reason); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -504,6 +514,27 @@ func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, r
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
+	}
+	s.advanceAfterFailure(r, runID, stageID)
+}
+
+// advanceAfterFailure invokes the orchestrator to walk the run's
+// state machine after a stage has transitioned terminally. Errors
+// are logged but never unwind the caller — the audit log is the
+// canonical signal that the stage failed; a stuck run is the kind
+// of bug we want surfaced via /v0/runs (state != pending) rather
+// than via a 500 on the upload that already wrote the audit row.
+func (s *Server) advanceAfterFailure(r *http.Request, runID, stageID uuid.UUID) {
+	if s.cfg.Orchestrator == nil {
+		return
+	}
+	if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"trace upload: orchestrator advance after stage failure failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
 	}
 }
 
