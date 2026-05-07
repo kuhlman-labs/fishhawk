@@ -1,9 +1,11 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +18,14 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
+
+// captureDispatcherLogs wires a JSON slog handler into d so tests
+// can assert on the structured lines Handle emits.
+func captureDispatcherLogs(d *Dispatcher) *bytes.Buffer {
+	var buf bytes.Buffer
+	d.Logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return &buf
+}
 
 // --- MatchEvent table tests ---
 
@@ -417,6 +427,7 @@ func issueLabeledEvent(t *testing.T) Event {
 
 func TestHandle_HappyPath_CreatesRunAndDispatches(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
 
 	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -465,6 +476,23 @@ func TestHandle_HappyPath_CreatesRunAndDispatches(t *testing.T) {
 	}
 	if !strings.Contains(string(au.appended[0].Payload), `"outcome":"dispatched"`) {
 		t.Errorf("audit payload outcome wrong: %s", au.appended[0].Payload)
+	}
+
+	out := logs.String()
+	for _, want := range []string{
+		`"level":"INFO"`,
+		`"msg":"webhook dispatched"`,
+		`"event":"issues"`,
+		`"action":"labeled"`,
+		`"delivery_id":"deliv-1"`,
+		`"repo":"kuhlman-labs/fishhawk"`,
+		`"workflow_id":"feature_change"`,
+		`"run_id":"` + got.ID.String() + `"`,
+		`"stage_id":"` + runs.createdStages[0].ID.String() + `"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("success log missing %s:\n%s", want, out)
+		}
 	}
 }
 
@@ -696,6 +724,7 @@ workflows:
 
 func TestHandle_DispatchError_AuditsFailureCategory(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
 	gh.dispatchErr = errors.New("github 422: bad ref")
 
 	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
@@ -709,6 +738,24 @@ func TestHandle_DispatchError_AuditsFailureCategory(t *testing.T) {
 	}
 	if !strings.Contains(string(au.appended[0].Payload), `"outcome":"dispatch_failed"`) {
 		t.Errorf("payload missing failure outcome: %s", au.appended[0].Payload)
+	}
+
+	out := logs.String()
+	for _, want := range []string{
+		`"level":"WARN"`,
+		`"msg":"webhook dispatch failed"`,
+		`"event":"issues"`,
+		`"action":"labeled"`,
+		`"delivery_id":"deliv-1"`,
+		`"repo":"kuhlman-labs/fishhawk"`,
+		`"workflow_id":"feature_change"`,
+		`"run_id":"` + runs.created[0].ID.String() + `"`,
+		`"stage_id":"` + runs.createdStages[0].ID.String() + `"`,
+		`"error":"github 422: bad ref"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("failure log missing %s:\n%s", want, out)
+		}
 	}
 }
 

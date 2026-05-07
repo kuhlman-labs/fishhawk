@@ -337,12 +337,35 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// pinning it to the trigger.
 	d.writeDispatchAudit(ctx, ev, m, created, specFile.SHA, dispatchErr, now)
 
+	// Step 9: log the outcome. Without these lines, operators tailing
+	// stdout see only `webhook received` + the request log and can't
+	// tell whether dispatch actually happened — the audit row is
+	// invisible without a query (#186).
 	if dispatchErr != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn, "webhook dispatch failed",
+			slog.String("event", ev.Type),
+			slog.String("action", ev.Action),
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+			slog.String("workflow_id", m.WorkflowID),
+			slog.String("run_id", created.ID.String()),
+			slog.String("stage_id", firstStage.ID.String()),
+			slog.String("error", dispatchErr.Error()),
+		)
 		// Dispatch failures aren't transient (validation, missing
 		// workflow file, etc.), so don't retry — the audit entry
 		// is the record.
 		return nil
 	}
+	d.logger().LogAttrs(ctx, slog.LevelInfo, "webhook dispatched",
+		slog.String("event", ev.Type),
+		slog.String("action", ev.Action),
+		slog.String("delivery_id", ev.DeliveryID),
+		slog.String("repo", ev.Repo),
+		slog.String("workflow_id", m.WorkflowID),
+		slog.String("run_id", created.ID.String()),
+		slog.String("stage_id", firstStage.ID.String()),
+	)
 	return nil
 }
 
