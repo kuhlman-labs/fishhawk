@@ -9,6 +9,7 @@ import { ApprovalPanel } from '@/plan/approval-panel';
 import { Section } from '@/plan/sections';
 import { StageStateBadge } from '@/components/stage-state-badge';
 import { renderStageEvent } from './stage-event';
+import { TranscriptSection } from './transcript-section';
 
 /*
  * Implement-stage session view (#215). Replaces the redundant
@@ -76,6 +77,7 @@ export function ImplementSessionDocument({
 
       <PromptSection stage={stage} />
       <ActivitySection stage={stage} runId={runId} />
+      <TranscriptSection stageId={stage.id} />
       {pullRequest && <PullRequestRow pullRequest={pullRequest} />}
     </article>
   );

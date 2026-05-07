@@ -157,6 +157,37 @@ export const api = {
   },
 
   /**
+   * Stream the most-recent redacted trace bundle for a stage (#218).
+   * The endpoint serves gzipped JSON Lines bytes; modern browsers
+   * auto-decompress when `Content-Encoding: gzip` is present, so the
+   * caller receives plain JSONL text. Returns the raw Response so
+   * the caller can fold over `response.body` (a streaming
+   * ReadableStream) line-by-line — fits the transcript surface,
+   * which renders progressively rather than buffering the whole
+   * bundle.
+   *
+   * Bypasses the JSON-decoding `request` helper since the body is
+   * not JSON; CSRF auto-attach is unnecessary here (GET).
+   */
+  async getStageTraceStream(stageId: string): Promise<Response> {
+    const res = await fetch(`/v0/stages/${encodeURIComponent(stageId)}/trace`, {
+      credentials: 'include',
+      headers: { Accept: 'application/x-ndjson' },
+    });
+    if (!res.ok) {
+      let body: ApiError | null = null;
+      try {
+        body = (await res.json()) as ApiError;
+      } catch {
+        // Non-JSON error body. Fine.
+      }
+      const msg = body?.message ?? body?.error ?? `request failed: ${res.status}`;
+      throw new ApiClientError(res.status, body, msg);
+    }
+    return res;
+  },
+
+  /**
    * Cross-chain audit search (#211). Returns per-run rows AND
    * global-chain rows in one time-descending feed; pagination and
    * filter envelope mirror listRunAudit so the same usePaginated

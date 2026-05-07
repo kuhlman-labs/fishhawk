@@ -511,3 +511,137 @@ func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
+
+// handleGetStageTrace implements GET /v0/stages/{stage_id}/trace (#218).
+//
+// Streams the redacted trace bundle for the stage as gzipped JSONL
+// bytes. The SPA gunzips via the browser's auto-decompression and
+// parses line-by-line to render the agent transcript.
+//
+// "Most-recent" is the right shape because retried stages can ship
+// multiple bundles; we want the latest. Audit log is the source of
+// truth for the (stage_id, content_hash) mapping — the bundle key
+// itself doesn't carry stage_id, so we read the trace_uploaded
+// audit entries for the run, filter to this stage + redacted
+// variant, take the highest-sequence one, and resolve to a
+// BundleRef.
+//
+// Raw variant is intentionally not exposed here: it can carry
+// secrets in agent output and lives behind S3 Object Lock for
+// compliance reasons. Surfacing raw is a separate decision (see
+// #218 "Out of scope").
+func (s *Server) handleGetStageTrace(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil || s.cfg.TraceStore == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "trace_unconfigured",
+			"trace endpoint requires run, audit, and tracestore repos to be configured", nil)
+		return
+	}
+
+	stageID, err := uuid.Parse(r.PathValue("stage_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"stage_id must be a valid UUID",
+			map[string]any{"field": "stage_id", "got": r.PathValue("stage_id")})
+		return
+	}
+
+	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "stage_not_found",
+				"no stage with that id", map[string]any{"stage_id": stageID.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), stage.RunID, "trace_uploaded")
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list trace audit entries failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	contentHash, ok := pickRedactedTraceHash(entries, stageID)
+	if !ok {
+		s.writeError(w, r, http.StatusNotFound, "trace_not_found",
+			"no redacted trace bundle uploaded for this stage yet",
+			map[string]any{"stage_id": stageID.String()})
+		return
+	}
+
+	body, err := s.cfg.TraceStore.Get(r.Context(), tracestore.BundleRef{
+		RunID:       stage.RunID,
+		Variant:     tracestore.VariantRedacted,
+		ContentHash: contentHash,
+	})
+	if err != nil {
+		if errors.Is(err, tracestore.ErrNotFound) {
+			// Audit row says we should have a bundle but storage
+			// disagrees — surface 410 so callers don't keep hammering
+			// the same stage hoping the storage catches up. The
+			// audit chain is the canonical record; the storage gap
+			// needs a human (or the verifier).
+			s.writeError(w, r, http.StatusGone, "trace_storage_missing",
+				"audit log references a trace bundle that is no longer in storage",
+				map[string]any{"stage_id": stageID.String(), "content_hash": contentHash})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get trace bundle failed", map[string]any{"error": err.Error()})
+		return
+	}
+	defer func() {
+		_ = body.Close()
+	}()
+
+	// Set Content-Encoding: gzip so the browser auto-decompresses on
+	// fetch — the bytes on disk are gzipped JSONL, the SPA wants
+	// JSONL. Content-Type advertises the inner format. Disposition
+	// is inline (the SPA reads the body via fetch; download isn't a
+	// supported flow yet).
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Encoding", "gzip")
+	w.Header().Set("X-Fishhawk-Content-Hash", contentHash)
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, body); err != nil {
+		// Headers already written; we can't return an error envelope.
+		// Log and let the connection drop.
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "trace stream copy failed",
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// pickRedactedTraceHash walks the run's trace_uploaded audit entries
+// and returns the most recent redacted variant's content hash for
+// the given stage. Returns false when none match.
+//
+// The audit entries are sequence-ascending (per ListForRunByCategory's
+// contract), so we iterate in reverse to find the latest match.
+func pickRedactedTraceHash(entries []*audit.Entry, stageID uuid.UUID) (string, bool) {
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			Variant     string `json:"variant"`
+			ContentHash string `json:"content_hash"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Variant != string(tracestore.VariantRedacted) {
+			continue
+		}
+		if len(payload.ContentHash) != 64 {
+			continue
+		}
+		return payload.ContentHash, true
+	}
+	return "", false
+}

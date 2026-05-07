@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { ImplementSessionDocument } from './session-document';
-import { api } from '@/api/client';
+import { ApiClientError, api } from '@/api/client';
 import type { PullRequestArtifactBody } from '@/api/pull-request';
 import type { AuditEntry, Stage } from '@/api/types';
 
@@ -68,7 +68,16 @@ function renderDoc(
 }
 
 describe('<ImplementSessionDocument>', () => {
-  beforeEach(() => vi.restoreAllMocks());
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    // Default trace-stream mock so the embedded <TranscriptSection>
+    // (#218) doesn't fire a real network request during the
+    // session-view tests that don't care about the transcript.
+    // Returning 404 puts the section in its silent empty state.
+    vi.spyOn(api, 'getStageTraceStream').mockRejectedValue(
+      new ApiClientError(404, { error: 'trace_not_found' }, 'trace_not_found'),
+    );
+  });
   afterEach(() => vi.restoreAllMocks());
 
   it('renders the session header and stage badge — no PR title', async () => {
@@ -86,6 +95,12 @@ describe('<ImplementSessionDocument>', () => {
     expect(screen.getByText('succeeded')).toBeInTheDocument();
     // The PR title is no longer the page heading (was the case in the old PR-card view).
     expect(screen.queryByRole('heading', { name: samplePR.title })).not.toBeInTheDocument();
+    // Wait for the async fetches inside Prompt / Activity / Transcript
+    // sections to settle so the test doesn't race teardown (avoids
+    // React's "update not wrapped in act" warnings).
+    await waitFor(() => {
+      expect(screen.getByText(/You are implementing/)).toBeInTheDocument();
+    });
   });
 
   it('fetches and renders the constructed prompt with a hash badge', async () => {
