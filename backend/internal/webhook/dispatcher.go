@@ -471,6 +471,11 @@ func (d *Dispatcher) createStages(ctx context.Context, runID uuid.UUID, defs []s
 		if sla := firstApprovalSLA(def.Gates); sla != "" {
 			params.GateSLA = &sla
 		}
+		// Persist whether the stage's spec demands an approval gate
+		// so the trace upload handler can pick the right
+		// post-upload transition (#207). Plan + review have one;
+		// implement does not.
+		params.RequiresApproval = hasApprovalGate(def.Gates)
 		stage, err := d.Runs.CreateStage(ctx, params)
 		if err != nil {
 			return nil, fmt.Errorf("create stage %d (%s): %w", i, def.ID, err)
@@ -490,6 +495,19 @@ func firstApprovalSLA(gates []spec.Gate) string {
 		}
 	}
 	return ""
+}
+
+// hasApprovalGate reports whether any of the stage's gates is the
+// approval type. The trace upload handler reads this through
+// stages.requires_approval to pick the right post-upload state
+// (gated → awaiting_approval, gateless → succeeded). #207.
+func hasApprovalGate(gates []spec.Gate) bool {
+	for _, g := range gates {
+		if g.Type == spec.GateTypeApproval {
+			return true
+		}
+	}
+	return false
 }
 
 // mapExecutor projects a spec.Executor onto the run-package

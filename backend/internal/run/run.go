@@ -185,7 +185,19 @@ type Stage struct {
 	// Nil when the stage's gate has no SLA, when the stage isn't
 	// gated, or for rows that predate the column. Parsed by the
 	// SLA ticker into a wall-clock duration via internal/sla.Parse.
-	GateSLA   *string
+	GateSLA *string
+
+	// RequiresApproval captures whether the workflow-spec stage
+	// definition included an approval-typed gate. The trace upload
+	// handler reads this to pick the right post-upload state:
+	// gated stages (plan, review per the v0 default workflow)
+	// transition to awaiting_approval; gateless stages (implement)
+	// transition straight to succeeded so the orchestrator can
+	// dispatch the next stage immediately. Persisted at
+	// stage-create time so the handler doesn't need to re-parse the
+	// workflow spec on every upload. Per migration 0013 (#207).
+	RequiresApproval bool
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

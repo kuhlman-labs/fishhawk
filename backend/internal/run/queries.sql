@@ -39,8 +39,8 @@ UPDATE runs
 RETURNING *;
 
 -- name: CreateStage :one
-INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state, gate_sla)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state, gate_sla, requires_approval)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING *;
 
 -- name: GetStage :one

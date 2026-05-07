@@ -193,6 +193,12 @@ func newPolicyTraceServer(t *testing.T, files []map[string]string) (
 		ExecutorKind: run.ExecutorAgent,
 		ExecutorRef:  "claude-code",
 		State:        run.StageStateDispatched,
+		// Tests in this file assert awaiting_approval as the
+		// post-policy-pass state. Per #207's gate-aware transition,
+		// that requires the stage to be marked as gated. The stage
+		// TYPE here is informational; what drives the trace
+		// handler's terminal state is RequiresApproval.
+		RequiresApproval: true,
 	}
 	runRow := &run.Run{
 		ID:             runID,

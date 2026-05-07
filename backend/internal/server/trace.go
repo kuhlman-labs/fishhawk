@@ -249,12 +249,29 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// advanceStageAfterTrace walks dispatched → running →
-// awaiting_approval. Each step is idempotent (the state machine
-// allows same-state re-application), so a redelivered trace upload
-// or a parallel transition path doesn't fault. Errors at either
-// step log but don't unwind.
+// advanceStageAfterTrace walks the stage out of `dispatched`. The
+// terminal target depends on the stage's spec:
+//
+//   - RequiresApproval = true  → dispatched → running → awaiting_approval
+//   - RequiresApproval = false → dispatched → running → succeeded; orchestrator picks it up
+//
+// Each step is idempotent (the state machine allows same-state
+// re-application), so a redelivered trace upload or a parallel
+// transition path doesn't fault. Errors at any step log but don't
+// unwind: the trace is already stored + audited, and the stage's
+// state is recoverable via GET /v0/runs/{id}/stages.
 func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUID) {
+	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"trace upload: get stage for transition failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
 	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
 		run.StageStateRunning, nil); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -265,14 +282,36 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 		)
 		return
 	}
+
+	terminal := run.StageStateAwaitingApproval
+	if !stage.RequiresApproval {
+		terminal = run.StageStateSucceeded
+	}
 	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
-		run.StageStateAwaitingApproval, nil); err != nil {
+		terminal, nil); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-			"trace upload: transition to awaiting_approval failed",
+			"trace upload: transition to terminal failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
+			slog.String("target", string(terminal)),
 			slog.String("error", err.Error()),
 		)
+		return
+	}
+
+	// Gateless stages don't get an approval submission to drive the
+	// next dispatch — fire the orchestrator ourselves so the next
+	// stage (typically a human-led review) gets picked up. Best-
+	// effort: a failure here logs but doesn't unwind the upload.
+	if !stage.RequiresApproval && s.cfg.Orchestrator != nil {
+		if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"trace upload: orchestrator advance after gateless stage failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 }
 
