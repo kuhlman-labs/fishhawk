@@ -1129,6 +1129,72 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/stages/{stage_id}/trace:
+    get:
+      operationId: getStageTrace
+      summary: Stream the redacted trace bundle for a stage
+      description: |
+        Streams the most-recent **redacted** trace bundle the runner
+        shipped for this stage. The body is gzipped JSON Lines; the
+        SPA gunzips client-side (or the browser auto-decompresses
+        when `Accept-Encoding: gzip` is honored) and parses
+        line-by-line to render the agent transcript (#218).
+
+        The bundle's first line is the manifest (agent, model,
+        agent_failed flag); middle lines are one captured agent
+        event each; last line is the trailer with event count + a
+        sha256 of the preceding lines (truncation detector). Schema
+        is ADR-007 (#71).
+
+        Raw variant access is not exposed here. The raw bundle can
+        carry secrets in agent output and lives behind S3 Object
+        Lock for compliance reasons; surfacing it is a separate
+        decision.
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            Gzipped JSON Lines bundle bytes. `X-Fishhawk-Content-Hash`
+            carries the bundle's hex sha256 so callers can cross-
+            reference the audit log's `trace_uploaded` payload.
+          headers:
+            X-Fishhawk-Content-Hash:
+              schema: { type: string }
+              description: Hex sha256 of the gzipped bundle bytes.
+            Content-Encoding:
+              schema: { type: string, enum: [gzip] }
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                format: binary
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404':
+          description: |
+            `stage_not_found` — no stage with that id;
+            `trace_not_found` — stage exists but no redacted bundle
+            has been uploaded yet.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: |
+            `trace_storage_missing` — the audit log references a
+            bundle that's no longer in storage (lifecycle expiry,
+            manual deletion, or a storage outage). The audit chain
+            is the canonical record; the storage gap needs human /
+            verifier intervention.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Backend wiring incomplete (run, audit, or tracestore unconfigured).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/stages/{stage_id}/approvals:
     post:
       operationId: submitApproval
