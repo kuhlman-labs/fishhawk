@@ -129,6 +129,85 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetStagePromptRender implements GET /v0/stages/{stage_id}/prompt-render.
+//
+// SPA-readable counterpart of handleGetStagePrompt: same response
+// shape, same construction, but no X-Fishhawk-Signature requirement.
+// The runner contract on the signature-authed path stays untouched.
+//
+// Read access tracks the existing stage/audit read endpoints — no
+// auth gate at the handler level today; the surrounding middleware
+// handles cookie/bearer resolution. Used by the implement-stage
+// session view (#215) to show the user the deterministic prompt
+// the agent received.
+func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Request) {
+	github := s.issueGetter()
+	if s.cfg.RunRepo == nil || github == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "prompt_unconfigured",
+			"prompt construction requires run repo and GitHub access to be configured", nil)
+		return
+	}
+
+	stageID, err := uuid.Parse(r.PathValue("stage_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"stage_id must be a valid UUID",
+			map[string]any{"field": "stage_id", "got": r.PathValue("stage_id")})
+		return
+	}
+
+	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "stage_not_found",
+				"no stage with that id", map[string]any{"stage_id": stageID.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get run for stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	trigger := prompt.Trigger{
+		Source: string(runRow.TriggerSource),
+		Repo:   runRow.Repo,
+	}
+	if runRow.TriggerRef != nil {
+		if number, ok := parseIssueRef(*runRow.TriggerRef); ok {
+			trigger.IssueNumber = number
+			s.fillIssueContext(r.Context(), github, runRow, number, &trigger)
+		}
+	}
+
+	text, err := prompt.Build(string(stage.Type), trigger)
+	if err != nil {
+		if errors.Is(err, prompt.ErrUnsupportedStage) {
+			s.writeError(w, r, http.StatusNotImplemented, "unsupported_stage_type",
+				"prompt construction not yet implemented for this stage type",
+				map[string]any{"stage_type": string(stage.Type)})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"build prompt failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	hash := signing.ComputeMessage([]byte(text))
+	s.writeJSON(w, r, http.StatusOK, promptResponse{
+		StageID:    stageID.String(),
+		StageType:  string(stage.Type),
+		Prompt:     text,
+		PromptHash: hex.EncodeToString(hash),
+	})
+}
+
 // verifyPromptSignature reads the X-Fishhawk-Signature header and
 // validates it against sha256("prompt:" + stage_id) using the
 // run's stored public key. Returns true on success; on failure

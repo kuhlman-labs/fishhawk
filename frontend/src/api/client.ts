@@ -130,14 +130,30 @@ export const api = {
 
   listRunAudit(
     runId: string,
-    params?: { limit?: number; cursor?: string; category?: string },
+    params?: { limit?: number; cursor?: string; category?: string; stageId?: string },
   ): Promise<PaginatedList<AuditEntry>> {
     const q = new URLSearchParams();
     if (params?.limit) q.set('limit', String(params.limit));
     if (params?.cursor) q.set('cursor', params.cursor);
     if (params?.category) q.set('category', params.category);
+    if (params?.stageId) q.set('stage_id', params.stageId);
     const qs = q.toString();
     return request(`/v0/runs/${encodeURIComponent(runId)}/audit${qs ? `?${qs}` : ''}`);
+  },
+
+  /**
+   * SPA-readable prompt render (#215). Same body as the runner's
+   * signature-authed `getStagePrompt` endpoint, no
+   * `X-Fishhawk-Signature` required. Used by the implement-stage
+   * session view to show the constructed prompt the agent received.
+   */
+  getStagePromptRender(stageId: string): Promise<{
+    stage_id: string;
+    stage_type: string;
+    prompt: string;
+    prompt_hash: string;
+  }> {
+    return request(`/v0/stages/${encodeURIComponent(stageId)}/prompt-render`);
   },
 
   /**

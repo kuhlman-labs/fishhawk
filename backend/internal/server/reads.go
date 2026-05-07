@@ -331,6 +331,23 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional stage_id filter (#215) — narrows the per-run feed to
+	// entries the dispatcher / runner / handlers tagged with a
+	// specific stage. Used by the implement-stage session view to
+	// render the activity for one stage without dragging in events
+	// from sibling stages.
+	var stageFilter *uuid.UUID
+	if rawStage := q.Get("stage_id"); rawStage != "" {
+		stageID, err := uuid.Parse(rawStage)
+		if err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"stage_id must be a valid UUID",
+				map[string]any{"field": "stage_id", "got": rawStage})
+			return
+		}
+		stageFilter = &stageID
+	}
+
 	var entries []*audit.Entry
 	if category != "" {
 		entries, err = s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, category)
@@ -346,6 +363,19 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"list audit failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	if stageFilter != nil {
+		// In-memory filter: per-run audit volume is small at v0
+		// scale (a few hundred entries max). Push down to the repo
+		// when this becomes expensive.
+		filtered := entries[:0]
+		for _, e := range entries {
+			if e.StageID != nil && *e.StageID == *stageFilter {
+				filtered = append(filtered, e)
+			}
+		}
+		entries = filtered
 	}
 
 	page, nextCursor := pageOffset(entries, offset, limit)

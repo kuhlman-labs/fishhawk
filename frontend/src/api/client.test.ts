@@ -131,3 +131,40 @@ describe('api.listGlobalAudit', () => {
     expect(url).not.toContain('run_id=');
   });
 });
+
+describe('api.listRunAudit stage_id filter (#215)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('serialises stageId as the snake_case `stage_id` query param', async () => {
+    const fetchMock = mockFetch();
+    await api.listRunAudit('11111111-2222-3333-4444-555555555555', {
+      stageId: '99999999-9999-9999-9999-999999999999',
+    });
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toContain('stage_id=99999999-9999-9999-9999-999999999999');
+  });
+
+  it('omits stage_id from the query string when not provided', async () => {
+    const fetchMock = mockFetch();
+    await api.listRunAudit('11111111-2222-3333-4444-555555555555');
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).not.toContain('stage_id=');
+  });
+});
+
+describe('api.getStagePromptRender (#215)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('hits /v0/stages/{id}/prompt-render with no body or signature header', async () => {
+    const fetchMock = mockFetch();
+    await api.getStagePromptRender('11111111-2222-3333-4444-555555555555');
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toMatch(/\/v0\/stages\/[^/]+\/prompt-render$/);
+
+    const init = lastInit(fetchMock);
+    expect((init.method ?? 'GET').toUpperCase()).toBe('GET');
+    expect(headerOf(init, 'X-Fishhawk-Signature')).toBeUndefined();
+  });
+});

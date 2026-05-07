@@ -912,6 +912,13 @@ paths:
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
         - { name: category, in: query, schema: { type: string } }
+        - name: stage_id
+          in: query
+          schema: { $ref: '#/components/schemas/UUID' }
+          description: |
+            Optional. When set, the response is filtered to entries
+            tagged with this stage id. Used by the implement-stage
+            session view (#215) to render a per-stage activity feed.
         - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
@@ -927,6 +934,9 @@ paths:
                       items:
                         type: array
                         items: { $ref: '#/components/schemas/AuditEntry' }
+        '400':
+          description: |
+            `validation_failed` — `stage_id` not a UUID, or `limit` out of range.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
@@ -1072,6 +1082,49 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: Backend wiring incomplete (run, signing, or GitHub repo unconfigured).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/stages/{stage_id}/prompt-render:
+    get:
+      operationId: getStagePromptRender
+      summary: Fetch the constructed prompt for a stage (SPA-readable)
+      description: |
+        SPA-side counterpart of `getStagePrompt` (#215). Returns the
+        same body shape, built by the same deterministic
+        `prompt.Build` pipeline, without requiring
+        `X-Fishhawk-Signature`. Read access tracks the existing
+        stage / audit reads.
+
+        The two endpoints exist as siblings rather than one with a
+        toggle so the runner contract on the signature-authed path
+        stays unchanged when the SPA-side surface evolves.
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Constructed prompt for the stage.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stage_id, stage_type, prompt, prompt_hash]
+                properties:
+                  stage_id: { $ref: '#/components/schemas/UUID' }
+                  stage_type: { type: string }
+                  prompt: { type: string }
+                  prompt_hash: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501':
+          description: Prompt construction not implemented for this stage type.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Backend wiring incomplete (run repo or GitHub unconfigured).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
