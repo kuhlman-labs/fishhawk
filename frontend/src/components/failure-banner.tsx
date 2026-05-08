@@ -122,6 +122,15 @@ export function FailureBanner({ stage, onStageUpdate, onStageRollback }: Props) 
         {stage.failure_reason && (
           <div className="font-mono text-xs leading-relaxed">{stage.failure_reason}</div>
         )}
+        {/* Category B is a constraint/policy violation; the
+         * implement page's <PolicySection> (#233) renders the
+         * structured violations. Anchor link gets the reviewer
+         * straight to it instead of leaving them to scroll. */}
+        {stage.failure_category === 'B' && (
+          <a href="#policy" className="inline-block text-xs underline">
+            View violations
+          </a>
+        )}
         {phase.kind === 'errored' && (
           <p className="font-mono text-xs">Retry failed: {phase.message}</p>
         )}

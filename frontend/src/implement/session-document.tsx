@@ -8,6 +8,7 @@ import type { PullRequestArtifactBody } from '@/api/pull-request';
 import { ApprovalPanel } from '@/plan/approval-panel';
 import { Section } from '@/plan/sections';
 import { StageStateBadge } from '@/components/stage-state-badge';
+import { PolicySection } from './policy-section';
 import { renderStageEvent } from './stage-event';
 import { TranscriptSection } from './transcript-section';
 
@@ -78,6 +79,7 @@ export function ImplementSessionDocument({
       <PromptSection stage={stage} />
       <ActivitySection stage={stage} runId={runId} />
       <TranscriptSection stageId={stage.id} />
+      <PolicySection runId={runId} stageId={stage.id} />
       {pullRequest && <PullRequestRow pullRequest={pullRequest} />}
     </article>
   );

@@ -257,6 +257,63 @@ describe('<ImplementSessionDocument>', () => {
     expect(screen.queryByRole('link', { name: /view pr/i })).not.toBeInTheDocument();
   });
 
+  it('mounts the policy section with violations when a policy_evaluated entry exists', async () => {
+    // The activity feed and the policy section both call
+    // listRunAudit; branch the mock by category so the policy
+    // section gets a real entry while the activity feed stays
+    // empty.
+    vi.spyOn(api, 'getStagePromptRender').mockResolvedValue({
+      stage_id: baseStage.id,
+      stage_type: 'implement',
+      prompt: '',
+      prompt_hash: '',
+    });
+    vi.spyOn(api, 'listRunAudit').mockImplementation(async (_runId, params) => {
+      if (params?.category === 'policy_evaluated') {
+        return {
+          items: [
+            makeEntry({
+              category: 'policy_evaluated',
+              payload: {
+                passed: false,
+                violations: [
+                  {
+                    constraint: 'forbidden_paths',
+                    detail: 'pattern infra/** matched',
+                    files: ['infra/main.tf'],
+                  },
+                ],
+                diff: [{ path: 'infra/main.tf', status: 'M' }],
+                applied_constraints: { forbidden_paths: ['infra/**'] },
+              },
+            }),
+          ],
+          next_cursor: null,
+        };
+      }
+      return { items: [], next_cursor: null };
+    });
+    renderDoc();
+    await waitFor(() => {
+      expect(screen.getByText(/policy violations \(1\)/i)).toBeInTheDocument();
+      expect(screen.getByText('infra/main.tf')).toBeInTheDocument();
+    });
+  });
+
+  it('shows the policy-pending empty state when no policy_evaluated entry exists', async () => {
+    vi.spyOn(api, 'getStagePromptRender').mockResolvedValue({
+      stage_id: baseStage.id,
+      stage_type: 'implement',
+      prompt: '',
+      prompt_hash: '',
+    });
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({ items: [], next_cursor: null });
+    renderDoc();
+    await waitFor(() => {
+      expect(screen.getByText(/policy evaluation pending/i)).toBeInTheDocument();
+    });
+  });
+
   it('shows the audit-log link for terminal states; ApprovalPanel for awaiting_approval', async () => {
     vi.spyOn(api, 'getStagePromptRender').mockResolvedValue({
       stage_id: baseStage.id,
