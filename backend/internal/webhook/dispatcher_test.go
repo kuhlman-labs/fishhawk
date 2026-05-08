@@ -163,6 +163,80 @@ func TestMatchEvent_IssueComment_EditedSkips(t *testing.T) {
 	}
 }
 
+func TestMatchEvent_IssueComment_ApproveCommand(t *testing.T) {
+	body := []byte(`{"comment":{"body":"/fishhawk approve"},"issue":{"number":1247}}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 42, RawBody: body}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want match", got)
+	}
+	if got.Action != MatchActionApprove {
+		t.Errorf("Action = %q, want approve", got.Action)
+	}
+	if got.IssueRef == nil || got.IssueRef.Number != 1247 {
+		t.Errorf("IssueRef = %+v", got.IssueRef)
+	}
+	if got.CommentBody != "" {
+		t.Errorf("CommentBody = %q, want empty", got.CommentBody)
+	}
+	if got.WorkflowID != "" {
+		t.Errorf("WorkflowID should be empty for approve action; got %q", got.WorkflowID)
+	}
+}
+
+func TestMatchEvent_IssueComment_RejectCommand_WithReason(t *testing.T) {
+	body := []byte(`{"comment":{"body":"/fishhawk reject\n\nthe scope is too wide"},"issue":{"number":1247}}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 42, RawBody: body}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want match", got)
+	}
+	if got.Action != MatchActionReject {
+		t.Errorf("Action = %q, want reject", got.Action)
+	}
+	if got.CommentBody != "the scope is too wide" {
+		t.Errorf("CommentBody = %q", got.CommentBody)
+	}
+}
+
+func TestMatchEvent_IssueComment_RunCommand_TaggedAction(t *testing.T) {
+	body := []byte(`{"comment":{"body":"/fishhawk run"},"issue":{"number":1247}}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 42, RawBody: body}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want match", got)
+	}
+	if got.Action != MatchActionRun {
+		t.Errorf("Action = %q, want run", got.Action)
+	}
+	if got.WorkflowID != DefaultWorkflowID {
+		t.Errorf("WorkflowID = %q", got.WorkflowID)
+	}
+}
+
+func TestMatchEvent_IssueComment_NonCommandBodyMentioningCommand_Skips(t *testing.T) {
+	// Quoted-reply guard: "/fishhawk approve" inside prose must not
+	// classify as a command. Only commands at the start of the
+	// trimmed body fire.
+	body := []byte(`{"comment":{"body":"Should I /fishhawk approve here?"},"issue":{"number":1}}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 1, RawBody: body}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("got = %+v, want skip", got)
+	}
+}
+
+func TestMatchEvent_IssueComment_NotMistakenForLongerCommandPrefix(t *testing.T) {
+	// "/fishhawk runner" is not "/fishhawk run" — the next byte
+	// after the command word must be whitespace or end-of-string.
+	body := []byte(`{"comment":{"body":"/fishhawk runner"},"issue":{"number":1}}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 1, RawBody: body}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("got = %+v, want skip", got)
+	}
+}
+
 // --- Dispatcher.Handle tests with stubs ---
 
 // stubGitHub is a minimal GitHubAPI for handler tests. Each call
@@ -1192,6 +1266,120 @@ func TestHandle_NotifyPickupError_DoesntFailDispatch(t *testing.T) {
 	}
 	if len(notifier.calls) != 1 {
 		t.Errorf("notifier should still be called once; got %d", len(notifier.calls))
+	}
+}
+
+// stubApprovalHandler captures HandleApprovalCommand invocations
+// so dispatcher routing tests can assert the handler is reached
+// with the right params.
+type stubApprovalHandler struct {
+	mu    sync.Mutex
+	calls []ApprovalCommandParams
+	err   error
+}
+
+func (s *stubApprovalHandler) HandleApprovalCommand(_ context.Context, p ApprovalCommandParams) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, p)
+	return s.err
+}
+
+func issueApproveCommentEvent(t *testing.T, body string) Event {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]any{
+		"action":  "created",
+		"comment": map[string]any{"body": body},
+		"issue":   map[string]any{"number": 1247},
+		"repository": map[string]any{
+			"full_name": "kuhlman-labs/fishhawk",
+		},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": "alice", "type": "User"},
+	})
+	ev, err := ParseEvent("issue_comment", "deliv-approve", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+func TestHandle_SlashApprove_RoutesToApprovalHandler(t *testing.T) {
+	d, gh, _, _ := newDispatcherWithStubs(t)
+	approver := &stubApprovalHandler{}
+	d.ApprovalHandler = approver
+
+	if err := d.Handle(context.Background(), issueApproveCommentEvent(t, "/fishhawk approve\n\nlooks good")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("approve command should not fire workflow_dispatch; got %d", gh.dispatchCalls)
+	}
+	if gh.specCalls != 0 {
+		t.Errorf("approve command should not fetch the spec; got %d", gh.specCalls)
+	}
+	if len(approver.calls) != 1 {
+		t.Fatalf("expected 1 approval handler call; got %d", len(approver.calls))
+	}
+	c := approver.calls[0]
+	if c.Decision != MatchActionApprove {
+		t.Errorf("decision = %q", c.Decision)
+	}
+	if c.SenderLogin != "alice" {
+		t.Errorf("sender = %q", c.SenderLogin)
+	}
+	if c.IssueNumber != 1247 {
+		t.Errorf("issue = %d", c.IssueNumber)
+	}
+	if c.Repo != "kuhlman-labs/fishhawk" {
+		t.Errorf("repo = %q", c.Repo)
+	}
+	if c.Comment != "looks good" {
+		t.Errorf("comment = %q", c.Comment)
+	}
+}
+
+func TestHandle_SlashReject_RoutesToApprovalHandler(t *testing.T) {
+	d, _, _, _ := newDispatcherWithStubs(t)
+	approver := &stubApprovalHandler{}
+	d.ApprovalHandler = approver
+
+	if err := d.Handle(context.Background(), issueApproveCommentEvent(t, "/fishhawk reject")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(approver.calls) != 1 {
+		t.Fatalf("expected 1 call; got %d", len(approver.calls))
+	}
+	if approver.calls[0].Decision != MatchActionReject {
+		t.Errorf("decision = %q want reject", approver.calls[0].Decision)
+	}
+}
+
+func TestHandle_SlashApprove_NoHandler_LogsAndSkips(t *testing.T) {
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	// Leave d.ApprovalHandler unset.
+
+	if err := d.Handle(context.Background(), issueApproveCommentEvent(t, "/fishhawk approve")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if gh.dispatchCalls != 0 || gh.specCalls != 0 {
+		t.Errorf("approve command should not fire workflow_dispatch or fetch spec without handler")
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("approve command should not create a run; got %+v", runs.created)
+	}
+}
+
+func TestHandle_SlashApprove_HandlerError_DoesntFailWebhook(t *testing.T) {
+	d, _, _, _ := newDispatcherWithStubs(t)
+	approver := &stubApprovalHandler{err: errors.New("forbidden")}
+	d.ApprovalHandler = approver
+
+	if err := d.Handle(context.Background(), issueApproveCommentEvent(t, "/fishhawk approve")); err != nil {
+		t.Errorf("handler errors should be swallowed; got %v", err)
+	}
+	if len(approver.calls) != 1 {
+		t.Errorf("handler should still be called; got %d", len(approver.calls))
 	}
 }
 

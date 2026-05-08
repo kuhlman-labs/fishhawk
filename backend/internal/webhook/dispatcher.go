@@ -26,6 +26,29 @@ const FishhawkLabel = "fishhawk"
 // from an issue or PR comment.
 const CommentTrigger = "/fishhawk run"
 
+// CommentApprove and CommentReject are the chat-style commands that
+// submit a gate decision against an issue's currently-awaiting-
+// approval stage (#238). The reviewer can leave an optional comment
+// on the line(s) following the command — captured into the
+// approval row's `comment` column.
+const (
+	CommentApprove = "/fishhawk approve"
+	CommentReject  = "/fishhawk reject"
+)
+
+// MatchAction tags how a matched event should be handled. Run is
+// the historical default (create + workflow_dispatch); approve and
+// reject act on an existing run's gate state without dispatching
+// new work.
+type MatchAction string
+
+// MatchAction values.
+const (
+	MatchActionRun     MatchAction = "run"
+	MatchActionApprove MatchAction = "approve"
+	MatchActionReject  MatchAction = "reject"
+)
+
 // DefaultWorkflowID is the workflow_id (a key under `workflows:`
 // in `.fishhawk/workflows.yaml`) the dispatcher selects when the
 // trigger doesn't specify one. Per MVP_SPEC §4.2's example.
@@ -38,12 +61,20 @@ const DefaultWorkflowID = "feature_change"
 const DefaultActionsWorkflowFile = "fishhawk.yml"
 
 // Match describes what to do with a webhook event after the
-// receiver has accepted it. Skip=true means "no run; record the
+// receiver has accepted it. Skip=true means "no action; record the
 // reason in the audit log and return 202." Skip=false means
-// "create a Run with these inputs and fire workflow_dispatch."
+// "perform Action against this run." For Action=run that's "create
+// a Run with these inputs and fire workflow_dispatch." For
+// Action=approve / reject it's "submit a gate decision against the
+// existing run for this issue."
 type Match struct {
 	Skip   bool
 	Reason string
+
+	// Action tags what kind of side effect Skip=false implies. Empty
+	// is treated as MatchActionRun for backwards-compatibility with
+	// the existing dispatcher path.
+	Action MatchAction
 
 	WorkflowID    string
 	TriggerSource run.TriggerSource
@@ -52,6 +83,12 @@ type Match struct {
 	// IssueRef is the parsed (number, body) tuple for issue-style
 	// triggers; empty for non-issue triggers.
 	IssueRef *IssueRef
+
+	// CommentBody is the trailing text of a slash command, when the
+	// comment carries a reason after the command word. Captured for
+	// approve / reject so the approval row's `comment` column gets
+	// the reviewer's rationale.
+	CommentBody string
 }
 
 // IssueRef captures the bits of an issue payload the dispatcher
@@ -115,6 +152,7 @@ func matchIssue(ev Event) Match {
 		return Match{Skip: true, Reason: "issue payload missing number"}
 	}
 	return Match{
+		Action:        MatchActionRun,
 		WorkflowID:    DefaultWorkflowID,
 		TriggerSource: run.TriggerGitHubIssue,
 		TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
@@ -141,22 +179,75 @@ func matchIssueComment(ev Event) Match {
 		return Match{Skip: true, Reason: "issue_comment payload parse failed"}
 	}
 	body := strings.TrimSpace(payload.Comment.Body)
-	if !strings.HasPrefix(body, CommentTrigger) {
-		return Match{Skip: true,
-			Reason: fmt.Sprintf("comment does not start with %q", CommentTrigger)}
-	}
 	if payload.Issue.Number == 0 {
 		return Match{Skip: true, Reason: "issue_comment payload missing issue number"}
 	}
-	return Match{
-		WorkflowID:    DefaultWorkflowID,
-		TriggerSource: run.TriggerGitHubIssue,
-		TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
-		IssueRef: &IssueRef{
-			Number: payload.Issue.Number,
-			Body:   payload.Comment.Body,
-		},
+
+	// Pick the most-specific command first so /fishhawk approve
+	// doesn't accidentally classify as /fishhawk run when the
+	// "/fishhawk" prefix coincides. Each branch leaves the trailing
+	// text (after the command) in CommentBody so approve / reject
+	// can capture an optional reason. The match is anchored at the
+	// start of the body — comments that begin with prose followed
+	// by the command are intentionally not honored (avoids quoted-
+	// reply false positives like "Should I run `/fishhawk run`?").
+	switch {
+	case isCommand(body, CommentApprove):
+		return Match{
+			Action:        MatchActionApprove,
+			TriggerSource: run.TriggerGitHubIssue,
+			TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
+			IssueRef:      &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
+			CommentBody:   trailingComment(body, CommentApprove),
+		}
+	case isCommand(body, CommentReject):
+		return Match{
+			Action:        MatchActionReject,
+			TriggerSource: run.TriggerGitHubIssue,
+			TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
+			IssueRef:      &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
+			CommentBody:   trailingComment(body, CommentReject),
+		}
+	case isCommand(body, CommentTrigger):
+		return Match{
+			Action:        MatchActionRun,
+			WorkflowID:    DefaultWorkflowID,
+			TriggerSource: run.TriggerGitHubIssue,
+			TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
+			IssueRef:      &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
+		}
 	}
+	return Match{Skip: true,
+		Reason: fmt.Sprintf("comment does not start with a Fishhawk command (recognized: %q, %q, %q)",
+			CommentTrigger, CommentApprove, CommentReject)}
+}
+
+// isCommand returns true when body starts with command followed by
+// either end-of-string, whitespace, or a newline. Matches
+// "/fishhawk run", "/fishhawk run\n…", "/fishhawk run because reason"
+// — but not "/fishhawk runner" (no false-prefix match against a
+// longer-but-similar command name).
+func isCommand(body, command string) bool {
+	if !strings.HasPrefix(body, command) {
+		return false
+	}
+	if len(body) == len(command) {
+		return true
+	}
+	next := body[len(command)]
+	return next == ' ' || next == '\t' || next == '\n' || next == '\r'
+}
+
+// trailingComment returns the trimmed text after a command word,
+// or "" when the command is the entire body. Used to capture the
+// reviewer's rationale on approve / reject. Multi-line bodies keep
+// internal newlines; only leading and trailing whitespace is
+// trimmed.
+func trailingComment(body, command string) string {
+	if len(body) <= len(command) {
+		return ""
+	}
+	return strings.TrimSpace(body[len(command):])
 }
 
 // GitHubAPI is the slice of githubclient.Client the dispatcher
@@ -180,6 +271,35 @@ type IssueNotifier interface {
 	NotifyPickup(ctx context.Context, runID uuid.UUID, senderLogin string) error
 }
 
+// ApprovalCommandHandler executes a slash-command approval / reject
+// against the run currently associated with an issue (#238). The
+// concrete implementation lives in the server package where the
+// approval, role, and stage-check repos all live; the dispatcher
+// just routes to it.
+//
+// Implementations are responsible for: finding the awaiting-approval
+// stage, authorizing the sender, enforcing blocking checks,
+// submitting the approval, advancing the run, and replying on the
+// issue with the outcome. Any error returned is best-effort logged
+// and not surfaced as a webhook 5xx — slash-command handling is a
+// best-effort companion to the SPA flow, not a failure-blocking
+// path.
+type ApprovalCommandHandler interface {
+	HandleApprovalCommand(ctx context.Context, params ApprovalCommandParams) error
+}
+
+// ApprovalCommandParams bundles what the handler needs to act on a
+// slash-command approval. The dispatcher fills these from the Match
+// + Event before calling the handler.
+type ApprovalCommandParams struct {
+	Repo           string
+	IssueNumber    int
+	InstallationID int64
+	SenderLogin    string
+	Decision       MatchAction // approve | reject
+	Comment        string      // optional reviewer rationale (the trailing line on the slash command)
+}
+
 // Dispatcher orchestrates the I/O side: it consumes a Match,
 // fetches the workflow spec, validates it, creates the Run record,
 // fires workflow_dispatch, and writes audit entries. The webhook
@@ -195,6 +315,12 @@ type Dispatcher struct {
 	// but don't unwind the dispatch. Nil leaves the comment-back
 	// path off; the run still dispatches.
 	IssueNotifier IssueNotifier
+
+	// ApprovalHandler routes /fishhawk approve and /fishhawk
+	// reject slash commands (#238). Nil leaves these commands
+	// silently skipped — useful in early dev or when the role
+	// resolver / approval repo aren't wired yet.
+	ApprovalHandler ApprovalCommandHandler
 
 	// DefaultRef is the git ref to dispatch against when the
 	// event doesn't carry one (e.g., issues events). Defaults to
@@ -230,6 +356,16 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 			slog.String("reason", m.Reason),
 		)
 		return nil
+	}
+
+	// Route by Match.Action. Approve / reject act on an existing
+	// run rather than creating a new one — they take a separate
+	// path that doesn't fetch the workflow spec or fire
+	// workflow_dispatch. The approval handler validates its own
+	// repo / installation inputs against what's already persisted.
+	switch m.Action {
+	case MatchActionApprove, MatchActionReject:
+		return d.handleApprovalCommand(ctx, ev, m)
 	}
 
 	repo, err := parseRepo(ev.Repo)
@@ -398,6 +534,49 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		slog.String("run_id", created.ID.String()),
 		slog.String("stage_id", firstStage.ID.String()),
 	)
+	return nil
+}
+
+// handleApprovalCommand routes /fishhawk approve and /fishhawk
+// reject slash commands (#238). Best-effort throughout: a missing
+// ApprovalHandler logs and returns nil (the comment is silently
+// dropped, same posture as a missing IssueNotifier on the pickup
+// path). A handler error logs but doesn't surface as a webhook 5xx
+// — slash-command approval is a companion to the SPA flow, not the
+// only path. The reviewer can still go to the dashboard.
+func (d *Dispatcher) handleApprovalCommand(ctx context.Context, ev Event, m Match) error {
+	if d.ApprovalHandler == nil {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"slash-command approval skipped: no handler wired",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("action", string(m.Action)),
+		)
+		return nil
+	}
+	if m.IssueRef == nil || m.IssueRef.Number == 0 {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"slash-command approval skipped: missing issue number",
+			slog.String("delivery_id", ev.DeliveryID),
+		)
+		return nil
+	}
+	if err := d.ApprovalHandler.HandleApprovalCommand(ctx, ApprovalCommandParams{
+		Repo:           ev.Repo,
+		IssueNumber:    m.IssueRef.Number,
+		InstallationID: ev.InstallationID,
+		SenderLogin:    ev.Sender,
+		Decision:       m.Action,
+		Comment:        m.CommentBody,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"slash-command approval failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("action", string(m.Action)),
+			slog.String("repo", ev.Repo),
+			slog.Int("issue", m.IssueRef.Number),
+			slog.String("error", err.Error()),
+		)
+	}
 	return nil
 }
 

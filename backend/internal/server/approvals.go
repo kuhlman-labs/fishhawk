@@ -154,7 +154,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// transition. Subsequent submissions return the prior decision
 	// and the stage's current state.
 	if res.Inserted {
-		stage, err = s.advanceStage(r, stageID, decision)
+		stage, err = s.advanceStage(r.Context(), stageID, decision)
 		if err != nil {
 			var inv run.InvalidTransitionError
 			if errors.As(err, &inv) {
@@ -200,13 +200,13 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 // path delegates to run.FailStage so the failure pattern is
 // identical to the SLA path and the trace-time policy path
 // (E8.1 #39).
-func (s *Server) advanceStage(r *http.Request, stageID uuid.UUID, decision approval.Decision) (*run.Stage, error) {
+func (s *Server) advanceStage(ctx context.Context, stageID uuid.UUID, decision approval.Decision) (*run.Stage, error) {
 	switch decision {
 	case approval.DecisionApprove:
-		return s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
+		return s.cfg.RunRepo.TransitionStage(ctx, stageID,
 			run.StageStateSucceeded, nil)
 	case approval.DecisionReject:
-		return run.FailStage(r.Context(), s.cfg.RunRepo, stageID,
+		return run.FailStage(ctx, s.cfg.RunRepo, stageID,
 			run.FailureD, "gate rejected by approver")
 	}
 	// Unreachable — decision was validated earlier.
@@ -254,7 +254,7 @@ func (s *Server) checkBlockingChecks(w http.ResponseWriter, r *http.Request, sta
 		// state on demand from artifact + audit-log presence so
 		// it always reflects the freshest run state.
 		if name == AuditCompleteCheckName {
-			state, err := s.deriveAuditCompleteState(r, stage.RunID)
+			state, err := s.deriveAuditCompleteState(r.Context(), stage.RunID)
 			if err != nil {
 				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 					"derive audit-complete state failed",
@@ -301,11 +301,11 @@ func (s *Server) checkBlockingChecks(w http.ResponseWriter, r *http.Request, sta
 // Check Run (#231) so the same gate that refuses approve here also
 // shows up on the PR's checks panel and (when wired to branch
 // protection) blocks the merge button. Best-effort.
-func (s *Server) deriveAuditCompleteState(r *http.Request, runID uuid.UUID) (stagecheck.State, error) {
+func (s *Server) deriveAuditCompleteState(ctx context.Context, runID uuid.UUID) (stagecheck.State, error) {
 	if s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
 		return stagecheck.StatePass, nil
 	}
-	state, missing, err := auditcomplete.Compute(r.Context(), runID, auditcomplete.Deps{
+	state, missing, err := auditcomplete.Compute(ctx, runID, auditcomplete.Deps{
 		Runs:      s.cfg.RunRepo,
 		Artifacts: s.cfg.ArtifactRepo,
 		Audit:     s.cfg.AuditRepo,
@@ -313,7 +313,7 @@ func (s *Server) deriveAuditCompleteState(r *http.Request, runID uuid.UUID) (sta
 	if err != nil {
 		return "", err
 	}
-	s.publishAuditCheck(r.Context(), runID, state, missing)
+	s.publishAuditCheck(ctx, runID, state, missing)
 	return state, nil
 }
 

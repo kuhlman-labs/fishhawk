@@ -1,0 +1,434 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
+)
+
+// Tests the slash-command approval flow end-to-end through the
+// Server.HandleApprovalCommand path (#238). Uses real-ish fakes
+// for the run, approval, audit, stagecheck, and orchestrator
+// repos; swaps in a recording GitHub commenter so reply text can
+// be asserted on.
+
+func TestHandleApprovalCommand_Approve_AdvancesStageAndReplies(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypePlan
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ApprovalRepo: ar,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ExternalURL:  "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        rr,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded", stage.State)
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("approval not recorded: %+v", ar.all)
+	}
+	if ar.all[0].Surface != approval.SurfaceGitHubComment {
+		t.Errorf("approval.Surface = %q, want github_comment", ar.all[0].Surface)
+	}
+	if ar.all[0].ApproverSubject != "alice" {
+		t.Errorf("approver = %q, want alice", ar.all[0].ApproverSubject)
+	}
+
+	if got := gh.calls(); len(got) != 1 {
+		t.Fatalf("expected 1 reply comment; got %d", len(got))
+	}
+	body := gh.calls()[0].body
+	if !strings.Contains(body, "Approved") {
+		t.Errorf("reply should say Approved: %q", body)
+	}
+	if !strings.Contains(body, "@alice") {
+		t.Errorf("reply should mention sender: %q", body)
+	}
+}
+
+func TestHandleApprovalCommand_Reject_FailsStageAndReplies(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:7"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypeReview
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ApprovalRepo: ar,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ExternalURL:  "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    7,
+		InstallationID: 99,
+		SenderLogin:    "bob",
+		Decision:       webhook.MatchActionReject,
+		Comment:        "scope is too wide",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stage.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", stage.State)
+	}
+	if got := ar.all[0].Decision; got != approval.DecisionReject {
+		t.Errorf("decision = %q", got)
+	}
+	if got := ar.all[0].Comment; got == nil || *got != "scope is too wide" {
+		t.Errorf("comment = %v, want 'scope is too wide'", got)
+	}
+	if !strings.Contains(gh.calls()[0].body, "Rejected") {
+		t.Errorf("reply should say Rejected: %q", gh.calls()[0].body)
+	}
+}
+
+func TestHandleApprovalCommand_NoAwaitingStage_RepliesAndSkips(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:1"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	// Stage is in pending — not awaiting approval.
+	rr.seedStage(r.ID, 0, run.StageStatePending)
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 1, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approval should not be recorded; got %+v", ar.all)
+	}
+	if !strings.Contains(gh.calls()[0].body, "No stage on this issue's run is awaiting approval") {
+		t.Errorf("reply should explain no awaiting stage: %q", gh.calls()[0].body)
+	}
+}
+
+func TestHandleApprovalCommand_BlockingChecksFailing_RefusesApprove(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:9"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypeReview
+	stage.Gate = &run.Gate{
+		Kind:           run.GateKindApproval,
+		BlockingChecks: []string{"ci_pass"},
+	}
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	scs := newFakeStageCheckRepo()
+	scs.seed(stage.ID, "ci_pass", stagecheck.StateFail)
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		StageCheckRepo: scs, ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 9, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage should NOT have advanced; state = %q", stage.State)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approval should not be recorded when checks failing; got %+v", ar.all)
+	}
+	body := gh.calls()[0].body
+	if !strings.Contains(body, "ci_pass") {
+		t.Errorf("reply should name failing check: %q", body)
+	}
+	if !strings.Contains(body, "blocking checks have not passed") {
+		t.Errorf("reply should explain why: %q", body)
+	}
+}
+
+func TestHandleApprovalCommand_RejectIgnoresBlockingChecks(t *testing.T) {
+	// Mirror the HTTP handler: reject is the path failing checks
+	// were intended to surface; the slash command should let it
+	// through too.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:9"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Gate = &run.Gate{
+		Kind:           run.GateKindApproval,
+		BlockingChecks: []string{"ci_pass"},
+	}
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	scs := newFakeStageCheckRepo()
+	scs.seed(stage.ID, "ci_pass", stagecheck.StateFail)
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		StageCheckRepo: scs, Orchestrator: o,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 9, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionReject,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stage.State != run.StageStateFailed {
+		t.Errorf("reject should advance stage to failed; got %q", stage.State)
+	}
+}
+
+func TestHandleApprovalCommand_RepeatAfterAdvance_RepliesNoAwaitingStage(t *testing.T) {
+	// Once an approve transitions the stage to succeeded, a second
+	// approve from the same reviewer on the same issue can't find
+	// an awaiting-approval stage — the run has moved on. The reply
+	// should explain that, not falsely claim success.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	params := webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+	}
+	if err := s.HandleApprovalCommand(context.Background(), params); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.HandleApprovalCommand(context.Background(), params); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ar.all) != 1 {
+		t.Errorf("approval repo should have one row; got %d", len(ar.all))
+	}
+	calls := gh.calls()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 reply comments (one per attempt); got %d", len(calls))
+	}
+	if !strings.Contains(calls[1].body, "No stage on this issue's run is awaiting approval") {
+		t.Errorf("second reply should explain no awaiting stage: %q", calls[1].body)
+	}
+}
+
+func TestHandleApprovalCommand_NoNotifier_NoOpReply(t *testing.T) {
+	// Without an issueNotifier wired, the slash-command handler
+	// short-circuits at approvalCommandConfigured() and logs.
+	// No reply, no approval written.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	_ = stage
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		// No ExternalURL → no issueNotifier.
+	})
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approval should not be recorded without notifier; got %+v", ar.all)
+	}
+}
+
+func TestHandleApprovalCommand_RepoLookupFailure_RepliesGracefully(t *testing.T) {
+	rr := &orchestratorRepoFailingList{listErr: errors.New("db down")}
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gh.calls(); len(got) != 1 || !strings.Contains(got[0].body, "Could not look up the run") {
+		t.Errorf("expected look-up-failed reply; got %+v", got)
+	}
+}
+
+// --- helpers ---
+
+type slashCommentCall struct {
+	repo        string
+	issueNumber int
+	body        string
+}
+
+type slashGitHubRecorder struct {
+	mu     sync.Mutex
+	stored []slashCommentCall
+}
+
+func newSlashGitHubRecorder() *slashGitHubRecorder { return &slashGitHubRecorder{} }
+
+func (g *slashGitHubRecorder) calls() []slashCommentCall {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]slashCommentCall, len(g.stored))
+	copy(out, g.stored)
+	return out
+}
+
+// CreateIssueComment satisfies issuecomment.IssueCommenter.
+func (g *slashGitHubRecorder) CreateIssueComment(_ context.Context, _ int64, repo githubclient.RepoRef, issueNumber int, body string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stored = append(g.stored, slashCommentCall{repo: repo.String(), issueNumber: issueNumber, body: body})
+	return nil
+}
+
+// orchestratorRepoFailingList wraps orchestratorRepo to inject a
+// failing ListRuns. The other methods come through the embedded
+// pointer; the test only exercises the look-up path so anything
+// past the ListRuns failure is unreachable.
+type orchestratorRepoFailingList struct {
+	*orchestratorRepo
+	listErr error
+}
+
+func (r *orchestratorRepoFailingList) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run, error) {
+	return nil, r.listErr
+}
