@@ -162,6 +162,19 @@ type Run struct {
 	// of creating a fresh one. Nil for webhook-driven runs (the
 	// receiver dedups via X-GitHub-Delivery).
 	IdempotencyKey *string
+	// ParentRunID, when non-nil, identifies the prior run this one
+	// follows up on (#216). Set by the dispatcher when it sees a
+	// new trigger for a (repo, trigger_ref) that already has a
+	// recent run. Lets the SPA render "follow-up to <short-id>"
+	// + a thread of related runs without a recursive walk.
+	ParentRunID *uuid.UUID
+	// PullRequestURL is set when the run's implement stage produces
+	// a pull_request artifact (#216). Denormalized so "show me
+	// every run on this PR" is a single equality query rather than
+	// a recursive parent walk. Nil for runs that haven't reached
+	// the implement stage yet, and for follow-up runs before their
+	// own implement stage lands.
+	PullRequestURL *string
 	State          State
 	CreatedAt      time.Time
 	UpdatedAt      time.Time

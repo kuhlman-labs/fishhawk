@@ -87,6 +87,9 @@ func (r *planPromptRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*ru
 func (r *planPromptRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *planPromptRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *planPromptRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }

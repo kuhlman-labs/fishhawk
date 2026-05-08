@@ -137,6 +137,9 @@ func (m *memRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, err
 func (m *memRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (m *memRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (m *memRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }

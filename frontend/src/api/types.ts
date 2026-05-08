@@ -17,6 +17,18 @@ export interface Run {
   trigger_source: TriggerSource;
   trigger_ref: string | null;
   state: RunState;
+  /**
+   * Set when the dispatcher saw a non-terminal run on the same
+   * (repo, trigger_ref) at create time and threaded this run as
+   * its follow-up (#216).
+   */
+  parent_run_id?: string | null;
+  /**
+   * Set when the implement stage produced a pull_request artifact
+   * (#216). The threaded-runs view groups by this column to render
+   * "every run on this PR."
+   */
+  pull_request_url?: string | null;
   created_at: string;
   updated_at: string;
 }

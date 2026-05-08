@@ -26,6 +26,11 @@ type CreateRunParams struct {
 	// constraint. Webhook-driven creates leave this nil; the
 	// receiver dedups via X-GitHub-Delivery upstream.
 	IdempotencyKey *string
+	// ParentRunID, when non-nil, threads the new run as a follow-
+	// up to an existing run (#216). Set by the dispatcher when a
+	// fresh trigger lands for a (repo, trigger_ref) tuple that
+	// already has a non-terminal run.
+	ParentRunID *uuid.UUID
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.
@@ -66,13 +71,21 @@ type StageCompletion struct {
 	FailureReason   *string
 }
 
-// ListRunsFilter scopes a ListRuns query. Empty strings mean "no
-// constraint" — same convention as the underlying SQL. Limit must
-// be > 0; Offset must be >= 0.
+// ListRunsFilter scopes a ListRuns query. Empty strings / nil
+// pointers mean "no constraint" — same convention as the
+// underlying SQL. Limit must be > 0; Offset must be >= 0.
 type ListRunsFilter struct {
 	Repo       string
 	WorkflowID string
 	State      string
+	// PullRequestURL filters to runs whose implement-stage
+	// pull_request artifact landed at the given URL. Used by the
+	// threaded-runs view (#216) to render every run on a PR.
+	PullRequestURL *string
+	// TriggerRef filters by the parsed trigger source ref (e.g.
+	// "issue:42"). Used by the dispatcher to find prior runs on
+	// the same issue when threading a new follow-up (#216).
+	TriggerRef *string
 	Limit      int
 	Offset     int
 }
@@ -104,6 +117,12 @@ type Repository interface {
 	// the target is not reachable. Same-state (idempotent) calls
 	// return the unchanged run.
 	TransitionRun(ctx context.Context, id uuid.UUID, to State) (*Run, error)
+
+	// SetRunPullRequestURL backfills the implement-stage PR URL
+	// onto the run row when the pull_request artifact lands
+	// (#216). Idempotent: setting the same URL twice is a no-op.
+	// Returns ErrNotFound when the run doesn't exist.
+	SetRunPullRequestURL(ctx context.Context, id uuid.UUID, url string) (*Run, error)
 
 	CreateStage(ctx context.Context, p CreateStageParams) (*Stage, error)
 	GetStage(ctx context.Context, id uuid.UUID) (*Stage, error)

@@ -14,21 +14,22 @@ import (
 
 const createRun = `-- name: CreateRun :one
 
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url
 `
 
 type CreateRunParams struct {
-	ID             uuid.UUID `json:"id"`
-	Repo           string    `json:"repo"`
-	WorkflowID     string    `json:"workflow_id"`
-	WorkflowSha    string    `json:"workflow_sha"`
-	TriggerSource  string    `json:"trigger_source"`
-	TriggerRef     *string   `json:"trigger_ref"`
-	State          string    `json:"state"`
-	InstallationID *int64    `json:"installation_id"`
-	IdempotencyKey *string   `json:"idempotency_key"`
+	ID             uuid.UUID  `json:"id"`
+	Repo           string     `json:"repo"`
+	WorkflowID     string     `json:"workflow_id"`
+	WorkflowSha    string     `json:"workflow_sha"`
+	TriggerSource  string     `json:"trigger_source"`
+	TriggerRef     *string    `json:"trigger_ref"`
+	State          string     `json:"state"`
+	InstallationID *int64     `json:"installation_id"`
+	IdempotencyKey *string    `json:"idempotency_key"`
+	ParentRunID    *uuid.UUID `json:"parent_run_id"`
 }
 
 // Run / stage queries consumed by the postgres adapter for the
@@ -45,6 +46,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		arg.State,
 		arg.InstallationID,
 		arg.IdempotencyKey,
+		arg.ParentRunID,
 	)
 	var i Run
 	err := row.Scan(
@@ -59,6 +61,8 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.UpdatedAt,
 		&i.InstallationID,
 		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
 	)
 	return i, err
 }
@@ -128,7 +132,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key FROM runs WHERE id = $1
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url FROM runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -146,12 +150,14 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.UpdatedAt,
 		&i.InstallationID,
 		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
 	)
 	return i, err
 }
 
 const getRunByIdempotencyKey = `-- name: GetRunByIdempotencyKey :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url FROM runs
  WHERE repo = $1
    AND idempotency_key = $2
 `
@@ -179,6 +185,8 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 		&i.UpdatedAt,
 		&i.InstallationID,
 		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
 	)
 	return i, err
 }
@@ -214,30 +222,41 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 }
 
 const listRuns = `-- name: ListRuns :many
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url FROM runs
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR workflow_id = $2)
    AND ($3::text = '' OR state = $3)
+   AND ($4::text IS NULL OR pull_request_url = $4)
+   AND ($5::text IS NULL OR trigger_ref = $5)
  ORDER BY created_at DESC, id DESC
- LIMIT $5 OFFSET $4
+ LIMIT $7 OFFSET $6
 `
 
 type ListRunsParams struct {
-	Repo       string `json:"repo"`
-	WorkflowID string `json:"workflow_id"`
-	State      string `json:"state"`
-	Off        int32  `json:"off"`
-	Lim        int32  `json:"lim"`
+	Repo           string  `json:"repo"`
+	WorkflowID     string  `json:"workflow_id"`
+	State          string  `json:"state"`
+	PullRequestUrl *string `json:"pull_request_url"`
+	TriggerRef     *string `json:"trigger_ref"`
+	Off            int32   `json:"off"`
+	Lim            int32   `json:"lim"`
 }
 
-// Empty string in any filter means "no constraint." created_at DESC
-// + id DESC tiebreak so paginations are stable across concurrent
+// Empty string / nil in any filter means "no constraint." created_at
+// DESC + id DESC tiebreak so paginations are stable across concurrent
 // inserts at the same created_at microsecond.
+//
+// pull_request_url and trigger_ref are nullable filters: pass NULL to
+// skip; pass a value to match exactly. They're indexed (partial,
+// WHERE NOT NULL) so an equality match on either is cheap. Used by
+// the threaded-runs view (#216) to render "every run on this PR."
 func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, error) {
 	rows, err := q.db.Query(ctx, listRuns,
 		arg.Repo,
 		arg.WorkflowID,
 		arg.State,
+		arg.PullRequestUrl,
+		arg.TriggerRef,
 		arg.Off,
 		arg.Lim,
 	)
@@ -260,6 +279,8 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 			&i.UpdatedAt,
 			&i.InstallationID,
 			&i.IdempotencyKey,
+			&i.ParentRunID,
+			&i.PullRequestUrl,
 		); err != nil {
 			return nil, err
 		}
@@ -417,7 +438,7 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 }
 
 const lockRunForUpdate = `-- name: LockRunForUpdate :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key FROM runs WHERE id = $1 FOR UPDATE
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url FROM runs WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -435,6 +456,8 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 		&i.UpdatedAt,
 		&i.InstallationID,
 		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
 	)
 	return i, err
 }
@@ -469,11 +492,48 @@ func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, 
 	return i, err
 }
 
+const setRunPullRequestURL = `-- name: SetRunPullRequestURL :one
+UPDATE runs
+   SET pull_request_url = $2
+ WHERE id = $1
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url
+`
+
+type SetRunPullRequestURLParams struct {
+	ID             uuid.UUID `json:"id"`
+	PullRequestUrl *string   `json:"pull_request_url"`
+}
+
+// Backfills the implement-stage PR URL onto the run row when the
+// pull_request artifact lands (#216). Idempotent: a re-upload with
+// the same URL is a no-op the trigger keeps as a no-op against
+// updated_at (assignment of identical value).
+func (q *Queries) SetRunPullRequestURL(ctx context.Context, arg SetRunPullRequestURLParams) (Run, error) {
+	row := q.db.QueryRow(ctx, setRunPullRequestURL, arg.ID, arg.PullRequestUrl)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.Repo,
+		&i.WorkflowID,
+		&i.WorkflowSha,
+		&i.TriggerSource,
+		&i.TriggerRef,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.InstallationID,
+		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
+	)
+	return i, err
+}
+
 const updateRunState = `-- name: UpdateRunState :one
 UPDATE runs
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url
 `
 
 type UpdateRunStateParams struct {
@@ -496,6 +556,8 @@ func (q *Queries) UpdateRunState(ctx context.Context, arg UpdateRunStateParams) 
 		&i.UpdatedAt,
 		&i.InstallationID,
 		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
 	)
 	return i, err
 }

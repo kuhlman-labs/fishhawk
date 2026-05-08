@@ -64,6 +64,8 @@ type Run struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	InstallationID *int64             `json:"installation_id"`
 	IdempotencyKey *string            `json:"idempotency_key"`
+	ParentRunID    pgtype.UUID        `json:"parent_run_id"`
+	PullRequestUrl *string            `json:"pull_request_url"`
 }
 
 type Session struct {

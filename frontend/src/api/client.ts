@@ -85,11 +85,17 @@ export const api = {
     limit?: number;
     cursor?: string;
     repo?: string;
+    /** Equality filter on run.pull_request_url (#216). */
+    pullRequestURL?: string;
+    /** Equality filter on run.trigger_ref, e.g. "issue:42" (#216). */
+    triggerRef?: string;
   }): Promise<PaginatedList<Run>> {
     const q = new URLSearchParams();
     if (params?.limit) q.set('limit', String(params.limit));
     if (params?.cursor) q.set('cursor', params.cursor);
     if (params?.repo) q.set('repo', params.repo);
+    if (params?.pullRequestURL) q.set('pull_request_url', params.pullRequestURL);
+    if (params?.triggerRef) q.set('trigger_ref', params.triggerRef);
     const qs = q.toString();
     return request(`/v0/runs${qs ? `?${qs}` : ''}`);
   },

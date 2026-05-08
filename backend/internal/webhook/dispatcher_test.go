@@ -314,6 +314,7 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		WorkflowSHA:   p.WorkflowSHA,
 		TriggerSource: p.TriggerSource,
 		TriggerRef:    p.TriggerRef,
+		ParentRunID:   p.ParentRunID,
 		State:         run.StatePending,
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
@@ -368,10 +369,32 @@ func (s *stubRuns) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
 func (s *stubRuns) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
 	return nil, run.ErrNotFound
 }
-func (s *stubRuns) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
-	return nil, errors.New("not used")
+func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*run.Run, 0, len(s.created))
+	// Mirror the SQL: created_at DESC tiebreak by id DESC. The
+	// dispatcher's parent-finder reads the first non-terminal row,
+	// so newest-first ordering matters. Tests append in order so
+	// reverse iteration is enough.
+	for i := len(s.created) - 1; i >= 0; i-- {
+		r := s.created[i]
+		if f.Repo != "" && r.Repo != f.Repo {
+			continue
+		}
+		if f.TriggerRef != nil {
+			if r.TriggerRef == nil || *r.TriggerRef != *f.TriggerRef {
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 func (s *stubRuns) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
+func (s *stubRuns) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
 func (s *stubRuns) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
@@ -1380,6 +1403,79 @@ func TestHandle_SlashApprove_HandlerError_DoesntFailWebhook(t *testing.T) {
 	}
 	if len(approver.calls) != 1 {
 		t.Errorf("handler should still be called; got %d", len(approver.calls))
+	}
+}
+
+func TestHandle_ThreadsFollowupAsParent_WhenPriorRunIsActive(t *testing.T) {
+	d, _, runs, _ := newDispatcherWithStubs(t)
+
+	// Pre-seed an existing non-terminal run on the same trigger_ref.
+	// The dispatcher's findParentRunID reads ListRuns; the stub
+	// returns rows newest-first, so the most-recent active run wins.
+	tr := "issue:1247"
+	priorID := uuid.New()
+	runs.created = append(runs.created, &run.Run{
+		ID:            priorID,
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    DefaultWorkflowID,
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    &tr,
+		State:         run.StateRunning,
+		CreatedAt:     time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
+	})
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(runs.created) != 2 {
+		t.Fatalf("expected 2 runs (prior + new); got %d", len(runs.created))
+	}
+	newest := runs.created[len(runs.created)-1]
+	if newest.ParentRunID == nil {
+		t.Fatalf("ParentRunID should be set when a prior active run exists")
+	}
+	if *newest.ParentRunID != priorID {
+		t.Errorf("ParentRunID = %s, want %s", newest.ParentRunID, priorID)
+	}
+}
+
+func TestHandle_DoesNotThread_WhenPriorRunIsTerminal(t *testing.T) {
+	d, _, runs, _ := newDispatcherWithStubs(t)
+
+	// Pre-seed an existing terminal run; the dispatcher should
+	// treat the new trigger as a fresh root rather than threading
+	// it under the closed predecessor.
+	tr := "issue:1247"
+	runs.created = append(runs.created, &run.Run{
+		ID:            uuid.New(),
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    DefaultWorkflowID,
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    &tr,
+		State:         run.StateSucceeded,
+		CreatedAt:     time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
+	})
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	newest := runs.created[len(runs.created)-1]
+	if newest.ParentRunID != nil {
+		t.Errorf("ParentRunID should be nil when prior run is terminal; got %v", newest.ParentRunID)
+	}
+}
+
+func TestHandle_DoesNotThread_WhenNoPriorRun(t *testing.T) {
+	d, _, runs, _ := newDispatcherWithStubs(t)
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Fatalf("expected 1 run; got %d", len(runs.created))
+	}
+	if runs.created[0].ParentRunID != nil {
+		t.Errorf("ParentRunID should be nil when there's no prior run; got %v", runs.created[0].ParentRunID)
 	}
 }
 

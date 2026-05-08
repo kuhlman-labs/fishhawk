@@ -74,6 +74,9 @@ func (r *traceReadStageRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*r
 func (r *traceReadStageRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *traceReadStageRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *traceReadStageRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }

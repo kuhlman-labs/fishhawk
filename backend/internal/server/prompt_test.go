@@ -21,12 +21,18 @@ import (
 // promptRunRepo is a run.Repository fake that supports GetStage +
 // GetRun. Other methods panic to make accidental calls loud.
 type promptRunRepo struct {
-	stage     *run.Stage
-	stageErr  error
-	runRow    *run.Run
-	runErr    error
-	getStages map[uuid.UUID]*run.Stage
-	getRuns   map[uuid.UUID]*run.Run
+	stage         *run.Stage
+	stageErr      error
+	runRow        *run.Run
+	runErr        error
+	getStages     map[uuid.UUID]*run.Stage
+	getRuns       map[uuid.UUID]*run.Run
+	setPRURLCalls []promptSetPRURLCall
+}
+
+type promptSetPRURLCall struct {
+	RunID uuid.UUID
+	URL   string
 }
 
 func newPromptRunRepo() *promptRunRepo {
@@ -73,6 +79,22 @@ func (r *promptRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Ru
 }
 func (r *promptRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
+}
+func (r *promptRunRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, url string) (*run.Run, error) {
+	r.setPRURLCalls = append(r.setPRURLCalls, promptSetPRURLCall{RunID: id, URL: url})
+	if rn, ok := r.getRuns[id]; ok {
+		u := url
+		rn.PullRequestURL = &u
+		return rn, nil
+	}
+	if r.runRow != nil && r.runRow.ID == id {
+		u := url
+		r.runRow.PullRequestURL = &u
+		return r.runRow, nil
+	}
+	// Run not seeded — return a synthetic row so the handler's
+	// best-effort log path still works.
+	return &run.Run{ID: id}, nil
 }
 func (r *promptRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -228,6 +229,20 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"append audit entry failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	// Backfill the run's pull_request_url so the threaded-runs view
+	// (#216) can group every run on this PR with a single equality
+	// query. Best-effort: a write failure logs but doesn't unwind
+	// the upload — the PR artifact + audit row are already in
+	// place, and a cron-style backfill could reconcile later.
+	if _, err := s.cfg.RunRepo.SetRunPullRequestURL(r.Context(), runID, pr.PRURL); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"backfill pull_request_url failed",
+			slog.String("run_id", runID.String()),
+			slog.String("pr_url", pr.PRURL),
+			slog.String("error", err.Error()),
+		)
 	}
 
 	s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{

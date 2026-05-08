@@ -5,6 +5,7 @@ import { useAsync } from '@/api/use-async';
 import { describeFailure } from '@/api/types';
 import type { Run, Stage } from '@/api/types';
 import { StageStateBadge } from '@/components/stage-state-badge';
+import { FollowUpLink, RelatedRunsSection } from '@/runs/related-runs';
 import { RunAuditList } from './audit-list';
 
 export function RunDetail() {
@@ -44,6 +45,7 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
 
       <header className="space-y-2">
         <h1 className="font-mono text-lg font-semibold tracking-tight">{run.repo}</h1>
+        {run.parent_run_id && <FollowUpLink parentRunID={run.parent_run_id} />}
         <dl className="grid grid-cols-[10rem_1fr] gap-y-1 text-sm">
           <dt className="text-neutral-500">Workflow</dt>
           <dd className="font-mono">{run.workflow_id}</dd>
@@ -54,6 +56,21 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
             {run.trigger_source}
             {run.trigger_ref ? ` · ${run.trigger_ref}` : ''}
           </dd>
+          {run.pull_request_url && (
+            <>
+              <dt className="text-neutral-500">Pull request</dt>
+              <dd className="font-mono text-xs">
+                <a
+                  href={run.pull_request_url}
+                  rel="noopener noreferrer"
+                  target="_blank"
+                  className="text-blue-700 hover:underline dark:text-blue-300"
+                >
+                  {run.pull_request_url}
+                </a>
+              </dd>
+            </>
+          )}
           <dt className="text-neutral-500">SHA</dt>
           <dd className="font-mono text-xs">{run.workflow_sha}</dd>
           <dt className="text-neutral-500">Run ID</dt>
@@ -104,6 +121,8 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
           ))}
         </ol>
       </div>
+
+      <RelatedRunsSection run={run} />
 
       <div id="audit" className="scroll-mt-8 space-y-2">
         <h2 className="text-sm font-medium tracking-wide text-neutral-600 uppercase dark:text-neutral-400">

@@ -423,8 +423,17 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// Step 4: create the Run record. workflow_sha is the blob SHA
 	// — stable per content, so two refs at the same content hash
 	// resolve to the same row's foreign key target.
+	//
+	// Thread the new run as a follow-up when a prior run on the
+	// same (repo, trigger_ref) is still active (#216). The most-
+	// recent active run is the parent so reviewers see "follow-up
+	// to <short-id>" pointing at the relevant predecessor.
+	// Best-effort: a lookup failure logs but doesn't unwind —
+	// threading is convenience, not correctness, and we'd rather
+	// dispatch unthreaded than refuse the run on a query flap.
 	triggerRef := m.TriggerRef
 	installationID := ev.InstallationID
+	parentRunID := d.findParentRunID(ctx, ev.Repo, triggerRef)
 	created, err := d.Runs.CreateRun(ctx, run.CreateRunParams{
 		Repo:           ev.Repo,
 		WorkflowID:     m.WorkflowID,
@@ -432,6 +441,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		TriggerSource:  m.TriggerSource,
 		TriggerRef:     &triggerRef,
 		InstallationID: &installationID,
+		ParentRunID:    parentRunID,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create run: %w", err)
@@ -534,6 +544,45 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		slog.String("run_id", created.ID.String()),
 		slog.String("stage_id", firstStage.ID.String()),
 	)
+	return nil
+}
+
+// findParentRunID returns the most-recent non-terminal run for
+// (repo, trigger_ref), or nil when there's no active predecessor
+// (#216). Best-effort: a query error logs but returns nil so the
+// new run dispatches as a fresh root rather than failing.
+//
+// "Active" here is "not in a terminal state." A run that finished
+// (succeeded / failed / cancelled) doesn't get follow-up children;
+// once the lifecycle is closed, the next /fishhawk run on the
+// same issue is treated as a fresh root. Open question for v0.x:
+// whether a succeeded run should still have follow-ups (revision
+// requests on a merged PR). Punt for now.
+func (d *Dispatcher) findParentRunID(ctx context.Context, repo, triggerRef string) *uuid.UUID {
+	if d.Runs == nil || repo == "" || triggerRef == "" {
+		return nil
+	}
+	tr := triggerRef
+	prior, err := d.Runs.ListRuns(ctx, run.ListRunsFilter{
+		Repo:       repo,
+		TriggerRef: &tr,
+		Limit:      10,
+	})
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"parent-run lookup failed",
+			slog.String("repo", repo),
+			slog.String("trigger_ref", triggerRef),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for _, r := range prior {
+		if !r.State.IsTerminal() {
+			id := r.ID
+			return &id
+		}
+	}
 	return nil
 }
 

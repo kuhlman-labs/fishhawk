@@ -102,6 +102,33 @@ func TestShipPullRequest_HappyPath(t *testing.T) {
 	}
 }
 
+func TestShipPullRequest_BackfillsPullRequestURLOnRun(t *testing.T) {
+	// Threaded-runs view (#216) groups runs by pull_request_url. The
+	// PR-upload handler is the one path that knows the URL, so it
+	// must call run.Repo.SetRunPullRequestURL after creating the
+	// artifact.
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, rr := newPRServer(t, runID, stageID)
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning}
+	priv, _ := sf.issue(t, runID)
+	body := validPRBytes(t)
+
+	w := shipPRRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if len(rr.setPRURLCalls) != 1 {
+		t.Fatalf("expected 1 SetRunPullRequestURL call; got %d", len(rr.setPRURLCalls))
+	}
+	c := rr.setPRURLCalls[0]
+	if c.RunID != runID {
+		t.Errorf("RunID = %s want %s", c.RunID, runID)
+	}
+	if c.URL == "" || !strings.HasPrefix(c.URL, "http") {
+		t.Errorf("URL = %q (should be the PR URL from the body)", c.URL)
+	}
+}
+
 func TestShipPullRequest_Idempotent_SecondUpload(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, au, _ := newPRServer(t, runID, stageID)

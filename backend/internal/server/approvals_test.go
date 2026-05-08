@@ -185,6 +185,9 @@ func (r *approvalRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.
 func (r *approvalRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *approvalRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *approvalRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
@@ -611,6 +614,18 @@ func (r *orchestratorRepo) TransitionRun(_ context.Context, id uuid.UUID, to run
 		return nil, run.InvalidTransitionError{Kind: "run", From: string(rr.State), To: string(to)}
 	}
 	rr.State = to
+	return rr, nil
+}
+
+func (r *orchestratorRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, url string) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rr, ok := r.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	u := url
+	rr.PullRequestURL = &u
 	return rr, nil
 }
 
