@@ -26,6 +26,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -227,11 +228,23 @@ func runServe(args []string, logSink io.Writer) int {
 	// don't produce runs — useful for early dev against a backend
 	// that hasn't been GitHub-wired yet.
 	if cfg.GitHub != nil && cfg.RunRepo != nil && cfg.AuditRepo != nil {
+		// Issue-comment notifier (#234). nil when ExternalURL is
+		// empty; the dispatcher then skips the pickup-ack step
+		// silently. Built once + shared between the dispatcher
+		// (pickup ack) and the trace handler's plan-ready hook
+		// (which goes through Server.issueNotifier separately).
+		notifier := issuecomment.New(issuecomment.Deps{
+			GitHub:      cfg.GitHub,
+			Runs:        cfg.RunRepo,
+			Audit:       cfg.AuditRepo,
+			ExternalURL: cfg.ExternalURL,
+		})
 		cfg.WebhookDispatcher = &webhook.Dispatcher{
-			GitHub: cfg.GitHub,
-			Runs:   cfg.RunRepo,
-			Audit:  cfg.AuditRepo,
-			Logger: logger,
+			GitHub:        cfg.GitHub,
+			Runs:          cfg.RunRepo,
+			Audit:         cfg.AuditRepo,
+			Logger:        logger,
+			IssueNotifier: notifier,
 		}
 		logger.Info("webhook dispatcher configured")
 	}

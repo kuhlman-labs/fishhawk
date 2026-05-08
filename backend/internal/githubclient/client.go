@@ -400,6 +400,54 @@ func (c *Client) DispatchWorkflow(ctx context.Context, installationID int64, rep
 	return classifyStatus("dispatch", resp)
 }
 
+// CreateIssueComment posts a markdown comment to the given issue
+// (or PR — GitHub treats PR conversations as issue threads).
+//
+//	POST /repos/{owner}/{repo}/issues/{number}/comments
+//
+// Returns ErrNotFound when the issue or repo isn't visible to the
+// installation, ErrForbidden when the App lacks `issues:write`.
+// Caller is responsible for any rate-limit / dedup logic — this
+// helper is the thin wrapper around the wire call.
+func (c *Client) CreateIssueComment(ctx context.Context, installationID int64, repo RepoRef, issueNumber int, body string) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if issueNumber <= 0 {
+		return errors.New("githubclient: issue number must be > 0")
+	}
+	if body == "" {
+		return errors.New("githubclient: comment body must be non-empty")
+	}
+
+	raw, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal issue comment: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/issues/" + url.PathEscape(fmt.Sprintf("%d", issueNumber)) +
+		"/comments")
+
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: create issue comment: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	return classifyStatus("create issue comment", resp)
+}
+
 // CheckRunStatus is the GitHub Checks API `status` enum.
 // Closed set; passing anything else returns ErrValidation.
 type CheckRunStatus string

@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -204,6 +205,12 @@ type Server struct {
 	// gate enforcement still runs in that case. Built once at New;
 	// concurrent Publish calls are safe.
 	auditCheckPublisher *auditcheckpublisher.Publisher
+
+	// issueNotifier posts pickup-ack and plan-ready comments back
+	// to the triggering GitHub issue (#234). nil when the deps
+	// don't add up (no GitHub client, no audit repo, or no
+	// ExternalURL). Concurrent NotifyXxx calls are safe.
+	issueNotifier *issuecomment.Notifier
 }
 
 // New builds a Server. It does not start listening; call Start.
@@ -224,6 +231,12 @@ func New(cfg Config) *Server {
 			GitHub:      cfg.GitHub,
 			Runs:        cfg.RunRepo,
 			Artifacts:   cfg.ArtifactRepo,
+			ExternalURL: cfg.ExternalURL,
+		})
+		s.issueNotifier = issuecomment.New(issuecomment.Deps{
+			GitHub:      cfg.GitHub,
+			Runs:        cfg.RunRepo,
+			Audit:       cfg.AuditRepo,
 			ExternalURL: cfg.ExternalURL,
 		})
 	}

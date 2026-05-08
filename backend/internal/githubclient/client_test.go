@@ -50,6 +50,9 @@ type fakeGitHub struct {
 	createCheckRunStatus int
 	createCheckRunBody   string
 
+	createIssueCommentStatus int
+	createIssueCommentBody   string
+
 	gotAuth        string
 	gotPath        string
 	gotQuery       string
@@ -63,11 +66,13 @@ type fakeGitHub struct {
 func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 	t.Helper()
 	fg := &fakeGitHub{
-		getFileStatus:        http.StatusOK,
-		dispatchStatus:       http.StatusNoContent,
-		getIssueStatus:       http.StatusOK,
-		createCheckRunStatus: http.StatusCreated,
-		createCheckRunBody:   `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
+		getFileStatus:            http.StatusOK,
+		dispatchStatus:           http.StatusNoContent,
+		getIssueStatus:           http.StatusOK,
+		createCheckRunStatus:     http.StatusCreated,
+		createCheckRunBody:       `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
+		createIssueCommentStatus: http.StatusCreated,
+		createIssueCommentBody:   `{"id":11111}`,
 	}
 	mux := http.NewServeMux()
 
@@ -118,6 +123,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.createCheckRunStatus)
 			if fg.createCheckRunBody != "" {
 				_, _ = io.WriteString(w, fg.createCheckRunBody)
+			}
+		})
+
+	mux.HandleFunc("POST /repos/{owner}/{repo}/issues/{number}/comments",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.createIssueCommentStatus)
+			if fg.createIssueCommentBody != "" {
+				_, _ = io.WriteString(w, fg.createIssueCommentBody)
 			}
 		})
 
@@ -696,5 +711,70 @@ func TestCreateCheckRun_GitHubError(t *testing.T) {
 		})
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+// --- CreateIssueComment ---
+
+func TestCreateIssueComment_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.CreateIssueComment(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 17, "Fishhawk picked this up."); err != nil {
+		t.Fatalf("CreateIssueComment: %v", err)
+	}
+	if fg.gotMethod != http.MethodPost {
+		t.Errorf("method = %q want POST", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/issues/17/comments" {
+		t.Errorf("path = %q", fg.gotPath)
+	}
+	if fg.gotContentType != "application/json" {
+		t.Errorf("content-type = %q", fg.gotContentType)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["body"] != "Fishhawk picked this up." {
+		t.Errorf("body = %q", body["body"])
+	}
+}
+
+func TestCreateIssueComment_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		number    int
+		body      string
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, 1, "x", "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, 1, "x", "owner and name"},
+		{"zero number", RepoRef{Owner: "x", Name: "y"}, 0, "x", "issue number must be"},
+		{"empty body", RepoRef{Owner: "x", Name: "y"}, 1, "", "body must be non-empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := c.CreateIssueComment(context.Background(), 1, tc.repo, tc.number, tc.body)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestCreateIssueComment_GitHubError(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.createIssueCommentStatus = http.StatusForbidden
+	fg.createIssueCommentBody = `{"message":"Resource not accessible by integration"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.CreateIssueComment(context.Background(), 1,
+		RepoRef{Owner: "x", Name: "y"}, 1, "hi")
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v want ErrForbidden", err)
 	}
 }
