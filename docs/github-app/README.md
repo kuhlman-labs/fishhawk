@@ -203,6 +203,23 @@ Per ADR-005 (#69) and E13.4 (#61) the production secrets path is AWS Secrets Man
 
 Customer-side: visit `https://github.com/apps/fishhawk` (or the App's settings page during private testing), pick the repo to install on, and grant access. Their installation triggers the backend's webhook receiver and is ready to run.
 
+### Making the audit gate block merges
+
+Fishhawk publishes a `fishhawk_audit_complete` Check Run on every PR's head commit (#231) once the backend has computed the run's audit-completeness state. The check is informational on its own — to make it actually block the merge button, customers add it as a **Required status check** in branch protection:
+
+1. Wait for at least one Fishhawk run on a PR so GitHub registers the check name. (Required-check selectors only show names GitHub has previously seen on the branch.)
+2. Repo **Settings → Branches**.
+3. Add or edit a branch protection rule for `main` (or whatever your default is).
+4. Tick **Require status checks to pass before merging**.
+5. Search for `fishhawk_audit_complete` and add it. Optionally add `ci_pass` and any other check names from your workflow spec's `blocking_checks`.
+6. Save.
+
+From this point, GitHub itself refuses the merge until Fishhawk reports `success`. The "Details" link on the check on github.com routes back to the run page in Fishhawk via the operator's configured `FISHHAWKD_EXTERNAL_URL`.
+
+### Re-installing after a permissions bump
+
+When the App's permission set changes (e.g. a new `checks: write` requirement), GitHub flags the installation as needing review and existing installations fall back to the old permission set until the customer accepts the new ones. Reinstall via the App's installation page (**Configure** → **Save**) to pick up the new permissions.
+
 **Installing the App is the only repo-side dependency.** Specifically, customers do **not** need to:
 
 - Enable **Settings → Actions → General → Workflow permissions → "Allow GitHub Actions to create and approve pull requests"**. The runner uses the App's installation token for push and PR creation (per #197), not the workflow's `GITHUB_TOKEN`.

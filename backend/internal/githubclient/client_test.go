@@ -47,6 +47,9 @@ type fakeGitHub struct {
 	getIssueStatus int
 	getIssueBody   string
 
+	createCheckRunStatus int
+	createCheckRunBody   string
+
 	gotAuth        string
 	gotPath        string
 	gotQuery       string
@@ -60,9 +63,11 @@ type fakeGitHub struct {
 func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 	t.Helper()
 	fg := &fakeGitHub{
-		getFileStatus:  http.StatusOK,
-		dispatchStatus: http.StatusNoContent,
-		getIssueStatus: http.StatusOK,
+		getFileStatus:        http.StatusOK,
+		dispatchStatus:       http.StatusNoContent,
+		getIssueStatus:       http.StatusOK,
+		createCheckRunStatus: http.StatusCreated,
+		createCheckRunBody:   `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
 	}
 	mux := http.NewServeMux()
 
@@ -103,6 +108,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.getIssueStatus)
 			if fg.getIssueBody != "" {
 				_, _ = io.WriteString(w, fg.getIssueBody)
+			}
+		})
+
+	mux.HandleFunc("POST /repos/{owner}/{repo}/check-runs",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.createCheckRunStatus)
+			if fg.createCheckRunBody != "" {
+				_, _ = io.WriteString(w, fg.createCheckRunBody)
 			}
 		})
 
@@ -521,5 +536,165 @@ func TestGetIssue_DecodeError(t *testing.T) {
 	_, err := c.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
 	if err == nil {
 		t.Fatalf("expected decode error")
+	}
+}
+
+// --- CreateCheckRun ---
+
+func TestCreateCheckRun_Completed_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.CreateCheckRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"},
+		CreateCheckRunParams{
+			Name:          "fishhawk_audit_complete",
+			HeadSHA:       "abc123",
+			Status:        CheckRunStatusCompleted,
+			Conclusion:    CheckRunConclusionSuccess,
+			DetailsURL:    "https://app.fishhawk.example.com/runs/RID",
+			OutputSummary: "All rules passed.",
+		})
+	if err != nil {
+		t.Fatalf("CreateCheckRun: %v", err)
+	}
+	if got.ID != 987654 {
+		t.Errorf("ID = %d, want 987654", got.ID)
+	}
+	if fg.gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/check-runs" {
+		t.Errorf("path = %q, want /repos/x/y/check-runs", fg.gotPath)
+	}
+	if fg.gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q", fg.gotContentType)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("body decode: %v", err)
+	}
+	if body["name"] != "fishhawk_audit_complete" {
+		t.Errorf("name = %v", body["name"])
+	}
+	if body["head_sha"] != "abc123" {
+		t.Errorf("head_sha = %v", body["head_sha"])
+	}
+	if body["status"] != "completed" {
+		t.Errorf("status = %v", body["status"])
+	}
+	if body["conclusion"] != "success" {
+		t.Errorf("conclusion = %v", body["conclusion"])
+	}
+	if body["details_url"] != "https://app.fishhawk.example.com/runs/RID" {
+		t.Errorf("details_url = %v", body["details_url"])
+	}
+	output, ok := body["output"].(map[string]any)
+	if !ok {
+		t.Fatalf("output not a map: %v", body["output"])
+	}
+	if output["title"] != "fishhawk_audit_complete" {
+		t.Errorf("output.title = %v (should default to name)", output["title"])
+	}
+	if output["summary"] != "All rules passed." {
+		t.Errorf("output.summary = %v", output["summary"])
+	}
+}
+
+func TestCreateCheckRun_InProgress_OmitsConclusion(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.CreateCheckRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"},
+		CreateCheckRunParams{
+			Name:    "fishhawk_audit_complete",
+			HeadSHA: "abc123",
+			Status:  CheckRunStatusInProgress,
+		})
+	if err != nil {
+		t.Fatalf("CreateCheckRun: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("body decode: %v", err)
+	}
+	if _, present := body["conclusion"]; present {
+		t.Errorf("conclusion should be absent for in_progress; got %v", body["conclusion"])
+	}
+}
+
+func TestCreateCheckRun_RejectsCompletedWithoutConclusion(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.CreateCheckRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"},
+		CreateCheckRunParams{
+			Name:    "fishhawk_audit_complete",
+			HeadSHA: "abc123",
+			Status:  CheckRunStatusCompleted,
+		})
+	if err == nil || !strings.Contains(err.Error(), "conclusion required") {
+		t.Errorf("err = %v, want conclusion-required error", err)
+	}
+}
+
+func TestCreateCheckRun_RejectsConclusionWithoutCompleted(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.CreateCheckRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"},
+		CreateCheckRunParams{
+			Name:       "fishhawk_audit_complete",
+			HeadSHA:    "abc123",
+			Status:     CheckRunStatusInProgress,
+			Conclusion: CheckRunConclusionSuccess,
+		})
+	if err == nil || !strings.Contains(err.Error(), "conclusion only allowed") {
+		t.Errorf("err = %v, want conclusion-only-allowed error", err)
+	}
+}
+
+func TestCreateCheckRun_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		params    CreateCheckRunParams
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, CreateCheckRunParams{Name: "n", HeadSHA: "s", Status: CheckRunStatusInProgress}, "owner and name"},
+		{"missing name", RepoRef{Owner: "x", Name: "y"}, CreateCheckRunParams{HeadSHA: "s", Status: CheckRunStatusInProgress}, "name required"},
+		{"missing head_sha", RepoRef{Owner: "x", Name: "y"}, CreateCheckRunParams{Name: "n", Status: CheckRunStatusInProgress}, "head_sha required"},
+		{"missing status", RepoRef{Owner: "x", Name: "y"}, CreateCheckRunParams{Name: "n", HeadSHA: "s"}, "status required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.CreateCheckRun(context.Background(), 1, tc.repo, tc.params)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestCreateCheckRun_GitHubError(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.createCheckRunStatus = http.StatusForbidden
+	fg.createCheckRunBody = `{"message":"Resource not accessible by integration"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.CreateCheckRun(context.Background(), 1,
+		RepoRef{Owner: "x", Name: "y"},
+		CreateCheckRunParams{
+			Name:    "fishhawk_audit_complete",
+			HeadSHA: "abc",
+			Status:  CheckRunStatusInProgress,
+		})
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
 	}
 }
