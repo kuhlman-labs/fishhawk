@@ -161,6 +161,11 @@ export const api = {
    * Returns the gate's declared list plus the most-recent observed
    * state per check name. Declared-but-not-observed entries are
    * absent from `items` — the SPA fills them with `not_tracked`.
+   *
+   * `fishhawk_audit_complete` (#229) is a self-derived row: the
+   * backend computes its state from artifact + audit-log presence
+   * and ships a `missing[]` list so the SPA can render the failure
+   * reason inline.
    */
   listStageChecks(stageId: string): Promise<{
     declared: string[];
@@ -172,6 +177,15 @@ export const api = {
       head_sha?: string;
       github_check_run_id?: number | null;
       ts?: string;
+      missing?: Array<{
+        kind:
+          | 'plan_missing'
+          | 'trace_missing'
+          | 'pr_missing'
+          | 'chain_invalid'
+          | 'chain_unrecoverable';
+        detail: string;
+      }>;
     }>;
   }> {
     return request(`/v0/stages/${encodeURIComponent(stageId)}/checks`);

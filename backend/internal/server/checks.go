@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -15,15 +16,18 @@ import (
 // expects: a small `{name, state, …}` shape with the SPA's enum
 // rather than raw GitHub fields. Detail fields (conclusion,
 // head_sha, github_check_run_id) are forwarded for forensic /
-// audit-export use.
+// audit-export use. `missing` is populated only for self-derived
+// checks like fishhawk_audit_complete (#229) where the failure
+// reason is structured rather than a raw GitHub conclusion.
 type stageCheckResponse struct {
-	Name             string    `json:"name"`
-	State            string    `json:"state"`
-	Status           string    `json:"status,omitempty"`
-	Conclusion       *string   `json:"conclusion,omitempty"`
-	HeadSHA          string    `json:"head_sha,omitempty"`
-	GitHubCheckRunID *int64    `json:"github_check_run_id,omitempty"`
-	Timestamp        time.Time `json:"ts,omitempty"`
+	Name             string                      `json:"name"`
+	State            string                      `json:"state"`
+	Status           string                      `json:"status,omitempty"`
+	Conclusion       *string                     `json:"conclusion,omitempty"`
+	HeadSHA          string                      `json:"head_sha,omitempty"`
+	GitHubCheckRunID *int64                      `json:"github_check_run_id,omitempty"`
+	Timestamp        time.Time                   `json:"ts,omitempty"`
+	Missing          []auditcomplete.MissingItem `json:"missing,omitempty"`
 }
 
 // stageChecksListResponse is the envelope for GET /v0/stages/{id}/checks.
@@ -85,10 +89,46 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 	for _, c := range checks {
 		items = append(items, toStageCheckResponse(c))
 	}
+
+	// Inject the self-derived fishhawk_audit_complete row when the
+	// gate declares it (#229). Computed live from the run's
+	// artifact + audit-log presence; carries the structured
+	// `missing` list so the SPA can show "fail because: plan
+	// missing, redacted trace missing on stage X" without a
+	// secondary call.
+	if containsString(declared, AuditCompleteCheckName) && s.cfg.ArtifactRepo != nil && s.cfg.AuditRepo != nil {
+		state, missing, err := auditcomplete.Compute(r.Context(), stage.RunID, auditcomplete.Deps{
+			Runs:      s.cfg.RunRepo,
+			Artifacts: s.cfg.ArtifactRepo,
+			Audit:     s.cfg.AuditRepo,
+		})
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"derive audit-complete state failed",
+				map[string]any{"stage_id": stageID.String(), "error": err.Error()})
+			return
+		}
+		items = append(items, stageCheckResponse{
+			Name:      AuditCompleteCheckName,
+			State:     string(state),
+			Timestamp: time.Now().UTC(),
+			Missing:   missing,
+		})
+	}
+
 	s.writeJSON(w, r, http.StatusOK, stageChecksListResponse{
 		Declared: declared,
 		Items:    items,
 	})
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func toStageCheckResponse(c *stagecheck.Check) stageCheckResponse {
