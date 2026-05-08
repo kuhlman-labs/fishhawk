@@ -58,26 +58,32 @@ type Diff struct {
 // Constraints is the parsed shape of the workflow-spec stage's
 // `constraints` block. Zero values mean "this constraint isn't
 // configured" — Evaluate skips them.
+//
+// JSON tags pin the audit-payload shape (#233): the SPA's policy
+// section reads `applied_constraints.<key>` from the
+// `policy_evaluated` audit entry, so the keys are part of the
+// public contract. Stay snake_case for consistency with every
+// other audit payload.
 type Constraints struct {
 	// ForbiddenPaths: any changed file matching ANY pattern is a
 	// violation. Patterns are gitignore-style globs.
-	ForbiddenPaths []string
+	ForbiddenPaths []string `json:"forbidden_paths,omitempty"`
 	// AllowedPaths: every changed file MUST match at least one
 	// pattern. A file matching none is a violation.
-	AllowedPaths []string
+	AllowedPaths []string `json:"allowed_paths,omitempty"`
 	// MaxFilesChanged: 0 means "no limit"; otherwise the diff's
 	// file count must be <= this value.
-	MaxFilesChanged int
+	MaxFilesChanged int `json:"max_files_changed,omitempty"`
 	// RequiredOutcomes: closed set per the schema —
 	// "tests_added_or_updated", "ci_green".
-	RequiredOutcomes []string
+	RequiredOutcomes []string `json:"required_outcomes,omitempty"`
 	// CIGreen is what an upstream signal said about the customer
 	// CI's outcome. Required only if RequiredOutcomes contains
 	// "ci_green"; nil when no signal is available yet — in which
 	// case the constraint is treated as a violation rather than
 	// silently passing (MVP_SPEC §6: honesty about gaps beats
 	// fictional completeness).
-	CIGreen *bool
+	CIGreen *bool `json:"ci_green,omitempty"`
 }
 
 // Violation is one constraint failure. Constraint names match the

@@ -86,6 +86,30 @@ describe('FailureBanner', () => {
     expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
   });
 
+  it('shows a "View violations" anchor link for category B (#233)', () => {
+    render(
+      <FailureBanner
+        stage={stage({
+          state: 'failed',
+          failure_category: 'B',
+          failure_reason: 'forbidden_paths',
+        })}
+      />,
+    );
+    const link = screen.getByRole('link', { name: /view violations/i });
+    expect(link).toHaveAttribute('href', '#policy');
+  });
+
+  it('omits the "View violations" link for non-B failures', () => {
+    for (const cat of ['A', 'C', 'D'] satisfies FailureCategory[]) {
+      const { unmount } = render(
+        <FailureBanner stage={stage({ state: 'failed', failure_category: cat })} />,
+      );
+      expect(screen.queryByRole('link', { name: /view violations/i })).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
   it('omits the Retry button when D failure_reason is rejection (not timeout)', () => {
     render(
       <FailureBanner
