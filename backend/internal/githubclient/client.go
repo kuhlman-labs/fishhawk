@@ -400,6 +400,150 @@ func (c *Client) DispatchWorkflow(ctx context.Context, installationID int64, rep
 	return classifyStatus("dispatch", resp)
 }
 
+// CheckRunStatus is the GitHub Checks API `status` enum.
+// Closed set; passing anything else returns ErrValidation.
+type CheckRunStatus string
+
+// Check-run status values. Documented at
+// https://docs.github.com/en/rest/checks/runs.
+const (
+	CheckRunStatusQueued     CheckRunStatus = "queued"
+	CheckRunStatusInProgress CheckRunStatus = "in_progress"
+	CheckRunStatusCompleted  CheckRunStatus = "completed"
+)
+
+// CheckRunConclusion is the Checks API `conclusion` enum.
+// Required when status=completed; must be empty otherwise.
+type CheckRunConclusion string
+
+// Check-run conclusion values.
+const (
+	CheckRunConclusionSuccess        CheckRunConclusion = "success"
+	CheckRunConclusionFailure        CheckRunConclusion = "failure"
+	CheckRunConclusionNeutral        CheckRunConclusion = "neutral"
+	CheckRunConclusionCancelled      CheckRunConclusion = "cancelled"
+	CheckRunConclusionTimedOut       CheckRunConclusion = "timed_out"
+	CheckRunConclusionActionRequired CheckRunConclusion = "action_required"
+	CheckRunConclusionSkipped        CheckRunConclusion = "skipped"
+)
+
+// CreateCheckRunParams is the typed wire body for
+// POST /repos/{owner}/{repo}/check-runs. Only the fields Fishhawk
+// uses today are surfaced; the GitHub schema is wider.
+type CreateCheckRunParams struct {
+	Name          string
+	HeadSHA       string
+	Status        CheckRunStatus
+	Conclusion    CheckRunConclusion // required when Status==completed
+	DetailsURL    string             // where the "Details" link on github.com points (typically a Fishhawk run URL)
+	OutputTitle   string
+	OutputSummary string
+}
+
+// CreateCheckRunResult carries the bits of GitHub's response we
+// care about. ID lets a caller PATCH the same row later if a
+// follow-up surface ever needs progressive updates; v0 callers
+// typically POST a fresh row per state change and ignore it.
+type CreateCheckRunResult struct {
+	ID      int64
+	HTMLURL string
+}
+
+// CreateCheckRun publishes a check run on a head commit (#231).
+//
+//	POST /repos/{owner}/{repo}/check-runs
+//
+// Each call creates a new row; GitHub displays the most recent
+// per (head_sha, name) on the PR's checks panel and uses it for
+// branch-protection evaluation. Re-POSTing identical state is
+// safe but wasteful — callers should dedup at the application
+// layer (the auditcomplete publisher does this).
+//
+// Returns ErrValidation when the params are malformed (missing
+// required fields, conclusion without status=completed),
+// ErrNotFound when the repo isn't visible to the installation,
+// ErrForbidden when the installation token lacks `checks:write`.
+func (c *Client) CreateCheckRun(ctx context.Context, installationID int64, repo RepoRef, p CreateCheckRunParams) (*CreateCheckRunResult, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if p.Name == "" {
+		return nil, errors.New("githubclient: check-run name required")
+	}
+	if p.HeadSHA == "" {
+		return nil, errors.New("githubclient: head_sha required")
+	}
+	if p.Status == "" {
+		return nil, errors.New("githubclient: status required")
+	}
+	if p.Status == CheckRunStatusCompleted && p.Conclusion == "" {
+		return nil, errors.New("githubclient: conclusion required when status=completed")
+	}
+	if p.Status != CheckRunStatusCompleted && p.Conclusion != "" {
+		return nil, errors.New("githubclient: conclusion only allowed when status=completed")
+	}
+
+	body := map[string]any{
+		"name":     p.Name,
+		"head_sha": p.HeadSHA,
+		"status":   string(p.Status),
+	}
+	if p.Conclusion != "" {
+		body["conclusion"] = string(p.Conclusion)
+	}
+	if p.DetailsURL != "" {
+		body["details_url"] = p.DetailsURL
+	}
+	if p.OutputTitle != "" || p.OutputSummary != "" {
+		// GitHub requires both `title` and `summary` when `output`
+		// is present. Default the title when only a summary is set
+		// so callers can pass just the body without ceremony.
+		title := p.OutputTitle
+		if title == "" {
+			title = p.Name
+		}
+		body["output"] = map[string]string{
+			"title":   title,
+			"summary": p.OutputSummary,
+		}
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: marshal check-run body: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) + "/check-runs")
+
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: create check run: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("create check run", resp); err != nil {
+		return nil, err
+	}
+
+	var out struct {
+		ID      int64  `json:"id"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("githubclient: decode check run: %w", err)
+	}
+	return &CreateCheckRunResult{ID: out.ID, HTMLURL: out.HTMLURL}, nil
+}
+
 // buildRequest constructs an http.Request with the standard
 // GitHub headers (auth, accept, version). Centralized so every
 // call site uses the same shape.

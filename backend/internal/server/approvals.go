@@ -296,11 +296,16 @@ func (s *Server) checkBlockingChecks(w http.ResponseWriter, r *http.Request, sta
 // is exposed through GET /v0/stages/{id}/checks; this helper exists
 // for the gate-enforcement read path that only cares about pass/
 // not-pass.
+//
+// Side-effect: publishes the (state, missing) pair to GitHub as a
+// Check Run (#231) so the same gate that refuses approve here also
+// shows up on the PR's checks panel and (when wired to branch
+// protection) blocks the merge button. Best-effort.
 func (s *Server) deriveAuditCompleteState(r *http.Request, runID uuid.UUID) (stagecheck.State, error) {
 	if s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
 		return stagecheck.StatePass, nil
 	}
-	state, _, err := auditcomplete.Compute(r.Context(), runID, auditcomplete.Deps{
+	state, missing, err := auditcomplete.Compute(r.Context(), runID, auditcomplete.Deps{
 		Runs:      s.cfg.RunRepo,
 		Artifacts: s.cfg.ArtifactRepo,
 		Audit:     s.cfg.AuditRepo,
@@ -308,6 +313,7 @@ func (s *Server) deriveAuditCompleteState(r *http.Request, runID uuid.UUID) (sta
 	if err != nil {
 		return "", err
 	}
+	s.publishAuditCheck(r.Context(), runID, state, missing)
 	return state, nil
 }
 

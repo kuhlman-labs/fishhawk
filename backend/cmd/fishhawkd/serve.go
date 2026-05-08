@@ -96,13 +96,16 @@ func runServe(args []string, logSink io.Writer) int {
 	oauthRedirectAfterLogin := fs.String("oauth-redirect-after-login",
 		envOr("FISHHAWKD_OAUTH_REDIRECT_AFTER_LOGIN", "/"),
 		"URL the callback handler redirects to on successful sign-in (must be a relative path)")
+	externalURL := fs.String("external-url",
+		envOr("FISHHAWKD_EXTERNAL_URL", ""),
+		"operator-facing root URL for the SPA, e.g. https://app.fishhawk.example.com; used to build links in surfaces that escape the backend (today: GitHub Check Runs). Empty disables the publish-to-GitHub paths cleanly.")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
 
 	logger := newLogger(logSink)
 
-	cfg := server.Config{Addr: *addr, Logger: logger}
+	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL}
 
 	// Wire the run repository when a DB URL is supplied. Without
 	// one the server still boots — /healthz works and any

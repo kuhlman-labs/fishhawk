@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -114,6 +116,12 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 			Timestamp: time.Now().UTC(),
 			Missing:   missing,
 		})
+
+		// Publish the same state to GitHub as a Check Run (#231).
+		// Best-effort: a failure logs but doesn't fail the read —
+		// the in-Fishhawk gate enforcement still works without
+		// the GitHub publish.
+		s.publishAuditCheck(r.Context(), stage.RunID, state, missing)
 	}
 
 	s.writeJSON(w, r, http.StatusOK, stageChecksListResponse{
@@ -129,6 +137,36 @@ func containsString(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// publishAuditCheck is the small adapter between the server's
+// compute paths and the auditcheckpublisher. Best-effort: a
+// publish failure logs at WARN and returns; the in-Fishhawk gate
+// enforcement still proceeds so a GitHub outage doesn't black-
+// hole approvals. Nil-safe — the publisher is nil when
+// ExternalURL or GitHub aren't wired (legacy / dev posture), and
+// Publish returns immediately in that case.
+func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem) {
+	if s.auditCheckPublisher == nil {
+		return
+	}
+	published, err := s.auditCheckPublisher.Publish(ctx, runID, state, missing)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"audit-complete check-run publish failed",
+			slog.String("run_id", runID.String()),
+			slog.String("state", string(state)),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if published {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
+			"audit-complete check-run published",
+			slog.String("run_id", runID.String()),
+			slog.String("state", string(state)),
+		)
+	}
 }
 
 func toStageCheckResponse(c *stagecheck.Check) stageCheckResponse {

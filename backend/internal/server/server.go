@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -162,6 +163,15 @@ type Config struct {
 	// root). Defaults to "/" when empty.
 	AuthRedirectAfterLogin string
 
+	// ExternalURL is the operator-facing root URL for the SPA, e.g.
+	// `https://app.fishhawk.example.com`. Used to build links in
+	// surfaces that escape the backend (today: GitHub Check Runs,
+	// E4.x #231 — `details_url` on a check run points back here so a
+	// reviewer who clicks the check on github.com lands in
+	// Fishhawk). Empty disables those features cleanly; the
+	// in-Fishhawk gates still work without it.
+	ExternalURL string
+
 	// RoleResolver expands `@org/team` references in the workflow
 	// spec to a GitHub-login allowlist and decides whether an
 	// approver subject is authorized for a gate. Wired by the
@@ -187,6 +197,13 @@ type Server struct {
 	// traceWorkflowSpecOverride is the same test seam for the
 	// trace handler's policy re-eval path. nil in production.
 	traceWorkflowSpecOverride workflowSpecFetcher
+
+	// auditCheckPublisher posts the derived fishhawk_audit_complete
+	// state to GitHub as a Check Run on every compute (#231). nil
+	// when ExternalURL or GitHub aren't wired — the in-Fishhawk
+	// gate enforcement still runs in that case. Built once at New;
+	// concurrent Publish calls are safe.
+	auditCheckPublisher *auditcheckpublisher.Publisher
 }
 
 // New builds a Server. It does not start listening; call Start.
@@ -202,6 +219,14 @@ func New(cfg Config) *Server {
 	}
 
 	s := &Server{cfg: cfg}
+	if cfg.GitHub != nil {
+		s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
+			GitHub:      cfg.GitHub,
+			Runs:        cfg.RunRepo,
+			Artifacts:   cfg.ArtifactRepo,
+			ExternalURL: cfg.ExternalURL,
+		})
+	}
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.buildHandler(),
