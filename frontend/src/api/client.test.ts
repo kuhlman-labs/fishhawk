@@ -168,3 +168,18 @@ describe('api.getStagePromptRender (#215)', () => {
     expect(headerOf(init, 'X-Fishhawk-Signature')).toBeUndefined();
   });
 });
+
+describe('api.listStageChecks (#228)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('hits /v0/stages/{id}/checks with no body or body content', async () => {
+    const fetchMock = mockFetch();
+    await api.listStageChecks('11111111-2222-3333-4444-555555555555');
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toMatch(/\/v0\/stages\/[^/]+\/checks$/);
+
+    const init = lastInit(fetchMock);
+    expect((init.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+});

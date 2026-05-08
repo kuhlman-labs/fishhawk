@@ -202,22 +202,31 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0014 added gate_type +
-	// gate_blocking_checks + gate_approvers columns to stages
-	// (#213). Down drops them. Confirm: those columns are gone, but
-	// every prior migration's effect is still present
-	// (stages.requires_approval from 0013, signing_keys.id from 0012,
-	// runs.idempotency_key from 0011, users + sessions from 0010,
-	// audit run_id nullability from 0009, etc.).
-	var gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0015 added the stage_checks
+	// table (#228). Down drops it. Confirm: the stage_checks table
+	// is gone, but every prior migration's effect is still present
+	// (stages.gate_type from 0014, stages.requires_approval from
+	// 0013, signing_keys.id from 0012, runs.idempotency_key from
+	// 0011, users + sessions from 0010, audit run_id nullability
+	// from 0009, etc.).
+	var stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables
+		 WHERE table_name = 'stage_checks'`,
+	).Scan(&stageChecksTable); err != nil {
+		t.Fatalf("query stage_checks table: %v", err)
+	}
+	if stageChecksTable != 0 {
+		t.Errorf("stage_checks table count after MigrateDown = %d, want 0 (0015 rolled back)", stageChecksTable)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'stages' AND column_name = 'gate_type'`,
 	).Scan(&gateTypeCol); err != nil {
 		t.Fatalf("query stages.gate_type column: %v", err)
 	}
-	if gateTypeCol != 0 {
-		t.Errorf("stages.gate_type count after MigrateDown = %d, want 0 (0014 rolled back)", gateTypeCol)
+	if gateTypeCol != 1 {
+		t.Errorf("stages.gate_type count after MigrateDown = %d, want 1 (0014 still applied)", gateTypeCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns

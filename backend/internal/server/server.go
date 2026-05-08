@@ -26,6 +26,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -72,6 +73,15 @@ type Config struct {
 	// Wired by GET /v0/stages/{id}/artifacts and
 	// GET /v0/artifacts/{id}; nil leaves both 503.
 	ArtifactRepo artifact.Repository
+
+	// StageCheckRepo persists blocking-check states. Wired by GET
+	// /v0/stages/{id}/checks, the GitHub check_run webhook
+	// ingester, and the approval handler's gate-enforcement read
+	// (#228). Nil leaves the checks endpoint at 503 and the
+	// approval handler falls open (no enforcement) so v0
+	// deployments without check ingestion don't refuse every
+	// approve.
+	StageCheckRepo stagecheck.Repository
 
 	// Orchestrator advances a run's stages after a gate passes.
 	// The approval handler calls Advance(runID) after transitioning

@@ -107,6 +107,18 @@ type Stage struct {
 	GateApprovers      []byte             `json:"gate_approvers"`
 }
 
+type StageCheck struct {
+	ID               uuid.UUID          `json:"id"`
+	StageID          uuid.UUID          `json:"stage_id"`
+	CheckName        string             `json:"check_name"`
+	Status           string             `json:"status"`
+	Conclusion       *string            `json:"conclusion"`
+	HeadSha          string             `json:"head_sha"`
+	GithubCheckRunID *int64             `json:"github_check_run_id"`
+	Ts               pgtype.Timestamptz `json:"ts"`
+	Payload          []byte             `json:"payload"`
+}
+
 type User struct {
 	ID           uuid.UUID          `json:"id"`
 	GithubUserID int64              `json:"github_user_id"`

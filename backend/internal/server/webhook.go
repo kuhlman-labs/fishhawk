@@ -105,5 +105,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// `check_run` events update the gate's blocking-check states
+	// (#228). Distinct from the dispatcher path: those events
+	// don't trigger runs, they update existing ones. Best-effort
+	// — per-row failures inside ingestCheckRun log but don't
+	// surface as a 5xx, since the audit log keeps the canonical
+	// trail and a missed delivery just leaves the SPA showing
+	// stale state until the next event.
+	if ev.Type == "check_run" {
+		s.ingestCheckRun(r.Context(), ev.RawBody)
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }

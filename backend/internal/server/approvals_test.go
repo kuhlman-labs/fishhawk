@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
 // fakeApprovalRepo is the in-memory approval.Repository for handler
@@ -772,5 +773,193 @@ func TestSubmitApproval_UnknownField(t *testing.T) {
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve","extra":true}`)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 on unknown field", w.Code)
+	}
+}
+
+// fakeStageCheckRepo lets the approval-handler tests exercise the
+// blocking-check enforcement without touching Postgres. Returns
+// canned states keyed by (stage_id, check_name).
+type fakeStageCheckRepo struct {
+	byKey map[string]*stagecheck.Check
+}
+
+func newFakeStageCheckRepo() *fakeStageCheckRepo {
+	return &fakeStageCheckRepo{byKey: map[string]*stagecheck.Check{}}
+}
+func (f *fakeStageCheckRepo) keyFor(stageID uuid.UUID, name string) string {
+	return stageID.String() + ":" + name
+}
+func (f *fakeStageCheckRepo) seed(stageID uuid.UUID, name string, state stagecheck.State) {
+	f.byKey[f.keyFor(stageID, name)] = &stagecheck.Check{
+		StageID: stageID, Name: name, State: state,
+	}
+}
+func (f *fakeStageCheckRepo) Append(context.Context, stagecheck.AppendParams) (*stagecheck.Check, error) {
+	return nil, errors.New("not used")
+}
+func (f *fakeStageCheckRepo) LatestForStage(_ context.Context, stageID uuid.UUID) ([]*stagecheck.Check, error) {
+	var out []*stagecheck.Check
+	for _, c := range f.byKey {
+		if c.StageID == stageID {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStageCheckRepo) LatestForStageAndName(_ context.Context, stageID uuid.UUID, name string) (*stagecheck.Check, error) {
+	if c, ok := f.byKey[f.keyFor(stageID, name)]; ok {
+		return c, nil
+	}
+	return nil, stagecheck.ErrNotFound
+}
+func (f *fakeStageCheckRepo) FindMatchingStages(context.Context, int, string, string) ([]uuid.UUID, error) {
+	return nil, errors.New("not used")
+}
+
+func TestSubmitApproval_Approve_BlockedWhenCheckFailing(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Gate = &run.Gate{
+		Kind:           run.GateKindApproval,
+		BlockingChecks: []string{"ci_pass"},
+	}
+	ar := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	scs := newFakeStageCheckRepo()
+	scs.seed(stage.ID, "ci_pass", stagecheck.StateFail)
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
+		AuditRepo: au, Orchestrator: o, StageCheckRepo: scs,
+	})
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "blocking_checks_not_passed") {
+		t.Errorf("response should reference blocking_checks_not_passed:\n%s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "ci_pass") {
+		t.Errorf("response should name the failing check:\n%s", w.Body.String())
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage transitioned despite 409: %q", stage.State)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approval written despite 409: %+v", ar.all)
+	}
+}
+
+func TestSubmitApproval_Approve_BlockedWhenCheckNeverObserved(t *testing.T) {
+	// not_tracked counts as a blocker — the gate refuses approval
+	// when a declared check has never reported a state. Otherwise
+	// approvers could clear a gate by approving before CI even
+	// started.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Gate = &run.Gate{
+		Kind:           run.GateKindApproval,
+		BlockingChecks: []string{"ci_pass"},
+	}
+	ar := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	scs := newFakeStageCheckRepo() // empty — ci_pass never observed
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
+		AuditRepo: au, Orchestrator: o, StageCheckRepo: scs,
+	})
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+}
+
+func TestSubmitApproval_Approve_PassesWhenAllChecksPass(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Gate = &run.Gate{
+		Kind:           run.GateKindApproval,
+		BlockingChecks: []string{"ci_pass", "fishhawk_audit_complete"},
+	}
+	ar := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	scs := newFakeStageCheckRepo()
+	scs.seed(stage.ID, "ci_pass", stagecheck.StatePass)
+	scs.seed(stage.ID, "fishhawk_audit_complete", stagecheck.StatePass)
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
+		AuditRepo: au, Orchestrator: o, StageCheckRepo: scs,
+	})
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded", stage.State)
+	}
+}
+
+func TestSubmitApproval_Reject_NotBlockedByFailingChecks(t *testing.T) {
+	// Reject is the path failing checks were intended to surface.
+	// Refusing rejection on a failing check would defeat the
+	// purpose — let the reviewer reject the stage and the run
+	// walks to failed.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Gate = &run.Gate{
+		Kind:           run.GateKindApproval,
+		BlockingChecks: []string{"ci_pass"},
+	}
+	ar := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	scs := newFakeStageCheckRepo()
+	scs.seed(stage.ID, "ci_pass", stagecheck.StateFail)
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
+		AuditRepo: au, Orchestrator: o, StageCheckRepo: scs,
+	})
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (reject ignores blocking checks)", w.Code)
+	}
+	if stage.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", stage.State)
+	}
+}
+
+func TestSubmitApproval_Approve_FallsOpenWhenStageCheckRepoNil(t *testing.T) {
+	// Legacy v0 deployments without check ingestion shouldn't
+	// refuse every approve. The handler falls open when
+	// StageCheckRepo is nil.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Gate = &run.Gate{
+		Kind:           run.GateKindApproval,
+		BlockingChecks: []string{"ci_pass"},
+	}
+	ar := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
+		AuditRepo: au, Orchestrator: o,
+	})
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no StageCheckRepo wired)", w.Code)
 	}
 }

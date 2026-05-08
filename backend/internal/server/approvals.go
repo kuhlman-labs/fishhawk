@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
 // approvalRequest mirrors POST /v0/stages/{stage_id}/approvals's
@@ -107,6 +108,27 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce gate's blocking_checks (#228). Approve refuses with
+	// 409 when any declared check isn't `pass`; reject is always
+	// allowed (rejecting a stage with failing checks is the path
+	// the failing checks were intended to surface). When the
+	// stage-check repo isn't wired or the stage has no gate, the
+	// enforcement falls open — the legacy v0 deployments without
+	// check ingestion shouldn't refuse every approve.
+	if decision == approval.DecisionApprove {
+		if blockers, ok := s.checkBlockingChecks(w, r, stage); !ok {
+			return
+		} else if len(blockers) > 0 {
+			s.writeError(w, r, http.StatusConflict, "blocking_checks_not_passed",
+				"one or more blocking checks have not passed",
+				map[string]any{
+					"stage_id": stageID.String(),
+					"blockers": blockers,
+				})
+			return
+		}
+	}
+
 	res, err := s.cfg.ApprovalRepo.Submit(r.Context(), approval.SubmitParams{
 		StageID:         stageID,
 		ApproverSubject: subject,
@@ -195,6 +217,52 @@ func (s *Server) advanceStage(r *http.Request, stageID uuid.UUID, decision appro
 // subject. For all_of-style approvers, every named role must
 // contain subject.
 //
+// checkBlockingChecks reads the latest state of each declared
+// blocking check on the stage's gate and returns the names of any
+// that aren't `pass`. The bool return is the "no error" flag —
+// false means this function already wrote the response (typically
+// a 500 from a stage-check repo failure) and the caller should
+// short-circuit.
+//
+// Falls open when:
+//   - StageCheckRepo isn't configured (legacy deployments without
+//     check ingestion shouldn't refuse every approve).
+//   - The stage has no gate, or its gate has no blocking_checks.
+//
+// Per the issue's "no bypass flag" posture, an approver who really
+// needs to approve over a failing check should change the spec to
+// remove the check from blocking_checks rather than override here.
+func (s *Server) checkBlockingChecks(w http.ResponseWriter, r *http.Request, stage *run.Stage) ([]string, bool) {
+	if s.cfg.StageCheckRepo == nil {
+		return nil, true
+	}
+	if stage.Gate == nil || len(stage.Gate.BlockingChecks) == 0 {
+		return nil, true
+	}
+	var blockers []string
+	for _, name := range stage.Gate.BlockingChecks {
+		c, err := s.cfg.StageCheckRepo.LatestForStageAndName(r.Context(), stage.ID, name)
+		if err != nil {
+			if errors.Is(err, stagecheck.ErrNotFound) {
+				// Never observed — treat as a blocker. The SPA
+				// renders this as `not_tracked`; an approver
+				// shouldn't be able to clear a gate that hasn't
+				// reported a state.
+				blockers = append(blockers, name)
+				continue
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"read stage check failed",
+				map[string]any{"stage_id": stage.ID.String(), "check": name, "error": err.Error()})
+			return nil, false
+		}
+		if c.State != stagecheck.StatePass {
+			blockers = append(blockers, name)
+		}
+	}
+	return blockers, true
+}
+
 // Lookups (spec fetch, team fetch) happen on the request path.
 // Spec fetch is one GitHub API call; team membership is cached by
 // the resolver. Acceptable for v0 traffic; a follow-up can move
