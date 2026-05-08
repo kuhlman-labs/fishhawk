@@ -2,7 +2,7 @@
 
 Fishhawk runs as a GitHub App. The App provides:
 
-- **Webhook events** that drive workflow triggers (issues labeled, comments matching `/fishhawk run`).
+- **Webhook events** that drive workflow triggers (issues labeled, comments matching `/fishhawk run`, `/fishhawk approve`, `/fishhawk reject`).
 - **Per-installation tokens** so the backend can read `.fishhawk/workflows.yaml`, fire `workflow_dispatch`, comment on issues, open PRs.
 - **OAuth user identification** for the Web UI sign-in flow (E4.2 / #49).
 
@@ -31,7 +31,7 @@ Webhook events:
 | Event | Why |
 |---|---|
 | `issues` | Trigger on `labeled` with the `fishhawk` label. |
-| `issue_comment` | Trigger on `created` matching `/fishhawk run`. |
+| `issue_comment` | Trigger on `created` matching `/fishhawk run`, `/fishhawk approve`, or `/fishhawk reject`. |
 | `pull_request` | Future: trigger flows on PR-side actions. |
 | `push` | Future: branch-policy + spec-change detection. |
 | `workflow_run` | Observe customer-side runner job state. |

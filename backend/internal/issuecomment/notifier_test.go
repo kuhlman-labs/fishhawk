@@ -299,6 +299,72 @@ func TestNew_NilDepsReturnsNilNotifier(t *testing.T) {
 	}
 }
 
+func TestNotifySlashApprovalReply_PostsAndDoesNotDedup(t *testing.T) {
+	_, _, _, n := happyDeps(t)
+	gh := &fakeGitHub{}
+	// Replace the inner GitHub fake by reflecting through New
+	// again with a fresh notifier sharing the audit log so dedup
+	// state would survive if we erroneously persisted it.
+	n2 := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Audit:       &fakeAudit{},
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	_ = n // unused; happyDeps constructs one we don't need here
+
+	if err := n2.NotifySlashApprovalReply(context.Background(), issuecomment.SlashApprovalReply{
+		Repo: "x/y", InstallationID: 99, IssueNumber: 42, Body: "Approved by `@alice`.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 call; got %d", len(gh.calls))
+	}
+	if gh.calls[0].body != "Approved by `@alice`." {
+		t.Errorf("body = %q", gh.calls[0].body)
+	}
+
+	// Second call — replies are not deduped.
+	if err := n2.NotifySlashApprovalReply(context.Background(), issuecomment.SlashApprovalReply{
+		Repo: "x/y", InstallationID: 99, IssueNumber: 42, Body: "Cannot approve: ci_pass failing.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 2 {
+		t.Errorf("replies should not be deduped; got %d calls", len(gh.calls))
+	}
+}
+
+func TestNotifySlashApprovalReply_SkipsBadParams(t *testing.T) {
+	gh := &fakeGitHub{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Audit:       &fakeAudit{},
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	cases := []struct {
+		name string
+		p    issuecomment.SlashApprovalReply
+	}{
+		{"zero issue", issuecomment.SlashApprovalReply{Repo: "x/y", InstallationID: 99, Body: "x"}},
+		{"zero installation", issuecomment.SlashApprovalReply{Repo: "x/y", IssueNumber: 1, Body: "x"}},
+		{"empty body", issuecomment.SlashApprovalReply{Repo: "x/y", InstallationID: 99, IssueNumber: 1}},
+		{"malformed repo", issuecomment.SlashApprovalReply{Repo: "no-slash", InstallationID: 99, IssueNumber: 1, Body: "x"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := n.NotifySlashApprovalReply(context.Background(), tc.p); err != nil {
+				t.Errorf("expected nil; got %v", err)
+			}
+		})
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("expected 0 calls; got %d", len(gh.calls))
+	}
+}
+
 func TestNotify_NilReceiver_NoOp(t *testing.T) {
 	var n *issuecomment.Notifier
 	if err := n.NotifyPickup(context.Background(), uuid.New(), "x"); err != nil {
@@ -307,6 +373,11 @@ func TestNotify_NilReceiver_NoOp(t *testing.T) {
 	if err := n.NotifyPlanReady(context.Background(), uuid.New(),
 		&run.Stage{ID: uuid.New(), Type: run.StageTypePlan}, &plan.Plan{}); err != nil {
 		t.Errorf("nil plan should be a no-op; got %v", err)
+	}
+	if err := n.NotifySlashApprovalReply(context.Background(), issuecomment.SlashApprovalReply{
+		Repo: "x/y", InstallationID: 1, IssueNumber: 1, Body: "x",
+	}); err != nil {
+		t.Errorf("nil reply should be a no-op; got %v", err)
 	}
 }
 

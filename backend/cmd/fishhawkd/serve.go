@@ -245,6 +245,11 @@ func runServe(args []string, logSink io.Writer) int {
 			Audit:         cfg.AuditRepo,
 			Logger:        logger,
 			IssueNotifier: notifier,
+			// ApprovalHandler is wired below after the Server
+			// is constructed — the Server implements the
+			// interface and holds all the deps the handler
+			// needs (approval repo, role resolver, stage-check
+			// repo, etc.).
 		}
 		logger.Info("webhook dispatcher configured")
 	}
@@ -320,6 +325,15 @@ func runServe(args []string, logSink io.Writer) int {
 	cfg.GitHubManifest = authpkg.NewGitHubManifest(authpkg.ManifestURLs{})
 
 	srv := server.New(cfg)
+
+	// Wire the slash-command approval handler now that the Server
+	// exists (#238). The dispatcher was constructed earlier without
+	// this field; we plug it in here so the dispatcher's nil-check
+	// stays honest when slash-command-approval deps aren't ready.
+	if cfg.WebhookDispatcher != nil {
+		cfg.WebhookDispatcher.ApprovalHandler = srv
+		logger.Info("slash-command approval handler wired")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -165,6 +165,48 @@ func (n *Notifier) NotifyPlanReady(ctx context.Context, runID uuid.UUID, planSta
 	return n.post(ctx, ctxv, KindPlan, body)
 }
 
+// SlashApprovalReply is the params for NotifySlashApprovalReply
+// (#238). Carries the issue coordinates explicitly because the
+// reply path doesn't have a run UUID handy yet — the slash-command
+// handler may post a reply before resolving (or while failing to
+// resolve) the corresponding run.
+type SlashApprovalReply struct {
+	Repo           string
+	InstallationID int64
+	IssueNumber    int
+	Body           string
+}
+
+// NotifySlashApprovalReply posts a reply comment to a /fishhawk
+// approve or /fishhawk reject command (#238). Unlike
+// NotifyPickup / NotifyPlanReady, replies are NOT deduped — every
+// command attempt should produce its own reply, even if the
+// reviewer fires the same command twice. The reply is fire-and-
+// forget for the slash-command handler: a failure here logs but
+// doesn't unwind the gate decision that's already recorded.
+//
+// Skips silently when:
+//   - The receiver is nil.
+//   - Repo is malformed (the slash-command handler should have
+//     short-circuited before getting here, but defense in depth).
+//   - InstallationID is zero (same).
+func (n *Notifier) NotifySlashApprovalReply(ctx context.Context, p SlashApprovalReply) error {
+	if n == nil {
+		return nil
+	}
+	if p.IssueNumber <= 0 || p.InstallationID == 0 || p.Body == "" {
+		return nil
+	}
+	repo, err := parseRepo(p.Repo)
+	if err != nil {
+		return nil
+	}
+	if err := n.github.CreateIssueComment(ctx, p.InstallationID, repo, p.IssueNumber, p.Body); err != nil {
+		return fmt.Errorf("issuecomment: create reply: %w", err)
+	}
+	return nil
+}
+
 // commentContext bundles the per-run inputs the post-helpers need:
 // the run row (for installation_id), the parsed repo, the issue
 // number, and the pre-rendered run URL. Built once per call.

@@ -636,8 +636,23 @@ func (r *orchestratorRepo) TransitionStage(_ context.Context, id uuid.UUID, to r
 func (r *orchestratorRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
-func (r *orchestratorRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
-	return nil, errors.New("not used")
+func (r *orchestratorRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*run.Run, 0, len(r.runs))
+	for _, rr := range r.runs {
+		if f.Repo != "" && rr.Repo != f.Repo {
+			continue
+		}
+		if f.WorkflowID != "" && rr.WorkflowID != f.WorkflowID {
+			continue
+		}
+		if f.State != "" && string(rr.State) != f.State {
+			continue
+		}
+		out = append(out, rr)
+	}
+	return out, nil
 }
 func (r *orchestratorRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
