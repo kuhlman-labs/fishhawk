@@ -171,6 +171,15 @@ type GitHubAPI interface {
 		inputs githubclient.DispatchInputs) error
 }
 
+// IssueNotifier is the slice of issuecomment.Notifier the dispatcher
+// uses for the pickup-acknowledgment hook. Defining it as an
+// interface keeps the import boundary clean and lets tests substitute
+// a recording stub. Nil at the dispatcher means no comment is posted
+// (the demo loop pre-#234 posture).
+type IssueNotifier interface {
+	NotifyPickup(ctx context.Context, runID uuid.UUID, senderLogin string) error
+}
+
 // Dispatcher orchestrates the I/O side: it consumes a Match,
 // fetches the workflow spec, validates it, creates the Run record,
 // fires workflow_dispatch, and writes audit entries. The webhook
@@ -180,6 +189,12 @@ type Dispatcher struct {
 	Runs   run.Repository
 	Audit  audit.Repository
 	Logger *slog.Logger
+
+	// IssueNotifier posts the pickup-acknowledgment comment back
+	// to the triggering issue (#234). Best-effort: failures log
+	// but don't unwind the dispatch. Nil leaves the comment-back
+	// path off; the run still dispatches.
+	IssueNotifier IssueNotifier
 
 	// DefaultRef is the git ref to dispatch against when the
 	// event doesn't carry one (e.g., issues events). Defaults to
@@ -336,6 +351,23 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// delivery produced a Run row, so the audit log gets an entry
 	// pinning it to the trigger.
 	d.writeDispatchAudit(ctx, ev, m, created, specFile.SHA, dispatchErr, now)
+
+	// Step 8.5: comment back on the triggering issue (#234) so the
+	// labeler sees that Fishhawk picked it up. Only fires for
+	// issue-triggered runs; the notifier itself is the source of
+	// truth on whether to skip (see issuecomment.Notifier).
+	// Best-effort: a failure logs at WARN but doesn't unwind the
+	// dispatch — the run is in the DB regardless of the comment.
+	if d.IssueNotifier != nil && dispatchErr == nil && m.TriggerSource == run.TriggerGitHubIssue {
+		if err := d.IssueNotifier.NotifyPickup(ctx, created.ID, ev.Sender); err != nil {
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"pickup comment-back failed",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("run_id", created.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 
 	// Step 9: log the outcome. Without these lines, operators tailing
 	// stdout see only `webhook received` + the request log and can't

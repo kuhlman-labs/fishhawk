@@ -1127,6 +1127,74 @@ workflows:
 	}
 }
 
+// stubIssueNotifier captures NotifyPickup invocations so the
+// dispatcher's pickup-ack hook can be asserted on without standing
+// up the full issuecomment package wiring.
+type stubIssueNotifier struct {
+	mu    sync.Mutex
+	calls []stubNotifyCall
+	err   error
+}
+
+type stubNotifyCall struct {
+	runID  uuid.UUID
+	sender string
+}
+
+func (s *stubIssueNotifier) NotifyPickup(_ context.Context, runID uuid.UUID, sender string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, stubNotifyCall{runID: runID, sender: sender})
+	return s.err
+}
+
+func TestHandle_IssueTrigger_FiresPickupNotification(t *testing.T) {
+	d, _, runs, _ := newDispatcherWithStubs(t)
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(notifier.calls) != 1 {
+		t.Fatalf("expected 1 NotifyPickup call; got %d", len(notifier.calls))
+	}
+	created := runs.created[0]
+	if notifier.calls[0].runID != created.ID {
+		t.Errorf("NotifyPickup runID = %s, want %s", notifier.calls[0].runID, created.ID)
+	}
+	if notifier.calls[0].sender != "alice" {
+		t.Errorf("NotifyPickup sender = %q, want alice", notifier.calls[0].sender)
+	}
+}
+
+func TestHandle_DispatchFailure_SuppressesPickupNotification(t *testing.T) {
+	d, gh, _, _ := newDispatcherWithStubs(t)
+	gh.dispatchErr = errors.New("422 invalid ref")
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(notifier.calls) != 0 {
+		t.Errorf("expected 0 NotifyPickup calls when dispatch failed; got %d", len(notifier.calls))
+	}
+}
+
+func TestHandle_NotifyPickupError_DoesntFailDispatch(t *testing.T) {
+	d, _, _, _ := newDispatcherWithStubs(t)
+	notifier := &stubIssueNotifier{err: errors.New("403 forbidden")}
+	d.IssueNotifier = notifier
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Errorf("Handle should swallow notifier errors; got %v", err)
+	}
+	if len(notifier.calls) != 1 {
+		t.Errorf("notifier should still be called once; got %d", len(notifier.calls))
+	}
+}
+
 func TestPickPrimaryGate(t *testing.T) {
 	// Approval wins over check, in any order, even if the check
 	// gate appears first in the spec — the review-stage UI's

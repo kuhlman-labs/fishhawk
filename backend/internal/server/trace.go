@@ -319,6 +319,56 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			)
 		}
 	}
+
+	// Plan-ready comment-back (#234). Fires only after a plan stage
+	// transitions terminally and only for issue-triggered runs (the
+	// notifier itself short-circuits on non-issue triggers + on
+	// repeat calls via its audit-log dedup). Best-effort: errors
+	// log but don't unwind the upload — the run's plan is already
+	// attached, the stage is already advanced.
+	if stage.Type == run.StageTypePlan {
+		s.notifyPlanReady(r, runID, stage)
+	}
+}
+
+// notifyPlanReady fires the plan-ready comment-back hook after a
+// plan stage transitions terminally (#234). Pulls the most-recent
+// standard_v1 plan artifact for the run and hands it to the
+// notifier. Best-effort: errors log but never unwind the
+// transition. Skips silently when:
+//
+//   - The notifier isn't wired (no GitHub client / no ExternalURL).
+//   - No standard_v1 plan artifact is attached to the run yet — the
+//     runner may have transitioned the stage before posting the
+//     plan body. (Today the trace upload happens after the plan
+//     POST, but defensive against that ordering changing.)
+//   - The notifier itself decides to skip (non-issue-triggered run,
+//     dedup hit).
+func (s *Server) notifyPlanReady(r *http.Request, runID uuid.UUID, stage *run.Stage) {
+	if s.issueNotifier == nil {
+		return
+	}
+	planArtifact, err := s.loadApprovedPlanForRun(r.Context(), runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan-ready notify: load plan failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if planArtifact == nil {
+		return
+	}
+	if err := s.issueNotifier.NotifyPlanReady(r.Context(), runID, stage, planArtifact); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan-ready notify: comment-back failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // reEvaluatePolicy is the backend's source-of-truth re-evaluation
