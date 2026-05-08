@@ -1208,9 +1208,17 @@ paths:
         not `items` — the SPA fills them with `not_tracked`.
 
         State values per check are the SPA-facing rollup of GitHub's
-        `status` + `conclusion` pair (or the backend's self-derived
-        equivalent for `fishhawk_audit_complete` once #229 lands):
-        `pass`, `fail`, `pending`, or `not_tracked`.
+        `status` + `conclusion` pair, or the backend's self-derived
+        equivalent for `fishhawk_audit_complete` (#229): `pass`,
+        `fail`, `pending`, or `not_tracked`.
+
+        For `fishhawk_audit_complete` the response item additionally
+        carries a `missing` array naming what's incomplete (plan
+        artifact, raw or redacted trace bundle, pull-request
+        artifact, or audit-chain mismatch) so the SPA can render
+        the failure reason without a secondary call. The check is
+        computed on read from artifact + audit-log presence; no row
+        for it lands in `stage_checks`.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -1250,6 +1258,29 @@ paths:
                         ts:
                           type: string
                           format: date-time
+                        missing:
+                          type: array
+                          description: |
+                            Populated only on the `fishhawk_audit_complete`
+                            row when the derivation found gaps. Each entry
+                            names a category of incompleteness; consumers
+                            branch on `kind`. Absent / empty when the check
+                            passes or for externally-fed checks like
+                            `ci_pass`.
+                          items:
+                            type: object
+                            required: [kind, detail]
+                            properties:
+                              kind:
+                                type: string
+                                enum:
+                                  - plan_missing
+                                  - trace_missing
+                                  - pr_missing
+                                  - chain_invalid
+                                  - chain_unrecoverable
+                              detail:
+                                type: string
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '503':

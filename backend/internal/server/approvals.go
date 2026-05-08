@@ -13,10 +13,18 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
+
+// AuditCompleteCheckName is the reserved name for the
+// `fishhawk_audit_complete` blocking check (#229). Stage gates
+// declare it like any other check; the backend self-derives its
+// state from artifact + audit-log presence rather than pulling it
+// from the stage_checks table.
+const AuditCompleteCheckName = "fishhawk_audit_complete"
 
 // approvalRequest mirrors POST /v0/stages/{stage_id}/approvals's
 // request body in docs/api/v0.openapi.yaml.
@@ -241,6 +249,23 @@ func (s *Server) checkBlockingChecks(w http.ResponseWriter, r *http.Request, sta
 	}
 	var blockers []string
 	for _, name := range stage.Gate.BlockingChecks {
+		// fishhawk_audit_complete is self-derived (#229), not read
+		// from the stage_checks table. The backend computes its
+		// state on demand from artifact + audit-log presence so
+		// it always reflects the freshest run state.
+		if name == AuditCompleteCheckName {
+			state, err := s.deriveAuditCompleteState(r, stage.RunID)
+			if err != nil {
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"derive audit-complete state failed",
+					map[string]any{"stage_id": stage.ID.String(), "check": name, "error": err.Error()})
+				return nil, false
+			}
+			if state != stagecheck.StatePass {
+				blockers = append(blockers, name)
+			}
+			continue
+		}
 		c, err := s.cfg.StageCheckRepo.LatestForStageAndName(r.Context(), stage.ID, name)
 		if err != nil {
 			if errors.Is(err, stagecheck.ErrNotFound) {
@@ -261,6 +286,29 @@ func (s *Server) checkBlockingChecks(w http.ResponseWriter, r *http.Request, sta
 		}
 	}
 	return blockers, true
+}
+
+// deriveAuditCompleteState calls auditcomplete.Compute and returns
+// just the state. Falls open (returns pass) when the artifact or
+// audit repo isn't configured — same posture as the other check-
+// derivation paths in the v0 demo loop, where missing infra
+// shouldn't refuse every approve. The full (state, missing) pair
+// is exposed through GET /v0/stages/{id}/checks; this helper exists
+// for the gate-enforcement read path that only cares about pass/
+// not-pass.
+func (s *Server) deriveAuditCompleteState(r *http.Request, runID uuid.UUID) (stagecheck.State, error) {
+	if s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
+		return stagecheck.StatePass, nil
+	}
+	state, _, err := auditcomplete.Compute(r.Context(), runID, auditcomplete.Deps{
+		Runs:      s.cfg.RunRepo,
+		Artifacts: s.cfg.ArtifactRepo,
+		Audit:     s.cfg.AuditRepo,
+	})
+	if err != nil {
+		return "", err
+	}
+	return state, nil
 }
 
 // Lookups (spec fetch, team fetch) happen on the request path.
