@@ -135,6 +135,16 @@ func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.R
 		if fil.State != "" && string(r.State) != fil.State {
 			continue
 		}
+		if fil.PullRequestURL != nil {
+			if r.PullRequestURL == nil || *r.PullRequestURL != *fil.PullRequestURL {
+				continue
+			}
+		}
+		if fil.TriggerRef != nil {
+			if r.TriggerRef == nil || *r.TriggerRef != *fil.TriggerRef {
+				continue
+			}
+		}
 		matched = append(matched, r)
 	}
 	// Order matches the SQL: created_at DESC, id DESC.
@@ -153,6 +163,19 @@ func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.R
 	}
 	return matched[fil.Offset:end], nil
 }
+func (f *fakeRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, url string) (*run.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	u := url
+	r.PullRequestURL = &u
+	r.UpdatedAt = time.Now().UTC()
+	return r, nil
+}
+
 func (f *fakeRepo) CreateStage(_ context.Context, _ run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("fakeRepo: CreateStage not implemented")
 }
@@ -682,6 +705,73 @@ func TestListRuns_RepoFilter(t *testing.T) {
 		t.Errorf("repo filter broken: %+v", got.Items)
 	}
 }
+
+func TestListRuns_PullRequestURLFilter(t *testing.T) {
+	// Threaded-runs view (#216) filters by pull_request_url to find
+	// every run on a PR.
+	repo := newFakeRepo()
+	t0 := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	target := "https://github.com/x/y/pull/42"
+	r1 := seedRun(repo, "x/y", "w", run.StateRunning, t0)
+	r1.PullRequestURL = strPtr(target)
+	r2 := seedRun(repo, "x/y", "w", run.StateSucceeded, t0.Add(time.Minute))
+	r2.PullRequestURL = strPtr(target)
+	other := seedRun(repo, "x/y", "w", run.StateRunning, t0.Add(2*time.Minute))
+	other.PullRequestURL = strPtr("https://github.com/x/y/pull/99")
+
+	s := newServer(t, repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs?pull_request_url="+target, nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got struct {
+		Items []runResponse `json:"items"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if len(got.Items) != 2 {
+		t.Fatalf("filter returned %d items, want 2; items=%+v", len(got.Items), got.Items)
+	}
+	for _, it := range got.Items {
+		if it.PullRequestURL == nil || *it.PullRequestURL != target {
+			t.Errorf("filtered row has PullRequestURL = %v, want %s", it.PullRequestURL, target)
+		}
+	}
+}
+
+func TestListRuns_TriggerRefFilter(t *testing.T) {
+	// Threaded-runs view (#216) also filters by trigger_ref so the
+	// dispatcher's parent-finder + the SPA's "all runs on this
+	// issue" view share the same query path.
+	repo := newFakeRepo()
+	t0 := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	r1 := seedRun(repo, "x/y", "w", run.StateRunning, t0)
+	r1.TriggerRef = strPtr("issue:42")
+	r2 := seedRun(repo, "x/y", "w", run.StateSucceeded, t0.Add(time.Minute))
+	r2.TriggerRef = strPtr("issue:99")
+
+	s := newServer(t, repo)
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs?trigger_ref=issue:42", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got struct {
+		Items []runResponse `json:"items"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if len(got.Items) != 1 {
+		t.Fatalf("filter returned %d items, want 1; items=%+v", len(got.Items), got.Items)
+	}
+	if got.Items[0].TriggerRef == nil || *got.Items[0].TriggerRef != "issue:42" {
+		t.Errorf("filtered row TriggerRef = %v", got.Items[0].TriggerRef)
+	}
+}
+
+func strPtr(s string) *string { return &s }
 
 func TestListRuns_StateFilter_BadValue(t *testing.T) {
 	s := newServer(t, newFakeRepo())

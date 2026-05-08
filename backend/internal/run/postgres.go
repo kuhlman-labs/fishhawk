@@ -51,6 +51,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		State:          string(StatePending),
 		InstallationID: p.InstallationID,
 		IdempotencyKey: p.IdempotencyKey,
+		ParentRunID:    p.ParentRunID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -94,11 +95,13 @@ func (r *postgresRepo) ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, 
 	}
 	q := rundb.New(r.pool)
 	rows, err := q.ListRuns(ctx, rundb.ListRunsParams{
-		Repo:       f.Repo,
-		WorkflowID: f.WorkflowID,
-		State:      f.State,
-		Lim:        int32(f.Limit),
-		Off:        int32(f.Offset),
+		Repo:           f.Repo,
+		WorkflowID:     f.WorkflowID,
+		State:          f.State,
+		PullRequestUrl: f.PullRequestURL,
+		TriggerRef:     f.TriggerRef,
+		Lim:            int32(f.Limit),
+		Off:            int32(f.Offset),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
@@ -146,6 +149,24 @@ func (r *postgresRepo) TransitionRun(ctx context.Context, id uuid.UUID, to State
 }
 
 // --- Stage methods ---
+
+func (r *postgresRepo) SetRunPullRequestURL(ctx context.Context, id uuid.UUID, url string) (*Run, error) {
+	if url == "" {
+		return nil, fmt.Errorf("set run pull_request_url: url required")
+	}
+	q := rundb.New(r.pool)
+	row, err := q.SetRunPullRequestURL(ctx, rundb.SetRunPullRequestURLParams{
+		ID:             id,
+		PullRequestUrl: &url,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("set run pull_request_url: %w", err)
+	}
+	return rowToRun(row), nil
+}
 
 func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*Stage, error) {
 	q := rundb.New(r.pool)
@@ -357,6 +378,8 @@ func rowToRun(r rundb.Run) *Run {
 		TriggerRef:     r.TriggerRef,
 		InstallationID: r.InstallationID,
 		IdempotencyKey: r.IdempotencyKey,
+		ParentRunID:    r.ParentRunID,
+		PullRequestURL: r.PullRequestUrl,
 		State:          State(r.State),
 		CreatedAt:      r.CreatedAt.Time,
 		UpdatedAt:      r.UpdatedAt.Time,

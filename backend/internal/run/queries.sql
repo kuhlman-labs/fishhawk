@@ -3,8 +3,8 @@
 -- into ./db per the config in /backend/sqlc.yaml.
 
 -- name: CreateRun :one
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING *;
 
 -- name: GetRun :one
@@ -19,13 +19,20 @@ SELECT * FROM runs
    AND idempotency_key = $2;
 
 -- name: ListRuns :many
--- Empty string in any filter means "no constraint." created_at DESC
--- + id DESC tiebreak so paginations are stable across concurrent
+-- Empty string / nil in any filter means "no constraint." created_at
+-- DESC + id DESC tiebreak so paginations are stable across concurrent
 -- inserts at the same created_at microsecond.
+--
+-- pull_request_url and trigger_ref are nullable filters: pass NULL to
+-- skip; pass a value to match exactly. They're indexed (partial,
+-- WHERE NOT NULL) so an equality match on either is cheap. Used by
+-- the threaded-runs view (#216) to render "every run on this PR."
 SELECT * FROM runs
  WHERE (sqlc.arg('repo')::text = '' OR repo = sqlc.arg('repo'))
    AND (sqlc.arg('workflow_id')::text = '' OR workflow_id = sqlc.arg('workflow_id'))
    AND (sqlc.arg('state')::text = '' OR state = sqlc.arg('state'))
+   AND (sqlc.narg('pull_request_url')::text IS NULL OR pull_request_url = sqlc.narg('pull_request_url'))
+   AND (sqlc.narg('trigger_ref')::text IS NULL OR trigger_ref = sqlc.narg('trigger_ref'))
  ORDER BY created_at DESC, id DESC
  LIMIT sqlc.arg('lim') OFFSET sqlc.arg('off');
 
@@ -35,6 +42,16 @@ SELECT * FROM runs WHERE id = $1 FOR UPDATE;
 -- name: UpdateRunState :one
 UPDATE runs
    SET state = $2
+ WHERE id = $1
+RETURNING *;
+
+-- name: SetRunPullRequestURL :one
+-- Backfills the implement-stage PR URL onto the run row when the
+-- pull_request artifact lands (#216). Idempotent: a re-upload with
+-- the same URL is a no-op the trigger keeps as a no-op against
+-- updated_at (assignment of identical value).
+UPDATE runs
+   SET pull_request_url = $2
  WHERE id = $1
 RETURNING *;
 

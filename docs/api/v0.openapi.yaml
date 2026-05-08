@@ -160,6 +160,22 @@ components:
         state:
           type: string
           enum: [pending, running, succeeded, failed, cancelled]
+        parent_run_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Set by the dispatcher when a non-terminal run already
+            existed for the same `(repo, trigger_ref)` at create
+            time (#216). Lets the SPA render "follow-up to
+            <short-id>" + a thread of related runs.
+        pull_request_url:
+          type: [string, "null"]
+          description: |
+            Set when the implement stage produces a `pull_request`
+            artifact (#216). Denormalized so the threaded-runs view
+            can group every run on a PR with a single equality
+            filter on `GET /v0/runs?pull_request_url=…`.
+          example: https://github.com/kuhlman-labs/fishhawk/pull/123
         created_at:
           type: string
           format: date-time
@@ -764,6 +780,19 @@ paths:
         - { name: repo, in: query, schema: { type: string } }
         - { name: workflow_id, in: query, schema: { type: string } }
         - { name: state, in: query, schema: { type: string, enum: [pending, running, succeeded, failed, cancelled] } }
+        - name: pull_request_url
+          in: query
+          description: |
+            Equality filter on `run.pull_request_url` (#216). Used by
+            the threaded-runs view to render every run on a PR.
+          schema: { type: string }
+        - name: trigger_ref
+          in: query
+          description: |
+            Equality filter on `run.trigger_ref` (e.g. `issue:42`).
+            Used by the threaded-runs view to render every run on the
+            same trigger when no PR has landed yet.
+          schema: { type: string }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:

@@ -344,6 +344,9 @@ func (r *fakeOIDCRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.
 func (r *fakeOIDCRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *fakeOIDCRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *fakeOIDCRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }

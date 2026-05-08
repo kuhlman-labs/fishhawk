@@ -17,28 +17,32 @@ import (
 // `Run` schema exactly so there's never a translation step between
 // the OpenAPI doc and the wire format.
 type runResponse struct {
-	ID            uuid.UUID `json:"id"`
-	Repo          string    `json:"repo"`
-	WorkflowID    string    `json:"workflow_id"`
-	WorkflowSHA   string    `json:"workflow_sha"`
-	TriggerSource string    `json:"trigger_source"`
-	TriggerRef    *string   `json:"trigger_ref"`
-	State         string    `json:"state"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID             uuid.UUID  `json:"id"`
+	Repo           string     `json:"repo"`
+	WorkflowID     string     `json:"workflow_id"`
+	WorkflowSHA    string     `json:"workflow_sha"`
+	TriggerSource  string     `json:"trigger_source"`
+	TriggerRef     *string    `json:"trigger_ref"`
+	State          string     `json:"state"`
+	ParentRunID    *uuid.UUID `json:"parent_run_id,omitempty"`
+	PullRequestURL *string    `json:"pull_request_url,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 func toRunResponse(r *run.Run) runResponse {
 	return runResponse{
-		ID:            r.ID,
-		Repo:          r.Repo,
-		WorkflowID:    r.WorkflowID,
-		WorkflowSHA:   r.WorkflowSHA,
-		TriggerSource: string(r.TriggerSource),
-		TriggerRef:    r.TriggerRef,
-		State:         string(r.State),
-		CreatedAt:     r.CreatedAt,
-		UpdatedAt:     r.UpdatedAt,
+		ID:             r.ID,
+		Repo:           r.Repo,
+		WorkflowID:     r.WorkflowID,
+		WorkflowSHA:    r.WorkflowSHA,
+		TriggerSource:  string(r.TriggerSource),
+		TriggerRef:     r.TriggerRef,
+		State:          string(r.State),
+		ParentRunID:    r.ParentRunID,
+		PullRequestURL: r.PullRequestURL,
+		CreatedAt:      r.CreatedAt,
+		UpdatedAt:      r.UpdatedAt,
 	}
 }
 
@@ -222,15 +226,30 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// pull_request_url and trigger_ref are optional equality
+	// filters introduced in #216 for the threaded-runs view.
+	// Empty value = no constraint (matches the SQL convention);
+	// any non-empty value is passed verbatim.
+	var prURLFilter *string
+	if v := q.Get("pull_request_url"); v != "" {
+		prURLFilter = &v
+	}
+	var triggerRefFilter *string
+	if v := q.Get("trigger_ref"); v != "" {
+		triggerRefFilter = &v
+	}
+
 	// Fetch one extra row so we can tell whether there's a next
 	// page without a separate COUNT query. The trick: ask for
 	// limit+1, drop the extra in the response if present.
 	rows, err := s.cfg.RunRepo.ListRuns(r.Context(), run.ListRunsFilter{
-		Repo:       q.Get("repo"),
-		WorkflowID: q.Get("workflow_id"),
-		State:      stateFilter,
-		Limit:      limit + 1,
-		Offset:     offset,
+		Repo:           q.Get("repo"),
+		WorkflowID:     q.Get("workflow_id"),
+		State:          stateFilter,
+		PullRequestURL: prURLFilter,
+		TriggerRef:     triggerRefFilter,
+		Limit:          limit + 1,
+		Offset:         offset,
 	})
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
