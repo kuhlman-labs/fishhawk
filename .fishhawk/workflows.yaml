@@ -89,7 +89,7 @@ workflows:
             approvers:
               any_of: [founder]
             blocking_checks:
-              - ci_pass
+              - "CI Pass"
               - fishhawk_audit_complete
 
   # Low autonomy — human-led work.
@@ -115,7 +115,7 @@ workflows:
             approvers:
               any_of: [founder]
             blocking_checks:
-              - ci_pass
+              - "CI Pass"
 
   # High autonomy — agent implements and merges if gates pass.
   # Reserved for low-risk, high-volume work where the cost of a mistake
@@ -150,5 +150,5 @@ workflows:
         gates:
           - type: check
             blocking_checks:
-              - ci_pass
+              - "CI Pass"
               - fishhawk_audit_complete
