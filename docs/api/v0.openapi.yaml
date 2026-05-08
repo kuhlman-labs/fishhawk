@@ -1195,6 +1195,69 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/stages/{stage_id}/checks:
+    get:
+      operationId: listStageChecks
+      summary: Latest state per blocking check on a stage
+      description: |
+        Returns the most-recent observed state for each blocking
+        check declared on the stage's gate (#228). `declared` is
+        the gate's `blocking_checks` list verbatim from the workflow
+        spec; `items` is the latest observed state per check name.
+        Declared-but-not-observed checks appear in `declared` but
+        not `items` — the SPA fills them with `not_tracked`.
+
+        State values per check are the SPA-facing rollup of GitHub's
+        `status` + `conclusion` pair (or the backend's self-derived
+        equivalent for `fishhawk_audit_complete` once #229 lands):
+        `pass`, `fail`, `pending`, or `not_tracked`.
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Declared blocking checks + latest observed state per check.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [declared, items]
+                properties:
+                  declared:
+                    type: array
+                    items: { type: string }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, state]
+                      properties:
+                        name: { type: string }
+                        state:
+                          type: string
+                          enum: [pass, fail, pending, not_tracked]
+                        status:
+                          type: string
+                          description: Verbatim GitHub `check_run.status` (queued / in_progress / completed).
+                        conclusion:
+                          type: [string, "null"]
+                          description: Verbatim GitHub `check_run.conclusion`; null while not completed.
+                        head_sha:
+                          type: string
+                        github_check_run_id:
+                          type: [integer, "null"]
+                          format: int64
+                        ts:
+                          type: string
+                          format: date-time
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503':
+          description: Backend wiring incomplete (run repo or stage-check repo unconfigured).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/stages/{stage_id}/approvals:
     post:
       operationId: submitApproval
@@ -1229,7 +1292,18 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
+        '409':
+          description: |
+            `invalid_state_transition` — stage isn't in
+            awaiting_approval, OR
+            `blocking_checks_not_passed` — one or more declared
+            blocking checks aren't `pass` (#228); response
+            `details.blockers` is the array of offending check
+            names. Reject is not subject to this gate; only
+            approve.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/stages/{stage_id}/retry:
     post:

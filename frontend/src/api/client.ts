@@ -157,6 +157,27 @@ export const api = {
   },
 
   /**
+   * Latest state per declared blocking check on a stage (#228).
+   * Returns the gate's declared list plus the most-recent observed
+   * state per check name. Declared-but-not-observed entries are
+   * absent from `items` — the SPA fills them with `not_tracked`.
+   */
+  listStageChecks(stageId: string): Promise<{
+    declared: string[];
+    items: Array<{
+      name: string;
+      state: 'pass' | 'fail' | 'pending' | 'not_tracked';
+      status?: string;
+      conclusion?: string | null;
+      head_sha?: string;
+      github_check_run_id?: number | null;
+      ts?: string;
+    }>;
+  }> {
+    return request(`/v0/stages/${encodeURIComponent(stageId)}/checks`);
+  },
+
+  /**
    * Stream the most-recent redacted trace bundle for a stage (#218).
    * The endpoint serves gzipped JSON Lines bytes; modern browsers
    * auto-decompress when `Content-Encoding: gzip` is present, so the

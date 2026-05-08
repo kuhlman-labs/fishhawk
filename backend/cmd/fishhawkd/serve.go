@@ -32,6 +32,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	slapkg "github.com/kuhlman-labs/fishhawk/backend/internal/sla"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -121,9 +122,10 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.AuditRepo = audit.NewPostgresRepository(pool)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
+		cfg.StageCheckRepo = stagecheck.NewPostgresRepository(pool)
 		cfg.APITokenRepo = apitoken.NewPostgresRepository(pool)
 		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
-		logger.Info("repositories configured (run + signing + audit + approval + artifact + apitoken + auth)", slog.String("driver", "postgres"))
+		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
 	}

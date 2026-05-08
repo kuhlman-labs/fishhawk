@@ -1,5 +1,7 @@
 import { FileClock } from 'lucide-react';
 import { Link } from 'react-router';
+import { api } from '@/api/client';
+import { useAsync } from '@/api/use-async';
 import type { PullRequestArtifactBody } from '@/api/pull-request';
 import type { Stage } from '@/api/types';
 import { ApprovalPanel } from '@/plan/approval-panel';
@@ -15,9 +17,11 @@ import { BlockingChecksPanel, type BlockingCheck } from '@/components/blocking-c
  *     h1, ApprovalPanel (gated stages only) or audit-log link.
  *   - PullRequestSummary: shared with the implement page, fed the
  *     implement stage's pull_request artifact.
- *   - BlockingChecksPanel: lists the gate's declared blocking_checks.
- *     v0 always shows `not_tracked` because the backend doesn't
- *     ingest check states yet (file as follow-up).
+ *   - BlockingChecksPanel: lists the gate's declared blocking_checks
+ *     with their live observed state (#228). The backend serves the
+ *     declared list + most-recent observed state; declared-but-not-
+ *     observed entries fill as `not_tracked` so the SPA always
+ *     shows the full gate.
  *   - Approvers list: shown only for approval-typed gates.
  *
  * For check-only review gates (e.g. routine_change.workflows.yaml),
@@ -38,10 +42,11 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
   const isApprovalGate = gate?.type === 'approval';
   const showApprovalPanel = isApprovalGate && stage.state === 'awaiting_approval';
 
-  const checks: BlockingCheck[] = (gate?.blocking_checks ?? []).map((name) => ({
-    name,
-    state: 'not_tracked',
-  }));
+  // Live blocking-check states (#228). Falls back to all-not-tracked
+  // when the endpoint is 503 (legacy deployments without check
+  // ingestion) or the request is in flight.
+  const checksResult = useAsync(() => api.listStageChecks(stage.id), [stage.id]);
+  const checks = mergeBlockingChecks(gate?.blocking_checks ?? [], checksResult);
 
   return (
     <article className="max-w-3xl space-y-8 pb-20">
@@ -84,6 +89,39 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
       )}
     </article>
   );
+}
+
+interface ChecksResponse {
+  declared: string[];
+  items: Array<{
+    name: string;
+    state: 'pass' | 'fail' | 'pending' | 'not_tracked';
+  }>;
+}
+
+// mergeBlockingChecks pairs the gate's declared list with the most-
+// recent observed state from /v0/stages/{id}/checks. Declared-but-
+// not-observed checks render as `not_tracked`. Loading and error
+// states (including a 503 from a backend without check ingestion)
+// fall back to declaring everything as `not_tracked` so the panel
+// always renders the full gate without a flicker.
+function mergeBlockingChecks(
+  declared: string[],
+  result:
+    | { status: 'loading' }
+    | { status: 'error'; error: Error }
+    | { status: 'ok'; data: ChecksResponse },
+): BlockingCheck[] {
+  const observed = new Map<string, BlockingCheck['state']>();
+  if (result.status === 'ok') {
+    for (const item of result.data.items) {
+      observed.set(item.name, item.state);
+    }
+  }
+  return declared.map((name) => ({
+    name,
+    state: observed.get(name) ?? 'not_tracked',
+  }));
 }
 
 function ApproversBlock({
