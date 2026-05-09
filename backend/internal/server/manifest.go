@@ -228,6 +228,12 @@ func buildManifest(backendURL, webhookURL, name string) map[string]any {
 			"workflows":     "write",
 			"members":       "read",
 			"metadata":      "read",
+			// administration:read lets the backend read branch
+			// protection + rulesets to derive the required-checks
+			// list at run-create time (ADR-017 / #249, consumed by
+			// #251). Read-only — we don't manage protection from
+			// Fishhawk.
+			"administration": "read",
 		},
 		"default_events": []string{
 			"issues",

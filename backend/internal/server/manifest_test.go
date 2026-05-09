@@ -304,6 +304,53 @@ func TestManifestCallback_Unconfigured_503(t *testing.T) {
 	}
 }
 
+// TestBuildManifest_DefaultPermissions asserts the rendered manifest
+// carries the permissions Fishhawk depends on. The contract here is
+// load-bearing for the install flow — a missing scope means the App
+// gets installed without the API access the backend assumes, and the
+// failure surfaces later as a 403 from a totally unrelated handler.
+//
+// The permissions listed below are the closed set required for v0;
+// each one has a load-bearing call site in the backend or runner.
+// Bumping a permission here requires a re-install, which is documented
+// in docs/github-app/README.md "Re-installing after a permissions
+// bump".
+func TestBuildManifest_DefaultPermissions(t *testing.T) {
+	m := buildManifest("http://localhost:8080", "https://smee.io/abc", "")
+	perms, ok := m["default_permissions"].(map[string]string)
+	if !ok {
+		t.Fatalf("default_permissions missing or wrong type: %T", m["default_permissions"])
+	}
+	want := map[string]string{
+		"actions":       "write",
+		"contents":      "write",
+		"issues":        "write",
+		"pull_requests": "write",
+		"checks":        "write",
+		"workflows":     "write",
+		"members":       "read",
+		"metadata":      "read",
+		// administration:read for ADR-017 / #249: backend reads
+		// branch protection + rulesets at run-create time to derive
+		// the required-checks list (consumed by #251).
+		"administration": "read",
+	}
+	if len(perms) != len(want) {
+		t.Errorf("permission count = %d, want %d:\n got: %v\nwant: %v",
+			len(perms), len(want), perms, want)
+	}
+	for k, v := range want {
+		got, ok := perms[k]
+		if !ok {
+			t.Errorf("permission %q missing", k)
+			continue
+		}
+		if got != v {
+			t.Errorf("permission %q = %q, want %q", k, got, v)
+		}
+	}
+}
+
 func TestDeriveOAuthCallbackURL(t *testing.T) {
 	cases := []struct {
 		name string
