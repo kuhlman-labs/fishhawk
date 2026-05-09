@@ -243,6 +243,11 @@ func buildManifest(backendURL, webhookURL, name string) map[string]any {
 			"workflow_run",
 			"check_run",
 			"check_suite",
+			// #251 / ADR-017: receive notice when an upstream
+			// protection edit invalidates a cached snapshot.
+			// Acknowledged by MatchEvent, no run-create.
+			"branch_protection_rule",
+			"repository_ruleset",
 		},
 	}
 }

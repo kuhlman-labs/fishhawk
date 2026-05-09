@@ -31,6 +31,11 @@ type CreateRunParams struct {
 	// fresh trigger lands for a (repo, trigger_ref) tuple that
 	// already has a non-terminal run.
 	ParentRunID *uuid.UUID
+	// RequiredChecksSnapshot is the GitHub branch protection /
+	// ruleset snapshot the dispatcher captured at run-create time
+	// (#251 / ADR-017). Nil for non-dispatcher creates and for
+	// CLI / UI runs in v0 — those paths don't gate on CI.
+	RequiredChecksSnapshot *RequiredChecksSnapshot
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.
