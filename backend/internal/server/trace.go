@@ -359,6 +359,20 @@ func (s *Server) notifyPlanReady(r *http.Request, runID uuid.UUID, stage *run.St
 		return
 	}
 	if planArtifact == nil {
+		// Most-likely cause: the runner ships trace before plan
+		// (current order), so the trace-handler hook runs before
+		// the plan artifact lands. The plan-upload handler will
+		// re-fire this hook when its turn comes (#245). The
+		// notifier's audit-log dedup ensures only one comment
+		// posts. Logged at debug level so the next time this
+		// branch fires for an unexpected reason (e.g. the runner's
+		// upload order changed and the plan never lands) the
+		// absence is recoverable from logs instead of silent.
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelDebug,
+			"plan-ready notify: no plan artifact yet — will retry on plan-upload hook",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+		)
 		return
 	}
 	if err := s.issueNotifier.NotifyPlanReady(r.Context(), runID, stage, planArtifact); err != nil {

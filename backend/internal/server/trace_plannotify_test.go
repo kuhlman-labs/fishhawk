@@ -104,6 +104,139 @@ func TestNotifyPlanReady_NoNotifier_NoOp(t *testing.T) {
 	s.notifyPlanReady(req, r.ID, planStage)
 }
 
+// TestNotifyPlanReady_RealRunnerOrder_TracePrecedesPlan covers the
+// race that #245 fixed: the runner ships trace bundles BEFORE the
+// plan artifact, so the trace-handler's notify hook runs before the
+// plan exists and silently skips. The plan-upload handler fires the
+// hook again; the audit-log dedup ensures only one comment lands.
+func TestNotifyPlanReady_RealRunnerOrder_TracePrecedesPlan(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+	r.WorkflowID = "feature_change"
+
+	planStage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	planStage.Type = run.StageTypePlan
+	planStage.RequiresApproval = true
+
+	arts := newFakeArtifactRepo()
+	au := newPlanReadyAuditFake()
+	gh := newCommentRecorder()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr,
+		AuditRepo: au, ArtifactRepo: arts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	req := httptest.NewRequest("POST", "/", nil)
+
+	// Step 1: trace lands first (the runner's actual order). The
+	// trace-handler's notify hook fires; no plan artifact exists
+	// yet; we should silently skip without commenting.
+	s.notifyPlanReady(req, r.ID, planStage)
+	if got := gh.calls(); len(got) != 0 {
+		t.Fatalf("trace-handler hook commented before plan artifact existed; got %d calls", len(got))
+	}
+
+	// Step 2: plan upload lands. The plan-upload handler's hook
+	// fires; the artifact is now there; the comment lands.
+	v := "standard_v1"
+	arts.all = append(arts.all, &artifact.Artifact{
+		ID: uuid.New(), StageID: planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       json.RawMessage(`{"summary":"add a feature","scope":{"files":[{"path":"x.go","operation":"modify"}]}}`),
+		CreatedAt:     time.Now().UTC(),
+	})
+	s.notifyPlanReadyIfReady(req, r.ID, planStage)
+	if got := gh.calls(); len(got) != 1 {
+		t.Fatalf("plan-upload hook should have posted one comment; got %d calls", len(got))
+	}
+	if !strings.Contains(gh.calls()[0].body, "Plan ready") {
+		t.Errorf("comment body should reference plan-ready: %q", gh.calls()[0].body)
+	}
+
+	// Step 3: re-fire (e.g. runner retries the plan upload, hits
+	// the idempotent path). Audit-log dedup should keep this a
+	// no-op so the issue doesn't get the same comment twice.
+	s.notifyPlanReadyIfReady(req, r.ID, planStage)
+	if got := gh.calls(); len(got) != 1 {
+		t.Errorf("dedup failed — re-firing the plan-upload hook produced %d calls; want 1", len(got))
+	}
+}
+
+// TestNotifyPlanReadyIfReady_SkipsWhenStagePending guards the
+// future-runner case where a plan upload arrives before the trace
+// (so the stage is still 'dispatched'/'running'). Commenting at
+// that point would be premature; the notify must wait for the
+// terminal transition.
+func TestNotifyPlanReadyIfReady_SkipsWhenStagePending(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	planStage := rr.seedStage(r.ID, 0, run.StageStateRunning) // not yet terminal
+	planStage.Type = run.StageTypePlan
+
+	arts := newFakeArtifactRepo()
+	v := "standard_v1"
+	arts.all = append(arts.all, &artifact.Artifact{
+		ID: uuid.New(), StageID: planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       json.RawMessage(`{"summary":"x","scope":{"files":[]}}`),
+		CreatedAt:     time.Now().UTC(),
+	})
+	au := newPlanReadyAuditFake()
+	gh := newCommentRecorder()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr,
+		AuditRepo: au, ArtifactRepo: arts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	req := httptest.NewRequest("POST", "/", nil)
+	s.notifyPlanReadyIfReady(req, r.ID, planStage)
+	if got := gh.calls(); len(got) != 0 {
+		t.Errorf("plan-upload hook commented while stage was non-terminal; got %d calls", len(got))
+	}
+}
+
+func TestNotifyPlanReadyIfReady_SkipsForNonPlanStage(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	implementStage := rr.seedStage(r.ID, 1, run.StageStateAwaitingApproval)
+	implementStage.Type = run.StageTypeImplement
+
+	gh := newCommentRecorder()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: newPlanReadyAuditFake(),
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	req := httptest.NewRequest("POST", "/", nil)
+	s.notifyPlanReadyIfReady(req, r.ID, implementStage)
+	if got := gh.calls(); len(got) != 0 {
+		t.Errorf("plan-upload hook commented on a non-plan stage; got %d calls", len(got))
+	}
+}
+
 func TestNotifyPlanReady_NoPlanArtifact_SkipsCleanly(t *testing.T) {
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
