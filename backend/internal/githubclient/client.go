@@ -400,6 +400,91 @@ func (c *Client) DispatchWorkflow(ctx context.Context, installationID int64, rep
 	return classifyStatus("dispatch", resp)
 }
 
+// WorkflowRun is the slice of an Actions workflow_run we surface
+// for matching back to a Fishhawk stage (#243). The real GitHub
+// payload is much wider; we only need enough to recover the
+// `workflow_dispatch` inputs (run_id / stage_id) the dispatcher
+// fired with.
+type WorkflowRun struct {
+	ID         int64
+	HTMLURL    string
+	Conclusion string
+	Status     string
+	Event      string
+	HeadBranch string
+	HeadSHA    string
+	// Inputs is the `workflow_dispatch` inputs map echoed back by
+	// GitHub. Empty for non-dispatch runs.
+	Inputs map[string]string
+}
+
+// GetWorkflowRun fetches a single Actions run by ID, surfacing the
+// fields Fishhawk needs to match it back to a dispatched stage
+// (#243).
+//
+//	GET /repos/{owner}/{repo}/actions/runs/{run_id}
+//
+// The returned `inputs` map is the workflow_dispatch input set the
+// dispatcher fired with, which carries `run_id` and `stage_id` for
+// the Fishhawk-side row.
+//
+// Returns ErrNotFound if the run id doesn't exist, ErrForbidden on
+// auth issues.
+func (c *Client) GetWorkflowRun(ctx context.Context, installationID int64, repo RepoRef, runID int64) (*WorkflowRun, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if runID <= 0 {
+		return nil, errors.New("githubclient: workflow run id must be > 0")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/actions/runs/" + url.PathEscape(fmt.Sprintf("%d", runID)))
+
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: get workflow run: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("get workflow run", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		ID         int64             `json:"id"`
+		HTMLURL    string            `json:"html_url"`
+		Conclusion string            `json:"conclusion"`
+		Status     string            `json:"status"`
+		Event      string            `json:"event"`
+		HeadBranch string            `json:"head_branch"`
+		HeadSHA    string            `json:"head_sha"`
+		Inputs     map[string]string `json:"inputs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode workflow run: %w", err)
+	}
+	return &WorkflowRun{
+		ID:         body.ID,
+		HTMLURL:    body.HTMLURL,
+		Conclusion: body.Conclusion,
+		Status:     body.Status,
+		Event:      body.Event,
+		HeadBranch: body.HeadBranch,
+		HeadSHA:    body.HeadSHA,
+		Inputs:     body.Inputs,
+	}, nil
+}
+
 // CreateIssueComment posts a markdown comment to the given issue
 // (or PR — GitHub treats PR conversations as issue threads).
 //

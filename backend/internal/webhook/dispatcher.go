@@ -39,14 +39,16 @@ const (
 // MatchAction tags how a matched event should be handled. Run is
 // the historical default (create + workflow_dispatch); approve and
 // reject act on an existing run's gate state without dispatching
-// new work.
+// new work; runner_action_failed flips a stuck dispatched stage to
+// failed-C when the customer-side GitHub Actions run errored out.
 type MatchAction string
 
 // MatchAction values.
 const (
-	MatchActionRun     MatchAction = "run"
-	MatchActionApprove MatchAction = "approve"
-	MatchActionReject  MatchAction = "reject"
+	MatchActionRun                MatchAction = "run"
+	MatchActionApprove            MatchAction = "approve"
+	MatchActionReject             MatchAction = "reject"
+	MatchActionRunnerActionFailed MatchAction = "runner_action_failed"
 )
 
 // DefaultWorkflowID is the workflow_id (a key under `workflows:`
@@ -89,6 +91,17 @@ type Match struct {
 	// approve / reject so the approval row's `comment` column gets
 	// the reviewer's rationale.
 	CommentBody string
+
+	// WorkflowRunID is the GitHub Actions run id from a
+	// `workflow_run.completed` event. Set for
+	// MatchActionRunnerActionFailed so the dispatcher can fetch
+	// the run's inputs (run_id / stage_id) via the actions API.
+	WorkflowRunID int64
+
+	// WorkflowRunConclusion is the GitHub Actions terminal status
+	// — `failure`, `timed_out`, `cancelled`, etc. Captured into
+	// the audit row's failure_reason so operators can correlate.
+	WorkflowRunConclusion string
 }
 
 // IssueRef captures the bits of an issue payload the dispatcher
@@ -122,6 +135,8 @@ func MatchEvent(ev Event) Match {
 		return matchIssue(ev)
 	case "issue_comment":
 		return matchIssueComment(ev)
+	case "workflow_run":
+		return matchWorkflowRun(ev)
 	default:
 		return Match{Skip: true,
 			Reason: fmt.Sprintf("unrecognized event type %q", ev.Type)}
@@ -250,6 +265,97 @@ func trailingComment(body, command string) string {
 	return strings.TrimSpace(body[len(command):])
 }
 
+// failedRunnerConclusions enumerates the GitHub Actions terminal
+// statuses that indicate the runner action failed before reporting
+// in (#243). `success` / `neutral` / `skipped` are excluded — the
+// trace upload is the canonical success signal, and a skipped run
+// (e.g., a workflow that was a no-op) is by definition fine.
+//
+// Closed set so a future GitHub-side conclusion (`stale`,
+// `startup_failure`, etc.) lands as "not a failure we recognize" by
+// default. Adding a new conclusion to this map is a deliberate
+// decision after confirming the operator wants Fishhawk to flip the
+// stage to failed-C on it.
+var failedRunnerConclusions = map[string]struct{}{
+	"failure":         {},
+	"timed_out":       {},
+	"cancelled":       {},
+	"action_required": {},
+	"startup_failure": {},
+	"stale":           {},
+}
+
+// matchWorkflowRun classifies a `workflow_run.completed` event for
+// the customer's runner workflow file (#243). Fishhawk uses
+// workflow_dispatch to fire `fishhawk.yml` on the customer's repo;
+// when that run errors out before uploading a trace, the matched
+// stage stays in `dispatched` until the watchdog times out. This
+// matcher routes the failure signal so the stage flips to failed-C
+// immediately.
+//
+// Skip rules:
+//   - action != "completed" — only the terminal event matters.
+//   - workflow path != fishhawk's actions file — ignore other
+//     workflows in the customer's repo.
+//   - conclusion not in failedRunnerConclusions — success / neutral
+//     / skipped don't need our intervention.
+//   - workflow_run.id zero / parse failure — bad payload, skip.
+func matchWorkflowRun(ev Event) Match {
+	if ev.Action != "completed" {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("workflow_run.%s is not a terminal action", ev.Action)}
+	}
+	var payload struct {
+		WorkflowRun struct {
+			ID         int64  `json:"id"`
+			Path       string `json:"path"`
+			Conclusion string `json:"conclusion"`
+			Status     string `json:"status"`
+			Event      string `json:"event"`
+		} `json:"workflow_run"`
+	}
+	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
+		return Match{Skip: true, Reason: "workflow_run payload parse failed"}
+	}
+	if payload.WorkflowRun.ID == 0 {
+		return Match{Skip: true, Reason: "workflow_run payload missing id"}
+	}
+	if !isFishhawkWorkflowPath(payload.WorkflowRun.Path) {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("workflow %q is not the runner action", payload.WorkflowRun.Path)}
+	}
+	if payload.WorkflowRun.Event != "workflow_dispatch" {
+		// We only fired workflow_dispatch invocations of this
+		// workflow; a manual / scheduled run on the same file is
+		// not Fishhawk's concern.
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("workflow_run.event %q is not workflow_dispatch", payload.WorkflowRun.Event)}
+	}
+	if _, ok := failedRunnerConclusions[payload.WorkflowRun.Conclusion]; !ok {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("workflow_run.conclusion %q is not a failure",
+				payload.WorkflowRun.Conclusion)}
+	}
+	return Match{
+		Action:                MatchActionRunnerActionFailed,
+		WorkflowRunID:         payload.WorkflowRun.ID,
+		WorkflowRunConclusion: payload.WorkflowRun.Conclusion,
+	}
+}
+
+// isFishhawkWorkflowPath returns true when the workflow_run's
+// `path` matches the runner action file (default `fishhawk.yml`).
+// GitHub reports `path` as `.github/workflows/<file>` — strip the
+// directory before comparing.
+func isFishhawkWorkflowPath(path string) bool {
+	const prefix = ".github/workflows/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	file := path[len(prefix):]
+	return file == DefaultActionsWorkflowFile
+}
+
 // GitHubAPI is the slice of githubclient.Client the dispatcher
 // uses. Defining it as an interface lets tests substitute a stub
 // without standing up an httptest.Server alongside the existing
@@ -260,6 +366,8 @@ type GitHubAPI interface {
 	DispatchWorkflow(ctx context.Context, installationID int64,
 		repo githubclient.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
+	GetWorkflowRun(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
 }
 
 // IssueNotifier is the slice of issuecomment.Notifier the dispatcher
@@ -366,6 +474,8 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	switch m.Action {
 	case MatchActionApprove, MatchActionReject:
 		return d.handleApprovalCommand(ctx, ev, m)
+	case MatchActionRunnerActionFailed:
+		return d.handleRunnerActionFailed(ctx, ev, m)
 	}
 
 	repo, err := parseRepo(ev.Repo)
@@ -626,6 +736,93 @@ func (d *Dispatcher) handleApprovalCommand(ctx context.Context, ev Event, m Matc
 			slog.String("error", err.Error()),
 		)
 	}
+	return nil
+}
+
+// handleRunnerActionFailed flips the matched stage to failed-C
+// when the customer-side runner action errors out (#243). Best-
+// effort: errors log but don't surface as webhook 5xx — the
+// dispatch watchdog (E8.4 #158) is the slow-but-eventual fallback,
+// so a flap here just delays the transition rather than losing it.
+//
+// The matching strategy uses the workflow_run's
+// `workflow_dispatch.inputs` echoed back by the actions API. We
+// fired the original dispatch with `run_id` and `stage_id`
+// inputs (per `Dispatcher.Handle` step 6); GitHub stores them
+// verbatim, and `GetWorkflowRun` returns them so we can recover
+// the Fishhawk stage without a separate matching scheme.
+//
+// Idempotency: re-deliveries of the same workflow_run.completed
+// hit the same stage. `run.FailStage` is itself idempotent on
+// already-failed stages (same-state transition is a no-op), so
+// the second handle is harmless.
+func (d *Dispatcher) handleRunnerActionFailed(ctx context.Context, ev Event, m Match) error {
+	repo, err := parseRepo(ev.Repo)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"runner_action_failed: repo parse failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+		)
+		return nil
+	}
+
+	wfRun, err := d.GitHub.GetWorkflowRun(ctx, ev.InstallationID, repo, m.WorkflowRunID)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"runner_action_failed: get workflow run failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.Int64("workflow_run_id", m.WorkflowRunID),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+
+	stageIDStr, ok := wfRun.Inputs["stage_id"]
+	if !ok || stageIDStr == "" {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"runner_action_failed: workflow_run has no stage_id input — not a Fishhawk dispatch",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.Int64("workflow_run_id", m.WorkflowRunID),
+		)
+		return nil
+	}
+	stageID, err := uuid.Parse(stageIDStr)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"runner_action_failed: stage_id input is not a UUID",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("stage_id", stageIDStr),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+
+	reason := fmt.Sprintf("runner action workflow_run #%d concluded as %s",
+		m.WorkflowRunID, m.WorkflowRunConclusion)
+	if _, err := run.FailStage(ctx, d.Runs, stageID, run.FailureC, reason); err != nil {
+		// Stage may have already advanced (trace upload landed
+		// before this webhook arrived) — that's fine, fail-stage
+		// is idempotent on already-terminal stages. Log other
+		// errors at warn but don't surface as 5xx.
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"runner_action_failed: fail-stage failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+
+	d.logger().LogAttrs(ctx, slog.LevelInfo,
+		"runner_action_failed: stage transitioned to failed-C",
+		slog.String("delivery_id", ev.DeliveryID),
+		slog.String("repo", ev.Repo),
+		slog.Int64("workflow_run_id", m.WorkflowRunID),
+		slog.String("conclusion", m.WorkflowRunConclusion),
+		slog.String("stage_id", stageID.String()),
+		slog.String("workflow_run_url", wfRun.HTMLURL),
+	)
 	return nil
 }
 
