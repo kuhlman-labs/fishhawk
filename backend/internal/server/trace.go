@@ -389,21 +389,23 @@ func (s *Server) notifyPlanReady(r *http.Request, runID uuid.UUID, stage *run.St
 // of the closed-set constraints (E3.13). Returns true (policy
 // passed) when:
 //
-//   - the bundle has no git_diff event (older runner / stage type
-//     that doesn't produce a diff — skip re-eval, preserve existing
-//     awaiting_approval behavior)
 //   - the spec lookup fails (best-effort: we don't black-hole a
 //     stage because GitHub flapped, just log and proceed)
 //   - the stage type isn't in the parsed spec
-//   - constraints for this stage are empty (no policy applies)
-//   - EmitEvaluation returns no violations
+//   - EmitEvaluation returns no violations (including the cases
+//     where the diff is empty and / or no constraints apply —
+//     those still emit a passed=true audit entry per #247 so the
+//     SPA's policy section can render the pass state instead of
+//     "pending")
 //
 // Returns false only when EmitEvaluation produces one or more
 // violations. The caller transitions the stage accordingly.
 //
-// EmitEvaluation writes its own chained policy_evaluated audit
-// entry; this helper doesn't audit on the skip paths because there's
-// nothing to evaluate.
+// Always tries to emit a policy_evaluated audit entry when we
+// reach a state that has either constraints or a diff — even if
+// one is empty. The SPA reads that entry to render the policy
+// section (#233); a missing entry is what makes the section
+// stuck on "pending" (#247).
 func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bundleBytes []byte) bool {
 	ctx := r.Context()
 	logger := s.cfg.Logger
@@ -423,17 +425,20 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 		return true
 	}
 
+	// Diff: tolerate "no diff in bundle" by treating it as an
+	// empty diff. The runner emits a git_diff event whenever
+	// --check-base-ref is set (#247); older runners / stages
+	// without diff data still need the SPA to render a pass-state
+	// rather than "pending."
 	diff, err := bundle.ExtractDiff(bundleBytes)
 	if err != nil {
-		if errors.Is(err, bundle.ErrNoDiffEvent) {
-			// Older runner or constraint-free stage: nothing to
-			// re-evaluate. Not an error.
+		if !errors.Is(err, bundle.ErrNoDiffEvent) {
+			logger.LogAttrs(ctx, slog.LevelWarn, "policy: extract diff failed",
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
 			return true
 		}
-		logger.LogAttrs(ctx, slog.LevelWarn, "policy: extract diff failed",
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()))
-		return true
+		diff = policy.Diff{} // empty diff; carry on so we emit an audit entry
 	}
 
 	constraints, err := s.fetchStageConstraints(ctx, runRow, string(stage.Type))
@@ -444,12 +449,12 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 			slog.String("error", err.Error()))
 		return true
 	}
-	if isEmptyConstraints(constraints) {
-		// No constraints configured for this stage — nothing to
-		// fail; proceed to awaiting_approval.
-		return true
-	}
 
+	// Always emit, even when the constraints are empty (nothing
+	// to violate; render as "Policy passed · No constraints
+	// configured" rather than "pending"). EmitEvaluation handles
+	// the empty case cleanly — Evaluate returns no violations,
+	// the row carries Applied={} and Passed=true.
 	violations, err := policy.EmitEvaluation(ctx, s.cfg.AuditRepo,
 		runID, stageID, string(stage.Type), diff, constraints, nil)
 	if err != nil {

@@ -300,9 +300,11 @@ func TestShipTrace_PolicyReEval_ForbiddenPath_FailedB(t *testing.T) {
 
 func TestShipTrace_PolicyReEval_NoDiffEvent_FallsBackToAwaitingApproval(t *testing.T) {
 	// Older-runner case (or stage that doesn't produce a diff): no
-	// git_diff event in the bundle. Re-eval is skipped; behavior
-	// matches the pre-E3.13 path (advance to awaiting_approval).
-	s, sf, repo, _, _ := newPolicyTraceServer(t, nil)
+	// git_diff event in the bundle. Re-eval treats this as an
+	// empty diff and STILL emits a policy_evaluated audit entry
+	// (#247) so the SPA's policy section renders the pass state
+	// instead of "pending."
+	s, sf, repo, au, _ := newPolicyTraceServer(t, nil)
 	bundle := makeTestBundle(t, nil) // no files = no git_diff event
 	priv, _ := sf.issue(t, repo.runRow.ID)
 
@@ -312,6 +314,20 @@ func TestShipTrace_PolicyReEval_NoDiffEvent_FallsBackToAwaitingApproval(t *testi
 	}
 	if repo.stage.State != run.StageStateAwaitingApproval {
 		t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
+	}
+	// Pre-#247 behavior was a silent skip — no audit row. Now we
+	// emit one so the SPA can render "Policy passed" instead of
+	// "Policy evaluation pending."
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	hasPolicy := false
+	for _, e := range au.appended {
+		if e.Category == "policy_evaluated" {
+			hasPolicy = true
+		}
+	}
+	if !hasPolicy {
+		t.Errorf("expected policy_evaluated audit entry even without a git_diff in the bundle")
 	}
 }
 

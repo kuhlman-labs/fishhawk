@@ -140,3 +140,19 @@ jobs:
           # so the artifact lands in the artifacts table and the UI
           # can render it for approval. (E5.X / #191.)
           plan-out: '/tmp/fishhawk-plan.json'
+          # check-base-ref: makes the runner compute `git diff` against
+          # this ref and emit a `git_diff` event into the trace bundle
+          # (#247). The backend's policy re-evaluation reads the diff
+          # from the bundle to decide pass/fail; without this, the SPA's
+          # policy section is stuck on "pending." We don't pass
+          # constraints-file because the backend pulls constraints
+          # directly from .fishhawk/workflows.yaml — emitting the diff
+          # is sufficient.
+          #
+          # The base ref is the repo's configured default branch
+          # (read from the dispatch event's repository payload, so
+          # repos with `develop` / `master` / etc. work too). actions/
+          # checkout above fetches the default branch into the
+          # remote-tracking ref `origin/<branch>` which is what the
+          # runner's `git diff <ref>...HEAD` expects.
+          check-base-ref: 'origin/${{ github.event.repository.default_branch }}'

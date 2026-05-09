@@ -188,11 +188,49 @@ func run(args []string, logSink io.Writer) int {
 		}
 	}
 
+	// Diff emission: when --check-base-ref is set, compute the
+	// stage's git diff and emit a git_diff event into the bundle.
+	// The backend's policy re-evaluation (E3.13) reads this event
+	// regardless of whether the runner does its own in-band
+	// constraint check; decoupling emission from enforcement (#247)
+	// means the SPA's policy section works even for customers who
+	// don't pass --constraints-file.
+	//
+	// A diff failure on its own doesn't demote res.OK — when the
+	// customer didn't pass constraints-file we have nothing to
+	// enforce. The in-band constraint check below treats a failed
+	// diff as fatal IF constraints-file is set (preserves the
+	// pre-#247 "couldn't enforce constraints → category-B" semantic).
+	var diff *constraint.Diff
+	var diffErr error
+	if cfg.checkBaseRef != "" {
+		d, ev, err := computeAndEmitDiff(cfg)
+		res.Events = append(res.Events, ev)
+		if err == nil {
+			diff = &d
+		} else {
+			diffErr = err
+		}
+	}
+
 	// Constraint evaluation: same demotion rules as plan
 	// validation. Only runs if everything before it succeeded so
 	// we don't double-stamp a category-A failure as B.
+	//
+	// Requires both flags. --constraints-file alone is a silent
+	// skip (legitimate for stages that don't produce diffs); the
+	// customer can pass it as a default in their action and only
+	// add --check-base-ref to stages that emit a diff. A diff
+	// failure when both flags are set is fatal — preserves the
+	// pre-#247 "couldn't enforce constraints → category-B"
+	// semantic.
 	if res.OK && cfg.constraintsFile != "" && cfg.checkBaseRef != "" {
-		if evs, demote := enforceConstraints(cfg); demote != nil {
+		if diff == nil {
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = diffErr.Error()
+			invokeErr = diffErr
+		} else if evs, demote := enforceConstraints(cfg, *diff); demote != nil {
 			res.Events = append(res.Events, evs...)
 			res.OK = false
 			res.FailureCategory = "B"
@@ -609,17 +647,50 @@ func classifyErr(err error) string {
 	}
 }
 
-// enforceConstraints runs `git diff --name-status` against the
-// configured base ref and evaluates the constraints from the JSON
-// file. Returns one or more policy_event events for the bundle
-// plus a non-nil error iff any constraint was violated. The
-// caller demotes the run to category-B on a non-nil error.
+// computeAndEmitDiff runs `git diff --name-status` against the
+// configured base ref and returns a `git_diff` bundle event the
+// backend's policy re-evaluation reads (E3.13). Decoupled from
+// constraint enforcement (#247) so the diff lands in the bundle
+// even when the customer doesn't pass --constraints-file — the
+// SPA's policy section needs the diff to render anything other
+// than "pending."
 //
-// On infra failures (file read, git error) we still demote to
-// category-B because from the workflow author's perspective "the
-// runner couldn't verify your constraints" is a constraint-stage
-// failure, not an agent failure.
-func enforceConstraints(cfg config) ([]agent.Event, error) {
+// Returns the parsed Diff (consumed by enforceConstraints when
+// constraints-file is also set), a bundle event (always — either
+// the git_diff payload on success, or a policy_event marking the
+// failure on error), and the underlying error for the caller's
+// log line. The error is intentionally NOT load-bearing on the
+// run's res.OK; the in-band constraint enforcer below is the one
+// that demotes to category-B.
+func computeAndEmitDiff(cfg config) (constraint.Diff, agent.Event, error) {
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	d, err := (&gitdiff.Runner{}).Run(context.Background(), cfg.checkBaseRef, repoDir)
+	if err != nil {
+		return constraint.Diff{}, agent.Event{
+			Kind:    "policy_event",
+			Payload: agent.MakePayload(map[string]string{"check": "diff", "outcome": "diff_failed", "error": err.Error()}),
+		}, fmt.Errorf("computeAndEmitDiff: %w", err)
+	}
+	return d, makeGitDiffEvent(cfg.checkBaseRef, d), nil
+}
+
+// enforceConstraints reads the constraints config and evaluates
+// it against the pre-computed diff. Returns one or more policy_event
+// events for the bundle plus a non-nil error iff any constraint
+// was violated. The caller demotes the run to category-B on a
+// non-nil error.
+//
+// On infra failures (config file read / parse error) we still
+// demote to category-B because from the workflow author's
+// perspective "the runner couldn't verify your constraints" is a
+// constraint-stage failure, not an agent failure.
+//
+// The git_diff event is emitted by computeAndEmitDiff before this
+// runs (see #247); this function returns only policy_event entries.
+func enforceConstraints(cfg config, d constraint.Diff) ([]agent.Event, error) {
 	raw, err := os.ReadFile(cfg.constraintsFile)
 	if err != nil {
 		return []agent.Event{{
@@ -635,29 +706,9 @@ func enforceConstraints(cfg config) ([]agent.Event, error) {
 		}}, fmt.Errorf("constraints: parse %s: %w", cfg.constraintsFile, err)
 	}
 
-	repoDir := cfg.workingDir
-	if repoDir == "" {
-		repoDir = "."
-	}
-	d, err := (&gitdiff.Runner{}).Run(context.Background(), cfg.checkBaseRef, repoDir)
-	if err != nil {
-		return []agent.Event{{
-			Kind:    "policy_event",
-			Payload: agent.MakePayload(map[string]string{"check": "constraints", "outcome": "diff_failed", "error": err.Error()}),
-		}}, fmt.Errorf("constraints: %w", err)
-	}
-
-	// Emit a git_diff event ahead of policy evaluation so the
-	// backend can re-evaluate constraints independently (E3.13).
-	// The runner is operating on a customer machine; the backend's
-	// re-evaluation is the auditable source of truth for whether a
-	// stage's output passes policy.
-	diffEvent := makeGitDiffEvent(cfg.checkBaseRef, d)
-
 	violations := constraint.Evaluate(d, c)
 	if len(violations) == 0 {
 		return []agent.Event{
-			diffEvent,
 			{
 				Kind: "policy_event",
 				Payload: agent.MakePayload(map[string]any{
@@ -671,9 +722,8 @@ func enforceConstraints(cfg config) ([]agent.Event, error) {
 
 	// One policy_event per violation keeps the bundle structured —
 	// audit consumers can group / filter by Constraint without
-	// parsing free-text. The git_diff event leads so a single-pass
-	// backend reader can pull the file list before the violations.
-	evs := []agent.Event{diffEvent}
+	// parsing free-text.
+	var evs []agent.Event
 	var summary []string
 	for _, v := range violations {
 		evs = append(evs, agent.Event{

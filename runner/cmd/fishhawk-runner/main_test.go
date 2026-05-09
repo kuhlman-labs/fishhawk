@@ -826,6 +826,37 @@ func TestRun_ConstraintsSkippedOnAgentFailure(t *testing.T) {
 	}
 }
 
+func TestRun_CheckBaseRefAlone_EmitsDiffEventDoesNotDemote(t *testing.T) {
+	// With --check-base-ref set but no --constraints-file, the
+	// runner should still attempt to emit a git_diff event (so the
+	// backend's policy re-evaluation has data) and NOT demote on
+	// diff failure — the customer didn't ask for enforcement, just
+	// for the diff to be in the bundle (#247).
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--check-base-ref", "main",
+		// --constraints-file intentionally absent.
+	}, &stderr)
+	// tempdir isn't a git repo, so the diff fetch will fail. That
+	// emits a `policy_event` with outcome=diff_failed but does NOT
+	// demote the run.
+	if got != exitOK {
+		t.Errorf("run = %d, want exitOK (diff failure shouldn't demote when no constraints-file)", got)
+	}
+	if strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected NO category B; got: %s", stderr.String())
+	}
+}
+
 func TestRun_UploadTrace_HappyPath(t *testing.T) {
 	dir := t.TempDir()
 	promptPath := filepath.Join(dir, "prompt.txt")
