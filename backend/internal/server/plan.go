@@ -13,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
@@ -146,6 +147,12 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// expected-success case shouldn't fail with a unique-constraint
 	// 500.
 	if existing, err := s.cfg.ArtifactRepo.GetByHash(r.Context(), stageID, contentHash); err == nil {
+		// Plan-ready comment-back retry hook (#245). The notify
+		// path may have run from the trace handler before this
+		// plan artifact existed, in which case it skipped silently;
+		// fire here too so the comment lands. Audit-log dedup keeps
+		// the second call a no-op when the first succeeded.
+		s.notifyPlanReadyIfReady(r, runID, stage)
 		s.writeJSON(w, r, http.StatusOK, planResponse{
 			ID:            existing.ID,
 			StageID:       existing.StageID,
@@ -201,6 +208,13 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Plan-ready comment-back hook (#245). Fires here so the
+	// notifier sees the just-landed artifact even when the runner's
+	// trace-then-plan upload order beats the trace-handler's
+	// notifyPlanReady to running. Best-effort + dedup'd via the
+	// audit log; safe to call alongside the trace-handler hook.
+	s.notifyPlanReadyIfReady(r, runID, stage)
+
 	s.writeJSON(w, r, http.StatusCreated, planResponse{
 		ID:            created.ID,
 		StageID:       created.StageID,
@@ -208,6 +222,23 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		SchemaVersion: deref(created.SchemaVersion),
 		Idempotent:    false,
 	})
+}
+
+// notifyPlanReadyIfReady wraps the trace handler's notifyPlanReady
+// with a "stage is terminal" guard for the plan-upload path (#245).
+// The trace handler is reached only after a stage transitions
+// terminally, so the trace-side hook can fire unconditionally; the
+// plan-upload handler can be reached BEFORE the trace upload (a
+// future runner reordering) and shouldn't comment until the stage
+// is actually settled.
+func (s *Server) notifyPlanReadyIfReady(r *http.Request, runID uuid.UUID, stage *run.Stage) {
+	if stage.Type != run.StageTypePlan {
+		return
+	}
+	if !stage.State.IsTerminal() && stage.State != run.StageStateAwaitingApproval {
+		return
+	}
+	s.notifyPlanReady(r, runID, stage)
 }
 
 // planResponse is the JSON returned to the runner on plan upload.
