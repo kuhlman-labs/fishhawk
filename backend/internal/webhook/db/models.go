@@ -53,19 +53,20 @@ type AuditEntry struct {
 }
 
 type Run struct {
-	ID             pgtype.UUID        `json:"id"`
-	Repo           string             `json:"repo"`
-	WorkflowID     string             `json:"workflow_id"`
-	WorkflowSha    string             `json:"workflow_sha"`
-	TriggerSource  string             `json:"trigger_source"`
-	TriggerRef     *string            `json:"trigger_ref"`
-	State          string             `json:"state"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	InstallationID *int64             `json:"installation_id"`
-	IdempotencyKey *string            `json:"idempotency_key"`
-	ParentRunID    pgtype.UUID        `json:"parent_run_id"`
-	PullRequestUrl *string            `json:"pull_request_url"`
+	ID                     pgtype.UUID        `json:"id"`
+	Repo                   string             `json:"repo"`
+	WorkflowID             string             `json:"workflow_id"`
+	WorkflowSha            string             `json:"workflow_sha"`
+	TriggerSource          string             `json:"trigger_source"`
+	TriggerRef             *string            `json:"trigger_ref"`
+	State                  string             `json:"state"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	InstallationID         *int64             `json:"installation_id"`
+	IdempotencyKey         *string            `json:"idempotency_key"`
+	ParentRunID            pgtype.UUID        `json:"parent_run_id"`
+	PullRequestUrl         *string            `json:"pull_request_url"`
+	RequiredChecksSnapshot []byte             `json:"required_checks_snapshot"`
 }
 
 type Session struct {

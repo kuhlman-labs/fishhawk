@@ -37,6 +37,7 @@ Webhook events:
 | `push` | Future: branch-policy + spec-change detection. |
 | `workflow_run` | Observe customer-side runner job state. |
 | `check_run`, `check_suite` | Required-status visibility on review-stage gates. |
+| `branch_protection_rule`, `repository_ruleset` | Acknowledged so a future cache layer can invalidate the per-run protection snapshot (ADR-017 / #251). v0 reads protection on every run-create — no cache to bust today. |
 
 ## Local development
 

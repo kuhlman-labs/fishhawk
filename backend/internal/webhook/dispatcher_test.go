@@ -345,6 +345,47 @@ func TestMatchEvent_WorkflowRun_OtherWorkflowFile_Skips(t *testing.T) {
 	}
 }
 
+func TestMatchEvent_BranchProtectionRule_AcknowledgedAsSkip(t *testing.T) {
+	// #251: the dispatcher recognizes branch_protection_rule events
+	// so the receiver returns 200 with a structured skip-reason
+	// rather than silently routing through the unknown-event path.
+	// v0 reads protection per-run (no cache to bust) so the action
+	// is a no-op; the contract here is "acknowledged".
+	body, _ := json.Marshal(map[string]any{
+		"action":       "edited",
+		"installation": map[string]any{"id": 99},
+		"repository":   map[string]any{"full_name": "x/y"},
+		"sender":       map[string]any{"login": "alice", "type": "User"},
+	})
+	ev, _ := ParseEvent("branch_protection_rule", "deliv-bp1", body)
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("Skip = false, want true")
+	}
+	if !strings.Contains(got.Reason, "branch_protection_rule") ||
+		!strings.Contains(got.Reason, "v0 reads protection per-run") {
+		t.Errorf("Reason = %q (want named-event + per-run hint)", got.Reason)
+	}
+}
+
+func TestMatchEvent_RepositoryRuleset_AcknowledgedAsSkip(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{
+		"action":       "created",
+		"installation": map[string]any{"id": 99},
+		"repository":   map[string]any{"full_name": "x/y"},
+		"sender":       map[string]any{"login": "alice", "type": "User"},
+	})
+	ev, _ := ParseEvent("repository_ruleset", "deliv-rs1", body)
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("Skip = false, want true")
+	}
+	if !strings.Contains(got.Reason, "repository_ruleset") ||
+		!strings.Contains(got.Reason, "v0 reads protection per-run") {
+		t.Errorf("Reason = %q (want named-event + per-run hint)", got.Reason)
+	}
+}
+
 func TestMatchEvent_WorkflowRun_NonDispatchEvent_Skips(t *testing.T) {
 	// A `push`-triggered run of fishhawk.yml (e.g. the customer
 	// committed something that triggered the workflow on their
@@ -388,6 +429,20 @@ type stubGitHub struct {
 		runID int64
 	}
 	workflowRunCalls int
+
+	// branchProtection / branchProtectionErr drive
+	// GetBranchProtection (#251). Default zero-value returns an
+	// empty protection — combine with rulesets to build a
+	// no-protection-anywhere refusal scenario.
+	branchProtection      *githubclient.BranchProtection
+	branchProtectionErr   error
+	branchProtectionCalls int
+	// rulesets / rulesetsErr drive ListRulesetRequiredChecks
+	// (#251). Default zero-value returns an empty list.
+	rulesets       []githubclient.RulesetRequiredCheck
+	rulesetsErr    error
+	rulesetsCalls  int
+	rulesetsBranch string
 }
 
 func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ int64,
@@ -425,6 +480,32 @@ func (s *stubGitHub) GetWorkflowRun(_ context.Context, _ int64,
 	return s.workflowRun, nil
 }
 
+func (s *stubGitHub) GetBranchProtection(_ context.Context, _ int64,
+	_ githubclient.RepoRef, _ string) (*githubclient.BranchProtection, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.branchProtectionCalls++
+	if s.branchProtectionErr != nil {
+		return nil, s.branchProtectionErr
+	}
+	if s.branchProtection != nil {
+		return s.branchProtection, nil
+	}
+	return &githubclient.BranchProtection{}, nil
+}
+
+func (s *stubGitHub) ListRulesetRequiredChecks(_ context.Context, _ int64,
+	_ githubclient.RepoRef, branch string) ([]githubclient.RulesetRequiredCheck, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rulesetsCalls++
+	s.rulesetsBranch = branch
+	if s.rulesetsErr != nil {
+		return nil, s.rulesetsErr
+	}
+	return s.rulesets, nil
+}
+
 // stubRuns is a tiny in-memory run.Repository covering the
 // methods Dispatcher.Handle uses: CreateRun, CreateStage,
 // TransitionStage. Other methods stay "not used" so accidental
@@ -451,16 +532,17 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		return nil, s.createErr
 	}
 	r := &run.Run{
-		ID:            uuid.New(),
-		Repo:          p.Repo,
-		WorkflowID:    p.WorkflowID,
-		WorkflowSHA:   p.WorkflowSHA,
-		TriggerSource: p.TriggerSource,
-		TriggerRef:    p.TriggerRef,
-		ParentRunID:   p.ParentRunID,
-		State:         run.StatePending,
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
+		ID:                     uuid.New(),
+		Repo:                   p.Repo,
+		WorkflowID:             p.WorkflowID,
+		WorkflowSHA:            p.WorkflowSHA,
+		TriggerSource:          p.TriggerSource,
+		TriggerRef:             p.TriggerRef,
+		ParentRunID:            p.ParentRunID,
+		RequiredChecksSnapshot: p.RequiredChecksSnapshot,
+		State:                  run.StatePending,
+		CreatedAt:              time.Now().UTC(),
+		UpdatedAt:              time.Now().UTC(),
 	}
 	s.created = append(s.created, r)
 	return r, nil
@@ -641,6 +723,13 @@ func newDispatcherWithStubs(t *testing.T) (*Dispatcher, *stubGitHub, *stubRuns, 
 	gh := &stubGitHub{
 		specContent: []byte(validSpec),
 		specSHA:     "feedf00d",
+		// Default to a protected branch so the dispatcher doesn't
+		// refuse every test run on the post-#251 protection check.
+		// Tests that exercise the no-protection refusal path zero
+		// this out explicitly.
+		branchProtection: &githubclient.BranchProtection{
+			RequiredStatusCheckContexts: []string{"ci/build"},
+		},
 	}
 	runs := &stubRuns{}
 	au := &stubAudit{}
@@ -1003,6 +1092,150 @@ func TestHandle_DispatchError_AuditsFailureCategory(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("failure log missing %s:\n%s", want, out)
 		}
+	}
+}
+
+func TestHandle_SnapshotsBranchProtection(t *testing.T) {
+	// Happy path: classic protection contributes one context, a
+	// ruleset contributes another. The dispatcher unions them and
+	// snapshots the result onto the run.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.branchProtection = &githubclient.BranchProtection{
+		RequiredStatusCheckContexts: []string{"ci/build"},
+	}
+	gh.rulesets = []githubclient.RulesetRequiredCheck{
+		{RulesetID: 42, Contexts: []string{"audit_complete"}},
+	}
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if gh.branchProtectionCalls != 1 || gh.rulesetsCalls != 1 {
+		t.Errorf("protection calls: branch=%d rulesets=%d, want 1/1",
+			gh.branchProtectionCalls, gh.rulesetsCalls)
+	}
+	if gh.rulesetsBranch != "main" {
+		t.Errorf("rulesets branch = %q, want main", gh.rulesetsBranch)
+	}
+	if len(runs.created) != 1 {
+		t.Fatalf("runs created = %d, want 1", len(runs.created))
+	}
+	snap := runs.created[0].RequiredChecksSnapshot
+	if snap == nil {
+		t.Fatal("RequiredChecksSnapshot nil; want populated")
+	}
+	wantContexts := []string{"ci/build", "audit_complete"}
+	if len(snap.Contexts) != 2 || snap.Contexts[0] != wantContexts[0] || snap.Contexts[1] != wantContexts[1] {
+		t.Errorf("Contexts = %v, want %v", snap.Contexts, wantContexts)
+	}
+	wantSources := []string{"branch_protection", "ruleset:42"}
+	if len(snap.Sources) != 2 || snap.Sources[0] != wantSources[0] || snap.Sources[1] != wantSources[1] {
+		t.Errorf("Sources = %v, want %v", snap.Sources, wantSources)
+	}
+}
+
+func TestHandle_SnapshotDedupsContexts(t *testing.T) {
+	// Same context name from both surfaces: snapshot lists it once
+	// but credits both surfaces in `sources` so audits can see what
+	// contributed.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.branchProtection = &githubclient.BranchProtection{
+		RequiredStatusCheckContexts: []string{"ci/build"},
+	}
+	gh.rulesets = []githubclient.RulesetRequiredCheck{
+		{RulesetID: 7, Contexts: []string{"ci/build"}},
+	}
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	snap := runs.created[0].RequiredChecksSnapshot
+	if snap == nil || len(snap.Contexts) != 1 || snap.Contexts[0] != "ci/build" {
+		t.Errorf("dedup failed; Contexts = %v", snap.Contexts)
+	}
+	if len(snap.Sources) != 2 {
+		t.Errorf("Sources = %v, want both surfaces credited", snap.Sources)
+	}
+}
+
+func TestHandle_NoBranchProtection_RefusesRun(t *testing.T) {
+	// Neither classic protection nor any ruleset contributes a
+	// context: refuse the dispatch (no run, no audit row, but a
+	// WARN log line). v0 won't dispatch into an unprotected branch.
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
+	gh.branchProtection = &githubclient.BranchProtection{}
+	gh.rulesets = nil
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("runs created despite no protection: %d", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("dispatched despite no protection: %d", gh.dispatchCalls)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit row written for refusal (writeProtectionRefusalAudit logs only): %d",
+			len(au.appended))
+	}
+	out := logs.String()
+	for _, want := range []string{
+		`"level":"WARN"`,
+		`"msg":"webhook dispatch refused: branch protection"`,
+		`"repo":"kuhlman-labs/fishhawk"`,
+		`"workflow_id":"feature_change"`,
+		`no branch protection`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("refusal log missing %s:\n%s", want, out)
+		}
+	}
+}
+
+func TestHandle_BranchProtectionForbidden_RefusesWithScopeHint(t *testing.T) {
+	// Existing install hasn't accepted the administration:read
+	// permission bump (#252) — surface as a refusal whose log line
+	// names the operator-side fix precisely.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
+	gh.branchProtectionErr = githubclient.ErrForbidden
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("runs created on forbidden: %d", len(runs.created))
+	}
+	if !strings.Contains(logs.String(), "administration:read") {
+		t.Errorf("refusal log missing scope-name hint:\n%s", logs.String())
+	}
+}
+
+func TestHandle_BranchProtectionNotFound_FallsThroughToRulesets(t *testing.T) {
+	// 404 from classic protection isn't an error — the branch may
+	// be governed only by a ruleset. Treat as "no classic context"
+	// and continue.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.branchProtection = nil
+	gh.branchProtectionErr = githubclient.ErrNotFound
+	gh.rulesets = []githubclient.RulesetRequiredCheck{
+		{RulesetID: 1, Contexts: []string{"e2e"}},
+	}
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Fatalf("runs created = %d, want 1", len(runs.created))
+	}
+	snap := runs.created[0].RequiredChecksSnapshot
+	if snap == nil || len(snap.Contexts) != 1 || snap.Contexts[0] != "e2e" {
+		t.Errorf("Contexts = %v, want [e2e]", snap)
+	}
+	if len(snap.Sources) != 1 || snap.Sources[0] != "ruleset:1" {
+		t.Errorf("Sources = %v, want [ruleset:1]", snap.Sources)
 	}
 }
 

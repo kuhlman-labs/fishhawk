@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,15 @@ type fakeGitHub struct {
 	getWorkflowRunStatus int
 	getWorkflowRunBody   string
 
+	getBranchProtectionStatus int
+	getBranchProtectionBody   string
+
+	listRulesetsStatus int
+	listRulesetsBody   string
+
+	getRulesetStatus int
+	getRulesetBody   map[int64]string
+
 	gotAuth        string
 	gotPath        string
 	gotQuery       string
@@ -69,15 +79,21 @@ type fakeGitHub struct {
 func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 	t.Helper()
 	fg := &fakeGitHub{
-		getFileStatus:            http.StatusOK,
-		dispatchStatus:           http.StatusNoContent,
-		getIssueStatus:           http.StatusOK,
-		createCheckRunStatus:     http.StatusCreated,
-		createCheckRunBody:       `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
-		createIssueCommentStatus: http.StatusCreated,
-		createIssueCommentBody:   `{"id":11111}`,
-		getWorkflowRunStatus:     http.StatusOK,
-		getWorkflowRunBody:       `{"id":987654321,"html_url":"https://github.com/x/y/actions/runs/987654321","conclusion":"failure","status":"completed","event":"workflow_dispatch","head_branch":"main","head_sha":"abc","inputs":{"stage_id":"22222222-2222-2222-2222-222222222222","run_id":"11111111-1111-1111-1111-111111111111"}}`,
+		getFileStatus:             http.StatusOK,
+		dispatchStatus:            http.StatusNoContent,
+		getIssueStatus:            http.StatusOK,
+		createCheckRunStatus:      http.StatusCreated,
+		createCheckRunBody:        `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
+		createIssueCommentStatus:  http.StatusCreated,
+		createIssueCommentBody:    `{"id":11111}`,
+		getWorkflowRunStatus:      http.StatusOK,
+		getWorkflowRunBody:        `{"id":987654321,"html_url":"https://github.com/x/y/actions/runs/987654321","conclusion":"failure","status":"completed","event":"workflow_dispatch","head_branch":"main","head_sha":"abc","inputs":{"stage_id":"22222222-2222-2222-2222-222222222222","run_id":"11111111-1111-1111-1111-111111111111"}}`,
+		getBranchProtectionStatus: http.StatusOK,
+		getBranchProtectionBody:   `{"required_status_checks":{"contexts":["ci/build","lint"]}}`,
+		listRulesetsStatus:        http.StatusOK,
+		listRulesetsBody:          `[]`,
+		getRulesetStatus:          http.StatusOK,
+		getRulesetBody:            map[int64]string{},
 	}
 	mux := http.NewServeMux()
 
@@ -149,6 +165,40 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			if fg.getWorkflowRunBody != "" {
 				_, _ = io.WriteString(w, fg.getWorkflowRunBody)
 			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/branches/{branch}/protection",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.getBranchProtectionStatus)
+			if fg.getBranchProtectionBody != "" {
+				_, _ = io.WriteString(w, fg.getBranchProtectionBody)
+			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.listRulesetsStatus)
+			if fg.listRulesetsBody != "" {
+				_, _ = io.WriteString(w, fg.listRulesetsBody)
+			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets/{id}",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+			body, ok := fg.getRulesetBody[id]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(fg.getRulesetStatus)
+			_, _ = io.WriteString(w, body)
 		})
 
 	srv := httptest.NewServer(mux)
@@ -858,4 +908,241 @@ func TestGetWorkflowRun_ValidationErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetBranchProtection_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getBranchProtectionBody = `{"required_status_checks":{"contexts":["ci/build","lint"],"checks":[{"context":"ci/build","app_id":1}]}}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.GetBranchProtection(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err != nil {
+		t.Fatalf("GetBranchProtection: %v", err)
+	}
+	wantContexts := []string{"ci/build", "lint"}
+	if !slicesEq(got.RequiredStatusCheckContexts, wantContexts) {
+		t.Errorf("contexts = %v, want %v", got.RequiredStatusCheckContexts, wantContexts)
+	}
+
+	if !strings.Contains(fg.gotPath, "/branches/main/protection") {
+		t.Errorf("path = %q", fg.gotPath)
+	}
+	if fg.gotMethod != http.MethodGet {
+		t.Errorf("method = %q", fg.gotMethod)
+	}
+	if fg.gotAuth != "Bearer ghs_canned_token" {
+		t.Errorf("Authorization = %q", fg.gotAuth)
+	}
+}
+
+func TestGetBranchProtection_EmptyContexts(t *testing.T) {
+	// A branch with protection but no required_status_checks rule
+	// returns 200 with the field absent / nil. The dispatcher should
+	// fall through to rulesets, so the contract here is "empty
+	// slice, no error" — distinct from "ErrNotFound, branch has no
+	// protection at all".
+	fg, srv := newFakeGitHub(t)
+	fg.getBranchProtectionBody = `{}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.GetBranchProtection(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err != nil {
+		t.Fatalf("GetBranchProtection: %v", err)
+	}
+	if len(got.RequiredStatusCheckContexts) != 0 {
+		t.Errorf("contexts = %v, want empty", got.RequiredStatusCheckContexts)
+	}
+}
+
+func TestGetBranchProtection_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getBranchProtectionStatus = http.StatusNotFound
+	fg.getBranchProtectionBody = `{"message":"Branch not protected"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetBranchProtection(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetBranchProtection_Forbidden(t *testing.T) {
+	// Missing administration:read scope (existing install pre-#252)
+	// surfaces as 403. Maps to ErrForbidden so the dispatcher can
+	// distinguish "no protection" (ErrNotFound, fall through) from
+	// "missing scope" (ErrForbidden, refuse with a clear audit).
+	fg, srv := newFakeGitHub(t)
+	fg.getBranchProtectionStatus = http.StatusForbidden
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetBranchProtection(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestGetBranchProtection_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		branch    string
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, "main", "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, "main", "owner and name"},
+		{"empty branch", RepoRef{Owner: "x", Name: "y"}, "", "branch is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.GetBranchProtection(context.Background(), 1, tc.repo, tc.branch)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestListRulesetRequiredChecks_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listRulesetsBody = `[
+		{"id":1,"target":"branch","enforcement":"active"},
+		{"id":2,"target":"tag","enforcement":"active"},
+		{"id":3,"target":"branch","enforcement":"disabled"},
+		{"id":4,"target":"branch","enforcement":"active"}
+	]`
+	fg.getRulesetBody = map[int64]string{
+		1: `{"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"audit_complete"}]}}]}`,
+		// 2 (tag) is filtered before fetch.
+		// 3 (disabled) is filtered before fetch.
+		4: `{"conditions":{"ref_name":{"include":["refs/heads/main","refs/heads/release/*"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"e2e"}]}},{"type":"deletion","parameters":null}]}`,
+	}
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListRulesetRequiredChecks(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err != nil {
+		t.Fatalf("ListRulesetRequiredChecks: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d (rulesets included), want 2: %+v", len(got), got)
+	}
+	if got[0].RulesetID != 1 || !slicesEq(got[0].Contexts, []string{"audit_complete"}) {
+		t.Errorf("ruleset[0] = %+v", got[0])
+	}
+	if got[1].RulesetID != 4 || !slicesEq(got[1].Contexts, []string{"e2e"}) {
+		t.Errorf("ruleset[1] = %+v", got[1])
+	}
+}
+
+func TestListRulesetRequiredChecks_NoneApply(t *testing.T) {
+	// Repo has rulesets but none target the branch / require status
+	// checks. Expect (nil, nil) — dispatcher then falls through to
+	// classic protection alone.
+	fg, srv := newFakeGitHub(t)
+	fg.listRulesetsBody = `[{"id":7,"target":"branch","enforcement":"active"}]`
+	fg.getRulesetBody = map[int64]string{
+		7: `{"conditions":{"ref_name":{"include":["refs/heads/release/*"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"e2e"}]}}]}`,
+	}
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListRulesetRequiredChecks(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err != nil {
+		t.Fatalf("ListRulesetRequiredChecks: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %+v, want empty", got)
+	}
+}
+
+func TestListRulesetRequiredChecks_NoRulesets(t *testing.T) {
+	// Repo with no rulesets at all — list returns []. Result is
+	// nil, nil; rulesets aren't an error condition.
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListRulesetRequiredChecks(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err != nil {
+		t.Fatalf("ListRulesetRequiredChecks: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %+v, want empty", got)
+	}
+}
+
+func TestListRulesetRequiredChecks_Forbidden(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listRulesetsStatus = http.StatusForbidden
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.ListRulesetRequiredChecks(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestRulesetMatchesBranch(t *testing.T) {
+	cases := []struct {
+		name    string
+		include []string
+		exclude []string
+		branch  string
+		want    bool
+	}{
+		{"nil conditions matches all", nil, nil, "main", true},
+		{"~ALL include", []string{"~ALL"}, nil, "main", true},
+		{"~DEFAULT_BRANCH on main", []string{"~DEFAULT_BRANCH"}, nil, "main", true},
+		{"~DEFAULT_BRANCH on develop", []string{"~DEFAULT_BRANCH"}, nil, "develop", false},
+		{"refs/heads/<branch>", []string{"refs/heads/main"}, nil, "main", true},
+		{"plain branch name", []string{"main"}, nil, "main", true},
+		{"non-matching include", []string{"refs/heads/release/*"}, nil, "main", false},
+		{"empty include treated as all", []string{}, nil, "main", true},
+		{"exclude wins over include", []string{"~ALL"}, []string{"refs/heads/main"}, "main", false},
+	}
+	type cond struct {
+		RefName *struct {
+			Include []string `json:"include"`
+			Exclude []string `json:"exclude"`
+		} `json:"ref_name"`
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c *cond
+			if tc.include != nil || tc.exclude != nil {
+				c = &cond{RefName: &struct {
+					Include []string `json:"include"`
+					Exclude []string `json:"exclude"`
+				}{Include: tc.include, Exclude: tc.exclude}}
+			}
+			got := rulesetMatchesBranch((*struct {
+				RefName *struct {
+					Include []string `json:"include"`
+					Exclude []string `json:"exclude"`
+				} `json:"ref_name"`
+			})(c), tc.branch)
+			if got != tc.want {
+				t.Errorf("rulesetMatchesBranch(%v, %q) = %v, want %v",
+					tc, tc.branch, got, tc.want)
+			}
+		})
+	}
+}
+
+func slicesEq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

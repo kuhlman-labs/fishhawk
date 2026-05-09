@@ -202,23 +202,32 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0016 added the
-	// runs.parent_run_id and runs.pull_request_url columns (#216).
-	// Down drops them. Confirm: those columns are gone, but every
-	// prior migration's effect is still present (stage_checks table
-	// from 0015, stages.gate_type from 0014, stages.requires_approval
-	// from 0013, signing_keys.id from 0012, runs.idempotency_key
-	// from 0011, users + sessions from 0010, audit run_id nullability
-	// from 0009, etc.).
-	var parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0017 added
+	// runs.required_checks_snapshot (#251); down drops it.
+	// Confirm: that column is gone, but every prior migration's
+	// effect is still present (parent_run_id + pull_request_url from
+	// 0016, stage_checks table from 0015, stages.gate_type from
+	// 0014, stages.requires_approval from 0013, signing_keys.id
+	// from 0012, runs.idempotency_key from 0011, users + sessions
+	// from 0010, audit run_id nullability from 0009, etc.).
+	var requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'required_checks_snapshot'`,
+	).Scan(&requiredChecksCol); err != nil {
+		t.Fatalf("query runs.required_checks_snapshot column: %v", err)
+	}
+	if requiredChecksCol != 0 {
+		t.Errorf("runs.required_checks_snapshot count after MigrateDown = %d, want 0 (0017 rolled back)", requiredChecksCol)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'runs' AND column_name = 'parent_run_id'`,
 	).Scan(&parentRunIDCol); err != nil {
 		t.Fatalf("query runs.parent_run_id column: %v", err)
 	}
-	if parentRunIDCol != 0 {
-		t.Errorf("runs.parent_run_id count after MigrateDown = %d, want 0 (0016 rolled back)", parentRunIDCol)
+	if parentRunIDCol != 1 {
+		t.Errorf("runs.parent_run_id count after MigrateDown = %d, want 1 (0016 still applied)", parentRunIDCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -226,8 +235,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&pullRequestURLCol); err != nil {
 		t.Fatalf("query runs.pull_request_url column: %v", err)
 	}
-	if pullRequestURLCol != 0 {
-		t.Errorf("runs.pull_request_url count after MigrateDown = %d, want 0 (0016 rolled back)", pullRequestURLCol)
+	if pullRequestURLCol != 1 {
+		t.Errorf("runs.pull_request_url count after MigrateDown = %d, want 1 (0016 still applied)", pullRequestURLCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables

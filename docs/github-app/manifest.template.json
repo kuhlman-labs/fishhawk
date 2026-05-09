@@ -31,6 +31,8 @@
     "push",
     "workflow_run",
     "check_run",
-    "check_suite"
+    "check_suite",
+    "branch_protection_rule",
+    "repository_ruleset"
   ]
 }

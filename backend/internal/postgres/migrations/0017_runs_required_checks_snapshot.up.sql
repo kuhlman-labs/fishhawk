@@ -1,0 +1,35 @@
+-- 0017: snapshot the required-status-checks list onto the run row
+-- at run-create time (#251 / ADR-017).
+--
+-- ADR-017 (#249) decides that GitHub branch protection (and rulesets)
+-- is the source of truth for the required-CI-checks list. The
+-- dispatcher reads `required_status_checks.contexts` from the
+-- protection API at run-create time and snapshots it here, so the
+-- approval flow + the SPA can both read a stable list per run
+-- regardless of whether protection is later edited mid-flight.
+--
+-- Shape:
+--   {
+--     "contexts": ["ci/build", "lint"],
+--     "sources":  ["branch_protection", "ruleset:42"]
+--   }
+--
+-- - contexts: the union of context names across classic protection
+--   and any required-status-check rulesets that target the run's
+--   ref. Order is the union order, dedup'd; tests pin it.
+-- - sources: which surfaces contributed (one or both of
+--   `branch_protection`, `ruleset:<id>`) — surfaced in the audit
+--   log so a missing-context investigation can tell which surface
+--   was responsible.
+--
+-- Nullable by design: runs created before this migration leave it
+-- NULL; the v0 dispatcher refuses to create new runs against a
+-- branch with no protection (see #251 acceptance), so post-migration
+-- rows are non-NULL in practice. CLI / UI run-create paths
+-- (POST /v0/runs) skip protection lookup in v0 and leave the column
+-- NULL — those flows are demo-only and don't gate on CI.
+--
+-- No index: lookup is always by run_id, which is already the PK.
+
+ALTER TABLE runs
+    ADD COLUMN required_checks_snapshot JSONB;

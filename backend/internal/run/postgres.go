@@ -41,17 +41,28 @@ func NewPostgresRepository(pool *pgxpool.Pool) Repository {
 
 func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, error) {
 	q := rundb.New(r.pool)
+
+	var snapshotBytes []byte
+	if p.RequiredChecksSnapshot != nil {
+		b, err := json.Marshal(p.RequiredChecksSnapshot)
+		if err != nil {
+			return nil, fmt.Errorf("marshal required_checks_snapshot: %w", err)
+		}
+		snapshotBytes = b
+	}
+
 	row, err := q.CreateRun(ctx, rundb.CreateRunParams{
-		ID:             uuid.New(),
-		Repo:           p.Repo,
-		WorkflowID:     p.WorkflowID,
-		WorkflowSha:    p.WorkflowSHA,
-		TriggerSource:  string(p.TriggerSource),
-		TriggerRef:     p.TriggerRef,
-		State:          string(StatePending),
-		InstallationID: p.InstallationID,
-		IdempotencyKey: p.IdempotencyKey,
-		ParentRunID:    p.ParentRunID,
+		ID:                     uuid.New(),
+		Repo:                   p.Repo,
+		WorkflowID:             p.WorkflowID,
+		WorkflowSha:            p.WorkflowSHA,
+		TriggerSource:          string(p.TriggerSource),
+		TriggerRef:             p.TriggerRef,
+		State:                  string(StatePending),
+		InstallationID:         p.InstallationID,
+		IdempotencyKey:         p.IdempotencyKey,
+		ParentRunID:            p.ParentRunID,
+		RequiredChecksSnapshot: snapshotBytes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -369,7 +380,7 @@ func (r *postgresRepo) RetryStage(ctx context.Context, id uuid.UUID, to StageSta
 // --- Conversions between DB and domain types ---
 
 func rowToRun(r rundb.Run) *Run {
-	return &Run{
+	out := &Run{
 		ID:             r.ID,
 		Repo:           r.Repo,
 		WorkflowID:     r.WorkflowID,
@@ -384,6 +395,20 @@ func rowToRun(r rundb.Run) *Run {
 		CreatedAt:      r.CreatedAt.Time,
 		UpdatedAt:      r.UpdatedAt.Time,
 	}
+	// JSONB → struct. Empty bytes means the column is NULL — the
+	// run pre-dates the snapshot wiring or skipped protection
+	// lookup (CLI / UI path). We tolerate a malformed payload by
+	// dropping the field rather than failing the read; the postgres
+	// adapter is on the request hot path and a corrupt snapshot
+	// shouldn't 500 every run-detail page. The audit log is the
+	// source of truth on what was captured at run-create.
+	if len(r.RequiredChecksSnapshot) > 0 {
+		var snap RequiredChecksSnapshot
+		if err := json.Unmarshal(r.RequiredChecksSnapshot, &snap); err == nil {
+			out.RequiredChecksSnapshot = &snap
+		}
+	}
+	return out
 }
 
 func rowToStage(s rundb.Stage) *Stage {

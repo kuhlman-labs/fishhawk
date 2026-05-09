@@ -238,6 +238,276 @@ func (c *Client) GetIssue(ctx context.Context, installationID int64, repo RepoRe
 	}, nil
 }
 
+// BranchProtection is the slice of a branch-protection API response
+// Fishhawk surfaces for the required-checks snapshot (#251 /
+// ADR-017). Only RequiredStatusCheckContexts is consumed today;
+// other fields land alongside as features need them.
+type BranchProtection struct {
+	// RequiredStatusCheckContexts is the closed list of context
+	// names a PR must report green before GitHub allows merge.
+	// Empty (nil or zero-length) means classic protection has no
+	// required-status-checks rule for the branch — rulesets may
+	// still contribute. The dispatcher derives the union per
+	// ADR-017.
+	RequiredStatusCheckContexts []string
+}
+
+// GetBranchProtection fetches classic branch protection for a
+// branch.
+//
+//	GET /repos/{owner}/{repo}/branches/{branch}/protection
+//
+// Returns ErrNotFound when the branch has no protection configured
+// (GitHub returns 404 for that case, not an empty document). The
+// dispatcher treats ErrNotFound on this call as "no classic
+// protection" and falls through to the rulesets check rather than
+// surfacing the error — protection-via-ruleset-only is a normal
+// shape on GitHub repos that have migrated.
+//
+// Requires the App to hold `administration: read` (#252 / ADR-017).
+func (c *Client) GetBranchProtection(ctx context.Context, installationID int64, repo RepoRef, branch string) (*BranchProtection, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if branch == "" {
+		return nil, errors.New("githubclient: branch is required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/branches/" + url.PathEscape(branch) +
+		"/protection")
+
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: get branch protection: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("get branch protection", resp); err != nil {
+		return nil, err
+	}
+
+	// GitHub's response shape: required_status_checks is an object
+	// with `contexts` (string[]) and `checks` (object[]). v0 reads
+	// only `contexts` — `checks` is the newer per-check-with-app-id
+	// shape that's a superset of `contexts` for our purposes (every
+	// check contributes its `context` to the contexts list).
+	var body struct {
+		RequiredStatusChecks *struct {
+			Contexts []string `json:"contexts"`
+		} `json:"required_status_checks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode branch protection: %w", err)
+	}
+	out := &BranchProtection{}
+	if body.RequiredStatusChecks != nil {
+		out.RequiredStatusCheckContexts = body.RequiredStatusChecks.Contexts
+	}
+	return out, nil
+}
+
+// RulesetRequiredCheck is one required-status-check context
+// contributed by a ruleset that targets the branch (#251).
+type RulesetRequiredCheck struct {
+	// RulesetID is the GitHub-side ruleset identifier — surfaced so
+	// the snapshot's `sources` field can record exactly which
+	// ruleset contributed.
+	RulesetID int64
+	// Contexts is the deduped list of context names the ruleset
+	// requires. May be empty when the ruleset doesn't include a
+	// `required_status_checks` rule.
+	Contexts []string
+}
+
+// ListRulesetRequiredChecks walks the repo-level rulesets that
+// target the given branch and returns their required-status-check
+// contexts. Two-step: list rulesets, then fetch each by ID for the
+// rule body — the list endpoint omits `parameters`.
+//
+//	GET /repos/{owner}/{repo}/rulesets
+//	GET /repos/{owner}/{repo}/rulesets/{id}
+//
+// Filters to rulesets whose target is "branch" (org-level rulesets
+// that target a different repo flow through the org endpoint, out of
+// scope for v0) and whose enforcement is "active". Disabled and
+// "evaluate-only" rulesets are skipped — they wouldn't block a
+// merge in production and shouldn't shape Fishhawk's snapshot.
+//
+// Returns nil + nil when the repo has no matching rulesets.
+//
+// Requires the App to hold `administration: read` (#252 / ADR-017).
+func (c *Client) ListRulesetRequiredChecks(ctx context.Context, installationID int64, repo RepoRef, branch string) ([]RulesetRequiredCheck, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if branch == "" {
+		return nil, errors.New("githubclient: branch is required")
+	}
+
+	listEndpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/rulesets?includes_parents=true")
+
+	listReq, err := c.buildRequest(ctx, http.MethodGet, listEndpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	listResp, err := c.HTTP.Do(listReq)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: list rulesets: %w", err)
+	}
+	defer func() { _ = listResp.Body.Close() }()
+
+	if err := classifyStatus("list rulesets", listResp); err != nil {
+		return nil, err
+	}
+
+	var summaries []struct {
+		ID          int64  `json:"id"`
+		Target      string `json:"target"`
+		Enforcement string `json:"enforcement"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&summaries); err != nil {
+		return nil, fmt.Errorf("githubclient: decode rulesets list: %w", err)
+	}
+
+	var out []RulesetRequiredCheck
+	for _, s := range summaries {
+		if s.Target != "branch" || s.Enforcement != "active" {
+			continue
+		}
+		contexts, err := c.fetchRulesetContexts(ctx, installationID, repo, s.ID, branch)
+		if err != nil {
+			return nil, err
+		}
+		if len(contexts) == 0 {
+			continue
+		}
+		out = append(out, RulesetRequiredCheck{RulesetID: s.ID, Contexts: contexts})
+	}
+	return out, nil
+}
+
+// fetchRulesetContexts pulls a single ruleset and returns the
+// `required_status_checks` rule's contexts when it applies to
+// `branch`. Returns an empty slice when the ruleset doesn't have a
+// matching rule or excludes the branch.
+//
+// v0 doesn't try to evaluate the full conditions DSL — it only
+// honors the common case (`include` containing `~ALL`, `~DEFAULT_BRANCH`,
+// or the literal branch name; `exclude` ignored). Rulesets with
+// complex match expressions land empty-handed; the operator's
+// fallback is to add a classic-protection row, which v0 does read.
+func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64, repo RepoRef, rulesetID int64, branch string) ([]string, error) {
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/rulesets/" + url.PathEscape(fmt.Sprintf("%d", rulesetID)))
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: get ruleset: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("get ruleset", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		Conditions *struct {
+			RefName *struct {
+				Include []string `json:"include"`
+				Exclude []string `json:"exclude"`
+			} `json:"ref_name"`
+		} `json:"conditions"`
+		Rules []struct {
+			Type       string `json:"type"`
+			Parameters *struct {
+				RequiredStatusChecks []struct {
+					Context string `json:"context"`
+				} `json:"required_status_checks"`
+			} `json:"parameters"`
+		} `json:"rules"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode ruleset: %w", err)
+	}
+
+	if !rulesetMatchesBranch(body.Conditions, branch) {
+		return nil, nil
+	}
+
+	var contexts []string
+	for _, r := range body.Rules {
+		if r.Type != "required_status_checks" || r.Parameters == nil {
+			continue
+		}
+		for _, c := range r.Parameters.RequiredStatusChecks {
+			if c.Context == "" {
+				continue
+			}
+			contexts = append(contexts, c.Context)
+		}
+	}
+	return contexts, nil
+}
+
+// rulesetMatchesBranch is the v0 condition matcher: honors `~ALL`,
+// `~DEFAULT_BRANCH` (only when branch is "main"; we don't have a
+// way to know the configured default here, and this is the v0
+// approximation), and exact branch-name matches against the
+// `refs/heads/<branch>` form GitHub returns. Rulesets with a
+// nil Conditions block are treated as "matches everything" —
+// GitHub's UI maps "no condition" to that.
+func rulesetMatchesBranch(conditions *struct {
+	RefName *struct {
+		Include []string `json:"include"`
+		Exclude []string `json:"exclude"`
+	} `json:"ref_name"`
+}, branch string) bool {
+	if conditions == nil || conditions.RefName == nil {
+		return true
+	}
+	full := "refs/heads/" + branch
+	for _, ex := range conditions.RefName.Exclude {
+		if ex == full || ex == branch || ex == "~ALL" {
+			return false
+		}
+	}
+	if len(conditions.RefName.Include) == 0 {
+		return true
+	}
+	for _, in := range conditions.RefName.Include {
+		switch in {
+		case "~ALL":
+			return true
+		case "~DEFAULT_BRANCH":
+			if branch == "main" {
+				return true
+			}
+		case full, branch:
+			return true
+		}
+	}
+	return false
+}
+
 // TeamMember is the slice of a team-membership API response we
 // surface for role resolution. Login is the canonical handle used
 // in audits and approvers comparisons; ID is preserved so future

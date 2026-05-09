@@ -175,9 +175,38 @@ type Run struct {
 	// the implement stage yet, and for follow-up runs before their
 	// own implement stage lands.
 	PullRequestURL *string
-	State          State
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// RequiredChecksSnapshot is the union of required-status-check
+	// context names across classic branch protection and any
+	// applicable rulesets at run-create time (#251 / ADR-017). The
+	// approval flow + the SPA read this to know which contexts must
+	// pass before the PR can merge — protection edits during the
+	// run don't shift the goalposts. Nil for runs created before
+	// the snapshot was wired (legacy rows) and for CLI / UI
+	// run-create paths that skip protection lookup.
+	RequiredChecksSnapshot *RequiredChecksSnapshot
+	State                  State
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+// RequiredChecksSnapshot captures the required-status-checks list
+// derived from the GitHub branch protection + rulesets APIs at
+// run-create time. Persisted to runs.required_checks_snapshot per
+// migration 0017 (#251). The shape is intentionally narrow — v0
+// only reads `required_status_checks.contexts` and the surfaces
+// that contributed; future fields land alongside without a schema
+// migration.
+type RequiredChecksSnapshot struct {
+	// Contexts is the deduped union of context names across each
+	// surface in Sources. Order is the order discovered (classic
+	// protection first, then rulesets in the order GitHub returned
+	// them) — stable so audit-log diffs are meaningful.
+	Contexts []string `json:"contexts"`
+	// Sources records which surfaces contributed contexts to the
+	// union. Each entry is one of `branch_protection` or
+	// `ruleset:<id>`. Empty when the run was created before the
+	// snapshot was wired; never nil on a fresh dispatcher run.
+	Sources []string `json:"sources"`
 }
 
 // Stage is one ordered unit of work within a run.
