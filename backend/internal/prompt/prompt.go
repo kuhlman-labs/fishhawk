@@ -58,8 +58,18 @@ type Trigger struct {
 	// for non-issue triggers.
 	IssueTitle string
 	// IssueBody is the issue body at trigger time. May be empty
-	// even for issue triggers (issue created with no body).
+	// even for issue triggers (issue created with no body). Only
+	// the plan-stage prompt renders the body verbatim; the
+	// implement stage links to the issue and lets the agent fetch
+	// (#244).
 	IssueBody string
+	// IssueURL is the canonical github.com URL for the triggering
+	// issue. Set by the server-side prompt handler from
+	// repo + IssueNumber. Used by the implement-stage prompt's
+	// link-only rendering (#244) so the agent can fetch fresh
+	// content via its GitHub tooling rather than reasoning from
+	// the snapshot taken at plan-stage trigger time.
+	IssueURL string
 	// Repo is the "owner/name" the run is operating on, surfaced in
 	// the prompt so the agent's reasoning can reference it.
 	Repo string
@@ -113,18 +123,24 @@ func buildImplement(t Trigger) string {
 	// `plan_missing_for_implement` audit entry on the handler side.
 	if t.ApprovedPlan != nil {
 		writeApprovedPlan(&b, t.ApprovedPlan)
-		b.WriteString("Originating issue (background context only):\n\n")
-		writeIssueContext(&b, t)
+		b.WriteString("Originating issue (link only — fetch if you need detail):\n\n")
+		writeIssueLink(&b, t)
 
-		b.WriteString("Your task: implement the approved plan above. The plan is the binding instruction; the issue is included for grounding when the plan is ambiguous. Make the smallest set of changes that satisfies the plan.\n")
+		b.WriteString("Your task: implement the approved plan above. The plan is the binding instruction; the issue is linked for grounding when the plan is ambiguous — fetch it via your GitHub tooling if you need the body. Make the smallest set of changes that satisfies the plan.\n")
 		b.WriteString("\n")
 		b.WriteString("If you discover the plan is wrong or infeasible — a file it names doesn't exist, an approach step is incompatible with the current code, the verification can't be implemented as specified — stop and surface that in your final response rather than diverging silently. The right path in that case is a follow-up run that re-plans, not an off-plan implementation.\n")
 		b.WriteString("\n")
 		b.WriteString("If the repository has materially changed since the plan was approved (files in the plan's scope have been heavily refactored, an approach step references code that no longer exists), surface that and pause.\n")
 		b.WriteString("\n")
 	} else {
-		writeIssueContext(&b, t)
-		b.WriteString("Your task: implement the change described above. Make the smallest set of changes that satisfies the issue.\n")
+		// No approved plan (race / non-issue-triggered run / missing
+		// plan-stage). Falls back to "implement against the issue"
+		// — but still link rather than copy the body, so the agent
+		// reasons against current data rather than the snapshot
+		// captured at plan-stage trigger time. The agent fetches
+		// the body via its GitHub tooling.
+		writeIssueLink(&b, t)
+		b.WriteString("Your task: implement the change described in the issue above. Fetch the issue body via your GitHub tooling — the URL resolves with the run's installation token. Make the smallest set of changes that satisfies the issue.\n")
 		b.WriteString("\n")
 	}
 
@@ -233,10 +249,54 @@ func writeApprovedPlan(b *strings.Builder, p *plan.Plan) {
 	}
 }
 
+// writeIssueLink renders the issue's number, title, and URL — but
+// not its body (#244). Used by the implement-stage prompt where
+// the plan is the binding instruction and the issue is reference
+// material the agent should fetch on demand if it needs detail.
+//
+// The URL gives the agent a stable handle to the issue's *current*
+// state via GitHub's API; the body in Trigger.IssueBody is a
+// snapshot from plan-stage trigger time and may be stale by the
+// time the implement stage runs. Linking rather than copying also
+// keeps the implement-stage prompt smaller — meaningful when the
+// plan artifact is the load-bearing instruction.
+//
+// Empty IssueNumber produces "(no issue context provided)" — same
+// fallback as writeIssueContext for non-issue-triggered runs.
+func writeIssueLink(b *strings.Builder, t Trigger) {
+	if t.IssueNumber == 0 && t.IssueTitle == "" && t.IssueURL == "" {
+		b.WriteString("(no issue context provided)\n\n")
+		return
+	}
+	if t.IssueNumber > 0 {
+		fmt.Fprintf(b, "Triggering issue: #%d", t.IssueNumber)
+		if t.IssueTitle != "" {
+			b.WriteString(" · ")
+			b.WriteString(t.IssueTitle)
+		}
+		b.WriteString("\n")
+	} else if t.IssueTitle != "" {
+		b.WriteString("Title: ")
+		b.WriteString(t.IssueTitle)
+		b.WriteString("\n")
+	}
+	if t.IssueURL != "" {
+		b.WriteString("URL: ")
+		b.WriteString(t.IssueURL)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+}
+
 // writeIssueContext renders the issue title and body into the
 // prompt. Empty title/body produces "(no issue context provided)";
 // the agent then has to ask clarifying questions, which is the
 // right behavior for v0 (better than fabricating intent).
+//
+// Used by the plan-stage prompt where the agent reads the issue
+// directly to construct a plan. The implement stage uses
+// writeIssueLink instead — the plan is the binding instruction
+// there and the issue body is redundant (#244).
 func writeIssueContext(b *strings.Builder, t Trigger) {
 	if t.IssueNumber == 0 && t.IssueTitle == "" && t.IssueBody == "" {
 		b.WriteString("(no issue context provided)\n\n")
