@@ -294,12 +294,18 @@ func TestImplementPrompt_LeadsWithApprovedPlan(t *testing.T) {
 		"1. Define Foo on the bar.Service interface.",
 		"binding instruction",
 		"diverging silently",
-		"Originating issue (background context only):",
-		"Add foo",
+		// Implement-stage prompt links the issue (#244): the body
+		// is dropped and the agent is told to fetch.
+		"Originating issue (link only — fetch if you need detail):",
+		"Triggering issue: #42 · Add foo",
+		"https://github.com/kuhlman-labs/example/issues/42",
 	} {
 		if !strings.Contains(resp.Prompt, want) {
 			t.Errorf("prompt missing %q\n---\n%s", want, resp.Prompt)
 		}
+	}
+	if strings.Contains(resp.Prompt, "We need a foo helper.") {
+		t.Errorf("implement prompt should not include the issue body verbatim:\n%s", resp.Prompt)
 	}
 	// No plan_missing_for_implement entry — the plan was found.
 	for _, e := range au.appended {

@@ -395,10 +395,15 @@ func (s *Server) emitPlanMissingForImplement(ctx context.Context, runID, stageID
 	}
 }
 
-// fillIssueContext populates the trigger's IssueTitle and IssueBody
-// by fetching from GitHub. Best-effort: failure to fetch logs and
-// returns silently — the prompt will fall back to "no issue
-// context provided" which the agent can handle.
+// fillIssueContext populates the trigger's IssueTitle, IssueBody,
+// and IssueURL by fetching from GitHub. Best-effort: failure to
+// fetch logs and returns silently — the prompt will fall back to
+// "no issue context provided" which the agent can handle.
+//
+// IssueURL is derived from `repo + IssueNumber` rather than the
+// API response's html_url — the canonical github.com URL is fully
+// determined by those two fields, and avoiding the response
+// dependency means the field is set even on a partial fetch.
 func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRow *run.Run, issueNumber int, trigger *prompt.Trigger) {
 	if runRow.InstallationID == nil {
 		return
@@ -412,6 +417,11 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 		)
 		return
 	}
+	// Set the URL up front so the link-only renderer in the
+	// implement prompt has a fallback even when the API call below
+	// fails (App permission flap, issue temporarily inaccessible).
+	trigger.IssueURL = fmt.Sprintf("https://github.com/%s/%s/issues/%d",
+		repo.Owner, repo.Name, issueNumber)
 	issue, err := github.GetIssue(ctx, *runRow.InstallationID, repo, issueNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: get issue failed",

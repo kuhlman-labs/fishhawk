@@ -208,11 +208,21 @@ func TestGetStagePrompt_HappyPath_ImplementWithIssue(t *testing.T) {
 	if resp.Prompt == "" || len(resp.PromptHash) != 64 {
 		t.Errorf("empty/short Prompt or PromptHash: %+v", resp)
 	}
-	// The prompt should reflect the fetched issue title/body.
-	for _, want := range []string{"Add foo", "Body text", "Triggering issue: #42", "kuhlman-labs/example"} {
+	// Implement-stage prompt links the issue (#244): title + URL
+	// appear, but the body is dropped — the agent is told to fetch.
+	for _, want := range []string{
+		"Add foo",
+		"Triggering issue: #42 · Add foo",
+		"https://github.com/kuhlman-labs/example/issues/42",
+		"Fetch the issue body via your GitHub tooling",
+		"kuhlman-labs/example",
+	} {
 		if !contains(resp.Prompt, want) {
 			t.Errorf("prompt missing %q\n---\n%s", want, resp.Prompt)
 		}
+	}
+	if contains(resp.Prompt, "Body text") {
+		t.Errorf("implement prompt should not include the issue body verbatim:\n%s", resp.Prompt)
 	}
 
 	if !gh.called || gh.gotNum != 42 || gh.gotInst != installation {
@@ -468,10 +478,20 @@ func TestGetStagePromptRender_HappyPath_NoSignatureRequired(t *testing.T) {
 	if resp.StageType != "implement" {
 		t.Errorf("StageType = %q", resp.StageType)
 	}
-	for _, want := range []string{"Add foo", "Body text", "Triggering issue: #42"} {
+	// Implement-stage prompt links the issue (#244): title + URL
+	// appear, but the body is dropped — the agent is told to fetch.
+	for _, want := range []string{
+		"Add foo",
+		"Triggering issue: #42 · Add foo",
+		"https://github.com/kuhlman-labs/example/issues/42",
+		"Fetch the issue body via your GitHub tooling",
+	} {
 		if !strings.Contains(resp.Prompt, want) {
 			t.Errorf("prompt missing %q:\n%s", want, resp.Prompt)
 		}
+	}
+	if strings.Contains(resp.Prompt, "Body text") {
+		t.Errorf("implement prompt should not include the issue body verbatim:\n%s", resp.Prompt)
 	}
 }
 

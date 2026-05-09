@@ -52,6 +52,7 @@ func TestBuild_Implement_FullContext(t *testing.T) {
 		IssueNumber: 42,
 		IssueTitle:  "Add foo",
 		IssueBody:   "We need a foo function in pkg/bar.",
+		IssueURL:    "https://github.com/kuhlman-labs/example/issues/42",
 		Repo:        "kuhlman-labs/example",
 	})
 	if err != nil {
@@ -59,9 +60,12 @@ func TestBuild_Implement_FullContext(t *testing.T) {
 	}
 	wants := []string{
 		"`kuhlman-labs/example`",
-		"Triggering issue: #42",
-		"Title: Add foo",
-		"We need a foo function in pkg/bar.",
+		// Implement-stage prompt links the issue (#244): number,
+		// title, and URL appear, but body is dropped — the agent
+		// fetches if it needs detail.
+		"Triggering issue: #42 · Add foo",
+		"URL: https://github.com/kuhlman-labs/example/issues/42",
+		"Fetch the issue body via your GitHub tooling",
 		"smallest set of changes",
 		// PR description guidance + the path the runner reads (#206).
 		PullRequestDescriptionPath,
@@ -82,6 +86,12 @@ func TestBuild_Implement_FullContext(t *testing.T) {
 		if !strings.Contains(got, w) {
 			t.Errorf("prompt missing %q\n---\n%s", w, got)
 		}
+	}
+	// The body should NOT be in the implement-stage prompt — that's
+	// the whole point of #244. The plan-stage prompt still gets the
+	// body (TestBuild_Plan covers that contract).
+	if strings.Contains(got, "We need a foo function in pkg/bar.") {
+		t.Errorf("implement prompt should not include the issue body verbatim:\n%s", got)
 	}
 }
 
@@ -111,18 +121,23 @@ func TestBuild_Implement_EmptyContext(t *testing.T) {
 	}
 }
 
-func TestBuild_Implement_BodyOnly(t *testing.T) {
+func TestBuild_Implement_BodyDropped(t *testing.T) {
+	// #244: the implement-stage prompt links the issue but does
+	// NOT render the body verbatim. A trigger with only a body
+	// (no title, no URL) should fall through to the empty-context
+	// branch — the body alone isn't enough to render a useful
+	// link block.
 	got, err := Build("implement", Trigger{
 		IssueBody: "Just a description.",
 	})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "Just a description.") {
-		t.Errorf("body missing from prompt:\n%s", got)
+	if strings.Contains(got, "Just a description.") {
+		t.Errorf("implement prompt should never render the issue body:\n%s", got)
 	}
-	if strings.Contains(got, "Title:") {
-		t.Errorf("Title: header should be omitted when title is empty:\n%s", got)
+	if !strings.Contains(got, "no issue context provided") {
+		t.Errorf("body-only trigger should fall through to empty-context branch:\n%s", got)
 	}
 }
 
@@ -229,11 +244,9 @@ func TestBuild_Implement_WithApprovedPlan_LeadsWithPlan(t *testing.T) {
 		"Rollback plan:",
 		"Risks & assumptions:",
 		"Assumes bar.Service is the only foo consumer.",
-		// Issue context still appears, but as background.
-		"Originating issue (background context only):",
-		"Triggering issue: #42",
-		"Title: Add foo",
-		"We need a foo helper.",
+		// Issue link (#244): number + title + URL only — no body.
+		"Originating issue (link only — fetch if you need detail):",
+		"Triggering issue: #42 · Add foo",
 		// Adherence + divergence + staleness instructions.
 		"binding instruction",
 		"diverging silently",
@@ -251,12 +264,18 @@ func TestBuild_Implement_WithApprovedPlan_LeadsWithPlan(t *testing.T) {
 		}
 	}
 
-	// The plan must come BEFORE the issue context in the prompt —
+	// Issue body must NOT appear in the implement-stage prompt
+	// (#244): linking is the new contract.
+	if strings.Contains(got, "We need a foo helper.") {
+		t.Errorf("implement prompt should not include the issue body verbatim:\n%s", got)
+	}
+
+	// The plan must come BEFORE the issue link in the prompt —
 	// the lead-with-plan framing is the whole point.
 	planIdx := strings.Index(got, "Approved plan (binding instruction)")
-	issueIdx := strings.Index(got, "Originating issue (background context only):")
+	issueIdx := strings.Index(got, "Originating issue (link only — fetch if you need detail):")
 	if planIdx < 0 || issueIdx < 0 || planIdx > issueIdx {
-		t.Errorf("plan should appear before issue context (planIdx=%d issueIdx=%d):\n%s",
+		t.Errorf("plan should appear before issue link (planIdx=%d issueIdx=%d):\n%s",
 			planIdx, issueIdx, got)
 	}
 
