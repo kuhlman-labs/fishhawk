@@ -21,7 +21,8 @@
     "checks": "write",
     "workflows": "write",
     "members": "read",
-    "metadata": "read"
+    "metadata": "read",
+    "administration": "read"
   },
   "default_events": [
     "issues",

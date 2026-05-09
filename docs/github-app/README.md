@@ -25,6 +25,7 @@ Per `MVP_SPEC.md` §5.1.5:
 | `workflows` | w | Edit `.github/workflows/*.yml` (e.g. install-time provisioning of the customer's `fishhawk.yml`). Does NOT cover the dispatch endpoint — see `actions` above. |
 | `members` | r | Resolve `@org/team` references in role definitions to GitHub-login allowlists for approver checks (E4.4 / #50). |
 | `metadata` | r | Always granted; required for any read access. |
+| `administration` | r | Read branch protection + rulesets to derive the required-checks list (ADR-017 / #249). |
 
 Webhook events:
 
@@ -219,6 +220,8 @@ From this point, GitHub itself refuses the merge until Fishhawk reports `success
 ### Re-installing after a permissions bump
 
 When the App's permission set changes (e.g. a new `checks: write` requirement), GitHub flags the installation as needing review and existing installations fall back to the old permission set until the customer accepts the new ones. Reinstall via the App's installation page (**Configure** → **Save**) to pick up the new permissions.
+
+The most recent bump (ADR-017 / #249) added `administration: read` so the backend can read branch protection + rulesets at run-create time. Existing installs must re-accept before required-checks derivation will work; the run will fall back to an empty required-checks list otherwise.
 
 **Installing the App is the only repo-side dependency.** Specifically, customers do **not** need to:
 
