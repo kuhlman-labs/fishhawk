@@ -237,6 +237,128 @@ func TestMatchEvent_IssueComment_NotMistakenForLongerCommandPrefix(t *testing.T)
 	}
 }
 
+// --- MatchEvent: workflow_run ---
+
+func workflowRunBody(t *testing.T, fields map[string]any) []byte {
+	t.Helper()
+	defaults := map[string]any{
+		"id":          int64(987654321),
+		"path":        ".github/workflows/fishhawk.yml",
+		"conclusion":  "failure",
+		"status":      "completed",
+		"event":       "workflow_dispatch",
+		"head_branch": "main",
+		"head_sha":    "abc123",
+	}
+	for k, v := range fields {
+		defaults[k] = v
+	}
+	body, _ := json.Marshal(map[string]any{"workflow_run": defaults})
+	return body
+}
+
+func TestMatchEvent_WorkflowRun_FailureCompleted_Matches(t *testing.T) {
+	ev := Event{
+		Type: "workflow_run", Action: "completed", InstallationID: 42,
+		RawBody: workflowRunBody(t, nil),
+	}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want match", got)
+	}
+	if got.Action != MatchActionRunnerActionFailed {
+		t.Errorf("Action = %q, want runner_action_failed", got.Action)
+	}
+	if got.WorkflowRunID != 987654321 {
+		t.Errorf("WorkflowRunID = %d", got.WorkflowRunID)
+	}
+	if got.WorkflowRunConclusion != "failure" {
+		t.Errorf("WorkflowRunConclusion = %q", got.WorkflowRunConclusion)
+	}
+}
+
+func TestMatchEvent_WorkflowRun_NonTerminalAction_Skips(t *testing.T) {
+	ev := Event{
+		Type: "workflow_run", Action: "in_progress", InstallationID: 42,
+		RawBody: workflowRunBody(t, nil),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("got = %+v, want skip on non-terminal action", got)
+	}
+}
+
+func TestMatchEvent_WorkflowRun_SuccessConclusion_Skips(t *testing.T) {
+	ev := Event{
+		Type: "workflow_run", Action: "completed", InstallationID: 42,
+		RawBody: workflowRunBody(t, map[string]any{"conclusion": "success"}),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("got = %+v, want skip on successful run", got)
+	}
+}
+
+func TestMatchEvent_WorkflowRun_OtherConclusionsSkip(t *testing.T) {
+	for _, c := range []string{"neutral", "skipped", "", "unknown_future_value"} {
+		t.Run(c, func(t *testing.T) {
+			ev := Event{
+				Type: "workflow_run", Action: "completed", InstallationID: 42,
+				RawBody: workflowRunBody(t, map[string]any{"conclusion": c}),
+			}
+			got := MatchEvent(ev)
+			if !got.Skip {
+				t.Errorf("conclusion=%q got = %+v, want skip", c, got)
+			}
+		})
+	}
+}
+
+func TestMatchEvent_WorkflowRun_FailedConclusionsMatch(t *testing.T) {
+	for _, c := range []string{"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"} {
+		t.Run(c, func(t *testing.T) {
+			ev := Event{
+				Type: "workflow_run", Action: "completed", InstallationID: 42,
+				RawBody: workflowRunBody(t, map[string]any{"conclusion": c}),
+			}
+			got := MatchEvent(ev)
+			if got.Skip {
+				t.Errorf("conclusion=%q should match; got skip: %s", c, got.Reason)
+			}
+			if got.WorkflowRunConclusion != c {
+				t.Errorf("WorkflowRunConclusion = %q, want %q", got.WorkflowRunConclusion, c)
+			}
+		})
+	}
+}
+
+func TestMatchEvent_WorkflowRun_OtherWorkflowFile_Skips(t *testing.T) {
+	// A failing CI workflow on the same repo isn't Fishhawk's
+	// concern — only the runner action's failures route here.
+	ev := Event{
+		Type: "workflow_run", Action: "completed", InstallationID: 42,
+		RawBody: workflowRunBody(t, map[string]any{"path": ".github/workflows/ci.yml"}),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("got = %+v, want skip for non-fishhawk workflow", got)
+	}
+}
+
+func TestMatchEvent_WorkflowRun_NonDispatchEvent_Skips(t *testing.T) {
+	// A `push`-triggered run of fishhawk.yml (e.g. the customer
+	// committed something that triggered the workflow on their
+	// own) isn't ours to react to.
+	ev := Event{
+		Type: "workflow_run", Action: "completed", InstallationID: 42,
+		RawBody: workflowRunBody(t, map[string]any{"event": "push"}),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("got = %+v, want skip for non-dispatch event", got)
+	}
+}
+
 // --- Dispatcher.Handle tests with stubs ---
 
 // stubGitHub is a minimal GitHubAPI for handler tests. Each call
@@ -257,6 +379,15 @@ type stubGitHub struct {
 	}
 	specCalls     int
 	dispatchCalls int
+
+	// workflowRun is what GetWorkflowRun returns; nil + non-nil err
+	// when the lookup should fail.
+	workflowRun     *githubclient.WorkflowRun
+	workflowRunErr  error
+	workflowRunCall struct {
+		runID int64
+	}
+	workflowRunCalls int
 }
 
 func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ int64,
@@ -280,6 +411,18 @@ func (s *stubGitHub) DispatchWorkflow(_ context.Context, _ int64,
 	s.dispatchCall.ref = ref
 	s.dispatchCall.args = args
 	return s.dispatchErr
+}
+
+func (s *stubGitHub) GetWorkflowRun(_ context.Context, _ int64,
+	_ githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workflowRunCalls++
+	s.workflowRunCall.runID = runID
+	if s.workflowRunErr != nil {
+		return nil, s.workflowRunErr
+	}
+	return s.workflowRun, nil
 }
 
 // stubRuns is a tiny in-memory run.Repository covering the
@@ -397,8 +540,15 @@ func (s *stubRuns) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Ru
 func (s *stubRuns) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
-func (s *stubRuns) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
-	return nil, errors.New("not used")
+func (s *stubRuns) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.createdStages {
+		if st.ID == id {
+			return st, nil
+		}
+	}
+	return nil, run.ErrNotFound
 }
 func (s *stubRuns) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
@@ -1476,6 +1626,160 @@ func TestHandle_DoesNotThread_WhenNoPriorRun(t *testing.T) {
 	}
 	if runs.created[0].ParentRunID != nil {
 		t.Errorf("ParentRunID should be nil when there's no prior run; got %v", runs.created[0].ParentRunID)
+	}
+}
+
+// --- workflow_run.failure routing ---
+
+func workflowRunFailedEvent(t *testing.T) Event {
+	t.Helper()
+	body := workflowRunBody(t, nil) // failure conclusion, dispatch event, fishhawk.yml
+	raw, _ := json.Marshal(map[string]any{
+		"action": "completed",
+		"workflow_run": map[string]any{
+			"id":          int64(987654321),
+			"path":        ".github/workflows/fishhawk.yml",
+			"conclusion":  "failure",
+			"status":      "completed",
+			"event":       "workflow_dispatch",
+			"head_branch": "main",
+			"head_sha":    "abc123",
+		},
+		"repository": map[string]any{
+			"full_name": "kuhlman-labs/fishhawk",
+		},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": "fishhawk-app[bot]", "type": "User"},
+	})
+	_ = body // produced for the matcher unit tests; we rebuild a richer event here
+	ev, err := ParseEvent("workflow_run", "deliv-wfrun", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// seedDispatchedStage adds a fake stage in the `dispatched` state to
+// the stub's createdStages so FailStage can walk it through running →
+// failed. Returns the stage id for assertion-side use.
+func seedDispatchedStage(t *testing.T, runs *stubRuns) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	runs.mu.Lock()
+	runs.createdStages = append(runs.createdStages, &run.Stage{
+		ID: id, RunID: uuid.New(), Sequence: 0, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		State: run.StageStateDispatched,
+	})
+	runs.mu.Unlock()
+	return id
+}
+
+func TestHandle_RunnerActionFailed_TransitionsStageToFailedC(t *testing.T) {
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	stageID := seedDispatchedStage(t, runs)
+	gh.workflowRun = &githubclient.WorkflowRun{
+		ID:         987654321,
+		Conclusion: "failure",
+		Status:     "completed",
+		Event:      "workflow_dispatch",
+		Inputs: map[string]string{
+			"run_id":      uuid.New().String(),
+			"stage_id":    stageID.String(),
+			"workflow_id": "feature_change",
+		},
+		HTMLURL: "https://github.com/kuhlman-labs/fishhawk/actions/runs/987654321",
+	}
+
+	if err := d.Handle(context.Background(), workflowRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if gh.workflowRunCalls != 1 {
+		t.Errorf("expected 1 GetWorkflowRun call; got %d", gh.workflowRunCalls)
+	}
+	if gh.workflowRunCall.runID != 987654321 {
+		t.Errorf("GetWorkflowRun runID = %d", gh.workflowRunCall.runID)
+	}
+
+	// FailStage walks dispatched -> running -> failed, so we expect
+	// two transition records on the stub.
+	runs.mu.Lock()
+	defer runs.mu.Unlock()
+	if len(runs.transitions) != 2 {
+		t.Fatalf("expected 2 transitions (running, failed); got %d: %+v",
+			len(runs.transitions), runs.transitions)
+	}
+	if runs.transitions[0].StageID != stageID || runs.transitions[0].To != run.StageStateRunning {
+		t.Errorf("first transition = %+v, want (stageID, running)", runs.transitions[0])
+	}
+	if runs.transitions[1].StageID != stageID || runs.transitions[1].To != run.StageStateFailed {
+		t.Errorf("second transition = %+v, want (stageID, failed)", runs.transitions[1])
+	}
+}
+
+func TestHandle_RunnerActionFailed_NotADispatchedRun_Skips(t *testing.T) {
+	// A workflow_run.completed with no stage_id input — e.g. a
+	// run fired by something other than Fishhawk's dispatcher
+	// (manual trigger, scheduled cron). We can't match it; just
+	// log and move on.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.workflowRun = &githubclient.WorkflowRun{
+		ID:     987654321,
+		Inputs: map[string]string{},
+	}
+
+	if err := d.Handle(context.Background(), workflowRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.transitions) != 0 {
+		t.Errorf("no stage_id input should mean no transition; got %+v", runs.transitions)
+	}
+}
+
+func TestHandle_RunnerActionFailed_StageAlreadyTerminal_Idempotent(t *testing.T) {
+	// The trace upload may have landed before the workflow_run
+	// webhook arrived (e.g., trace POST then runner exit). The
+	// stage is already in awaiting_approval; FailStage's
+	// transition to failed-from-awaiting_approval succeeds.
+	// Confirms that the handler doesn't 5xx and that re-deliveries
+	// don't break.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	stageID := uuid.New()
+	runs.mu.Lock()
+	runs.createdStages = append(runs.createdStages, &run.Stage{
+		ID: stageID, Sequence: 0, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent,
+		State:        run.StageStateAwaitingApproval,
+	})
+	runs.mu.Unlock()
+	gh.workflowRun = &githubclient.WorkflowRun{
+		ID:     987654321,
+		Inputs: map[string]string{"stage_id": stageID.String()},
+	}
+
+	if err := d.Handle(context.Background(), workflowRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	// awaiting_approval -> failed is one transition (no running step).
+	runs.mu.Lock()
+	defer runs.mu.Unlock()
+	if len(runs.transitions) != 1 || runs.transitions[0].To != run.StageStateFailed {
+		t.Errorf("expected 1 transition to failed; got %+v", runs.transitions)
+	}
+}
+
+func TestHandle_RunnerActionFailed_GetWorkflowRunErrors_LogsAndReturns(t *testing.T) {
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	gh.workflowRunErr = errors.New("github 5xx")
+
+	// Should not surface as a webhook error. We log + return nil so
+	// GitHub doesn't retry the delivery — the watchdog will still
+	// time out the stage.
+	if err := d.Handle(context.Background(), workflowRunFailedEvent(t)); err != nil {
+		t.Errorf("Handle should swallow lookup errors; got %v", err)
+	}
+	if len(runs.transitions) != 0 {
+		t.Errorf("no transition expected on lookup failure; got %+v", runs.transitions)
 	}
 }
 

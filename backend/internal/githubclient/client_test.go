@@ -53,6 +53,9 @@ type fakeGitHub struct {
 	createIssueCommentStatus int
 	createIssueCommentBody   string
 
+	getWorkflowRunStatus int
+	getWorkflowRunBody   string
+
 	gotAuth        string
 	gotPath        string
 	gotQuery       string
@@ -73,6 +76,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		createCheckRunBody:       `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
 		createIssueCommentStatus: http.StatusCreated,
 		createIssueCommentBody:   `{"id":11111}`,
+		getWorkflowRunStatus:     http.StatusOK,
+		getWorkflowRunBody:       `{"id":987654321,"html_url":"https://github.com/x/y/actions/runs/987654321","conclusion":"failure","status":"completed","event":"workflow_dispatch","head_branch":"main","head_sha":"abc","inputs":{"stage_id":"22222222-2222-2222-2222-222222222222","run_id":"11111111-1111-1111-1111-111111111111"}}`,
 	}
 	mux := http.NewServeMux()
 
@@ -133,6 +138,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.createIssueCommentStatus)
 			if fg.createIssueCommentBody != "" {
 				_, _ = io.WriteString(w, fg.createIssueCommentBody)
+			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/runs/{run_id}",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.getWorkflowRunStatus)
+			if fg.getWorkflowRunBody != "" {
+				_, _ = io.WriteString(w, fg.getWorkflowRunBody)
 			}
 		})
 
@@ -776,5 +791,71 @@ func TestCreateIssueComment_GitHubError(t *testing.T) {
 		RepoRef{Owner: "x", Name: "y"}, 1, "hi")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v want ErrForbidden", err)
+	}
+}
+
+// --- GetWorkflowRun ---
+
+func TestGetWorkflowRun_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.GetWorkflowRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 987654321)
+	if err != nil {
+		t.Fatalf("GetWorkflowRun: %v", err)
+	}
+	if got.ID != 987654321 {
+		t.Errorf("ID = %d want 987654321", got.ID)
+	}
+	if got.Conclusion != "failure" {
+		t.Errorf("Conclusion = %q", got.Conclusion)
+	}
+	if got.Event != "workflow_dispatch" {
+		t.Errorf("Event = %q", got.Event)
+	}
+	if got.Inputs["stage_id"] != "22222222-2222-2222-2222-222222222222" {
+		t.Errorf("Inputs.stage_id = %q", got.Inputs["stage_id"])
+	}
+	if fg.gotMethod != http.MethodGet {
+		t.Errorf("method = %q want GET", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/actions/runs/987654321" {
+		t.Errorf("path = %q", fg.gotPath)
+	}
+}
+
+func TestGetWorkflowRun_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getWorkflowRunStatus = http.StatusNotFound
+	fg.getWorkflowRunBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetWorkflowRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 987654321)
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v want ErrNotFound", err)
+	}
+}
+
+func TestGetWorkflowRun_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		runID     int64
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, 1, "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, 1, "owner and name"},
+		{"zero run id", RepoRef{Owner: "x", Name: "y"}, 0, "workflow run id must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.GetWorkflowRun(context.Background(), 1, tc.repo, tc.runID)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
 	}
 }
