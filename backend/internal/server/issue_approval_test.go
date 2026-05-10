@@ -199,8 +199,7 @@ func TestHandleApprovalCommand_ApproveSucceedsRegardlessOfCheckState(t *testing.
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Type = run.StageTypeReview
 	stage.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{"ci_pass"},
+		Kind: run.GateKindApproval,
 	}
 
 	ar := newFakeApprovalRepo()

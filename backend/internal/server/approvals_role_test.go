@@ -99,7 +99,7 @@ func (s *stubTeamLister) ListTeamMembers(_ context.Context, _ int64, org, slug s
 }
 
 const approvalGateSpec = `
-version: "0.1"
+version: "0.2"
 roles:
   eng_team:
     members: ["@acme/eng"]

@@ -164,10 +164,14 @@ workflows:
           - type: approval
             approvers:
               any_of: [senior_engineer]
-            blocking_checks:
-              - ci_pass
-              - fishhawk_audit_complete
 ```
+
+> Note: spec v0.2 (ADR-017 / #249) dropped the gate-level
+> `blocking_checks` field. Required CI checks are now derived from
+> GitHub branch protection at run-create time and snapshotted onto
+> the run row. The `fishhawk_audit_complete` signal is published as
+> a Check Run (#231) and enforced via branch protection, not the
+> spec.
 
 ### 4.3 Plan artifact schema (`standard_v1`)
 

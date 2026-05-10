@@ -639,8 +639,7 @@ func TestPostgres_StageGate_RoundTripPreservesShape(t *testing.T) {
 		ExecutorRef:      "human",
 		RequiresApproval: true,
 		Gate: &run.Gate{
-			Kind:           run.GateKindApproval,
-			BlockingChecks: []string{"ci_pass", "fishhawk_audit_complete"},
+			Kind: run.GateKindApproval,
 			Approvers: &run.GateApprovers{
 				AnyOf: []string{"founder", "tech-lead"},
 			},
@@ -654,9 +653,6 @@ func TestPostgres_StageGate_RoundTripPreservesShape(t *testing.T) {
 	}
 	if s.Gate.Kind != run.GateKindApproval {
 		t.Errorf("Gate.Kind = %q, want approval", s.Gate.Kind)
-	}
-	if got := s.Gate.BlockingChecks; len(got) != 2 || got[0] != "ci_pass" || got[1] != "fishhawk_audit_complete" {
-		t.Errorf("Gate.BlockingChecks = %v", got)
 	}
 	if s.Gate.Approvers == nil || len(s.Gate.Approvers.AnyOf) != 2 {
 		t.Fatalf("Gate.Approvers = %+v, want any_of with 2 entries", s.Gate.Approvers)
@@ -728,8 +724,7 @@ func TestPostgres_StageGate_CheckGateHasNoApprovers(t *testing.T) {
 		ExecutorKind: run.ExecutorAgent,
 		ExecutorRef:  "claude-code",
 		Gate: &run.Gate{
-			Kind:           run.GateKindCheck,
-			BlockingChecks: []string{"ci_pass"},
+			Kind: run.GateKindCheck,
 		},
 	})
 	if err != nil {

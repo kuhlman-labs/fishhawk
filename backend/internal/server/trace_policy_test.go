@@ -155,7 +155,7 @@ func makeTestBundle(t *testing.T, files []map[string]string) []byte {
 }
 
 const testWorkflowSpec = `
-version: "0.1"
+version: "0.2"
 roles:
   eng_team:
     members: ["@org/eng"]

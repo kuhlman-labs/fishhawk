@@ -11,8 +11,8 @@
   "properties": {
     "version": {
       "type": "string",
-      "enum": ["0.1"],
-      "description": "Spec syntax version. v0 freezes at 0.1; future syntax bumps land as 0.2 etc., with new schema files."
+      "enum": ["0.2"],
+      "description": "Spec syntax version. 0.2 dropped gate.blocking_checks (ADR-017 / #249); required CI checks are derived from GitHub branch protection at run-create time. 0.1 specs that still declare the field fail validation — the field has no consumer left."
     },
     "roles": {
       "type": "object",
@@ -264,24 +264,14 @@
             "sla": {
               "type": "string",
               "description": "SLA before timeout fires a category-D failure (e.g. '4_business_hours', '24_hours')."
-            },
-            "blocking_checks": {
-              "type": "array",
-              "minItems": 1,
-              "items": { "type": "string" }
             }
           }
         },
         {
-          "description": "Check gate — passes when all blocking_checks succeed; no human approval.",
-          "required": ["type", "blocking_checks"],
+          "description": "Check gate — placeholder for workflows that delegate to GitHub branch protection (ADR-017 / #249). Carries no fields in v0.2; the merge-readiness signal lives in branch protection / rulesets, not in the spec.",
+          "required": ["type"],
           "properties": {
-            "type": { "const": "check" },
-            "blocking_checks": {
-              "type": "array",
-              "minItems": 1,
-              "items": { "type": "string" }
-            }
+            "type": { "const": "check" }
           }
         }
       ]

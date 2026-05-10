@@ -3,16 +3,12 @@ import { Circle } from 'lucide-react';
 /*
  * Blocking-checks panel for the review-stage detail page (#213).
  *
- * The workflow-spec gate carries `blocking_checks: [ci_pass,
- * fishhawk_audit_complete]` for review stages; this component
- * renders one row per declared check with a state pill.
- *
- * v0 of this page only ever passes `not_tracked` because the
- * backend doesn't yet ingest GitHub check-run states (#214 / TBD)
- * or define `fishhawk_audit_complete`'s passing condition. Shipping
- * the panel anyway is the cheaper half: when ingestion lands, the
- * caller swaps `not_tracked` for live `pass | fail | pending`
- * states without touching this component.
+ * Renders one row per required check with a state pill. The
+ * declared list now comes from the run's branch-protection
+ * snapshot (#251 / #254 / ADR-017) — pre-v0.2 it sourced from the
+ * spec-level `gate.blocking_checks` field, which has been removed.
+ * The panel is informational; merge gating happens on GitHub via
+ * branch protection (#253 dropped the in-Fishhawk approval gate).
  */
 
 export type BlockingCheckState = 'pass' | 'fail' | 'pending' | 'not_tracked';

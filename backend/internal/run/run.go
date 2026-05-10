@@ -277,12 +277,12 @@ type GateApprovers struct {
 }
 
 // Gate is the persisted shape of a stage's workflow-spec gate. The
-// review-stage UI reads it to render blocking_checks and decide
-// whether to surface the approval panel. Persisted to
-// stages.gate_type / .gate_blocking_checks / .gate_approvers per
-// migration 0014.
+// review-stage UI reads it to decide whether to surface the
+// approval panel. Persisted to stages.gate_type / .gate_approvers
+// per migration 0014; the gate_blocking_checks column was dropped
+// in migration 0018 (#254 / ADR-017) along with the spec field —
+// required CI checks now live in branch protection (#251).
 type Gate struct {
-	Kind           GateKind
-	BlockingChecks []string
-	Approvers      *GateApprovers
+	Kind      GateKind
+	Approvers *GateApprovers
 }

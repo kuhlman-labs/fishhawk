@@ -2,7 +2,7 @@
 # Used as a regression fixture: any change to the parser must keep
 # this example parseable end-to-end.
 
-version: "0.1"
+version: "0.2"
 
 roles:
   tech_lead:
@@ -78,6 +78,3 @@ workflows:
           - type: approval
             approvers:
               any_of: [senior_engineer]
-            blocking_checks:
-              - ci_pass
-              - fishhawk_audit_complete

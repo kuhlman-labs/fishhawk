@@ -6,7 +6,7 @@
 # - executor on a review stage being an agent
 # - omitted optional sections (no inputs, no budget on either stage)
 
-version: "0.1"
+version: "0.2"
 
 roles:
   founder:
@@ -42,6 +42,3 @@ workflows:
           agent: claude-code
         gates:
           - type: check
-            blocking_checks:
-              - ci_pass
-              - fishhawk_audit_complete

@@ -878,8 +878,7 @@ func TestSubmitApproval_Approve_SucceedsRegardlessOfCheckState(t *testing.T) {
 			r := rr.seedRun()
 			stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 			stage.Gate = &run.Gate{
-				Kind:           run.GateKindApproval,
-				BlockingChecks: []string{"ci_pass"},
+				Kind: run.GateKindApproval,
 			}
 			ar := newFakeApprovalRepo()
 			au := newApprovalAuditFake()
@@ -914,8 +913,7 @@ func TestSubmitApproval_Approve_PassesWhenAllChecksPass(t *testing.T) {
 	r := rr.seedRun()
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{"ci_pass", "fishhawk_audit_complete"},
+		Kind: run.GateKindApproval,
 	}
 	ar := newFakeApprovalRepo()
 	au := newApprovalAuditFake()
@@ -946,8 +944,7 @@ func TestSubmitApproval_Reject_NotBlockedByFailingChecks(t *testing.T) {
 	r := rr.seedRun()
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{"ci_pass"},
+		Kind: run.GateKindApproval,
 	}
 	ar := newFakeApprovalRepo()
 	au := newApprovalAuditFake()
@@ -976,8 +973,7 @@ func TestSubmitApproval_Approve_FallsOpenWhenStageCheckRepoNil(t *testing.T) {
 	r := rr.seedRun()
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{"ci_pass"},
+		Kind: run.GateKindApproval,
 	}
 	ar := newFakeApprovalRepo()
 	au := newApprovalAuditFake()

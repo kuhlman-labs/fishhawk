@@ -32,16 +32,21 @@ SELECT * FROM stage_checks
  LIMIT 1;
 
 -- name: FindRunStagesForCheckRun :many
--- Locate the run + stages whose pull_request artifact matches the
--- given (pr_number, head_sha) and whose gate carries the given
--- check name. Used by the GitHub check_run webhook ingest path:
--- one event arrives, this query returns every stage that should
--- record a row.
+-- Locate the review stage of every run whose pull_request artifact
+-- matches the given (pr_number, head_sha). Used by the GitHub
+-- check_run webhook ingest path: one event arrives, this query
+-- returns every review stage that should record a row.
 --
--- Walks artifacts → stages → runs → stages-on-the-same-run filtered
--- by gate_blocking_checks containing the check name. v0 keeps it
--- as a single query so the ingest hot path doesn't roundtrip the
--- DB N times per event.
+-- Walks artifacts → implement-stage → run → review-stage. Pre-#254
+-- this filtered on the spec-level gate's blocking_checks list; that
+-- field was dropped in v0.2 (ADR-017 / #249). Required CI checks
+-- now live in branch protection (#251), and the review stage is the
+-- canonical recording target — it's the only stage whose gate is
+-- meaningfully tied to merge state.
+--
+-- check_name is accepted as a parameter so the existing call sites
+-- don't need to change shape; v0 records every observed check
+-- against the review stage regardless of declared list.
 SELECT s.*
   FROM artifacts a
   JOIN stages s_pr ON s_pr.id = a.stage_id
@@ -50,5 +55,6 @@ SELECT s.*
  WHERE a.kind = 'pull_request'
    AND (a.content->>'pr_number')::int = sqlc.arg('pr_number')::int
    AND (a.content->>'head_sha') = sqlc.arg('head_sha')::text
-   AND sqlc.arg('check_name')::text = ANY(s.gate_blocking_checks)
+   AND s.stage_type = 'review'
+   AND sqlc.arg('check_name')::text != ''
  ORDER BY s.sequence ASC;

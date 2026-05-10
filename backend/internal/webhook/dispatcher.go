@@ -1137,8 +1137,7 @@ func primaryGate(gates []spec.Gate) *run.Gate {
 		return nil
 	}
 	out := &run.Gate{
-		Kind:           run.GateKind(g.Type),
-		BlockingChecks: g.BlockingChecks,
+		Kind: run.GateKind(g.Type),
 	}
 	if g.Approvers != nil {
 		out.Approvers = &run.GateApprovers{

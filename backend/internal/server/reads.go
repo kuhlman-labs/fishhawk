@@ -41,13 +41,14 @@ type stageExecutor struct {
 	Ref  string `json:"ref"`
 }
 
-// stageGate mirrors the workflow-spec gate's persisted shape so
-// review-stage UI can render blocking_checks + approvers. Persisted
-// per migration 0014 (#213). Omitted when the stage has no gate.
+// stageGate mirrors the workflow-spec gate's persisted shape so the
+// review-stage UI can render approvers. Persisted per migration 0014
+// (#213). The blocking_checks field was dropped in v0.2 / migration
+// 0018 (#254 / ADR-017): required CI checks now live in branch
+// protection, not the spec. Omitted when the stage has no gate.
 type stageGate struct {
-	Type           string              `json:"type"`
-	BlockingChecks []string            `json:"blocking_checks,omitempty"`
-	Approvers      *stageGateApprovers `json:"approvers,omitempty"`
+	Type      string              `json:"type"`
+	Approvers *stageGateApprovers `json:"approvers,omitempty"`
 }
 
 type stageGateApprovers struct {
@@ -77,8 +78,7 @@ func toStageResponse(s *run.Stage) stageResponse {
 	}
 	if s.Gate != nil {
 		gate := &stageGate{
-			Type:           string(s.Gate.Kind),
-			BlockingChecks: s.Gate.BlockingChecks,
+			Type: string(s.Gate.Kind),
 		}
 		if s.Gate.Approvers != nil {
 			gate.Approvers = &stageGateApprovers{

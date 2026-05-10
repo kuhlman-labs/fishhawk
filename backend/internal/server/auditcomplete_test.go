@@ -40,8 +40,7 @@ func TestListStageChecks_InjectsAuditCompleteWithMissing(t *testing.T) {
 	rev := rr.seedStage(r.ID, 2, run.StageStateAwaitingApproval)
 	rev.Type = run.StageTypeReview
 	rev.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{AuditCompleteCheckName},
+		Kind: run.GateKindApproval,
 	}
 
 	au := newAuditCompleteAuditFake()
