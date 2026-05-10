@@ -66,6 +66,12 @@ type fakeGitHub struct {
 	getRulesetStatus int
 	getRulesetBody   map[int64]string
 
+	getPullRequestStatus int
+	getPullRequestBody   string
+
+	graphqlStatus int
+	graphqlBody   string
+
 	gotAuth        string
 	gotPath        string
 	gotQuery       string
@@ -94,6 +100,10 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		listRulesetsBody:          `[]`,
 		getRulesetStatus:          http.StatusOK,
 		getRulesetBody:            map[int64]string{},
+		getPullRequestStatus:      http.StatusOK,
+		getPullRequestBody:        `{"number":42,"node_id":"PR_kwDOABcDEf"}`,
+		graphqlStatus:             http.StatusOK,
+		graphqlBody:               `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
 	}
 	mux := http.NewServeMux()
 
@@ -199,6 +209,26 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			}
 			w.WriteHeader(fg.getRulesetStatus)
 			_, _ = io.WriteString(w, body)
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.getPullRequestStatus)
+			if fg.getPullRequestBody != "" {
+				_, _ = io.WriteString(w, fg.getPullRequestBody)
+			}
+		})
+
+	mux.HandleFunc("POST /graphql",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.graphqlStatus)
+			if fg.graphqlBody != "" {
+				_, _ = io.WriteString(w, fg.graphqlBody)
+			}
 		})
 
 	srv := httptest.NewServer(mux)
@@ -1145,4 +1175,113 @@ func slicesEq(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestEnableAutoMerge_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.EnableAutoMerge(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
+	if err != nil {
+		t.Fatalf("EnableAutoMerge: %v", err)
+	}
+	// The capture only retains the LAST request — confirm the
+	// graphql mutation hit the /graphql endpoint and carried the
+	// node id from the prior REST lookup.
+	if fg.gotPath != "/graphql" {
+		t.Errorf("final path = %q, want /graphql", fg.gotPath)
+	}
+	if fg.gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", fg.gotMethod)
+	}
+	if !strings.Contains(string(fg.gotBody), `"id":"PR_kwDOABcDEf"`) {
+		t.Errorf("graphql body missing PR node id:\n%s", fg.gotBody)
+	}
+	if !strings.Contains(string(fg.gotBody), `"method":"SQUASH"`) {
+		t.Errorf("graphql body missing merge method:\n%s", fg.gotBody)
+	}
+	if !strings.Contains(string(fg.gotBody), "enablePullRequestAutoMerge") {
+		t.Errorf("graphql body missing mutation name:\n%s", fg.gotBody)
+	}
+}
+
+func TestEnableAutoMerge_DefaultsMethodToSquash(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.EnableAutoMerge(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 42, ""); err != nil {
+		t.Fatalf("EnableAutoMerge: %v", err)
+	}
+	if !strings.Contains(string(fg.gotBody), `"method":"SQUASH"`) {
+		t.Errorf("empty method should default to SQUASH:\n%s", fg.gotBody)
+	}
+}
+
+func TestEnableAutoMerge_PRNotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getPullRequestStatus = http.StatusNotFound
+	fg.getPullRequestBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.EnableAutoMerge(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEnableAutoMerge_GraphQLError_AsValidation(t *testing.T) {
+	// GitHub returns 200 even for application-level errors
+	// ("auto-merge is not enabled for this repository", "the
+	// pull request is in a clean state already", etc.). Surface
+	// those as ErrValidation so the orchestrator can audit + skip
+	// retry rather than retry-storm.
+	fg, srv := newFakeGitHub(t)
+	fg.graphqlBody = `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.EnableAutoMerge(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+	if !strings.Contains(err.Error(), "Pull request is in clean status") {
+		t.Errorf("err should surface graphql message: %v", err)
+	}
+}
+
+func TestEnableAutoMerge_MissingNodeID(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getPullRequestBody = `{"number":42}` // node_id absent
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.EnableAutoMerge(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
+	if err == nil || !strings.Contains(err.Error(), "node_id") {
+		t.Errorf("err = %v, want missing-node_id error", err)
+	}
+}
+
+func TestEnableAutoMerge_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		prNumber  int
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, 1, "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, 1, "owner and name"},
+		{"zero pr", RepoRef{Owner: "x", Name: "y"}, 0, "pr number must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := c.EnableAutoMerge(context.Background(), 1, tc.repo, tc.prNumber, MergeMethodSquash)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
 }

@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -34,6 +36,12 @@ type GitHubAPI interface {
 	DispatchWorkflow(ctx context.Context, installationID int64,
 		repo githubclient.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
+	// EnableAutoMerge queues a PR for auto-merge once branch
+	// protection clears (#255 / ADR-017). Used by routine_change-
+	// style workflows whose review stage is a check-only gate.
+	EnableAutoMerge(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, prNumber int,
+		method githubclient.MergeMethod) error
 }
 
 // Orchestrator wires the run repository to a GitHub client to
@@ -165,7 +173,14 @@ func (o *Orchestrator) completeRun(ctx context.Context, r *run.Run, stages []*ru
 // dispatchStage transitions the next stage to dispatched and (for
 // agent stages) fires workflow_dispatch. Human stages transition
 // to awaiting_approval directly — there's no runner to wake up.
+// Auto-merge stages (review with a check-only gate, ADR-017 / #255)
+// take a third path: queue gh pr merge --auto and transition
+// straight to succeeded — there's no runner work to do, and GitHub
+// owns the merge gate.
 func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.Stage) (Outcome, error) {
+	if isAutoMergeStage(next) {
+		return o.dispatchAutoMergeStage(ctx, r, next)
+	}
 	if next.ExecutorKind == run.ExecutorHuman {
 		// Human stages don't need workflow_dispatch — they go to
 		// awaiting_approval and wait for someone to click. Walk
@@ -213,6 +228,130 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 		slog.String("executor", string(next.ExecutorKind)),
 	)
 	return OutcomeDispatched, nil
+}
+
+// isAutoMergeStage returns true when a stage's role is "queue auto-
+// merge and step out of the way" — review stages with a check-only
+// gate (#255 / ADR-017). The routine_change workflow is the
+// canonical case: agent implements, GitHub branch protection +
+// auto-merge handle the rest. The dispatcher persists the gate's
+// kind on the stage row at create time (#213); we read that here
+// rather than re-parsing the spec.
+//
+// Returns false for stages with no gate (implement) and for
+// approval-typed gates (feature_change review). Falls open for
+// pre-#213 rows that don't have a persisted gate — they fall
+// through to the standard agent / human dispatch paths.
+func isAutoMergeStage(s *run.Stage) bool {
+	return s.Type == run.StageTypeReview && s.Gate != nil && s.Gate.Kind == run.GateKindCheck
+}
+
+// dispatchAutoMergeStage queues GitHub auto-merge and transitions
+// the stage to succeeded (#255 / ADR-017). The merge happens later
+// when branch protection clears; Fishhawk's run is logically done
+// once auto-merge is enqueued. State machine walk: pending →
+// dispatched → running → succeeded.
+//
+// Best-effort on the GitHub side: a failure to enable auto-merge
+// (e.g., the customer hasn't enabled the feature on the repo,
+// branch protection is misconfigured, the PR's already merged
+// synchronously) leaves the stage in dispatched and surfaces the
+// error to the caller. The stage doesn't fail — re-running Advance
+// retries the auto-merge enable, and an operator can flip the PR
+// manually.
+func (o *Orchestrator) dispatchAutoMergeStage(ctx context.Context, r *run.Run, next *run.Stage) (Outcome, error) {
+	if _, err := o.Runs.TransitionStage(ctx, next.ID, run.StageStateDispatched, nil); err != nil {
+		return OutcomeNoOp, fmt.Errorf("orchestrator: transition auto-merge stage to dispatched: %w", err)
+	}
+
+	if err := o.enableAutoMerge(ctx, r); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn,
+			"orchestrator: enable auto-merge failed",
+			slog.String("run_id", r.ID.String()),
+			slog.String("stage_id", next.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return OutcomeDispatched, err
+	}
+
+	for _, to := range []run.StageState{
+		run.StageStateRunning,
+		run.StageStateSucceeded,
+	} {
+		if _, err := o.Runs.TransitionStage(ctx, next.ID, to, nil); err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: transition auto-merge stage to %s: %w", to, err)
+		}
+	}
+
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator queued auto-merge",
+		slog.String("run_id", r.ID.String()),
+		slog.String("stage_id", next.ID.String()),
+		slog.Int("sequence", next.Sequence),
+	)
+	return OutcomeDispatched, nil
+}
+
+// enableAutoMerge calls GitHub's enablePullRequestAutoMerge
+// mutation via the client. Skips silently when the GitHub client
+// is unwired (CLI runs, dev posture). Requires the run's
+// pull_request_url to be backfilled — that happens when the
+// implement stage's PR artifact lands (#216), which is upstream of
+// the review stage.
+func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
+	if o.GitHub == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping auto-merge",
+			slog.String("run_id", r.ID.String()),
+		)
+		return nil
+	}
+	if r.InstallationID == nil || *r.InstallationID == 0 {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run has no installation_id; skipping auto-merge",
+			slog.String("run_id", r.ID.String()),
+		)
+		return nil
+	}
+	if r.PullRequestURL == nil || *r.PullRequestURL == "" {
+		return errors.New("orchestrator: run missing pull_request_url; cannot enable auto-merge")
+	}
+
+	repo, err := parseRepo(r.Repo)
+	if err != nil {
+		return fmt.Errorf("orchestrator: parse repo %q: %w", r.Repo, err)
+	}
+	prNumber, err := pullRequestNumberFromURL(*r.PullRequestURL)
+	if err != nil {
+		return fmt.Errorf("orchestrator: parse pr url %q: %w", *r.PullRequestURL, err)
+	}
+
+	// Default to SQUASH for v0 — matches the typical PR merge
+	// conventions on GitHub repos and is what Fishhawk's own
+	// CLAUDE.md prescribes. Spec-level merge_method is a v0.x
+	// follow-up.
+	return o.GitHub.EnableAutoMerge(ctx, *r.InstallationID, repo, prNumber, githubclient.MergeMethodSquash)
+}
+
+// pullRequestNumberFromURL parses the trailing /pull/<n> segment
+// from a GitHub PR URL. The runner stores the canonical
+// `https://github.com/<owner>/<repo>/pull/<n>` form when it opens
+// the PR (#206); this helper round-trips it back to <n>.
+func pullRequestNumberFromURL(u string) (int, error) {
+	const segment = "/pull/"
+	idx := strings.LastIndex(u, segment)
+	if idx < 0 {
+		return 0, fmt.Errorf("missing %q segment", segment)
+	}
+	tail := u[idx+len(segment):]
+	if i := strings.IndexAny(tail, "/?#"); i >= 0 {
+		tail = tail[:i]
+	}
+	n, err := strconv.Atoi(tail)
+	if err != nil {
+		return 0, fmt.Errorf("parse pr number from %q: %w", tail, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("pr number must be > 0, got %d", n)
+	}
+	return n, nil
 }
 
 // fireDispatch builds a RepoRef + dispatch inputs and calls the

@@ -189,12 +189,14 @@ func (s *stubRuns) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
 
-// stubGitHub records DispatchWorkflow calls without making network
-// requests.
+// stubGitHub records DispatchWorkflow + EnableAutoMerge calls
+// without making network requests.
 type stubGitHub struct {
-	mu          sync.Mutex
-	calls       []dispatchCall
-	dispatchErr error
+	mu             sync.Mutex
+	calls          []dispatchCall
+	dispatchErr    error
+	autoMergeCalls []autoMergeCall
+	autoMergeErr   error
 }
 
 type dispatchCall struct {
@@ -203,6 +205,13 @@ type dispatchCall struct {
 	WorkflowFile   string
 	Ref            string
 	Inputs         githubclient.DispatchInputs
+}
+
+type autoMergeCall struct {
+	InstallationID int64
+	Repo           githubclient.RepoRef
+	PRNumber       int
+	Method         githubclient.MergeMethod
 }
 
 func (g *stubGitHub) DispatchWorkflow(_ context.Context, installationID int64,
@@ -215,6 +224,20 @@ func (g *stubGitHub) DispatchWorkflow(_ context.Context, installationID int64,
 	g.calls = append(g.calls, dispatchCall{
 		InstallationID: installationID, Repo: repo,
 		WorkflowFile: file, Ref: ref, Inputs: inputs,
+	})
+	return nil
+}
+
+func (g *stubGitHub) EnableAutoMerge(_ context.Context, installationID int64,
+	repo githubclient.RepoRef, prNumber int, method githubclient.MergeMethod) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.autoMergeErr != nil {
+		return g.autoMergeErr
+	}
+	g.autoMergeCalls = append(g.autoMergeCalls, autoMergeCall{
+		InstallationID: installationID, Repo: repo,
+		PRNumber: prNumber, Method: method,
 	})
 	return nil
 }
@@ -291,6 +314,119 @@ func TestAdvance_HumanStage_TransitionsToAwaitingApproval(t *testing.T) {
 	// Human stages don't fire workflow_dispatch.
 	if len(gh.calls) != 0 {
 		t.Errorf("workflow_dispatch fired for human stage: %d", len(gh.calls))
+	}
+}
+
+func TestAdvance_AutoMergeStage_QueuesAndSucceeds(t *testing.T) {
+	// routine_change canonical case (#255 / ADR-017): the review
+	// stage carries a check-only gate. Advance must queue
+	// gh pr merge --auto rather than fire workflow_dispatch, then
+	// transition the stage straight to succeeded — Fishhawk's role
+	// is done; GitHub owns the merge.
+	o, rs, gh := newOrchestrator(t)
+	r, stages := rs.seed(t, "kuhlman-labs/example", int64Ptr(99), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	stages[1].Gate = &run.Gate{Kind: run.GateKindCheck}
+	prURL := "https://github.com/kuhlman-labs/example/pull/42"
+	r.PullRequestURL = &prURL
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched", out)
+	}
+	if stages[1].State != run.StageStateSucceeded {
+		t.Errorf("review stage state = %q, want succeeded", stages[1].State)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("workflow_dispatch fired for auto-merge stage: %d", len(gh.calls))
+	}
+	if len(gh.autoMergeCalls) != 1 {
+		t.Fatalf("auto-merge calls = %d, want 1", len(gh.autoMergeCalls))
+	}
+	got := gh.autoMergeCalls[0]
+	if got.PRNumber != 42 || got.InstallationID != 99 || got.Method != githubclient.MergeMethodSquash {
+		t.Errorf("auto-merge call = %+v", got)
+	}
+	if got.Repo.Owner != "kuhlman-labs" || got.Repo.Name != "example" {
+		t.Errorf("repo = %+v", got.Repo)
+	}
+}
+
+func TestAdvance_AutoMergeStage_FailureLeavesStageDispatched(t *testing.T) {
+	// Best-effort: a GitHub-side rejection (auto-merge disabled on
+	// the repo, branch protection misconfigured, etc.) leaves the
+	// stage in dispatched and surfaces the error. Re-running
+	// Advance retries — same idempotency posture as workflow_dispatch.
+	o, rs, gh := newOrchestrator(t)
+	r, stages := rs.seed(t, "kuhlman-labs/example", int64Ptr(99), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	stages[1].Gate = &run.Gate{Kind: run.GateKindCheck}
+	prURL := "https://github.com/kuhlman-labs/example/pull/42"
+	r.PullRequestURL = &prURL
+	gh.autoMergeErr = errors.New("auto-merge not enabled on this repo")
+
+	if _, err := o.Advance(context.Background(), r.ID); err == nil {
+		t.Fatal("Advance returned nil err; want error from auto-merge enable")
+	}
+	if stages[1].State != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched (not transitioned past)", stages[1].State)
+	}
+}
+
+func TestAdvance_AutoMergeStage_MissingPRURL_Errors(t *testing.T) {
+	// The implement stage's PR artifact upload backfills
+	// runs.pull_request_url (#216). When that hasn't happened yet
+	// the orchestrator has no PR number to call against — surface
+	// the gap as an error rather than calling enable-auto-merge with
+	// a zero number.
+	o, rs, gh := newOrchestrator(t)
+	r, stages := rs.seed(t, "kuhlman-labs/example", int64Ptr(99), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	stages[1].Gate = &run.Gate{Kind: run.GateKindCheck}
+	// PullRequestURL deliberately nil.
+
+	if _, err := o.Advance(context.Background(), r.ID); err == nil {
+		t.Fatal("Advance returned nil err; want missing-pr-url error")
+	}
+	if len(gh.autoMergeCalls) != 0 {
+		t.Errorf("auto-merge fired without a PR url: %+v", gh.autoMergeCalls)
+	}
+}
+
+func TestPullRequestNumberFromURL(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int
+		wantErr bool
+	}{
+		{"https://github.com/x/y/pull/42", 42, false},
+		{"https://github.com/x/y/pull/1", 1, false},
+		{"https://github.com/x/y/pull/123/files", 123, false},
+		{"https://github.com/x/y/pull/456?diff=split", 456, false},
+		{"https://github.com/x/y/issues/42", 0, true},
+		{"https://github.com/x/y/pull/abc", 0, true},
+		{"https://github.com/x/y/pull/0", 0, true},
+		{"", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := pullRequestNumberFromURL(tc.in)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
