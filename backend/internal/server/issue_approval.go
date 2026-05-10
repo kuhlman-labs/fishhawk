@@ -3,10 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,7 +13,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
@@ -78,19 +75,11 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 
-	if decision == approval.DecisionApprove {
-		if blockers, ok, err := s.collectBlockingChecks(ctx, stage); err != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"slash-command approval: blocking-check read failed",
-				slog.String("stage_id", stage.ID.String()),
-				slog.String("error", err.Error()))
-			s.replyApproval(ctx, p, "Could not read blocking-check state. Try the dashboard.")
-			return nil
-		} else if !ok {
-			s.replyApproval(ctx, p, formatBlockerReply(blockers))
-			return nil
-		}
-	}
+	// ADR-017 (#249, #253): the approval gate no longer reads
+	// stage_check state. Reviewers approve based on plan + diff;
+	// GitHub branch protection blocks the merge until the required
+	// checks (including fishhawk_audit_complete, published per
+	// #231) report green.
 
 	var commentPtr *string
 	if p.Comment != "" {
@@ -240,45 +229,6 @@ func (s *Server) authorizeSlashApprover(ctx context.Context, stage *run.Stage, s
 	return "", true
 }
 
-// collectBlockingChecks mirrors checkBlockingChecks but returns
-// typed values instead of writing to an HTTP response. The bool
-// is "approval-allowed" — true when no blockers, false when one
-// or more checks aren't passing. The error return is non-nil only
-// on transient I/O.
-func (s *Server) collectBlockingChecks(ctx context.Context, stage *run.Stage) ([]string, bool, error) {
-	if s.cfg.StageCheckRepo == nil {
-		return nil, true, nil
-	}
-	if stage.Gate == nil || len(stage.Gate.BlockingChecks) == 0 {
-		return nil, true, nil
-	}
-	var blockers []string
-	for _, name := range stage.Gate.BlockingChecks {
-		if name == AuditCompleteCheckName {
-			state, err := s.deriveAuditCompleteState(ctx, stage.RunID)
-			if err != nil {
-				return nil, false, err
-			}
-			if state != stagecheck.StatePass {
-				blockers = append(blockers, name)
-			}
-			continue
-		}
-		c, err := s.cfg.StageCheckRepo.LatestForStageAndName(ctx, stage.ID, name)
-		if err != nil {
-			if errors.Is(err, stagecheck.ErrNotFound) {
-				blockers = append(blockers, name)
-				continue
-			}
-			return nil, false, err
-		}
-		if c.State != stagecheck.StatePass {
-			blockers = append(blockers, name)
-		}
-	}
-	return blockers, len(blockers) == 0, nil
-}
-
 // writeSlashApprovalAudit mirrors writeApprovalAudit's chain entry
 // — same category, same payload shape — so audit consumers don't
 // care which surface produced the row.
@@ -342,19 +292,6 @@ func decodeMatchAction(a webhook.MatchAction) (approval.Decision, bool) {
 		return approval.DecisionReject, true
 	}
 	return "", false
-}
-
-// formatBlockerReply renders the 409-equivalent reply when one or
-// more blocking checks aren't passing. Returns a markdown bullet
-// list so the reviewer sees exactly what's missing without a
-// click-through.
-func formatBlockerReply(blockers []string) string {
-	var b strings.Builder
-	b.WriteString("Cannot approve — one or more blocking checks have not passed:\n\n")
-	for _, name := range blockers {
-		fmt.Fprintf(&b, "- `%s`\n", name)
-	}
-	return b.String()
 }
 
 // formatSuccessReply renders the celebratory reply on approve /

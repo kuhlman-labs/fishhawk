@@ -201,19 +201,12 @@ function ApprovalStatus({ stage, runId }: { stage: Stage; runId: string }) {
 }
 
 // formatApprovalError turns a thrown error into the message rendered
-// in the panel. Special-cases the blocking_checks_not_passed 409
-// from #228: lists the offending check names so the reviewer knows
-// what to wait on (or which checks the spec is gating against),
-// rather than just seeing a 409 with a generic "conflict" body.
+// in the panel. Pre-#253 there was a special case for the 409 +
+// blocking_checks_not_passed pair (#228); ADR-017 (#249) moved that
+// gate to GitHub branch protection and the error code went away with
+// #253.
 function formatApprovalError(err: unknown): string {
   if (err instanceof ApiClientError) {
-    if (err.status === 409 && err.body?.error === 'blocking_checks_not_passed') {
-      const blockers = err.body?.details?.blockers;
-      if (Array.isArray(blockers) && blockers.length > 0) {
-        return `Blocking checks haven't passed: ${blockers.join(', ')}`;
-      }
-      return 'Blocking checks haven’t passed.';
-    }
     return `${err.status} · ${err.body?.error ?? err.message}`;
   }
   if (err instanceof Error) {

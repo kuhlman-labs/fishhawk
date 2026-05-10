@@ -18,10 +18,13 @@ import { BlockingChecksPanel, type BlockingCheck } from '@/components/blocking-c
  *   - PullRequestSummary: shared with the implement page, fed the
  *     implement stage's pull_request artifact.
  *   - BlockingChecksPanel: lists the gate's declared blocking_checks
- *     with their live observed state (#228). The backend serves the
- *     declared list + most-recent observed state; declared-but-not-
- *     observed entries fill as `not_tracked` so the SPA always
- *     shows the full gate.
+ *     with their live observed state (#228). Informational only as
+ *     of #253 / ADR-017 — the approve button no longer waits on
+ *     check state; GitHub branch protection blocks the merge until
+ *     the required checks (which include fishhawk_audit_complete,
+ *     published as a Check Run per #231) report green. Declared-
+ *     but-not-observed entries fill as `not_tracked` so the SPA
+ *     always shows the full gate.
  *   - Approvers list: shown only for approval-typed gates.
  *
  * For check-only review gates (e.g. routine_change.workflows.yaml),

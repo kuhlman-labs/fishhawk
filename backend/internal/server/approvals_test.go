@@ -846,67 +846,66 @@ func (f *fakeStageCheckRepo) FindMatchingStages(context.Context, int, string, st
 	return nil, errors.New("not used")
 }
 
-func TestSubmitApproval_Approve_BlockedWhenCheckFailing(t *testing.T) {
-	rr := newOrchestratorRepo()
-	r := rr.seedRun()
-	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
-	stage.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{"ci_pass"},
+// TestSubmitApproval_Approve_SucceedsRegardlessOfCheckState pins
+// the post-#253 (ADR-017) contract: the approval handler does NOT
+// gate on stage_check state. Reviewers approve based on plan + diff;
+// GitHub branch protection blocks the merge until the required
+// checks (including fishhawk_audit_complete, published per #231)
+// report green. Both pre-#253 failure modes — a failing observed
+// check and a never-observed-yet check — now succeed at the
+// approval API; protection is the merge gate.
+func TestSubmitApproval_Approve_SucceedsRegardlessOfCheckState(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(scs *fakeStageCheckRepo, stageID uuid.UUID)
+	}{
+		{
+			name: "failing check no longer blocks approval",
+			seed: func(scs *fakeStageCheckRepo, stageID uuid.UUID) {
+				scs.seed(stageID, "ci_pass", stagecheck.StateFail)
+			},
+		},
+		{
+			name: "never-observed check no longer blocks approval",
+			seed: func(_ *fakeStageCheckRepo, _ uuid.UUID) {
+				// nothing seeded — ci_pass never observed
+			},
+		},
 	}
-	ar := newFakeApprovalRepo()
-	au := newApprovalAuditFake()
-	scs := newFakeStageCheckRepo()
-	scs.seed(stage.ID, "ci_pass", stagecheck.StateFail)
-	o := &orchestrator.Orchestrator{Runs: rr}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := newOrchestratorRepo()
+			r := rr.seedRun()
+			stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+			stage.Gate = &run.Gate{
+				Kind:           run.GateKindApproval,
+				BlockingChecks: []string{"ci_pass"},
+			}
+			ar := newFakeApprovalRepo()
+			au := newApprovalAuditFake()
+			scs := newFakeStageCheckRepo()
+			tc.seed(scs, stage.ID)
+			o := &orchestrator.Orchestrator{Runs: rr}
 
-	s := New(Config{
-		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
-		AuditRepo: au, Orchestrator: o, StageCheckRepo: scs,
-	})
+			s := New(Config{
+				Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
+				AuditRepo: au, Orchestrator: o, StageCheckRepo: scs,
+			})
 
-	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "blocking_checks_not_passed") {
-		t.Errorf("response should reference blocking_checks_not_passed:\n%s", w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "ci_pass") {
-		t.Errorf("response should name the failing check:\n%s", w.Body.String())
-	}
-	if stage.State != run.StageStateAwaitingApproval {
-		t.Errorf("stage transitioned despite 409: %q", stage.State)
-	}
-	if len(ar.all) != 0 {
-		t.Errorf("approval written despite 409: %+v", ar.all)
-	}
-}
-
-func TestSubmitApproval_Approve_BlockedWhenCheckNeverObserved(t *testing.T) {
-	// not_tracked counts as a blocker — the gate refuses approval
-	// when a declared check has never reported a state. Otherwise
-	// approvers could clear a gate by approving before CI even
-	// started.
-	rr := newOrchestratorRepo()
-	r := rr.seedRun()
-	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
-	stage.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{"ci_pass"},
-	}
-	ar := newFakeApprovalRepo()
-	au := newApprovalAuditFake()
-	scs := newFakeStageCheckRepo() // empty — ci_pass never observed
-	o := &orchestrator.Orchestrator{Runs: rr}
-
-	s := New(Config{
-		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
-		AuditRepo: au, Orchestrator: o, StageCheckRepo: scs,
-	})
-	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if stage.State != run.StageStateSucceeded {
+				t.Errorf("stage state = %q, want succeeded", stage.State)
+			}
+			if len(ar.all) != 1 {
+				t.Errorf("approval not recorded: %+v", ar.all)
+			}
+			if strings.Contains(w.Body.String(), "blocking_checks_not_passed") {
+				t.Errorf("response should not reference the dropped error code:\n%s", w.Body.String())
+			}
+		})
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,97 +15,20 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// Tests the wiring between the server's gate enforcement / read
-// endpoint and the auditcomplete derivation (#229). Unit-level
-// rule coverage lives in internal/auditcomplete; this file only
-// asserts that the special-cased name flows through both call
-// sites correctly.
-
-func TestSubmitApproval_Approve_BlockedByAuditCompleteFail(t *testing.T) {
-	rr := newOrchestratorRepo()
-	r := rr.seedRun()
-	plan := rr.seedStage(r.ID, 0, run.StageStateSucceeded)
-	plan.Type = run.StageTypePlan
-	impl := rr.seedStage(r.ID, 1, run.StageStateSucceeded)
-	impl.Type = run.StageTypeImplement
-	rev := rr.seedStage(r.ID, 2, run.StageStateAwaitingApproval)
-	rev.Type = run.StageTypeReview
-	rev.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{AuditCompleteCheckName},
-	}
-
-	ar := newFakeApprovalRepo()
-	au := newAuditCompleteAuditFake()
-	au.appendTrace(t, r.ID, plan.ID, "raw")
-	au.appendTrace(t, r.ID, plan.ID, "redacted")
-	// Implement stage's traces are missing → fishhawk_audit_complete fails.
-
-	arts := newFakeArtifactRepo()
-	seedPlanArtifact(arts, plan.ID)
-	seedPullRequestArtifact(arts, impl.ID)
-
-	scs := newFakeStageCheckRepo()
-	o := &orchestrator.Orchestrator{Runs: rr}
-
-	s := New(Config{
-		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
-		AuditRepo: au, ArtifactRepo: arts,
-		Orchestrator: o, StageCheckRepo: scs,
-	})
-
-	w := submitApproval(t, s, rev.ID, `{"decision":"approve"}`)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d want 409:\n%s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), AuditCompleteCheckName) {
-		t.Errorf("response should name fishhawk_audit_complete:\n%s", w.Body.String())
-	}
-}
-
-func TestSubmitApproval_Approve_PassesWhenAuditCompletePasses(t *testing.T) {
-	rr := newOrchestratorRepo()
-	r := rr.seedRun()
-	plan := rr.seedStage(r.ID, 0, run.StageStateSucceeded)
-	plan.Type = run.StageTypePlan
-	impl := rr.seedStage(r.ID, 1, run.StageStateSucceeded)
-	impl.Type = run.StageTypeImplement
-	rev := rr.seedStage(r.ID, 2, run.StageStateAwaitingApproval)
-	rev.Type = run.StageTypeReview
-	rev.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{AuditCompleteCheckName},
-	}
-
-	ar := newFakeApprovalRepo()
-	au := newAuditCompleteAuditFake()
-	au.appendTrace(t, r.ID, plan.ID, "raw")
-	au.appendTrace(t, r.ID, plan.ID, "redacted")
-	au.appendTrace(t, r.ID, impl.ID, "raw")
-	au.appendTrace(t, r.ID, impl.ID, "redacted")
-
-	arts := newFakeArtifactRepo()
-	seedPlanArtifact(arts, plan.ID)
-	seedPullRequestArtifact(arts, impl.ID)
-
-	scs := newFakeStageCheckRepo()
-	o := &orchestrator.Orchestrator{Runs: rr}
-
-	s := New(Config{
-		Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr,
-		AuditRepo: au, ArtifactRepo: arts,
-		Orchestrator: o, StageCheckRepo: scs,
-	})
-
-	w := submitApproval(t, s, rev.ID, `{"decision":"approve"}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d want 200:\n%s", w.Code, w.Body.String())
-	}
-}
+// Tests the wiring between the server's check-state read endpoint
+// and the auditcomplete derivation (#229). Unit-level rule coverage
+// lives in internal/auditcomplete; this file only asserts that the
+// special-cased name flows through GET /v0/stages/{id}/checks
+// correctly.
+//
+// The pre-#253 approval-gate behavior (a failing audit-complete
+// check refused approval with a 409) is gone — ADR-017 (#249, #253)
+// moved the gating to GitHub branch protection. The audit-complete
+// state is still derived and published as a Check Run (#231); it's
+// just not the API gate.
 
 func TestListStageChecks_InjectsAuditCompleteWithMissing(t *testing.T) {
 	rr := newOrchestratorRepo()
