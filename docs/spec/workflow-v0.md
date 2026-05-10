@@ -108,6 +108,12 @@ Two types:
 
 # Check gate — placeholder for workflows that delegate to GitHub branch
 # protection. Carries no spec-level fields in 0.2 (#254 / ADR-017).
+# When a review stage carries a check-only gate, Fishhawk's
+# orchestrator queues `gh pr merge --auto --squash` against the
+# implement stage's PR (#255) and transitions the review stage to
+# `succeeded` immediately. GitHub's auto-merge machinery handles the
+# actual merge once the required checks (from branch protection)
+# pass — Fishhawk's role is "queue and step out of the way".
 - type: check
 ```
 

@@ -508,6 +508,141 @@ func rulesetMatchesBranch(conditions *struct {
 	return false
 }
 
+// MergeMethod is the strategy GitHub uses when an auto-merge fires.
+// Mirrors the GraphQL `PullRequestMergeMethod` enum on the wire so
+// callers can pass the canonical names through.
+type MergeMethod string
+
+// Merge methods accepted by enablePullRequestAutoMerge.
+const (
+	MergeMethodSquash MergeMethod = "SQUASH"
+	MergeMethodMerge  MergeMethod = "MERGE"
+	MergeMethodRebase MergeMethod = "REBASE"
+)
+
+// EnableAutoMerge queues a PR for auto-merge once branch protection
+// clears (#255 / ADR-017). Uses the GitHub GraphQL API because the
+// REST surface does not expose auto-merge directly — only synchronous
+// merge.
+//
+// Two-call sequence:
+//  1. REST GET /repos/{owner}/{repo}/pulls/{number} to resolve the
+//     PR's GraphQL node id.
+//  2. GraphQL mutation `enablePullRequestAutoMerge` with the node id
+//     and the requested merge method.
+//
+// Returns nil on success. ErrNotFound when the PR doesn't exist on
+// the installation; ErrForbidden for auth issues; ErrValidation when
+// GitHub rejects the auto-merge enable (e.g., branch protection
+// already met and the PR auto-merged synchronously, repo doesn't
+// allow auto-merge, or the merge method is disabled).
+//
+// Idempotent in practice: enabling auto-merge on a PR that already
+// has it queued returns success rather than failing. The dispatcher
+// can call this multiple times across retries without special-
+// casing.
+func (c *Client) EnableAutoMerge(ctx context.Context, installationID int64,
+	repo RepoRef, prNumber int, method MergeMethod) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if prNumber <= 0 {
+		return errors.New("githubclient: pr number must be > 0")
+	}
+	if method == "" {
+		method = MergeMethodSquash
+	}
+
+	nodeID, err := c.fetchPullRequestNodeID(ctx, installationID, repo, prNumber)
+	if err != nil {
+		return err
+	}
+
+	mutation := `mutation EnableAutoMerge($id: ID!, $method: PullRequestMergeMethod!) {
+  enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method }) {
+    pullRequest { number url state }
+  }
+}`
+	body := map[string]any{
+		"query": mutation,
+		"variables": map[string]any{
+			"id":     nodeID,
+			"method": string(method),
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal auto-merge mutation: %w", err)
+	}
+	req, err := c.buildRequest(ctx, http.MethodPost, c.endpoint("/graphql"), bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: enable auto-merge: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("enable auto-merge", resp); err != nil {
+		return err
+	}
+	// GraphQL returns 200 even for application-level errors. Inspect
+	// the `errors` field and surface as ErrValidation so the
+	// orchestrator can audit the rejection without retrying.
+	var gqlResp struct {
+		Errors []struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"errors"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&gqlResp); err != nil {
+		return fmt.Errorf("githubclient: decode auto-merge response: %w", err)
+	}
+	if len(gqlResp.Errors) > 0 {
+		return fmt.Errorf("%w: enable auto-merge: %s", ErrValidation, gqlResp.Errors[0].Message)
+	}
+	return nil
+}
+
+// fetchPullRequestNodeID resolves a PR number to its GraphQL node id
+// via REST. The GraphQL mutation `enablePullRequestAutoMerge` needs
+// the node id (opaque, base64-encoded) rather than the (owner, repo,
+// number) tuple.
+func (c *Client) fetchPullRequestNodeID(ctx context.Context, installationID int64,
+	repo RepoRef, number int) (string, error) {
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/pulls/" + url.PathEscape(fmt.Sprintf("%d", number)))
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("githubclient: fetch pr node id: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := classifyStatus("fetch pr node id", resp); err != nil {
+		return "", err
+	}
+	var body struct {
+		NodeID string `json:"node_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", fmt.Errorf("githubclient: decode pr: %w", err)
+	}
+	if body.NodeID == "" {
+		return "", fmt.Errorf("githubclient: pr response missing node_id")
+	}
+	return body.NodeID, nil
+}
+
 // TeamMember is the slice of a team-membership API response we
 // surface for role resolution. Login is the canonical handle used
 // in audits and approvers comparisons; ID is preserved so future
