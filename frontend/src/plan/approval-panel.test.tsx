@@ -168,32 +168,3 @@ describe('ApprovalPanel', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
-
-describe('ApprovalPanel 409 blocking_checks_not_passed (#228)', () => {
-  beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
-
-  it('renders the offending check names when approve is refused 409', async () => {
-    const fetchMock = vi.fn(async () => {
-      return new Response(
-        JSON.stringify({
-          error: 'blocking_checks_not_passed',
-          message: 'one or more blocking checks have not passed',
-          details: { blockers: ['ci_pass', 'fishhawk_audit_complete'] },
-        }),
-        { status: 409, headers: { 'Content-Type': 'application/json' } },
-      );
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    renderPanel();
-
-    fireEvent.click(screen.getByRole('button', { name: /^approve$/i }));
-    fireEvent.click(screen.getByRole('button', { name: /confirm approve/i }));
-
-    await waitFor(() => {
-      expect(screen.getByRole('alert')).toHaveTextContent(/blocking checks haven/i);
-    });
-    expect(screen.getByRole('alert')).toHaveTextContent(/ci_pass/);
-    expect(screen.getByRole('alert')).toHaveTextContent(/fishhawk_audit_complete/);
-  });
-});

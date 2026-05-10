@@ -182,7 +182,12 @@ func TestHandleApprovalCommand_NoAwaitingStage_RepliesAndSkips(t *testing.T) {
 	}
 }
 
-func TestHandleApprovalCommand_BlockingChecksFailing_RefusesApprove(t *testing.T) {
+// TestHandleApprovalCommand_ApproveSucceedsRegardlessOfCheckState
+// pins the post-#253 (ADR-017) contract for the slash-command
+// approval path: a failing blocking check no longer refuses approve.
+// Reviewers approve based on plan + diff; GitHub branch protection
+// blocks the merge until the required checks report green.
+func TestHandleApprovalCommand_ApproveSucceedsRegardlessOfCheckState(t *testing.T) {
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
 	r.TriggerSource = run.TriggerGitHubIssue
@@ -202,60 +207,8 @@ func TestHandleApprovalCommand_BlockingChecksFailing_RefusesApprove(t *testing.T
 	au := newAuditCompleteAuditFake()
 	gh := newSlashGitHubRecorder()
 	scs := newFakeStageCheckRepo()
-	scs.seed(stage.ID, "ci_pass", stagecheck.StateFail)
-
-	s := New(Config{
-		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
-		StageCheckRepo: scs, ExternalURL: "https://app.fishhawk.example.com",
-	})
-	s.issueNotifier = issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: rr, Audit: au,
-		ExternalURL: "https://app.fishhawk.example.com",
-	})
-
-	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
-		Repo: "x/y", IssueNumber: 9, InstallationID: 99, SenderLogin: "alice",
-		Decision: webhook.MatchActionApprove,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if stage.State != run.StageStateAwaitingApproval {
-		t.Errorf("stage should NOT have advanced; state = %q", stage.State)
-	}
-	if len(ar.all) != 0 {
-		t.Errorf("approval should not be recorded when checks failing; got %+v", ar.all)
-	}
-	body := gh.calls()[0].body
-	if !strings.Contains(body, "ci_pass") {
-		t.Errorf("reply should name failing check: %q", body)
-	}
-	if !strings.Contains(body, "blocking checks have not passed") {
-		t.Errorf("reply should explain why: %q", body)
-	}
-}
-
-func TestHandleApprovalCommand_RejectIgnoresBlockingChecks(t *testing.T) {
-	// Mirror the HTTP handler: reject is the path failing checks
-	// were intended to surface; the slash command should let it
-	// through too.
-	rr := newOrchestratorRepo()
-	r := rr.seedRun()
-	r.TriggerSource = run.TriggerGitHubIssue
-	triggerRef := "issue:9"
-	r.TriggerRef = &triggerRef
-	r.InstallationID = ptrInt64(99)
-	r.Repo = "x/y"
-
-	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
-	stage.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{"ci_pass"},
-	}
-
-	ar := newFakeApprovalRepo()
-	au := newAuditCompleteAuditFake()
-	gh := newSlashGitHubRecorder()
-	scs := newFakeStageCheckRepo()
+	// A failing observed check used to refuse the slash approval; it
+	// no longer does. Seeded to prove the dropped gate.
 	scs.seed(stage.ID, "ci_pass", stagecheck.StateFail)
 	o := &orchestrator.Orchestrator{Runs: rr}
 
@@ -271,12 +224,19 @@ func TestHandleApprovalCommand_RejectIgnoresBlockingChecks(t *testing.T) {
 
 	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
 		Repo: "x/y", IssueNumber: 9, InstallationID: 99, SenderLogin: "alice",
-		Decision: webhook.MatchActionReject,
+		Decision: webhook.MatchActionApprove,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if stage.State != run.StageStateFailed {
-		t.Errorf("reject should advance stage to failed; got %q", stage.State)
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage should advance to succeeded; got %q", stage.State)
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("approval should be recorded; got %+v", ar.all)
+	}
+	body := gh.calls()[0].body
+	if strings.Contains(body, "blocking checks have not passed") {
+		t.Errorf("reply should not reference dropped gate wording: %q", body)
 	}
 }
 

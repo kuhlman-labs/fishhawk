@@ -1355,12 +1355,11 @@ paths:
         '409':
           description: |
             `invalid_state_transition` — stage isn't in
-            awaiting_approval, OR
-            `blocking_checks_not_passed` — one or more declared
-            blocking checks aren't `pass` (#228); response
-            `details.blockers` is the array of offending check
-            names. Reject is not subject to this gate; only
-            approve.
+            awaiting_approval. (Pre-#253 the handler also returned
+            409 with `blocking_checks_not_passed` when any declared
+            blocking check wasn't `pass`. ADR-017 / #249 moved that
+            gate to GitHub branch protection; the approval API no
+            longer reads stage_check state.)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
