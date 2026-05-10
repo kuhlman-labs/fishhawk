@@ -175,6 +175,13 @@ export const api = {
    */
   listStageChecks(stageId: string): Promise<{
     declared: string[];
+    /**
+     * Surfaces that contributed to `declared` — one or both of
+     * `branch_protection` and `ruleset:<id>`. Used by the
+     * RequiredChecksPanel attribution sub-label (#256). Optional
+     * on the wire for forward-compat with pre-#256 backends.
+     */
+    sources?: string[];
     items: Array<{
       name: string;
       state: 'pass' | 'fail' | 'pending' | 'not_tracked';
