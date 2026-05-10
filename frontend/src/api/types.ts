@@ -67,10 +67,10 @@ export function describeFailure(cat: FailureCategory | null | undefined): string
 /**
  * The persisted shape of a stage's workflow-spec gate (#213). Mirrors
  * the StageGate schema in docs/api/v0.openapi.yaml. Approval gates
- * carry approvers; check gates don't. blocking_checks lists the
- * named checks the gate depends on; v0 doesn't yet ingest their
- * states (a follow-up surface), so the review UI renders the names
- * with a "not tracked yet" placeholder.
+ * carry approvers; check gates don't. The pre-#254 `blocking_checks`
+ * array was dropped in v0.2 (ADR-017 / #249) — required CI checks
+ * now live in branch protection and surface via
+ * GET /v0/stages/{id}/checks.
  */
 export type StageGateType = 'approval' | 'check';
 
@@ -81,7 +81,6 @@ export interface StageGateApprovers {
 
 export interface StageGate {
   type: StageGateType;
-  blocking_checks?: string[];
   approvers?: StageGateApprovers | null;
 }
 
@@ -99,7 +98,8 @@ export interface Stage {
   /**
    * Persisted workflow-spec gate. Omitted when the stage has no gate
    * (e.g. implement, or pre-#213 rows). The review-stage detail page
-   * reads this to render blocking_checks + the approval panel.
+   * reads this to render the approval panel; live check state comes
+   * from GET /v0/stages/{id}/checks.
    */
   gate?: StageGate;
   created_at: string;

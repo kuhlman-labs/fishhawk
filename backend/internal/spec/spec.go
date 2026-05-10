@@ -161,12 +161,17 @@ const (
 )
 
 // Gate is either an approval gate (humans must act) or a check gate
-// (named status checks must pass).
+// (a placeholder that delegates merge-readiness to GitHub branch
+// protection). v0.2 dropped the gate-level `blocking_checks` field
+// (ADR-017 / #254); required CI checks are derived from branch
+// protection at run-create time and snapshotted onto the run row
+// (#251). The check-gate variant carries no spec-level fields and
+// is effectively a no-op until #255 wires routine_change to
+// `gh pr merge --auto`.
 type Gate struct {
-	Type           GateType   `json:"type" yaml:"type"`
-	Approvers      *Approvers `json:"approvers,omitempty" yaml:"approvers,omitempty"`
-	SLA            string     `json:"sla,omitempty" yaml:"sla,omitempty"`
-	BlockingChecks []string   `json:"blocking_checks,omitempty" yaml:"blocking_checks,omitempty"`
+	Type      GateType   `json:"type" yaml:"type"`
+	Approvers *Approvers `json:"approvers,omitempty" yaml:"approvers,omitempty"`
+	SLA       string     `json:"sla,omitempty" yaml:"sla,omitempty"`
 }
 
 // GateType is approval or check.

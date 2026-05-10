@@ -234,9 +234,12 @@ components:
           description: |
             The persisted shape of the stage's workflow-spec gate.
             Null/omitted when the stage has no gate. Per migration
-            0014 / #213 — the review-stage UI reads this to render
-            blocking_checks and decide whether to surface the
-            approval panel.
+            0014 / #213 — the review-stage UI reads this to decide
+            whether to surface the approval panel. Pre-#254 the
+            shape carried a `blocking_checks` array; v0.2 dropped
+            that field (ADR-017 / #249) — required CI checks now
+            live in branch protection, snapshotted onto the run
+            row's `required_checks_snapshot` (#251).
         created_at:
           type: string
           format: date-time
@@ -248,23 +251,17 @@ components:
       type: object
       description: |
         Workflow-spec gate snapshot stored on the stage row. Mirrors
-        spec.Gate but flattened — `type` distinguishes approval-vs-
-        check, blocking_checks lists the named checks the gate
-        depends on, approvers is set only for approval gates.
+        spec.Gate — `type` distinguishes approval-vs-check, approvers
+        is set only for approval gates. The pre-#254 `blocking_checks`
+        array was removed in v0.2 (ADR-017 / #249); required CI
+        checks now live in branch protection, exposed via the run's
+        `required_checks_snapshot` (#251) and the per-stage
+        `/v0/stages/{id}/checks` endpoint.
       required: [type]
       properties:
         type:
           type: string
           enum: [approval, check]
-        blocking_checks:
-          type: array
-          items: { type: string }
-          description: |
-            Named checks (e.g. `ci_pass`, `fishhawk_audit_complete`)
-            that must pass before the gate clears. v0 doesn't yet
-            persist per-stage check states; the review UI renders
-            the names with a "not tracked yet" placeholder until a
-            follow-up issue lands ingestion.
         approvers:
           oneOf:
             - type: "null"
@@ -1229,12 +1226,14 @@ paths:
       operationId: listStageChecks
       summary: Latest state per blocking check on a stage
       description: |
-        Returns the most-recent observed state for each blocking
-        check declared on the stage's gate (#228). `declared` is
-        the gate's `blocking_checks` list verbatim from the workflow
-        spec; `items` is the latest observed state per check name.
-        Declared-but-not-observed checks appear in `declared` but
-        not `items` — the SPA fills them with `not_tracked`.
+        Returns the most-recent observed state for each required
+        check on the stage's run (#228). `declared` is the run's
+        required-checks snapshot from GitHub branch protection
+        (#251 / ADR-017) — pre-#254 it sourced from the spec-level
+        `gate.blocking_checks` field, which has been dropped. `items`
+        is the latest observed state per check name. Declared-but-
+        not-observed checks appear in `declared` but not `items` —
+        the SPA fills them with `not_tracked`.
 
         State values per check are the SPA-facing rollup of GitHub's
         `status` + `conclusion` pair, or the backend's self-derived
@@ -1247,7 +1246,8 @@ paths:
         artifact, or audit-chain mismatch) so the SPA can render
         the failure reason without a secondary call. The check is
         computed on read from artifact + audit-log presence; no row
-        for it lands in `stage_checks`.
+        for it lands in `stage_checks`. The audit-complete row is
+        injected only for review stages.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }

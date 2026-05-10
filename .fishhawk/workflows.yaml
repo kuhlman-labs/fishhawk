@@ -11,7 +11,7 @@
 # When the product can execute this spec, the syntax may be revised to
 # match the frozen v0 schema. The intent expressed here will not change.
 
-version: "0.1"
+version: "0.2"
 
 roles:
   founder:
@@ -88,9 +88,6 @@ workflows:
           - type: approval
             approvers:
               any_of: [founder]
-            blocking_checks:
-              - "CI Pass"
-              - fishhawk_audit_complete
 
   # Low autonomy — human-led work.
   # Used for cryptographic, policy, and audit-integrity surfaces.
@@ -114,8 +111,6 @@ workflows:
           - type: approval
             approvers:
               any_of: [founder]
-            blocking_checks:
-              - "CI Pass"
 
   # High autonomy — agent implements and merges if gates pass.
   # Reserved for low-risk, high-volume work where the cost of a mistake
@@ -148,7 +143,9 @@ workflows:
         executor:
           agent: claude-code
         gates:
+          # ADR-017 (#249): GitHub branch protection (and a future
+          # gh pr merge --auto on the runner side, #255) own the
+          # merge-readiness gate for routine_change. The Fishhawk-
+          # side gate is degenerate now — it just lets the run
+          # advance once branch protection clears.
           - type: check
-            blocking_checks:
-              - "CI Pass"
-              - fishhawk_audit_complete

@@ -4,7 +4,7 @@
 # fixture: any change to the schema must keep this example valid, and
 # any change to this example must remain valid against the schema.
 
-version: "0.1"
+version: "0.2"
 
 roles:
   tech_lead:
@@ -80,6 +80,3 @@ workflows:
           - type: approval
             approvers:
               any_of: [senior_engineer]
-            blocking_checks:
-              - ci_pass
-              - fishhawk_audit_complete

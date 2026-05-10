@@ -37,8 +37,7 @@ func TestListStageChecks_PublishesAuditCompleteToGitHub(t *testing.T) {
 	rev := rr.seedStage(r.ID, 2, run.StageStateAwaitingApproval)
 	rev.Type = run.StageTypeReview
 	rev.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{AuditCompleteCheckName},
+		Kind: run.GateKindApproval,
 	}
 
 	au := newAuditCompleteAuditFake()
@@ -114,8 +113,7 @@ func TestListStageChecks_NoPublisher_StillSucceeds(t *testing.T) {
 	rev := rr.seedStage(r.ID, 2, run.StageStateAwaitingApproval)
 	rev.Type = run.StageTypeReview
 	rev.Gate = &run.Gate{
-		Kind:           run.GateKindApproval,
-		BlockingChecks: []string{AuditCompleteCheckName},
+		Kind: run.GateKindApproval,
 	}
 
 	au := newAuditCompleteAuditFake()

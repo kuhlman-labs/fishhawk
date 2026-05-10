@@ -75,8 +75,7 @@ func seedStage(t *testing.T, pool *pgxpool.Pool) (runID, stageID uuid.UUID) {
 		ExecutorKind: run.ExecutorHuman,
 		ExecutorRef:  "human",
 		Gate: &run.Gate{
-			Kind:           run.GateKindApproval,
-			BlockingChecks: []string{"ci_pass", "fishhawk_audit_complete"},
+			Kind: run.GateKindApproval,
 		},
 	})
 	if err != nil {
@@ -215,8 +214,7 @@ func TestFindMatchingStages_FiltersByPRAndCheck(t *testing.T) {
 		RunID: r.ID, Sequence: 1, Type: run.StageTypeReview,
 		ExecutorKind: run.ExecutorHuman, ExecutorRef: "human",
 		Gate: &run.Gate{
-			Kind:           run.GateKindApproval,
-			BlockingChecks: []string{"ci_pass"},
+			Kind: run.GateKindApproval,
 		},
 	})
 	if err != nil {
@@ -271,9 +269,21 @@ func TestFindMatchingStages_FiltersByPRAndCheck(t *testing.T) {
 	if len(stages) != 0 {
 		t.Errorf("expected empty, got %v", stages)
 	}
-	// Check not in the gate's blocking_checks: no match.
-	stages, _ = scRepo.FindMatchingStages(context.Background(), 42, "abc123", "some_other")
+	// Empty check name is a no-op (the SQL guard against the empty
+	// string from the migrated-away gate.blocking_checks shape).
+	stages, _ = scRepo.FindMatchingStages(context.Background(), 42, "abc123", "")
 	if len(stages) != 0 {
-		t.Errorf("expected empty, got %v", stages)
+		t.Errorf("empty check_name should match nothing, got %v", stages)
+	}
+
+	// Post-#254 (ADR-017): the query matches by stage_type = 'review'
+	// rather than the dropped gate.blocking_checks list. Any check
+	// name reported against a review stage's PR head_sha records,
+	// since branch protection is now the authority on which checks
+	// matter — Fishhawk just records what GitHub tells us.
+	stages, _ = scRepo.FindMatchingStages(context.Background(), 42, "abc123", "some_other")
+	if len(stages) != 1 || stages[0] != reviewStage.ID {
+		t.Errorf("post-#254 the check_name no longer filters; got %v want [%v]",
+			stages, reviewStage.ID)
 	}
 }

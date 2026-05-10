@@ -63,14 +63,20 @@ func (f *stageCheckRepoFake) FindMatchingStages(_ context.Context, _ int, _, _ s
 }
 
 // stageGetterRepo is a minimal run.Repository fake for the
-// checks-read handler — only GetStage is exercised.
+// checks-read handler. GetStage and GetRun are exercised — the
+// latter feeds the run's required-checks snapshot into the
+// `declared` list (#251 / #254).
 type stageGetterRepo struct {
 	stages map[uuid.UUID]*run.Stage
+	runs   map[uuid.UUID]*run.Run
 	getErr error
 }
 
 func newStageGetterRepo() *stageGetterRepo {
-	return &stageGetterRepo{stages: map[uuid.UUID]*run.Stage{}}
+	return &stageGetterRepo{
+		stages: map[uuid.UUID]*run.Stage{},
+		runs:   map[uuid.UUID]*run.Run{},
+	}
 }
 func (r *stageGetterRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
 	if r.getErr != nil {
@@ -84,8 +90,11 @@ func (r *stageGetterRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage,
 func (r *stageGetterRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
-func (r *stageGetterRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
-	return nil, errors.New("not used")
+func (r *stageGetterRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	if rn, ok := r.runs[id]; ok {
+		return rn, nil
+	}
+	return nil, run.ErrNotFound
 }
 func (r *stageGetterRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
 	return nil, run.ErrNotFound
@@ -132,13 +141,24 @@ func ptrStr(s string) *string { return &s }
 
 func TestListStageChecks_HappyPath(t *testing.T) {
 	s, rr, scs := newChecksServer(t)
+	runID := uuid.New()
 	stageID := uuid.New()
+	rr.runs[runID] = &run.Run{
+		ID: runID,
+		// #251 / #254: the response's `declared` list now sources
+		// from the run's branch-protection snapshot rather than the
+		// dropped spec-level gate.blocking_checks field.
+		RequiredChecksSnapshot: &run.RequiredChecksSnapshot{
+			Contexts: []string{"ci_pass", "fishhawk_audit_complete"},
+			Sources:  []string{"branch_protection"},
+		},
+	}
 	rr.stages[stageID] = &run.Stage{
-		ID:   stageID,
-		Type: run.StageTypeReview,
+		ID:    stageID,
+		RunID: runID,
+		Type:  run.StageTypeReview,
 		Gate: &run.Gate{
-			Kind:           run.GateKindApproval,
-			BlockingChecks: []string{"ci_pass", "fishhawk_audit_complete"},
+			Kind: run.GateKindApproval,
 		},
 	}
 	scs.seed(stageID, &stagecheck.Check{
@@ -171,15 +191,24 @@ func TestListStageChecks_HappyPath(t *testing.T) {
 func TestListStageChecks_DeclaredButNotObserved(t *testing.T) {
 	// Empty Items + non-empty Declared → SPA renders all as
 	// not_tracked. The handler doesn't fill in placeholder rows;
-	// the SPA does that derivation.
+	// the SPA does that derivation. `Declared` sources from the
+	// run's required-checks snapshot post-#254.
 	s, rr, _ := newChecksServer(t)
+	runID := uuid.New()
 	stageID := uuid.New()
+	rr.runs[runID] = &run.Run{
+		ID: runID,
+		RequiredChecksSnapshot: &run.RequiredChecksSnapshot{
+			Contexts: []string{"ci_pass"},
+			Sources:  []string{"branch_protection"},
+		},
+	}
 	rr.stages[stageID] = &run.Stage{
-		ID:   stageID,
-		Type: run.StageTypeReview,
+		ID:    stageID,
+		RunID: runID,
+		Type:  run.StageTypeReview,
 		Gate: &run.Gate{
-			Kind:           run.GateKindApproval,
-			BlockingChecks: []string{"ci_pass"},
+			Kind: run.GateKindApproval,
 		},
 	}
 	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s/checks", stageID), nil)

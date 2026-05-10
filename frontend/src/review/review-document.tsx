@@ -45,11 +45,14 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
   const isApprovalGate = gate?.type === 'approval';
   const showApprovalPanel = isApprovalGate && stage.state === 'awaiting_approval';
 
-  // Live blocking-check states (#228). Falls back to all-not-tracked
-  // when the endpoint is 503 (legacy deployments without check
-  // ingestion) or the request is in flight.
+  // Live check states (#228). Declared list and observed states
+  // both come from /v0/stages/{id}/checks: post-#254 the declared
+  // names live on the run's branch-protection snapshot (#251), not
+  // the spec. Falls back to an empty list when the endpoint is 503
+  // (legacy deployments without check ingestion) or the request is
+  // in flight.
   const checksResult = useAsync(() => api.listStageChecks(stage.id), [stage.id]);
-  const checks = mergeBlockingChecks(gate?.blocking_checks ?? [], checksResult);
+  const checks = mergeBlockingChecks(checksResult);
 
   return (
     <article className="max-w-3xl space-y-8 pb-20">
@@ -102,26 +105,25 @@ interface ChecksResponse {
   }>;
 }
 
-// mergeBlockingChecks pairs the gate's declared list with the most-
-// recent observed state from /v0/stages/{id}/checks. Declared-but-
-// not-observed checks render as `not_tracked`. Loading and error
-// states (including a 503 from a backend without check ingestion)
-// fall back to declaring everything as `not_tracked` so the panel
-// always renders the full gate without a flicker.
+// mergeBlockingChecks pairs the response's declared list (sourced
+// from the run's branch-protection snapshot post-#254) with the
+// most-recent observed state from /v0/stages/{id}/checks. Declared-
+// but-not-observed checks render as `not_tracked`. Loading and
+// error states (including a 503 from a backend without check
+// ingestion) return an empty list so the panel renders cleanly
+// without a flicker.
 function mergeBlockingChecks(
-  declared: string[],
   result:
     | { status: 'loading' }
     | { status: 'error'; error: Error }
     | { status: 'ok'; data: ChecksResponse },
 ): BlockingCheck[] {
+  if (result.status !== 'ok') return [];
   const observed = new Map<string, BlockingCheck['state']>();
-  if (result.status === 'ok') {
-    for (const item of result.data.items) {
-      observed.set(item.name, item.state);
-    }
+  for (const item of result.data.items) {
+    observed.set(item.name, item.state);
   }
-  return declared.map((name) => ({
+  return result.data.declared.map((name) => ({
     name,
     state: observed.get(name) ?? 'not_tracked',
   }));

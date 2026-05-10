@@ -7,7 +7,7 @@ Reference for `.fishhawk/workflows.yaml`. The canonical schema is [`workflow-v0.
 ## Top-level shape
 
 ```yaml
-version: "0.1"          # required, exactly "0.1" in v0
+version: "0.2"          # required, exactly "0.2" in v0
 roles:                  # optional; named groups referenced by gates
   <role_id>:
     members: ["@org/team", "@user"]
@@ -105,20 +105,19 @@ Two types:
   approvers:
     any_of: [tech_lead, senior_engineer]   # or all_of
   sla: 4_business_hours                    # optional; D-category timeout
-  blocking_checks: [ci_pass]               # optional pre-checks
 
-# Check gate — passes when all named checks succeed; no human approval.
+# Check gate — placeholder for workflows that delegate to GitHub branch
+# protection. Carries no spec-level fields in 0.2 (#254 / ADR-017).
 - type: check
-  blocking_checks: [ci_pass, fishhawk_audit_complete]
 ```
 
-`blocking_checks` are GitHub status check contexts (e.g. `ci_pass`) plus Fishhawk-internal ones (`fishhawk_audit_complete`).
+`blocking_checks` was removed in v0.2 (ADR-017 / #249). Required CI checks are now derived from GitHub branch protection / rulesets at run-create time and snapshotted onto the run row (#251). The `fishhawk_audit_complete` signal is still computed by Fishhawk (#229) and published as a Check Run on the PR (#231) so branch protection can enforce it.
 
 ## Identifier namespaces
 
 | Field | Pattern / values | Notes |
 |---|---|---|
-| `version` | `"0.1"` | v0 frozen value |
+| `version` | `"0.2"` | current value; 0.1 was frozen briefly before ADR-017 dropped `blocking_checks` (#254) |
 | Role / workflow / stage IDs | `^[a-z][a-z0-9_]*$` | snake_case |
 | Member refs | `^@[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$` | GitHub user or team |
 | Stage `type` | `plan` \| `implement` \| `review` | closed set |

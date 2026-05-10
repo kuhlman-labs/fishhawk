@@ -217,9 +217,8 @@ func TestGetStage_GateShapeOnWire(t *testing.T) {
 		ExecutorKind: run.ExecutorHuman, ExecutorRef: "human",
 		State: run.StageStateAwaitingApproval, CreatedAt: now, UpdatedAt: now,
 		Gate: &run.Gate{
-			Kind:           run.GateKindApproval,
-			BlockingChecks: []string{"ci_pass", "fishhawk_audit_complete"},
-			Approvers:      &run.GateApprovers{AnyOf: []string{"founder"}},
+			Kind:      run.GateKindApproval,
+			Approvers: &run.GateApprovers{AnyOf: []string{"founder"}},
 		},
 	}}
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
@@ -239,9 +238,6 @@ func TestGetStage_GateShapeOnWire(t *testing.T) {
 	}
 	if got.Gate.Type != "approval" {
 		t.Errorf("gate.type = %q, want approval", got.Gate.Type)
-	}
-	if len(got.Gate.BlockingChecks) != 2 {
-		t.Errorf("gate.blocking_checks = %v", got.Gate.BlockingChecks)
 	}
 	if got.Gate.Approvers == nil || len(got.Gate.Approvers.AnyOf) != 1 || got.Gate.Approvers.AnyOf[0] != "founder" {
 		t.Errorf("gate.approvers = %+v", got.Gate.Approvers)

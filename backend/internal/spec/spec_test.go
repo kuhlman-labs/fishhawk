@@ -26,8 +26,8 @@ func TestParse_CanonicalFeatureChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if s.Version != "0.1" {
-		t.Errorf("version = %q, want 0.1", s.Version)
+	if s.Version != "0.2" {
+		t.Errorf("version = %q, want 0.2", s.Version)
 	}
 	if got, want := len(s.Workflows), 1; got != want {
 		t.Errorf("workflows count = %d, want %d", got, want)
@@ -118,7 +118,7 @@ workflows:
 
 func TestParse_UnknownStageType(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 workflows:
   trivial:
     stages:
@@ -135,7 +135,7 @@ workflows:
 func TestParse_BothExecutorKinds(t *testing.T) {
 	// Schema's oneOf rejects {agent, human} together.
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 workflows:
   trivial:
     stages:
@@ -154,7 +154,7 @@ workflows:
 func TestParse_StageIDPattern(t *testing.T) {
 	// Stage IDs must be snake_case (^[a-z][a-z0-9_]*$).
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 workflows:
   trivial:
     stages:
@@ -170,7 +170,7 @@ workflows:
 
 func TestParse_UnknownArtifactKind(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 workflows:
   trivial:
     stages:
@@ -190,7 +190,7 @@ workflows:
 
 func TestParse_DuplicateStageIDs(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 workflows:
   trivial:
     stages:
@@ -217,7 +217,7 @@ workflows:
 
 func TestParse_DanglingFromStage(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 workflows:
   trivial:
     stages:
@@ -242,7 +242,7 @@ workflows:
 func TestParse_ForwardFromStage(t *testing.T) {
 	// from_stage may reference only earlier stages.
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 workflows:
   trivial:
     stages:
@@ -266,7 +266,7 @@ workflows:
 
 func TestParse_UndefinedApproverRole(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 roles:
   founder:
     members: ["@kuhlman-labs"]
@@ -292,7 +292,7 @@ workflows:
 
 func TestParse_PlanMissingSchema(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.1"
+version: "0.2"
 workflows:
   trivial:
     stages:
@@ -324,7 +324,7 @@ func TestValidate_BuiltProgrammatically(t *testing.T) {
 	// Confirms callers can build a Spec in-memory and run only the
 	// semantic layer without going through Parse.
 	s := &spec.Spec{
-		Version: "0.1",
+		Version: "0.2",
 		Roles: map[string]spec.Role{
 			"founder": {Members: []string{"@kuhlman-labs"}},
 		},
@@ -352,7 +352,7 @@ func TestValidate_BuiltProgrammatically(t *testing.T) {
 
 func TestParse_ReaderRoundTrip(t *testing.T) {
 	s, err := spec.Parse(strings.NewReader(`
-version: "0.1"
+version: "0.2"
 workflows:
   t:
     stages:

@@ -202,23 +202,34 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0017 added
-	// runs.required_checks_snapshot (#251); down drops it.
-	// Confirm: that column is gone, but every prior migration's
-	// effect is still present (parent_run_id + pull_request_url from
-	// 0016, stage_checks table from 0015, stages.gate_type from
-	// 0014, stages.requires_approval from 0013, signing_keys.id
-	// from 0012, runs.idempotency_key from 0011, users + sessions
-	// from 0010, audit run_id nullability from 0009, etc.).
-	var requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0018 dropped
+	// stages.gate_blocking_checks (#254); the down migration restores
+	// the column. Confirm: gate_blocking_checks is back, but every
+	// prior migration's effect is still present
+	// (required_checks_snapshot from 0017, parent_run_id +
+	// pull_request_url from 0016, stage_checks table from 0015,
+	// stages.gate_type from 0014, stages.requires_approval from 0013,
+	// signing_keys.id from 0012, runs.idempotency_key from 0011,
+	// users + sessions from 0010, audit run_id nullability from 0009,
+	// etc.).
+	var gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'stages' AND column_name = 'gate_blocking_checks'`,
+	).Scan(&gateBlockingChecksCol); err != nil {
+		t.Fatalf("query stages.gate_blocking_checks column: %v", err)
+	}
+	if gateBlockingChecksCol != 1 {
+		t.Errorf("stages.gate_blocking_checks count after MigrateDown = %d, want 1 (0018 down restored it)", gateBlockingChecksCol)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'runs' AND column_name = 'required_checks_snapshot'`,
 	).Scan(&requiredChecksCol); err != nil {
 		t.Fatalf("query runs.required_checks_snapshot column: %v", err)
 	}
-	if requiredChecksCol != 0 {
-		t.Errorf("runs.required_checks_snapshot count after MigrateDown = %d, want 0 (0017 rolled back)", requiredChecksCol)
+	if requiredChecksCol != 1 {
+		t.Errorf("runs.required_checks_snapshot count after MigrateDown = %d, want 1 (0017 still applied)", requiredChecksCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns

@@ -693,7 +693,7 @@ func (s *stubAudit) ListForRunByCategory(context.Context, uuid.UUID, string) ([]
 
 // validSpec is the canonical workflow YAML used in dispatcher
 // tests. Mirrors MVP_SPEC §4.2 in shape but with minimal content.
-const validSpec = `version: "0.1"
+const validSpec = `version: "0.2"
 roles:
   tech_lead:
     members: ["@kuhlman-labs"]
@@ -877,7 +877,7 @@ func TestHandle_HappyPath_CreatesStagesAndDispatchesFirst(t *testing.T) {
 
 func TestHandle_MultiStageSpec_OnlyFirstDispatched(t *testing.T) {
 	d, gh, runs, _ := newDispatcherWithStubs(t)
-	gh.specContent = []byte(`version: "0.1"
+	gh.specContent = []byte(`version: "0.2"
 roles:
   tech_lead:
     members: ["@x"]
@@ -960,7 +960,7 @@ func TestHandle_HumanStage_ExecutorRefIsConventional(t *testing.T) {
 	// stage's from_stage reference must resolve, so we keep both
 	// stages and assert the human one's executor mapping.
 	d, gh, runs, _ := newDispatcherWithStubs(t)
-	gh.specContent = []byte(`version: "0.1"
+	gh.specContent = []byte(`version: "0.2"
 roles:
   tech_lead:
     members: ["@x"]
@@ -1044,7 +1044,7 @@ func TestHandle_EmptyStagesSpec_NoRun(t *testing.T) {
 	// A workflow with no stages — schema requires at least one,
 	// but defense-in-depth: the dispatcher refuses rather than
 	// dispatching with no work to do.
-	gh.specContent = []byte(`version: "0.1"
+	gh.specContent = []byte(`version: "0.2"
 workflows:
   feature_change:
     description: empty
@@ -1320,7 +1320,7 @@ func TestHandle_SpecParseError_NoRun(t *testing.T) {
 func TestHandle_WorkflowIDNotInSpec_NoRun(t *testing.T) {
 	d, gh, runs, _ := newDispatcherWithStubs(t)
 	// Spec parses, but doesn't contain "feature_change".
-	gh.specContent = []byte(`version: "0.1"
+	gh.specContent = []byte(`version: "0.2"
 roles:
   tech_lead:
     members: ["@x"]
@@ -1448,7 +1448,7 @@ func TestHandle_PersistsRequiresApprovalPerStageGate(t *testing.T) {
 	// RequiresApproval=true at create time so the trace upload
 	// handler picks the right post-upload transition. Stages
 	// without an approval gate must have RequiresApproval=false.
-	const multiStageSpec = `version: "0.1"
+	const multiStageSpec = `version: "0.2"
 roles:
   founder:
     members: ["@kuhlman-labs"]
@@ -1520,20 +1520,19 @@ workflows:
 }
 
 func TestHandle_PersistsGateShapePerStage(t *testing.T) {
-	// Per #213: the dispatcher writes the *primary* gate's shape
-	// (type + blocking_checks + approvers) onto each stages row so
-	// the review-stage UI can render it without re-parsing the spec.
-	// Primary = first approval gate, else first check gate, else
-	// nil. v0 stages don't usually have multiple gates, but the
-	// review-stage gate is the canonical case where blocking_checks
-	// matter.
-	const spec = `version: "0.1"
+	// Per #213 the dispatcher writes the *primary* gate's shape
+	// (type + approvers) onto each stages row so the review-stage
+	// UI can render it without re-parsing the spec. Primary = first
+	// approval gate, else first check gate, else nil. The
+	// blocking_checks field was dropped in v0.2 (#254); required
+	// CI checks now live in branch protection (#251).
+	const spec = `version: "0.2"
 roles:
   founder:
     members: ["@kuhlman-labs"]
 workflows:
   feature_change:
-    description: review gate carries blocking_checks
+    description: review gate persists approvers
     stages:
       - id: plan
         type: plan
@@ -1561,9 +1560,6 @@ workflows:
         gates:
           - type: approval
             approvers: { any_of: [founder] }
-            blocking_checks:
-              - ci_pass
-              - fishhawk_audit_complete
 `
 	d, gh, runs, _ := newDispatcherWithStubs(t)
 	gh.specContent = []byte(spec)
@@ -1583,24 +1579,18 @@ workflows:
 	if plan.Gate != nil && plan.Gate.Approvers == nil {
 		t.Errorf("plan.Gate.Approvers = nil, want any_of:[founder]")
 	}
-	if plan.Gate != nil && len(plan.Gate.BlockingChecks) != 0 {
-		t.Errorf("plan.Gate.BlockingChecks = %v, want empty (none in spec)", plan.Gate.BlockingChecks)
-	}
 
 	// implement stage has no gates: Gate must be nil.
 	if implement.Gate != nil {
 		t.Errorf("implement.Gate = %+v, want nil (no gates in spec)", implement.Gate)
 	}
 
-	// review stage carries the blocking_checks the UI needs to render.
+	// review stage carries the approver list the UI needs to render.
 	if review.Gate == nil {
-		t.Fatal("review.Gate = nil, want approval gate with blocking_checks")
+		t.Fatal("review.Gate = nil, want approval gate with approvers")
 	}
 	if review.Gate.Kind != run.GateKindApproval {
 		t.Errorf("review.Gate.Kind = %q, want approval", review.Gate.Kind)
-	}
-	if got := review.Gate.BlockingChecks; len(got) != 2 || got[0] != "ci_pass" || got[1] != "fishhawk_audit_complete" {
-		t.Errorf("review.Gate.BlockingChecks = %v, want [ci_pass, fishhawk_audit_complete]", got)
 	}
 	if review.Gate.Approvers == nil || len(review.Gate.Approvers.AnyOf) != 1 || review.Gate.Approvers.AnyOf[0] != "founder" {
 		t.Errorf("review.Gate.Approvers = %+v, want any_of:[founder]", review.Gate.Approvers)
@@ -2020,7 +2010,7 @@ func TestPickPrimaryGate(t *testing.T) {
 	// Approval wins over check, in any order, even if the check
 	// gate appears first in the spec — the review-stage UI's
 	// approval-vs-check decision depends on the right pick.
-	checkGate := spec.Gate{Type: spec.GateTypeCheck, BlockingChecks: []string{"ci_pass"}}
+	checkGate := spec.Gate{Type: spec.GateTypeCheck}
 	approvalGate := spec.Gate{Type: spec.GateTypeApproval, Approvers: &spec.Approvers{AnyOf: []string{"founder"}}}
 
 	if got := pickPrimaryGate([]spec.Gate{checkGate, approvalGate}); got == nil || got.Type != spec.GateTypeApproval {

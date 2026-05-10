@@ -74,25 +74,24 @@ const createStage = `-- name: CreateStage :one
 INSERT INTO stages (
     id, run_id, sequence, stage_type, executor_kind, executor_ref, state,
     gate_sla, requires_approval,
-    gate_type, gate_blocking_checks, gate_approvers
+    gate_type, gate_approvers
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_blocking_checks, gate_approvers
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers
 `
 
 type CreateStageParams struct {
-	ID                 uuid.UUID `json:"id"`
-	RunID              uuid.UUID `json:"run_id"`
-	Sequence           int32     `json:"sequence"`
-	StageType          string    `json:"stage_type"`
-	ExecutorKind       string    `json:"executor_kind"`
-	ExecutorRef        string    `json:"executor_ref"`
-	State              string    `json:"state"`
-	GateSla            *string   `json:"gate_sla"`
-	RequiresApproval   bool      `json:"requires_approval"`
-	GateType           *string   `json:"gate_type"`
-	GateBlockingChecks []string  `json:"gate_blocking_checks"`
-	GateApprovers      []byte    `json:"gate_approvers"`
+	ID               uuid.UUID `json:"id"`
+	RunID            uuid.UUID `json:"run_id"`
+	Sequence         int32     `json:"sequence"`
+	StageType        string    `json:"stage_type"`
+	ExecutorKind     string    `json:"executor_kind"`
+	ExecutorRef      string    `json:"executor_ref"`
+	State            string    `json:"state"`
+	GateSla          *string   `json:"gate_sla"`
+	RequiresApproval bool      `json:"requires_approval"`
+	GateType         *string   `json:"gate_type"`
+	GateApprovers    []byte    `json:"gate_approvers"`
 }
 
 func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage, error) {
@@ -107,7 +106,6 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 		arg.GateSla,
 		arg.RequiresApproval,
 		arg.GateType,
-		arg.GateBlockingChecks,
 		arg.GateApprovers,
 	)
 	var i Stage
@@ -128,7 +126,6 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 		&i.GateSla,
 		&i.RequiresApproval,
 		&i.GateType,
-		&i.GateBlockingChecks,
 		&i.GateApprovers,
 	)
 	return i, err
@@ -197,7 +194,7 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 }
 
 const getStage = `-- name: GetStage :one
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_blocking_checks, gate_approvers FROM stages WHERE id = $1
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages WHERE id = $1
 `
 
 func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
@@ -220,7 +217,6 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 		&i.GateSla,
 		&i.RequiresApproval,
 		&i.GateType,
-		&i.GateBlockingChecks,
 		&i.GateApprovers,
 	)
 	return i, err
@@ -299,7 +295,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 }
 
 const listStagesAwaitingApproval = `-- name: ListStagesAwaitingApproval :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_blocking_checks, gate_approvers FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages
  WHERE state = 'awaiting_approval'
    AND gate_sla IS NOT NULL
  ORDER BY updated_at ASC
@@ -337,7 +333,6 @@ func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, erro
 			&i.GateSla,
 			&i.RequiresApproval,
 			&i.GateType,
-			&i.GateBlockingChecks,
 			&i.GateApprovers,
 		); err != nil {
 			return nil, err
@@ -351,7 +346,7 @@ func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, erro
 }
 
 const listStagesDispatched = `-- name: ListStagesDispatched :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_blocking_checks, gate_approvers FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages
  WHERE state = 'dispatched'
  ORDER BY updated_at ASC
 `
@@ -387,7 +382,6 @@ func (q *Queries) ListStagesDispatched(ctx context.Context) ([]Stage, error) {
 			&i.GateSla,
 			&i.RequiresApproval,
 			&i.GateType,
-			&i.GateBlockingChecks,
 			&i.GateApprovers,
 		); err != nil {
 			return nil, err
@@ -401,7 +395,7 @@ func (q *Queries) ListStagesDispatched(ctx context.Context) ([]Stage, error) {
 }
 
 const listStagesForRun = `-- name: ListStagesForRun :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_blocking_checks, gate_approvers FROM stages WHERE run_id = $1 ORDER BY sequence ASC
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages WHERE run_id = $1 ORDER BY sequence ASC
 `
 
 func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stage, error) {
@@ -430,7 +424,6 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 			&i.GateSla,
 			&i.RequiresApproval,
 			&i.GateType,
-			&i.GateBlockingChecks,
 			&i.GateApprovers,
 		); err != nil {
 			return nil, err
@@ -470,7 +463,7 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 }
 
 const lockStageForUpdate = `-- name: LockStageForUpdate :one
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_blocking_checks, gate_approvers FROM stages WHERE id = $1 FOR UPDATE
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, error) {
@@ -493,7 +486,6 @@ func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, 
 		&i.GateSla,
 		&i.RequiresApproval,
 		&i.GateType,
-		&i.GateBlockingChecks,
 		&i.GateApprovers,
 	)
 	return i, err
@@ -579,7 +571,7 @@ UPDATE stages
        failure_category = $5,
        failure_reason   = $6
  WHERE id = $1
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_blocking_checks, gate_approvers
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers
 `
 
 type UpdateStageStateParams struct {
@@ -618,7 +610,6 @@ func (q *Queries) UpdateStageState(ctx context.Context, arg UpdateStageStatePara
 		&i.GateSla,
 		&i.RequiresApproval,
 		&i.GateType,
-		&i.GateBlockingChecks,
 		&i.GateApprovers,
 	)
 	return i, err

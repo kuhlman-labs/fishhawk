@@ -183,12 +183,10 @@ func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*S
 	q := rundb.New(r.pool)
 
 	var gateType *string
-	var blockingChecks []string
 	var approversBytes []byte
 	if p.Gate != nil {
 		k := string(p.Gate.Kind)
 		gateType = &k
-		blockingChecks = p.Gate.BlockingChecks
 		if p.Gate.Approvers != nil {
 			b, err := json.Marshal(p.Gate.Approvers)
 			if err != nil {
@@ -199,18 +197,17 @@ func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*S
 	}
 
 	row, err := q.CreateStage(ctx, rundb.CreateStageParams{
-		ID:                 uuid.New(),
-		RunID:              p.RunID,
-		Sequence:           int32(p.Sequence),
-		StageType:          string(p.Type),
-		ExecutorKind:       string(p.ExecutorKind),
-		ExecutorRef:        p.ExecutorRef,
-		State:              string(StageStatePending),
-		GateSla:            p.GateSLA,
-		RequiresApproval:   p.RequiresApproval,
-		GateType:           gateType,
-		GateBlockingChecks: blockingChecks,
-		GateApprovers:      approversBytes,
+		ID:               uuid.New(),
+		RunID:            p.RunID,
+		Sequence:         int32(p.Sequence),
+		StageType:        string(p.Type),
+		ExecutorKind:     string(p.ExecutorKind),
+		ExecutorRef:      p.ExecutorRef,
+		State:            string(StageStatePending),
+		GateSla:          p.GateSLA,
+		RequiresApproval: p.RequiresApproval,
+		GateType:         gateType,
+		GateApprovers:    approversBytes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create stage: %w", err)
@@ -441,10 +438,11 @@ func rowToStage(s rundb.Stage) *Stage {
 	if s.GateType != nil {
 		// Pre-#213 rows have NULL gate_type; nil Gate is the right
 		// projection in that case (mirror dispatcher's logic that
-		// only writes Gate when the spec defines one).
+		// only writes Gate when the spec defines one). The
+		// gate_blocking_checks column was dropped in migration 0018
+		// (#254).
 		gate := &Gate{
-			Kind:           GateKind(*s.GateType),
-			BlockingChecks: s.GateBlockingChecks,
+			Kind: GateKind(*s.GateType),
 		}
 		if len(s.GateApprovers) > 0 {
 			var ap GateApprovers

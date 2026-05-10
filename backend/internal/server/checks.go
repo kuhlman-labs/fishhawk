@@ -33,11 +33,11 @@ type stageCheckResponse struct {
 }
 
 // stageChecksListResponse is the envelope for GET /v0/stages/{id}/checks.
-// `declared` is the gate's blocking_checks list as written in the
-// workflow spec; `items` is the latest observed state per check
-// name. Declared-but-not-observed checks render in the SPA as
-// `not_tracked`; the response itself only carries observed rows
-// since the SPA already knows the declared list from the stage.
+// `declared` is the run's required-checks snapshot from branch
+// protection (post-#251 / ADR-017); `items` is the latest observed
+// state per check name. Declared-but-not-observed checks render in
+// the SPA as `not_tracked`; the response itself only carries
+// observed rows since the SPA already knows the declared list.
 type stageChecksListResponse struct {
 	Declared []string             `json:"declared"`
 	Items    []stageCheckResponse `json:"items"`
@@ -83,22 +83,30 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Source the declared list from the run's required-checks
+	// snapshot (#251 / ADR-017): the spec-level gate.blocking_checks
+	// field was removed in v0.2 (#254). Best-effort — a run that
+	// pre-dates the snapshot wiring or skipped protection lookup
+	// (CLI / UI flow) renders an empty declared list and the SPA
+	// falls back to "no checks declared yet".
 	declared := []string{}
-	if stage.Gate != nil {
-		declared = stage.Gate.BlockingChecks
+	runRow, runErr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
+	if runErr == nil && runRow.RequiredChecksSnapshot != nil {
+		declared = runRow.RequiredChecksSnapshot.Contexts
 	}
 	items := make([]stageCheckResponse, 0, len(checks))
 	for _, c := range checks {
 		items = append(items, toStageCheckResponse(c))
 	}
 
-	// Inject the self-derived fishhawk_audit_complete row when the
-	// gate declares it (#229). Computed live from the run's
-	// artifact + audit-log presence; carries the structured
-	// `missing` list so the SPA can show "fail because: plan
-	// missing, redacted trace missing on stage X" without a
-	// secondary call.
-	if containsString(declared, AuditCompleteCheckName) && s.cfg.ArtifactRepo != nil && s.cfg.AuditRepo != nil {
+	// Inject the self-derived fishhawk_audit_complete row for review
+	// stages — the only stage type where the audit-complete signal
+	// is meaningful (it gates the merge via the published Check Run
+	// per #231). Computed live from the run's artifact + audit-log
+	// presence; carries the structured `missing` list so the SPA
+	// can show "fail because: plan missing, redacted trace missing
+	// on stage X" without a secondary call.
+	if stage.Type == run.StageTypeReview && s.cfg.ArtifactRepo != nil && s.cfg.AuditRepo != nil {
 		state, missing, err := auditcomplete.Compute(r.Context(), stage.RunID, auditcomplete.Deps{
 			Runs:      s.cfg.RunRepo,
 			Artifacts: s.cfg.ArtifactRepo,
@@ -128,15 +136,6 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 		Declared: declared,
 		Items:    items,
 	})
-}
-
-func containsString(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
 }
 
 // publishAuditCheck is the small adapter between the server's
