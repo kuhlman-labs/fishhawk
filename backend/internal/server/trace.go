@@ -17,7 +17,6 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -425,38 +424,39 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 		return true
 	}
 
-	// Diff: tolerate "no diff in bundle" by treating it as an
-	// empty diff. The runner emits a git_diff event whenever
-	// --check-base-ref is set (#247); older runners / stages
-	// without diff data still need the SPA to render a pass-state
-	// rather than "pending."
-	diff, err := bundle.ExtractDiff(bundleBytes)
-	if err != nil {
-		if !errors.Is(err, bundle.ErrNoDiffEvent) {
-			logger.LogAttrs(ctx, slog.LevelWarn, "policy: extract diff failed",
-				slog.String("stage_id", stageID.String()),
-				slog.String("error", err.Error()))
-			return true
-		}
-		diff = policy.Diff{} // empty diff; carry on so we emit an audit entry
-	}
+	stageType := string(stage.Type)
 
-	constraints, err := s.fetchStageConstraints(ctx, runRow, string(stage.Type))
-	if err != nil {
-		logger.LogAttrs(ctx, slog.LevelWarn, "policy: fetch constraints failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_type", string(stage.Type)),
-			slog.String("error", err.Error()))
+	// Diff extraction: ErrNoDiffEvent is a known-empty case, emit
+	// skipped with no_diff_in_bundle so the SPA can render the
+	// reason rather than "pending" (#283). Other ExtractDiff errors
+	// also flow through the skip path — the diff is unparseable, but
+	// the audit story is "we tried; here's why we couldn't."
+	diff, diffErr := bundle.ExtractDiff(bundleBytes)
+	if diffErr != nil {
+		reason := policy.SkipNoDiffInBundle
+		s.emitPolicySkipped(ctx, runID, stageID, stageType, reason, diffErr.Error())
 		return true
 	}
 
-	// Always emit, even when the constraints are empty (nothing
-	// to violate; render as "Policy passed · No constraints
-	// configured" rather than "pending"). EmitEvaluation handles
-	// the empty case cleanly — Evaluate returns no violations,
-	// the row carries Applied={} and Passed=true.
+	// Constraints: load from the cached spec on the run row (#283).
+	// Failures are categorized so the audit signals the right cause.
+	constraints, skipReason, skipDetail, ok := s.loadStageConstraintsFromCache(runRow, stageType)
+	if !ok {
+		logger.LogAttrs(ctx, slog.LevelWarn, "policy: load constraints skipped",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_type", stageType),
+			slog.String("skip_reason", string(skipReason)),
+			slog.String("detail", skipDetail))
+		s.emitPolicySkipped(ctx, runID, stageID, stageType, skipReason, skipDetail)
+		return true
+	}
+
+	// Happy path: real evaluation. EmitEvaluation handles the empty-
+	// constraints case cleanly — Evaluate returns no violations, the
+	// row carries Applied={} and Passed=true. SPA renders "Policy
+	// passed · No constraints configured."
 	violations, err := policy.EmitEvaluation(ctx, s.cfg.AuditRepo,
-		runID, stageID, string(stage.Type), diff, constraints, nil)
+		runID, stageID, stageType, diff, constraints, nil)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "policy: emit evaluation failed",
 			slog.String("stage_id", stageID.String()),
@@ -466,70 +466,60 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 	return len(violations) == 0
 }
 
-// workflowSpecFetcher is the slice of githubclient.Client the
-// policy re-eval path consumes. Defining the interface here lets
-// tests substitute a stub without standing up a fake api.github.com.
-type workflowSpecFetcher interface {
-	GetWorkflowSpec(ctx context.Context, installationID int64,
-		repo githubclient.RepoRef, ref string) (*githubclient.FileContent, error)
+// emitPolicySkipped is a thin wrapper around policy.EmitEvaluationSkipped
+// that logs the audit-write failure as WARN rather than returning it.
+// The trace upload is already stored at this point; failing the
+// handler just for a skipped-emit doesn't help anyone.
+func (s *Server) emitPolicySkipped(ctx context.Context, runID, stageID uuid.UUID,
+	stageType string, reason policy.SkipReason, detail string) {
+	if err := policy.EmitEvaluationSkipped(ctx, s.cfg.AuditRepo,
+		runID, stageID, stageType, reason, detail); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "policy: emit skipped audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("skip_reason", string(reason)),
+			slog.String("error", err.Error()))
+	}
 }
 
-// workflowSpecFetcher resolves the configured fetcher (test
-// override takes precedence over cfg.GitHub).
-func (s *Server) workflowSpecFetcher() workflowSpecFetcher {
-	if s.traceWorkflowSpecOverride != nil {
-		return s.traceWorkflowSpecOverride
+// loadStageConstraintsFromCache reads constraints from the cached
+// workflow spec on the run row (#283). Returns (constraints, "", "",
+// true) on success and (zero, reason, detail, false) when the cache
+// can't yield constraints — the caller emits a skip audit with the
+// reason and treats the stage as policy-pass.
+//
+// Pre-#283 this called GitHub directly using `runRow.WorkflowSHA` as
+// the contents-API `ref`, but that's a blob SHA, not a commit / branch
+// ref — GitHub returned 404, the function errored, and the trace
+// handler skipped the audit emission, leaving the SPA's <PolicySection>
+// stuck on "pending."
+func (*Server) loadStageConstraintsFromCache(runRow *run.Run, stageType string) (
+	policy.Constraints, policy.SkipReason, string, bool,
+) {
+	if len(runRow.WorkflowSpec) == 0 {
+		// Legacy row created before #283's migration, or a CLI / UI
+		// flow that didn't fetch a spec. No constraints to evaluate
+		// against; surface the reason in the audit instead of going
+		// silent.
+		return policy.Constraints{}, policy.SkipSpecUnavailable,
+			"run row has no cached workflow spec (legacy or non-dispatcher flow)", false
 	}
-	if s.cfg.GitHub == nil {
-		return nil
-	}
-	return s.cfg.GitHub
-}
-
-// fetchStageConstraints fetches the workflow spec at the run's
-// pinned SHA, finds the workflow + stage definition, and merges the
-// stage's constraint list into a single policy.Constraints. Returns
-// a zero-value Constraints (no rules) when the stage has no
-// constraints block — the caller treats that as "no policy applies."
-func (s *Server) fetchStageConstraints(ctx context.Context, runRow *run.Run, stageType string) (policy.Constraints, error) {
-	github := s.workflowSpecFetcher()
-	if github == nil {
-		return policy.Constraints{}, errors.New("github client not configured")
-	}
-	if runRow.InstallationID == nil {
-		return policy.Constraints{}, errors.New("run missing installation_id")
-	}
-	repo, err := parseRepoOwnerName(runRow.Repo)
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
-		return policy.Constraints{}, err
+		return policy.Constraints{}, policy.SkipSpecUnparseable, err.Error(), false
 	}
-
-	// Use the workflow_sha as the ref so we re-parse exactly the
-	// spec the dispatcher validated at run-create time. Stable
-	// across rebases of main.
-	ref := runRow.WorkflowSHA
-	if ref == "" {
-		ref = "main"
-	}
-	specFile, err := github.GetWorkflowSpec(ctx, *runRow.InstallationID, repo, ref)
-	if err != nil {
-		return policy.Constraints{}, fmt.Errorf("get workflow spec: %w", err)
-	}
-	parsed, err := spec.ParseBytes(specFile.Content)
-	if err != nil {
-		return policy.Constraints{}, fmt.Errorf("parse workflow spec: %w", err)
-	}
-
 	wf, ok := parsed.Workflows[runRow.WorkflowID]
 	if !ok {
-		return policy.Constraints{}, fmt.Errorf("workflow %q not in spec", runRow.WorkflowID)
+		return policy.Constraints{}, policy.SkipWorkflowNotInSpec,
+			fmt.Sprintf("workflow %q not in cached spec", runRow.WorkflowID), false
 	}
 	for _, stg := range wf.Stages {
 		if string(stg.Type) == stageType {
-			return mergeConstraints(stg.Constraints), nil
+			return mergeConstraints(stg.Constraints), "", "", true
 		}
 	}
-	return policy.Constraints{}, fmt.Errorf("stage_type %q not in workflow %q", stageType, runRow.WorkflowID)
+	return policy.Constraints{}, policy.SkipStageNotInSpec,
+		fmt.Sprintf("stage_type %q not in workflow %q", stageType, runRow.WorkflowID), false
 }
 
 // mergeConstraints folds the spec's []spec.Constraint (each entry a

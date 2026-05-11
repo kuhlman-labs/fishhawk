@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -180,9 +182,12 @@ workflows:
 
 // newPolicyTraceServer wires a Server with the full policy
 // re-eval stack: signing, tracestore, audit, run repo (with stage
-// + run rows), and a workflow spec fetcher stub.
+// + run rows). The run row's WorkflowSpec is populated from
+// testWorkflowSpec so the trace handler's policy re-eval reads
+// constraints from the cache (#283) rather than refetching from
+// GitHub.
 func newPolicyTraceServer(t *testing.T, files []map[string]string) (
-	*Server, *signingFake, *policyRunRepo, *auditFake, *stubWorkflowSpecFetcher,
+	*Server, *signingFake, *policyRunRepo, *auditFake,
 ) {
 	t.Helper()
 	stageID := uuid.New()
@@ -209,15 +214,17 @@ func newPolicyTraceServer(t *testing.T, files []map[string]string) (
 		WorkflowID:     "feature_change",
 		WorkflowSHA:    "abc123",
 		InstallationID: &installation,
+		// Cache the spec on the run row (#283). The trace handler's
+		// policy re-eval reads constraints from here instead of
+		// refetching from GitHub.
+		WorkflowSpec: []byte(testWorkflowSpec),
 	}
 	repo := newPolicyRunRepo(stage, runRow)
-	gh := &stubWorkflowSpecFetcher{content: []byte(testWorkflowSpec), sha: "abc123"}
 
 	s, sf, _, au := newTraceServer(t)
 	s.cfg.RunRepo = repo
-	s.traceWorkflowSpecOverride = gh
 	_ = files
-	return s, sf, repo, au, gh
+	return s, sf, repo, au
 }
 
 func TestShipTrace_PolicyReEval_CleanDiff_AwaitingApproval(t *testing.T) {
@@ -225,7 +232,7 @@ func TestShipTrace_PolicyReEval_CleanDiff_AwaitingApproval(t *testing.T) {
 		{"path": "backend/main.go", "status": "M"},
 		{"path": "backend/main_test.go", "status": "A"},
 	}
-	s, sf, repo, au, gh := newPolicyTraceServer(t, clean)
+	s, sf, repo, au := newPolicyTraceServer(t, clean)
 	bundle := makeTestBundle(t, clean)
 	priv, _ := sf.issue(t, repo.runRow.ID)
 
@@ -253,9 +260,6 @@ func TestShipTrace_PolicyReEval_CleanDiff_AwaitingApproval(t *testing.T) {
 	if !hasPolicy {
 		t.Errorf("expected policy_evaluated audit entry, got categories %v", categories)
 	}
-	if gh.calls != 1 {
-		t.Errorf("workflow spec fetched %d times, want 1", gh.calls)
-	}
 }
 
 func TestShipTrace_PolicyReEval_ForbiddenPath_FailedB(t *testing.T) {
@@ -263,7 +267,7 @@ func TestShipTrace_PolicyReEval_ForbiddenPath_FailedB(t *testing.T) {
 		{"path": "infra/terraform.tf", "status": "M"},
 		{"path": "backend/main.go", "status": "M"},
 	}
-	s, sf, repo, au, _ := newPolicyTraceServer(t, violating)
+	s, sf, repo, au := newPolicyTraceServer(t, violating)
 	bundle := makeTestBundle(t, violating)
 	priv, _ := sf.issue(t, repo.runRow.ID)
 
@@ -298,13 +302,14 @@ func TestShipTrace_PolicyReEval_ForbiddenPath_FailedB(t *testing.T) {
 	}
 }
 
-func TestShipTrace_PolicyReEval_NoDiffEvent_FallsBackToAwaitingApproval(t *testing.T) {
+func TestShipTrace_PolicyReEval_NoDiffEvent_EmitsSkippedAndAdvances(t *testing.T) {
 	// Older-runner case (or stage that doesn't produce a diff): no
-	// git_diff event in the bundle. Re-eval treats this as an
-	// empty diff and STILL emits a policy_evaluated audit entry
-	// (#247) so the SPA's policy section renders the pass state
-	// instead of "pending."
-	s, sf, repo, au, _ := newPolicyTraceServer(t, nil)
+	// git_diff event in the bundle. The trace handler emits a
+	// policy_evaluated audit entry with `skip_reason =
+	// no_diff_in_bundle` (#283 — was previously rendered as a
+	// generic pass via #247; #283 made the skip reason structured
+	// so the SPA can render it precisely).
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
 	bundle := makeTestBundle(t, nil) // no files = no git_diff event
 	priv, _ := sf.issue(t, repo.runRow.ID)
 
@@ -315,37 +320,63 @@ func TestShipTrace_PolicyReEval_NoDiffEvent_FallsBackToAwaitingApproval(t *testi
 	if repo.stage.State != run.StageStateAwaitingApproval {
 		t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
 	}
-	// Pre-#247 behavior was a silent skip — no audit row. Now we
-	// emit one so the SPA can render "Policy passed" instead of
-	// "Policy evaluation pending."
 	au.mu.Lock()
 	defer au.mu.Unlock()
-	hasPolicy := false
-	for _, e := range au.appended {
-		if e.Category == "policy_evaluated" {
-			hasPolicy = true
+	var policyEntry *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "policy_evaluated" {
+			policyEntry = &au.appended[i]
+			break
 		}
 	}
-	if !hasPolicy {
-		t.Errorf("expected policy_evaluated audit entry even without a git_diff in the bundle")
+	if policyEntry == nil {
+		t.Fatalf("expected policy_evaluated audit entry; got %v", categoryNames(au.appended))
+	}
+	if !strings.Contains(string(policyEntry.Payload), `"skip_reason":"no_diff_in_bundle"`) {
+		t.Errorf("payload missing skip_reason=no_diff_in_bundle:\n%s", policyEntry.Payload)
 	}
 }
 
-func TestShipTrace_PolicyReEval_SpecFetchFails_ProceedsToAwaitingApproval(t *testing.T) {
+func TestShipTrace_PolicyReEval_NoCachedSpec_EmitsSkippedAndProceedsToAwaitingApproval(t *testing.T) {
+	// Legacy run row (pre-#283 migration) has no cached spec bytes.
+	// The trace handler must emit a `policy_evaluated` audit entry
+	// with `skip_reason = spec_unavailable` instead of leaving the
+	// SPA's <PolicySection> stuck on "pending" (the bug #283 fixed).
+	// Pre-#283 this code path tried to refetch the spec from GitHub
+	// using `runRow.WorkflowSHA` as the contents-API ref — but the
+	// SHA was a blob SHA, not a commit ref, so GitHub returned 404
+	// for every call.
 	clean := []map[string]string{{"path": "backend/main.go", "status": "M"}}
-	s, sf, repo, _, gh := newPolicyTraceServer(t, clean)
-	gh.getErr = errors.New("github down")
-	bundle := makeTestBundle(t, clean)
+	s, sf, repo, au := newPolicyTraceServer(t, clean)
+	repo.runRow.WorkflowSpec = nil // simulate legacy row
+	bundleBytes := makeTestBundle(t, clean)
 	priv, _ := sf.issue(t, repo.runRow.ID)
 
-	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, bundle, "")
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, bundleBytes, "")
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 	}
-	// Best-effort: spec fetch failure shouldn't black-hole the
-	// stage. Advance to awaiting_approval.
+	// Best-effort: a missing cache shouldn't black-hole the stage.
 	if repo.stage.State != run.StageStateAwaitingApproval {
 		t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
+	}
+	// The audit row STILL lands, with the skip_reason populated so
+	// the SPA can render the reason instead of "pending."
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var policyEntry *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "policy_evaluated" {
+			policyEntry = &au.appended[i]
+			break
+		}
+	}
+	if policyEntry == nil {
+		t.Fatalf("expected a policy_evaluated audit entry with skip_reason; got categories %v",
+			categoryNames(au.appended))
+	}
+	if !strings.Contains(string(policyEntry.Payload), `"skip_reason":"spec_unavailable"`) {
+		t.Errorf("payload missing skip_reason=spec_unavailable:\n%s", policyEntry.Payload)
 	}
 }
 
@@ -353,7 +384,7 @@ func TestShipTrace_PolicyReEval_SpecFetchFails_ProceedsToAwaitingApproval(t *tes
 // flips the stage to failed-A — bypassing both the policy
 // re-evaluation and the awaiting_approval advance.
 func TestShipTrace_AgentFailed_TransitionsToFailedA(t *testing.T) {
-	s, sf, repo, _, _ := newPolicyTraceServer(t, nil)
+	s, sf, repo, _ := newPolicyTraceServer(t, nil)
 	bundleBytes := makeTestBundleAgentFailed(t, "agent process exited 137 (OOM)")
 	priv, _ := sf.issue(t, repo.runRow.ID)
 
@@ -374,7 +405,7 @@ func TestShipTrace_AgentFailed_TransitionsToFailedA(t *testing.T) {
 }
 
 func TestShipTrace_AgentFailedNoReason_StampsFallbackString(t *testing.T) {
-	s, sf, repo, _, _ := newPolicyTraceServer(t, nil)
+	s, sf, repo, _ := newPolicyTraceServer(t, nil)
 	bundleBytes := makeTestBundleAgentFailed(t, "") // no reason supplied
 	priv, _ := sf.issue(t, repo.runRow.ID)
 
@@ -445,4 +476,15 @@ func TestIsEmptyConstraints(t *testing.T) {
 	if isEmptyConstraints(policy.Constraints{MaxFilesChanged: 1}) {
 		t.Error("non-empty Constraints flagged as empty")
 	}
+}
+
+// categoryNames is a tiny helper for error messages: list the
+// audit categories that landed on the fake so the assertion can
+// say "got [x, y, z]" without a manual loop in each test.
+func categoryNames(entries []audit.ChainAppendParams) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Category)
+	}
+	return out
 }
