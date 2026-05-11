@@ -39,6 +39,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -57,8 +58,9 @@ type Kind string
 
 // Kind values.
 const (
-	KindPickup Kind = "pickup"
-	KindPlan   Kind = "plan"
+	KindPickup       Kind = "pickup"
+	KindPlan         Kind = "plan"
+	KindPlanApproved Kind = "plan_approved"
 )
 
 // IssueCommenter is the slice of githubclient.Client this package
@@ -163,6 +165,50 @@ func (n *Notifier) NotifyPlanReady(ctx context.Context, runID uuid.UUID, planSta
 	}
 	body := renderPlanBody(ctxv, planStage, planArtifact, n.externalURL)
 	return n.post(ctx, ctxv, KindPlan, body)
+}
+
+// NotifyPlanApproved posts the "plan approved → implementing now"
+// comment back on the originating issue (#274). Closes the
+// feedback-loop gap between NotifyPlanReady ("here's the plan,
+// approve in the dashboard") and the eventual PR-open signal:
+// without this comment the conversation goes "plan ready → … long
+// silence → PR opened" from the labeler's POV.
+//
+// Best-effort: returns errors so callers can log them, but a
+// comment failure should NOT unwind the approval — the gate is
+// already cleared and the audit row is in place.
+//
+// Skips silently when:
+//   - The receiver is nil.
+//   - `decision != approve` — reject already gets a tailored
+//     reply via NotifySlashApprovalReply on the slash path, and
+//     the HTTP path lands the reviewer back on the dashboard.
+//     Broadcasting reject to the issue thread is a separate UX.
+//   - The run isn't issue-triggered (CLI / PR / etc.), is missing
+//     installation_id, or has an unparseable trigger_ref.
+//   - A plan_approved comment already landed for this run
+//     (audit-log dedup mirrors the pickup / plan-ready paths).
+//
+// `approverLogin` is the GitHub login resolved from the approval
+// surface — `IdentityFrom(ctx).Subject` on the HTTP path,
+// `ApprovalCommandParams.SenderLogin` on the slash path. Empty
+// or `"anonymous"` renders as "Plan approved by an approver"
+// rather than `@anonymous` (the audit log still carries the real
+// subject; the comment-side wording is the only thing that
+// changes).
+func (n *Notifier) NotifyPlanApproved(ctx context.Context, runID uuid.UUID, approverLogin string, decision approval.Decision) error {
+	if n == nil {
+		return nil
+	}
+	if decision != approval.DecisionApprove {
+		return nil
+	}
+	ctxv, ok, err := n.contextFor(ctx, runID, KindPlanApproved)
+	if err != nil || !ok {
+		return err
+	}
+	body := renderPlanApprovedBody(ctxv, approverLogin)
+	return n.post(ctx, ctxv, KindPlanApproved, body)
 }
 
 // SlashApprovalReply is the params for NotifySlashApprovalReply
@@ -338,6 +384,32 @@ func renderPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, extern
 		fmt.Fprintf(&b, "\n[View run →](%s)\n", c.runURL)
 	}
 	return b.String()
+}
+
+// renderPlanApprovedBody renders the "plan approved → implementing
+// now" comment (#274). Names the approver when we have a real
+// GitHub login; falls back to a generic "an approver" when the
+// subject is anonymous or empty so the comment never says
+// "Plan approved by `@anonymous`."
+func renderPlanApprovedBody(c commentContext, approverLogin string) string {
+	var b strings.Builder
+	if validApproverLogin(approverLogin) {
+		fmt.Fprintf(&b, "Plan approved by `@%s`. Implementing now — [View run →](%s).\n",
+			approverLogin, c.runURL)
+	} else {
+		fmt.Fprintf(&b, "Plan approved by an approver. Implementing now — [View run →](%s).\n",
+			c.runURL)
+	}
+	return b.String()
+}
+
+// validApproverLogin returns true when `s` is a real GitHub login
+// suitable for `@`-prefix display. Rejects the empty string and
+// the literal "anonymous" placeholder the HTTP handler stamps when
+// bearer auth didn't resolve an identity (so the SPA's "anonymous"
+// fallback never leaks into the issue thread as @anonymous).
+func validApproverLogin(s string) bool {
+	return s != "" && s != "anonymous"
 }
 
 // renderFileList renders Plan.Scope.Files as a markdown bullet list,

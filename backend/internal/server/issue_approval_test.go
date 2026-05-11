@@ -77,15 +77,29 @@ func TestHandleApprovalCommand_Approve_AdvancesStageAndReplies(t *testing.T) {
 		t.Errorf("approver = %q, want alice", ar.all[0].ApproverSubject)
 	}
 
-	if got := gh.calls(); len(got) != 1 {
-		t.Fatalf("expected 1 reply comment; got %d", len(got))
+	// Two comments expected: the sender-scoped slash reply
+	// ("Approved …") and the issue-thread broadcast announcing the
+	// plan-approved event (#274). The two are intentionally
+	// separate — they serve different audiences.
+	if got := gh.calls(); len(got) != 2 {
+		t.Fatalf("expected 2 comments (slash reply + plan-approved broadcast); got %d", len(got))
 	}
-	body := gh.calls()[0].body
-	if !strings.Contains(body, "Approved") {
-		t.Errorf("reply should say Approved: %q", body)
+	// Walk both bodies; assertion order-independent so the test
+	// doesn't break if the post order changes.
+	var slashReply, planBroadcast string
+	for _, c := range gh.calls() {
+		switch {
+		case strings.Contains(c.body, "Approved"):
+			slashReply = c.body
+		case strings.Contains(c.body, "Plan approved by"):
+			planBroadcast = c.body
+		}
 	}
-	if !strings.Contains(body, "@alice") {
-		t.Errorf("reply should mention sender: %q", body)
+	if !strings.Contains(slashReply, "@alice") {
+		t.Errorf("slash reply should mention sender: %q", slashReply)
+	}
+	if !strings.Contains(planBroadcast, "`@alice`") {
+		t.Errorf("plan-approved broadcast should mention approver: %q", planBroadcast)
 	}
 }
 
@@ -282,12 +296,31 @@ func TestHandleApprovalCommand_RepeatAfterAdvance_RepliesNoAwaitingStage(t *test
 	if len(ar.all) != 1 {
 		t.Errorf("approval repo should have one row; got %d", len(ar.all))
 	}
+	// Three comments expected: the first attempt's slash reply +
+	// plan-approved broadcast (#274), plus the second attempt's
+	// "no awaiting stage" reply. The broadcast fires once because
+	// the dedup machinery short-circuits a re-post.
 	calls := gh.calls()
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 reply comments (one per attempt); got %d", len(calls))
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 comments (1st: reply + broadcast, 2nd: reply); got %d", len(calls))
 	}
-	if !strings.Contains(calls[1].body, "No stage on this issue's run is awaiting approval") {
-		t.Errorf("second reply should explain no awaiting stage: %q", calls[1].body)
+	// Order-independent body scan — the second-attempt's reply
+	// must explain that no awaiting stage exists.
+	var noAwaitingReply string
+	for _, c := range calls {
+		if strings.Contains(c.body, "No stage on this issue's run is awaiting approval") {
+			noAwaitingReply = c.body
+		}
+	}
+	if noAwaitingReply == "" {
+		t.Errorf("expected one comment explaining 'no awaiting stage'; got bodies %v",
+			func() []string {
+				out := []string{}
+				for _, c := range calls {
+					out = append(out, c.body)
+				}
+				return out
+			}())
 	}
 }
 
