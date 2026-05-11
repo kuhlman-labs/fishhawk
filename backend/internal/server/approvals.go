@@ -175,6 +175,29 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
+
+		// Plan-approved comment-back (#274): post on the originating
+		// issue when a plan-stage approve clears, closing the
+		// feedback loop between NotifyPlanReady and the eventual
+		// PR-open signal. Gated on stage type so review-stage
+		// approvals don't double-comment (the merged-PR signal
+		// covers them); gated on decision so rejects don't fire
+		// here (slash-command replies + the dashboard cover them).
+		// The notifier itself is the source of truth on whether
+		// the run is issue-triggered. Best-effort: a failure logs
+		// at WARN but doesn't unwind the approval.
+		if s.issueNotifier != nil &&
+			stage.Type == run.StageTypePlan &&
+			decision == approval.DecisionApprove {
+			if err := s.issueNotifier.NotifyPlanApproved(r.Context(), stage.RunID, subject, decision); err != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"plan-approved comment-back failed",
+					slog.String("run_id", stage.RunID.String()),
+					slog.String("stage_id", stage.ID.String()),
+					slog.String("error", err.Error()),
+				)
+			}
+		}
 	}
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(stage))

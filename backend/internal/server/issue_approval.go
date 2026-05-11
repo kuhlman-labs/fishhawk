@@ -133,6 +133,23 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		}
 	}
 
+	// Plan-approved comment-back (#274): same hook as the HTTP
+	// approval path. The slash command already posts a sender-
+	// scoped reply ("Approved …") via replyApproval; this is the
+	// issue-thread broadcast for everyone else watching the issue.
+	// Both fire — they serve different audiences. Gated on plan
+	// stage + approve so review-stage approvals and reject paths
+	// don't double-comment.
+	if advanced.Type == run.StageTypePlan && decision == approval.DecisionApprove {
+		if err := s.issueNotifier.NotifyPlanApproved(ctx, advanced.RunID, p.SenderLogin, decision); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"slash-command approval: plan-approved comment-back failed",
+				slog.String("run_id", advanced.RunID.String()),
+				slog.String("stage_id", advanced.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+
 	s.replyApproval(ctx, p, formatSuccessReply(decision, subject, runRow.ID, advanced))
 	return nil
 }

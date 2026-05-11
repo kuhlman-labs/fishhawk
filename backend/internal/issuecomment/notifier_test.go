@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -378,6 +379,165 @@ func TestNotify_NilReceiver_NoOp(t *testing.T) {
 		Repo: "x/y", InstallationID: 1, IssueNumber: 1, Body: "x",
 	}); err != nil {
 		t.Errorf("nil reply should be a no-op; got %v", err)
+	}
+}
+
+// --- NotifyPlanApproved (#274) ---
+
+func TestNotifyPlanApproved_HappyPath_NamesApprover(t *testing.T) {
+	// The whole point of the comment is naming who approved. The
+	// rendered body MUST carry `@<login>` so observers can see who
+	// cleared the gate. Approve-decision-only — reject doesn't fire
+	// here.
+	runID, gh, au, n := happyDeps(t)
+	if err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove); err != nil {
+		t.Fatalf("NotifyPlanApproved: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 GitHub call; got %d", len(gh.calls))
+	}
+	c := gh.calls[0]
+	if !strings.Contains(c.body, "Plan approved by `@alice`") {
+		t.Errorf("body should name the approver: %q", c.body)
+	}
+	if !strings.Contains(c.body, "Implementing now") {
+		t.Errorf("body should mention implementing: %q", c.body)
+	}
+	if !strings.Contains(c.body, "View run") {
+		t.Errorf("body should link to the run page: %q", c.body)
+	}
+
+	// Audit entry recorded with kind=plan_approved so the dedup
+	// check on subsequent calls works.
+	if len(au.appended) != 1 {
+		t.Fatalf("expected 1 audit append; got %d", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload["kind"] != "plan_approved" {
+		t.Errorf("payload.kind = %v, want plan_approved", payload["kind"])
+	}
+}
+
+func TestNotifyPlanApproved_EmptyApprover_RendersGenericFallback(t *testing.T) {
+	// Empty subject means the HTTP middleware didn't resolve an
+	// identity. Don't render "@" (a stray @ in the body would look
+	// like a broken mention).
+	runID, gh, _, n := happyDeps(t)
+	if err := n.NotifyPlanApproved(context.Background(), runID, "", approval.DecisionApprove); err != nil {
+		t.Fatalf("NotifyPlanApproved: %v", err)
+	}
+	c := gh.calls[0]
+	if !strings.Contains(c.body, "Plan approved by an approver") {
+		t.Errorf("empty subject should fall back to generic wording: %q", c.body)
+	}
+	if strings.Contains(c.body, "@") {
+		t.Errorf("body should not contain a stray @: %q", c.body)
+	}
+}
+
+func TestNotifyPlanApproved_AnonymousApprover_RendersGenericFallback(t *testing.T) {
+	// The HTTP handler stamps "anonymous" when bearer auth doesn't
+	// resolve. Match the empty-string treatment so we never render
+	// `@anonymous` (it's not a real GitHub login and would look like
+	// a broken mention or worse, a real user named "anonymous").
+	runID, gh, _, n := happyDeps(t)
+	if err := n.NotifyPlanApproved(context.Background(), runID, "anonymous", approval.DecisionApprove); err != nil {
+		t.Fatalf("NotifyPlanApproved: %v", err)
+	}
+	c := gh.calls[0]
+	if !strings.Contains(c.body, "Plan approved by an approver") {
+		t.Errorf("anonymous subject should fall back to generic wording: %q", c.body)
+	}
+	if strings.Contains(c.body, "@anonymous") {
+		t.Errorf("body should not surface @anonymous: %q", c.body)
+	}
+}
+
+func TestNotifyPlanApproved_RejectIsNoOp(t *testing.T) {
+	// Reject decisions have their own surfaces (slash reply, the
+	// SPA's dashboard); we don't broadcast them to the issue
+	// thread. The receiver returns nil before touching GitHub.
+	runID, gh, au, n := happyDeps(t)
+	if err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionReject); err != nil {
+		t.Fatalf("NotifyPlanApproved: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("reject should not post a comment: %d calls", len(gh.calls))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("reject should not append an audit row: %d", len(au.appended))
+	}
+}
+
+func TestNotifyPlanApproved_DedupsViaAuditLog(t *testing.T) {
+	// A pre-seeded plan_approved audit entry means we already
+	// commented. Re-approve (e.g. idempotent re-submit from the
+	// SPA) should NOT re-post.
+	runID, gh, au, n := happyDeps(t)
+	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{"kind": "plan_approved"})
+
+	if err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove); err != nil {
+		t.Fatalf("NotifyPlanApproved: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("dedup should skip the GitHub call: %d", len(gh.calls))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("dedup should skip the audit append: %d", len(au.appended))
+	}
+}
+
+func TestNotifyPlanApproved_SkipsNonIssueTrigger(t *testing.T) {
+	// CLI / UI / PR triggers don't have an originating issue
+	// thread to comment on. Skip cleanly.
+	runID := uuid.New()
+	triggerRef := "cli:operator"
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID:             runID,
+			Repo:           "x/y",
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerCLI,
+			TriggerRef:     &triggerRef,
+			InstallationID: int64Ptr(99),
+		}},
+	}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove); err != nil {
+		t.Fatalf("NotifyPlanApproved: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("CLI-triggered run should not comment: %d", len(gh.calls))
+	}
+}
+
+func TestNotifyPlanApproved_GitHubErrorReturned_NoAuditEntry(t *testing.T) {
+	// Comment-side failure surfaces as a non-nil error so the
+	// caller can log + carry on. Same posture as NotifyPickup:
+	// the audit row is only written after the comment lands.
+	runID, gh, au, n := happyDeps(t)
+	gh.err = errors.New("github rate-limited")
+	err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove)
+	if err == nil {
+		t.Fatal("expected error from GitHub failure")
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entry should not land when the comment fails: %d", len(au.appended))
+	}
+}
+
+func TestNotifyPlanApproved_NilReceiver_NoOp(t *testing.T) {
+	var n *issuecomment.Notifier // nil
+	if err := n.NotifyPlanApproved(context.Background(), uuid.New(), "alice", approval.DecisionApprove); err != nil {
+		t.Errorf("nil receiver should be a no-op; got %v", err)
 	}
 }
 
