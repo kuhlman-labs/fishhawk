@@ -8,7 +8,7 @@ import { ApprovalPanel } from '@/plan/approval-panel';
 import { Section } from '@/plan/sections';
 import { PullRequestSummary } from '@/pull-request/pr-summary';
 import { StageStateBadge } from '@/components/stage-state-badge';
-import { BlockingChecksPanel, type BlockingCheck } from '@/components/blocking-checks-panel';
+import { RequiredChecksPanel, type RequiredCheck } from '@/components/required-checks-panel';
 
 /*
  * Review-stage detail (#213). Composition:
@@ -17,14 +17,17 @@ import { BlockingChecksPanel, type BlockingCheck } from '@/components/blocking-c
  *     h1, ApprovalPanel (gated stages only) or audit-log link.
  *   - PullRequestSummary: shared with the implement page, fed the
  *     implement stage's pull_request artifact.
- *   - BlockingChecksPanel: lists the gate's declared blocking_checks
- *     with their live observed state (#228). Informational only as
- *     of #253 / ADR-017 — the approve button no longer waits on
- *     check state; GitHub branch protection blocks the merge until
- *     the required checks (which include fishhawk_audit_complete,
- *     published as a Check Run per #231) report green. Declared-
- *     but-not-observed entries fill as `not_tracked` so the SPA
- *     always shows the full gate.
+ *   - RequiredChecksPanel (renamed from BlockingChecksPanel in #256):
+ *     lists the run's required checks with their live observed state
+ *     (#228). Both the declared list and the source attribution
+ *     ("Required by branch protection" / "+ N rulesets") come from
+ *     GET /v0/stages/{id}/checks, sourced from the run's branch-
+ *     protection snapshot (#251). Informational only as of #253 /
+ *     ADR-017 — the approve button no longer waits on check state;
+ *     GitHub branch protection blocks the merge until the required
+ *     checks (which include fishhawk_audit_complete, published as a
+ *     Check Run per #231) report green. Declared-but-not-observed
+ *     entries fill as `not_tracked` so the panel shows the full gate.
  *   - Approvers list: shown only for approval-typed gates.
  *
  * For check-only review gates (e.g. routine_change.workflows.yaml),
@@ -45,14 +48,18 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
   const isApprovalGate = gate?.type === 'approval';
   const showApprovalPanel = isApprovalGate && stage.state === 'awaiting_approval';
 
-  // Live check states (#228). Declared list and observed states
-  // both come from /v0/stages/{id}/checks: post-#254 the declared
-  // names live on the run's branch-protection snapshot (#251), not
-  // the spec. Falls back to an empty list when the endpoint is 503
-  // (legacy deployments without check ingestion) or the request is
-  // in flight.
+  // Live check states (#228). Declared list, sources, and observed
+  // states all come from /v0/stages/{id}/checks: post-#254 the
+  // declared names live on the run's branch-protection snapshot
+  // (#251), not the spec. Sources name which surfaces contributed
+  // (`branch_protection`, `ruleset:<id>`) so the panel can render
+  // a "Required by branch protection" attribution sub-label (#256).
+  // Falls back to an empty list when the endpoint is 503 (legacy
+  // deployments without check ingestion) or the request is in
+  // flight.
   const checksResult = useAsync(() => api.listStageChecks(stage.id), [stage.id]);
-  const checks = mergeBlockingChecks(checksResult);
+  const checks = mergeRequiredChecks(checksResult);
+  const sources = checksResult.status === 'ok' ? (checksResult.data.sources ?? []) : [];
 
   return (
     <article className="max-w-3xl space-y-8 pb-20">
@@ -84,8 +91,8 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
 
       <PullRequestSummary artifact={artifact} />
 
-      <Section id="blocking-checks" title="Blocking checks">
-        <BlockingChecksPanel checks={checks} />
+      <Section id="required-checks" title="Required checks">
+        <RequiredChecksPanel checks={checks} sources={sources} />
       </Section>
 
       {isApprovalGate && gate?.approvers && (
@@ -99,27 +106,32 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
 
 interface ChecksResponse {
   declared: string[];
+  // sources records which surfaces contributed to `declared` (one
+  // or both of `branch_protection`, `ruleset:<id>`). Optional so
+  // legacy backends that pre-date #256 don't break — the panel just
+  // renders without an attribution sub-label in that case.
+  sources?: string[];
   items: Array<{
     name: string;
     state: 'pass' | 'fail' | 'pending' | 'not_tracked';
   }>;
 }
 
-// mergeBlockingChecks pairs the response's declared list (sourced
+// mergeRequiredChecks pairs the response's declared list (sourced
 // from the run's branch-protection snapshot post-#254) with the
 // most-recent observed state from /v0/stages/{id}/checks. Declared-
 // but-not-observed checks render as `not_tracked`. Loading and
 // error states (including a 503 from a backend without check
 // ingestion) return an empty list so the panel renders cleanly
 // without a flicker.
-function mergeBlockingChecks(
+function mergeRequiredChecks(
   result:
     | { status: 'loading' }
     | { status: 'error'; error: Error }
     | { status: 'ok'; data: ChecksResponse },
-): BlockingCheck[] {
+): RequiredCheck[] {
   if (result.status !== 'ok') return [];
-  const observed = new Map<string, BlockingCheck['state']>();
+  const observed = new Map<string, RequiredCheck['state']>();
   for (const item of result.data.items) {
     observed.set(item.name, item.state);
   }

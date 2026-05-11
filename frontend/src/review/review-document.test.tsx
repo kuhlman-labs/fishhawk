@@ -106,7 +106,7 @@ describe('<ReviewDocument>', () => {
 
   it("renders the response's declared check names with the not-tracked-yet placeholder", async () => {
     renderDoc();
-    expect(screen.getByRole('heading', { name: /blocking checks/i })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /required checks/i })).toBeInTheDocument();
     // The declared list now sources from the run's branch-protection
     // snapshot via the response (#251 / #254), not stage.gate.
     await waitFor(() => {
@@ -186,7 +186,7 @@ describe('<ReviewDocument>', () => {
     expect(screen.getByText(sampleArtifact.branch)).toBeInTheDocument();
     // Blocking-checks panel renders with empty-gate fallback.
     await waitFor(() => {
-      expect(screen.getByText(/no blocking checks declared/i)).toBeInTheDocument();
+      expect(screen.getByText(/no required checks configured/i)).toBeInTheDocument();
     });
     // No approvers section (no gate at all).
     expect(screen.queryByRole('heading', { name: /approvers/i })).not.toBeInTheDocument();
@@ -257,7 +257,7 @@ describe('<ReviewDocument> live blocking-check states (#228)', () => {
     // Post-#254 the declared list lives on the response (sourced
     // from the run's branch-protection snapshot), so a 503 from
     // /v0/stages/{id}/checks leaves the panel with nothing to
-    // render — the empty-declared "no blocking checks declared"
+    // render — the empty-declared "no required checks configured"
     // fallback fires instead of the not_tracked placeholders that
     // pre-v0.2 came from stage.gate.blocking_checks.
     checksSpy.mockRejectedValue(new Error('503 stage_checks_unconfigured'));
@@ -273,7 +273,7 @@ describe('<ReviewDocument> live blocking-check states (#228)', () => {
       </MemoryRouter>,
     );
     await waitFor(() => {
-      expect(screen.getByText(/no blocking checks declared/i)).toBeInTheDocument();
+      expect(screen.getByText(/no required checks configured/i)).toBeInTheDocument();
     });
   });
 });

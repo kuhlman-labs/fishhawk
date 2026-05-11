@@ -34,12 +34,16 @@ type stageCheckResponse struct {
 
 // stageChecksListResponse is the envelope for GET /v0/stages/{id}/checks.
 // `declared` is the run's required-checks snapshot from branch
-// protection (post-#251 / ADR-017); `items` is the latest observed
-// state per check name. Declared-but-not-observed checks render in
-// the SPA as `not_tracked`; the response itself only carries
-// observed rows since the SPA already knows the declared list.
+// protection (post-#251 / ADR-017); `sources` records which surfaces
+// contributed (`branch_protection` and/or `ruleset:<id>`) so the SPA
+// can render the right attribution sub-label (#256). `items` is the
+// latest observed state per check name. Declared-but-not-observed
+// checks render in the SPA as `not_tracked`; the response itself
+// only carries observed rows since the SPA already knows the
+// declared list.
 type stageChecksListResponse struct {
 	Declared []string             `json:"declared"`
+	Sources  []string             `json:"sources"`
 	Items    []stageCheckResponse `json:"items"`
 }
 
@@ -90,9 +94,11 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 	// (CLI / UI flow) renders an empty declared list and the SPA
 	// falls back to "no checks declared yet".
 	declared := []string{}
+	sources := []string{}
 	runRow, runErr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
 	if runErr == nil && runRow.RequiredChecksSnapshot != nil {
 		declared = runRow.RequiredChecksSnapshot.Contexts
+		sources = runRow.RequiredChecksSnapshot.Sources
 	}
 	items := make([]stageCheckResponse, 0, len(checks))
 	for _, c := range checks {
@@ -134,6 +140,7 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 
 	s.writeJSON(w, r, http.StatusOK, stageChecksListResponse{
 		Declared: declared,
+		Sources:  sources,
 		Items:    items,
 	})
 }

@@ -1253,16 +1253,30 @@ paths:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
       responses:
         '200':
-          description: Declared blocking checks + latest observed state per check.
+          description: Declared required checks + latest observed state per check.
           content:
             application/json:
               schema:
                 type: object
-                required: [declared, items]
+                required: [declared, sources, items]
                 properties:
                   declared:
                     type: array
                     items: { type: string }
+                    description: |
+                      Required-status-check context names from the
+                      run's branch-protection snapshot (#251). Empty
+                      when the run pre-dates the snapshot wiring or
+                      skipped protection lookup (CLI / UI).
+                  sources:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      Surfaces that contributed to `declared`. Each
+                      entry is `branch_protection` or `ruleset:<id>`.
+                      The SPA renders this as a "Required by branch
+                      protection" sub-label so reviewers know where
+                      the list comes from (#256).
                   items:
                     type: array
                     items:
