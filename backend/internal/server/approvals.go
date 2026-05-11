@@ -218,9 +218,9 @@ func (s *Server) checkApproverAuthorization(w http.ResponseWriter, r *http.Reque
 	if s.cfg.RoleResolver == nil {
 		return true
 	}
-	if s.cfg.RunRepo == nil || s.workflowSpecFetcher() == nil {
+	if s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "approver_check_unconfigured",
-			"role-based approver check requires RunRepo and GitHub client", nil)
+			"role-based approver check requires RunRepo", nil)
 		return false
 	}
 
@@ -275,10 +275,17 @@ type gateContext struct {
 	installationID int64
 }
 
-// fetchGateForStage fetches the workflow spec at the stage's
-// run.WorkflowSHA and returns the gate context. Returns
+// fetchGateForStage loads the workflow spec from the run row's
+// cached bytes (#283) and returns the gate context. Returns
 // (nil, nil) when the stage exists in the spec but has no
 // approval gate.
+//
+// Pre-#283 this called GitHub directly using `runRow.WorkflowSHA`
+// as the contents-API ref, but that's a blob SHA, not a commit
+// ref — every call 404'd in production. checkApproverAuthorization
+// falls open on fetch failure, so the role check was being silently
+// bypassed for every approval. The cache fixes both call sites
+// (this one + the trace handler's policy re-eval).
 func (s *Server) fetchGateForStage(ctx context.Context, stage *run.Stage) (*gateContext, error) {
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
 	if err != nil {
@@ -287,19 +294,10 @@ func (s *Server) fetchGateForStage(ctx context.Context, stage *run.Stage) (*gate
 	if runRow.InstallationID == nil {
 		return nil, errors.New("run missing installation_id")
 	}
-	repo, err := parseRepoOwnerName(runRow.Repo)
-	if err != nil {
-		return nil, err
+	if len(runRow.WorkflowSpec) == 0 {
+		return nil, errors.New("run has no cached workflow spec (legacy or non-dispatcher run)")
 	}
-	ref := runRow.WorkflowSHA
-	if ref == "" {
-		ref = "main"
-	}
-	specFile, err := s.workflowSpecFetcher().GetWorkflowSpec(ctx, *runRow.InstallationID, repo, ref)
-	if err != nil {
-		return nil, fmt.Errorf("get workflow spec: %w", err)
-	}
-	parsed, err := spec.ParseBytes(specFile.Content)
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
 		return nil, fmt.Errorf("parse workflow spec: %w", err)
 	}

@@ -580,6 +580,11 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		InstallationID:         &installationID,
 		ParentRunID:            parentRunID,
 		RequiredChecksSnapshot: snapshot,
+		// Cache the validated spec bytes so the trace handler's
+		// policy re-evaluation reads constraints from storage
+		// instead of refetching from GitHub (the refetch path was
+		// broken — passed the blob SHA as a ref; see #283).
+		WorkflowSpec: specFile.Content,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create run: %w", err)

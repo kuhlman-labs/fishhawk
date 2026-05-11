@@ -63,6 +63,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		IdempotencyKey:         p.IdempotencyKey,
 		ParentRunID:            p.ParentRunID,
 		RequiredChecksSnapshot: snapshotBytes,
+		WorkflowSpec:           p.WorkflowSpec,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -388,6 +389,7 @@ func rowToRun(r rundb.Run) *Run {
 		IdempotencyKey: r.IdempotencyKey,
 		ParentRunID:    r.ParentRunID,
 		PullRequestURL: r.PullRequestUrl,
+		WorkflowSpec:   r.WorkflowSpec,
 		State:          State(r.State),
 		CreatedAt:      r.CreatedAt.Time,
 		UpdatedAt:      r.UpdatedAt.Time,

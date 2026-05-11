@@ -36,6 +36,13 @@ type CreateRunParams struct {
 	// (#251 / ADR-017). Nil for non-dispatcher creates and for
 	// CLI / UI runs in v0 — those paths don't gate on CI.
 	RequiredChecksSnapshot *RequiredChecksSnapshot
+	// WorkflowSpec is the raw bytes of the workflow file the
+	// dispatcher fetched + validated at run-create time (#283).
+	// Cached on the run row so the trace handler's policy re-
+	// evaluation reads from storage instead of refetching from
+	// GitHub. Nil for CLI / UI run-create paths that don't fetch
+	// a spec.
+	WorkflowSpec []byte
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

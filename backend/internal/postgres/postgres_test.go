@@ -202,25 +202,38 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0018 dropped
-	// stages.gate_blocking_checks (#254); the down migration restores
-	// the column. Confirm: gate_blocking_checks is back, but every
-	// prior migration's effect is still present
-	// (required_checks_snapshot from 0017, parent_run_id +
+	// MigrateDown rolls back one step. 0019 dropped
+	// runs.workflow_spec (#283); the down migration drops the
+	// column entirely (no data to restore). Confirm:
+	// workflow_spec is gone, but every prior migration's effect
+	// is still present (stages.gate_blocking_checks restored from
+	// 0018's down would still be there if we hadn't rolled it back,
+	// required_checks_snapshot from 0017, parent_run_id +
 	// pull_request_url from 0016, stage_checks table from 0015,
 	// stages.gate_type from 0014, stages.requires_approval from 0013,
 	// signing_keys.id from 0012, runs.idempotency_key from 0011,
 	// users + sessions from 0010, audit run_id nullability from 0009,
 	// etc.).
-	var gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	var workflowSpecCol, gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'workflow_spec'`,
+	).Scan(&workflowSpecCol); err != nil {
+		t.Fatalf("query runs.workflow_spec column: %v", err)
+	}
+	if workflowSpecCol != 0 {
+		t.Errorf("runs.workflow_spec count after MigrateDown = %d, want 0 (0019 down dropped it)", workflowSpecCol)
+	}
+	// 0018 (drop gate_blocking_checks) is still applied — its down
+	// would restore the column, but we only rolled back 0019.
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'stages' AND column_name = 'gate_blocking_checks'`,
 	).Scan(&gateBlockingChecksCol); err != nil {
 		t.Fatalf("query stages.gate_blocking_checks column: %v", err)
 	}
-	if gateBlockingChecksCol != 1 {
-		t.Errorf("stages.gate_blocking_checks count after MigrateDown = %d, want 1 (0018 down restored it)", gateBlockingChecksCol)
+	if gateBlockingChecksCol != 0 {
+		t.Errorf("stages.gate_blocking_checks count after MigrateDown = %d, want 0 (0018 still applied — only 0019 rolled back)", gateBlockingChecksCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns

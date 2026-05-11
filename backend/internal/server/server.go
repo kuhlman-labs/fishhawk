@@ -195,10 +195,6 @@ type Server struct {
 	// handler then resolves through cfg.GitHub.
 	promptIssueGetterOverride issueGetter
 
-	// traceWorkflowSpecOverride is the same test seam for the
-	// trace handler's policy re-eval path. nil in production.
-	traceWorkflowSpecOverride workflowSpecFetcher
-
 	// auditCheckPublisher posts the derived fishhawk_audit_complete
 	// state to GitHub as a Check Run on every compute (#231). nil
 	// when ExternalURL or GitHub aren't wired — the in-Fishhawk

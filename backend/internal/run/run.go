@@ -184,9 +184,20 @@ type Run struct {
 	// the snapshot was wired (legacy rows) and for CLI / UI
 	// run-create paths that skip protection lookup.
 	RequiredChecksSnapshot *RequiredChecksSnapshot
-	State                  State
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	// WorkflowSpec is the raw bytes of `.fishhawk/workflows.yaml`
+	// the dispatcher fetched + validated at run-create time (#283).
+	// Cached here so the trace handler's policy re-evaluation can
+	// read constraints from storage rather than refetching from
+	// GitHub (the refetch path was broken — it passed `workflow_sha`
+	// as a contents-API ref, but that's a blob SHA, not a commit
+	// ref; GitHub returned 404 and the policy_evaluated audit row
+	// was skipped). Nil for legacy rows created before this column
+	// existed — the trace handler emits a skip-with-reason in that
+	// case rather than re-introducing the broken refetch.
+	WorkflowSpec []byte
+	State        State
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // RequiredChecksSnapshot captures the required-status-checks list

@@ -140,9 +140,12 @@ func newRoleApprovalServer(t *testing.T, members map[string][]role.TeamMember) (
 		WorkflowID:     "feature_change",
 		WorkflowSHA:    "abc123",
 		InstallationID: &installation,
+		// Cache the spec on the run row (#283) so the approval
+		// handler reads from storage instead of refetching from
+		// GitHub.
+		WorkflowSpec: []byte(approvalGateSpec),
 	}
 	rr := &approvalGateRunRepo{stage: stage, runRow: runRow}
-	gh := &stubWorkflowSpecFetcher{content: []byte(approvalGateSpec), sha: "abc123"}
 	resolver := role.NewResolver(&stubTeamLister{teamMembers: members})
 	apRepo := newFakeApprovalRepo()
 	auditFake := newAuditFake()
@@ -153,8 +156,7 @@ func newRoleApprovalServer(t *testing.T, members map[string][]role.TeamMember) (
 		AuditRepo:    auditFake,
 		RoleResolver: resolver,
 	})
-	s.traceWorkflowSpecOverride = gh
-	return s, rr, gh, apRepo, auditFake
+	return s, rr, nil, apRepo, auditFake
 }
 
 // approveRequest builds a POST /v0/stages/{id}/approvals request
@@ -228,12 +230,16 @@ func TestApproval_RoleCheck_NoResolver_AllowsAll(t *testing.T) {
 	}
 }
 
-func TestApproval_RoleCheck_SpecFetchFailure_AllowsThrough(t *testing.T) {
-	s, rr, gh, apRepo, _ := newRoleApprovalServer(t, nil)
-	gh.getErr = errors.New("github down")
+func TestApproval_RoleCheck_NoCachedSpec_AllowsThrough(t *testing.T) {
+	// Legacy run row (pre-#283 migration) has no cached spec bytes.
+	// The role check falls open — best-effort posture — but the
+	// approval still goes through. Pre-#283 this was hit by every
+	// real-world approval because fetchGateForStage refetched the
+	// spec from GitHub using a blob SHA as the ref → 404 → fall-
+	// open → silent bypass of the role gate.
+	s, rr, _, apRepo, _ := newRoleApprovalServer(t, nil)
+	rr.runRow.WorkflowSpec = nil // simulate legacy row
 	w := approveRequest(t, s, rr.stage.ID, "alice", "approve")
-	// Best-effort: spec fetch failure should NOT black-hole the
-	// approval. The submission goes through.
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (best-effort):\n%s", w.Code, w.Body.String())
 	}

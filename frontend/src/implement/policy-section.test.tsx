@@ -185,4 +185,54 @@ describe('<PolicySection>', () => {
       expect(screen.getByRole('alert')).toHaveTextContent(/audit log offline/i);
     });
   });
+
+  it('renders the skipped arm when payload.skip_reason is set (#283)', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        policyEntry({
+          stage_type: 'implement',
+          passed: true,
+          violations: [],
+          diff: [],
+          applied_constraints: {},
+          skip_reason: 'spec_unavailable',
+          skip_detail: 'run row has no cached workflow spec (legacy or non-dispatcher flow)',
+        }),
+      ],
+      next_cursor: null,
+    });
+    render(<PolicySection runId={RUN_ID} stageId={STAGE_ID} />);
+    await waitFor(() => {
+      expect(screen.getByText(/policy evaluation skipped/i)).toBeInTheDocument();
+    });
+    // Reason line uses the structured-to-prose mapping.
+    expect(screen.getByText(/^Reason:.*no cached workflow spec/i)).toBeInTheDocument();
+    // Detail block renders the verbatim backend message.
+    expect(screen.getByText(/run row has no cached workflow spec/i)).toBeInTheDocument();
+    // The skipped arm wins even though payload.passed is true —
+    // we don't want to render the misleading "Policy passed"
+    // header next to a skip reason.
+    expect(screen.queryByText(/^Policy passed$/i)).not.toBeInTheDocument();
+  });
+
+  it('renders the skipped arm with no_diff_in_bundle reason', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        policyEntry({
+          stage_type: 'implement',
+          passed: true,
+          violations: [],
+          diff: [],
+          applied_constraints: {},
+          skip_reason: 'no_diff_in_bundle',
+        }),
+      ],
+      next_cursor: null,
+    });
+    render(<PolicySection runId={RUN_ID} stageId={STAGE_ID} />);
+    await waitFor(() => {
+      expect(screen.getByText(/policy evaluation skipped/i)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/git_diff/i)).toBeInTheDocument();
+  });
 });

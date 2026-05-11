@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { AlertTriangle, ChevronDown, ChevronRight, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronRight, Info, ShieldCheck } from 'lucide-react';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import { Section } from '@/plan/sections';
@@ -10,18 +10,24 @@ import { Section } from '@/plan/sections';
  * reviewer doesn't have to dig into raw audit JSON to see what
  * policy ran and what (if anything) violated.
  *
- * Three states:
- *   - pending: no entry yet (mid-flight, or a workflow that doesn't
- *     evaluate policy on this stage type). Single line.
+ * Four states:
+ *   - pending: no entry yet (the audit fetch is still in flight).
+ *     A brief loading state; settles to one of the three below
+ *     as soon as the entry lands.
  *   - pass: green header + foldable applied constraints + diff
  *     summary.
  *   - fail: violations grouped by rule are the headline, applied
  *     constraints fold away by default but stay accessible.
+ *   - skipped: the backend wrote a policy_evaluated entry with a
+ *     structured skip_reason (#283) — e.g., the run row had no
+ *     cached spec, the bundle's diff event was malformed, the
+ *     stage type wasn't in the workflow. Renders as informational
+ *     (gray) with the reason inline, distinct from pass / fail.
  *
  * The audit category is constant (`policy_evaluated`); the per-
- * file and per-violation detail lives in the payload, mirroring
- * `policy.EvaluationPayload` in the backend. Field names track
- * the wire shape — snake_case throughout.
+ * file, per-violation, and skip detail lives in the payload,
+ * mirroring `policy.EvaluationPayload` in the backend. Field names
+ * track the wire shape — snake_case throughout.
  */
 
 interface PolicyPayload {
@@ -30,7 +36,19 @@ interface PolicyPayload {
   applied_constraints?: AppliedConstraints;
   violations?: PolicyViolation[];
   passed?: boolean;
+  // skip_reason / skip_detail populated when the backend couldn't
+  // carry out a meaningful evaluation (#283). When present, the
+  // section renders the skipped arm regardless of `passed`.
+  skip_reason?: SkipReason;
+  skip_detail?: string;
 }
+
+type SkipReason =
+  | 'spec_unavailable'
+  | 'spec_unparseable'
+  | 'workflow_not_in_spec'
+  | 'stage_not_in_spec'
+  | 'no_diff_in_bundle';
 
 interface PolicyDiffEntry {
   path?: string;
@@ -105,6 +123,14 @@ export function PolicySection({ runId, stageId }: Props) {
 }
 
 function PolicyBody({ payload }: { payload: PolicyPayload }) {
+  // Skipped state takes priority over pass/fail — the backend
+  // emits skip_reason when it couldn't run a meaningful evaluation
+  // (#283). The payload's `passed` is true in those cases (so
+  // downstream gates don't trip), but the SPA wording must reflect
+  // that no actual check happened.
+  if (payload.skip_reason) {
+    return <SkippedBody reason={payload.skip_reason} detail={payload.skip_detail} />;
+  }
   const passed = payload.passed === true;
   return (
     <div className="space-y-3">
@@ -117,6 +143,37 @@ function PolicyBody({ payload }: { payload: PolicyPayload }) {
         applied={payload.applied_constraints}
         defaultOpen={passed} // pass-state: open by default ("what was checked"); fail-state: collapse so violations are the headline.
       />
+    </div>
+  );
+}
+
+// SkippedBody renders the "evaluation didn't run" arm. The wording
+// in `reason` is human-readable but the structured value is what
+// the test asserts on — keep them aligned with the backend's
+// SkipReason enum (#283).
+const skipReasonLabel: Record<SkipReason, string> = {
+  spec_unavailable: 'no cached workflow spec on this run',
+  spec_unparseable: 'the cached workflow spec failed to parse',
+  workflow_not_in_spec: "the run's workflow_id is not in the cached spec",
+  stage_not_in_spec: 'this stage type is not declared in the workflow',
+  no_diff_in_bundle: 'the trace bundle did not include a git_diff event',
+};
+
+function SkippedBody({ reason, detail }: { reason: SkipReason; detail?: string }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 text-sm font-medium text-neutral-700 dark:text-neutral-300">
+        <Info className="size-4" aria-hidden />
+        Policy evaluation skipped
+      </div>
+      <p className="text-xs text-neutral-600 dark:text-neutral-400">
+        Reason: {skipReasonLabel[reason] ?? reason}
+      </p>
+      {detail && (
+        <pre className="overflow-x-auto rounded-md border border-neutral-200 bg-neutral-50 p-3 font-mono text-xs whitespace-pre-wrap text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300">
+          {detail}
+        </pre>
+      )}
     </div>
   );
 }
