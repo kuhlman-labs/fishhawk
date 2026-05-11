@@ -69,14 +69,14 @@ export function PolicySection({ runId, stageId }: Props) {
 
   if (result.status === 'loading') {
     return (
-      <Section id="policy" title="Policy">
+      <Section id="policy" title="Policy" collapsible>
         <p className="text-sm text-neutral-500">Loading policy evaluation…</p>
       </Section>
     );
   }
   if (result.status === 'error') {
     return (
-      <Section id="policy" title="Policy">
+      <Section id="policy" title="Policy" collapsible>
         <div
           role="alert"
           className="rounded-md border border-rose-300 bg-rose-50 p-3 font-mono text-xs text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200"
@@ -90,7 +90,7 @@ export function PolicySection({ runId, stageId }: Props) {
   const entry = result.data.items[0];
   if (!entry) {
     return (
-      <Section id="policy" title="Policy">
+      <Section id="policy" title="Policy" collapsible>
         <p className="text-sm text-neutral-500">Policy evaluation pending.</p>
       </Section>
     );
@@ -98,7 +98,7 @@ export function PolicySection({ runId, stageId }: Props) {
 
   const payload = (entry.payload as PolicyPayload | null) ?? {};
   return (
-    <Section id="policy" title="Policy">
+    <Section id="policy" title="Policy" collapsible>
       <PolicyBody payload={payload} />
     </Section>
   );

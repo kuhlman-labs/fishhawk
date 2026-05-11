@@ -92,7 +92,7 @@ export function TranscriptSection({ stageId }: Props) {
   }, [stageId]);
 
   return (
-    <Section id="transcript" title="Transcript">
+    <Section id="transcript" title="Transcript" collapsible>
       <Body state={state} />
     </Section>
   );

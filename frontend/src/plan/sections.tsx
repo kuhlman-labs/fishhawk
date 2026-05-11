@@ -1,4 +1,5 @@
-import { ArrowUpRight, FileMinus, FilePlus, FilePen } from 'lucide-react';
+import { useState } from 'react';
+import { ArrowUpRight, ChevronDown, ChevronRight, FileMinus, FilePlus, FilePen } from 'lucide-react';
 import type { ScopeFile, StandardV1Plan } from '@/api/plan';
 
 /*
@@ -9,23 +10,59 @@ import type { ScopeFile, StandardV1Plan } from '@/api/plan';
  * Brand Foundations §6: plans are documents. No avatars, no chat
  * bubbles, no "agent says…" framing. Just the structured fields the
  * agent committed to.
+ *
+ * When `collapsible` is set, the header doubles as a toggle button —
+ * the implement-stage page (#250) uses this to let reviewers fold any
+ * section. The non-collapsible path stays byte-identical to the
+ * original markup so plan / review consumers render unchanged.
  */
 
 export function Section({
   id,
   title,
+  collapsible,
+  defaultOpen = true,
   children,
 }: {
   id: string;
   title: string;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
   children: React.ReactNode;
 }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const bodyId = `${id}-body`;
+
+  if (!collapsible) {
+    return (
+      <section id={id} className="scroll-mt-8 space-y-3">
+        <h2 className="text-sm font-medium tracking-wide text-neutral-600 uppercase dark:text-neutral-400">
+          {title}
+        </h2>
+        <div>{children}</div>
+      </section>
+    );
+  }
+
   return (
     <section id={id} className="scroll-mt-8 space-y-3">
-      <h2 className="text-sm font-medium tracking-wide text-neutral-600 uppercase dark:text-neutral-400">
-        {title}
-      </h2>
-      <div>{children}</div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-controls={bodyId}
+        className="group inline-flex items-center gap-1.5 text-left text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100"
+      >
+        {open ? (
+          <ChevronDown className="size-3.5" aria-hidden />
+        ) : (
+          <ChevronRight className="size-3.5" aria-hidden />
+        )}
+        <h2 className="text-sm font-medium tracking-wide uppercase">{title}</h2>
+      </button>
+      {open && (
+        <div id={bodyId}>{children}</div>
+      )}
     </section>
   );
 }
