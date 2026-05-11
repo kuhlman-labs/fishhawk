@@ -207,8 +207,14 @@ func TestNotifyPlanReady_GatedRun_LinksToApprovalSurface(t *testing.T) {
 	if !strings.Contains(body, "`x.go`") || !strings.Contains(body, "`y.go`") {
 		t.Errorf("body should include file paths: %q", body)
 	}
-	if !strings.Contains(body, "/stages/"+planStage.ID.String()) {
-		t.Errorf("body should link to approval surface for gated run: %q", body)
+	// The approval link must include the /runs/<run_id> prefix
+	// before the /stages/<stage_id> segment — the SPA route is
+	// /runs/:runId/stages/:stageId; pre-#273 this asserted only on
+	// the trailing /stages/<id> shape, which pinned a broken URL
+	// in place (every plan-ready comment 404'd).
+	wantURL := "/runs/" + runID.String() + "/stages/" + planStage.ID.String()
+	if !strings.Contains(body, wantURL) {
+		t.Errorf("body should link to %q (run-scoped stage URL): %q", wantURL, body)
 	}
 }
 
