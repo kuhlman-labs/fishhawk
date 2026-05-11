@@ -132,10 +132,107 @@ describe('<ImplementSessionDocument>', () => {
     renderDoc();
     await waitFor(() => expect(screen.getByText('visible prompt body')).toBeInTheDocument());
 
-    const toggle = screen.getByRole('button', { name: /hide prompt/i });
+    const toggle = screen.getByRole('button', { name: /prompt/i });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
     fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByText('visible prompt body')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /show prompt/i })).toBeInTheDocument();
+  });
+
+  it('collapses the activity section when its header button is clicked', async () => {
+    vi.spyOn(api, 'getStagePromptRender').mockResolvedValue({
+      stage_id: baseStage.id,
+      stage_type: 'implement',
+      prompt: '',
+      prompt_hash: 'x'.repeat(64),
+    });
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [makeEntry({ id: 'e1', sequence: 1, category: 'stage_dispatched' })],
+      next_cursor: null,
+    });
+
+    renderDoc();
+    await waitFor(() => expect(screen.getByText('Stage dispatched')).toBeInTheDocument());
+
+    const toggle = screen.getByRole('button', { name: /activity/i });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Stage dispatched')).not.toBeInTheDocument();
+  });
+
+  it('collapses the policy section when its header button is clicked', async () => {
+    vi.spyOn(api, 'getStagePromptRender').mockResolvedValue({
+      stage_id: baseStage.id,
+      stage_type: 'implement',
+      prompt: '',
+      prompt_hash: 'x'.repeat(64),
+    });
+    vi.spyOn(api, 'listRunAudit').mockImplementation(async (_runId, params) => {
+      if (params?.category === 'policy_evaluated') {
+        return {
+          items: [
+            makeEntry({
+              category: 'policy_evaluated',
+              payload: { passed: true, diff: [{ path: 'a.go', status: 'M' }] },
+            }),
+          ],
+          next_cursor: null,
+        };
+      }
+      return { items: [], next_cursor: null };
+    });
+
+    renderDoc();
+    await waitFor(() => expect(screen.getByText(/policy passed/i)).toBeInTheDocument());
+
+    const toggle = screen.getByRole('button', { name: /^policy$/i });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText(/policy passed/i)).not.toBeInTheDocument();
+  });
+
+  it('collapses the transcript section when its header button is clicked', async () => {
+    vi.spyOn(api, 'getStagePromptRender').mockResolvedValue({
+      stage_id: baseStage.id,
+      stage_type: 'implement',
+      prompt: '',
+      prompt_hash: 'x'.repeat(64),
+    });
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({ items: [], next_cursor: null });
+
+    renderDoc();
+    // Default trace mock is 404 -> empty state. Wait for that text to
+    // appear so we know the section settled.
+    await waitFor(() =>
+      expect(screen.getByText(/trace bundle not yet uploaded/i)).toBeInTheDocument(),
+    );
+
+    const toggle = screen.getByRole('button', { name: /transcript/i });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText(/trace bundle not yet uploaded/i)).not.toBeInTheDocument();
+  });
+
+  it('does not expose a toggle button on the Output PR-link row', async () => {
+    vi.spyOn(api, 'getStagePromptRender').mockResolvedValue({
+      stage_id: baseStage.id,
+      stage_type: 'implement',
+      prompt: '',
+      prompt_hash: 'x'.repeat(64),
+    });
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({ items: [], next_cursor: null });
+    renderDoc();
+    await waitFor(() => {
+      expect(screen.getByRole('link', { name: /view pr #209 on github/i })).toBeInTheDocument();
+    });
+    // The Output section's "Output" heading is not wrapped in a
+    // button — it stays a plain <h2>, so the PR-link row can't be
+    // hidden.
+    expect(screen.queryByRole('button', { name: /^output$/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /^output$/i })).toBeInTheDocument();
   });
 
   it('does not fetch the prompt for a stage that has not dispatched yet', async () => {

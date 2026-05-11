@@ -1,5 +1,4 @@
-import { useState } from 'react';
-import { ArrowUpRight, ChevronDown, ChevronRight, FileClock } from 'lucide-react';
+import { ArrowUpRight, FileClock } from 'lucide-react';
 import { Link } from 'react-router';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
@@ -95,7 +94,7 @@ function PromptSection({ stage }: { stage: Stage }) {
 
   if (!stageStarted) {
     return (
-      <Section id="prompt" title="Prompt">
+      <Section id="prompt" title="Prompt" collapsible>
         <p className="text-sm text-neutral-500">
           Prompt is constructed when the runner fetches it. Stage hasn&apos;t dispatched yet.
         </p>
@@ -108,18 +107,17 @@ function PromptSection({ stage }: { stage: Stage }) {
 
 function PromptBody({ stageId }: { stageId: string }) {
   const result = useAsync(() => api.getStagePromptRender(stageId), [stageId]);
-  const [open, setOpen] = useState(true);
 
   if (result.status === 'loading') {
     return (
-      <Section id="prompt" title="Prompt">
+      <Section id="prompt" title="Prompt" collapsible>
         <p className="text-sm text-neutral-500">Loading prompt…</p>
       </Section>
     );
   }
   if (result.status === 'error') {
     return (
-      <Section id="prompt" title="Prompt">
+      <Section id="prompt" title="Prompt" collapsible>
         <div
           role="alert"
           className="rounded-md border border-rose-300 bg-rose-50 p-3 font-mono text-xs text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200"
@@ -131,26 +129,14 @@ function PromptBody({ stageId }: { stageId: string }) {
   }
 
   return (
-    <Section id="prompt" title="Prompt">
+    <Section id="prompt" title="Prompt" collapsible>
       <div className="space-y-2">
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          className="inline-flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
-          aria-expanded={open}
-        >
-          {open ? (
-            <ChevronDown className="size-3.5" aria-hidden />
-          ) : (
-            <ChevronRight className="size-3.5" aria-hidden />
-          )}
-          {open ? 'Hide' : 'Show'} prompt · sha256:{result.data.prompt_hash.slice(0, 12)}…
-        </button>
-        {open && (
-          <pre className="overflow-x-auto rounded-md border border-neutral-200 bg-neutral-50 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap dark:border-neutral-800 dark:bg-neutral-900">
-            {result.data.prompt}
-          </pre>
-        )}
+        <p className="font-mono text-[10px] text-neutral-400" title={result.data.prompt_hash}>
+          sha256:{result.data.prompt_hash.slice(0, 12)}…
+        </p>
+        <pre className="overflow-x-auto rounded-md border border-neutral-200 bg-neutral-50 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap dark:border-neutral-800 dark:bg-neutral-900">
+          {result.data.prompt}
+        </pre>
       </div>
     </Section>
   );
@@ -166,14 +152,14 @@ function ActivitySection({ stage, runId }: { stage: Stage; runId: string }) {
 
   if (result.status === 'loading') {
     return (
-      <Section id="activity" title="Activity">
+      <Section id="activity" title="Activity" collapsible>
         <p className="text-sm text-neutral-500">Loading activity…</p>
       </Section>
     );
   }
   if (result.status === 'error') {
     return (
-      <Section id="activity" title="Activity">
+      <Section id="activity" title="Activity" collapsible>
         <div
           role="alert"
           className="rounded-md border border-rose-300 bg-rose-50 p-3 font-mono text-xs text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200"
@@ -187,7 +173,7 @@ function ActivitySection({ stage, runId }: { stage: Stage; runId: string }) {
   const entries = result.data.items;
   if (entries.length === 0) {
     return (
-      <Section id="activity" title="Activity">
+      <Section id="activity" title="Activity" collapsible>
         <p className="rounded-md border border-dashed border-neutral-300 p-4 text-sm text-neutral-500 dark:border-neutral-700">
           No events recorded for this stage yet.
         </p>
@@ -196,7 +182,7 @@ function ActivitySection({ stage, runId }: { stage: Stage; runId: string }) {
   }
 
   return (
-    <Section id="activity" title="Activity">
+    <Section id="activity" title="Activity" collapsible>
       <ol className="overflow-hidden rounded-md border border-neutral-200 dark:border-neutral-800">
         {entries.map((entry) => (
           <ActivityRow key={entry.id} entry={entry} />
