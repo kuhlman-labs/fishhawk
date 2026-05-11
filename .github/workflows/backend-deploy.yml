@@ -111,7 +111,7 @@ jobs:
       AWS_ENV: ${{ needs.resolve.outputs.environment }}
       IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -189,7 +189,7 @@ jobs:
       AWS_ENV: ${{ needs.resolve.outputs.environment }}
       IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
