@@ -131,10 +131,7 @@ function PromptBody({ stageId }: { stageId: string }) {
   return (
     <Section id="prompt" title="Prompt" collapsible>
       <div className="space-y-2">
-        <p
-          className="font-mono text-[10px] text-neutral-400"
-          title={result.data.prompt_hash}
-        >
+        <p className="font-mono text-[10px] text-neutral-400" title={result.data.prompt_hash}>
           sha256:{result.data.prompt_hash.slice(0, 12)}…
         </p>
         <pre className="overflow-x-auto rounded-md border border-neutral-200 bg-neutral-50 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap dark:border-neutral-800 dark:bg-neutral-900">

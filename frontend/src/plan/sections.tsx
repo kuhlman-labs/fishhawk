@@ -1,5 +1,12 @@
 import { useState } from 'react';
-import { ArrowUpRight, ChevronDown, ChevronRight, FileMinus, FilePlus, FilePen } from 'lucide-react';
+import {
+  ArrowUpRight,
+  ChevronDown,
+  ChevronRight,
+  FileMinus,
+  FilePlus,
+  FilePen,
+} from 'lucide-react';
 import type { ScopeFile, StandardV1Plan } from '@/api/plan';
 
 /*
@@ -60,9 +67,7 @@ export function Section({
         )}
         <h2 className="text-sm font-medium tracking-wide uppercase">{title}</h2>
       </button>
-      {open && (
-        <div id={bodyId}>{children}</div>
-      )}
+      {open && <div id={bodyId}>{children}</div>}
     </section>
   );
 }
