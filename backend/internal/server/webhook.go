@@ -116,5 +116,15 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.ingestCheckRun(r.Context(), ev.RawBody)
 	}
 
+	// `pull_request.synchronize` fires whenever the PR's head_sha
+	// moves (push, force-push, rebase, "Update branch" merge from
+	// base). Re-publish the fishhawk_audit_complete Check Run so
+	// branch protection re-evaluates against the new HEAD — that's
+	// where the foreign-commit drift becomes visible to the
+	// reviewer + the merge gate (#282). Best-effort.
+	if ev.Type == "pull_request" && ev.Action == "synchronize" {
+		s.republishOnSynchronize(r.Context(), ev.RawBody)
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }

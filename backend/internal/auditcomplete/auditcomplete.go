@@ -30,11 +30,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -45,11 +47,13 @@ type MissingKind string
 
 // MissingKind values.
 const (
-	MissingPlan        MissingKind = "plan_missing"        // plan stage didn't produce a standard_v1 artifact
-	MissingTrace       MissingKind = "trace_missing"       // a non-review stage hasn't shipped both bundle variants
-	MissingPullRequest MissingKind = "pr_missing"          // implement stage didn't produce a pull_request artifact
-	MissingChain       MissingKind = "chain_invalid"       // audit chain prev_hash → entry_hash links don't verify
-	MissingChainBroken MissingKind = "chain_unrecoverable" // chain read or hash recomputation errored
+	MissingPlan          MissingKind = "plan_missing"        // plan stage didn't produce a standard_v1 artifact
+	MissingTrace         MissingKind = "trace_missing"       // a non-review stage hasn't shipped both bundle variants
+	MissingPullRequest   MissingKind = "pr_missing"          // implement stage didn't produce a pull_request artifact
+	MissingChain         MissingKind = "chain_invalid"       // audit chain prev_hash → entry_hash links don't verify
+	MissingChainBroken   MissingKind = "chain_unrecoverable" // chain read or hash recomputation errored
+	MissingForeignCommit MissingKind = "foreign_commit"      // PR HEAD on GitHub isn't a Fishhawk-recorded head_sha (#282)
+	MissingHeadFetchFail MissingKind = "head_fetch_failed"   // couldn't read PR HEAD from GitHub; result is pending, not fail (#282)
 )
 
 // MissingItem points at a specific gap. Detail is human-readable;
@@ -67,7 +71,20 @@ type Deps struct {
 	Runs      run.Repository
 	Artifacts artifact.Repository
 	Audit     audit.Repository
+	// PRHead resolves a PR number to its live HEAD sha on GitHub
+	// (#282). Used by rule 5 (foreign-commit detection) to compare
+	// what's on GitHub right now against the Fishhawk-recorded
+	// head_shas across the run + parent chain. Nil disables the
+	// rule — Compute treats that as "no live data, skip drift
+	// check" rather than failing it. Production wires a closure
+	// around `githubclient.Client.GetPullRequest`.
+	PRHead PRHeadFetcher
 }
+
+// PRHeadFetcher is the signature for the live-HEAD callback. Errors
+// flow into a `head_fetch_failed` MissingItem rather than failing
+// Compute outright (GitHub flap shouldn't break the audit signal).
+type PRHeadFetcher func(ctx context.Context, installationID int64, repo githubclient.RepoRef, prNumber int) (headSHA string, err error)
 
 // Compute returns the audit-completeness state for the run plus a
 // list of structured missing items. Both are returned together so
@@ -178,10 +195,239 @@ func Compute(ctx context.Context, runID uuid.UUID, deps Deps) (stagecheck.State,
 		})
 	}
 
-	if len(missing) > 0 {
+	// Rule 5: the PR's live HEAD on GitHub must match a Fishhawk-
+	// recorded head_sha across the run + its parent_run_id chain
+	// (#282 / ADR-017 spirit — Fishhawk's audit story is "every
+	// commit on this branch was produced by Fishhawk").
+	//
+	// Skipped when:
+	//   - PRHead callback isn't wired (dev / test posture without
+	//     a GitHub client).
+	//   - The implement stage hasn't produced a pull_request
+	//     artifact yet (caught by Rule 3 above; rule 5 has nothing
+	//     to compare against).
+	//   - The PR couldn't be read from GitHub (head_fetch_failed).
+	//     Surfaces as a "pending"-flavored missing item; doesn't
+	//     flip the overall state to fail. A flapping GitHub signal
+	//     mustn't break the audit gate.
+	rule5(ctx, deps, runID, &missing)
+
+	// Decide overall state. A `head_fetch_failed` item is
+	// pending-flavored — if it's the ONLY thing in the missing
+	// list, the audit isn't broken, we just couldn't verify the
+	// drift rule against a live source. State stays pending so
+	// branch protection re-evaluates on a successful follow-up
+	// publish rather than tripping a misleading red.
+	switch {
+	case len(missing) == 0:
+		return stagecheck.StatePass, nil, nil
+	case onlyHeadFetchFailures(missing):
+		return stagecheck.StatePending, missing, nil
+	default:
 		return stagecheck.StateFail, missing, nil
 	}
-	return stagecheck.StatePass, nil, nil
+}
+
+// rule5 implements the foreign-commit detection. Appends missing
+// items to `out` and never returns an error — fetch failures land
+// as `head_fetch_failed` so the state-decision logic can treat them
+// as pending rather than fail. Pure data-flow helper; the I/O is
+// guarded by the PRHead callback being non-nil.
+func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) {
+	if deps.PRHead == nil {
+		return
+	}
+	gather, ok, err := gatherForeignCommitInputs(ctx, deps, runID)
+	if err != nil {
+		// Walking the parent chain or reading artifacts failed —
+		// log-equivalent as a fetch-failure missing item. The
+		// caller treats it as pending for state decision.
+		*out = append(*out, MissingItem{
+			Kind:   MissingHeadFetchFail,
+			Detail: fmt.Sprintf("could not gather Fishhawk-recorded head_shas: %v", err),
+		})
+		return
+	}
+	if !ok {
+		// Either no implement stage yet, no installation, no PR
+		// artifact, or no parseable PR number — Rule 3 covers the
+		// missing artifact case; for the others rule 5 has nothing
+		// to compare against.
+		return
+	}
+
+	liveSHA, err := deps.PRHead(ctx, gather.installationID, gather.repo, gather.prNumber)
+	if err != nil {
+		*out = append(*out, MissingItem{
+			Kind:   MissingHeadFetchFail,
+			Detail: fmt.Sprintf("could not read PR HEAD from GitHub: %v", err),
+		})
+		return
+	}
+	if _, hit := gather.knownSHAs[liveSHA]; hit {
+		return
+	}
+
+	known := make([]string, 0, len(gather.knownSHAs))
+	for sha := range gather.knownSHAs {
+		known = append(known, shortSHA(sha))
+	}
+	*out = append(*out, MissingItem{
+		Kind: MissingForeignCommit,
+		Detail: fmt.Sprintf(
+			"PR HEAD %s is not a Fishhawk-recorded commit (known: %s)",
+			shortSHA(liveSHA),
+			strings.Join(known, ", ")),
+	})
+}
+
+// foreignCommitInputs bundles the values rule5 needs to make the
+// PRHead call + compose the missing-item detail.
+type foreignCommitInputs struct {
+	installationID int64
+	repo           githubclient.RepoRef
+	prNumber       int
+	knownSHAs      map[string]struct{}
+}
+
+// gatherForeignCommitInputs walks runID upward via parent_run_id
+// (#216) and collects every implement-stage `pull_request`
+// artifact's head_sha + the PR's number. Returns (inputs, true, nil)
+// when there's enough to call PRHead; (_, false, nil) when there's
+// no implement stage / no installation / no PR yet; error only on
+// transient I/O.
+func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) (foreignCommitInputs, bool, error) {
+	known := make(map[string]struct{})
+	var (
+		installationID int64
+		repoRef        githubclient.RepoRef
+		prNumber       int
+	)
+
+	cursor := runID
+	visited := map[uuid.UUID]struct{}{}
+	for {
+		if _, seen := visited[cursor]; seen {
+			break // defensive against a corrupted parent loop
+		}
+		visited[cursor] = struct{}{}
+
+		r, err := deps.Runs.GetRun(ctx, cursor)
+		if err != nil {
+			return foreignCommitInputs{}, false, fmt.Errorf("get run %s: %w", shortID(cursor), err)
+		}
+
+		// The original (head) run anchors installation + repo;
+		// every ancestor shares them. Capture once.
+		if installationID == 0 && r.InstallationID != nil {
+			installationID = *r.InstallationID
+			parsed, perr := parseRepo(r.Repo)
+			if perr == nil {
+				repoRef = parsed
+			}
+		}
+
+		// Pull head_sha + pr_number from this run's implement stage.
+		stages, err := deps.Runs.ListStagesForRun(ctx, r.ID)
+		if err != nil {
+			return foreignCommitInputs{}, false, fmt.Errorf("list stages for %s: %w", shortID(r.ID), err)
+		}
+		var impl *run.Stage
+		for _, s := range stages {
+			if s.Type == run.StageTypeImplement {
+				impl = s
+				break
+			}
+		}
+		if impl != nil {
+			arts, err := deps.Artifacts.ListForStage(ctx, impl.ID)
+			if err != nil {
+				return foreignCommitInputs{}, false, fmt.Errorf("list artifacts for %s: %w", shortID(impl.ID), err)
+			}
+			for _, a := range arts {
+				if a.Kind != artifact.KindPullRequest {
+					continue
+				}
+				sha, num := decodePRArtifact(a.Content)
+				if sha != "" {
+					known[sha] = struct{}{}
+				}
+				// The newest run on the chain (we visit it first)
+				// is authoritative for the PR number.
+				if prNumber == 0 && num > 0 {
+					prNumber = num
+				}
+			}
+		}
+
+		if r.ParentRunID == nil {
+			break
+		}
+		cursor = *r.ParentRunID
+	}
+
+	if installationID == 0 || repoRef.Owner == "" || prNumber == 0 || len(known) == 0 {
+		return foreignCommitInputs{}, false, nil
+	}
+	return foreignCommitInputs{
+		installationID: installationID,
+		repo:           repoRef,
+		prNumber:       prNumber,
+		knownSHAs:      known,
+	}, true, nil
+}
+
+// decodePRArtifact pulls (head_sha, pr_number) out of a
+// pull_request artifact's content. Mirrors the publisher's
+// `decodeHeadSHA` but returns the number too. Empty / unparseable
+// values come back as zero — the caller skips silently rather than
+// surfacing the parse failure (the artifact validator is the right
+// place for that complaint).
+func decodePRArtifact(content []byte) (string, int) {
+	if len(content) == 0 {
+		return "", 0
+	}
+	var body struct {
+		HeadSHA  string `json:"head_sha"`
+		PRNumber int    `json:"pr_number"`
+	}
+	if err := json.Unmarshal(content, &body); err != nil {
+		return "", 0
+	}
+	return body.HeadSHA, body.PRNumber
+}
+
+// parseRepo splits "owner/name" into a RepoRef. Mirrors the
+// helpers in other packages; duplicated here to keep auditcomplete
+// import-free of higher layers.
+func parseRepo(s string) (githubclient.RepoRef, error) {
+	i := strings.IndexByte(s, '/')
+	if i <= 0 || i == len(s)-1 {
+		return githubclient.RepoRef{}, fmt.Errorf("auditcomplete: repo %q must be owner/name", s)
+	}
+	return githubclient.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
+}
+
+// shortSHA renders the leading 7 of a SHA for human-readable
+// missing-item details. Leaves shorter SHAs untouched.
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+// onlyHeadFetchFailures returns true when every entry in `missing`
+// is a `head_fetch_failed` row. Used to demote the overall state
+// from fail to pending — a fetch failure isn't an audit gap, just
+// "we don't know."
+func onlyHeadFetchFailures(missing []MissingItem) bool {
+	for _, m := range missing {
+		if m.Kind != MissingHeadFetchFail {
+			return false
+		}
+	}
+	return len(missing) > 0
 }
 
 func shortID(id uuid.UUID) string {

@@ -556,10 +556,11 @@ func (c *Client) EnableAutoMerge(ctx context.Context, installationID int64,
 		method = MergeMethodSquash
 	}
 
-	nodeID, err := c.fetchPullRequestNodeID(ctx, installationID, repo, prNumber)
+	pr, err := c.GetPullRequest(ctx, installationID, repo, prNumber)
 	if err != nil {
 		return err
 	}
+	nodeID := pr.NodeID
 
 	mutation := `mutation EnableAutoMerge($id: ID!, $method: PullRequestMergeMethod!) {
   enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method }) {
@@ -610,37 +611,77 @@ func (c *Client) EnableAutoMerge(ctx context.Context, installationID int64,
 	return nil
 }
 
-// fetchPullRequestNodeID resolves a PR number to its GraphQL node id
-// via REST. The GraphQL mutation `enablePullRequestAutoMerge` needs
-// the node id (opaque, base64-encoded) rather than the (owner, repo,
-// number) tuple.
-func (c *Client) fetchPullRequestNodeID(ctx context.Context, installationID int64,
-	repo RepoRef, number int) (string, error) {
+// PullRequest is the slice of a pull-request API response Fishhawk
+// surfaces. NodeID is the opaque base64-encoded GraphQL identifier
+// (consumed by `EnableAutoMerge` per #255). HeadSHA + State are
+// consumed by the foreign-commit audit rule (#282) — Fishhawk
+// compares the live HEAD on GitHub against the head_shas it
+// recorded in its own pull_request artifacts.
+type PullRequest struct {
+	NodeID  string
+	HeadSHA string
+	State   string // "open" | "closed"
+	Merged  bool   // true when state=closed and the PR was merged
+}
+
+// GetPullRequest fetches a single PR by number.
+//
+//	GET /repos/{owner}/{repo}/pulls/{number}
+//
+// Returns ErrNotFound when the PR doesn't exist on the installation,
+// ErrForbidden on auth issues. Used by:
+//
+//   - `EnableAutoMerge` (#255) — for the node id (the GraphQL
+//     mutation can't be addressed by number).
+//   - `auditcomplete.Compute` rule 5 (#282) — for the live head_sha
+//     comparison.
+func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
+	repo RepoRef, number int) (*PullRequest, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: pr number must be > 0")
+	}
+
 	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
 		"/" + url.PathEscape(repo.Name) +
 		"/pulls/" + url.PathEscape(fmt.Sprintf("%d", number)))
 	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("githubclient: fetch pr node id: %w", err)
+		return nil, fmt.Errorf("githubclient: get pr: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if err := classifyStatus("fetch pr node id", resp); err != nil {
-		return "", err
+	if err := classifyStatus("get pr", resp); err != nil {
+		return nil, err
 	}
 	var body struct {
 		NodeID string `json:"node_id"`
+		State  string `json:"state"`
+		Merged bool   `json:"merged"`
+		Head   struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", fmt.Errorf("githubclient: decode pr: %w", err)
+		return nil, fmt.Errorf("githubclient: decode pr: %w", err)
 	}
 	if body.NodeID == "" {
-		return "", fmt.Errorf("githubclient: pr response missing node_id")
+		return nil, fmt.Errorf("githubclient: pr response missing node_id")
 	}
-	return body.NodeID, nil
+	return &PullRequest{
+		NodeID:  body.NodeID,
+		HeadSHA: body.Head.SHA,
+		State:   body.State,
+		Merged:  body.Merged,
+	}, nil
 }
 
 // TeamMember is the slice of a team-membership API response we

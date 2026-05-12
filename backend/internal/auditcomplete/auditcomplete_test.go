@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -205,6 +207,153 @@ func TestCompute_NilDeps(t *testing.T) {
 	}
 }
 
+// --- Rule 5 (foreign commit, #282) ---
+
+// foreignCommitSetup builds a run with a populated PR artifact +
+// known head_sha + installation. The four tests below mutate one
+// piece (the live PRHead callback, the parent chain, etc.) to drive
+// the behavior they care about. Returns the runID + the fake repos
+// + the canonical recorded head_sha.
+func foreignCommitSetup(t *testing.T) (uuid.UUID, *fakeRuns, *fakeArtifacts, *fakeAudit, string) {
+	t.Helper()
+	runID := uuid.New()
+	plan := mkStage(runID, 1, run.StageTypePlan, run.StageStateSucceeded)
+	impl := mkStage(runID, 2, run.StageTypeImplement, run.StageStateSucceeded)
+	rev := mkStage(runID, 3, run.StageTypeReview, run.StageStateAwaitingApproval)
+
+	const recordedSHA = "abc123def4567890abc123def4567890abc12345"
+	const prNumber = 275
+
+	installID := int64(99)
+	runs := &fakeRuns{
+		stages: []*run.Stage{plan, impl, rev},
+		runs: map[uuid.UUID]*run.Run{
+			runID: {
+				ID:             runID,
+				Repo:           "kuhlman-labs/fishhawk",
+				WorkflowID:     "feature_change",
+				InstallationID: &installID,
+			},
+		},
+	}
+	arts := &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			plan.ID: {planArtifact(plan.ID, "standard_v1")},
+			impl.ID: {pullRequestArtifactWithBody(impl.ID, recordedSHA, prNumber)},
+		},
+	}
+	auditRepo := &fakeAudit{}
+	auditRepo.appendChained(t, runID, &plan.ID, "trace_uploaded", traceVariantPayload("raw"))
+	auditRepo.appendChained(t, runID, &plan.ID, "trace_uploaded", traceVariantPayload("redacted"))
+	auditRepo.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("raw"))
+	auditRepo.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("redacted"))
+
+	return runID, runs, arts, auditRepo, recordedSHA
+}
+
+func TestCompute_Rule5_PRHeadMatches_Passes(t *testing.T) {
+	// Live HEAD matches the recorded artifact head_sha → pass.
+	// This is the canonical happy path; everything other rules say
+	// pass should keep passing once rule 5 lands.
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Errorf("state = %s want pass; missing=%+v", state, missing)
+	}
+}
+
+func TestCompute_Rule5_ForeignCommit_Fails(t *testing.T) {
+	// Live HEAD differs from the recorded SHA — exactly the case
+	// the user reproduced by pushing a prettier fix directly to PR
+	// #275 (which then had `fishhawk_audit_complete` stay green
+	// because the rule didn't exist yet). Pre-#282 we'd render
+	// pass; post-#282 the drift fails the rule with the foreign-
+	// commit kind and both shas in the detail.
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const foreignSHA = "deadbeef1111deadbeef1111deadbeef11111111"
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, foreignSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s, want fail; missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("expected foreign_commit missing item; got %+v", missing)
+	}
+	// Detail names both the observed and known shas so a reviewer
+	// can identify the drift without cross-referencing.
+	var detail string
+	for _, m := range missing {
+		if m.Kind == auditcomplete.MissingForeignCommit {
+			detail = m.Detail
+		}
+	}
+	if !strings.Contains(detail, foreignSHA[:7]) {
+		t.Errorf("detail should name observed sha %q: %s", foreignSHA[:7], detail)
+	}
+}
+
+func TestCompute_Rule5_LiveFetchFailure_Pending(t *testing.T) {
+	// GitHub fetch errors must NOT flip the audit to fail — that
+	// produces a flapping signal on every transient outage. The
+	// rule emits a `head_fetch_failed` missing item and the overall
+	// state demotes to pending so branch protection re-evaluates
+	// on the next successful publish.
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, "", errors.New("rate limited")),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Errorf("state = %s want pending (head_fetch_failed shouldn't fail audit); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed missing item; got %+v", missing)
+	}
+}
+
+func TestCompute_Rule5_NilPRHead_SkipsCleanly(t *testing.T) {
+	// Dev / CLI posture: no GitHub client wired. Compute MUST skip
+	// rule 5 cleanly — other rules still evaluate, the overall
+	// state is the rest-of-the-audit's verdict (pass here).
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	d := auditcomplete.Deps{Runs: runs, Artifacts: arts, Audit: ar} // PRHead nil
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Errorf("state = %s want pass (nil PRHead skips rule 5); missing=%+v", state, missing)
+	}
+}
+
+// stubPRHead returns a PRHeadFetcher that always returns `(headSHA,
+// err)`. Captures the input args in t.Log so a failing test can show
+// what was asked.
+func stubPRHead(t *testing.T, headSHA string, err error) auditcomplete.PRHeadFetcher {
+	t.Helper()
+	return func(_ context.Context, installationID int64, repo githubclient.RepoRef, prNumber int) (string, error) {
+		t.Logf("PRHead called: installationID=%d repo=%s pr=%d", installationID, repo.String(), prNumber)
+		return headSHA, err
+	}
+}
+
 // --- helpers ---
 
 func deps(r *fakeRuns, a *fakeArtifacts, au *fakeAudit) auditcomplete.Deps {
@@ -241,6 +390,23 @@ func pullRequestArtifact(stageID uuid.UUID) *artifact.Artifact {
 	}
 }
 
+// pullRequestArtifactWithBody is the rule-5 (#282) variant —
+// `pullRequestArtifact` returns `{}` which doesn't carry the
+// head_sha / pr_number that the foreign-commit rule needs to gather
+// the Fishhawk-recorded SHA set.
+func pullRequestArtifactWithBody(stageID uuid.UUID, headSHA string, prNumber int) *artifact.Artifact {
+	body, _ := json.Marshal(map[string]any{
+		"head_sha":  headSHA,
+		"pr_number": prNumber,
+	})
+	return &artifact.Artifact{
+		ID:      uuid.New(),
+		StageID: stageID,
+		Kind:    artifact.KindPullRequest,
+		Content: body,
+	}
+}
+
 func traceVariantPayload(variant string) json.RawMessage {
 	b, _ := json.Marshal(map[string]string{"variant": variant})
 	return b
@@ -261,13 +427,43 @@ type fakeRuns struct {
 	run.Repository // embed for the methods we don't care about (panic on call is fine)
 	stages         []*run.Stage
 	listErr        error
+	// runs is the chain GetRun walks. Rule 5 (foreign-commit
+	// detection) walks parent_run_id upward; tests that exercise
+	// that path seed multiple entries here. Tests that don't care
+	// leave it nil — GetRun falls back to a default issue-triggered
+	// run synthesized from stages[0].RunID.
+	runs map[uuid.UUID]*run.Run
 }
 
-func (f *fakeRuns) ListStagesForRun(_ context.Context, _ uuid.UUID) ([]*run.Stage, error) {
+func (f *fakeRuns) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
+	// When `runs` is seeded, scope the stages to the requested run
+	// (the chain walk hits multiple run ids). When it isn't, keep
+	// the original "all stages everywhere" behavior so existing
+	// tests don't have to change.
+	if f.runs != nil {
+		var out []*run.Stage
+		for _, s := range f.stages {
+			if s.RunID == runID {
+				out = append(out, s)
+			}
+		}
+		return out, nil
+	}
 	return f.stages, nil
+}
+
+func (f *fakeRuns) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	if r, ok := f.runs[id]; ok {
+		return r, nil
+	}
+	// Default: synthesize an issue-triggered run rooted at this id
+	// so existing tests (which don't seed `runs`) keep working. The
+	// foreign-commit rule reads InstallationID + Repo from the
+	// returned row; tests that don't care leave them nil.
+	return &run.Run{ID: id}, nil
 }
 
 type fakeArtifacts struct {
