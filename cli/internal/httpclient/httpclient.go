@@ -71,15 +71,19 @@ type errorEnvelope struct {
 // Run is the CLI-side projection of the OpenAPI Run schema. Field
 // names + types match the wire shape verbatim.
 type Run struct {
-	ID            uuid.UUID `json:"id"`
-	Repo          string    `json:"repo"`
-	WorkflowID    string    `json:"workflow_id"`
-	WorkflowSHA   string    `json:"workflow_sha"`
-	TriggerSource string    `json:"trigger_source"`
-	TriggerRef    *string   `json:"trigger_ref"`
-	State         string    `json:"state"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID                 uuid.UUID  `json:"id"`
+	Repo               string     `json:"repo"`
+	WorkflowID         string     `json:"workflow_id"`
+	WorkflowSHA        string     `json:"workflow_sha"`
+	TriggerSource      string     `json:"trigger_source"`
+	TriggerRef         *string    `json:"trigger_ref"`
+	State              string     `json:"state"`
+	ParentRunID        *uuid.UUID `json:"parent_run_id"`
+	PullRequestURL     *string    `json:"pull_request_url"`
+	RetryAttempt       int        `json:"retry_attempt"`
+	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 // CreateRunInput is what StartRun marshals into the request body.

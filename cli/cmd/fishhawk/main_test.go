@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -248,6 +249,63 @@ func TestRunStatus_MissingArg(t *testing.T) {
 	got := run([]string{"run", "status"}, io.Discard, io.Discard)
 	if got != exitUsage {
 		t.Errorf("status = %d, want exitUsage", got)
+	}
+}
+
+func TestRunStatus_JSONOutput(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	id := uuid.New()
+	fb.getResp = httpclient.Run{
+		ID:           id,
+		Repo:         "x/y",
+		State:        "running",
+		RetryAttempt: 2,
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"run", "status", "--output", "json", id.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	var decoded httpclient.Run
+	if err := json.Unmarshal([]byte(stdout.String()), &decoded); err != nil {
+		t.Fatalf("unmarshal stdout: %v\nstdout: %q", err, stdout.String())
+	}
+	if decoded.ID != id {
+		t.Errorf("ID = %s, want %s", decoded.ID, id)
+	}
+	if decoded.State != "running" {
+		t.Errorf("State = %q, want running", decoded.State)
+	}
+	if decoded.RetryAttempt != 2 {
+		t.Errorf("RetryAttempt = %d, want 2", decoded.RetryAttempt)
+	}
+}
+
+func TestRunStatus_BadOutputValue(t *testing.T) {
+	var hits atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(httpclient.Run{})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	t.Setenv("FISHHAWK_BACKEND_URL", srv.URL)
+	t.Setenv("FISHHAWK_TOKEN", "")
+
+	var stderr strings.Builder
+	got := run([]string{"run", "status", "--output", "xml", uuid.New().String()}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("backend hit %d times; want 0 (bad --output must short-circuit before the network call)", n)
+	}
+	if !strings.Contains(stderr.String(), "invalid --output") {
+		t.Errorf("stderr missing 'invalid --output': %s", stderr.String())
 	}
 }
 
