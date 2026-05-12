@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -117,6 +118,12 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 			Runs:      s.cfg.RunRepo,
 			Artifacts: s.cfg.ArtifactRepo,
 			Audit:     s.cfg.AuditRepo,
+			// Live HEAD lookup for the foreign-commit rule (#282).
+			// Nil-safe: when GitHub isn't wired (dev / CLI runs),
+			// Compute treats `nil PRHead` as "skip the drift rule"
+			// rather than failing — the rest of the audit still
+			// evaluates.
+			PRHead: s.prHeadFetcher(),
 		})
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -184,5 +191,22 @@ func toStageCheckResponse(c *stagecheck.Check) stageCheckResponse {
 		HeadSHA:          c.HeadSHA,
 		GitHubCheckRunID: c.GitHubCheckRunID,
 		Timestamp:        c.Timestamp,
+	}
+}
+
+// prHeadFetcher returns the closure auditcomplete.Compute calls
+// for the foreign-commit rule (#282). Nil when no GitHub client is
+// wired — Compute then skips the rule cleanly. Production wires
+// `cfg.GitHub.GetPullRequest`.
+func (s *Server) prHeadFetcher() auditcomplete.PRHeadFetcher {
+	if s.cfg.GitHub == nil {
+		return nil
+	}
+	return func(ctx context.Context, installationID int64, repo githubclient.RepoRef, prNumber int) (string, error) {
+		pr, err := s.cfg.GitHub.GetPullRequest(ctx, installationID, repo, prNumber)
+		if err != nil {
+			return "", err
+		}
+		return pr.HeadSHA, nil
 	}
 }

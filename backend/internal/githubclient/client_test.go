@@ -101,7 +101,7 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		getRulesetStatus:          http.StatusOK,
 		getRulesetBody:            map[int64]string{},
 		getPullRequestStatus:      http.StatusOK,
-		getPullRequestBody:        `{"number":42,"node_id":"PR_kwDOABcDEf"}`,
+		getPullRequestBody:        `{"number":42,"node_id":"PR_kwDOABcDEf","state":"open","merged":false,"head":{"sha":"abc123"}}`,
 		graphqlStatus:             http.StatusOK,
 		graphqlBody:               `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
 	}
@@ -1279,6 +1279,70 @@ func TestEnableAutoMerge_ValidationErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := c.EnableAutoMerge(context.Background(), 1, tc.repo, tc.prNumber, MergeMethodSquash)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestGetPullRequest_HappyPath(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+	pr, err := c.GetPullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err != nil {
+		t.Fatalf("GetPullRequest: %v", err)
+	}
+	if pr.NodeID != "PR_kwDOABcDEf" {
+		t.Errorf("NodeID = %q", pr.NodeID)
+	}
+	if pr.HeadSHA != "abc123" {
+		t.Errorf("HeadSHA = %q", pr.HeadSHA)
+	}
+	if pr.State != "open" {
+		t.Errorf("State = %q", pr.State)
+	}
+	if pr.Merged {
+		t.Errorf("Merged = true, want false")
+	}
+}
+
+func TestGetPullRequest_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getPullRequestStatus = http.StatusNotFound
+	fg.getPullRequestBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+	_, err := c.GetPullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetPullRequest_MissingNodeID(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getPullRequestBody = `{"number":42,"head":{"sha":"abc"}}`
+	c, _ := newTestClient(t, srv, nil)
+	_, err := c.GetPullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err == nil || !strings.Contains(err.Error(), "node_id") {
+		t.Errorf("err = %v, want missing-node_id error", err)
+	}
+}
+
+func TestGetPullRequest_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		prNumber  int
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, 1, "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, 1, "owner and name"},
+		{"zero pr", RepoRef{Owner: "x", Name: "y"}, 0, "pr number must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.GetPullRequest(context.Background(), 1, tc.repo, tc.prNumber)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}

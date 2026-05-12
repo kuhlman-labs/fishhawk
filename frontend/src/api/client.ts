@@ -196,7 +196,16 @@ export const api = {
           | 'trace_missing'
           | 'pr_missing'
           | 'chain_invalid'
-          | 'chain_unrecoverable';
+          | 'chain_unrecoverable'
+          // #282: PR HEAD on GitHub isn't one of Fishhawk's
+          // recorded head_shas — a commit landed outside the
+          // Fishhawk runner.
+          | 'foreign_commit'
+          // #282 (pending-flavored): couldn't read the PR HEAD
+          // from GitHub. Compute demotes the overall state to
+          // pending so a flapping signal doesn't trip branch
+          // protection.
+          | 'head_fetch_failed';
         detail: string;
       }>;
     }>;
