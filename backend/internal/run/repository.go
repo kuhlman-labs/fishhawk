@@ -47,6 +47,12 @@ type CreateRunParams struct {
 	// chain (#279). 0 for original runs; parent.RetryAttempt + 1
 	// for CI-failure retries (cap-enforced by the dispatcher).
 	RetryAttempt int
+	// MaxRetriesSnapshot is the workflow's
+	// on_ci_failure.max_retries cap at run-create time (#280).
+	// 0 means "use the migration's default" (1); callers should
+	// pass the explicit value from spec parsing — see
+	// dispatcher.resolveMaxRetriesForCreate.
+	MaxRetriesSnapshot int
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

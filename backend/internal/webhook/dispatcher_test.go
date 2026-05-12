@@ -710,6 +710,7 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		RequiredChecksSnapshot: p.RequiredChecksSnapshot,
 		WorkflowSpec:           p.WorkflowSpec,
 		RetryAttempt:           p.RetryAttempt,
+		MaxRetriesSnapshot:     p.MaxRetriesSnapshot,
 		State:                  run.StatePending,
 		CreatedAt:              time.Now().UTC(),
 		UpdatedAt:              time.Now().UTC(),
@@ -974,6 +975,69 @@ func issueLabeledEvent(t *testing.T) Event {
 		t.Fatal(err)
 	}
 	return ev
+}
+
+// specWithMaxRetries3 extends validSpec with an explicit
+// on_ci_failure.max_retries=3 so the snapshot test can prove the
+// dispatcher reads from the spec rather than always stamping the
+// default (1).
+const specWithMaxRetries3 = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow
+    on_ci_failure:
+      max_retries: 3
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+            sla: 4_business_hours
+`
+
+func TestHandle_RunCreate_SnapshotsMaxRetriesFromSpec(t *testing.T) {
+	t.Run("default when on_ci_failure is absent", func(t *testing.T) {
+		// validSpec has no on_ci_failure block → the snapshot defaults
+		// to spec.DefaultMaxRetries (= 1).
+		d, _, runs, _ := newDispatcherWithStubs(t)
+		if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if len(runs.created) != 1 {
+			t.Fatalf("runs.created = %d, want 1", len(runs.created))
+		}
+		if runs.created[0].MaxRetriesSnapshot != spec.DefaultMaxRetries {
+			t.Errorf("MaxRetriesSnapshot = %d, want %d (default)",
+				runs.created[0].MaxRetriesSnapshot, spec.DefaultMaxRetries)
+		}
+	})
+	t.Run("explicit value carries through", func(t *testing.T) {
+		d, gh, runs, _ := newDispatcherWithStubs(t)
+		gh.specContent = []byte(specWithMaxRetries3)
+		if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if len(runs.created) != 1 {
+			t.Fatalf("runs.created = %d, want 1", len(runs.created))
+		}
+		if runs.created[0].MaxRetriesSnapshot != 3 {
+			t.Errorf("MaxRetriesSnapshot = %d, want 3 (from spec)",
+				runs.created[0].MaxRetriesSnapshot)
+		}
+	})
 }
 
 func TestHandle_HappyPath_CreatesRunAndDispatches(t *testing.T) {
@@ -2350,11 +2414,12 @@ func seedParentRunForRetry(t *testing.T, runs *stubRuns, repo, specYAML string, 
 			Contexts: []string{"ci/build"},
 			Sources:  []string{"branch_protection"},
 		},
-		WorkflowSpec: []byte(specYAML),
-		RetryAttempt: retryAttempt,
-		State:        run.StateRunning,
-		CreatedAt:    time.Now().Add(-time.Minute).UTC(),
-		UpdatedAt:    time.Now().Add(-time.Minute).UTC(),
+		WorkflowSpec:       []byte(specYAML),
+		RetryAttempt:       retryAttempt,
+		MaxRetriesSnapshot: 1, // ciRetrySpec sets max_retries: 1
+		State:              run.StateRunning,
+		CreatedAt:          time.Now().Add(-time.Minute).UTC(),
+		UpdatedAt:          time.Now().Add(-time.Minute).UTC(),
 	}
 	runs.mu.Lock()
 	runs.created = append(runs.created, r)
@@ -2393,6 +2458,12 @@ func TestHandle_CIFailureRetry_HappyPath_DispatchesChild(t *testing.T) {
 		len(child.RequiredChecksSnapshot.Contexts) != 1 ||
 		child.RequiredChecksSnapshot.Contexts[0] != "ci/build" {
 		t.Errorf("child snapshot didn't carry over: %+v", child.RequiredChecksSnapshot)
+	}
+	// Child inherits the parent's max_retries snapshot so a long-
+	// running chain sees the same N/M on every row (#280).
+	if child.MaxRetriesSnapshot != parent.MaxRetriesSnapshot {
+		t.Errorf("child.MaxRetriesSnapshot = %d, want %d (inherited)",
+			child.MaxRetriesSnapshot, parent.MaxRetriesSnapshot)
 	}
 
 	// Only the implement stage should be created for the retry —

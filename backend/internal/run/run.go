@@ -204,9 +204,20 @@ type Run struct {
 	// refuses to create a new child when retry_attempt >=
 	// max_retries — emitting a `ci_retry_exhausted` audit instead.
 	RetryAttempt int
-	State        State
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// MaxRetriesSnapshot is the workflow's
+	// on_ci_failure.max_retries cap captured at run-create time
+	// (#280 / E16). Snapshotted alongside RequiredChecksSnapshot
+	// so a spec edit during a long-running auto-retry chain
+	// doesn't shift the goalposts on what the SPA renders or what
+	// the dispatcher enforces. Defaults to spec.DefaultMaxRetries
+	// (= 1) when the workflow has no `on_ci_failure:` block.
+	// Legacy rows (created before migration 0021) carry the
+	// migration's column-level default of 1, which matches the
+	// no-block case.
+	MaxRetriesSnapshot int
+	State              State
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // RequiredChecksSnapshot captures the required-status-checks list

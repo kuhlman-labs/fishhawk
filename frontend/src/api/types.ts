@@ -29,6 +29,20 @@ export interface Run {
    * "every run on this PR."
    */
   pull_request_url?: string | null;
+  /**
+   * Position in the CI-failure auto-retry chain (#279 / E16). 0 for
+   * the canonical first attempt; N for the Nth retry. Compared
+   * against max_retries_snapshot to decide whether more retries
+   * are available.
+   */
+  retry_attempt: number;
+  /**
+   * Workflow's on_ci_failure.max_retries cap snapshotted at
+   * run-create time (#280 / E16). Defaults to 1 when the spec
+   * has no on_ci_failure block. Renders alongside retry_attempt
+   * as "Retry N/M" on the run-detail header.
+   */
+  max_retries_snapshot: number;
   created_at: string;
   updated_at: string;
 }

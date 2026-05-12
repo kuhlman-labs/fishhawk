@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { api } from '@/api/client';
 import type { Run } from '@/api/types';
-import { RelatedRunsSection, FollowUpLink } from './related-runs';
+import { RelatedRunsSection, FollowUpLink, RetryBadge } from './related-runs';
 
 const RUN_A: Run = {
   id: 'aaaaaaaa-1111-1111-1111-111111111111',
@@ -14,6 +14,8 @@ const RUN_A: Run = {
   trigger_ref: 'issue:42',
   state: 'running',
   pull_request_url: 'https://github.com/kuhlman-labs/fishhawk/pull/123',
+  retry_attempt: 0,
+  max_retries_snapshot: 1,
   created_at: '2026-05-08T12:00:00Z',
   updated_at: '2026-05-08T12:00:00Z',
 };
@@ -108,5 +110,67 @@ describe('<FollowUpLink>', () => {
     renderInRouter(<FollowUpLink parentRunID="cccccccc-3333-3333-3333-333333333333" />);
     const link = screen.getByRole('link', { name: /cccccccc/i });
     expect(link).toHaveAttribute('href', '/runs/cccccccc-3333-3333-3333-333333333333');
+  });
+});
+
+describe('<RetryBadge>', () => {
+  it('renders Retry N/M and points the tooltip at the parent run', () => {
+    render(<RetryBadge attempt={1} max={3} parentRunID="cccccccc-3333-3333-3333-333333333333" />);
+    const badge = screen.getByText('Retry 1/3');
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveAttribute('title', expect.stringMatching(/Re-dispatched after CI failure/));
+    expect(badge).toHaveAttribute('title', expect.stringMatching(/cccccccc/));
+    // Non-terminal attempt keeps the neutral tone.
+    expect(badge.className).toContain('neutral');
+    expect(badge.className).not.toContain('amber');
+  });
+
+  it('shifts to amber tone and "Last retry" tooltip when at the cap', () => {
+    render(<RetryBadge attempt={1} max={1} parentRunID="cccccccc-3333-3333-3333-333333333333" />);
+    const badge = screen.getByText('Retry 1/1');
+    expect(badge).toHaveAttribute('title', 'Last retry — no further auto-dispatches.');
+    expect(badge.className).toContain('amber');
+  });
+
+  it('falls back to a generic tooltip when parent_run_id is null', () => {
+    render(<RetryBadge attempt={1} max={3} parentRunID={null} />);
+    expect(screen.getByText('Retry 1/3')).toHaveAttribute(
+      'title',
+      'Re-dispatched after CI failure.',
+    );
+  });
+});
+
+describe('<RelatedRunsSection> retry chip', () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  it('renders a Retry #N chip for sibling runs with retry_attempt > 0', async () => {
+    const retrySibling: Run = {
+      ...RUN_A,
+      id: 'dddddddd-4444-4444-4444-444444444444',
+      retry_attempt: 1,
+      state: 'running',
+    };
+    vi.spyOn(api, 'listRuns').mockResolvedValue({
+      items: [RUN_A, retrySibling],
+      next_cursor: null,
+    });
+    renderInRouter(<RelatedRunsSection run={RUN_A} />);
+    await waitFor(() => {
+      expect(screen.getByText('Retry #1')).toBeInTheDocument();
+    });
+  });
+
+  it('omits the chip for sibling runs that are the original (retry_attempt === 0)', async () => {
+    vi.spyOn(api, 'listRuns').mockResolvedValue({
+      items: [RUN_A, SIBLING_RUN],
+      next_cursor: null,
+    });
+    renderInRouter(<RelatedRunsSection run={RUN_A} />);
+    await waitFor(() => {
+      expect(screen.getByText(SIBLING_RUN.id.slice(0, 8) + '…')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Retry #/)).not.toBeInTheDocument();
   });
 });

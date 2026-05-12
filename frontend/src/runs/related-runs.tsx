@@ -127,6 +127,11 @@ function RelatedRunRow({ run }: { run: Run }) {
           {run.trigger_source}
           {run.trigger_ref ? ` · ${run.trigger_ref}` : ''}
         </span>
+        {run.retry_attempt > 0 && (
+          <span className="rounded bg-amber-100 px-1.5 py-0.5 font-mono text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+            Retry #{run.retry_attempt}
+          </span>
+        )}
         <span className="ml-auto font-mono text-xs">{run.state}</span>
       </Link>
     </li>
@@ -149,6 +154,39 @@ function groupingLabel(run: Run): string {
     return run.trigger_ref;
   }
   return '';
+}
+
+// RetryBadge renders "Retry N/M" on the run-detail header when the
+// run is part of a CI-failure auto-retry chain (#279 / #280). When
+// the attempt has reached the cap, the tone shifts to amber and
+// the tooltip names the terminal state so reviewers know no
+// further auto-dispatches will fire.
+export function RetryBadge({
+  attempt,
+  max,
+  parentRunID,
+}: {
+  attempt: number;
+  max: number;
+  parentRunID: string | null;
+}) {
+  const exhausted = max > 0 && attempt >= max;
+  // Two tones: amber when capped (warning — no more auto-retries),
+  // neutral otherwise. The badge sits next to the page title so we
+  // keep it small and monospace to match the surrounding header.
+  const tone = exhausted
+    ? 'border-amber-300 bg-amber-100 text-amber-900 dark:border-amber-900/60 dark:bg-amber-900/40 dark:text-amber-200'
+    : 'border-neutral-300 bg-neutral-100 text-neutral-700 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200';
+  const tooltip = exhausted
+    ? 'Last retry — no further auto-dispatches.'
+    : parentRunID
+      ? `Re-dispatched after CI failure on ${parentRunID.slice(0, 8)}…`
+      : 'Re-dispatched after CI failure.';
+  return (
+    <span className={`rounded border px-1.5 py-0.5 font-mono text-xs ${tone}`} title={tooltip}>
+      Retry {attempt}/{max}
+    </span>
+  );
 }
 
 // FollowUpLink is a small inline affordance for the run-detail

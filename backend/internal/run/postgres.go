@@ -51,6 +51,15 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		snapshotBytes = b
 	}
 
+	// The migration's column-level DEFAULT 1 only applies when the
+	// column is omitted from INSERT — since sqlc lists it in every
+	// generated INSERT, a zero in CreateRunParams would persist as 0
+	// and trip the SPA's "Retry 0/0" rendering. Promote 0 → 1 here so
+	// callers that don't set the field still get the sane default.
+	maxRetries := p.MaxRetriesSnapshot
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
 	row, err := q.CreateRun(ctx, rundb.CreateRunParams{
 		ID:                     uuid.New(),
 		Repo:                   p.Repo,
@@ -65,6 +74,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		RequiredChecksSnapshot: snapshotBytes,
 		WorkflowSpec:           p.WorkflowSpec,
 		RetryAttempt:           int32(p.RetryAttempt),
+		MaxRetriesSnapshot:     int32(maxRetries),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -380,21 +390,22 @@ func (r *postgresRepo) RetryStage(ctx context.Context, id uuid.UUID, to StageSta
 
 func rowToRun(r rundb.Run) *Run {
 	out := &Run{
-		ID:             r.ID,
-		Repo:           r.Repo,
-		WorkflowID:     r.WorkflowID,
-		WorkflowSHA:    r.WorkflowSha,
-		TriggerSource:  TriggerSource(r.TriggerSource),
-		TriggerRef:     r.TriggerRef,
-		InstallationID: r.InstallationID,
-		IdempotencyKey: r.IdempotencyKey,
-		ParentRunID:    r.ParentRunID,
-		PullRequestURL: r.PullRequestUrl,
-		WorkflowSpec:   r.WorkflowSpec,
-		RetryAttempt:   int(r.RetryAttempt),
-		State:          State(r.State),
-		CreatedAt:      r.CreatedAt.Time,
-		UpdatedAt:      r.UpdatedAt.Time,
+		ID:                 r.ID,
+		Repo:               r.Repo,
+		WorkflowID:         r.WorkflowID,
+		WorkflowSHA:        r.WorkflowSha,
+		TriggerSource:      TriggerSource(r.TriggerSource),
+		TriggerRef:         r.TriggerRef,
+		InstallationID:     r.InstallationID,
+		IdempotencyKey:     r.IdempotencyKey,
+		ParentRunID:        r.ParentRunID,
+		PullRequestURL:     r.PullRequestUrl,
+		WorkflowSpec:       r.WorkflowSpec,
+		RetryAttempt:       int(r.RetryAttempt),
+		MaxRetriesSnapshot: int(r.MaxRetriesSnapshot),
+		State:              State(r.State),
+		CreatedAt:          r.CreatedAt.Time,
+		UpdatedAt:          r.UpdatedAt.Time,
 	}
 	// JSONB → struct. Empty bytes means the column is NULL — the
 	// run pre-dates the snapshot wiring or skipped protection
