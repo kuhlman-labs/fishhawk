@@ -393,6 +393,69 @@ func TestImplementPrompt_NoPlan_FallsBackAndAuditsTheGap(t *testing.T) {
 	}
 }
 
+func TestImplementPrompt_WalksParentRunForRetry(t *testing.T) {
+	// A CI-failure retry run (#279 / E16) has no plan stage of its
+	// own — variant A skips plan in the retry. The implement-stage
+	// prompt builder must walk parent_run_id to find the parent's
+	// approved plan; without this the retry would fall back to the
+	// issue-only prompt and the audit log would (incorrectly) emit
+	// plan_missing_for_implement for every retry.
+	s, rr, ar, au, sf, gh := newImplementPromptServer(t)
+	parentRunID, parentPlanStageID, _, _ := seedRunWithStages(rr)
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "ctx"}
+
+	v := "standard_v1"
+	ar.seed(parentPlanStageID, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       parentPlanStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       fixturePlanJSON(t),
+		ContentHash:   "p",
+		CreatedAt:     time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
+	})
+
+	// Seed a retry run pointing at parent, with no plan stage of
+	// its own — only implement.
+	retryRunID := uuid.New()
+	retryImplStageID := uuid.New()
+	parentID := parentRunID
+	triggerRef := "issue:42"
+	installation := int64(99)
+	rr.seedRun(&run.Run{
+		ID:             retryRunID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+		ParentRunID:    &parentID,
+		RetryAttempt:   1,
+	})
+	rr.seedStages(retryRunID,
+		&run.Stage{ID: retryImplStageID, RunID: retryRunID, Type: run.StageTypeImplement, Sequence: 0},
+	)
+
+	priv, _ := sf.issue(t, retryRunID)
+	w := promptRequestForStage(t, s, retryRunID, retryImplStageID, priv)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !strings.Contains(resp.Prompt, "Approved plan (binding instruction)") {
+		t.Errorf("retry prompt missed parent's plan:\n%s", resp.Prompt)
+	}
+	if !strings.Contains(resp.Prompt, "Add a foo helper to pkg/bar.") {
+		t.Errorf("retry prompt missed parent plan summary:\n%s", resp.Prompt)
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_missing_for_implement" {
+			t.Errorf("retry path should not emit plan_missing_for_implement when parent had a plan: %+v", e)
+		}
+	}
+}
+
 func TestImplementPrompt_PlanRender_WorksWithoutSignatureRequirement(t *testing.T) {
 	// The SPA-readable /prompt-render endpoint resolves the plan
 	// the same way as the signature-authed runner endpoint. This

@@ -195,6 +195,15 @@ type Run struct {
 	// existed — the trace handler emits a skip-with-reason in that
 	// case rather than re-introducing the broken refetch.
 	WorkflowSpec []byte
+	// RetryAttempt records this run's position in an auto-retry
+	// chain (#279 / E16). 0 = original (canonical first attempt);
+	// 1 = first retry; 2 = second retry; capped at the spec's
+	// on_ci_failure.max_retries (default 1 per spec.DefaultMaxRetries).
+	// The CI-failure dispatcher (handleCIFailureRetry) reads
+	// parent.RetryAttempt + 1 when creating a follow-up run and
+	// refuses to create a new child when retry_attempt >=
+	// max_retries — emitting a `ci_retry_exhausted` audit instead.
+	RetryAttempt int
 	State        State
 	CreatedAt    time.Time
 	UpdatedAt    time.Time

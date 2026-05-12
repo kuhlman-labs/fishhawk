@@ -307,6 +307,14 @@ func promptCanonicalMessage(stageID uuid.UUID) []byte {
 // with no plan stage). The implement-stage prompt builder treats nil
 // as "no plan available" and falls back to the issue-only template.
 //
+// CI-failure retry runs (#279 / E16) intentionally skip the plan
+// stage — their implement stage is meant to re-run against the
+// parent's already-approved plan. When the current run has no plan
+// stage of its own, we walk ParentRunID upward until we find a run
+// that does (or until the chain ends). The walk is capped at
+// retryPlanChainDepth so a corrupt parent_run_id cycle can't loop
+// forever.
+//
 // Errors are returned to the caller only when the underlying repo
 // IO fails — a missing or malformed plan logs and yields nil so the
 // prompt fetch stays robust against the kinds of mid-flight states
@@ -315,9 +323,46 @@ func (s *Server) loadApprovedPlanForRun(ctx context.Context, runID uuid.UUID) (*
 	if s.cfg.ArtifactRepo == nil || s.cfg.RunRepo == nil {
 		return nil, nil
 	}
+	current := runID
+	for depth := 0; depth < retryPlanChainDepth; depth++ {
+		p, found, err := s.tryLoadPlanForRun(ctx, current)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			return p, nil
+		}
+		// No plan stage on this run; walk to the parent.
+		runRow, err := s.cfg.RunRepo.GetRun(ctx, current)
+		if err != nil {
+			return nil, fmt.Errorf("get run for parent walk: %w", err)
+		}
+		if runRow.ParentRunID == nil {
+			return nil, nil
+		}
+		current = *runRow.ParentRunID
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parent-walk hit depth cap",
+		slog.String("run_id", runID.String()),
+		slog.Int("max_depth", retryPlanChainDepth))
+	return nil, nil
+}
+
+// retryPlanChainDepth caps the parent-walk in loadApprovedPlanForRun.
+// In practice an auto-retry chain is at most a handful of links
+// (max_retries defaults to 1); 8 is generous and bounds a corrupt
+// cycle without imposing on legitimate workflows.
+const retryPlanChainDepth = 8
+
+// tryLoadPlanForRun looks for a standard_v1 plan artifact on the
+// single run identified by runID. Returns (plan, true, nil) on a
+// hit; (nil, false, nil) when the run has no plan stage or its plan
+// stage has no usable plan artifact (caller should walk to parent);
+// (nil, false, err) on repo IO failure.
+func (s *Server) tryLoadPlanForRun(ctx context.Context, runID uuid.UUID) (*plan.Plan, bool, error) {
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
 	if err != nil {
-		return nil, fmt.Errorf("list stages for run: %w", err)
+		return nil, false, fmt.Errorf("list stages for run: %w", err)
 	}
 	var planStageID uuid.UUID
 	for _, st := range stages {
@@ -327,11 +372,11 @@ func (s *Server) loadApprovedPlanForRun(ctx context.Context, runID uuid.UUID) (*
 		}
 	}
 	if planStageID == uuid.Nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	arts, err := s.cfg.ArtifactRepo.ListForStage(ctx, planStageID)
 	if err != nil {
-		return nil, fmt.Errorf("list plan stage artifacts: %w", err)
+		return nil, false, fmt.Errorf("list plan stage artifacts: %w", err)
 	}
 	var picked *artifact.Artifact
 	for _, a := range arts {
@@ -346,20 +391,18 @@ func (s *Server) loadApprovedPlanForRun(ctx context.Context, runID uuid.UUID) (*
 		}
 	}
 	if picked == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	var p plan.Plan
 	if err := json.Unmarshal(picked.Content, &p); err != nil {
-		// Plan was validated at upload; a malformed read here is a
-		// backend bug, not a prompt-fetch failure. Log and fall back.
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: plan unmarshal failed",
 			slog.String("run_id", runID.String()),
 			slog.String("artifact_id", picked.ID.String()),
 			slog.String("error", err.Error()),
 		)
-		return nil, nil
+		return nil, false, nil
 	}
-	return &p, nil
+	return &p, true, nil
 }
 
 // emitPlanMissingForImplement records the case where an implement-

@@ -43,6 +43,10 @@ type CreateRunParams struct {
 	// GitHub. Nil for CLI / UI run-create paths that don't fetch
 	// a spec.
 	WorkflowSpec []byte
+	// RetryAttempt is the new run's position in the auto-retry
+	// chain (#279). 0 for original runs; parent.RetryAttempt + 1
+	// for CI-failure retries (cap-enforced by the dispatcher).
+	RetryAttempt int
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

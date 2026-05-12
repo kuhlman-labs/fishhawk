@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -704,8 +705,11 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		WorkflowSHA:            p.WorkflowSHA,
 		TriggerSource:          p.TriggerSource,
 		TriggerRef:             p.TriggerRef,
+		InstallationID:         p.InstallationID,
 		ParentRunID:            p.ParentRunID,
 		RequiredChecksSnapshot: p.RequiredChecksSnapshot,
+		WorkflowSpec:           p.WorkflowSpec,
+		RetryAttempt:           p.RetryAttempt,
 		State:                  run.StatePending,
 		CreatedAt:              time.Now().UTC(),
 		UpdatedAt:              time.Now().UTC(),
@@ -778,6 +782,11 @@ func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run
 				continue
 			}
 		}
+		if f.PullRequestURL != nil {
+			if r.PullRequestURL == nil || *r.PullRequestURL != *f.PullRequestURL {
+				continue
+			}
+		}
 		out = append(out, r)
 	}
 	return out, nil
@@ -798,8 +807,16 @@ func (s *stubRuns) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error)
 	}
 	return nil, run.ErrNotFound
 }
-func (s *stubRuns) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
+func (s *stubRuns) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*run.Stage
+	for _, st := range s.createdStages {
+		if st.RunID == runID {
+			out = append(out, st)
+		}
+	}
+	return out, nil
 }
 func (s *stubRuns) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
@@ -811,6 +828,38 @@ func (s *stubRuns) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 
 func (s *stubRuns) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
 	return nil, errors.New("not used")
+}
+
+// stubArtifacts is a tiny in-memory artifact.Repository covering
+// just ListForStage — the CI-retry dedup path is the only consumer
+// in the dispatcher.
+type stubArtifacts struct {
+	mu      sync.Mutex
+	byStage map[uuid.UUID][]*artifact.Artifact
+}
+
+func (s *stubArtifacts) add(stageID uuid.UUID, a *artifact.Artifact) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byStage == nil {
+		s.byStage = map[uuid.UUID][]*artifact.Artifact{}
+	}
+	s.byStage[stageID] = append(s.byStage[stageID], a)
+}
+
+func (s *stubArtifacts) Create(context.Context, artifact.CreateParams) (*artifact.Artifact, error) {
+	return nil, errors.New("not used")
+}
+func (s *stubArtifacts) Get(context.Context, uuid.UUID) (*artifact.Artifact, error) {
+	return nil, errors.New("not used")
+}
+func (s *stubArtifacts) GetByHash(context.Context, uuid.UUID, string) (*artifact.Artifact, error) {
+	return nil, errors.New("not used")
+}
+func (s *stubArtifacts) ListForStage(_ context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byStage[stageID], nil
 }
 
 // stubAudit captures every AppendChained call so tests can assert
@@ -1767,9 +1816,10 @@ workflows:
 // dispatcher's pickup-ack hook can be asserted on without standing
 // up the full issuecomment package wiring.
 type stubIssueNotifier struct {
-	mu    sync.Mutex
-	calls []stubNotifyCall
-	err   error
+	mu         sync.Mutex
+	calls      []stubNotifyCall
+	retryCalls []stubCIRetryCall
+	err        error
 }
 
 type stubNotifyCall struct {
@@ -1781,6 +1831,28 @@ func (s *stubIssueNotifier) NotifyPickup(_ context.Context, runID uuid.UUID, sen
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, stubNotifyCall{runID: runID, sender: sender})
+	return s.err
+}
+
+// stubCIRetryCall records a NotifyCIRetry invocation for the #279
+// retry-handler tests. Separate from stubNotifyCall so existing
+// pickup tests don't need to grow new fields.
+type stubCIRetryCall struct {
+	runID       uuid.UUID
+	parentRunID uuid.UUID
+	checkName   string
+	attempt     int
+	max         int
+}
+
+func (s *stubIssueNotifier) NotifyCIRetry(_ context.Context, runID, parentRunID uuid.UUID,
+	checkName string, attempt, max int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retryCalls = append(s.retryCalls, stubCIRetryCall{
+		runID: runID, parentRunID: parentRunID,
+		checkName: checkName, attempt: attempt, max: max,
+	})
 	return s.err
 }
 
@@ -2224,39 +2296,264 @@ func checkRunFailedEvent(t *testing.T) Event {
 	return ev
 }
 
-func TestHandle_CIFailureRetry_RoutesToHandlerPlaceholder(t *testing.T) {
-	// This PR scopes to *matching* the trigger; the real
-	// re-dispatch logic lands in #279. Assert the placeholder
-	// handler fires (visible via the structured log line) and that
-	// no run-create / dispatch I/O happens against the existing
-	// stubs.
+// ciRetrySpec extends validSpec with a 2-stage shape (plan +
+// implement) and an explicit on_ci_failure.max_retries — the retry
+// handler reads the cached spec on the parent run to pick the cap.
+const ciRetrySpec = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow with retries
+    on_ci_failure:
+      max_retries: 1
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+            sla: 4_business_hours
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+
+// seedParentRunForRetry inserts a parent run into the stubRuns that
+// matches the PR coordinates used by checkRunFailedEvent (PR #42)
+// and is shaped the way a real run would be: trigger ref, PR URL
+// stamped, required-checks snapshot covering "ci/build", and the
+// cached workflow spec available so resolveRetryPolicy succeeds.
+func seedParentRunForRetry(t *testing.T, runs *stubRuns, repo, specYAML string, retryAttempt int) *run.Run {
+	t.Helper()
+	prURL := "https://github.com/" + repo + "/pull/42"
+	triggerRef := "issue:1247"
+	installID := int64(42)
+	r := &run.Run{
+		ID:             uuid.New(),
+		Repo:           repo,
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "feedf00d",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installID,
+		PullRequestURL: &prURL,
+		RequiredChecksSnapshot: &run.RequiredChecksSnapshot{
+			Contexts: []string{"ci/build"},
+			Sources:  []string{"branch_protection"},
+		},
+		WorkflowSpec: []byte(specYAML),
+		RetryAttempt: retryAttempt,
+		State:        run.StateRunning,
+		CreatedAt:    time.Now().Add(-time.Minute).UTC(),
+		UpdatedAt:    time.Now().Add(-time.Minute).UTC(),
+	}
+	runs.mu.Lock()
+	runs.created = append(runs.created, r)
+	runs.mu.Unlock()
+	return r
+}
+
+func TestHandle_CIFailureRetry_HappyPath_DispatchesChild(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
-	logs := captureDispatcherLogs(d)
+	d.Artifacts = &stubArtifacts{}
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
 
 	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if gh.specCalls != 0 || gh.dispatchCalls != 0 {
-		t.Errorf("unexpected GitHub calls: spec=%d dispatch=%d", gh.specCalls, gh.dispatchCalls)
+
+	// Child run created with parent_run_id + retry_attempt=1, and
+	// the cached spec / snapshot carried forward.
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (parent + child)", len(runs.created))
 	}
-	if len(runs.created) != 0 {
-		t.Errorf("placeholder handler should not create runs: %d", len(runs.created))
+	child := runs.created[1]
+	if child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Errorf("child.ParentRunID = %v, want %s", child.ParentRunID, parent.ID)
 	}
-	if len(au.appended) != 0 {
-		t.Errorf("placeholder handler should not write audit rows: %d", len(au.appended))
+	if child.RetryAttempt != 1 {
+		t.Errorf("child.RetryAttempt = %d, want 1", child.RetryAttempt)
+	}
+	if child.WorkflowID != parent.WorkflowID || child.WorkflowSHA != parent.WorkflowSHA {
+		t.Errorf("child workflow_id/sha = %q/%q, want %q/%q",
+			child.WorkflowID, child.WorkflowSHA, parent.WorkflowID, parent.WorkflowSHA)
+	}
+	if child.RequiredChecksSnapshot == nil ||
+		len(child.RequiredChecksSnapshot.Contexts) != 1 ||
+		child.RequiredChecksSnapshot.Contexts[0] != "ci/build" {
+		t.Errorf("child snapshot didn't carry over: %+v", child.RequiredChecksSnapshot)
 	}
 
-	out := logs.String()
-	for _, want := range []string{
-		`"level":"INFO"`,
-		`ci_failure_retry: matched`,
-		`"check_name":"ci/build"`,
-		`"conclusion":"failure"`,
-		`"head_sha":"abc123"`,
-		`"pr_number":42`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("expected log line to contain %q; got:\n%s", want, out)
+	// Only the implement stage should be created for the retry —
+	// plan is skipped (variant A from the issue body).
+	var childStages []*run.Stage
+	for _, st := range runs.createdStages {
+		if st.RunID == child.ID {
+			childStages = append(childStages, st)
 		}
+	}
+	if len(childStages) != 1 {
+		t.Fatalf("child stages = %d, want 1 (plan skipped)", len(childStages))
+	}
+	if childStages[0].Type != run.StageTypeImplement {
+		t.Errorf("child stage type = %q, want implement", childStages[0].Type)
+	}
+
+	// workflow_dispatch was fired.
+	if gh.dispatchCalls != 1 {
+		t.Errorf("DispatchWorkflow calls = %d, want 1", gh.dispatchCalls)
+	}
+
+	// One ci_failure_retry_dispatched audit row chained against the
+	// child run.
+	var dispatched *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "ci_failure_retry_dispatched" {
+			dispatched = &au.appended[i]
+			break
+		}
+	}
+	if dispatched == nil {
+		t.Fatalf("expected ci_failure_retry_dispatched audit row; got %+v", au.appended)
+	}
+	if dispatched.RunID != child.ID {
+		t.Errorf("audit RunID = %s, want %s (child)", dispatched.RunID, child.ID)
+	}
+
+	// Notifier fired with the right attempt/max.
+	if len(notifier.retryCalls) != 1 {
+		t.Fatalf("notifier.retryCalls = %d, want 1", len(notifier.retryCalls))
+	}
+	rc := notifier.retryCalls[0]
+	if rc.runID != child.ID || rc.parentRunID != parent.ID || rc.attempt != 1 || rc.max != 1 {
+		t.Errorf("notifier call = %+v, want runID=%s parent=%s attempt=1 max=1",
+			rc, child.ID, parent.ID)
+	}
+}
+
+func TestHandle_CIFailureRetry_CapHit_EmitsExhaustedAudit(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	// Parent already at retry_attempt=1, spec caps at 1 → cap hit.
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 1)
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(runs.created) != 1 {
+		t.Errorf("runs.created = %d, want 1 (no child)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0 (cap hit)", gh.dispatchCalls)
+	}
+	var exhausted *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "ci_retry_exhausted" {
+			exhausted = &au.appended[i]
+			break
+		}
+	}
+	if exhausted == nil {
+		t.Fatalf("expected ci_retry_exhausted audit row; got %+v", au.appended)
+	}
+	if exhausted.RunID != parent.ID {
+		t.Errorf("exhausted.RunID = %s, want %s (parent)", exhausted.RunID, parent.ID)
+	}
+}
+
+func TestHandle_CIFailureRetry_PRNotFishhawkManaged_Skips(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	// No parent seeded — no Fishhawk run touches PR #42.
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("runs.created = %d, want 0 (PR not managed)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit rows = %d, want 0", len(au.appended))
+	}
+}
+
+func TestHandle_CIFailureRetry_CheckNotRequired_Skips(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	// Parent's snapshot only requires "lint", but the event names
+	// "ci/build" — failure isn't a merge blocker.
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	parent.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{
+		Contexts: []string{"lint"},
+		Sources:  []string{"branch_protection"},
+	}
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Errorf("runs.created = %d, want 1 (no child)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit rows = %d, want 0 (non-required check skipped silently)", len(au.appended))
+	}
+}
+
+func TestHandle_CIFailureRetry_DuplicateHeadSHA_Skips(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+
+	// Attach an implement stage to the parent with a pull_request
+	// artifact whose head_sha matches the event ("abc123") — i.e., a
+	// run already exists for this commit, so the retry should
+	// dedup.
+	implStage := &run.Stage{
+		ID:    uuid.New(),
+		RunID: parent.ID,
+		Type:  run.StageTypeImplement,
+		State: run.StageStateSucceeded,
+	}
+	runs.mu.Lock()
+	runs.createdStages = append(runs.createdStages, implStage)
+	runs.mu.Unlock()
+	prContent := []byte(`{"head_sha":"abc123"}`)
+	arts.add(implStage.ID, &artifact.Artifact{
+		ID:      uuid.New(),
+		StageID: implStage.ID,
+		Kind:    artifact.KindPullRequest,
+		Content: prContent,
+	})
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Errorf("runs.created = %d, want 1 (dedup; no child)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit rows = %d, want 0 (dedup skipped silently)", len(au.appended))
 	}
 }

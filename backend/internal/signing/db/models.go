@@ -69,6 +69,7 @@ type Run struct {
 	PullRequestUrl         *string            `json:"pull_request_url"`
 	RequiredChecksSnapshot []byte             `json:"required_checks_snapshot"`
 	WorkflowSpec           []byte             `json:"workflow_spec"`
+	RetryAttempt           int32              `json:"retry_attempt"`
 }
 
 type Session struct {

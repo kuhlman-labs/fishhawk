@@ -243,6 +243,7 @@ func runServe(args []string, logSink io.Writer) int {
 			GitHub:        cfg.GitHub,
 			Runs:          cfg.RunRepo,
 			Audit:         cfg.AuditRepo,
+			Artifacts:     cfg.ArtifactRepo,
 			Logger:        logger,
 			IssueNotifier: notifier,
 			// ApprovalHandler is wired below after the Server
