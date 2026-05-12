@@ -400,6 +400,172 @@ func TestMatchEvent_WorkflowRun_NonDispatchEvent_Skips(t *testing.T) {
 	}
 }
 
+// --- MatchEvent: check_run (#278) ---
+
+// checkRunBody builds a check_run.completed payload with sensible
+// defaults (failure conclusion on a non-fishhawk_audit_complete
+// check, attached to PR #42). Tests override individual fields via
+// `fields` — same pattern as workflowRunBody above.
+func checkRunBody(t *testing.T, fields map[string]any) []byte {
+	t.Helper()
+	defaults := map[string]any{
+		"name":       "ci/build",
+		"head_sha":   "abc123",
+		"conclusion": "failure",
+		"status":     "completed",
+		"pull_requests": []map[string]any{
+			{"number": 42},
+		},
+	}
+	for k, v := range fields {
+		defaults[k] = v
+	}
+	body, _ := json.Marshal(map[string]any{"check_run": defaults})
+	return body
+}
+
+func TestMatchEvent_CheckRun_FailureCompleted_Matches(t *testing.T) {
+	ev := Event{
+		Type: "check_run", Action: "completed", InstallationID: 42,
+		RawBody: checkRunBody(t, nil),
+	}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want match for failure on a required check", got)
+	}
+	if got.Action != MatchActionCIFailureRetry {
+		t.Errorf("Action = %q, want ci_failure_retry", got.Action)
+	}
+	if got.CheckRunRef == nil {
+		t.Fatal("CheckRunRef should be populated for ci_failure_retry")
+	}
+	if got.CheckRunRef.PRNumber != 42 || got.CheckRunRef.HeadSHA != "abc123" {
+		t.Errorf("CheckRunRef = %+v", got.CheckRunRef)
+	}
+	if got.CheckRunRef.CheckName != "ci/build" || got.CheckRunRef.Conclusion != "failure" {
+		t.Errorf("CheckRunRef name/conclusion = %q/%q", got.CheckRunRef.CheckName, got.CheckRunRef.Conclusion)
+	}
+}
+
+func TestMatchEvent_CheckRun_FailureBucketMatches(t *testing.T) {
+	// Every conclusion in the closed "fail" bucket (per
+	// stagecheck.DeriveState) should fire the retry trigger.
+	// Sharing the same set keeps the SPA's failing-check pill
+	// consistent with what triggers a retry — operators can
+	// predict from the SPA which failures will fire.
+	for _, c := range []string{"failure", "timed_out", "cancelled", "action_required", "stale", "startup_failure"} {
+		t.Run(c, func(t *testing.T) {
+			ev := Event{
+				Type: "check_run", Action: "completed", InstallationID: 42,
+				RawBody: checkRunBody(t, map[string]any{"conclusion": c}),
+			}
+			got := MatchEvent(ev)
+			if got.Skip {
+				t.Errorf("conclusion %q skipped: %s", c, got.Reason)
+			}
+			if got.Action != MatchActionCIFailureRetry {
+				t.Errorf("conclusion %q Action = %q", c, got.Action)
+			}
+		})
+	}
+}
+
+func TestMatchEvent_CheckRun_NonFailureConclusionsSkip(t *testing.T) {
+	// success / neutral / skipped are explicitly not failures.
+	// Skipping silently is the right behavior — we don't want to
+	// retry on a green check.
+	for _, c := range []string{"success", "neutral", "skipped"} {
+		t.Run(c, func(t *testing.T) {
+			ev := Event{
+				Type: "check_run", Action: "completed", InstallationID: 42,
+				RawBody: checkRunBody(t, map[string]any{"conclusion": c}),
+			}
+			got := MatchEvent(ev)
+			if !got.Skip {
+				t.Errorf("conclusion %q matched (want skip): %+v", c, got)
+			}
+		})
+	}
+}
+
+func TestMatchEvent_CheckRun_FishhawkAuditComplete_Skips(t *testing.T) {
+	// Retrying the agent won't fix Fishhawk's own audit gaps
+	// (missing plan, foreign commit, etc.); that's #229's job.
+	// Explicit guard so a flapping audit-complete check doesn't
+	// pull an infinite retry chain.
+	ev := Event{
+		Type: "check_run", Action: "completed", InstallationID: 42,
+		RawBody: checkRunBody(t, map[string]any{"name": "fishhawk_audit_complete"}),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Fatalf("got = %+v, want skip for fishhawk_audit_complete", got)
+	}
+	if !strings.Contains(got.Reason, "fishhawk_audit_complete") {
+		t.Errorf("Reason should name the offending check: %q", got.Reason)
+	}
+}
+
+func TestMatchEvent_CheckRun_NonCompletedAction_Skips(t *testing.T) {
+	// `created` / `rerequested` actions fire too — we only care
+	// about the terminal `completed` event.
+	for _, action := range []string{"created", "rerequested", "requested_action"} {
+		t.Run(action, func(t *testing.T) {
+			ev := Event{
+				Type: "check_run", Action: action, InstallationID: 42,
+				RawBody: checkRunBody(t, nil),
+			}
+			got := MatchEvent(ev)
+			if !got.Skip {
+				t.Errorf("action %q matched (want skip): %+v", action, got)
+			}
+		})
+	}
+}
+
+func TestMatchEvent_CheckRun_NoPullRequests_Skips(t *testing.T) {
+	// Org-level checks, scheduled scans, etc. arrive with an empty
+	// pull_requests[]; nothing to retry against.
+	ev := Event{
+		Type: "check_run", Action: "completed", InstallationID: 42,
+		RawBody: checkRunBody(t, map[string]any{"pull_requests": []map[string]any{}}),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Fatalf("got = %+v, want skip when pull_requests[] empty", got)
+	}
+	if !strings.Contains(got.Reason, "pull_requests") {
+		t.Errorf("Reason should name the missing field: %q", got.Reason)
+	}
+}
+
+func TestMatchEvent_CheckRun_MalformedPayload_Skips(t *testing.T) {
+	ev := Event{
+		Type: "check_run", Action: "completed", InstallationID: 42,
+		RawBody: []byte("{not json"),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("got = %+v, want skip on parse failure", got)
+	}
+}
+
+func TestMatchEvent_CheckRun_ZeroPRNumber_Skips(t *testing.T) {
+	// Defensive: GitHub *should* never deliver pull_requests with
+	// a zero number, but the matcher refuses to forward bogus data
+	// downstream to the handler.
+	ev := Event{
+		Type: "check_run", Action: "completed", InstallationID: 42,
+		RawBody: checkRunBody(t, map[string]any{
+			"pull_requests": []map[string]any{{"number": 0}},
+		}),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip {
+		t.Errorf("got = %+v, want skip on zero pr number", got)
+	}
+}
+
 // --- Dispatcher.Handle tests with stubs ---
 
 // stubGitHub is a minimal GitHubAPI for handler tests. Each call
@@ -2024,5 +2190,73 @@ func TestPickPrimaryGate(t *testing.T) {
 	}
 	if got := pickPrimaryGate(nil); got != nil {
 		t.Errorf("empty gates: got %+v, want nil", got)
+	}
+}
+
+// --- Dispatcher.Handle: CI-failure retry (#278) ---
+
+// checkRunFailedEvent builds a fully-formed check_run.completed
+// event with the failure-bucket defaults checkRunBody uses. The
+// Handle path needs the same envelope ParseEvent populates
+// (sender, installation, repository) — checkRunBody only fills
+// the check_run payload itself.
+func checkRunFailedEvent(t *testing.T) Event {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]any{
+		"action": "completed",
+		"check_run": map[string]any{
+			"name":       "ci/build",
+			"head_sha":   "abc123",
+			"conclusion": "failure",
+			"status":     "completed",
+			"pull_requests": []map[string]any{
+				{"number": 42},
+			},
+		},
+		"repository":   map[string]any{"full_name": "kuhlman-labs/fishhawk"},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": "alice", "type": "User"},
+	})
+	ev, err := ParseEvent("check_run", "deliv-checkrun-1", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+func TestHandle_CIFailureRetry_RoutesToHandlerPlaceholder(t *testing.T) {
+	// This PR scopes to *matching* the trigger; the real
+	// re-dispatch logic lands in #279. Assert the placeholder
+	// handler fires (visible via the structured log line) and that
+	// no run-create / dispatch I/O happens against the existing
+	// stubs.
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if gh.specCalls != 0 || gh.dispatchCalls != 0 {
+		t.Errorf("unexpected GitHub calls: spec=%d dispatch=%d", gh.specCalls, gh.dispatchCalls)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("placeholder handler should not create runs: %d", len(runs.created))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("placeholder handler should not write audit rows: %d", len(au.appended))
+	}
+
+	out := logs.String()
+	for _, want := range []string{
+		`"level":"INFO"`,
+		`ci_failure_retry: matched`,
+		`"check_name":"ci/build"`,
+		`"conclusion":"failure"`,
+		`"head_sha":"abc123"`,
+		`"pr_number":42`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected log line to contain %q; got:\n%s", want, out)
+		}
 	}
 }

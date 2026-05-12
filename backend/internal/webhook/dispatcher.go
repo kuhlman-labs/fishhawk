@@ -49,6 +49,16 @@ const (
 	MatchActionApprove            MatchAction = "approve"
 	MatchActionReject             MatchAction = "reject"
 	MatchActionRunnerActionFailed MatchAction = "runner_action_failed"
+	// MatchActionCIFailureRetry tags a check_run.completed event
+	// whose conclusion is in the fail bucket (per
+	// stagecheck.DeriveState) and whose target is a Fishhawk-
+	// managed PR (#276 / #278). The dispatcher's handler in #279
+	// looks up the run by PR URL, counts retries against the
+	// workflow's on_ci_failure.max_retries (#277), and either fires
+	// a fresh implement workflow_dispatch or audits a
+	// `ci_retry_exhausted`. Matching stays pure here; the real I/O
+	// lives in handleCIFailureRetry.
+	MatchActionCIFailureRetry MatchAction = "ci_failure_retry"
 )
 
 // DefaultWorkflowID is the workflow_id (a key under `workflows:`
@@ -102,6 +112,25 @@ type Match struct {
 	// — `failure`, `timed_out`, `cancelled`, etc. Captured into
 	// the audit row's failure_reason so operators can correlate.
 	WorkflowRunConclusion string
+
+	// CheckRunRef carries the bits of a check_run.completed payload
+	// the CI-retry handler needs (#278). Set when Action is
+	// MatchActionCIFailureRetry. The handler in #279 uses
+	// (PRNumber, HeadSHA) to look up the parent Fishhawk run via
+	// runs.pull_request_url and uses CheckName + Conclusion for
+	// the audit-row payload.
+	CheckRunRef *CheckRunRef
+}
+
+// CheckRunRef is the subset of a check_run payload the CI-retry
+// dispatcher path needs (#278). All fields are required for
+// MatchActionCIFailureRetry — matchCheckRun fills them in lock-
+// step before tagging the action.
+type CheckRunRef struct {
+	PRNumber   int
+	HeadSHA    string
+	CheckName  string
+	Conclusion string
 }
 
 // IssueRef captures the bits of an issue payload the dispatcher
@@ -137,6 +166,8 @@ func MatchEvent(ev Event) Match {
 		return matchIssueComment(ev)
 	case "workflow_run":
 		return matchWorkflowRun(ev)
+	case "check_run":
+		return matchCheckRun(ev)
 	case "branch_protection_rule", "repository_ruleset":
 		// Recognized for #251 / ADR-017: an upstream protection
 		// edit invalidates any cached snapshot for the repo. v0
@@ -365,6 +396,109 @@ func isFishhawkWorkflowPath(path string) bool {
 	return file == DefaultActionsWorkflowFile
 }
 
+// fishhawkAuditCompleteCheckName is the check name Fishhawk
+// publishes for its own audit-complete signal (#231). Excluded from
+// the CI-retry trigger predicate (#278 / E16) — a failing audit-
+// complete means Fishhawk's own audit story is broken (missing
+// plan, foreign commit, etc.), and re-running the agent won't fix
+// it. Hardcoded here (not imported from auditcheckpublisher) to
+// keep the matcher pure + free of upstream-package coupling.
+const fishhawkAuditCompleteCheckName = "fishhawk_audit_complete"
+
+// failedCheckRunConclusions enumerates the GitHub check_run terminal
+// conclusions that map to the "fail" bucket in
+// stagecheck.DeriveState. Sharing the same closed set keeps the
+// retry trigger consistent with what the SPA renders as a failing
+// check, so a customer can predict from the SPA which failures
+// will fire a retry.
+//
+// Closed set on purpose: a future GitHub-side conclusion (or one
+// we just haven't catalogued yet) lands as "not a failure we
+// recognize" by default — we don't want to retry on every unknown
+// signal.
+var failedCheckRunConclusions = map[string]struct{}{
+	"failure":         {},
+	"timed_out":       {},
+	"cancelled":       {},
+	"action_required": {},
+	"stale":           {},
+	"startup_failure": {},
+}
+
+// matchCheckRun classifies a `check_run.completed` event for the
+// CI-failure retry path (#278 / E16). Pure — the handler in #279
+// does the run lookup, retry counting, and workflow_dispatch.
+//
+// The match is narrow on purpose: `check_run.completed` fires for
+// every check on every PR. We only want to retry when:
+//
+//   - action == "completed" (the terminal signal).
+//   - conclusion is in `failedCheckRunConclusions`. success /
+//     neutral / skipped don't need our intervention; pending
+//     conclusions haven't decided yet.
+//   - check name != fishhawk_audit_complete. Retrying won't fix
+//     Fishhawk's own audit gaps; that's #229's job.
+//   - pull_requests[] is non-empty. Org-level / standalone checks
+//     don't have a Fishhawk run to retry against.
+//
+// Whether the PR is actually Fishhawk-managed (lookup by
+// pull_request_url, etc.) is the handler's responsibility — keeps
+// matching pure + table-test-friendly.
+func matchCheckRun(ev Event) Match {
+	if ev.Action != "completed" {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("check_run.%s is not the terminal action", ev.Action)}
+	}
+	var payload struct {
+		CheckRun struct {
+			Name         string `json:"name"`
+			HeadSHA      string `json:"head_sha"`
+			Conclusion   string `json:"conclusion"`
+			Status       string `json:"status"`
+			PullRequests []struct {
+				Number int `json:"number"`
+			} `json:"pull_requests"`
+		} `json:"check_run"`
+	}
+	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
+		return Match{Skip: true, Reason: "check_run payload parse failed"}
+	}
+	if _, ok := failedCheckRunConclusions[payload.CheckRun.Conclusion]; !ok {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("check_run.conclusion %q is not a failure",
+				payload.CheckRun.Conclusion)}
+	}
+	if payload.CheckRun.Name == fishhawkAuditCompleteCheckName {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("check_run %q is fishhawk_audit_complete; not retrying",
+				payload.CheckRun.Name)}
+	}
+	if len(payload.CheckRun.PullRequests) == 0 {
+		return Match{Skip: true,
+			Reason: "check_run has no pull_requests[]; nothing to retry against"}
+	}
+	// First-listed PR is the canonical one in GitHub's payload.
+	// Multi-PR check_runs (shared branches across forks) are out
+	// of scope for v0; the handler can revisit when a customer
+	// surfaces the need.
+	pr := payload.CheckRun.PullRequests[0]
+	if pr.Number <= 0 {
+		return Match{Skip: true, Reason: "check_run.pull_requests[0].number is zero"}
+	}
+	if payload.CheckRun.HeadSHA == "" {
+		return Match{Skip: true, Reason: "check_run.head_sha is empty"}
+	}
+	return Match{
+		Action: MatchActionCIFailureRetry,
+		CheckRunRef: &CheckRunRef{
+			PRNumber:   pr.Number,
+			HeadSHA:    payload.CheckRun.HeadSHA,
+			CheckName:  payload.CheckRun.Name,
+			Conclusion: payload.CheckRun.Conclusion,
+		},
+	}
+}
+
 // GitHubAPI is the slice of githubclient.Client the dispatcher
 // uses. Defining it as an interface lets tests substitute a stub
 // without standing up an httptest.Server alongside the existing
@@ -489,6 +623,8 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		return d.handleApprovalCommand(ctx, ev, m)
 	case MatchActionRunnerActionFailed:
 		return d.handleRunnerActionFailed(ctx, ev, m)
+	case MatchActionCIFailureRetry:
+		return d.handleCIFailureRetry(ctx, ev, m)
 	}
 
 	repo, err := parseRepo(ev.Repo)
@@ -855,6 +991,34 @@ func (d *Dispatcher) handleRunnerActionFailed(ctx context.Context, ev Event, m M
 		slog.String("conclusion", m.WorkflowRunConclusion),
 		slog.String("stage_id", stageID.String()),
 		slog.String("workflow_run_url", wfRun.HTMLURL),
+	)
+	return nil
+}
+
+// handleCIFailureRetry is the placeholder hook for the auto-retry
+// chain (#278 / E16). The real implementation lands in #279 — this
+// PR scopes to *matching* the trigger, not acting on it. Logs the
+// recognized event so an operator running the SPA against this
+// commit can confirm the match landed; returns nil so the webhook
+// receiver acknowledges with 202.
+func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match) error {
+	if m.CheckRunRef == nil {
+		// Defensive: matchCheckRun fills CheckRunRef before
+		// tagging the action; a nil here means upstream coupling
+		// broke. Log + skip rather than nil-deref.
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: missing CheckRunRef",
+			slog.String("delivery_id", ev.DeliveryID))
+		return nil
+	}
+	d.logger().LogAttrs(ctx, slog.LevelInfo,
+		"ci_failure_retry: matched (handler placeholder; real dispatch in #279)",
+		slog.String("delivery_id", ev.DeliveryID),
+		slog.String("repo", ev.Repo),
+		slog.String("check_name", m.CheckRunRef.CheckName),
+		slog.String("conclusion", m.CheckRunRef.Conclusion),
+		slog.String("head_sha", m.CheckRunRef.HeadSHA),
+		slog.Int("pr_number", m.CheckRunRef.PRNumber),
 	)
 	return nil
 }
