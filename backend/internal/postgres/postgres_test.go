@@ -202,24 +202,34 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0020 added
-	// runs.retry_attempt (#279); the down migration drops the
-	// column. Confirm: retry_attempt is gone, but every prior
-	// migration's effect is still present (workflow_spec from 0019,
-	// stages.gate_blocking_checks dropped by 0018, required_checks_snapshot
-	// from 0017, parent_run_id + pull_request_url from 0016,
-	// stage_checks table from 0015, stages.gate_type from 0014,
-	// stages.requires_approval from 0013, signing_keys.id from 0012,
-	// runs.idempotency_key from 0011, users + sessions from 0010, etc.).
-	var retryAttemptCol, workflowSpecCol, gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0021 added
+	// runs.max_retries_snapshot (#280); the down migration drops
+	// the column. Confirm: max_retries_snapshot is gone, but every
+	// prior migration's effect is still present (retry_attempt from
+	// 0020, workflow_spec from 0019, stages.gate_blocking_checks
+	// dropped by 0018, required_checks_snapshot from 0017,
+	// parent_run_id + pull_request_url from 0016, stage_checks table
+	// from 0015, stages.gate_type from 0014, stages.requires_approval
+	// from 0013, signing_keys.id from 0012, runs.idempotency_key from
+	// 0011, users + sessions from 0010, etc.).
+	var maxRetriesCol, retryAttemptCol, workflowSpecCol, gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'max_retries_snapshot'`,
+	).Scan(&maxRetriesCol); err != nil {
+		t.Fatalf("query runs.max_retries_snapshot column: %v", err)
+	}
+	if maxRetriesCol != 0 {
+		t.Errorf("runs.max_retries_snapshot count after MigrateDown = %d, want 0 (0021 down dropped it)", maxRetriesCol)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'runs' AND column_name = 'retry_attempt'`,
 	).Scan(&retryAttemptCol); err != nil {
 		t.Fatalf("query runs.retry_attempt column: %v", err)
 	}
-	if retryAttemptCol != 0 {
-		t.Errorf("runs.retry_attempt count after MigrateDown = %d, want 0 (0020 down dropped it)", retryAttemptCol)
+	if retryAttemptCol != 1 {
+		t.Errorf("runs.retry_attempt count after MigrateDown = %d, want 1 (0020 still applied)", retryAttemptCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns

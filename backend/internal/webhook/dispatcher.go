@@ -734,6 +734,9 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		// instead of refetching from GitHub (the refetch path was
 		// broken — passed the blob SHA as a ref; see #283).
 		WorkflowSpec: specFile.Content,
+		// Snapshot the CI-retry cap so the SPA can render
+		// "Retry N/M" without re-parsing the spec (#280).
+		MaxRetriesSnapshot: workflowMaxRetries(workflow),
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create run: %w", err)
@@ -1140,6 +1143,9 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 		RequiredChecksSnapshot: parent.RequiredChecksSnapshot,
 		WorkflowSpec:           parent.WorkflowSpec,
 		RetryAttempt:           parent.RetryAttempt + 1,
+		// Carry the parent's snapshotted cap forward so a chained
+		// retry chain sees the same N/M values on every row (#280).
+		MaxRetriesSnapshot: parent.MaxRetriesSnapshot,
 	}
 	if triggerRef != "" {
 		params.TriggerRef = &triggerRef
@@ -1375,6 +1381,18 @@ func (*Dispatcher) resolveRetryPolicy(_ context.Context, parent *run.Run) (spec.
 		max = wf.OnCIFailure.MaxRetries
 	}
 	return wf, max, true
+}
+
+// workflowMaxRetries returns the spec's on_ci_failure.max_retries
+// value, defaulting to spec.DefaultMaxRetries when the block is
+// absent. Used by the run-create path to snapshot the cap on the
+// runs row (#280) so the SPA can render "Retry N/M" without
+// re-parsing the spec.
+func workflowMaxRetries(wf spec.Workflow) int {
+	if wf.OnCIFailure != nil {
+		return wf.OnCIFailure.MaxRetries
+	}
+	return spec.DefaultMaxRetries
 }
 
 // filterOutPlanStages returns the stages list with all `plan` types

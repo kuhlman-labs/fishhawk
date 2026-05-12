@@ -5,7 +5,7 @@ import { useAsync } from '@/api/use-async';
 import { describeFailure } from '@/api/types';
 import type { Run, Stage } from '@/api/types';
 import { StageStateBadge } from '@/components/stage-state-badge';
-import { FollowUpLink, RelatedRunsSection } from '@/runs/related-runs';
+import { FollowUpLink, RelatedRunsSection, RetryBadge } from '@/runs/related-runs';
 import { RunAuditList } from './audit-list';
 
 export function RunDetail() {
@@ -44,7 +44,16 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
       </div>
 
       <header className="space-y-2">
-        <h1 className="font-mono text-lg font-semibold tracking-tight">{run.repo}</h1>
+        <div className="flex items-center gap-2">
+          <h1 className="font-mono text-lg font-semibold tracking-tight">{run.repo}</h1>
+          {run.retry_attempt > 0 && (
+            <RetryBadge
+              attempt={run.retry_attempt}
+              max={run.max_retries_snapshot}
+              parentRunID={run.parent_run_id ?? null}
+            />
+          )}
+        </div>
         {run.parent_run_id && <FollowUpLink parentRunID={run.parent_run_id} />}
         <dl className="grid grid-cols-[10rem_1fr] gap-y-1 text-sm">
           <dt className="text-neutral-500">Workflow</dt>

@@ -69,6 +69,7 @@ type Run struct {
 	RequiredChecksSnapshot []byte             `json:"required_checks_snapshot"`
 	WorkflowSpec           []byte             `json:"workflow_spec"`
 	RetryAttempt           int32              `json:"retry_attempt"`
+	MaxRetriesSnapshot     int32              `json:"max_retries_snapshot"`
 }
 
 type Session struct {

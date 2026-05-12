@@ -138,7 +138,7 @@ components:
         table in `backend/internal/run/transition.go`.
       required:
         [id, repo, workflow_id, workflow_sha, trigger_source, state,
-         created_at, updated_at]
+         retry_attempt, max_retries_snapshot, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         repo:
@@ -176,6 +176,28 @@ components:
             can group every run on a PR with a single equality
             filter on `GET /v0/runs?pull_request_url=…`.
           example: https://github.com/kuhlman-labs/fishhawk/pull/123
+        retry_attempt:
+          type: integer
+          minimum: 0
+          description: |
+            Position in the CI-failure auto-retry chain (#279 /
+            E16). 0 for the canonical first attempt; N for the Nth
+            retry. Capped by `max_retries_snapshot` — the
+            dispatcher refuses to create a new child when
+            `retry_attempt >= max_retries_snapshot` and emits a
+            `ci_retry_exhausted` audit row.
+          example: 0
+        max_retries_snapshot:
+          type: integer
+          minimum: 0
+          description: |
+            The workflow's `on_ci_failure.max_retries` cap at
+            run-create time (#280 / E16). Snapshotted alongside
+            `required_checks_snapshot` so a spec edit during a
+            long-running auto-retry chain doesn't shift the
+            goalposts on what the SPA renders. Defaults to 1 when
+            the workflow has no `on_ci_failure:` block.
+          example: 1
         created_at:
           type: string
           format: date-time

@@ -17,32 +17,36 @@ import (
 // `Run` schema exactly so there's never a translation step between
 // the OpenAPI doc and the wire format.
 type runResponse struct {
-	ID             uuid.UUID  `json:"id"`
-	Repo           string     `json:"repo"`
-	WorkflowID     string     `json:"workflow_id"`
-	WorkflowSHA    string     `json:"workflow_sha"`
-	TriggerSource  string     `json:"trigger_source"`
-	TriggerRef     *string    `json:"trigger_ref"`
-	State          string     `json:"state"`
-	ParentRunID    *uuid.UUID `json:"parent_run_id,omitempty"`
-	PullRequestURL *string    `json:"pull_request_url,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID                 uuid.UUID  `json:"id"`
+	Repo               string     `json:"repo"`
+	WorkflowID         string     `json:"workflow_id"`
+	WorkflowSHA        string     `json:"workflow_sha"`
+	TriggerSource      string     `json:"trigger_source"`
+	TriggerRef         *string    `json:"trigger_ref"`
+	State              string     `json:"state"`
+	ParentRunID        *uuid.UUID `json:"parent_run_id,omitempty"`
+	PullRequestURL     *string    `json:"pull_request_url,omitempty"`
+	RetryAttempt       int        `json:"retry_attempt"`
+	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 func toRunResponse(r *run.Run) runResponse {
 	return runResponse{
-		ID:             r.ID,
-		Repo:           r.Repo,
-		WorkflowID:     r.WorkflowID,
-		WorkflowSHA:    r.WorkflowSHA,
-		TriggerSource:  string(r.TriggerSource),
-		TriggerRef:     r.TriggerRef,
-		State:          string(r.State),
-		ParentRunID:    r.ParentRunID,
-		PullRequestURL: r.PullRequestURL,
-		CreatedAt:      r.CreatedAt,
-		UpdatedAt:      r.UpdatedAt,
+		ID:                 r.ID,
+		Repo:               r.Repo,
+		WorkflowID:         r.WorkflowID,
+		WorkflowSHA:        r.WorkflowSHA,
+		TriggerSource:      string(r.TriggerSource),
+		TriggerRef:         r.TriggerRef,
+		State:              string(r.State),
+		ParentRunID:        r.ParentRunID,
+		PullRequestURL:     r.PullRequestURL,
+		RetryAttempt:       r.RetryAttempt,
+		MaxRetriesSnapshot: r.MaxRetriesSnapshot,
+		CreatedAt:          r.CreatedAt,
+		UpdatedAt:          r.UpdatedAt,
 	}
 }
 
