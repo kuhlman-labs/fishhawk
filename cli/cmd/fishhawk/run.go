@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -114,7 +115,15 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fishhawk run status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cf := bindCommonFlags(fs)
+	outputFmt := fs.String("output", "text", "output format: text | json")
+	fs.StringVar(outputFmt, "o", "text", "output format: text | json (shorthand)")
 	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	switch *outputFmt {
+	case "text", "json":
+	default:
+		_, _ = fmt.Fprintf(stderr, "fishhawk run status: invalid --output %q (want text|json)\n", *outputFmt)
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
@@ -133,7 +142,15 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "fishhawk run status: %v\n", err)
 		return exitOnAPIError(err)
 	}
-	printRun(stdout, r)
+	switch *outputFmt {
+	case "json":
+		if err := json.NewEncoder(stdout).Encode(r); err != nil {
+			_, _ = fmt.Fprintf(stderr, "fishhawk run status: encode: %v\n", err)
+			return exitFailure
+		}
+	default:
+		printRun(stdout, r)
+	}
 	return exitOK
 }
 

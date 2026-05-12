@@ -4,7 +4,7 @@
 // Subcommands:
 //
 //	fishhawk run start  --repo R --workflow W --workflow-sha S [--trigger-ref REF]
-//	fishhawk run status <run-id>
+//	fishhawk run status <run-id> [--output text|json]
 //	fishhawk run list   [--repo R] [--workflow W] [--state S] [--limit N]
 //	fishhawk run cancel <run-id>
 //	fishhawk run open   <run-id>

@@ -19,7 +19,7 @@ E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `
 
 ```
 fishhawk run start  --repo R --workflow W --workflow-sha S [--trigger-ref REF]
-fishhawk run status <run-id>
+fishhawk run status <run-id> [--output text|json]
 fishhawk run list   [--repo R] [--workflow W] [--state S] [--limit N] [--cursor C]
 fishhawk run cancel <run-id>
 fishhawk run open   <run-id> [--print-url]
@@ -60,6 +60,9 @@ Or from this directory directly:
 
     # Watch its state
     fishhawk run status <run-id>
+
+    # Pipe a machine-readable Run into jq (handy for demo / status loops)
+    fishhawk run status <run-id> --output json | jq .state
 
     # List recent runs
     fishhawk run list --state running --limit 25
