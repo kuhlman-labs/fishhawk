@@ -693,7 +693,7 @@ func (s *stubAudit) ListForRunByCategory(context.Context, uuid.UUID, string) ([]
 
 // validSpec is the canonical workflow YAML used in dispatcher
 // tests. Mirrors MVP_SPEC §4.2 in shape but with minimal content.
-const validSpec = `version: "0.2"
+const validSpec = `version: "0.3"
 roles:
   tech_lead:
     members: ["@kuhlman-labs"]
@@ -877,7 +877,7 @@ func TestHandle_HappyPath_CreatesStagesAndDispatchesFirst(t *testing.T) {
 
 func TestHandle_MultiStageSpec_OnlyFirstDispatched(t *testing.T) {
 	d, gh, runs, _ := newDispatcherWithStubs(t)
-	gh.specContent = []byte(`version: "0.2"
+	gh.specContent = []byte(`version: "0.3"
 roles:
   tech_lead:
     members: ["@x"]
@@ -960,7 +960,7 @@ func TestHandle_HumanStage_ExecutorRefIsConventional(t *testing.T) {
 	// stage's from_stage reference must resolve, so we keep both
 	// stages and assert the human one's executor mapping.
 	d, gh, runs, _ := newDispatcherWithStubs(t)
-	gh.specContent = []byte(`version: "0.2"
+	gh.specContent = []byte(`version: "0.3"
 roles:
   tech_lead:
     members: ["@x"]
@@ -1044,7 +1044,7 @@ func TestHandle_EmptyStagesSpec_NoRun(t *testing.T) {
 	// A workflow with no stages — schema requires at least one,
 	// but defense-in-depth: the dispatcher refuses rather than
 	// dispatching with no work to do.
-	gh.specContent = []byte(`version: "0.2"
+	gh.specContent = []byte(`version: "0.3"
 workflows:
   feature_change:
     description: empty
@@ -1320,7 +1320,7 @@ func TestHandle_SpecParseError_NoRun(t *testing.T) {
 func TestHandle_WorkflowIDNotInSpec_NoRun(t *testing.T) {
 	d, gh, runs, _ := newDispatcherWithStubs(t)
 	// Spec parses, but doesn't contain "feature_change".
-	gh.specContent = []byte(`version: "0.2"
+	gh.specContent = []byte(`version: "0.3"
 roles:
   tech_lead:
     members: ["@x"]
@@ -1448,7 +1448,7 @@ func TestHandle_PersistsRequiresApprovalPerStageGate(t *testing.T) {
 	// RequiresApproval=true at create time so the trace upload
 	// handler picks the right post-upload transition. Stages
 	// without an approval gate must have RequiresApproval=false.
-	const multiStageSpec = `version: "0.2"
+	const multiStageSpec = `version: "0.3"
 roles:
   founder:
     members: ["@kuhlman-labs"]
@@ -1526,7 +1526,7 @@ func TestHandle_PersistsGateShapePerStage(t *testing.T) {
 	// approval gate, else first check gate, else nil. The
 	// blocking_checks field was dropped in v0.2 (#254); required
 	// CI checks now live in branch protection (#251).
-	const spec = `version: "0.2"
+	const spec = `version: "0.3"
 roles:
   founder:
     members: ["@kuhlman-labs"]

@@ -4,7 +4,7 @@
 # fixture: any change to the schema must keep this example valid, and
 # any change to this example must remain valid against the schema.
 
-version: "0.2"
+version: "0.3"
 
 roles:
   tech_lead:
@@ -17,6 +17,8 @@ roles:
 workflows:
   feature_change:
     description: "Default workflow for new features and non-trivial changes."
+    on_ci_failure:
+      max_retries: 1
 
     stages:
       - id: plan

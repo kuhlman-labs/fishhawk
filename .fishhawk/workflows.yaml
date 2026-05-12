@@ -11,7 +11,7 @@
 # When the product can execute this spec, the syntax may be revised to
 # match the frozen v0 schema. The intent expressed here will not change.
 
-version: "0.2"
+version: "0.3"
 
 roles:
   founder:
@@ -26,6 +26,11 @@ workflows:
     description: >-
       Default workflow for feature work and non-trivial changes.
       Human approves plan and PR; agent does the implementation.
+    # Auto-retry once on CI failure (#276). The human approves the
+    # plan; the agent should self-heal on a routine test or lint
+    # regression without forcing the reviewer back into the loop.
+    on_ci_failure:
+      max_retries: 1
 
     stages:
       - id: plan
@@ -119,6 +124,13 @@ workflows:
     description: >-
       Workflow for documentation, dependency bumps, lint/format fixes,
       and tests for existing behavior. Agent may merge if all gates pass.
+    # High-autonomy auto-retry (#276). Routine_change is the
+    # canonical case for self-healing: the human never approved
+    # anything; the agent's job is to keep the change merging
+    # cleanly. One retry strikes the balance between resilience to
+    # flaky CI and not spinning forever on a real bug.
+    on_ci_failure:
+      max_retries: 1
 
     stages:
       - id: implement

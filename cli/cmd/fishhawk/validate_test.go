@@ -8,7 +8,7 @@ import (
 )
 
 const validateValidYAML = `
-version: "0.2"
+version: "0.3"
 roles:
   tech_lead:
     members: ["@org/tech-leads"]
@@ -128,7 +128,7 @@ func TestValidate_EmptyFile_ReturnsParseError(t *testing.T) {
 }
 
 func TestValidate_SchemaError_ReturnsValidationError(t *testing.T) {
-	bad := strings.Replace(validateValidYAML, `version: "0.2"`, "", 1)
+	bad := strings.Replace(validateValidYAML, `version: "0.3"`, "", 1)
 	path := writeTempSpec(t, bad)
 	var stdout, stderr strings.Builder
 	got := runValidate([]string{path}, &stdout, &stderr)

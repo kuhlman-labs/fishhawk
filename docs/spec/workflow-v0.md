@@ -7,13 +7,15 @@ Reference for `.fishhawk/workflows.yaml`. The canonical schema is [`workflow-v0.
 ## Top-level shape
 
 ```yaml
-version: "0.2"          # required, exactly "0.2" in v0
+version: "0.3"          # required, exactly "0.3" in v0
 roles:                  # optional; named groups referenced by gates
   <role_id>:
     members: ["@org/team", "@user"]
 workflows:              # required; at least one workflow
   <workflow_id>:
     description: "..."
+    on_ci_failure:      # optional; auto-retry policy (#276)
+      max_retries: 1    # default when the block is absent
     stages: [...]
 ```
 
@@ -119,11 +121,28 @@ Two types:
 
 `blocking_checks` was removed in v0.2 (ADR-017 / #249). Required CI checks are now derived from GitHub branch protection / rulesets at run-create time and snapshotted onto the run row (#251). The `fishhawk_audit_complete` signal is still computed by Fishhawk (#229) and published as a Check Run on the PR (#231) so branch protection can enforce it.
 
+## On CI failure (auto-retry)
+
+```yaml
+workflows:
+  feature_change:
+    on_ci_failure:
+      max_retries: 1    # 0 disables; 1 (default) = retry once; max 5
+    stages: [ … ]
+```
+
+Per-workflow auto-retry policy (#276 / E16). When a required CI check fails on the implement stage's PR, the dispatcher fires a fresh implement workflow_dispatch up to `max_retries` times, threading each retry via `parent_run_id` (#216).
+
+- **`max_retries`** — integer, `0..5`, default `1`. A retry chain of length N means the agent is dispatched `N+1` times total (original + N retries). Set to `0` to disable auto-retry — useful for low-autonomy workflows where a human prefers to re-trigger after inspecting the failure.
+- **Trigger predicate**: only the closed set of failing conclusions in `stagecheck.DeriveState` (`failure`, `timed_out`, `cancelled`, `action_required`, `stale`, `startup_failure`) fires a retry. `success` / `neutral` / `skipped` are no-ops.
+- **`fishhawk_audit_complete` failures are excluded** from the retry trigger. Retrying won't fix Fishhawk's own audit gaps; that's #229's job.
+- **Required-check scoping**: only failures of checks in the run's branch-protection snapshot (#251) count. A failing third-party non-required check doesn't trigger retries.
+
 ## Identifier namespaces
 
 | Field | Pattern / values | Notes |
 |---|---|---|
-| `version` | `"0.2"` | current value; 0.1 was frozen briefly before ADR-017 dropped `blocking_checks` (#254) |
+| `version` | `"0.3"` | current value; 0.2 added v0.2's `blocking_checks` drop, 0.3 adds `on_ci_failure.max_retries` (#277) |
 | Role / workflow / stage IDs | `^[a-z][a-z0-9_]*$` | snake_case |
 | Member refs | `^@[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$` | GitHub user or team |
 | Stage `type` | `plan` \| `implement` \| `review` | closed set |

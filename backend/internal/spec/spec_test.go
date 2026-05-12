@@ -26,8 +26,8 @@ func TestParse_CanonicalFeatureChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if s.Version != "0.2" {
-		t.Errorf("version = %q, want 0.2", s.Version)
+	if s.Version != "0.3" {
+		t.Errorf("version = %q, want 0.3", s.Version)
 	}
 	if got, want := len(s.Workflows), 1; got != want {
 		t.Errorf("workflows count = %d, want %d", got, want)
@@ -62,6 +62,125 @@ func TestParse_Minimal(t *testing.T) {
 	}
 	if len(s.Roles) != 0 {
 		t.Errorf("roles should be empty, got %v", s.Roles)
+	}
+}
+
+// --- on_ci_failure / retry policy (#277) ---
+
+func TestParse_OnCIFailure_Absent_NilPointer(t *testing.T) {
+	// No `on_ci_failure` block → Workflow.OnCIFailure is nil. The
+	// nil-vs-zero distinction is load-bearing: nil = "use the
+	// default of 1 retry"; an explicit `max_retries: 0` = "opt out
+	// of auto-retries." The dispatcher reads these differently.
+	s, err := spec.ParseBytes(readFixture(t, "valid/minimal.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf, ok := s.Workflows["trivial"]
+	if !ok {
+		t.Fatal("trivial workflow missing from parsed spec")
+	}
+	if wf.OnCIFailure != nil {
+		t.Errorf("OnCIFailure = %+v, want nil for an unset block", wf.OnCIFailure)
+	}
+}
+
+func TestParse_OnCIFailure_Default(t *testing.T) {
+	// `max_retries: 1` round-trips cleanly. Same shape the
+	// dispatcher will read at run-create time when evaluating
+	// whether to fire a follow-up implement workflow_dispatch on
+	// CI failure (#276).
+	yml := []byte(`
+version: "0.3"
+workflows:
+  feature_change:
+    description: "x"
+    on_ci_failure:
+      max_retries: 1
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf := s.Workflows["feature_change"]
+	if wf.OnCIFailure == nil {
+		t.Fatal("OnCIFailure should round-trip non-nil")
+	}
+	if wf.OnCIFailure.MaxRetries != 1 {
+		t.Errorf("MaxRetries = %d, want 1", wf.OnCIFailure.MaxRetries)
+	}
+}
+
+func TestParse_OnCIFailure_ExplicitZero_OptsOut(t *testing.T) {
+	// `max_retries: 0` is the explicit opt-out — the dispatcher
+	// won't fire any auto-retries even on CI failure. Distinct
+	// from the absent-block case (nil pointer → DefaultMaxRetries).
+	yml := []byte(`
+version: "0.3"
+workflows:
+  human_led_change:
+    description: "x"
+    on_ci_failure:
+      max_retries: 0
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - source: pull_request
+            required: true
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf := s.Workflows["human_led_change"]
+	if wf.OnCIFailure == nil {
+		t.Fatal("OnCIFailure should round-trip non-nil even when value=0")
+	}
+	if wf.OnCIFailure.MaxRetries != 0 {
+		t.Errorf("MaxRetries = %d, want 0", wf.OnCIFailure.MaxRetries)
+	}
+}
+
+func TestParse_OnCIFailure_ExceedsCap_Rejected(t *testing.T) {
+	// max_retries: 6 violates the schema's maximum: 5. The schema-
+	// validation pass surfaces it as a ValidationError naming the
+	// failing field — the dispatcher never gets a chance to fire
+	// six retries because we refuse the spec before it lands on a
+	// run row.
+	yml := []byte(`
+version: "0.3"
+workflows:
+  feature_change:
+    description: "x"
+    on_ci_failure:
+      max_retries: 6
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	// The error trail names the offending field so a customer can
+	// fix their spec without grepping the schema source.
+	if !strings.Contains(se.Path, "max_retries") && !strings.Contains(se.Message, "maximum") {
+		t.Errorf("error should name the offending field / constraint: %s", se.Error())
 	}
 }
 
@@ -118,7 +237,7 @@ workflows:
 
 func TestParse_UnknownStageType(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 workflows:
   trivial:
     stages:
@@ -135,7 +254,7 @@ workflows:
 func TestParse_BothExecutorKinds(t *testing.T) {
 	// Schema's oneOf rejects {agent, human} together.
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 workflows:
   trivial:
     stages:
@@ -154,7 +273,7 @@ workflows:
 func TestParse_StageIDPattern(t *testing.T) {
 	// Stage IDs must be snake_case (^[a-z][a-z0-9_]*$).
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 workflows:
   trivial:
     stages:
@@ -170,7 +289,7 @@ workflows:
 
 func TestParse_UnknownArtifactKind(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 workflows:
   trivial:
     stages:
@@ -190,7 +309,7 @@ workflows:
 
 func TestParse_DuplicateStageIDs(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 workflows:
   trivial:
     stages:
@@ -217,7 +336,7 @@ workflows:
 
 func TestParse_DanglingFromStage(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 workflows:
   trivial:
     stages:
@@ -242,7 +361,7 @@ workflows:
 func TestParse_ForwardFromStage(t *testing.T) {
 	// from_stage may reference only earlier stages.
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 workflows:
   trivial:
     stages:
@@ -266,7 +385,7 @@ workflows:
 
 func TestParse_UndefinedApproverRole(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 roles:
   founder:
     members: ["@kuhlman-labs"]
@@ -292,7 +411,7 @@ workflows:
 
 func TestParse_PlanMissingSchema(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
-version: "0.2"
+version: "0.3"
 workflows:
   trivial:
     stages:
@@ -324,7 +443,7 @@ func TestValidate_BuiltProgrammatically(t *testing.T) {
 	// Confirms callers can build a Spec in-memory and run only the
 	// semantic layer without going through Parse.
 	s := &spec.Spec{
-		Version: "0.2",
+		Version: "0.3",
 		Roles: map[string]spec.Role{
 			"founder": {Members: []string{"@kuhlman-labs"}},
 		},
@@ -352,7 +471,7 @@ func TestValidate_BuiltProgrammatically(t *testing.T) {
 
 func TestParse_ReaderRoundTrip(t *testing.T) {
 	s, err := spec.Parse(strings.NewReader(`
-version: "0.2"
+version: "0.3"
 workflows:
   t:
     stages:

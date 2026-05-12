@@ -6,7 +6,7 @@
 # - executor on a review stage being an agent
 # - omitted optional sections (no inputs, no budget on either stage)
 
-version: "0.2"
+version: "0.3"
 
 roles:
   founder:
@@ -17,6 +17,8 @@ workflows:
     description: >-
       Workflow for documentation, dependency bumps, lint/format fixes,
       and tests for existing behavior. Agent may merge if all gates pass.
+    on_ci_failure:
+      max_retries: 1
 
     stages:
       - id: implement
