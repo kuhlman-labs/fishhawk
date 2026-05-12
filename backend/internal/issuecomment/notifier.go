@@ -61,6 +61,13 @@ const (
 	KindPickup       Kind = "pickup"
 	KindPlan         Kind = "plan"
 	KindPlanApproved Kind = "plan_approved"
+	// KindCIRetry tags a comment posted when the dispatcher fires a
+	// CI-failure auto-retry (#279 / E16). Dedup is per-attempt: the
+	// payload also carries `retry_attempt`, and the dedup query
+	// matches both kind and retry_attempt so re-deliveries of the
+	// same check_run.completed event don't double-post but a fresh
+	// retry round (attempt N → N+1) still announces itself.
+	KindCIRetry Kind = "ci_retry"
 )
 
 // IssueCommenter is the slice of githubclient.Client this package
@@ -209,6 +216,162 @@ func (n *Notifier) NotifyPlanApproved(ctx context.Context, runID uuid.UUID, appr
 	}
 	body := renderPlanApprovedBody(ctxv, approverLogin)
 	return n.post(ctx, ctxv, KindPlanApproved, body)
+}
+
+// NotifyCIRetry posts the CI-failure auto-retry comment for an
+// issue-triggered run (#279 / E16). Best-effort: returns errors so
+// callers can log them, but a comment failure does NOT unwind the
+// retry dispatch — the child run is already in the DB with its own
+// audit entries, and the SPA's threaded-runs view (#216) renders
+// the lineage without the comment.
+//
+// Skips silently when:
+//   - The receiver is nil.
+//   - The CHILD run isn't issue-triggered (CLI / PR / etc.) — we
+//     read the child's TriggerSource here, not the parent's,
+//     because the comment routes to the child's run page and the
+//     contextFor helper validates the child.
+//   - The child run is missing installation_id or a decodable issue
+//     number.
+//   - A ci_retry comment with the SAME retry_attempt already landed
+//     on this run (per-attempt dedup; redeliveries of the same
+//     check_run.completed are absorbed, but a fresh attempt N+1
+//     still posts).
+//
+// `attempt` is the child run's RetryAttempt (1 for the first retry);
+// `max` is the workflow's on_ci_failure.max_retries cap. Both render
+// into the comment body so the labeler knows whether they have
+// budget for another auto-retry if this one also fails.
+func (n *Notifier) NotifyCIRetry(ctx context.Context, runID uuid.UUID, parentRunID uuid.UUID, checkName string, attempt, max int) error {
+	if n == nil {
+		return nil
+	}
+	if attempt <= 0 {
+		// 0 = original run; never the child of a CI-retry path.
+		// Negative is nonsense from a bad caller. Either way, skip.
+		return nil
+	}
+	ctxv, ok, err := n.contextForCIRetry(ctx, runID, attempt)
+	if err != nil || !ok {
+		return err
+	}
+	body := renderCIRetryBody(ctxv, parentRunID, checkName, attempt, max, n.externalURL)
+	return n.postCIRetry(ctx, ctxv, attempt, body)
+}
+
+// contextForCIRetry mirrors contextFor but uses the per-attempt
+// dedup query — `alreadyPosted(KindCIRetry, …)` would falsely
+// suppress attempt 2 after attempt 1 posted.
+func (n *Notifier) contextForCIRetry(ctx context.Context, runID uuid.UUID, attempt int) (commentContext, bool, error) {
+	runRow, err := n.runs.GetRun(ctx, runID)
+	if err != nil {
+		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
+	}
+	if runRow.TriggerSource != run.TriggerGitHubIssue {
+		return commentContext{}, false, nil
+	}
+	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
+		return commentContext{}, false, nil
+	}
+	number, ok := parseIssueRef(*runRow.TriggerRef)
+	if !ok {
+		return commentContext{}, false, nil
+	}
+	repo, err := parseRepo(runRow.Repo)
+	if err != nil {
+		return commentContext{}, false, nil
+	}
+	already, err := n.alreadyPostedAttempt(ctx, runID, attempt)
+	if err != nil {
+		return commentContext{}, false, fmt.Errorf("issuecomment: dedup check: %w", err)
+	}
+	if already {
+		return commentContext{}, false, nil
+	}
+	return commentContext{
+		run:         runRow,
+		repo:        repo,
+		issueNumber: number,
+		runURL:      n.externalURL + "/runs/" + runID.String(),
+	}, true, nil
+}
+
+// alreadyPostedAttempt returns true when a ci_retry audit entry on
+// this run already records the same retry_attempt. Different from
+// alreadyPosted (which matches on kind alone) because a child run
+// only ever sees one retry_attempt — but a future change that
+// reuses one run row across multiple attempts would still need this
+// per-attempt scoping.
+func (n *Notifier) alreadyPostedAttempt(ctx context.Context, runID uuid.UUID, attempt int) (bool, error) {
+	entries, err := n.audit.ListForRunByCategory(ctx, runID, CategoryIssueCommented)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if extractKind(e.Payload) != KindCIRetry {
+			continue
+		}
+		if extractRetryAttempt(e.Payload) == attempt {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// postCIRetry fires the comment and writes the audit row. Mirrors
+// post() but stamps retry_attempt into the payload so dedup can
+// scope per-attempt.
+func (n *Notifier) postCIRetry(ctx context.Context, ctxv commentContext, attempt int, body string) error {
+	if err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
+		return fmt.Errorf("issuecomment: create comment: %w", err)
+	}
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"kind":          string(KindCIRetry),
+		"issue_number":  ctxv.issueNumber,
+		"repo":          ctxv.repo.String(),
+		"retry_attempt": attempt,
+	})
+	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     ctxv.run.ID,
+		Timestamp: n.now().UTC(),
+		Category:  CategoryIssueCommented,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("issuecomment: audit append: %w", err)
+	}
+	return nil
+}
+
+// renderCIRetryBody renders the CI-failure auto-retry comment.
+// Names the failing check and the attempt budget so the labeler
+// can predict whether a second failure will trigger another retry.
+func renderCIRetryBody(c commentContext, parentRunID uuid.UUID, checkName string, attempt, max int, externalURL string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CI check `%s` failed on Run [`%s`](%s/runs/%s) — Fishhawk dispatched a retry as Run [`%s`](%s).\n\n",
+		checkName,
+		shortID(parentRunID), externalURL, parentRunID.String(),
+		shortID(c.run.ID), c.runURL)
+	fmt.Fprintf(&b, "Retry attempt %d of %d.\n", attempt, max)
+	return b.String()
+}
+
+// extractRetryAttempt reads `retry_attempt` out of an
+// issue_commented payload. Returns 0 on any decode failure or
+// absent field; the caller treats 0 as "not the attempt we're
+// checking" since a real ci_retry payload always carries >=1.
+func extractRetryAttempt(payload []byte) int {
+	if len(payload) == 0 {
+		return 0
+	}
+	var p struct {
+		RetryAttempt int `json:"retry_attempt"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return 0
+	}
+	return p.RetryAttempt
 }
 
 // SlashApprovalReply is the params for NotifySlashApprovalReply

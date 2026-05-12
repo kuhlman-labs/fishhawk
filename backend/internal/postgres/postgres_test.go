@@ -202,27 +202,33 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0019 dropped
-	// runs.workflow_spec (#283); the down migration drops the
-	// column entirely (no data to restore). Confirm:
-	// workflow_spec is gone, but every prior migration's effect
-	// is still present (stages.gate_blocking_checks restored from
-	// 0018's down would still be there if we hadn't rolled it back,
-	// required_checks_snapshot from 0017, parent_run_id +
-	// pull_request_url from 0016, stage_checks table from 0015,
-	// stages.gate_type from 0014, stages.requires_approval from 0013,
-	// signing_keys.id from 0012, runs.idempotency_key from 0011,
-	// users + sessions from 0010, audit run_id nullability from 0009,
-	// etc.).
-	var workflowSpecCol, gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	// MigrateDown rolls back one step. 0020 added
+	// runs.retry_attempt (#279); the down migration drops the
+	// column. Confirm: retry_attempt is gone, but every prior
+	// migration's effect is still present (workflow_spec from 0019,
+	// stages.gate_blocking_checks dropped by 0018, required_checks_snapshot
+	// from 0017, parent_run_id + pull_request_url from 0016,
+	// stage_checks table from 0015, stages.gate_type from 0014,
+	// stages.requires_approval from 0013, signing_keys.id from 0012,
+	// runs.idempotency_key from 0011, users + sessions from 0010, etc.).
+	var retryAttemptCol, workflowSpecCol, gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'retry_attempt'`,
+	).Scan(&retryAttemptCol); err != nil {
+		t.Fatalf("query runs.retry_attempt column: %v", err)
+	}
+	if retryAttemptCol != 0 {
+		t.Errorf("runs.retry_attempt count after MigrateDown = %d, want 0 (0020 down dropped it)", retryAttemptCol)
+	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'runs' AND column_name = 'workflow_spec'`,
 	).Scan(&workflowSpecCol); err != nil {
 		t.Fatalf("query runs.workflow_spec column: %v", err)
 	}
-	if workflowSpecCol != 0 {
-		t.Errorf("runs.workflow_spec count after MigrateDown = %d, want 0 (0019 down dropped it)", workflowSpecCol)
+	if workflowSpecCol != 1 {
+		t.Errorf("runs.workflow_spec count after MigrateDown = %d, want 1 (0019 still applied)", workflowSpecCol)
 	}
 	// 0018 (drop gate_blocking_checks) is still applied — its down
 	// would restore the column, but we only rolled back 0019.

@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -524,6 +525,11 @@ type GitHubAPI interface {
 // (the demo loop pre-#234 posture).
 type IssueNotifier interface {
 	NotifyPickup(ctx context.Context, runID uuid.UUID, senderLogin string) error
+	// NotifyCIRetry posts a comment on the originating issue when
+	// the dispatcher fires a CI-failure auto-retry (#279 / E16).
+	// Per-attempt dedup via the audit log; failures log but don't
+	// unwind the dispatch.
+	NotifyCIRetry(ctx context.Context, runID uuid.UUID, parentRunID uuid.UUID, checkName string, attempt, max int) error
 }
 
 // ApprovalCommandHandler executes a slash-command approval / reject
@@ -563,7 +569,14 @@ type Dispatcher struct {
 	GitHub GitHubAPI
 	Runs   run.Repository
 	Audit  audit.Repository
-	Logger *slog.Logger
+	// Artifacts is consulted by the CI-failure retry handler (#279
+	// / E16) to look up the implement-stage pull_request artifact
+	// for a run, so the dedup guard can compare head_sha against
+	// every Fishhawk run on the PR. Nil leaves the retry path's
+	// dedup guard at "no, this head_sha isn't recorded yet" — the
+	// audit cap still bounds runaway retries.
+	Artifacts artifact.Repository
+	Logger    *slog.Logger
 
 	// IssueNotifier posts the pickup-acknowledgment comment back
 	// to the triggering issue (#234). Best-effort: failures log
@@ -995,32 +1008,467 @@ func (d *Dispatcher) handleRunnerActionFailed(ctx context.Context, ev Event, m M
 	return nil
 }
 
-// handleCIFailureRetry is the placeholder hook for the auto-retry
-// chain (#278 / E16). The real implementation lands in #279 — this
-// PR scopes to *matching* the trigger, not acting on it. Logs the
-// recognized event so an operator running the SPA against this
-// commit can confirm the match landed; returns nil so the webhook
-// receiver acknowledges with 202.
+// handleCIFailureRetry creates a follow-up implement run when a
+// required CI check fails on a Fishhawk-managed PR (#279 / E16).
+// Best-effort throughout — every skip path emits a structured log
+// line so an operator can trace why the auto-retry didn't fire.
+//
+// Algorithm:
+//
+//  1. Find the most-recent run on the PR URL via runs.pull_request_url
+//     (#216). Skip if no Fishhawk run touches this PR.
+//
+//  2. Skip if the failing check isn't in the parent's
+//     required_checks_snapshot (#251). A non-required check failing
+//     isn't a merge blocker, so it isn't a retry trigger.
+//
+//  3. Skip if a Fishhawk run already has this head_sha. The runner's
+//     fresh commit produces a new head_sha each retry; an event for
+//     a SHA we already wrote a run against is a redelivery / racing
+//     event.
+//
+//  4. Read on_ci_failure.max_retries from the parent's cached
+//     workflow spec (#283 / #277), defaulting to DefaultMaxRetries
+//     when the block is absent. Explicit max_retries: 0 disables
+//     auto-retry — emit ci_retry_exhausted with the
+//     "opt-out" reason.
+//
+//  5. Cap check: when parent.RetryAttempt >= maxRetries, emit
+//     ci_retry_exhausted with the "cap" reason and stop.
+//
+//  6. Create the follow-up run with ParentRunID = parent.ID,
+//     RetryAttempt = parent.RetryAttempt + 1, reusing the parent's
+//     workflow_id / workflow_sha / installation_id / required-checks
+//     snapshot / cached spec.
+//
+//  7. Create stages for the retry — variant A from the issue body:
+//     skip plan stages. The implement stage's prompt builder
+//     (server/prompt.go::loadApprovedPlanForRun) walks ParentRunID
+//     to find the most-recent approved plan, so the retry runs
+//     against the parent's plan without re-prompting.
+//
+//  8. Fire workflow_dispatch on the implement stage.
+//
+//  9. Audit (ci_failure_retry_dispatched) + best-effort notify the
+//     originating issue.
 func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match) error {
 	if m.CheckRunRef == nil {
-		// Defensive: matchCheckRun fills CheckRunRef before
-		// tagging the action; a nil here means upstream coupling
-		// broke. Log + skip rather than nil-deref.
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
 			"ci_failure_retry: missing CheckRunRef",
 			slog.String("delivery_id", ev.DeliveryID))
 		return nil
 	}
-	d.logger().LogAttrs(ctx, slog.LevelInfo,
-		"ci_failure_retry: matched (handler placeholder; real dispatch in #279)",
-		slog.String("delivery_id", ev.DeliveryID),
-		slog.String("repo", ev.Repo),
-		slog.String("check_name", m.CheckRunRef.CheckName),
-		slog.String("conclusion", m.CheckRunRef.Conclusion),
-		slog.String("head_sha", m.CheckRunRef.HeadSHA),
-		slog.Int("pr_number", m.CheckRunRef.PRNumber),
-	)
+	ref := m.CheckRunRef
+	now := d.now()
+
+	// Step 1: find the parent run on this PR.
+	parent, ok := d.findRunForCIRetry(ctx, ev.Repo, ref.PRNumber)
+	if !ok {
+		d.logger().LogAttrs(ctx, slog.LevelDebug,
+			"ci_failure_retry: PR not Fishhawk-managed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+			slog.Int("pr_number", ref.PRNumber))
+		return nil
+	}
+
+	// Step 2: only fire when the failing check is one the run's
+	// branch-protection snapshot says is required.
+	if !checkInSnapshot(parent, ref.CheckName) {
+		d.logger().LogAttrs(ctx, slog.LevelDebug,
+			"ci_failure_retry: check is not in required snapshot",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", parent.ID.String()),
+			slog.String("check_name", ref.CheckName))
+		return nil
+	}
+
+	// Step 3: dedup against existing runs on this head_sha.
+	dup, err := d.runOnHeadSHAExists(ctx, ev.Repo, ref.PRNumber, ref.HeadSHA)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: dedup lookup failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if dup {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"ci_failure_retry: a Fishhawk run already exists on this head_sha",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("head_sha", ref.HeadSHA))
+		return nil
+	}
+
+	// Step 4: resolve the retry cap from the cached spec.
+	workflow, maxRetries, ok := d.resolveRetryPolicy(ctx, parent)
+	if !ok {
+		// The dispatch path here is best-effort. If we can't read
+		// the spec, refuse the retry to avoid a runaway loop —
+		// logged loudly so the operator sees it.
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: cannot resolve retry policy from cached spec",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", parent.ID.String()))
+		return nil
+	}
+
+	// Step 5: cap check (covers both the max-hit and explicit
+	// max_retries:0 opt-out cases; max_retries:0 means cap is 0,
+	// any RetryAttempt >= 0 trips the check on the original).
+	if parent.RetryAttempt >= maxRetries {
+		d.writeCIRetryExhaustedAudit(ctx, ev, parent, ref, maxRetries, now)
+		return nil
+	}
+
+	// Step 6: create the follow-up run.
+	triggerRef := ""
+	if parent.TriggerRef != nil {
+		triggerRef = *parent.TriggerRef
+	}
+	installationID := int64(0)
+	if parent.InstallationID != nil {
+		installationID = *parent.InstallationID
+	}
+	parentID := parent.ID
+	params := run.CreateRunParams{
+		Repo:                   parent.Repo,
+		WorkflowID:             parent.WorkflowID,
+		WorkflowSHA:            parent.WorkflowSHA,
+		TriggerSource:          parent.TriggerSource,
+		ParentRunID:            &parentID,
+		RequiredChecksSnapshot: parent.RequiredChecksSnapshot,
+		WorkflowSpec:           parent.WorkflowSpec,
+		RetryAttempt:           parent.RetryAttempt + 1,
+	}
+	if triggerRef != "" {
+		params.TriggerRef = &triggerRef
+	}
+	if installationID != 0 {
+		params.InstallationID = &installationID
+	}
+	child, err := d.Runs.CreateRun(ctx, params)
+	if err != nil {
+		return fmt.Errorf("dispatcher: create retry run: %w", err)
+	}
+
+	// Step 7: create stages — skip plan. The retry's implement
+	// stage prompt walks ParentRunID to find the original plan.
+	retryStages := filterOutPlanStages(workflow.Stages)
+	if len(retryStages) == 0 {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: no non-plan stages to retry against",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", child.ID.String()))
+		return nil
+	}
+	stages, err := d.createStages(ctx, child.ID, retryStages)
+	if err != nil {
+		return fmt.Errorf("dispatcher: create retry stages: %w", err)
+	}
+
+	// Step 8: fire workflow_dispatch on the first retry stage.
+	repo, err := parseRepo(ev.Repo)
+	if err != nil {
+		return fmt.Errorf("dispatcher: parse repo: %w", err)
+	}
+	dispatchRef := d.DefaultRef
+	if dispatchRef == "" {
+		dispatchRef = "main"
+	}
+	actionsFile := d.ActionsWorkflowFile
+	if actionsFile == "" {
+		actionsFile = DefaultActionsWorkflowFile
+	}
+	firstStage := stages[0]
+	dispatchErr := d.GitHub.DispatchWorkflow(ctx, installationID, repo,
+		actionsFile, dispatchRef, githubclient.DispatchInputs{
+			"run_id":      child.ID.String(),
+			"stage_id":    firstStage.ID.String(),
+			"workflow_id": parent.WorkflowID,
+			"stage":       firstStage.ExecutorRef,
+		})
+	if dispatchErr == nil {
+		if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,
+			run.StageStateDispatched, nil); err != nil {
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"ci_failure_retry: transition stage to dispatched failed",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("stage_id", firstStage.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	// Step 9: audit.
+	d.writeCIRetryDispatchedAudit(ctx, ev, parent, child, ref, maxRetries, dispatchErr, now)
+
+	// Notify the originating issue. Best-effort — a comment failure
+	// logs but doesn't unwind the dispatch.
+	if d.IssueNotifier != nil && dispatchErr == nil {
+		if err := d.IssueNotifier.NotifyCIRetry(ctx, child.ID, parent.ID,
+			ref.CheckName, child.RetryAttempt, maxRetries); err != nil {
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"ci_failure_retry: comment-back failed",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("run_id", child.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	if dispatchErr != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: workflow_dispatch failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", child.ID.String()),
+			slog.String("error", dispatchErr.Error()))
+	} else {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"ci_failure_retry: dispatched retry run",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.String("run_id", child.ID.String()),
+			slog.Int("retry_attempt", child.RetryAttempt),
+			slog.Int("max_retries", maxRetries),
+			slog.String("check_name", ref.CheckName),
+			slog.String("head_sha", ref.HeadSHA),
+		)
+	}
 	return nil
+}
+
+// pullRequestURLFor builds the canonical github.com PR URL for a
+// (repo, number) tuple. The runner stamps this exact shape when it
+// opens the PR (#216 / #206); using the same builder keeps the
+// ListRuns lookup byte-equal.
+func pullRequestURLFor(repo string, prNumber int) string {
+	return fmt.Sprintf("https://github.com/%s/pull/%d", repo, prNumber)
+}
+
+// findRunForCIRetry returns the most-recent run on the given PR. The
+// list is ordered by created_at desc + id desc (per the SQL); a
+// non-cancelled run at index 0 is the canonical parent for a retry.
+// When the run is cancelled, the chain is "closed" — refuse to
+// retry on top of a manually-stopped lineage.
+func (d *Dispatcher) findRunForCIRetry(ctx context.Context, repo string, prNumber int) (*run.Run, bool) {
+	if d.Runs == nil || repo == "" || prNumber <= 0 {
+		return nil, false
+	}
+	prURL := pullRequestURLFor(repo, prNumber)
+	runs, err := d.Runs.ListRuns(ctx, run.ListRunsFilter{
+		PullRequestURL: &prURL,
+		Limit:          25,
+	})
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: list runs failed",
+			slog.String("repo", repo),
+			slog.Int("pr_number", prNumber),
+			slog.String("error", err.Error()))
+		return nil, false
+	}
+	if len(runs) == 0 {
+		return nil, false
+	}
+	parent := runs[0]
+	if parent.State == run.StateCancelled {
+		// Lineage was manually stopped; don't restart it.
+		return nil, false
+	}
+	return parent, true
+}
+
+// checkInSnapshot reports whether the run's required-checks
+// snapshot includes `name`. Empty snapshot (legacy run pre-#251 or
+// CLI / UI flow) returns false — without protection metadata we
+// don't know what's required, so we refuse to retry rather than
+// trigger on every check.
+func checkInSnapshot(r *run.Run, name string) bool {
+	if r.RequiredChecksSnapshot == nil {
+		return false
+	}
+	for _, c := range r.RequiredChecksSnapshot.Contexts {
+		if c == name {
+			return true
+		}
+	}
+	return false
+}
+
+// runOnHeadSHAExists reports whether some Fishhawk run on this PR
+// already records the given head_sha — either as a direct PR
+// artifact head or as an ancestor in the chain. Used by the dedup
+// guard so a redelivery on the same head_sha doesn't spawn a second
+// retry.
+func (d *Dispatcher) runOnHeadSHAExists(ctx context.Context, repo string, prNumber int, headSHA string) (bool, error) {
+	if d.Runs == nil || d.Artifacts == nil || headSHA == "" {
+		return false, nil
+	}
+	prURL := pullRequestURLFor(repo, prNumber)
+	runs, err := d.Runs.ListRuns(ctx, run.ListRunsFilter{
+		PullRequestURL: &prURL,
+		Limit:          25,
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, r := range runs {
+		stages, err := d.Runs.ListStagesForRun(ctx, r.ID)
+		if err != nil {
+			return false, err
+		}
+		for _, s := range stages {
+			if s.Type != run.StageTypeImplement {
+				continue
+			}
+			arts, err := d.Artifacts.ListForStage(ctx, s.ID)
+			if err != nil {
+				return false, err
+			}
+			for _, a := range arts {
+				if a.Kind != artifact.KindPullRequest {
+					continue
+				}
+				if sha := decodeArtifactHeadSHA(a.Content); sha != "" && sha == headSHA {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+// decodeArtifactHeadSHA pulls head_sha out of a pull_request
+// artifact's JSON content. Mirrors the helper in
+// auditcheckpublisher; duplicated here to keep the dispatcher
+// import-free of that package.
+func decodeArtifactHeadSHA(content []byte) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var body struct {
+		HeadSHA string `json:"head_sha"`
+	}
+	if err := json.Unmarshal(content, &body); err != nil {
+		return ""
+	}
+	return body.HeadSHA
+}
+
+// resolveRetryPolicy reads on_ci_failure.max_retries from the
+// parent's cached spec. Returns the workflow definition so the
+// caller can use its stages list. ok=false signals "couldn't
+// resolve" — the caller refuses the retry rather than guessing.
+func (*Dispatcher) resolveRetryPolicy(_ context.Context, parent *run.Run) (spec.Workflow, int, bool) {
+	if len(parent.WorkflowSpec) == 0 {
+		return spec.Workflow{}, 0, false
+	}
+	parsed, err := spec.ParseBytes(parent.WorkflowSpec)
+	if err != nil {
+		return spec.Workflow{}, 0, false
+	}
+	wf, ok := parsed.Workflows[parent.WorkflowID]
+	if !ok {
+		return spec.Workflow{}, 0, false
+	}
+	max := spec.DefaultMaxRetries
+	if wf.OnCIFailure != nil {
+		max = wf.OnCIFailure.MaxRetries
+	}
+	return wf, max, true
+}
+
+// filterOutPlanStages returns the stages list with all `plan` types
+// removed. Retry runs inherit the parent's plan via parent_run_id
+// (resolved in server/prompt.go::loadApprovedPlanForRun) so the
+// retry doesn't need its own plan stage row.
+func filterOutPlanStages(in []spec.Stage) []spec.Stage {
+	out := make([]spec.Stage, 0, len(in))
+	for _, s := range in {
+		if s.Type == spec.StageTypePlan {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// writeCIRetryDispatchedAudit appends a chained audit entry tying
+// the retry dispatch to the parent run + the failing check.
+func (d *Dispatcher) writeCIRetryDispatchedAudit(ctx context.Context, ev Event, parent, child *run.Run,
+	ref *CheckRunRef, maxRetries int, dispatchErr error, now time.Time) {
+	systemKind := audit.ActorKind("system")
+	outcome := "dispatched"
+	if dispatchErr != nil {
+		outcome = "dispatch_failed"
+	}
+	payload := map[string]any{
+		"event":         ev.Type,
+		"delivery_id":   ev.DeliveryID,
+		"repo":          ev.Repo,
+		"parent_run_id": parent.ID.String(),
+		"child_run_id":  child.ID.String(),
+		"check_name":    ref.CheckName,
+		"conclusion":    ref.Conclusion,
+		"head_sha":      ref.HeadSHA,
+		"pr_number":     ref.PRNumber,
+		"retry_attempt": child.RetryAttempt,
+		"max_retries":   maxRetries,
+		"outcome":       outcome,
+	}
+	if dispatchErr != nil {
+		payload["error"] = dispatchErr.Error()
+	}
+	body, _ := json.Marshal(payload)
+	if _, err := d.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        child.ID,
+		Timestamp:    now,
+		Category:     "ci_failure_retry_dispatched",
+		ActorKind:    &systemKind,
+		ActorSubject: stringPtr("github-webhook"),
+		Payload:      body,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelError, "ci_failure_retry: audit append failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("error", err.Error()))
+	}
+}
+
+// writeCIRetryExhaustedAudit records the cap-hit case so an
+// operator can see "we tried, this is why we stopped." Chains
+// against the parent run since there's no child to attribute to.
+func (d *Dispatcher) writeCIRetryExhaustedAudit(ctx context.Context, ev Event, parent *run.Run,
+	ref *CheckRunRef, maxRetries int, now time.Time) {
+	systemKind := audit.ActorKind("system")
+	payload, _ := json.Marshal(map[string]any{
+		"event":         ev.Type,
+		"delivery_id":   ev.DeliveryID,
+		"repo":          ev.Repo,
+		"run_id":        parent.ID.String(),
+		"check_name":    ref.CheckName,
+		"conclusion":    ref.Conclusion,
+		"head_sha":      ref.HeadSHA,
+		"pr_number":     ref.PRNumber,
+		"retry_attempt": parent.RetryAttempt,
+		"max_retries":   maxRetries,
+	})
+	if _, err := d.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        parent.ID,
+		Timestamp:    now,
+		Category:     "ci_retry_exhausted",
+		ActorKind:    &systemKind,
+		ActorSubject: stringPtr("github-webhook"),
+		Payload:      payload,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelError, "ci_failure_retry: exhausted audit failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("error", err.Error()))
+	}
+	d.logger().LogAttrs(ctx, slog.LevelInfo, "ci_failure_retry: retry cap reached; not dispatching",
+		slog.String("delivery_id", ev.DeliveryID),
+		slog.String("run_id", parent.ID.String()),
+		slog.Int("retry_attempt", parent.RetryAttempt),
+		slog.Int("max_retries", maxRetries),
+	)
 }
 
 func (d *Dispatcher) logger() *slog.Logger {

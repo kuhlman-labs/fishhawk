@@ -64,6 +64,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		ParentRunID:            p.ParentRunID,
 		RequiredChecksSnapshot: snapshotBytes,
 		WorkflowSpec:           p.WorkflowSpec,
+		RetryAttempt:           int32(p.RetryAttempt),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -390,6 +391,7 @@ func rowToRun(r rundb.Run) *Run {
 		ParentRunID:    r.ParentRunID,
 		PullRequestURL: r.PullRequestUrl,
 		WorkflowSpec:   r.WorkflowSpec,
+		RetryAttempt:   int(r.RetryAttempt),
 		State:          State(r.State),
 		CreatedAt:      r.CreatedAt.Time,
 		UpdatedAt:      r.UpdatedAt.Time,

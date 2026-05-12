@@ -269,6 +269,90 @@ func TestNotifyPlanReady_DedupsViaAuditLog(t *testing.T) {
 	}
 }
 
+func TestNotifyCIRetry_PostsCommentAndAuditEntry(t *testing.T) {
+	runID, gh, au, n := happyDeps(t)
+	parentID := uuid.New()
+	if err := n.NotifyCIRetry(context.Background(), runID, parentID, "ci/build", 1, 1); err != nil {
+		t.Fatalf("NotifyCIRetry: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 GitHub call; got %d", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "ci/build") || !strings.Contains(body, "Retry attempt 1 of 1") {
+		t.Errorf("body missing expected text: %q", body)
+	}
+	if !strings.Contains(body, parentID.String()[:8]) {
+		t.Errorf("body should include parent short id: %q", body)
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("expected 1 audit entry; got %d", len(au.appended))
+	}
+	var p map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if p["kind"] != "ci_retry" {
+		t.Errorf("payload.kind = %v, want ci_retry", p["kind"])
+	}
+	if attempt, _ := p["retry_attempt"].(float64); int(attempt) != 1 {
+		t.Errorf("payload.retry_attempt = %v, want 1", p["retry_attempt"])
+	}
+}
+
+func TestNotifyCIRetry_PerAttemptDedup(t *testing.T) {
+	runID, gh, au, n := happyDeps(t)
+	// Pre-seed a ci_retry audit at retry_attempt=1: a second
+	// NotifyCIRetry for the same attempt is the redelivery case
+	// and should skip; an attempt=2 call (different run, but for
+	// stub-test purposes) still posts because the dedup is
+	// per-attempt.
+	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{
+		"kind":          "ci_retry",
+		"retry_attempt": 1,
+	})
+
+	if err := n.NotifyCIRetry(context.Background(), runID, uuid.New(), "ci/build", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("attempt=1 should dedup; got %d calls", len(gh.calls))
+	}
+	if err := n.NotifyCIRetry(context.Background(), runID, uuid.New(), "ci/build", 2, 2); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("attempt=2 should post; got %d calls", len(gh.calls))
+	}
+	if len(au.appended) != 1 {
+		t.Errorf("expected 1 new audit entry; got %d", len(au.appended))
+	}
+}
+
+func TestNotifyCIRetry_SkipsNonIssueTrigger(t *testing.T) {
+	runID := uuid.New()
+	cliRef := "cli:adhoc"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y",
+			TriggerSource:  run.TriggerCLI,
+			TriggerRef:     &cliRef,
+			InstallationID: int64Ptr(99),
+		}},
+	}
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: au, ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if err := n.NotifyCIRetry(context.Background(), runID, uuid.New(), "ci/build", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 0 || len(au.appended) != 0 {
+		t.Errorf("expected no GitHub / audit activity; got %d / %d", len(gh.calls), len(au.appended))
+	}
+}
+
 func TestNotifyPickup_AndPlan_ShareCategoryButDistinctKinds(t *testing.T) {
 	runID, gh, au, n := happyDeps(t)
 	if err := n.NotifyPickup(context.Background(), runID, "alice"); err != nil {
