@@ -378,8 +378,11 @@ func renderPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, extern
 	}
 
 	if planStage.RequiresApproval {
-		fmt.Fprintf(&b, "\n[Approve in the dashboard →](%s/stages/%s)\n",
-			externalURL, planStage.ID.String())
+		// SPA route is /runs/:runId/stages/:stageId — there's no
+		// top-level /stages/<id> route, so pre-#273 this URL 404'd
+		// for every plan-ready comment that landed (#273).
+		fmt.Fprintf(&b, "\n[Approve in the dashboard →](%s/runs/%s/stages/%s)\n",
+			externalURL, c.run.ID.String(), planStage.ID.String())
 	} else {
 		fmt.Fprintf(&b, "\n[View run →](%s)\n", c.runURL)
 	}
