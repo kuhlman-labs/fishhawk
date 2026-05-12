@@ -272,6 +272,36 @@ func TestVerify_BadRunIDInExport(t *testing.T) {
 	}
 }
 
+// TestRetryChain_VerifierTool_AcceptsRetryRuns asserts that an
+// export carrying both a parent run's chain and a CI-failure retry
+// run's chain verifies cleanly (#281 / E16.5). Each run owns its
+// own per-run chain in the Export.Runs map; the verifier walks
+// them independently, so a retry chain that uses a fresh prev=nil
+// anchor on its first entry must pass alongside the parent's
+// chain without any cross-run linkage.
+func TestRetryChain_VerifierTool_AcceptsRetryRuns(t *testing.T) {
+	parentID := uuid.MustParse("00000000-0000-0000-0000-0000000000a1")
+	retryID := uuid.MustParse("00000000-0000-0000-0000-0000000000a2")
+	ex := &audit.Export{
+		Schema:     audit.ExportSchemaV1,
+		ExportedAt: time.Date(2026, 5, 12, 12, 0, 0, 0, time.UTC),
+		Runs: map[string]audit.RunData{
+			parentID.String(): {AuditEntries: makeChain(t, parentID)},
+			retryID.String():  {AuditEntries: makeChain(t, retryID)},
+		},
+	}
+	res := audit.VerifyExport(ex)
+	if !res.OK() {
+		t.Fatalf("expected verify OK across parent+retry chains; got issues=%+v", res.Issues)
+	}
+	if res.RunsVerified != 2 {
+		t.Errorf("RunsVerified = %d, want 2", res.RunsVerified)
+	}
+	if res.EntriesChecked != 6 {
+		t.Errorf("EntriesChecked = %d, want 6 (3 per run)", res.EntriesChecked)
+	}
+}
+
 // --- VerifyBundleSignature ---
 
 func TestVerifyBundleSignature_HappyPath(t *testing.T) {

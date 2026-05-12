@@ -354,6 +354,175 @@ func stubPRHead(t *testing.T, headSHA string, err error) auditcomplete.PRHeadFet
 	}
 }
 
+// --- Retry chain (#281 / E16.5) ---
+
+// retryChainSetup seeds a parent run + a retry run that follows it,
+// each with its own plan + implement + review stages, distinct
+// head_shas on their pull_request artifacts, and complete
+// trace_uploaded chains. Mirrors the on-the-wire shape produced by
+// the dispatcher's auto-retry path (#279): retry.ParentRunID =
+// parent.ID, retry.RetryAttempt = parent.RetryAttempt + 1,
+// distinct head_shas because the runner commits fresh on each
+// attempt.
+//
+// Returns both run IDs + the fakes so individual tests can mutate a
+// single run's audit story to assert the parent / child boundary
+// holds.
+func retryChainSetup(t *testing.T) (parentID, retryID uuid.UUID, runs *fakeRuns, arts *fakeArtifacts, ar *fakeAudit) {
+	t.Helper()
+	parentID = uuid.New()
+	retryID = uuid.New()
+
+	parentImpl := mkStage(parentID, 2, run.StageTypeImplement, run.StageStateSucceeded)
+	retryImpl := mkStage(retryID, 1, run.StageTypeImplement, run.StageStateSucceeded)
+	// Variant A from the issue body: retry runs skip the plan stage —
+	// only the parent has one. Adding a retry-side plan would
+	// over-state the rig: real retries never get one.
+	parentPlan := mkStage(parentID, 1, run.StageTypePlan, run.StageStateSucceeded)
+	parentReview := mkStage(parentID, 3, run.StageTypeReview, run.StageStateAwaitingApproval)
+	retryReview := mkStage(retryID, 2, run.StageTypeReview, run.StageStateAwaitingApproval)
+
+	installID := int64(99)
+	parentRow := &run.Run{
+		ID: parentID, Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+		InstallationID: &installID, RetryAttempt: 0, MaxRetriesSnapshot: 1,
+	}
+	retryRow := &run.Run{
+		ID: retryID, Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+		InstallationID: &installID, ParentRunID: &parentID,
+		RetryAttempt: 1, MaxRetriesSnapshot: 1,
+	}
+
+	runs = &fakeRuns{
+		stages: []*run.Stage{parentPlan, parentImpl, parentReview, retryImpl, retryReview},
+		runs: map[uuid.UUID]*run.Run{
+			parentID: parentRow,
+			retryID:  retryRow,
+		},
+	}
+	arts = &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			parentPlan.ID: {planArtifact(parentPlan.ID, "standard_v1")},
+			// Distinct head_shas — the runner commits fresh on each
+			// attempt and the foreign-commit rule reads these to
+			// build the known-set.
+			parentImpl.ID: {pullRequestArtifactWithBody(parentImpl.ID, "p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1", 275)},
+			retryImpl.ID:  {pullRequestArtifactWithBody(retryImpl.ID, "r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2", 275)},
+		},
+	}
+
+	ar = &fakeAudit{}
+	// Parent's chain: dispatch + traces on plan & implement.
+	ar.appendChained(t, parentID, &parentPlan.ID, "stage_dispatched", nil)
+	ar.appendChained(t, parentID, &parentPlan.ID, "trace_uploaded", traceVariantPayload("raw"))
+	ar.appendChained(t, parentID, &parentPlan.ID, "trace_uploaded", traceVariantPayload("redacted"))
+	ar.appendChained(t, parentID, &parentImpl.ID, "trace_uploaded", traceVariantPayload("raw"))
+	ar.appendChained(t, parentID, &parentImpl.ID, "trace_uploaded", traceVariantPayload("redacted"))
+	// Retry's chain: traces on its own implement stage. Independent
+	// chain — prev_hash threading is per-run, so the retry's first
+	// entry has prev_hash=nil just like the parent's first did.
+	ar.appendChainedReset(t, retryID, &retryImpl.ID, "trace_uploaded", traceVariantPayload("raw"))
+	ar.appendChained(t, retryID, &retryImpl.ID, "trace_uploaded", traceVariantPayload("redacted"))
+	return parentID, retryID, runs, arts, ar
+}
+
+func TestRetryChain_AuditComplete_PassesPerRun(t *testing.T) {
+	// Parent and retry each carry their own complete audit story.
+	// Compute is run-scoped: both IDs return pass independently,
+	// proving the implementation doesn't smear state across the
+	// retry boundary.
+	parentID, retryID, runs, arts, ar := retryChainSetup(t)
+	d := deps(runs, arts, ar)
+	parentState, parentMissing, err := auditcomplete.Compute(context.Background(), parentID, d)
+	if err != nil {
+		t.Fatalf("Compute(parent): %v", err)
+	}
+	if parentState != stagecheck.StatePass {
+		t.Errorf("parent state = %s, want pass; missing=%+v", parentState, parentMissing)
+	}
+	retryState, retryMissing, err := auditcomplete.Compute(context.Background(), retryID, d)
+	if err != nil {
+		t.Fatalf("Compute(retry): %v", err)
+	}
+	if retryState != stagecheck.StatePass {
+		t.Errorf("retry state = %s, want pass; missing=%+v", retryState, retryMissing)
+	}
+}
+
+func TestRetryChain_AuditComplete_RetryGapsDontInfectParent(t *testing.T) {
+	// Drop the retry's redacted trace entry — the retry's audit story
+	// is now broken, but the parent's is untouched. Compute(parent)
+	// must still pass; Compute(retry) must fail with trace_missing.
+	// This is what proves the per-run scoping actually works: a
+	// regression that read all entries regardless of run_id would
+	// false-positive a pass on the retry (since the parent's traces
+	// are present) AND a false-fail on the parent if the gap-detection
+	// ever leaked across run boundaries.
+	parentID, retryID, runs, arts, ar := retryChainSetup(t)
+	retryImplID := runs.stages[3].ID // see retryChainSetup ordering
+	ar.dropEntry(func(e *audit.Entry) bool {
+		if e.StageID == nil || *e.StageID != retryImplID {
+			return false
+		}
+		if e.Category != "trace_uploaded" {
+			return false
+		}
+		return string(e.Payload) == string(traceVariantPayload("redacted"))
+	})
+
+	d := deps(runs, arts, ar)
+	parentState, parentMissing, err := auditcomplete.Compute(context.Background(), parentID, d)
+	if err != nil {
+		t.Fatalf("Compute(parent): %v", err)
+	}
+	if parentState != stagecheck.StatePass {
+		t.Errorf("parent state = %s, want pass (gap on retry must not infect parent); missing=%+v",
+			parentState, parentMissing)
+	}
+	retryState, retryMissing, err := auditcomplete.Compute(context.Background(), retryID, d)
+	if err != nil {
+		t.Fatalf("Compute(retry): %v", err)
+	}
+	if retryState != stagecheck.StateFail {
+		t.Fatalf("retry state = %s, want fail; missing=%+v", retryState, retryMissing)
+	}
+	if !containsKind(retryMissing, auditcomplete.MissingTrace) {
+		t.Errorf("retry missing should include trace_missing: %+v", retryMissing)
+	}
+}
+
+func TestRetryChain_AuditLogChain_VerifiesAcrossRuns(t *testing.T) {
+	// The per-run chain integrity rule (rule 4 of Compute) MUST hold
+	// for each run in a retry chain. Both parent and retry have
+	// their own chains; both must verify. A regression that broke
+	// linkage between successive entries on either side would surface
+	// here as a chain_invalid missing item.
+	parentID, retryID, runs, arts, ar := retryChainSetup(t)
+	d := deps(runs, arts, ar)
+
+	for _, tc := range []struct {
+		name  string
+		runID uuid.UUID
+	}{
+		{"parent", parentID},
+		{"retry", retryID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state, missing, err := auditcomplete.Compute(context.Background(), tc.runID, d)
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
+			}
+			if state != stagecheck.StatePass {
+				t.Errorf("state = %s, want pass; missing=%+v", state, missing)
+			}
+			if containsKind(missing, auditcomplete.MissingChain) ||
+				containsKind(missing, auditcomplete.MissingChainBroken) {
+				t.Errorf("chain integrity check produced an issue: %+v", missing)
+			}
+		})
+	}
+}
+
 // --- helpers ---
 
 func deps(r *fakeRuns, a *fakeArtifacts, au *fakeAudit) auditcomplete.Deps {
@@ -482,17 +651,26 @@ type fakeAudit struct {
 
 // appendChained mirrors what the real audit.Repository.AppendChained
 // does at the integrity layer: compute the canonical hash, link
-// prev → entry. Tests use this so the synthetic chain is identical
-// in shape to the production one and verifyChain agrees.
+// prev → entry within the run's chain. Per-run scoping mirrors
+// production — each run has its own chain, prev_hash threads only
+// within that run. Tests use this so the synthetic chain is
+// identical in shape to the production one and verifyChain agrees.
 func (f *fakeAudit) appendChained(t *testing.T, runID uuid.UUID, stageID *uuid.UUID, category string, payload json.RawMessage) {
 	t.Helper()
 	if payload == nil {
 		payload = json.RawMessage(`{}`)
 	}
+	// Find the last entry that belongs to THIS run — that's the
+	// prev_hash anchor. Entries on other runs (siblings in a retry
+	// chain, etc.) don't link in.
 	var prev *string
-	if n := len(f.entries); n > 0 {
-		ph := f.entries[n-1].EntryHash
-		prev = &ph
+	for i := len(f.entries) - 1; i >= 0; i-- {
+		e := f.entries[i]
+		if e.RunID != nil && *e.RunID == runID {
+			ph := e.EntryHash
+			prev = &ph
+			break
+		}
 	}
 	r := runID
 	ts := time.Date(2026, 5, 7, 12, 0, int(len(f.entries)), 0, time.UTC)
@@ -522,6 +700,15 @@ func (f *fakeAudit) appendChained(t *testing.T, runID uuid.UUID, stageID *uuid.U
 	})
 }
 
+// appendChainedReset is appendChained's alias; the per-run scoping
+// in appendChained already gives a fresh chain for a new run_id.
+// Kept as a named entry point in tests so the intent ("start a new
+// run's chain") is explicit at the call site.
+func (f *fakeAudit) appendChainedReset(t *testing.T, runID uuid.UUID, stageID *uuid.UUID, category string, payload json.RawMessage) {
+	t.Helper()
+	f.appendChained(t, runID, stageID, category, payload)
+}
+
 func (f *fakeAudit) dropEntry(pred func(*audit.Entry) bool) {
 	out := f.entries[:0]
 	for _, e := range f.entries {
@@ -532,16 +719,31 @@ func (f *fakeAudit) dropEntry(pred func(*audit.Entry) bool) {
 	f.entries = out
 }
 
-func (f *fakeAudit) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit.Entry, error) {
-	return f.entries, nil
-}
-
-func (f *fakeAudit) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
+func (f *fakeAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
 	out := []*audit.Entry{}
 	for _, e := range f.entries {
-		if e.Category == category {
+		// Scope by runID so retry-chain tests (#281) can seed parent
+		// + child chains side by side and have each verifyChain call
+		// see only its own entries. Single-run tests are unaffected:
+		// their entries all carry the one runID, so the filter is a
+		// no-op for them.
+		if e.RunID != nil && *e.RunID == runID {
 			out = append(out, e)
 		}
+	}
+	return out, nil
+}
+
+func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	out := []*audit.Entry{}
+	for _, e := range f.entries {
+		if e.Category != category {
+			continue
+		}
+		if e.RunID != nil && *e.RunID != runID {
+			continue
+		}
+		out = append(out, e)
 	}
 	return out, nil
 }

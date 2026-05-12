@@ -256,6 +256,135 @@ func TestPublish_GitHubError_Returned(t *testing.T) {
 	}
 }
 
+// --- Retry chain (#281 / E16.5) ---
+
+// TestCheckRunPublisher_RetryHeadSHA_PublishesIndependently asserts
+// that publishing audit-complete state for a parent run + a retry
+// run on the same PR (distinct head_shas, as the runner commits
+// fresh each attempt) results in two independent CreateCheckRun
+// calls — one against each head_sha. Branch protection re-evaluates
+// against whatever sha is currently the PR's HEAD; if the publisher
+// ever conflated the two head_shas, GitHub would receive the wrong
+// (or no) signal for the retry's commit and the PR would stay
+// merge-blocked even after the retry succeeded.
+func TestCheckRunPublisher_RetryHeadSHA_PublishesIndependently(t *testing.T) {
+	parentID := uuid.New()
+	retryID := uuid.New()
+	parentImplID := uuid.New()
+	retryImplID := uuid.New()
+	const parentSHA = "p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1"
+	const retrySHA = "r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2"
+
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{
+			parentID: {ID: parentID, Repo: "x/y", InstallationID: int64Ptr(42)},
+			retryID:  {ID: retryID, Repo: "x/y", InstallationID: int64Ptr(42), ParentRunID: &parentID, RetryAttempt: 1},
+		},
+		stages: map[uuid.UUID][]*run.Stage{
+			parentID: {{ID: parentImplID, Type: run.StageTypeImplement, RunID: parentID}},
+			retryID:  {{ID: retryImplID, Type: run.StageTypeImplement, RunID: retryID}},
+		},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		parentImplID: {prArtifact(parentImplID, parentSHA)},
+		retryImplID:  {prArtifact(retryImplID, retrySHA)},
+	}}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if _, err := pub.Publish(context.Background(), parentID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish(parent): %v", err)
+	}
+	if _, err := pub.Publish(context.Background(), retryID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish(retry): %v", err)
+	}
+	if len(gh.calls) != 2 {
+		t.Fatalf("expected 2 CreateCheckRun calls, got %d", len(gh.calls))
+	}
+	// Each call carries its own head_sha — the publisher is keyed
+	// off the implement-stage artifact, not the run's lineage, so
+	// the retry's call must name retrySHA and the parent's must
+	// name parentSHA.
+	if gh.calls[0].params.HeadSHA != parentSHA {
+		t.Errorf("first call head_sha = %q, want %q", gh.calls[0].params.HeadSHA, parentSHA)
+	}
+	if gh.calls[1].params.HeadSHA != retrySHA {
+		t.Errorf("second call head_sha = %q, want %q", gh.calls[1].params.HeadSHA, retrySHA)
+	}
+	// Details URLs route to the correct run page on each call too —
+	// reviewers clicking through from GitHub get the right run.
+	if !strings.Contains(gh.calls[0].params.DetailsURL, parentID.String()) {
+		t.Errorf("parent details_url should reference parent run id: %q", gh.calls[0].params.DetailsURL)
+	}
+	if !strings.Contains(gh.calls[1].params.DetailsURL, retryID.String()) {
+		t.Errorf("retry details_url should reference retry run id: %q", gh.calls[1].params.DetailsURL)
+	}
+}
+
+// TestCheckRunPublisher_DoesNotRepublishParentOnRetry covers the
+// case where a retry exists and the publisher is later invoked
+// again on the *parent* run — e.g. an audit-log read triggers a
+// re-compute on the parent for some reason. The publisher must
+// still post against the parent's own head_sha rather than trying
+// to be clever about "latest on PR." If it tried to publish the
+// retry's sha for the parent's run id, the details_url would point
+// at the wrong run page and reviewers chasing the GitHub link
+// would see mismatched audit context.
+func TestCheckRunPublisher_DoesNotRepublishParentOnRetry(t *testing.T) {
+	parentID := uuid.New()
+	retryID := uuid.New()
+	parentImplID := uuid.New()
+	retryImplID := uuid.New()
+	const parentSHA = "p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1"
+	const retrySHA = "r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2r2"
+
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{
+			parentID: {ID: parentID, Repo: "x/y", InstallationID: int64Ptr(42)},
+			retryID:  {ID: retryID, Repo: "x/y", InstallationID: int64Ptr(42), ParentRunID: &parentID, RetryAttempt: 1},
+		},
+		stages: map[uuid.UUID][]*run.Stage{
+			parentID: {{ID: parentImplID, Type: run.StageTypeImplement, RunID: parentID}},
+			retryID:  {{ID: retryImplID, Type: run.StageTypeImplement, RunID: retryID}},
+		},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		parentImplID: {prArtifact(parentImplID, parentSHA)},
+		retryImplID:  {prArtifact(retryImplID, retrySHA)},
+	}}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	// Publish retry first — simulates the most-recent retry
+	// finishing and being audit-complete.
+	if _, err := pub.Publish(context.Background(), retryID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish(retry): %v", err)
+	}
+	// Now publish parent — a second audit read on the older run
+	// must still route through parent's own head_sha.
+	if _, err := pub.Publish(context.Background(), parentID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish(parent): %v", err)
+	}
+	if len(gh.calls) != 2 {
+		t.Fatalf("expected 2 CreateCheckRun calls; got %d", len(gh.calls))
+	}
+	// First call (retry) used retrySHA; second call (parent) must
+	// use parentSHA — the publisher reads the artifact for the run
+	// being published, not whichever was most recently published.
+	if gh.calls[0].params.HeadSHA != retrySHA {
+		t.Errorf("first call (retry) head_sha = %q, want %q", gh.calls[0].params.HeadSHA, retrySHA)
+	}
+	if gh.calls[1].params.HeadSHA != parentSHA {
+		t.Errorf("second call (parent) head_sha = %q, want %q", gh.calls[1].params.HeadSHA, parentSHA)
+	}
+}
+
 func TestNew_NilDepsReturnsNilPublisher(t *testing.T) {
 	cases := []struct {
 		name string
