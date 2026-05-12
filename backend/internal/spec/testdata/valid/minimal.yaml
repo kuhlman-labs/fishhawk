@@ -2,7 +2,7 @@
 # gates, no constraints. Useful as a regression baseline that
 # nothing about the parser regressed for the bare-bones case.
 
-version: "0.2"
+version: "0.3"
 
 workflows:
   trivial:

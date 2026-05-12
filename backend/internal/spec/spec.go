@@ -37,9 +37,31 @@ type Role struct {
 // Workflow is one named pipeline (e.g. "feature_change") with an
 // ordered list of stages.
 type Workflow struct {
-	Description string  `json:"description,omitempty" yaml:"description,omitempty"`
-	Stages      []Stage `json:"stages" yaml:"stages"`
+	Description string       `json:"description,omitempty" yaml:"description,omitempty"`
+	Stages      []Stage      `json:"stages" yaml:"stages"`
+	OnCIFailure *OnCIFailure `json:"on_ci_failure,omitempty" yaml:"on_ci_failure,omitempty"`
 }
+
+// OnCIFailure is the per-workflow auto-retry policy (#276 / #277).
+// When set, the dispatcher fires a fresh implement workflow_dispatch
+// on a required-check failure (#251 / branch protection snapshot)
+// up to MaxRetries times, chaining each retry via `parent_run_id`.
+//
+// Nil-vs-zero distinction matters: a nil pointer means the workflow
+// doesn't declare a policy at all (use the documented default of 1
+// retry — `DefaultMaxRetries`). An explicit `max_retries: 0` is the
+// opt-out signal — useful for low-autonomy workflows that prefer a
+// human re-trigger. The consumer (dispatcher) reads MaxRetries
+// directly when the pointer is non-nil; resolves to
+// DefaultMaxRetries otherwise.
+type OnCIFailure struct {
+	MaxRetries int `json:"max_retries,omitempty" yaml:"max_retries,omitempty"`
+}
+
+// DefaultMaxRetries is the value the dispatcher uses when a
+// workflow doesn't declare an `on_ci_failure` block. Centralized
+// here so the consumer side has a single source of truth.
+const DefaultMaxRetries = 1
 
 // Stage is one unit of work in a workflow. The closed set of types
 // (plan / implement / review) is enforced by the schema.

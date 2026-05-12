@@ -2,7 +2,7 @@
 # Used as a regression fixture: any change to the parser must keep
 # this example parseable end-to-end.
 
-version: "0.2"
+version: "0.3"
 
 roles:
   tech_lead:

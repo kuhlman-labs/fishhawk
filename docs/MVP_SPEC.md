@@ -88,7 +88,7 @@ Lives in the customer's repo at `.fishhawk/workflows.yaml`. Declarative YAML. Ve
 ### 4.2 Workflow spec example (canonical reference)
 
 ```yaml
-version: "0.2"
+version: "0.3"
 
 roles:
   tech_lead:

@@ -9,7 +9,7 @@ import (
 )
 
 const validSpec = `
-version: "0.2"
+version: "0.3"
 roles:
   tech_lead:
     members: ["@org/tech-leads"]
@@ -57,7 +57,7 @@ func TestValidateBytes_MalformedYAML(t *testing.T) {
 
 func TestValidateBytes_MissingRequiredFields(t *testing.T) {
 	// Missing `version` (required at the top level).
-	noVersion := strings.Replace(validSpec, `version: "0.2"`, "", 1)
+	noVersion := strings.Replace(validSpec, `version: "0.3"`, "", 1)
 	err := spec.ValidateBytes([]byte(noVersion))
 	var ve *spec.ValidationError
 	if !errors.As(err, &ve) {
