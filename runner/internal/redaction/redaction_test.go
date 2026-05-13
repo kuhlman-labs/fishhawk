@@ -35,6 +35,7 @@ func TestDefaultPatterns_PositiveCases(t *testing.T) {
 		{"openai-project-key", "sk-proj-" + strings.Repeat("A", 50)},
 		{"anthropic-api-key", "sk-ant-api03-" + strings.Repeat("A", 50)},
 		{"aws-access-key-id", "AKIAABCDEFGHIJKLMNOP"},
+		{"npm-publish-token", "npm_" + strings.Repeat("a", 36)},
 		{"authorization-bearer", "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"},
 		{"json-password-field", `"password": "swordfish"`},
 		{"json-password-field", `"api_key": "abc123"`},
@@ -68,6 +69,7 @@ func TestDefaultPatterns_NegativeCases(t *testing.T) {
 		`"username": "alice"`,                   // not a redaction-tier field
 		"github_pat_" + strings.Repeat("a", 80), // fine-grained PAT requires 82, not 80
 		"akia0123456789abcdef",                  // lowercase doesn't match aws-access-key-id
+		"npm_short",                             // too few trailing chars for npm-publish-token
 	}
 	for _, sample := range cases {
 		t.Run(sample[:min(30, len(sample))], func(t *testing.T) {
