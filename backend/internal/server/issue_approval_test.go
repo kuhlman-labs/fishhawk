@@ -88,8 +88,14 @@ func TestHandleApprovalCommand_PlanApprove_PostsOnlyBroadcast(t *testing.T) {
 	if !strings.Contains(got[0].body, "Plan approved by") {
 		t.Errorf("broadcast should announce plan approval: %q", got[0].body)
 	}
-	if !strings.Contains(got[0].body, "`@alice`") {
+	if !strings.Contains(got[0].body, "@alice") {
 		t.Errorf("plan-approved broadcast should mention approver: %q", got[0].body)
+	}
+	// Regression guard for #305: the @login must NOT be wrapped in
+	// backticks — GitHub only fires a mention notification when the
+	// handle is bare.
+	if strings.Contains(got[0].body, "`@") {
+		t.Errorf("plan-approved broadcast must not backtick-wrap the @mention (breaks GitHub notification): %q", got[0].body)
 	}
 }
 
