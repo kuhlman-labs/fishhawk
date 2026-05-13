@@ -77,6 +77,7 @@ func (f *fakeApprovalRepo) ListForStage(_ context.Context, stageID uuid.UUID) ([
 type approvalRunRepo struct {
 	mu             sync.Mutex
 	stages         map[uuid.UUID]*run.Stage
+	runs           map[uuid.UUID]*run.Run
 	getErr         error
 	transitionErr  error
 	transitions    []approvalTransition
@@ -90,7 +91,19 @@ type approvalTransition struct {
 }
 
 func newApprovalRunRepo() *approvalRunRepo {
-	return &approvalRunRepo{stages: map[uuid.UUID]*run.Stage{}}
+	return &approvalRunRepo{
+		stages: map[uuid.UUID]*run.Stage{},
+		runs:   map[uuid.UUID]*run.Run{},
+	}
+}
+
+// seedRun lets tests stand up a *run.Run keyed by id so GetRun can
+// surface it. Used by the ADR-018 prune tests to confirm the 409
+// body includes the PR URL when one is stamped on the row.
+func (r *approvalRunRepo) seedRun(runRow *run.Run) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.runs[runRow.ID] = runRow
 }
 
 func (r *approvalRunRepo) seedStage(state run.StageState) *run.Stage {
@@ -124,6 +137,18 @@ func (r *approvalRunRepo) seedGatelessStage(state run.StageState) *run.Stage {
 	r.mu.Lock()
 	st.RequiresApproval = false
 	st.Type = run.StageTypeImplement
+	r.mu.Unlock()
+	return st
+}
+
+// seedReviewStage seeds a review-type stage in awaiting_approval.
+// ADR-018 / #313: review-stage approval moved to GitHub, so the
+// in-Fishhawk approval API refuses these stages. Tests use this
+// helper to exercise the new 409 path.
+func (r *approvalRunRepo) seedReviewStage() *run.Stage {
+	st := r.seedStage(run.StageStateAwaitingApproval)
+	r.mu.Lock()
+	st.Type = run.StageTypeReview
 	r.mu.Unlock()
 	return st
 }
@@ -173,8 +198,13 @@ func (r *approvalRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to ru
 func (r *approvalRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
-func (r *approvalRunRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
-	return nil, errors.New("not used")
+func (r *approvalRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rn, ok := r.runs[id]; ok {
+		return rn, nil
+	}
+	return nil, run.ErrNotFound
 }
 func (r *approvalRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
 	return nil, run.ErrNotFound
@@ -423,6 +453,68 @@ func TestSubmitApproval_Idempotent_SameApprover(t *testing.T) {
 	}
 	if len(au.appended) != 1 {
 		t.Errorf("audit = %d, want 1 (no second audit on idempotent submit)", len(au.appended))
+	}
+}
+
+func TestSubmitApproval_ReviewStage_Refused(t *testing.T) {
+	// ADR-018 / #313: the in-Fishhawk approval API rejects review-
+	// stage submissions and points the caller at the PR. Plan-stage
+	// approvals are unaffected (covered by TestSubmitApproval_Approve_AdvancesStage).
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedReviewStage()
+	prURL := "https://github.com/x/y/pull/42"
+	rr.seedRun(&run.Run{ID: stage.RunID, PullRequestURL: &prURL})
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"review_stage_managed_by_github"`) {
+		t.Errorf("error code missing: %s", body)
+	}
+	if !strings.Contains(body, prURL) {
+		t.Errorf("body should include the PR URL: %s", body)
+	}
+	// No stage transition + no audit row — the prune is purely a
+	// guard that runs before submit.
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 (refused before submit)", len(rr.transitions))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit rows = %d, want 0 (refused before submit)", len(au.appended))
+	}
+}
+
+func TestSubmitApproval_ReviewStage_RefusesRejectToo(t *testing.T) {
+	// Reject submissions against review stages are refused the same
+	// way as approves — the surface is gone, not the verb.
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedReviewStage()
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"review_stage_managed_by_github"`) {
+		t.Errorf("error code missing: %s", w.Body.String())
+	}
+}
+
+func TestSubmitApproval_ReviewStage_RefusesEvenWithoutPRURL(t *testing.T) {
+	// When the run row has no PullRequestURL stamped (legacy or
+	// pre-PR-open state), the 409 still fires — the body just
+	// omits the PR URL detail.
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedReviewStage()
+	// Intentionally not seeding the run row; GetRun returns ErrNotFound.
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"review_stage_managed_by_github"`) {
+		t.Errorf("error code missing: %s", w.Body.String())
 	}
 }
 

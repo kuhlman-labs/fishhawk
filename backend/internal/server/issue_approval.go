@@ -70,6 +70,16 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 
+	// ADR-018 (#311, #313): review-stage approval is owned by GitHub.
+	// The PR merge event (#312) advances the stage; branch protection's
+	// required-reviewers enforces the approver list. Reply with a help
+	// message pointing at the PR rather than submitting an approval.
+	// Plan-stage slash approvals continue to work.
+	if stage.Type == run.StageTypeReview {
+		s.replyApproval(ctx, p, reviewStageHelpReply(runRow, subject))
+		return nil
+	}
+
 	if msg, allowed := s.authorizeSlashApprover(ctx, stage, subject); !allowed {
 		s.replyApproval(ctx, p, msg)
 		return nil
@@ -309,6 +319,19 @@ func decodeMatchAction(a webhook.MatchAction) (approval.Decision, bool) {
 		return approval.DecisionReject, true
 	}
 	return "", false
+}
+
+// reviewStageHelpReply is the slash-approval response when the
+// reviewer targets a review stage. ADR-018 / #313 moved review-
+// stage approval onto GitHub; the help text points at the PR
+// (when the run row has one stamped) so the reviewer's next action
+// is one click away.
+func reviewStageHelpReply(runRow *run.Run, subject string) string {
+	if runRow != nil && runRow.PullRequestURL != nil && *runRow.PullRequestURL != "" {
+		return fmt.Sprintf("Review-stage approval is recorded from GitHub's PR surface. Approve or merge the PR to advance the stage: %s (caller: @%s)",
+			*runRow.PullRequestURL, subject)
+	}
+	return fmt.Sprintf("Review-stage approval is recorded from GitHub's PR surface — approve or merge the PR to advance the stage. (Caller: @%s)", subject)
 }
 
 // formatSuccessReply renders the celebratory reply on approve /

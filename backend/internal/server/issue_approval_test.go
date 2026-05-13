@@ -109,7 +109,10 @@ func TestHandleApprovalCommand_Reject_FailsStageAndReplies(t *testing.T) {
 	r.Repo = "x/y"
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
-	stage.Type = run.StageTypeReview
+	// Plan stage — review-stage rejects are refused on the slash path
+	// per ADR-018 / #313 (covered by TestHandleApprovalCommand_ReviewStage_RejectAlsoRefused).
+	// This test pins the reject end-to-end for plan stages.
+	stage.Type = run.StageTypePlan
 
 	ar := newFakeApprovalRepo()
 	au := newAuditCompleteAuditFake()
@@ -202,6 +205,108 @@ func TestHandleApprovalCommand_PlanReject_StillPostsSlashReply(t *testing.T) {
 	}
 }
 
+func TestHandleApprovalCommand_ReviewStage_PostsHelpReply(t *testing.T) {
+	// ADR-018 / #313: review-stage approval moved to GitHub.
+	// `/fishhawk approve` against a review stage replies with a
+	// help message that names the PR; no approval row written,
+	// no stage transition.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+	prURL := "https://github.com/x/y/pull/42"
+	r.PullRequestURL = &prURL
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypeReview
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No approval recorded — the prune runs before submit.
+	if len(ar.all) != 0 {
+		t.Errorf("approval should not be recorded; got %+v", ar.all)
+	}
+	// Stage stays awaiting_approval.
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", stage.State)
+	}
+	// Help reply posted with the PR URL.
+	calls := gh.calls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 reply; got %d", len(calls))
+	}
+	body := calls[0].body
+	if !strings.Contains(body, "Review-stage approval is recorded from GitHub's PR surface") {
+		t.Errorf("reply body should explain the GitHub-side move: %q", body)
+	}
+	if !strings.Contains(body, prURL) {
+		t.Errorf("reply body should include PR URL: %q", body)
+	}
+}
+
+func TestHandleApprovalCommand_ReviewStage_RejectAlsoRefused(t *testing.T) {
+	// Reject command targeting a review stage gets the same help
+	// reply. The surface is gone, not the verb.
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypeReview
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au, ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionReject,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approval should not be recorded; got %+v", ar.all)
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", stage.State)
+	}
+	body := gh.calls()[0].body
+	if !strings.Contains(body, "Review-stage approval is recorded from GitHub's PR surface") {
+		t.Errorf("reject reply should also explain the move: %q", body)
+	}
+}
+
 func TestHandleApprovalCommand_NoAwaitingStage_RepliesAndSkips(t *testing.T) {
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
@@ -256,7 +361,11 @@ func TestHandleApprovalCommand_ApproveSucceedsRegardlessOfCheckState(t *testing.
 	r.Repo = "x/y"
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
-	stage.Type = run.StageTypeReview
+	// Plan stage — review-stage slash approvals are refused per
+	// ADR-018 / #313. This test pins the ADR-017 "approve despite
+	// failing check" contract for the plan-stage path; the
+	// review-stage equivalent moved to GitHub's PR surface.
+	stage.Type = run.StageTypePlan
 	stage.Gate = &run.Gate{
 		Kind: run.GateKindApproval,
 	}
