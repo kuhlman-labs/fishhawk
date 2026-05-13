@@ -28,6 +28,7 @@
     "issues",
     "issue_comment",
     "pull_request",
+    "pull_request_review",
     "push",
     "workflow_run",
     "check_run",

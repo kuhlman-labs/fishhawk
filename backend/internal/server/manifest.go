@@ -239,6 +239,12 @@ func buildManifest(backendURL, webhookURL, name string) map[string]any {
 			"issues",
 			"issue_comment",
 			"pull_request",
+			// ADR-018 / #312: review-stage success signal comes
+			// from PR-side events. The merge transition flows
+			// through `pull_request.closed` (already subscribed
+			// above); approver/reviewer actions feed the audit
+			// log via `pull_request_review.submitted`.
+			"pull_request_review",
 			"push",
 			"workflow_run",
 			"check_run",
