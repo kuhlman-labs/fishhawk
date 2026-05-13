@@ -235,4 +235,53 @@ describe('<PolicySection>', () => {
     });
     expect(screen.getByText(/git_diff/i)).toBeInTheDocument();
   });
+
+  it('renders the deferred-outcomes note when payload.deferred_outcomes is set (#297)', async () => {
+    // ci_green is deferred to branch protection at trace-upload time
+    // (CI hasn't started yet on the just-opened PR). The pass-state
+    // header renders; the deferral is called out inline as a neutral
+    // info row so the reviewer sees where the gate actually lives.
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        policyEntry({
+          stage_type: 'implement',
+          passed: true,
+          violations: [],
+          diff: [{ path: 'a.go', status: 'M' }],
+          applied_constraints: {
+            required_outcomes: ['tests_added_or_updated', 'ci_green'],
+          },
+          deferred_outcomes: ['ci_green'],
+        }),
+      ],
+      next_cursor: null,
+    });
+    render(<PolicySection runId={RUN_ID} stageId={STAGE_ID} />);
+    await waitFor(() => {
+      expect(screen.getByText(/policy passed/i)).toBeInTheDocument();
+    });
+    const note = screen.getByTestId('policy-deferred-outcomes');
+    expect(note).toHaveTextContent(/Deferred to branch protection/i);
+    expect(note).toHaveTextContent('ci_green');
+  });
+
+  it('does not render the deferred-outcomes note when the list is empty', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        policyEntry({
+          passed: true,
+          violations: [],
+          diff: [{ path: 'a.go', status: 'M' }],
+          applied_constraints: { required_outcomes: ['tests_added_or_updated'] },
+          deferred_outcomes: [],
+        }),
+      ],
+      next_cursor: null,
+    });
+    render(<PolicySection runId={RUN_ID} stageId={STAGE_ID} />);
+    await waitFor(() => {
+      expect(screen.getByText(/policy passed/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('policy-deferred-outcomes')).not.toBeInTheDocument();
+  });
 });

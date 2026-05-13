@@ -176,12 +176,56 @@ func TestRequiredOutcomes_DeletedTestFileDoesntCount(t *testing.T) {
 	}
 }
 
-func TestRequiredOutcomes_CIGreen_NoSignal(t *testing.T) {
-	v := Evaluate(diff("a.go"), Constraints{RequiredOutcomes: []string{"ci_green"}})
-	if len(v) != 1 || !strings.Contains(v[0].Detail, "no signal") {
-		t.Errorf("expected no-signal violation, got %+v", v)
+func TestRequiredOutcomes_CIGreen_NoSignal_Defers(t *testing.T) {
+	// Pre-#297 a nil CIGreen produced a "no signal available"
+	// violation. That false-positive fired on every Fishhawk-managed
+	// PR because trace upload happens before CI runs. The new
+	// behavior defers to branch protection: no violation, the outcome
+	// is recorded in DeferredRequiredOutcomes instead.
+	c := Constraints{RequiredOutcomes: []string{"ci_green"}}
+	v := Evaluate(diff("a.go"), c)
+	if len(v) != 0 {
+		t.Errorf("expected no violation for ci_green when signal is nil, got %+v", v)
+	}
+	got := DeferredRequiredOutcomes(c)
+	if len(got) != 1 || got[0] != "ci_green" {
+		t.Errorf("expected DeferredRequiredOutcomes = [ci_green], got %+v", got)
 	}
 }
+
+func TestDeferredRequiredOutcomes_OnlyDefersCIGreenWhenSignalAbsent(t *testing.T) {
+	// Other outcomes are never deferred: tests_added_or_updated is
+	// always evaluable against the diff at upload time. ci_green
+	// only defers when the signal is nil — once the signal is
+	// populated (future re-eval path) it evaluates normally.
+	cases := []struct {
+		name string
+		c    Constraints
+		want []string
+	}{
+		{"no required outcomes", Constraints{}, nil},
+		{"tests_added_or_updated only", Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}}, nil},
+		{"ci_green with nil signal", Constraints{RequiredOutcomes: []string{"ci_green"}}, []string{"ci_green"}},
+		{"ci_green with true signal", Constraints{RequiredOutcomes: []string{"ci_green"}, CIGreen: ptrBool(true)}, nil},
+		{"ci_green with false signal", Constraints{RequiredOutcomes: []string{"ci_green"}, CIGreen: ptrBool(false)}, nil},
+		{"both outcomes, ci_green nil", Constraints{RequiredOutcomes: []string{"tests_added_or_updated", "ci_green"}}, []string{"ci_green"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := DeferredRequiredOutcomes(tc.c)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+			for i, w := range tc.want {
+				if got[i] != w {
+					t.Errorf("got[%d] = %q, want %q", i, got[i], w)
+				}
+			}
+		})
+	}
+}
+
+func ptrBool(b bool) *bool { return &b }
 
 func TestRequiredOutcomes_CIGreen_True(t *testing.T) {
 	green := true

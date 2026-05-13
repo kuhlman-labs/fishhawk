@@ -36,6 +36,14 @@ type EvaluationPayload struct {
 	Passed     bool        `json:"passed"`
 	SkipReason SkipReason  `json:"skip_reason,omitempty"`
 	SkipDetail string      `json:"skip_detail,omitempty"`
+	// DeferredOutcomes names required_outcomes that evaluation
+	// declined to assert on because no signal was available at
+	// evaluation time (#297). At trace-upload time the only entry
+	// here is `ci_green`: CI hasn't started against the just-opened
+	// PR, so branch protection (#251 / ADR-017) is the actual gate
+	// at merge time. The SPA renders this as an info note next to
+	// the pass state. Omitted when nothing was deferred.
+	DeferredOutcomes []string `json:"deferred_outcomes,omitempty"`
 }
 
 // SkipReason names why a policy evaluation couldn't be carried out.
@@ -109,11 +117,12 @@ func EmitEvaluation(
 	}
 
 	payload, err := json.Marshal(EvaluationPayload{
-		StageType:  stageType,
-		Diff:       entries,
-		Applied:    constraints,
-		Violations: append([]Violation(nil), violations...),
-		Passed:     len(violations) == 0,
+		StageType:        stageType,
+		Diff:             entries,
+		Applied:          constraints,
+		Violations:       append([]Violation(nil), violations...),
+		Passed:           len(violations) == 0,
+		DeferredOutcomes: DeferredRequiredOutcomes(constraints),
 	})
 	if err != nil {
 		return violations, fmt.Errorf("policy: marshal audit payload: %w", err)

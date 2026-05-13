@@ -214,15 +214,28 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violat
 				})
 			}
 		case "ci_green":
-			// Same semantics as the runner: nil signal records the
-			// gap honestly rather than passing silently. The
-			// orchestrator can re-evaluate once the CI signal lands.
+			// Branch protection (ADR-017 / #251) is the source of
+			// truth for CI completion at merge time: the required-
+			// status-checks snapshot on the run row enumerates the
+			// contexts the PR must pass, and GitHub itself blocks
+			// the merge until they're green. The policy engine
+			// evaluates at trace-upload time — before CI has even
+			// started on the just-opened PR — so the only signal
+			// available is nil. Pre-#297 we emitted a violation in
+			// that case, which made every Fishhawk-managed PR fail
+			// `fishhawk_audit_complete` on a false-positive.
+			//
+			// Now: a nil signal at evaluation time defers the
+			// outcome to branch protection. DeferredRequiredOutcomes
+			// surfaces the same list to the audit payload (#297) so
+			// the SPA can render a note ("ci_green deferred to
+			// branch protection"). A non-nil-and-false signal still
+			// fails — preserves correctness for a future code path
+			// that re-evaluates after CI lands.
 			if ciGreen == nil {
-				v = append(v, Violation{
-					Constraint: "required_outcomes",
-					Detail:     "ci_green required but no signal available",
-				})
-			} else if !*ciGreen {
+				continue
+			}
+			if !*ciGreen {
 				v = append(v, Violation{
 					Constraint: "required_outcomes",
 					Detail:     "ci is not green",
@@ -238,6 +251,27 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violat
 		}
 	}
 	return v
+}
+
+// DeferredRequiredOutcomes returns the names of required_outcomes
+// whose evaluation was skipped because no signal was available at
+// evaluation time (#297). At trace-upload time the only deferrable
+// outcome is `ci_green`: CI hasn't run on the just-opened PR yet,
+// so branch protection (#251 / ADR-017) is the actual gate at
+// merge time. Returns an empty slice when nothing was deferred.
+//
+// Callers persist this list in the policy_evaluated audit payload
+// so reviewers can see which outcomes the policy engine declined
+// to assert on. The SPA renders the list as an info note next to
+// the pass state.
+func DeferredRequiredOutcomes(c Constraints) []string {
+	var out []string
+	for _, o := range c.RequiredOutcomes {
+		if o == "ci_green" && c.CIGreen == nil {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 func diffTouchesTests(diff Diff) bool {
