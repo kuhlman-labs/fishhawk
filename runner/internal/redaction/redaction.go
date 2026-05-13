@@ -91,6 +91,10 @@ var DefaultPatterns = []Pattern{
 		Regex: regexp.MustCompile(`(?i)authorization:\s*bearer\s+[A-Za-z0-9_\-\.~+/=]+`),
 	},
 	{
+		Name:  "npm-publish-token",
+		Regex: regexp.MustCompile(`npm_[A-Za-z0-9]{36}`),
+	},
+	{
 		Name: "json-password-field",
 		// Matches "password": "anything-not-quote", "secret": "...",
 		// "token": "...", "api_key": "...", "apikey": "...",
