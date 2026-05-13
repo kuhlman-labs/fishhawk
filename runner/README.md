@@ -17,7 +17,7 @@ Tag prefix `runner/v…` follows the Go module convention for non-root modules i
 - `internal/bundle/` — `*.jsonl.gz` trace bundle pack/unpack per ADR-007 (#71).
 - `internal/plan/` — plan-artifact validator against `standard_v1` (E1.5 schema; embedded copy under `schemas/`).
 - `internal/constraint/` — workflow-spec constraint evaluator (`forbidden_paths`, `allowed_paths`, `max_files_changed`, `required_outcomes`).
-- `internal/gitdiff/` — thin shim around `git diff --name-status -z` producing a `constraint.Diff`.
+- `internal/gitdiff/` — thin shim around `git diff --cached --name-status -z <base>` producing a `constraint.Diff`. Compares <base>'s tree to the index, so the caller must stage everything with `git add -A` first (the runner's `computeAndEmitDiff` does this). Pre-#296 the form was `<base>...HEAD` and silently produced empty diffs when the agent's edits weren't committed yet.
 - `internal/upload/` — HTTP client for the backend's signing-key + trace endpoints; signs the bundle and POSTs.
 - `internal/version/` — build-version package; set via `-ldflags` at release time.
 

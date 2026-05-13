@@ -1,12 +1,19 @@
 // Package gitdiff produces a constraint.Diff from a git working
-// tree by running `git diff --name-status <baseRef>...HEAD`. It's
+// tree by running `git diff --cached --name-status <baseRef>`. It's
 // a thin shim around os/exec so the constraint package itself
 // stays pure and testable without touching real git state.
 //
-// The runner calls this after the agent finishes editing files
-// (typically: agent commits to a branch, runner runs gitdiff
-// against the merge-base with the workflow base ref, evaluates
-// constraints).
+// `--cached <base>` compares <base>'s tree to the index — so the
+// caller is responsible for staging everything the diff should
+// see (typically `git add -A` after the agent finishes). Staging
+// is what lets a new (untracked) file appear in the diff at all;
+// `git diff <base>` against the working tree silently skips
+// untracked files. The runner stages with `git add -A` in
+// `computeAndEmitDiff` (#296 / E16 demo loop). Pre-#296 the form
+// was `<base>...HEAD` which only saw COMMITTED changes; agents
+// leaving edits unstaged produced empty diff events that silently
+// failed every `tests_added_or_updated` and `max_files_changed`
+// constraint at the backend's policy re-evaluation step.
 package gitdiff
 
 import (
@@ -34,12 +41,11 @@ type Runner struct {
 //
 // baseRef is the ref the stage's changes should be measured
 // against (typically the workflow base branch); repoDir is the
-// git working directory the agent edited.
-//
-// The form `<base>...HEAD` (three-dot) gives the diff at the
-// merge base, which is what the workflow author intends — changes
-// the stage actually introduced, not unrelated commits on the base
-// branch.
+// git working directory the agent edited. The caller is expected
+// to have staged any agent-produced changes (`git add -A`) before
+// calling Run — `--cached <base>` compares <base> to the index,
+// which is the only form that reliably captures both modified
+// and freshly-created files. See the package doc for why.
 func (r *Runner) Run(ctx context.Context, baseRef, repoDir string) (constraint.Diff, error) {
 	if baseRef == "" {
 		return constraint.Diff{}, fmt.Errorf("gitdiff: baseRef required")
@@ -57,7 +63,7 @@ func (r *Runner) Run(ctx context.Context, baseRef, repoDir string) (constraint.D
 		cmdFn = exec.CommandContext
 	}
 
-	args := []string{"diff", "--name-status", "-z", fmt.Sprintf("%s...HEAD", baseRef)}
+	args := []string{"diff", "--cached", "--name-status", "-z", baseRef}
 	cmd := cmdFn(ctx, binary, args...)
 	cmd.Dir = repoDir
 
