@@ -1,62 +1,54 @@
-import { FileClock } from 'lucide-react';
-import { Link } from 'react-router';
+import { CheckCircle2, ExternalLink, GitMerge, MessageSquare, ShieldAlert } from 'lucide-react';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import type { PullRequestArtifactBody } from '@/api/pull-request';
-import type { Stage } from '@/api/types';
-import { ApprovalPanel } from '@/plan/approval-panel';
+import type { AuditEntry, Stage } from '@/api/types';
 import { Section } from '@/plan/sections';
 import { PullRequestSummary } from '@/pull-request/pr-summary';
 import { StageStateBadge } from '@/components/stage-state-badge';
 import { RequiredChecksPanel, type RequiredCheck } from '@/components/required-checks-panel';
 
 /*
- * Review-stage detail (#213). Composition:
+ * Review-stage detail (#213, ADR-018 / #314). Composition:
  *
  *   - Header: stage state badge, "Review · pull request" eyebrow,
- *     h1, ApprovalPanel (gated stages only) or audit-log link.
- *   - PullRequestSummary: shared with the implement page, fed the
- *     implement stage's pull_request artifact.
- *   - RequiredChecksPanel (renamed from BlockingChecksPanel in #256):
- *     lists the run's required checks with their live observed state
- *     (#228). Both the declared list and the source attribution
- *     ("Required by branch protection" / "+ N rulesets") come from
- *     GET /v0/stages/{id}/checks, sourced from the run's branch-
- *     protection snapshot (#251). Informational only as of #253 /
- *     ADR-017 — the approve button no longer waits on check state;
- *     GitHub branch protection blocks the merge until the required
- *     checks (which include fishhawk_audit_complete, published as a
- *     Check Run per #231) report green. Declared-but-not-observed
- *     entries fill as `not_tracked` so the panel shows the full gate.
- *   - Approvers list: shown only for approval-typed gates.
+ *     h1, and a "View on GitHub" affordance linking to the PR. The
+ *     reviewer's next action lives on GitHub now — branch
+ *     protection's required-reviewers is the approver gate, the
+ *     PR merge is the success signal (ADR-018 / #311).
+ *   - PullRequestSummary: shared with the implement page.
+ *   - RequiredChecksPanel: live observed state of the run's
+ *     required checks (#228, #251). Informational — branch
+ *     protection enforces the merge gate.
+ *   - Activity: chronological list of PR-side events ingested via
+ *     the audit log (#312). Surfaces "@x approved", "@y requested
+ *     changes", "@z merged" so reviewers see the same set of facts
+ *     from the SPA as from the PR conversation.
+ *   - Approvers list: informational for review stages (ADR-018);
+ *     branch protection's required-reviewers is the actual gate.
  *
- * For check-only review gates (e.g. routine_change.workflows.yaml),
- * ApprovalPanel is suppressed — there's no human action; the gate
- * clears automatically when checks pass.
+ * The pre-#314 ApprovalPanel is gone — review-stage approval moved
+ * to GitHub. Plan-stage approvals still use the SPA's
+ * ApprovalPanel via the plan document, untouched by this change.
  */
 
 interface Props {
   artifact: PullRequestArtifactBody;
   stage: Stage;
   runId: string;
-  onStageUpdate: (next: Stage) => void;
-  onStageRollback: (prev: Stage) => void;
+  // onStageUpdate / onStageRollback were part of the pre-#314
+  // approval-flow callback contract. They're now unused — the
+  // stage transitions on the merge webhook, not via SPA-driven
+  // approval. The parent route still passes them; we accept and
+  // ignore so the prop surface stays stable for callers.
+  onStageUpdate?: (next: Stage) => void;
+  onStageRollback?: (prev: Stage) => void;
 }
 
-export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageRollback }: Props) {
+export function ReviewDocument({ artifact, stage, runId }: Props) {
   const gate = stage.gate;
   const isApprovalGate = gate?.type === 'approval';
-  const showApprovalPanel = isApprovalGate && stage.state === 'awaiting_approval';
 
-  // Live check states (#228). Declared list, sources, and observed
-  // states all come from /v0/stages/{id}/checks: post-#254 the
-  // declared names live on the run's branch-protection snapshot
-  // (#251), not the spec. Sources name which surfaces contributed
-  // (`branch_protection`, `ruleset:<id>`) so the panel can render
-  // a "Required by branch protection" attribution sub-label (#256).
-  // Falls back to an empty list when the endpoint is 503 (legacy
-  // deployments without check ingestion) or the request is in
-  // flight.
   const checksResult = useAsync(() => api.listStageChecks(stage.id), [stage.id]);
   const checks = mergeRequiredChecks(checksResult);
   const sources = checksResult.status === 'ok' ? (checksResult.data.sources ?? []) : [];
@@ -71,22 +63,15 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
             <StageStateBadge state={stage.state} />
           </div>
         </div>
-        {showApprovalPanel ? (
-          <ApprovalPanel
-            stage={stage}
-            runId={runId}
-            onUpdate={onStageUpdate}
-            onRollback={onStageRollback}
-          />
-        ) : (
-          <Link
-            to={`/runs/${runId}#audit`}
-            className="inline-flex items-center gap-1 self-start text-xs text-neutral-500 hover:underline"
-          >
-            <FileClock className="size-3.5" aria-hidden />
-            View audit log
-          </Link>
-        )}
+        <a
+          href={artifact.pr_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 self-start rounded-md border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 focus-visible:ring-1 focus-visible:ring-neutral-400 focus-visible:outline-none dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-900/50"
+        >
+          <ExternalLink className="size-3.5" aria-hidden />
+          View on GitHub
+        </a>
       </header>
 
       <PullRequestSummary artifact={artifact} />
@@ -95,8 +80,12 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
         <RequiredChecksPanel checks={checks} sources={sources} />
       </Section>
 
+      <Section id="activity" title="Activity">
+        <ReviewActivityPanel runId={runId} stageId={stage.id} />
+      </Section>
+
       {isApprovalGate && gate?.approvers && (
-        <Section id="approvers" title="Approvers">
+        <Section id="approvers" title="Approvers (informational)">
           <ApproversBlock approvers={gate.approvers} />
         </Section>
       )}
@@ -106,10 +95,6 @@ export function ReviewDocument({ artifact, stage, runId, onStageUpdate, onStageR
 
 interface ChecksResponse {
   declared: string[];
-  // sources records which surfaces contributed to `declared` (one
-  // or both of `branch_protection`, `ruleset:<id>`). Optional so
-  // legacy backends that pre-date #256 don't break — the panel just
-  // renders without an attribution sub-label in that case.
   sources?: string[];
   items: Array<{
     name: string;
@@ -117,13 +102,6 @@ interface ChecksResponse {
   }>;
 }
 
-// mergeRequiredChecks pairs the response's declared list (sourced
-// from the run's branch-protection snapshot post-#254) with the
-// most-recent observed state from /v0/stages/{id}/checks. Declared-
-// but-not-observed checks render as `not_tracked`. Loading and
-// error states (including a 503 from a backend without check
-// ingestion) return an empty list so the panel renders cleanly
-// without a flicker.
 function mergeRequiredChecks(
   result:
     | { status: 'loading' }
@@ -139,6 +117,161 @@ function mergeRequiredChecks(
     name,
     state: observed.get(name) ?? 'not_tracked',
   }));
+}
+
+/*
+ * ReviewActivityPanel reads the run's audit log scoped to the
+ * review stage and filters to the PR-side categories (#312):
+ *
+ *   - pr_approved_on_github       → "@x approved"
+ *   - pr_review_submitted         → "@x requested changes" / "@x commented" / "@x dismissed"
+ *   - pr_merged                   → "@x merged"
+ *
+ * Chronological (oldest first; matches how a reviewer scans the
+ * PR conversation). Empty list → quiet "no activity yet" copy.
+ * Loading / error states render their own placeholders so the
+ * surrounding shell stays calm.
+ */
+function ReviewActivityPanel({ runId, stageId }: { runId: string; stageId: string }) {
+  const result = useAsync(() => api.listRunAudit(runId, { stageId, limit: 100 }), [runId, stageId]);
+
+  if (result.status === 'loading') {
+    return <p className="text-sm text-neutral-500">Loading activity…</p>;
+  }
+  if (result.status === 'error') {
+    return (
+      <p className="text-sm text-rose-700 dark:text-rose-300">
+        Couldn&apos;t load activity: {result.error.message}
+      </p>
+    );
+  }
+
+  const events = result.data.items.filter(isPRActivity);
+  if (events.length === 0) {
+    return <p className="text-sm text-neutral-500">No GitHub activity yet.</p>;
+  }
+
+  // Oldest first so a reader scans the timeline left-to-right /
+  // top-to-bottom. listRunAudit returns descending by sequence —
+  // reverse client-side.
+  const ordered = [...events].reverse();
+
+  return (
+    <ul
+      data-testid="review-activity"
+      className="overflow-hidden rounded-md border border-neutral-200 dark:border-neutral-800"
+    >
+      {ordered.map((e) => (
+        <li
+          key={e.id}
+          className="flex items-start gap-3 border-b border-neutral-200 px-3 py-2 text-sm last:border-b-0 dark:border-neutral-800"
+        >
+          <ActivityIcon category={e.category} payload={e.payload} />
+          <div className="flex-1">
+            <ActivityLine entry={e} />
+            <p className="text-xs text-neutral-500">{formatTimestamp(e.ts)}</p>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const PR_ACTIVITY_CATEGORIES = new Set([
+  'pr_approved_on_github',
+  'pr_review_submitted',
+  'pr_merged',
+]);
+
+function isPRActivity(entry: AuditEntry): boolean {
+  return PR_ACTIVITY_CATEGORIES.has(entry.category);
+}
+
+function ActivityIcon({ category, payload }: { category: string; payload: unknown }) {
+  if (category === 'pr_merged') {
+    return <GitMerge className="mt-0.5 size-4 text-violet-600 dark:text-violet-400" aria-hidden />;
+  }
+  if (category === 'pr_approved_on_github') {
+    return (
+      <CheckCircle2 className="mt-0.5 size-4 text-emerald-600 dark:text-emerald-400" aria-hidden />
+    );
+  }
+  if (category === 'pr_review_submitted') {
+    const state = reviewStateOf(payload);
+    if (state === 'changes_requested') {
+      return (
+        <ShieldAlert className="mt-0.5 size-4 text-amber-600 dark:text-amber-400" aria-hidden />
+      );
+    }
+    return <MessageSquare className="mt-0.5 size-4 text-neutral-500" aria-hidden />;
+  }
+  return null;
+}
+
+function ActivityLine({ entry }: { entry: AuditEntry }) {
+  const actor = entry.actor_subject ?? 'unknown';
+  const at = `@${actor}`;
+  switch (entry.category) {
+    case 'pr_merged':
+      return (
+        <p>
+          <span className="font-medium">{at}</span> merged the PR
+        </p>
+      );
+    case 'pr_approved_on_github':
+      return (
+        <p>
+          <span className="font-medium">{at}</span> approved
+        </p>
+      );
+    case 'pr_review_submitted': {
+      const state = reviewStateOf(entry.payload);
+      return (
+        <p>
+          <span className="font-medium">{at}</span> {humanReviewVerb(state)}
+        </p>
+      );
+    }
+    default:
+      return <p>{entry.category}</p>;
+  }
+}
+
+function reviewStateOf(payload: unknown): string {
+  if (payload && typeof payload === 'object' && 'state' in payload) {
+    const v = (payload as { state?: unknown }).state;
+    if (typeof v === 'string') return v;
+  }
+  return '';
+}
+
+function humanReviewVerb(state: string): string {
+  switch (state) {
+    case 'commented':
+      return 'commented';
+    case 'changes_requested':
+      return 'requested changes';
+    case 'dismissed':
+      return 'dismissed a review';
+    case 'approved':
+      // Should hit the pr_approved_on_github category instead, but
+      // be defensive — the backend's category split is based on the
+      // event's state field; a future schema change could land
+      // approved events on this generic category.
+      return 'approved';
+    default:
+      return state ? `submitted a "${state}" review` : 'submitted a review';
+  }
+}
+
+function formatTimestamp(ts: string): string {
+  try {
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return ts;
+    return d.toLocaleString();
+  } catch {
+    return ts;
+  }
 }
 
 function ApproversBlock({
@@ -157,6 +290,11 @@ function ApproversBlock({
 
   return (
     <div className="space-y-2">
+      <p className="text-xs text-neutral-500">
+        Branch protection&apos;s required-reviewers is the actual approver gate (ADR-018). This list
+        is the workflow spec&apos;s declaration; Fishhawk records reviews against it but does not
+        enforce.
+      </p>
       <p className="text-xs tracking-wide text-neutral-500 uppercase">{mode}</p>
       <ul className="overflow-hidden rounded-md border border-neutral-200 dark:border-neutral-800">
         {list.map((role) => (
