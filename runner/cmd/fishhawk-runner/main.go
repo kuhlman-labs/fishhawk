@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -647,13 +648,22 @@ func classifyErr(err error) string {
 	}
 }
 
-// computeAndEmitDiff runs `git diff --name-status` against the
-// configured base ref and returns a `git_diff` bundle event the
+// computeAndEmitDiff runs `git diff --cached --name-status` against
+// the configured base ref and returns a `git_diff` bundle event the
 // backend's policy re-evaluation reads (E3.13). Decoupled from
 // constraint enforcement (#247) so the diff lands in the bundle
 // even when the customer doesn't pass --constraints-file — the
 // SPA's policy section needs the diff to render anything other
 // than "pending."
+//
+// Stages everything with `git add -A` before running the diff so
+// fresh files the agent created (test fixtures, new packages) show
+// up. The runner's later CommitAndPush calls `git add -A` again,
+// which is a no-op on an already-staged index. Pre-#296 the diff
+// ran against `<base>...HEAD` and saw nothing because the agent's
+// edits hadn't been committed yet; every PR silently failed
+// `tests_added_or_updated` and friends at the backend's policy
+// re-evaluation step.
 //
 // Returns the parsed Diff (consumed by enforceConstraints when
 // constraints-file is also set), a bundle event (always — either
@@ -666,6 +676,22 @@ func computeAndEmitDiff(cfg config) (constraint.Diff, agent.Event, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
+	}
+	// Stage everything the agent touched so `git diff --cached` can
+	// see it. add -A respects .gitignore, idempotent on a clean
+	// repo, and doesn't fail when there's nothing to stage. A
+	// failure here means we can't reliably compute the diff — surface
+	// as a diff_failed policy_event same as a git diff failure.
+	addCmd := exec.CommandContext(context.Background(), "git", "add", "-A")
+	addCmd.Dir = repoDir
+	if out, err := addCmd.CombinedOutput(); err != nil {
+		return constraint.Diff{}, agent.Event{
+			Kind: "policy_event",
+			Payload: agent.MakePayload(map[string]string{
+				"check": "diff", "outcome": "stage_failed",
+				"error": fmt.Sprintf("git add -A: %v: %s", err, strings.TrimSpace(string(out))),
+			}),
+		}, fmt.Errorf("computeAndEmitDiff: stage: %w", err)
 	}
 	d, err := (&gitdiff.Runner{}).Run(context.Background(), cfg.checkBaseRef, repoDir)
 	if err != nil {

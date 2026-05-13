@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -171,6 +172,88 @@ func TestRun_RequiredArgs(t *testing.T) {
 	}
 	if _, err := r.Run(context.Background(), "main", ""); err == nil {
 		t.Error("expected repoDir required")
+	}
+}
+
+// TestRun_RealRepo_CapturesUncommittedEdits is the regression test
+// for #296: the runner's bundle event was empty because the gitdiff
+// form `<base>...HEAD` only saw committed changes and the agent's
+// edits were still unstaged when the runner emitted the bundle.
+// The two-arg form `<base>` diffs the working tree, so uncommitted
+// edits land in the result.
+//
+// Real git is required; skipped when not on PATH so the suite stays
+// portable.
+func TestRun_RealRepo_CapturesUncommittedEdits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+
+	mustRunGit(t, repo, "init", "--initial-branch=main")
+	mustRunGit(t, repo, "config", "user.name", "init")
+	mustRunGit(t, repo, "config", "user.email", "init@example.com")
+	// Disable signing so developers with `commit.gpgsign=true` in
+	// their global gitconfig don't trip an interactive signer here.
+	mustRunGit(t, repo, "config", "commit.gpgsign", "false")
+	mustRunGit(t, repo, "config", "tag.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+	mustRunGit(t, repo, "commit", "-m", "initial")
+
+	// Snapshot the "base" — what the workflow's base branch points
+	// at. Production runners use `origin/main`; for this isolated
+	// repo we just keep "main" pinned to the initial commit.
+	mustRunGit(t, repo, "branch", "base")
+
+	// Agent-style edits: add a new file and modify an existing one,
+	// but DON'T commit. The caller is expected to stage before
+	// calling Run (mirrors what computeAndEmitDiff does in the
+	// runner's main.go). Pre-#296 the form was `<base>...HEAD` and
+	// this would produce an empty diff because HEAD == base; the
+	// new `--cached <base>` form catches everything once staged.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "new_test.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+
+	d, err := (&Runner{}).Run(context.Background(), "base", repo)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(d.ChangedFiles) != 2 {
+		t.Fatalf("got %d changed files, want 2 (README modify + new_test.go add); files=%+v",
+			len(d.ChangedFiles), d.ChangedFiles)
+	}
+
+	// Verify the new file is in the diff as an Add — that's the
+	// signal the `tests_added_or_updated` constraint reads.
+	var sawNew bool
+	for _, f := range d.ChangedFiles {
+		if f.Path == "new_test.go" && f.Status == constraint.StatusAdded {
+			sawNew = true
+		}
+	}
+	if !sawNew {
+		t.Errorf("expected new_test.go (Added) in diff; got %+v", d.ChangedFiles)
+	}
+}
+
+// mustRunGit invokes git in `repoDir` and fails the test on any
+// non-zero exit. Output is captured into the test log so a flaky
+// CI failure is debuggable.
+func mustRunGit(t *testing.T, repoDir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }
 
