@@ -126,5 +126,22 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.republishOnSynchronize(r.Context(), ev.RawBody)
 	}
 
+	// `pull_request.closed` with merged=true is the review-stage
+	// success signal per ADR-018 (#311 / #312). Branch protection
+	// already gated the merge — Fishhawk just records who merged
+	// and transitions the review stage. Closed-without-merging
+	// leaves the run in awaiting_approval; operator can manually
+	// intervene. Best-effort.
+	if ev.Type == "pull_request" && ev.Action == "closed" {
+		s.handlePullRequestClosed(r.Context(), ev.RawBody)
+	}
+
+	// `pull_request_review.submitted` records approver / commenter
+	// actions on the PR into the audit log per ADR-018. Audit-only
+	// — the merge event is what advances the stage. Best-effort.
+	if ev.Type == "pull_request_review" && ev.Action == "submitted" {
+		s.handlePullRequestReviewSubmitted(r.Context(), ev.RawBody)
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }
