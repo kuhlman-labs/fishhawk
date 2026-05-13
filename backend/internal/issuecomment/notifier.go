@@ -520,8 +520,15 @@ func renderPickupBody(c commentContext, senderLogin string) string {
 	fmt.Fprintf(&b, "Fishhawk picked this up — Run [`%s`](%s) started.\n\n",
 		shortID(c.run.ID), c.runURL)
 	fmt.Fprintf(&b, "Workflow: `%s`", c.run.WorkflowID)
-	if senderLogin != "" {
-		fmt.Fprintf(&b, " · Triggered by `@%s`", senderLogin)
+	switch {
+	case validApproverLogin(senderLogin):
+		// Bare @login (no backticks) so GitHub renders a real mention
+		// — the labeler gets a notification and the handle autolinks.
+		fmt.Fprintf(&b, " · Triggered by @%s", senderLogin)
+	case senderLogin != "":
+		// "anonymous" or other non-displayable subjects fall through to
+		// a generic phrase rather than leaking `@anonymous`.
+		b.WriteString(" · Triggered by an actor")
 	}
 	b.WriteString("\n")
 	return b.String()
@@ -560,7 +567,9 @@ func renderPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, extern
 func renderPlanApprovedBody(c commentContext, approverLogin string) string {
 	var b strings.Builder
 	if validApproverLogin(approverLogin) {
-		fmt.Fprintf(&b, "Plan approved by `@%s`. Implementing now — [View run →](%s).\n",
+		// Bare @login (no backticks) so GitHub fires a real mention
+		// notification to the approver and autolinks the handle.
+		fmt.Fprintf(&b, "Plan approved by @%s. Implementing now — [View run →](%s).\n",
 			approverLogin, c.runURL)
 	} else {
 		fmt.Fprintf(&b, "Plan approved by an approver. Implementing now — [View run →](%s).\n",

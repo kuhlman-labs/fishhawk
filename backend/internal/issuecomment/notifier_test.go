@@ -75,6 +75,12 @@ func TestNotifyPickup_PostsCommentAndAuditEntry(t *testing.T) {
 	if !strings.Contains(c.body, "@alice") {
 		t.Errorf("body should reference triggering user: %q", c.body)
 	}
+	// Regression guard for #305: the @login must NOT be wrapped in
+	// backticks — a backticked "`@alice`" suppresses the GitHub
+	// mention notification that lets the labeler know we picked up.
+	if strings.Contains(c.body, "`@") {
+		t.Errorf("body must not backtick-wrap the @mention (breaks GitHub notification): %q", c.body)
+	}
 	if !strings.Contains(c.body, runID.String()[:8]) {
 		t.Errorf("body should include short run id: %q", c.body)
 	}
@@ -405,14 +411,14 @@ func TestNotifySlashApprovalReply_PostsAndDoesNotDedup(t *testing.T) {
 	_ = n // unused; happyDeps constructs one we don't need here
 
 	if err := n2.NotifySlashApprovalReply(context.Background(), issuecomment.SlashApprovalReply{
-		Repo: "x/y", InstallationID: 99, IssueNumber: 42, Body: "Approved by `@alice`.",
+		Repo: "x/y", InstallationID: 99, IssueNumber: 42, Body: "Approved by @alice.",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if len(gh.calls) != 1 {
 		t.Fatalf("expected 1 call; got %d", len(gh.calls))
 	}
-	if gh.calls[0].body != "Approved by `@alice`." {
+	if gh.calls[0].body != "Approved by @alice." {
 		t.Errorf("body = %q", gh.calls[0].body)
 	}
 
@@ -487,8 +493,14 @@ func TestNotifyPlanApproved_HappyPath_NamesApprover(t *testing.T) {
 		t.Fatalf("expected 1 GitHub call; got %d", len(gh.calls))
 	}
 	c := gh.calls[0]
-	if !strings.Contains(c.body, "Plan approved by `@alice`") {
+	if !strings.Contains(c.body, "Plan approved by @alice") {
 		t.Errorf("body should name the approver: %q", c.body)
+	}
+	// Regression guard for #305: the @login must NOT be wrapped in
+	// backticks — GitHub only fires a mention notification when the
+	// handle is bare, and a backticked "`@alice`" silently broke that.
+	if strings.Contains(c.body, "`@") {
+		t.Errorf("body must not backtick-wrap the @mention (breaks GitHub notification): %q", c.body)
 	}
 	if !strings.Contains(c.body, "Implementing now") {
 		t.Errorf("body should mention implementing: %q", c.body)

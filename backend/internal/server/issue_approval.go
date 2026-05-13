@@ -66,7 +66,7 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 	if !found {
-		s.replyApproval(ctx, p, fmt.Sprintf("No stage on this issue's run is awaiting approval. (Subject: `@%s`)", subject))
+		s.replyApproval(ctx, p, fmt.Sprintf("No stage on this issue's run is awaiting approval. (Subject: @%s)", subject))
 		return nil
 	}
 
@@ -106,7 +106,7 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		// A previous submission from the same approver already
 		// settled the gate. Surface that fact rather than
 		// re-running the transition.
-		s.replyApproval(ctx, p, fmt.Sprintf("`@%s` already submitted a `%s` decision on this stage; the prior decision wins.", subject, res.Approval.Decision))
+		s.replyApproval(ctx, p, fmt.Sprintf("@%s already submitted a `%s` decision on this stage; the prior decision wins.", subject, res.Approval.Decision))
 		return nil
 	}
 
@@ -241,7 +241,7 @@ func (s *Server) authorizeSlashApprover(ctx context.Context, stage *run.Stage, s
 		return "", true // best-effort allow
 	}
 	if !allowed {
-		return fmt.Sprintf("Cannot approve: `@%s` is not in this stage's approvers list.", subject), false
+		return fmt.Sprintf("Cannot approve: @%s is not in this stage's approvers list.", subject), false
 	}
 	return "", true
 }
@@ -324,5 +324,5 @@ func formatSuccessReply(decision approval.Decision, subject string, runID uuid.U
 	if len(short) >= 8 {
 		short = short[:8]
 	}
-	return fmt.Sprintf("%s by `@%s`. Stage `%s` advanced for run `%s`.", verb, subject, stage.Type, short)
+	return fmt.Sprintf("%s by @%s. Stage `%s` advanced for run `%s`.", verb, subject, stage.Type, short)
 }
