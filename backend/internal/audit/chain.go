@@ -40,7 +40,20 @@ type HashInputs struct {
 // when checking a stored chain. Changes to the canonical
 // representation are breaking and must coincide with a chain-format
 // version bump.
+//
+// Timestamp normalization (#302): `time.Now()` returns nanosecond
+// precision in some local timezone (`time.Now().UTC()` is UTC but
+// keeps nanos). Postgres `timestamptz` stores microsecond precision
+// and `pgx` reads the value back in the connection's timezone —
+// neither matches the in-memory write-time value exactly, so a
+// recomputation after the DB round-trip would hash a different
+// JSON encoding (`-04:00 + microseconds` vs `Z + nanoseconds`). We
+// truncate to microseconds and force UTC here so the canonical
+// form is whatever the database can store losslessly, which makes
+// the hash stable across `time.Now()` → INSERT → SELECT →
+// re-hash. External verifiers MUST apply the same normalization.
 func ComputeEntryHash(p HashInputs) (string, error) {
+	p.Timestamp = p.Timestamp.UTC().Truncate(time.Microsecond)
 	canonical, err := json.Marshal(p)
 	if err != nil {
 		return "", fmt.Errorf("audit: marshal hash inputs: %w", err)

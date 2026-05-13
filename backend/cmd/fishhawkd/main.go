@@ -36,6 +36,8 @@ func run(args []string, logSink io.Writer) int {
 		return runServe(rest, logSink)
 	case "migrate":
 		return runMigrate(rest, logSink)
+	case "audit-rehash":
+		return runAuditRehash(rest, logSink)
 	case "token":
 		return runToken(rest, logSink)
 	case "-h", "--help", "help":
@@ -69,6 +71,7 @@ func printUsage(w io.Writer) {
 		"  serve         Run the HTTP server (default).",
 		"  migrate up    Apply pending DB migrations.",
 		"  migrate down  Roll back the most recent migration (dev only).",
+		"  audit-rehash  Rewrite audit_entries.entry_hash with the canonical algorithm (#302).",
 		"  token issue   Mint a bootstrap API token for an identity.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
