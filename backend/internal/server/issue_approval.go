@@ -133,13 +133,13 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		}
 	}
 
-	// Plan-approved comment-back (#274): same hook as the HTTP
-	// approval path. The slash command already posts a sender-
-	// scoped reply ("Approved …") via replyApproval; this is the
-	// issue-thread broadcast for everyone else watching the issue.
-	// Both fire — they serve different audiences. Gated on plan
-	// stage + approve so review-stage approvals and reject paths
-	// don't double-comment.
+	// Plan-approved comment-back (#274, #304): NotifyPlanApproved is
+	// the single source of truth for the plan-approve confirmation
+	// on the issue thread. The slash reply duplicates that broadcast
+	// for the plan-approve path, so it is deliberately skipped here.
+	// The slash reply still fires for plan-reject (no broadcast on
+	// that path), review-stage approve/reject (NotifyPlanApproved is
+	// plan-scoped), and authorization/error paths handled above.
 	if advanced.Type == run.StageTypePlan && decision == approval.DecisionApprove {
 		if err := s.issueNotifier.NotifyPlanApproved(ctx, advanced.RunID, p.SenderLogin, decision); err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -148,9 +148,9 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 				slog.String("stage_id", advanced.ID.String()),
 				slog.String("error", err.Error()))
 		}
+	} else {
+		s.replyApproval(ctx, p, formatSuccessReply(decision, subject, runRow.ID, advanced))
 	}
-
-	s.replyApproval(ctx, p, formatSuccessReply(decision, subject, runRow.ID, advanced))
 	return nil
 }
 
