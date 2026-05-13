@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router';
 import { ReviewDocument } from './review-document';
 import { api } from '@/api/client';
 import type { PullRequestArtifactBody } from '@/api/pull-request';
-import type { Stage } from '@/api/types';
+import type { AuditEntry, Stage } from '@/api/types';
 
 const sampleArtifact: PullRequestArtifactBody = {
   pr_number: 209,
@@ -36,41 +36,58 @@ const baseStage: Stage = {
   },
 };
 
+function auditEntry(overrides: Partial<AuditEntry>): AuditEntry {
+  return {
+    id: '00000000-0000-0000-0000-000000000000',
+    sequence: 1,
+    run_id: baseStage.run_id,
+    stage_id: baseStage.id,
+    ts: '2026-05-13T12:00:00Z',
+    category: 'pr_merged',
+    actor_kind: 'user',
+    actor_subject: 'alice',
+    payload: {},
+    prev_hash: null,
+    entry_hash: 'h',
+    ...overrides,
+  };
+}
+
 function renderDoc(stageOverride: Partial<Stage> = {}) {
   const stage = { ...baseStage, ...stageOverride };
   return render(
     <MemoryRouter>
-      <ReviewDocument
-        artifact={sampleArtifact}
-        stage={stage}
-        runId={stage.run_id}
-        onStageUpdate={vi.fn()}
-        onStageRollback={vi.fn()}
-      />
+      <ReviewDocument artifact={sampleArtifact} stage={stage} runId={stage.run_id} />
     </MemoryRouter>,
   );
 }
 
-// flushChecksFetch waits for the listStageChecks mock to settle so
-// the post-promise setState fires inside act(). Every test in this
-// file fetches checks at mount; calling this at the end avoids the
-// "update inside test was not wrapped in act" warning without
-// changing what each test asserts.
-async function flushChecksFetch(spy: ReturnType<typeof vi.spyOn>) {
-  await waitFor(() => expect(spy).toHaveBeenCalled());
+// Wait for the listStageChecks fetch to settle so the post-promise
+// setState fires inside act(). Saves us from "update not wrapped in
+// act()" warnings without changing the surface each test asserts.
+async function flushAsync() {
+  await waitFor(() => {
+    // Either the not-tracked placeholder shows or the audit panel
+    // settles — either resolves the act() warning. We pick whichever
+    // text the page should reach a stable state with.
+    const ready =
+      screen.queryByText(/not tracked yet/i) ||
+      screen.queryByText(/no required checks configured/i) ||
+      screen.queryByText(/no github activity yet/i) ||
+      screen.queryByTestId('review-activity');
+    expect(ready).toBeTruthy();
+  });
 }
 
 describe('<ReviewDocument>', () => {
-  let checksSpy: ReturnType<typeof vi.spyOn>;
-
-  // Default checks-stub: declared list reflects the run's branch-
-  // protection snapshot (#251 / #254). Empty observed → the panel
-  // renders all entries as `not_tracked`. Prevents the live-state
-  // fetch from racing synchronous assertions.
   beforeEach(() => {
-    checksSpy = vi.spyOn(api, 'listStageChecks').mockResolvedValue({
+    vi.spyOn(api, 'listStageChecks').mockResolvedValue({
       declared: ['ci_pass', 'fishhawk_audit_complete'],
       items: [],
+    });
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [],
+      next_cursor: null,
     });
   });
   afterEach(() => {
@@ -81,77 +98,67 @@ describe('<ReviewDocument>', () => {
     renderDoc();
     expect(screen.getByRole('heading', { name: sampleArtifact.title })).toBeInTheDocument();
     expect(screen.getByText(/^Review · pull request$/i)).toBeInTheDocument();
-    // Wait for the listStageChecks promise to settle so React's
-    // post-render state update doesn't fire outside act().
-    await waitFor(() => {
-      expect(screen.getAllByText(/not tracked yet/i).length).toBeGreaterThan(0);
-    });
+    await flushAsync();
   });
 
   it('renders the stage state badge', async () => {
     renderDoc();
     expect(screen.getByText('awaiting_approval')).toBeInTheDocument();
-    await waitFor(() => {
-      expect(screen.getAllByText(/not tracked yet/i).length).toBeGreaterThan(0);
-    });
+    await flushAsync();
   });
 
-  it('renders the shared PullRequestSummary block (branch + GitHub link)', async () => {
+  it('renders a "View on GitHub" header affordance that links to the PR (ADR-018 / #314)', async () => {
+    // Header replaces the old approve/reject control. Two "View on
+    // GitHub" links land on the page — the header CTA and the
+    // PullRequestSummary's own link — both pointing at pr_url.
     renderDoc();
-    expect(screen.getByText(sampleArtifact.branch)).toBeInTheDocument();
-    const link = screen.getByRole('link', { name: /view on github/i });
-    expect(link).toHaveAttribute('href', sampleArtifact.pr_url);
-    await flushChecksFetch(checksSpy);
+    const links = screen.getAllByRole('link', { name: /view on github/i });
+    expect(links.length).toBeGreaterThanOrEqual(1);
+    for (const l of links) {
+      expect(l).toHaveAttribute('href', sampleArtifact.pr_url);
+    }
+    await flushAsync();
+  });
+
+  it('does NOT render the in-Fishhawk Approve/Reject controls (ADR-018 / #313)', async () => {
+    // Pre-#314 the review-stage page rendered ApprovalPanel buttons.
+    // ADR-018 / #313 moved review-stage approval to GitHub; the
+    // surface is gone.
+    renderDoc();
+    expect(screen.queryByRole('button', { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^reject$/i })).not.toBeInTheDocument();
+    await flushAsync();
+  });
+
+  it('renders the same shape on terminal states (no more audit-log fallback link)', async () => {
+    // Pre-#314 a terminal-state review stage swapped the approval
+    // panel for an "audit log" link. Post-#314 the header is the
+    // PR link in every state.
+    renderDoc({ state: 'succeeded' });
+    const links = screen.getAllByRole('link', { name: /view on github/i });
+    expect(links.length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByRole('link', { name: /view audit log/i })).not.toBeInTheDocument();
+    await flushAsync();
   });
 
   it("renders the response's declared check names with the not-tracked-yet placeholder", async () => {
     renderDoc();
     expect(screen.getByRole('heading', { name: /required checks/i })).toBeInTheDocument();
-    // The declared list now sources from the run's branch-protection
-    // snapshot via the response (#251 / #254), not stage.gate.
     await waitFor(() => {
       expect(screen.getByText('ci_pass')).toBeInTheDocument();
     });
     expect(screen.getByText('fishhawk_audit_complete')).toBeInTheDocument();
-    // Two declared, none observed → two placeholder pills.
     expect(screen.getAllByText(/not tracked yet/i)).toHaveLength(2);
   });
 
-  it('shows the ApprovalPanel buttons when state is awaiting_approval and gate is approval-typed', async () => {
-    renderDoc();
-    expect(screen.getByRole('button', { name: /^approve$/i })).toBeEnabled();
-    expect(screen.getByRole('button', { name: /^reject$/i })).toBeEnabled();
-    await flushChecksFetch(checksSpy);
-  });
-
-  it('hides the ApprovalPanel for terminal states and shows the audit-log link instead', async () => {
-    renderDoc({ state: 'succeeded' });
-    expect(screen.queryByRole('button', { name: /^approve$/i })).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /view audit log/i })).toHaveAttribute(
-      'href',
-      `/runs/${baseStage.run_id}#audit`,
-    );
-    await flushChecksFetch(checksSpy);
-  });
-
-  it('suppresses the ApprovalPanel on check-only review gates (no human action)', async () => {
-    renderDoc({
-      gate: {
-        type: 'check',
-      },
-    });
-    expect(screen.queryByRole('button', { name: /^approve$/i })).not.toBeInTheDocument();
-    // Audit-log link still present so the reviewer can inspect chain.
-    expect(screen.getByRole('link', { name: /view audit log/i })).toBeInTheDocument();
-    await flushChecksFetch(checksSpy);
-  });
-
-  it('renders the approvers list with the any_of mode label for approval gates', async () => {
+  it('renders the approvers list with the any_of mode label (informational; ADR-018)', async () => {
     renderDoc();
     expect(screen.getByRole('heading', { name: /approvers/i })).toBeInTheDocument();
     expect(screen.getByText('any of')).toBeInTheDocument();
     expect(screen.getByText('founder')).toBeInTheDocument();
-    await flushChecksFetch(checksSpy);
+    // New copy explains the informational nature (#314).
+    expect(screen.getByText(/branch protection.*required-reviewers/i)).toBeInTheDocument();
+    await flushAsync();
   });
 
   it('renders the all_of mode when the gate uses all_of', async () => {
@@ -164,7 +171,7 @@ describe('<ReviewDocument>', () => {
     expect(screen.getByText('all of')).toBeInTheDocument();
     expect(screen.getByText('founder')).toBeInTheDocument();
     expect(screen.getByText('security-lead')).toBeInTheDocument();
-    await flushChecksFetch(checksSpy);
+    await flushAsync();
   });
 
   it('omits the Approvers section for check-only gates', async () => {
@@ -174,34 +181,169 @@ describe('<ReviewDocument>', () => {
       },
     });
     expect(screen.queryByRole('heading', { name: /approvers/i })).not.toBeInTheDocument();
-    await flushChecksFetch(checksSpy);
+    await flushAsync();
   });
 
   it('renders a usable page even when the gate is missing on the wire (legacy / pre-#213 row)', async () => {
-    // Empty declared list mimics a run that pre-dates branch
-    // protection wiring (#251) or skipped the snapshot.
-    checksSpy.mockResolvedValue({ declared: [], items: [] });
+    (api.listStageChecks as ReturnType<typeof vi.fn>).mockResolvedValue({
+      declared: [],
+      items: [],
+    });
     renderDoc({ gate: undefined });
-    // PR summary still shows.
     expect(screen.getByText(sampleArtifact.branch)).toBeInTheDocument();
-    // Blocking-checks panel renders with empty-gate fallback.
     await waitFor(() => {
       expect(screen.getByText(/no required checks configured/i)).toBeInTheDocument();
     });
-    // No approvers section (no gate at all).
     expect(screen.queryByRole('heading', { name: /approvers/i })).not.toBeInTheDocument();
   });
 });
 
-describe('<ReviewDocument> live blocking-check states (#228)', () => {
-  let checksSpy: ReturnType<typeof vi.spyOn>;
+describe('<ReviewDocument> activity panel (#314)', () => {
   beforeEach(() => {
-    checksSpy = vi.spyOn(api, 'listStageChecks');
+    vi.spyOn(api, 'listStageChecks').mockResolvedValue({
+      declared: [],
+      items: [],
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('renders an empty-state when no PR activity yet', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({ items: [], next_cursor: null });
+    renderDoc();
+    await waitFor(() => {
+      expect(screen.getByText(/no github activity yet/i)).toBeInTheDocument();
+    });
+  });
+
+  it('renders pr_merged with the merger name', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        auditEntry({
+          id: 'a1',
+          sequence: 1,
+          category: 'pr_merged',
+          actor_subject: 'alice',
+          payload: { pr_url: sampleArtifact.pr_url, merger: 'alice' },
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderDoc();
+    await waitFor(() => {
+      const panel = screen.getByTestId('review-activity');
+      expect(panel).toHaveTextContent('@alice');
+      expect(panel).toHaveTextContent(/merged the PR/i);
+    });
+  });
+
+  it('renders pr_approved_on_github with the reviewer name', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        auditEntry({
+          id: 'a2',
+          sequence: 2,
+          category: 'pr_approved_on_github',
+          actor_subject: 'bob',
+          payload: { state: 'approved' },
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderDoc();
+    await waitFor(() => {
+      const panel = screen.getByTestId('review-activity');
+      expect(panel).toHaveTextContent('@bob');
+      expect(panel).toHaveTextContent(/approved/i);
+    });
+  });
+
+  it('picks the right verb for non-approve review states', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        auditEntry({
+          id: 'r1',
+          sequence: 3,
+          category: 'pr_review_submitted',
+          actor_subject: 'carol',
+          payload: { state: 'changes_requested' },
+        }),
+        auditEntry({
+          id: 'r2',
+          sequence: 4,
+          category: 'pr_review_submitted',
+          actor_subject: 'dave',
+          payload: { state: 'commented' },
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderDoc();
+    await waitFor(() => {
+      const panel = screen.getByTestId('review-activity');
+      expect(panel).toHaveTextContent(/@carol requested changes/i);
+      expect(panel).toHaveTextContent(/@dave commented/i);
+    });
+  });
+
+  it('orders the timeline oldest-first regardless of audit-log return order', async () => {
+    // listRunAudit returns DESC by sequence; the panel reverses so
+    // the reader sees a left-to-right chronology.
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        auditEntry({
+          id: 'newest',
+          sequence: 3,
+          category: 'pr_merged',
+          actor_subject: 'alice',
+          payload: {},
+        }),
+        auditEntry({
+          id: 'oldest',
+          sequence: 1,
+          category: 'pr_approved_on_github',
+          actor_subject: 'bob',
+          payload: {},
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderDoc();
+    await waitFor(() => {
+      expect(screen.getByTestId('review-activity')).toBeInTheDocument();
+    });
+    const items = screen.getByTestId('review-activity').querySelectorAll('li');
+    expect(items.length).toBe(2);
+    expect(items[0].textContent).toMatch(/@bob/);
+    expect(items[1].textContent).toMatch(/@alice/);
+  });
+
+  it('filters out non-PR audit categories', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        auditEntry({
+          id: 'unrelated',
+          category: 'run_dispatched',
+          actor_subject: 'system',
+          payload: {},
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderDoc();
+    await waitFor(() => {
+      expect(screen.getByText(/no github activity yet/i)).toBeInTheDocument();
+    });
+  });
+});
+
+describe('<ReviewDocument> live blocking-check states (#228)', () => {
+  beforeEach(() => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({ items: [], next_cursor: null });
   });
   afterEach(() => vi.restoreAllMocks());
 
   it('replaces the not_tracked placeholder with live state from the backend', async () => {
-    checksSpy.mockResolvedValue({
+    vi.spyOn(api, 'listStageChecks').mockResolvedValue({
       declared: ['ci_pass', 'fishhawk_audit_complete'],
       items: [
         { name: 'ci_pass', state: 'pass' },
@@ -210,41 +352,24 @@ describe('<ReviewDocument> live blocking-check states (#228)', () => {
     });
     render(
       <MemoryRouter>
-        <ReviewDocument
-          artifact={sampleArtifact}
-          stage={baseStage}
-          runId={baseStage.run_id}
-          onStageUpdate={vi.fn()}
-          onStageRollback={vi.fn()}
-        />
+        <ReviewDocument artifact={sampleArtifact} stage={baseStage} runId={baseStage.run_id} />
       </MemoryRouter>,
     );
     await waitFor(() => {
       expect(screen.getByText('pass')).toBeInTheDocument();
     });
     expect(screen.getByText('pending')).toBeInTheDocument();
-    // None of the checks render the not_tracked placeholder when
-    // observed states are present.
     expect(screen.queryAllByText(/not tracked yet/i)).toHaveLength(0);
   });
 
   it('falls back to not_tracked for declared checks the backend has not observed', async () => {
-    checksSpy.mockResolvedValue({
+    vi.spyOn(api, 'listStageChecks').mockResolvedValue({
       declared: ['ci_pass', 'fishhawk_audit_complete'],
-      items: [
-        { name: 'ci_pass', state: 'pass' },
-        // fishhawk_audit_complete observed-but-not-yet — falls back.
-      ],
+      items: [{ name: 'ci_pass', state: 'pass' }],
     });
     render(
       <MemoryRouter>
-        <ReviewDocument
-          artifact={sampleArtifact}
-          stage={baseStage}
-          runId={baseStage.run_id}
-          onStageUpdate={vi.fn()}
-          onStageRollback={vi.fn()}
-        />
+        <ReviewDocument artifact={sampleArtifact} stage={baseStage} runId={baseStage.run_id} />
       </MemoryRouter>,
     );
     await waitFor(() => {
@@ -254,22 +379,10 @@ describe('<ReviewDocument> live blocking-check states (#228)', () => {
   });
 
   it('renders the empty-declared fallback when the backend errors (legacy / 503)', async () => {
-    // Post-#254 the declared list lives on the response (sourced
-    // from the run's branch-protection snapshot), so a 503 from
-    // /v0/stages/{id}/checks leaves the panel with nothing to
-    // render — the empty-declared "no required checks configured"
-    // fallback fires instead of the not_tracked placeholders that
-    // pre-v0.2 came from stage.gate.blocking_checks.
-    checksSpy.mockRejectedValue(new Error('503 stage_checks_unconfigured'));
+    vi.spyOn(api, 'listStageChecks').mockRejectedValue(new Error('503 stage_checks_unconfigured'));
     render(
       <MemoryRouter>
-        <ReviewDocument
-          artifact={sampleArtifact}
-          stage={baseStage}
-          runId={baseStage.run_id}
-          onStageUpdate={vi.fn()}
-          onStageRollback={vi.fn()}
-        />
+        <ReviewDocument artifact={sampleArtifact} stage={baseStage} runId={baseStage.run_id} />
       </MemoryRouter>,
     );
     await waitFor(() => {
