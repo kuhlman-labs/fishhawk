@@ -22,7 +22,7 @@ import (
 // repos; swaps in a recording GitHub commenter so reply text can
 // be asserted on.
 
-func TestHandleApprovalCommand_Approve_AdvancesStageAndReplies(t *testing.T) {
+func TestHandleApprovalCommand_PlanApprove_PostsOnlyBroadcast(t *testing.T) {
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
 	r.TriggerSource = run.TriggerGitHubIssue
@@ -77,29 +77,19 @@ func TestHandleApprovalCommand_Approve_AdvancesStageAndReplies(t *testing.T) {
 		t.Errorf("approver = %q, want alice", ar.all[0].ApproverSubject)
 	}
 
-	// Two comments expected: the sender-scoped slash reply
-	// ("Approved …") and the issue-thread broadcast announcing the
-	// plan-approved event (#274). The two are intentionally
-	// separate — they serve different audiences.
-	if got := gh.calls(); len(got) != 2 {
-		t.Fatalf("expected 2 comments (slash reply + plan-approved broadcast); got %d", len(got))
+	// Exactly one comment expected: the plan-approved broadcast
+	// (#274). The redundant slash reply is suppressed on the plan-
+	// approve path (#304) so the issue thread sees a single canonical
+	// confirmation.
+	got := gh.calls()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 comment (plan-approved broadcast only); got %d", len(got))
 	}
-	// Walk both bodies; assertion order-independent so the test
-	// doesn't break if the post order changes.
-	var slashReply, planBroadcast string
-	for _, c := range gh.calls() {
-		switch {
-		case strings.Contains(c.body, "Approved"):
-			slashReply = c.body
-		case strings.Contains(c.body, "Plan approved by"):
-			planBroadcast = c.body
-		}
+	if !strings.Contains(got[0].body, "Plan approved by") {
+		t.Errorf("broadcast should announce plan approval: %q", got[0].body)
 	}
-	if !strings.Contains(slashReply, "@alice") {
-		t.Errorf("slash reply should mention sender: %q", slashReply)
-	}
-	if !strings.Contains(planBroadcast, "`@alice`") {
-		t.Errorf("plan-approved broadcast should mention approver: %q", planBroadcast)
+	if !strings.Contains(got[0].body, "`@alice`") {
+		t.Errorf("plan-approved broadcast should mention approver: %q", got[0].body)
 	}
 }
 
@@ -154,6 +144,55 @@ func TestHandleApprovalCommand_Reject_FailsStageAndReplies(t *testing.T) {
 	}
 	if !strings.Contains(gh.calls()[0].body, "Rejected") {
 		t.Errorf("reply should say Rejected: %q", gh.calls()[0].body)
+	}
+}
+
+// TestHandleApprovalCommand_PlanReject_StillPostsSlashReply locks in
+// the contract from #304: the plan-approve case is the only path that
+// suppresses the slash reply. A plan-stage reject has no companion
+// broadcast (NotifyPlanApproved only fires on approve), so the slash
+// reply remains the sole confirmation on the issue thread.
+func TestHandleApprovalCommand_PlanReject_StillPostsSlashReply(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypePlan
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionReject,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stage.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", stage.State)
+	}
+	got := gh.calls()
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 comment (slash reply on plan-reject); got %d: %+v", len(got), got)
+	}
+	if !strings.HasPrefix(got[0].body, "Rejected by ") {
+		t.Errorf("slash reply should start with 'Rejected by ': %q", got[0].body)
 	}
 }
 
@@ -296,13 +335,14 @@ func TestHandleApprovalCommand_RepeatAfterAdvance_RepliesNoAwaitingStage(t *test
 	if len(ar.all) != 1 {
 		t.Errorf("approval repo should have one row; got %d", len(ar.all))
 	}
-	// Three comments expected: the first attempt's slash reply +
-	// plan-approved broadcast (#274), plus the second attempt's
-	// "no awaiting stage" reply. The broadcast fires once because
-	// the dedup machinery short-circuits a re-post.
+	// Two comments expected: the first attempt's plan-approved
+	// broadcast (#274), plus the second attempt's "no awaiting
+	// stage" slash reply. The slash reply on the plan-approve path
+	// is suppressed in favor of the broadcast (#304), so the first
+	// attempt posts only one comment.
 	calls := gh.calls()
-	if len(calls) != 3 {
-		t.Fatalf("expected 3 comments (1st: reply + broadcast, 2nd: reply); got %d", len(calls))
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 comments (1st: broadcast, 2nd: reply); got %d", len(calls))
 	}
 	// Order-independent body scan — the second-attempt's reply
 	// must explain that no awaiting stage exists.
