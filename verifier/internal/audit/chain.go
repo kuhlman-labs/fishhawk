@@ -16,6 +16,7 @@
 package audit
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -61,21 +62,54 @@ type HashInputs struct {
 // marshaled to JSON. Deterministic: same inputs produce the same
 // output across implementations.
 //
-// Timestamp normalization (#302): the backend writes audit rows
-// from `time.Now()`-derived values (nanosecond precision, possibly
-// local timezone). Postgres `timestamptz` stores microsecond
-// precision and `pgx` reads back in the connection's timezone, so
-// the in-memory write-time value and the read-back value differ
-// even though they refer to the same moment. The canonical form
-// for hashing is whatever the database can round-trip losslessly
-// — UTC, microsecond-truncated. The backend ships the same
-// normalization; ADR-008 / #72 keeps the two paths byte-equal.
+// Two normalizations apply so the canonical form is stable across
+// the backend's write → DB → re-hash round-trip:
+//
+// Timestamp (#302): the backend writes audit rows from
+// `time.Now()`-derived values (nanosecond precision, possibly local
+// timezone). Postgres `timestamptz` stores microsecond precision
+// and `pgx` reads back in the connection's timezone. We normalize
+// to UTC, microsecond-truncated — whatever the database can
+// round-trip losslessly.
+//
+// Payload (#308): `audit_entries.payload` is a JSONB column that
+// doesn't preserve key order or whitespace. The bytes the backend's
+// json.Marshal produced and the bytes pgx reads back are different
+// shapes of the same semantic JSON, so a hash over the raw payload
+// diverges between write and verify. We canonicalize via parse +
+// re-marshal (UseNumber to preserve int precision) — both sides
+// converge on the Go canonical form.
+//
+// The backend ships the same normalizations; ADR-008 / #72 keeps
+// the two paths byte-equal.
 func ComputeEntryHash(p HashInputs) (string, error) {
 	p.Timestamp = p.Timestamp.UTC().Truncate(time.Microsecond)
+	canonicalPayload, err := canonicalizeJSON(p.Payload)
+	if err != nil {
+		return "", fmt.Errorf("verifier: canonicalize payload: %w", err)
+	}
+	p.Payload = canonicalPayload
 	canonical, err := json.Marshal(p)
 	if err != nil {
 		return "", fmt.Errorf("verifier: marshal hash inputs: %w", err)
 	}
 	sum := sha256.Sum256(canonical)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// canonicalizeJSON returns a re-marshaled form of `raw` so the bytes
+// used for hashing don't depend on the storage layer's serialization
+// choices. Mirrors the backend's helper of the same name; intentional
+// duplication per ADR-008 (no shared code between backend and verifier).
+func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var parsed any
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, err
+	}
+	return json.Marshal(parsed)
 }

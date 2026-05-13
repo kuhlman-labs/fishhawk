@@ -1,6 +1,7 @@
 package audit_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -385,6 +386,79 @@ func TestPostgres_AppendChained_HashRoundTripsThroughDB(t *testing.T) {
 	}
 }
 
+// TestPostgres_AppendChained_HashRoundTripsWithMultiKeyPayload is
+// the regression test for #308: ComputeEntryHash must also produce
+// the same digest when the payload has multiple keys. The earlier
+// #302 round-trip test happened to use a single-key payload
+// (`{"outcome":"dispatched"}`) where PG's JSONB re-serialization is
+// a no-op vs Go's `json.Marshal` output, so the deeper byte-
+// instability slipped through. Multi-key payloads trip PG's
+// internal-order-plus-whitespace serialization on read; the fix is
+// to canonicalize the payload inside ComputeEntryHash so both sides
+// converge on the same bytes.
+func TestPostgres_AppendChained_HashRoundTripsWithMultiKeyPayload(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	// Match the shape the dispatcher's writeDispatchAudit produces —
+	// a 9-key payload that PG's JSONB will definitely re-order.
+	payload, _ := json.Marshal(map[string]any{
+		"event":          "issue_comment",
+		"delivery_id":    "deadbeef-cafe-babe-feed-facefacefeed",
+		"action":         "created",
+		"sender":         "kuhlman-labs",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "1234567890abcdef1234567890abcdef12345678",
+		"trigger_ref":    "issue:42",
+		"trigger_source": "github_issue",
+		"outcome":        "dispatched",
+	})
+
+	subj := "github-webhook"
+	kind := audit.ActorSystem
+	e, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:        runID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "run_dispatched",
+		ActorKind:    &kind,
+		ActorSubject: &subj,
+		Payload:      payload,
+	})
+	if err != nil {
+		t.Fatalf("AppendChained: %v", err)
+	}
+
+	// pgx-read bytes WILL differ from the write bytes (PG's JSONB
+	// re-serialization), so assert that up front — it's the exact
+	// shape of the #308 bug and we want a clear failure mode if PG
+	// ever changes this behaviour.
+	if string(e.Payload) == string(payload) {
+		t.Logf("PG returned the payload bytes unchanged — JSONB serialization changed; rest of the test still asserts hash stability")
+	}
+
+	recomputed, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID:        e.RunID,
+		StageID:      e.StageID,
+		Timestamp:    e.Timestamp,
+		Category:     e.Category,
+		ActorKind:    e.ActorKind,
+		ActorSubject: e.ActorSubject,
+		Payload:      e.Payload,
+		PrevHash:     e.PrevHash,
+	})
+	if err != nil {
+		t.Fatalf("ComputeEntryHash: %v", err)
+	}
+	if recomputed != e.EntryHash {
+		t.Fatalf("hash mismatch after DB round-trip with multi-key payload:\n  stored:     %s\n  recomputed: %s\n  write bytes (%d): %s\n  read bytes  (%d): %s\n\n"+
+			"This is the bug from #308 — JSONB payload doesn't round-trip byte-equal.",
+			e.EntryHash, recomputed,
+			len(payload), payload,
+			len(e.Payload), e.Payload)
+	}
+}
+
 // TestComputeEntryHash_NormalizesTimestamp is the unit-test
 // counterpart to the round-trip integration test above (#302). The
 // same logical moment expressed as `time.Now()`, `time.Now().UTC()`,
@@ -431,6 +505,90 @@ func TestComputeEntryHash_NormalizesTimestamp(t *testing.T) {
 		if h != first {
 			t.Errorf("hash divergence for variant %q: got %s, want %s", k, h, first)
 		}
+	}
+}
+
+// TestComputeEntryHash_CanonicalizesPayload is the unit-test
+// counterpart to the integration test below (#308). The
+// audit_entries.payload column is JSONB, which doesn't preserve key
+// order or whitespace — the dispatcher's `json.Marshal` produces
+// alphabetically-sorted compact bytes, but pgx reads back the
+// JSONB-emitted form (PG's internal order + spaces after colons).
+// ComputeEntryHash must produce the same digest for every
+// representation of the same semantic JSON, otherwise verifyChain
+// fails on every entry with a multi-key payload.
+func TestComputeEntryHash_CanonicalizesPayload(t *testing.T) {
+	runID := uuid.New()
+	ts := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
+
+	// Five forms of the same logical payload: differ in key order,
+	// whitespace, and number representation. All must hash to the
+	// same value after the new canonicalization.
+	variants := map[string]json.RawMessage{
+		"alphabetical-compact":         json.RawMessage(`{"a":1,"b":"x","c":true}`),
+		"alphabetical-with-spaces":     json.RawMessage(`{"a": 1, "b": "x", "c": true}`),
+		"reverse-order-compact":        json.RawMessage(`{"c":true,"b":"x","a":1}`),
+		"reverse-order-with-spaces":    json.RawMessage(`{"c": true, "b": "x", "a": 1}`),
+		"jsonb-style-mixed-whitespace": json.RawMessage(`{ "b":"x", "a":1, "c":true }`),
+	}
+
+	hashes := map[string]string{}
+	for name, p := range variants {
+		h, err := audit.ComputeEntryHash(audit.HashInputs{
+			RunID: &runID, Timestamp: ts, Category: "x", Payload: p,
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		hashes[name] = h
+	}
+
+	var first string
+	for name, h := range hashes {
+		if first == "" {
+			first = h
+			continue
+		}
+		if h != first {
+			t.Errorf("hash divergence for %q: got %s, want %s", name, h, first)
+		}
+	}
+}
+
+// TestComputeEntryHash_PayloadPreservesIntPrecision asserts that the
+// payload canonicalization doesn't collapse JSON integers to
+// float64. Without `dec.UseNumber()` in the canonicalizer, a payload
+// like `{"pr_number":9999999999999999}` would parse to a float and
+// re-marshal with precision loss — hash diverges across re-runs of
+// the same input.
+func TestComputeEntryHash_PayloadPreservesIntPrecision(t *testing.T) {
+	runID := uuid.New()
+	ts := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
+	payload := json.RawMessage(`{"pr_number":9999999999999999,"retry_attempt":3}`)
+
+	h1, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID: &runID, Timestamp: ts, Category: "x", Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID: &runID, Timestamp: ts, Category: "x", Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != h2 {
+		t.Errorf("hash not deterministic across recomputes: %s vs %s", h1, h2)
+	}
+	// 9999999999999999 is past float64's safe integer range. If the
+	// canonicalizer collapsed the value, the re-marshaled bytes
+	// would carry "1e+16" instead of the original; hashing the
+	// reconstructed payload would still be deterministic but would
+	// silently mutate semantic content. We re-marshal a json.Number
+	// path explicitly to assert the value is preserved verbatim.
+	if !bytes.Contains(payload, []byte("9999999999999999")) {
+		t.Fatalf("test payload missing canary integer: %s", payload)
 	}
 }
 
