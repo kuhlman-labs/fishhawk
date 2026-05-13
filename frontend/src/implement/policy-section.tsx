@@ -41,6 +41,13 @@ interface PolicyPayload {
   // section renders the skipped arm regardless of `passed`.
   skip_reason?: SkipReason;
   skip_detail?: string;
+  // deferred_outcomes names required_outcomes the backend declined
+  // to assert on because no signal was available at evaluation
+  // time (#297). At trace-upload time the only entry is "ci_green":
+  // CI hasn't started against the just-opened PR yet, so branch
+  // protection is the actual gate at merge time. Surfaced inline
+  // with the pass state as a neutral info note.
+  deferred_outcomes?: string[];
 }
 
 type SkipReason =
@@ -135,6 +142,7 @@ function PolicyBody({ payload }: { payload: PolicyPayload }) {
   return (
     <div className="space-y-3">
       <PolicyHeader passed={passed} violationCount={payload.violations?.length ?? 0} />
+      <DeferredOutcomesNote deferred={payload.deferred_outcomes} />
       <DiffSummary diff={payload.diff ?? []} />
       {!passed && payload.violations && payload.violations.length > 0 && (
         <ViolationsList violations={payload.violations} />
@@ -144,6 +152,26 @@ function PolicyBody({ payload }: { payload: PolicyPayload }) {
         defaultOpen={passed} // pass-state: open by default ("what was checked"); fail-state: collapse so violations are the headline.
       />
     </div>
+  );
+}
+
+// DeferredOutcomesNote renders the small info row that names any
+// required_outcomes the backend declined to assert on (#297). For
+// v0 the only entry is `ci_green`; the wording calls out branch
+// protection so the reviewer understands where the merge-time gate
+// actually lives.
+function DeferredOutcomesNote({ deferred }: { deferred?: string[] }) {
+  if (!deferred || deferred.length === 0) return null;
+  return (
+    <p
+      className="flex items-start gap-1.5 text-xs text-neutral-600 dark:text-neutral-400"
+      data-testid="policy-deferred-outcomes"
+    >
+      <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+      <span>
+        Deferred to branch protection: <span className="font-mono">{deferred.join(', ')}</span>
+      </span>
+    </p>
   );
 }
 

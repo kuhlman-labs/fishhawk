@@ -159,6 +159,45 @@ func TestEmitEvaluation_Violations(t *testing.T) {
 	}
 }
 
+func TestEmitEvaluation_DeferredCIGreen_PassesAndRecordsDeferral(t *testing.T) {
+	// Trace upload happens before CI runs against the just-opened
+	// PR, so ci_green has no signal at evaluation time. Pre-#297
+	// this emitted a "no signal available" violation; post-#297 the
+	// outcome is deferred to branch protection (ADR-017 / #251) and
+	// recorded on the payload's DeferredOutcomes list so the SPA
+	// can render the deferral inline with the pass state.
+	repo := &fakeAuditRepo{}
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	violations, err := EmitEvaluation(
+		context.Background(), repo, runID, stageID,
+		"implement",
+		diff("backend/main.go", "backend/main_test.go"),
+		Constraints{
+			RequiredOutcomes: []string{"tests_added_or_updated", "ci_green"},
+			// CIGreen is nil — the production trace-handler path.
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("EmitEvaluation: %v", err)
+	}
+	if len(violations) != 0 {
+		t.Errorf("expected no violations (ci_green deferred), got %+v", violations)
+	}
+	var got EvaluationPayload
+	if err := json.Unmarshal(repo.captured.Payload, &got); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	if !got.Passed {
+		t.Errorf("Passed = false, want true (ci_green deferral isn't a violation)")
+	}
+	if len(got.DeferredOutcomes) != 1 || got.DeferredOutcomes[0] != "ci_green" {
+		t.Errorf("DeferredOutcomes = %+v, want [ci_green]", got.DeferredOutcomes)
+	}
+}
+
 func TestEmitEvaluation_ActorSubjectPropagated(t *testing.T) {
 	repo := &fakeAuditRepo{}
 	runID := uuid.New()
