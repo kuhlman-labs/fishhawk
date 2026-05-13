@@ -106,6 +106,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ADR-018 (#311, #313): review-stage approval is owned by GitHub.
+	// The PR merge event (#312) transitions the stage to succeeded;
+	// branch protection's required-reviewers enforces the approver
+	// list. Refuse the in-Fishhawk submission with a 409 + the PR
+	// URL so the caller knows where the merge gate actually lives.
+	// Plan-stage approvals are unaffected — Fishhawk's vote at plan
+	// time is independent and has no GitHub-side equivalent.
+	if stage.Type == run.StageTypeReview {
+		s.rejectReviewStageApproval(w, r, stage)
+		return
+	}
+
 	// Authorization: when a RoleResolver is wired, the subject
 	// must be in the gate's approvers list. Without the resolver,
 	// any authenticated subject can approve — the v0 demo posture
@@ -345,6 +357,30 @@ func (s *Server) fetchGateForStage(ctx context.Context, stage *run.Stage) (*gate
 		return &gateContext{roles: parsed.Roles, installationID: *runRow.InstallationID}, nil
 	}
 	return nil, fmt.Errorf("stage_type %q not in workflow %q", stage.Type, runRow.WorkflowID)
+}
+
+// rejectReviewStageApproval returns a 409 explaining that review-
+// stage approval moved to GitHub per ADR-018 (#311). The error
+// body carries the PR URL when the run row has one stamped so the
+// caller can point a misbehaving client at the right surface.
+//
+// 409 (not 410) because the resource still exists — only the
+// action against this stage type is no longer valid. Plan-stage
+// approvals continue to use the same endpoint.
+func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Request, stage *run.Stage) {
+	details := map[string]any{
+		"stage_id":   stage.ID.String(),
+		"stage_type": string(stage.Type),
+	}
+	if s.cfg.RunRepo != nil {
+		if runRow, err := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); err == nil &&
+			runRow.PullRequestURL != nil {
+			details["pull_request_url"] = *runRow.PullRequestURL
+		}
+	}
+	s.writeError(w, r, http.StatusConflict, "review_stage_managed_by_github",
+		"review-stage approval is recorded from PR-side events (ADR-018); merge or review the PR on GitHub",
+		details)
 }
 
 // writeApprovalAudit appends an entry tying the decision to the

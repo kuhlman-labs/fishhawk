@@ -1392,12 +1392,24 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            `invalid_state_transition` — stage isn't in
-            awaiting_approval. (Pre-#253 the handler also returned
-            409 with `blocking_checks_not_passed` when any declared
-            blocking check wasn't `pass`. ADR-017 / #249 moved that
-            gate to GitHub branch protection; the approval API no
-            longer reads stage_check state.)
+            Possible error codes:
+
+            - `invalid_state_transition` — stage isn't in
+              awaiting_approval. (Pre-#253 the handler also returned
+              409 with `blocking_checks_not_passed` when any declared
+              blocking check wasn't `pass`. ADR-017 / #249 moved that
+              gate to GitHub branch protection; the approval API no
+              longer reads stage_check state.)
+            - `review_stage_managed_by_github` — the target stage is
+              a review stage. ADR-018 / #311 moved review-stage
+              approval onto GitHub: the `pull_request.closed`
+              webhook with `merged=true` transitions the stage;
+              `pull_request_review.submitted` events feed the audit
+              log. Branch protection's required-reviewers is the
+              approver-list mechanism. Response body's `details`
+              includes the run's `pull_request_url` when stamped so
+              the caller knows where the merge gate lives. Plan-
+              stage approvals continue to use this endpoint.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

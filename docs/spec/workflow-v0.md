@@ -119,6 +119,11 @@ Two types:
 - type: check
 ```
 
+**Where `approval` gates enforce** (ADR-018 / #311):
+
+- **Plan stages**: enforced by Fishhawk. The in-Fishhawk approval surface (HTTP `POST /v0/stages/{id}/approvals`, slash commands `/fishhawk approve` / `/fishhawk reject`) reads `approvers` and `sla` and gates the transition. This is the meaningful Fishhawk vote — it approves intent before any code is written; GitHub has no equivalent.
+- **Review stages**: `approvers` is **informational** in v0. Branch protection's required-reviewers is the actual gate; Fishhawk records reviewer activity from `pull_request_review.submitted` events and transitions the review stage to `succeeded` on `pull_request.closed` with `merged=true` (#312). The in-Fishhawk approval API refuses review-stage submissions with `409 review_stage_managed_by_github` and points the caller at the PR. Teams that want strict approver enforcement configure branch protection's required-reviewers.
+
 `blocking_checks` was removed in v0.2 (ADR-017 / #249). Required CI checks are now derived from GitHub branch protection / rulesets at run-create time and snapshotted onto the run row (#251). The `fishhawk_audit_complete` signal is still computed by Fishhawk (#229) and published as a Check Run on the PR (#231) so branch protection can enforce it.
 
 ## On CI failure (auto-retry)
