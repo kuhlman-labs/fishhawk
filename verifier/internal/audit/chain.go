@@ -60,7 +60,18 @@ type HashInputs struct {
 // ComputeEntryHash returns lowercase-hex sha256 of HashInputs
 // marshaled to JSON. Deterministic: same inputs produce the same
 // output across implementations.
+//
+// Timestamp normalization (#302): the backend writes audit rows
+// from `time.Now()`-derived values (nanosecond precision, possibly
+// local timezone). Postgres `timestamptz` stores microsecond
+// precision and `pgx` reads back in the connection's timezone, so
+// the in-memory write-time value and the read-back value differ
+// even though they refer to the same moment. The canonical form
+// for hashing is whatever the database can round-trip losslessly
+// — UTC, microsecond-truncated. The backend ships the same
+// normalization; ADR-008 / #72 keeps the two paths byte-equal.
 func ComputeEntryHash(p HashInputs) (string, error) {
+	p.Timestamp = p.Timestamp.UTC().Truncate(time.Microsecond)
 	canonical, err := json.Marshal(p)
 	if err != nil {
 		return "", fmt.Errorf("verifier: marshal hash inputs: %w", err)

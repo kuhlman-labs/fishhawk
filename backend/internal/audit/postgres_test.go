@@ -327,6 +327,113 @@ func TestPostgres_TriggerBlocksDelete(t *testing.T) {
 
 // --- Global chain tests (E2.7) ---
 
+// TestPostgres_AppendChained_HashRoundTripsThroughDB is the
+// regression test for #302: ComputeEntryHash must produce the same
+// digest from the in-memory timestamp passed to AppendChained AND
+// from the timestamp read back off the row. Before #302 the write
+// hashed a nanosecond-precision UTC `time.Now()` value, but the
+// stored row was microsecond-precision and pgx read it back in the
+// connection's timezone — both sides of the difference broke the
+// round-trip, so verifyChain in auditcomplete always reported
+// chain_invalid on production runs.
+//
+// The fix normalizes the timestamp inside ComputeEntryHash
+// (UTC, microsecond-truncated). This test exercises the full
+// integration boundary the in-memory fakes don't reach.
+func TestPostgres_AppendChained_HashRoundTripsThroughDB(t *testing.T) {
+	pool := startContainer(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	// Use time.Now().UTC() — the same value the dispatcher passes
+	// in production. Carries nanosecond precision (Go default) which
+	// Postgres truncates to microsecond on INSERT.
+	now := time.Now().UTC()
+	subj := "github-webhook"
+	kind := audit.ActorSystem
+	e, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:        runID,
+		Timestamp:    now,
+		Category:     "run_dispatched",
+		ActorKind:    &kind,
+		ActorSubject: &subj,
+		Payload:      json.RawMessage(`{"outcome":"dispatched"}`),
+	})
+	if err != nil {
+		t.Fatalf("AppendChained: %v", err)
+	}
+
+	// Recompute the hash from the read-back row — that's what
+	// auditcomplete.verifyChain does in production.
+	recomputed, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID:        e.RunID,
+		StageID:      e.StageID,
+		Timestamp:    e.Timestamp,
+		Category:     e.Category,
+		ActorKind:    e.ActorKind,
+		ActorSubject: e.ActorSubject,
+		Payload:      e.Payload,
+		PrevHash:     e.PrevHash,
+	})
+	if err != nil {
+		t.Fatalf("ComputeEntryHash: %v", err)
+	}
+	if recomputed != e.EntryHash {
+		t.Fatalf("hash mismatch after DB round-trip:\n  stored:     %s\n  recomputed: %s\n\n"+
+			"This is the bug from #302 — write-time hashed in-memory time, read-back hashed truncated/TZ-shifted time.",
+			e.EntryHash, recomputed)
+	}
+}
+
+// TestComputeEntryHash_NormalizesTimestamp is the unit-test
+// counterpart to the round-trip integration test above (#302). The
+// same logical moment expressed as `time.Now()`, `time.Now().UTC()`,
+// and the read-back-from-DB shape (truncated to microseconds, in
+// a local timezone) MUST all hash to the same value — that's what
+// makes the chain stable across the write/read boundary.
+func TestComputeEntryHash_NormalizesTimestamp(t *testing.T) {
+	runID := uuid.New()
+	payload := json.RawMessage(`{"x":1}`)
+
+	// Pick a moment with nonzero nanoseconds in a non-UTC timezone
+	// so the normalization actually has something to do.
+	loc := time.FixedZone("EDT", -4*3600)
+	base := time.Date(2026, 5, 13, 8, 52, 53, 665435123, loc) // 123 ns past microsecond
+
+	// Variants that all refer to the same logical moment but
+	// differ in their in-memory time.Time representation.
+	variants := []time.Time{
+		base,                                    // local TZ, nano precision
+		base.UTC(),                              // UTC, nano precision (dispatcher's typical input)
+		base.UTC().Truncate(time.Microsecond),   // UTC, micro (post-DB-roundtrip, UTC connection)
+		base.In(loc).Truncate(time.Microsecond), // local TZ, micro (post-DB-roundtrip, local connection)
+	}
+
+	hashes := make(map[string]string, len(variants))
+	for i, v := range variants {
+		h, err := audit.ComputeEntryHash(audit.HashInputs{
+			RunID: &runID, Timestamp: v, Category: "x", Payload: payload,
+		})
+		if err != nil {
+			t.Fatalf("variant %d: %v", i, err)
+		}
+		hashes[v.Format(time.RFC3339Nano)] = h
+	}
+
+	// Every variant must produce the same hash. A regression here
+	// is the same bug #302 reported.
+	var first string
+	for k, h := range hashes {
+		if first == "" {
+			first = h
+			continue
+		}
+		if h != first {
+			t.Errorf("hash divergence for variant %q: got %s, want %s", k, h, first)
+		}
+	}
+}
+
 func TestPostgres_AppendGlobalChained_FirstEntryHasNilPrevHash(t *testing.T) {
 	pool := startContainer(t)
 	repo := audit.NewPostgresRepository(pool)

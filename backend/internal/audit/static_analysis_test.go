@@ -43,6 +43,16 @@ func TestNoAuditMutationsOutsideAuditPackage(t *testing.T) {
 
 	auditPkgRoot := filepath.Join(backendRoot, "internal", "audit")
 	migrationsRoot := filepath.Join(backendRoot, "internal", "postgres", "migrations")
+	// auditrehash is the canonical-hash data-migration package (#302).
+	// It legitimately UPDATEs audit_entries inside a transaction that
+	// temporarily disables the append-only triggers, walking every
+	// chain in sequence order to rewrite entry_hash + prev_hash under
+	// the new canonical form. The append-only invariant is preserved
+	// at every visible boundary — only the rehash transaction
+	// relaxes it, and rollback restores the triggers if anything
+	// fails. Treated like the audit package itself: exempt from the
+	// scan, gated by code review.
+	auditRehashRoot := filepath.Join(backendRoot, "internal", "auditrehash")
 
 	var violations []string
 	walkErr := filepath.WalkDir(backendRoot, func(path string, d fs.DirEntry, err error) error {
@@ -64,6 +74,11 @@ func TestNoAuditMutationsOutsideAuditPackage(t *testing.T) {
 			// level (we checked when authoring 0002), but skip the
 			// dir wholesale to keep the rule unambiguous.
 			if path == migrationsRoot {
+				return filepath.SkipDir
+			}
+			// auditrehash is the one-shot canonical-hash migration
+			// (#302). See comment above the path definition.
+			if path == auditRehashRoot {
 				return filepath.SkipDir
 			}
 			return nil
