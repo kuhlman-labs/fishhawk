@@ -83,18 +83,27 @@ type fakeBackend struct {
 	approvedID   string
 	approvalBody httpclient.SubmitApprovalInput
 
+	// E18.3 / #334 — captures the last retry request.
+	retriedID string
+
 	startResp Run
 	getResp   Run
 	listResp  ListResp
 
 	// approvalResp returned by POST /v0/stages/{id}/approvals
 	approvalResp httpclient.Stage
+	// retryResp returned by POST /v0/stages/{id}/retry
+	retryResp httpclient.Stage
+	// retryErrCode lets a test request a 4xx response with a typed
+	// API code; empty + retryStatus<400 → happy path.
+	retryErrCode string
 
 	startStatus    int
 	getStatus      int
 	listStatus     int
 	stagesStatus   int
 	approvalStatus int
+	retryStatus    int
 }
 
 // Local copies — main.go doesn't import these from the httpclient
@@ -110,6 +119,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		listStatus:     http.StatusOK,
 		stagesStatus:   http.StatusOK,
 		approvalStatus: http.StatusOK,
+		retryStatus:    http.StatusOK,
 		stagesForRun:   map[uuid.UUID][]httpclient.Stage{},
 	}
 	mux := http.NewServeMux()
@@ -157,6 +167,27 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		items := fb.stagesForRun[id]
 		fb.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(httpclient.ListStagesResult{Items: items})
+	})
+	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.retriedID = r.PathValue("stage_id")
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(fb.retryStatus)
+		if fb.retryStatus >= 400 {
+			code := fb.retryErrCode
+			if code == "" {
+				code = "internal_error"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"code":    code,
+					"message": "retry rejected",
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(fb.retryResp)
 	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
 		var in httpclient.SubmitApprovalInput
@@ -490,6 +521,140 @@ func TestRun_UnknownRunSubcommand(t *testing.T) {
 	got := run([]string{"run", "frobnicate"}, io.Discard, &stderr)
 	if got != exitUsage {
 		t.Errorf("status = %d, want exitUsage", got)
+	}
+}
+
+// --- run retry (E18.3 / #334) ---
+
+func TestRunRetry_HappyPath(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	stageID := uuid.New()
+	runID := uuid.New()
+	// Category-A retry path: state flips to dispatched once the
+	// orchestrator hands off workflow_dispatch.
+	fb.retryResp = httpclient.Stage{
+		ID: stageID, RunID: runID, Sequence: 2, Type: "implement",
+		State:    "dispatched",
+		Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"run", "retry", stageID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if fb.retriedID != stageID.String() {
+		t.Errorf("retried stage_id = %s, want %s", fb.retriedID, stageID)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, stageID.String()) {
+		t.Errorf("stdout missing stage id: %s", out)
+	}
+	if !strings.Contains(out, "dispatched") {
+		t.Errorf("stdout missing post-retry state: %s", out)
+	}
+}
+
+func TestRunRetry_NotApplicable_409(t *testing.T) {
+	// retry_not_applicable (e.g. category B or gate-rejected D).
+	// The CLI surfaces the API error code verbatim so operators
+	// can switch on it.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	fb.retryStatus = http.StatusUnprocessableEntity
+	fb.retryErrCode = "retry_not_applicable"
+
+	var stderr strings.Builder
+	got := run([]string{"run", "retry", uuid.New().String()}, io.Discard, &stderr)
+	if got != exitFailure {
+		t.Errorf("status = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), "retry_not_applicable") {
+		t.Errorf("stderr missing api code: %s", stderr.String())
+	}
+}
+
+func TestRunRetry_StageNotFound_404(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	fb.retryStatus = http.StatusNotFound
+	fb.retryErrCode = "stage_not_found"
+
+	var stderr strings.Builder
+	got := run([]string{"run", "retry", uuid.New().String()}, io.Discard, &stderr)
+	if got != exitFailure {
+		t.Errorf("status = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), "stage_not_found") {
+		t.Errorf("stderr missing api code: %s", stderr.String())
+	}
+}
+
+func TestRunRetry_BadUUID(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"run", "retry", "not-a-uuid"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "not a UUID") {
+		t.Errorf("stderr missing 'not a UUID': %s", stderr.String())
+	}
+}
+
+func TestRunRetry_MissingArg(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"run", "retry"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "<stage-id> required") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+}
+
+func TestRunRetry_JSONOutput(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.retryResp = httpclient.Stage{
+		ID: stageID, RunID: runID, Sequence: 2, Type: "implement",
+		State:    "dispatched",
+		Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"run", "retry", "--output", "json", stageID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d", got)
+	}
+	var decoded httpclient.Stage
+	if err := json.NewDecoder(strings.NewReader(stdout.String())).Decode(&decoded); err != nil {
+		t.Fatalf("decode json: %v\nstdout: %s", err, stdout.String())
+	}
+	if decoded.ID != stageID {
+		t.Errorf("ID = %s, want %s", decoded.ID, stageID)
+	}
+	if decoded.State != "dispatched" {
+		t.Errorf("State = %q", decoded.State)
+	}
+}
+
+func TestRunRetry_BadOutputValue(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"run", "retry", "--output", "xml", uuid.New().String()}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "invalid --output") {
+		t.Errorf("stderr missing 'invalid --output': %s", stderr.String())
 	}
 }
 

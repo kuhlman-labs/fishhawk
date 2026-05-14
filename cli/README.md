@@ -13,7 +13,7 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 
 ## Status
 
-E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332) and E18.2 (#333) added `plan approve` and `plan reject`.
+E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334) added `plan approve`, `plan reject`, `run retry`.
 
 ## Subcommands
 
@@ -23,11 +23,14 @@ fishhawk run status   <run-id> [--output text|json]
 fishhawk run list     [--repo R] [--workflow W] [--state S] [--limit N] [--cursor C]
 fishhawk run cancel   <run-id>
 fishhawk run open     <run-id> [--print-url]
+fishhawk run retry    <stage-id> [--output text|json]
 fishhawk plan approve <run-id> [--reason R] [--output text|json]
 fishhawk plan reject  <run-id> [--reason R] [--output text|json]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
 fishhawk version
 ```
+
+`run retry` takes a **stage** id, not a run id — retry is stage-scoped per the state machine. Pick the failed stage from `fishhawk run status <run-id> --output json` (`.stages[].id`).
 
 ## Global flags
 
