@@ -445,6 +445,40 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 	return n.appendStatusAudit(ctx, ctxv, created.ID)
 }
 
+// NotifyStatusUpdateForRun is the convenience entry point transition-
+// point callers use (E20.4 / #330). It loads the run, its stages, and
+// the audit chain for the run, renders the body via RenderStatusBody,
+// and dispatches to NotifyStatusUpdate. Returns nil silently for
+// non-issue triggers so callers at every transition point don't need
+// to branch on TriggerSource.
+//
+// Best-effort: load failures return wrapped errors the caller can
+// log; the post itself follows NotifyStatusUpdate's own best-effort
+// posture (operator-deleted comment → fresh create, idempotent on
+// redelivery, etc.).
+func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error {
+	if n == nil {
+		return nil
+	}
+	runRow, err := n.runs.GetRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: get run: %w", err)
+	}
+	if runRow.TriggerSource != run.TriggerGitHubIssue {
+		return nil
+	}
+	stages, err := n.runs.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: list stages: %w", err)
+	}
+	entries, err := n.audit.ListForRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: list audit: %w", err)
+	}
+	body := RenderStatusBody(runRow, stages, entries, n.externalURL, n.now())
+	return n.NotifyStatusUpdate(ctx, runID, body)
+}
+
 // contextForStatus is the status-comment variant of contextFor — it
 // resolves run + repo + issue without the per-kind dedup check that
 // contextFor enforces. The status comment's "dedup" is "use the

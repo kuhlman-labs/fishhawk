@@ -210,6 +210,12 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
+
+		// Sticky status comment (E20.4 / #330). Every approval —
+		// approve or reject, plan stage or otherwise — changes the
+		// run's surface state and is worth surfacing in the issue
+		// thread.
+		s.notifyStatusUpdate(r.Context(), stage.RunID, "approval_submit")
 	}
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(stage))

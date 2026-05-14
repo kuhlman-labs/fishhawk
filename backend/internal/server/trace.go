@@ -328,6 +328,13 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	if stage.Type == run.StageTypePlan {
 		s.notifyPlanReady(r, runID, stage)
 	}
+
+	// Sticky status comment (E20.4 / #330). Every terminal stage
+	// transition is a state change worth surfacing — plan terminal,
+	// implement terminal, review terminal, etc. The notifier itself
+	// short-circuits for non-issue triggers; for issue triggers it
+	// edits the seeded comment in place.
+	s.notifyStatusUpdate(r.Context(), runID, "trace_handler")
 }
 
 // notifyPlanReady fires the plan-ready comment-back hook after a
@@ -379,6 +386,30 @@ func (s *Server) notifyPlanReady(r *http.Request, runID uuid.UUID, stage *run.St
 			"plan-ready notify: comment-back failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// notifyStatusUpdate is the best-effort sticky-comment hook called
+// from every meaningful transition (E20.4 / #330). The notifier
+// short-circuits for non-issue triggers + handles its own dedup +
+// 404-recovery; here we just call it and log on failure. The state
+// machine is authoritative; the comment is a UI mirror.
+//
+// `source` is a short tag identifying the call site (e.g.
+// "trace_handler", "approval_submit", "pr_merged"). It lands in the
+// log line as a slog attribute so operators tailing logs can pinpoint
+// which transition tripped a notify failure.
+func (s *Server) notifyStatusUpdate(ctx context.Context, runID uuid.UUID, source string) {
+	if s.issueNotifier == nil {
+		return
+	}
+	if err := s.issueNotifier.NotifyStatusUpdateForRun(ctx, runID); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"status comment update failed",
+			slog.String("source", source),
+			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
 	}

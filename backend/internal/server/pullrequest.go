@@ -245,6 +245,12 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	// Sticky status comment (E20.4 / #330). The PR-opened transition
+	// adds the PR URL to the run; the status comment's footer now
+	// surfaces the "Pull request →" link, so an update here is the
+	// signal that lets operators jump to the PR from the issue thread.
+	s.notifyStatusUpdate(r.Context(), runID, "pr_opened")
+
 	s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
 		ID:          created.ID,
 		StageID:     created.StageID,

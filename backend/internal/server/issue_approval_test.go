@@ -77,25 +77,27 @@ func TestHandleApprovalCommand_PlanApprove_PostsOnlyBroadcast(t *testing.T) {
 		t.Errorf("approver = %q, want alice", ar.all[0].ApproverSubject)
 	}
 
-	// Exactly one comment expected: the plan-approved broadcast
-	// (#274). The redundant slash reply is suppressed on the plan-
-	// approve path (#304) so the issue thread sees a single canonical
-	// confirmation.
+	// Two comments expected: the plan-approved broadcast (#274) and
+	// the sticky-status seed (E20.4 / #330). The redundant slash
+	// reply is suppressed on the plan-approve path (#304) so the
+	// issue thread sees a single canonical broadcast confirmation
+	// plus the live-status comment.
 	got := gh.calls()
-	if len(got) != 1 {
-		t.Fatalf("expected 1 comment (plan-approved broadcast only); got %d", len(got))
+	broadcast, status := splitBroadcastAndStatus(got)
+	if broadcast == "" {
+		t.Fatalf("expected a plan-approved broadcast comment; got bodies %v", commentBodies(got))
 	}
-	if !strings.Contains(got[0].body, "Plan approved by") {
-		t.Errorf("broadcast should announce plan approval: %q", got[0].body)
+	if status == "" {
+		t.Fatalf("expected a sticky-status comment; got bodies %v", commentBodies(got))
 	}
-	if !strings.Contains(got[0].body, "@alice") {
-		t.Errorf("plan-approved broadcast should mention approver: %q", got[0].body)
+	if !strings.Contains(broadcast, "@alice") {
+		t.Errorf("plan-approved broadcast should mention approver: %q", broadcast)
 	}
 	// Regression guard for #305: the @login must NOT be wrapped in
 	// backticks — GitHub only fires a mention notification when the
 	// handle is bare.
-	if strings.Contains(got[0].body, "`@") {
-		t.Errorf("plan-approved broadcast must not backtick-wrap the @mention (breaks GitHub notification): %q", got[0].body)
+	if strings.Contains(broadcast, "`@") {
+		t.Errorf("plan-approved broadcast must not backtick-wrap the @mention (breaks GitHub notification): %q", broadcast)
 	}
 }
 
@@ -196,12 +198,24 @@ func TestHandleApprovalCommand_PlanReject_StillPostsSlashReply(t *testing.T) {
 	if stage.State != run.StageStateFailed {
 		t.Errorf("stage state = %q, want failed", stage.State)
 	}
+	// Two comments expected: the slash reply on plan-reject (the
+	// only path that doesn't suppress it in favor of a broadcast)
+	// and the sticky-status update (E20.4 / #330).
 	got := gh.calls()
-	if len(got) != 1 {
-		t.Fatalf("expected exactly 1 comment (slash reply on plan-reject); got %d: %+v", len(got), got)
+	var reply, status string
+	for _, c := range got {
+		switch {
+		case strings.HasPrefix(c.body, "Rejected by "):
+			reply = c.body
+		case strings.Contains(c.body, "Fishhawk run"):
+			status = c.body
+		}
 	}
-	if !strings.HasPrefix(got[0].body, "Rejected by ") {
-		t.Errorf("slash reply should start with 'Rejected by ': %q", got[0].body)
+	if reply == "" {
+		t.Fatalf("expected a 'Rejected by ' slash reply; got bodies %v", commentBodies(got))
+	}
+	if status == "" {
+		t.Fatalf("expected a sticky-status comment; got bodies %v", commentBodies(got))
 	}
 }
 
@@ -450,17 +464,18 @@ func TestHandleApprovalCommand_RepeatAfterAdvance_RepliesNoAwaitingStage(t *test
 	if len(ar.all) != 1 {
 		t.Errorf("approval repo should have one row; got %d", len(ar.all))
 	}
-	// Two comments expected: the first attempt's plan-approved
-	// broadcast (#274), plus the second attempt's "no awaiting
-	// stage" slash reply. The slash reply on the plan-approve path
-	// is suppressed in favor of the broadcast (#304), so the first
-	// attempt posts only one comment.
+	// Three comments expected: the first attempt's plan-approved
+	// broadcast (#274), the first attempt's sticky-status seed
+	// (E20.4 / #330), and the second attempt's "no awaiting stage"
+	// slash reply. The slash reply on the plan-approve path is
+	// suppressed in favor of the broadcast (#304), so the first
+	// attempt posts the broadcast + status; the second never
+	// reaches the status hook because it returns early on the
+	// missing-awaiting-stage branch.
 	calls := gh.calls()
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 comments (1st: broadcast, 2nd: reply); got %d", len(calls))
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 comments (broadcast + status seed + 2nd-attempt reply); got %d: %v", len(calls), commentBodies(calls))
 	}
-	// Order-independent body scan — the second-attempt's reply
-	// must explain that no awaiting stage exists.
 	var noAwaitingReply string
 	for _, c := range calls {
 		if strings.Contains(c.body, "No stage on this issue's run is awaiting approval") {
@@ -468,14 +483,7 @@ func TestHandleApprovalCommand_RepeatAfterAdvance_RepliesNoAwaitingStage(t *test
 		}
 	}
 	if noAwaitingReply == "" {
-		t.Errorf("expected one comment explaining 'no awaiting stage'; got bodies %v",
-			func() []string {
-				out := []string{}
-				for _, c := range calls {
-					out = append(out, c.body)
-				}
-				return out
-			}())
+		t.Errorf("expected one comment explaining 'no awaiting stage'; got bodies %v", commentBodies(calls))
 	}
 }
 
@@ -537,6 +545,32 @@ func TestHandleApprovalCommand_RepoLookupFailure_RepliesGracefully(t *testing.T)
 }
 
 // --- helpers ---
+
+// splitBroadcastAndStatus picks the plan-approved broadcast (the
+// "Plan approved by" comment) and the sticky-status comment (the
+// "Fishhawk run" header) out of a recorded call list. Returns the
+// matched bodies, or empty strings when not found.
+func splitBroadcastAndStatus(calls []slashCommentCall) (broadcast, status string) {
+	for _, c := range calls {
+		switch {
+		case strings.Contains(c.body, "Plan approved by"):
+			broadcast = c.body
+		case strings.Contains(c.body, "Fishhawk run"):
+			status = c.body
+		}
+	}
+	return broadcast, status
+}
+
+// commentBodies returns just the body slice for diagnostics in
+// failed assertions.
+func commentBodies(calls []slashCommentCall) []string {
+	out := make([]string, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, c.body)
+	}
+	return out
+}
 
 type slashCommentCall struct {
 	repo        string
