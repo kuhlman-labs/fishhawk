@@ -86,6 +86,12 @@ type fakeBackend struct {
 	// E18.3 / #334 — captures the last retry request.
 	retriedID string
 
+	// E18.4 / #335 — captures the last audit-list request.
+	auditQuery  string
+	auditRunID  string
+	auditResp   httpclient.ListRunAuditResult
+	auditStatus int
+
 	startResp Run
 	getResp   Run
 	listResp  ListResp
@@ -120,6 +126,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		stagesStatus:   http.StatusOK,
 		approvalStatus: http.StatusOK,
 		retryStatus:    http.StatusOK,
+		auditStatus:    http.StatusOK,
 		stagesForRun:   map[uuid.UUID][]httpclient.Stage{},
 	}
 	mux := http.NewServeMux()
@@ -167,6 +174,24 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		items := fb.stagesForRun[id]
 		fb.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(httpclient.ListStagesResult{Items: items})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/audit", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.auditRunID = r.PathValue("run_id")
+		fb.auditQuery = r.URL.RawQuery
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(fb.auditStatus)
+		if fb.auditStatus >= 400 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"code":    "internal_error",
+					"message": "boom",
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(fb.auditResp)
 	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", func(w http.ResponseWriter, r *http.Request) {
 		fb.mu.Lock()
@@ -521,6 +546,250 @@ func TestRun_UnknownRunSubcommand(t *testing.T) {
 	got := run([]string{"run", "frobnicate"}, io.Discard, &stderr)
 	if got != exitUsage {
 		t.Errorf("status = %d, want exitUsage", got)
+	}
+}
+
+// --- audit list (E18.4 / #335) ---
+
+func auditEntryFixture(seq int64, runID uuid.UUID, category, actor string, payload map[string]any) httpclient.AuditEntry {
+	body, _ := json.Marshal(payload)
+	var actorPtr *string
+	if actor != "" {
+		s := actor
+		actorPtr = &s
+	}
+	return httpclient.AuditEntry{
+		ID: uuid.New(), Sequence: seq, RunID: runID,
+		Timestamp:    time.Date(2026, 5, 14, 12, 0, int(seq), 0, time.UTC),
+		Category:     category,
+		ActorSubject: actorPtr,
+		Payload:      body,
+		EntryHash:    fmt.Sprintf("hash-%d", seq),
+	}
+}
+
+func TestAuditList_HappyPath_TextOutput(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	fb.auditResp = httpclient.ListRunAuditResult{
+		Items: []httpclient.AuditEntry{
+			auditEntryFixture(1, runID, "run_dispatched", "", map[string]any{"kind": "issue"}),
+			auditEntryFixture(2, runID, "plan_generated", "system", map[string]any{"summary": "add a feature"}),
+			auditEntryFixture(3, runID, "approval_submitted", "alice", map[string]any{"decision": "approve"}),
+		},
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"audit", "list", runID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if fb.auditRunID != runID.String() {
+		t.Errorf("audit ran against %s, want %s", fb.auditRunID, runID)
+	}
+	out := stdout.String()
+	for _, want := range []string{"SEQ", "CATEGORY", "ACTOR", "WHEN", "SUMMARY",
+		"run_dispatched", "plan_generated", "approval_submitted",
+		"system", "alice", "approve", "add a feature"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout missing %q\n---\n%s", want, out)
+		}
+	}
+}
+
+func TestAuditList_FiltersForwarded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stageID := uuid.New()
+	fb.auditResp = httpclient.ListRunAuditResult{Items: nil}
+
+	got := run([]string{
+		"audit", "list",
+		"--category", "approval_submitted",
+		"--stage", stageID.String(),
+		"--limit", "25",
+		"--cursor", "abc",
+		runID.String(),
+	}, io.Discard, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	q := fb.auditQuery
+	for _, want := range []string{
+		"category=approval_submitted",
+		"stage_id=" + stageID.String(),
+		"limit=25",
+		"cursor=abc",
+	} {
+		if !strings.Contains(q, want) {
+			t.Errorf("query missing %q: %s", want, q)
+		}
+	}
+}
+
+func TestAuditList_EmptyPage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	fb.auditResp = httpclient.ListRunAuditResult{Items: nil}
+
+	var stdout strings.Builder
+	got := run([]string{"audit", "list", uuid.New().String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d", got)
+	}
+	if !strings.Contains(stdout.String(), "(no audit entries)") {
+		t.Errorf("stdout missing empty-page placeholder: %s", stdout.String())
+	}
+}
+
+func TestAuditList_NextCursorRendered(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	fb.auditResp = httpclient.ListRunAuditResult{
+		Items:      []httpclient.AuditEntry{auditEntryFixture(1, runID, "run_dispatched", "", nil)},
+		NextCursor: "tok-42",
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"audit", "list", runID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d", got)
+	}
+	if !strings.Contains(stdout.String(), "--cursor tok-42") {
+		t.Errorf("stdout missing cursor hint: %s", stdout.String())
+	}
+}
+
+func TestAuditList_JSONOutputIsNDJSON(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	fb.auditResp = httpclient.ListRunAuditResult{
+		Items: []httpclient.AuditEntry{
+			auditEntryFixture(1, runID, "run_dispatched", "system", map[string]any{"kind": "issue"}),
+			auditEntryFixture(2, runID, "plan_generated", "system", map[string]any{"summary": "x"}),
+		},
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"audit", "list", "--output", "json", runID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d", got)
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 NDJSON lines; got %d\n%s", len(lines), stdout.String())
+	}
+	// Each line must round-trip through the AuditEntry shape.
+	for i, line := range lines {
+		var e httpclient.AuditEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("line %d not valid AuditEntry json: %v\n%s", i, err, line)
+		}
+		if e.RunID != runID {
+			t.Errorf("line %d run_id = %s, want %s", i, e.RunID, runID)
+		}
+	}
+}
+
+func TestAuditList_BadUUID(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"audit", "list", "not-a-uuid"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "not a UUID") {
+		t.Errorf("stderr missing 'not a UUID': %s", stderr.String())
+	}
+}
+
+func TestAuditList_BadStageUUID(t *testing.T) {
+	// --stage parses locally; surface a clean error without hitting
+	// the backend.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{
+		"audit", "list",
+		"--stage", "nope",
+		uuid.New().String(),
+	}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "--stage") {
+		t.Errorf("stderr missing --stage diagnostic: %s", stderr.String())
+	}
+	if fb.auditRunID != "" {
+		t.Errorf("backend hit despite local --stage validation failure")
+	}
+}
+
+func TestAuditList_MissingArg(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"audit", "list"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "<run-id> required") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+}
+
+func TestAuditList_ServerError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	fb.auditStatus = http.StatusInternalServerError
+
+	var stderr strings.Builder
+	got := run([]string{"audit", "list", uuid.New().String()}, io.Discard, &stderr)
+	if got != exitFailure {
+		t.Errorf("status = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), "internal_error") {
+		t.Errorf("stderr missing api code: %s", stderr.String())
+	}
+}
+
+func TestAuditList_BadOutputValue(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"audit", "list", "--output", "xml", uuid.New().String()}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "invalid --output") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+}
+
+func TestAudit_UnknownSubcommand(t *testing.T) {
+	var stderr strings.Builder
+	got := run([]string{"audit", "frobnicate"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "unknown subcommand") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+}
+
+func TestAudit_NoSubcommand(t *testing.T) {
+	var stderr strings.Builder
+	got := run([]string{"audit"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "subcommand required") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
 	}
 }
 
