@@ -161,15 +161,20 @@ func TestPullRequestClosed_Merged_TransitionsReviewStageAndAudits(t *testing.T) 
 	}
 }
 
-func TestPullRequestClosed_NotMerged_NoTransitionNoAudit(t *testing.T) {
-	// Closed-without-merging: leave the run alone. The labeler /
-	// operator decides whether to manually intervene.
+func TestPullRequestClosed_NotMerged_CancelsReviewStageAndAudits(t *testing.T) {
+	// ADR-018 follow-up (#316): PR closed without merging signals
+	// the work was abandoned. Cancel the review stage + write a
+	// pr_closed_without_merge audit row naming the closer. The
+	// run-level state becomes `cancelled` once every stage is
+	// terminal (existing state-machine behavior; not asserted
+	// here since the test uses the in-memory fake).
 	runID := uuid.New()
+	reviewStageID := uuid.New()
 	prURL := "https://github.com/x/y/pull/42"
 	rr := &prEventsRunRepo{
 		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
 		stages: map[uuid.UUID][]*run.Stage{
-			runID: {{ID: uuid.New(), RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
 		},
 	}
 	ar := &prEventsAuditRepo{}
@@ -180,16 +185,122 @@ func TestPullRequestClosed_NotMerged_NoTransitionNoAudit(t *testing.T) {
 			"html_url": prURL,
 			"merged":   false,
 			"head":     map[string]any{"sha": "headsha"},
+			"base":     map[string]any{"sha": "basesha"},
+		},
+		"sender": map[string]any{"login": "alice"},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+
+	// Review stage transitioned to cancelled.
+	if len(rr.transitions) != 1 {
+		t.Fatalf("transitions = %d, want 1", len(rr.transitions))
+	}
+	if rr.transitions[0].StageID != reviewStageID {
+		t.Errorf("transition stage_id = %s, want %s (review)",
+			rr.transitions[0].StageID, reviewStageID)
+	}
+	if rr.transitions[0].To != run.StageStateCancelled {
+		t.Errorf("transition.To = %q, want cancelled", rr.transitions[0].To)
+	}
+
+	// pr_closed_without_merge audit row recorded against the run +
+	// review stage.
+	row := findCategory(ar.appended, CategoryPRClosedWithoutMerge)
+	if row == nil {
+		t.Fatalf("missing pr_closed_without_merge audit row; got %v", auditCategories(ar.appended))
+	}
+	if row.RunID != runID {
+		t.Errorf("audit RunID = %s, want %s", row.RunID, runID)
+	}
+	if row.StageID == nil || *row.StageID != reviewStageID {
+		t.Errorf("audit StageID = %v, want %s", row.StageID, reviewStageID)
+	}
+	if row.ActorSubject == nil || *row.ActorSubject != "alice" {
+		t.Errorf("audit ActorSubject = %v, want alice", row.ActorSubject)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(row.Payload, &body); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	if body["head_sha"] != "headsha" || body["closer"] != "alice" {
+		t.Errorf("audit payload missing expected fields: %+v", body)
+	}
+	// No pr_merged row written.
+	if findCategory(ar.appended, CategoryPRMerged) != nil {
+		t.Errorf("unexpected pr_merged row on a non-merge close: %v", auditCategories(ar.appended))
+	}
+}
+
+func TestPullRequestClosed_NotMerged_NoReviewStage_AuditOnlyNoTransition(t *testing.T) {
+	// routine_change-shape runs are implement-only. A close-without-
+	// merge still records the close in the audit log; there's no
+	// review stage to cancel.
+	runID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url": prURL,
+			"merged":   false,
+			"head":     map[string]any{"sha": "h"},
+			"base":     map[string]any{"sha": "b"},
 		},
 		"sender": map[string]any{"login": "alice"},
 	})
 	s.handlePullRequestClosed(context.Background(), payload)
 
 	if len(rr.transitions) != 0 {
-		t.Errorf("transitions = %d, want 0 (no auto-action on non-merge close)", len(rr.transitions))
+		t.Errorf("transitions = %d, want 0 (no review stage)", len(rr.transitions))
 	}
-	if len(ar.appended) != 0 {
-		t.Errorf("audit rows = %d, want 0 (no auto-action on non-merge close)", len(ar.appended))
+	row := findCategory(ar.appended, CategoryPRClosedWithoutMerge)
+	if row == nil {
+		t.Fatalf("expected pr_closed_without_merge row for implement-only run")
+	}
+	if row.StageID != nil {
+		t.Errorf("audit StageID = %v, want nil (no review stage)", row.StageID)
+	}
+}
+
+func TestPullRequestClosed_NotMerged_TransitionFailureLogged_AuditStillWritten(t *testing.T) {
+	// State-machine rejection (e.g., reviewer manually cancelled
+	// the stage first; close webhook lands after) must NOT drop
+	// the pr_closed_without_merge audit row. The close happened
+	// on GitHub regardless of whether Fishhawk can advance the
+	// stage.
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+		transErr: errors.New("state machine refusal"),
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url": prURL,
+			"merged":   false,
+			"head":     map[string]any{"sha": "h"},
+			"base":     map[string]any{"sha": "b"},
+		},
+		"sender": map[string]any{"login": "alice"},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+
+	if findCategory(ar.appended, CategoryPRClosedWithoutMerge) == nil {
+		t.Errorf("pr_closed_without_merge audit row should be written even when transition fails")
 	}
 }
 

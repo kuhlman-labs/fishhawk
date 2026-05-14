@@ -1,4 +1,11 @@
-import { CheckCircle2, ExternalLink, GitMerge, MessageSquare, ShieldAlert } from 'lucide-react';
+import {
+  CheckCircle2,
+  ExternalLink,
+  GitMerge,
+  MessageSquare,
+  ShieldAlert,
+  XCircle,
+} from 'lucide-react';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import type { PullRequestArtifactBody } from '@/api/pull-request';
@@ -126,6 +133,7 @@ function mergeRequiredChecks(
  *   - pr_approved_on_github       → "@x approved"
  *   - pr_review_submitted         → "@x requested changes" / "@x commented" / "@x dismissed"
  *   - pr_merged                   → "@x merged"
+ *   - pr_closed_without_merge     → "@x closed without merging" (#316)
  *
  * Chronological (oldest first; matches how a reviewer scans the
  * PR conversation). Empty list → quiet "no activity yet" copy.
@@ -181,6 +189,7 @@ const PR_ACTIVITY_CATEGORIES = new Set([
   'pr_approved_on_github',
   'pr_review_submitted',
   'pr_merged',
+  'pr_closed_without_merge',
 ]);
 
 function isPRActivity(entry: AuditEntry): boolean {
@@ -190,6 +199,9 @@ function isPRActivity(entry: AuditEntry): boolean {
 function ActivityIcon({ category, payload }: { category: string; payload: unknown }) {
   if (category === 'pr_merged') {
     return <GitMerge className="mt-0.5 size-4 text-violet-600 dark:text-violet-400" aria-hidden />;
+  }
+  if (category === 'pr_closed_without_merge') {
+    return <XCircle className="mt-0.5 size-4 text-neutral-500" aria-hidden />;
   }
   if (category === 'pr_approved_on_github') {
     return (
@@ -216,6 +228,12 @@ function ActivityLine({ entry }: { entry: AuditEntry }) {
       return (
         <p>
           <span className="font-medium">{at}</span> merged the PR
+        </p>
+      );
+    case 'pr_closed_without_merge':
+      return (
+        <p>
+          <span className="font-medium">{at}</span> closed without merging
         </p>
       );
     case 'pr_approved_on_github':

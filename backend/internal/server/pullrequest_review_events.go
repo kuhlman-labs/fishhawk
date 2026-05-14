@@ -32,6 +32,15 @@ const (
 	// dismissed). Same audit-only posture as the approve case;
 	// distinct category lets the SPA render the right verb.
 	CategoryPRReviewSubmitted = "pr_review_submitted"
+	// CategoryPRClosedWithoutMerge records that a Fishhawk-managed
+	// PR was closed without merging (#316). The webhook handler
+	// also cancels the run's review stage after writing this row,
+	// per ADR-018's "closed without merge = abandoned work"
+	// stance — the alternative (leave the stage in awaiting_approval
+	// indefinitely) clutters the dashboard with stale state and
+	// the existing state machine has a clean target (`cancelled`)
+	// reachable from `awaiting_approval`.
+	CategoryPRClosedWithoutMerge = "pr_closed_without_merge"
 )
 
 // pullRequestClosedPayload is the subset of the GitHub
@@ -86,14 +95,14 @@ const reviewBodyExcerptMax = 280
 // handlePullRequestClosed handles `pull_request.closed` events.
 // When merged=true, transitions the matching Fishhawk run's review
 // stage to succeeded (ADR-018 / #311) and writes a pr_merged audit
-// row naming the merger. When merged=false (closed without merging),
-// logs and skips — v0 doesn't auto-cancel runs; the operator
-// decides whether to manually intervene.
+// row naming the merger. When merged=false (closed without merging,
+// #316), transitions the review stage to cancelled and writes a
+// pr_closed_without_merge row naming the closer.
 //
 // Best-effort throughout: a parse failure, a missing run, or a
 // non-Fishhawk-managed PR all log and return without surfacing as
 // a 5xx. Idempotent on redeliveries: TransitionStage is a no-op on
-// an already-succeeded stage.
+// an already-terminal stage.
 func (s *Server) handlePullRequestClosed(ctx context.Context, raw []byte) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		return
@@ -115,15 +124,7 @@ func (s *Server) handlePullRequestClosed(ctx context.Context, raw []byte) {
 	}
 
 	if !p.PullRequest.Merged {
-		// Closed without merging. v0 leaves the run alone — the
-		// review stage stays awaiting_approval so the operator sees
-		// the run is stuck and can manually cancel via the SPA /
-		// API. File a follow-up if customers want auto-cancel here.
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"pull_request.closed: not merged; no state change",
-			slog.String("pr_url", prURL),
-			slog.String("run_id", target.ID.String()),
-			slog.String("sender", p.Sender.Login))
+		s.handlePullRequestClosedWithoutMerge(ctx, target, p)
 		return
 	}
 
@@ -274,6 +275,84 @@ func (s *Server) findReviewStage(ctx context.Context, runID uuid.UUID) *run.Stag
 		}
 	}
 	return nil
+}
+
+// handlePullRequestClosedWithoutMerge is the merged=false branch of
+// `pull_request.closed` (#316). Audit + cancel: write a
+// pr_closed_without_merge row naming the closer, then transition
+// the review stage to cancelled. Runs that don't have a review
+// stage (routine_change-shape) still get the audit row; nothing
+// to transition. Idempotent — the state machine treats a
+// terminal-state transition as a no-op when the stage is already
+// cancelled.
+//
+// Reopening is intentionally out of scope: the cancelled stage is
+// terminal. If a reviewer reopens the PR and wants Fishhawk
+// involved again, they re-trigger via `/fishhawk run` on the
+// issue; the new run threads off the cancelled parent via the
+// `parent_run_id` lineage primitive (#216).
+func (s *Server) handlePullRequestClosedWithoutMerge(ctx context.Context, target *run.Run, p pullRequestClosedPayload) {
+	reviewStage := s.findReviewStage(ctx, target.ID)
+	var stageID *uuid.UUID
+	if reviewStage != nil {
+		stageID = &reviewStage.ID
+	}
+	// Audit row first — if the transition fails (state machine
+	// reject) we still want the close recorded.
+	s.writePRClosedWithoutMergeAudit(ctx, target.ID, stageID, p)
+
+	if reviewStage == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"pull_request.closed: not merged; no review stage on run; audit-only",
+			slog.String("pr_url", p.PullRequest.HTMLURL),
+			slog.String("run_id", target.ID.String()),
+			slog.String("closer", p.Sender.Login))
+		return
+	}
+	if _, err := s.cfg.RunRepo.TransitionStage(ctx,
+		reviewStage.ID, run.StageStateCancelled, nil); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"pull_request.closed: review-stage cancel transition failed",
+			slog.String("run_id", target.ID.String()),
+			slog.String("stage_id", reviewStage.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+		"pull_request.closed: review stage cancelled (PR closed without merging)",
+		slog.String("pr_url", p.PullRequest.HTMLURL),
+		slog.String("run_id", target.ID.String()),
+		slog.String("stage_id", reviewStage.ID.String()),
+		slog.String("closer", p.Sender.Login),
+	)
+}
+
+// writePRClosedWithoutMergeAudit appends a pr_closed_without_merge
+// audit row naming the closer (the `sender.login` on the event;
+// closed-without-merge events don't populate `merged_by`).
+func (s *Server) writePRClosedWithoutMergeAudit(ctx context.Context, runID uuid.UUID, stageID *uuid.UUID, p pullRequestClosedPayload) {
+	closer := p.Sender.Login
+	payload, _ := json.Marshal(map[string]any{
+		"pr_url":   p.PullRequest.HTMLURL,
+		"closer":   closer,
+		"head_sha": p.PullRequest.Head.SHA,
+		"base_sha": p.PullRequest.Base.SHA,
+	})
+	systemKind := audit.ActorKind("user")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryPRClosedWithoutMerge,
+		ActorKind:    &systemKind,
+		ActorSubject: &closer,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+			"pull_request.closed: pr_closed_without_merge audit append failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // writePRMergedAudit appends a pr_merged audit row. Called from
