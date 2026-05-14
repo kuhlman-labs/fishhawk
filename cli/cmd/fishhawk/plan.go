@@ -19,13 +19,15 @@ import (
 // already use, including the terminal.
 func runPlan(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(stderr, `fishhawk plan: subcommand required (approve)`)
+		_, _ = fmt.Fprintln(stderr, `fishhawk plan: subcommand required (approve|reject)`)
 		return exitUsage
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "approve":
 		return planApprove(rest, stdout, stderr)
+	case "reject":
+		return planReject(rest, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "fishhawk plan: unknown subcommand %q\n", sub)
 		return exitUsage
@@ -33,71 +35,115 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 }
 
 // planApprove implements `fishhawk plan approve <run-id> [--reason ...] [--output text|json]`.
-// Resolves the plan stage from the run id (the operator-facing
-// identifier; the SPA exposes stages only as nested sub-routes), then
-// POSTs the approval. Mirrors the slash-command flow's resolution
-// logic so the same "no plan stage awaiting approval" condition
-// surfaces with the same error.
+// Resolves the plan stage from the run id and POSTs an approve
+// decision.
 func planApprove(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("fishhawk plan approve", flag.ContinueOnError)
+	return planDecision("fishhawk plan approve", httpclient.ApprovalApprove,
+		args, stdout, stderr)
+}
+
+// planReject implements `fishhawk plan reject <run-id> [--reason ...] [--output text|json]`.
+// Same flow as planApprove but submits a reject decision, which the
+// state machine resolves as a category-D stage failure.
+//
+// The CLI emits a soft warning (to stderr, doesn't change the exit
+// code) when --reason is omitted: rejection without a recorded
+// rationale is allowed but the audit row would have an empty
+// comment, which is unhelpful for the requester reading back what
+// changed.
+func planReject(args []string, stdout, stderr io.Writer) int {
+	return planDecision("fishhawk plan reject", httpclient.ApprovalReject,
+		args, stdout, stderr)
+}
+
+// planDecision is the shared body of `plan approve` / `plan reject`.
+// It owns flag parsing, run-id validation, plan-stage resolution,
+// the approvals POST, and output formatting. The two verbs differ
+// only in the decision passed to SubmitApproval and the soft-warning
+// behavior reject opts into for missing --reason.
+func planDecision(name string, decision httpclient.ApprovalDecision, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cf := bindCommonFlags(fs)
-	reason := fs.String("reason", "", "optional approval comment recorded on the approval row")
+	reason := fs.String("reason", "", "optional comment recorded on the approval row")
 	outputFmt := fs.String("output", "text", "output format: text | json")
 	fs.StringVar(outputFmt, "o", "text", "output format: text | json (shorthand)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if err := validateOutputFormat(*outputFmt); err != nil {
-		_, _ = fmt.Fprintf(stderr, "fishhawk plan approve: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", name, err)
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		_, _ = fmt.Fprintln(stderr, "fishhawk plan approve: <run-id> required")
+		_, _ = fmt.Fprintf(stderr, "%s: <run-id> required\n", name)
 		return exitUsage
 	}
 	runID, err := uuid.Parse(fs.Arg(0))
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "fishhawk plan approve: %q is not a UUID: %v\n", fs.Arg(0), err)
+		_, _ = fmt.Fprintf(stderr, "%s: %q is not a UUID: %v\n", name, fs.Arg(0), err)
 		return exitUsage
+	}
+	if decision == httpclient.ApprovalReject && *reason == "" {
+		// Soft warning. Reject without a reason is wire-legal but
+		// produces an audit row whose comment is empty, leaving the
+		// requester guessing why the plan got blocked. Don't fail
+		// the command — operators sometimes legitimately want a
+		// silent reject (e.g. scripted clean-up) — but make the
+		// loss visible.
+		_, _ = fmt.Fprintf(stderr,
+			"%s: warning: --reason not provided; the approval row will record an empty comment\n", name)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
 	defer cancel()
 	client := newClient(cf)
 
-	stages, err := client.ListRunStages(ctx, runID)
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "fishhawk plan approve: list stages: %v\n", err)
-		return exitOnAPIError(err)
-	}
-	planStage := findAwaitingApprovalPlanStage(stages.Items)
+	planStage, exitCode := resolvePlanStage(ctx, client, name, runID, stderr)
 	if planStage == nil {
-		_, _ = fmt.Fprintf(stderr,
-			"fishhawk plan approve: run %s has no plan stage awaiting approval (check `fishhawk run status %s`)\n",
-			runID, runID)
-		return exitFailure
+		return exitCode
 	}
 
 	stage, err := client.SubmitApproval(ctx, planStage.ID, httpclient.SubmitApprovalInput{
-		Decision: httpclient.ApprovalApprove,
+		Decision: decision,
 		Comment:  *reason,
 	})
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "fishhawk plan approve: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", name, err)
 		return exitOnAPIError(err)
 	}
 
 	switch *outputFmt {
 	case "json":
 		if err := json.NewEncoder(stdout).Encode(stage); err != nil {
-			_, _ = fmt.Fprintf(stderr, "fishhawk plan approve: encode: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "%s: encode: %v\n", name, err)
 			return exitFailure
 		}
 	default:
 		printStage(stdout, stage)
 	}
 	return exitOK
+}
+
+// resolvePlanStage finds the plan stage that's awaiting approval on
+// the given run. Returns (stage, exitOK) on success; (nil, exitCode)
+// when no awaiting-approval plan stage exists or the list call
+// failed. Centralized so plan approve / plan reject (and any future
+// plan-* verbs) share the same lookup + error wording.
+func resolvePlanStage(ctx context.Context, client *httpclient.Client, name string, runID uuid.UUID, stderr io.Writer) (*httpclient.Stage, int) {
+	stages, err := client.ListRunStages(ctx, runID)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: list stages: %v\n", name, err)
+		return nil, exitOnAPIError(err)
+	}
+	planStage := findAwaitingApprovalPlanStage(stages.Items)
+	if planStage == nil {
+		_, _ = fmt.Fprintf(stderr,
+			"%s: run %s has no plan stage awaiting approval (check `fishhawk run status %s`)\n",
+			name, runID, runID)
+		return nil, exitFailure
+	}
+	return planStage, exitOK
 }
 
 // findAwaitingApprovalPlanStage walks the stage list (sequence

@@ -9,6 +9,7 @@
 //	fishhawk run cancel   <run-id>
 //	fishhawk run open     <run-id>
 //	fishhawk plan approve <run-id> [--reason ...] [--output text|json]
+//	fishhawk plan reject  <run-id> [--reason ...] [--output text|json]
 //
 // Auth is the same `bearerToken` scheme defined in the OpenAPI:
 // CLI sends `Authorization: Bearer <token>` from --token /
@@ -93,6 +94,7 @@ func printUsage(w io.Writer) {
 		"  run cancel   Cancel an in-flight run.",
 		"  run open     Open a run's detail page in the browser.",
 		"  plan approve Approve the plan stage on a run.",
+		"  plan reject  Reject the plan stage on a run (category-D failure).",
 		"  validate     Validate a workflow spec file locally.",
 		"  version      Print the CLI version and exit.",
 		"  help         Show this help.",
