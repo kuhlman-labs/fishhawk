@@ -54,6 +54,9 @@ type fakeGitHub struct {
 	createIssueCommentStatus int
 	createIssueCommentBody   string
 
+	updateIssueCommentStatus int
+	updateIssueCommentBody   string
+
 	getWorkflowRunStatus int
 	getWorkflowRunBody   string
 
@@ -92,6 +95,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		createCheckRunBody:        `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
 		createIssueCommentStatus:  http.StatusCreated,
 		createIssueCommentBody:    `{"id":11111}`,
+		updateIssueCommentStatus:  http.StatusOK,
+		updateIssueCommentBody:    `{"id":11111,"body":"edited body","html_url":"https://github.com/x/y/issues/17#issuecomment-11111"}`,
 		getWorkflowRunStatus:      http.StatusOK,
 		getWorkflowRunBody:        `{"id":987654321,"html_url":"https://github.com/x/y/actions/runs/987654321","conclusion":"failure","status":"completed","event":"workflow_dispatch","head_branch":"main","head_sha":"abc","inputs":{"stage_id":"22222222-2222-2222-2222-222222222222","run_id":"11111111-1111-1111-1111-111111111111"}}`,
 		getBranchProtectionStatus: http.StatusOK,
@@ -164,6 +169,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.createIssueCommentStatus)
 			if fg.createIssueCommentBody != "" {
 				_, _ = io.WriteString(w, fg.createIssueCommentBody)
+			}
+		})
+
+	mux.HandleFunc("PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.updateIssueCommentStatus)
+			if fg.updateIssueCommentBody != "" {
+				_, _ = io.WriteString(w, fg.updateIssueCommentBody)
 			}
 		})
 
@@ -868,6 +883,95 @@ func TestCreateIssueComment_GitHubError(t *testing.T) {
 	c, _ := newTestClient(t, srv, nil)
 
 	err := c.CreateIssueComment(context.Background(), 1,
+		RepoRef{Owner: "x", Name: "y"}, 1, "hi")
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v want ErrForbidden", err)
+	}
+}
+
+// --- UpdateIssueComment (E20.1 / #327, ADR-019) ---
+
+func TestUpdateIssueComment_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.UpdateIssueComment(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 11111, "edited body")
+	if err != nil {
+		t.Fatalf("UpdateIssueComment: %v", err)
+	}
+	if fg.gotMethod != http.MethodPatch {
+		t.Errorf("method = %q want PATCH", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/issues/comments/11111" {
+		t.Errorf("path = %q", fg.gotPath)
+	}
+	if fg.gotContentType != "application/json" {
+		t.Errorf("content-type = %q", fg.gotContentType)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if body["body"] != "edited body" {
+		t.Errorf("request body[\"body\"] = %q", body["body"])
+	}
+	// Returned struct mirrors the PATCH response body so callers can
+	// verify the edit landed (e.g., assert html_url matches the
+	// original comment).
+	if got == nil || got.ID != 11111 || got.Body != "edited body" ||
+		got.HTMLURL != "https://github.com/x/y/issues/17#issuecomment-11111" {
+		t.Errorf("returned IssueComment = %+v", got)
+	}
+}
+
+func TestUpdateIssueComment_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		commentID int64
+		body      string
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, 1, "x", "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, 1, "x", "owner and name"},
+		{"zero comment id", RepoRef{Owner: "x", Name: "y"}, 0, "x", "comment id must be"},
+		{"empty body", RepoRef{Owner: "x", Name: "y"}, 1, "", "body must be non-empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.UpdateIssueComment(context.Background(), 1, tc.repo, tc.commentID, tc.body)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestUpdateIssueComment_NotFound(t *testing.T) {
+	// Operator deleted the comment between Create and Update. The
+	// 404 maps to ErrNotFound so the caller (E20.2's NotifyStatusUpdate)
+	// can fall back to creating a fresh comment.
+	fg, srv := newFakeGitHub(t)
+	fg.updateIssueCommentStatus = http.StatusNotFound
+	fg.updateIssueCommentBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.UpdateIssueComment(context.Background(), 1,
+		RepoRef{Owner: "x", Name: "y"}, 9999, "edited")
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v want ErrNotFound", err)
+	}
+}
+
+func TestUpdateIssueComment_Forbidden(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.updateIssueCommentStatus = http.StatusForbidden
+	fg.updateIssueCommentBody = `{"message":"Resource not accessible by integration"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.UpdateIssueComment(context.Background(), 1,
 		RepoRef{Owner: "x", Name: "y"}, 1, "hi")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v want ErrForbidden", err)
