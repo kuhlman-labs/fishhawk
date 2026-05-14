@@ -544,6 +544,133 @@ func TestHandleApprovalCommand_RepoLookupFailure_RepliesGracefully(t *testing.T)
 	}
 }
 
+// --- reply-comment approval (E17.3 / #338) ---
+
+// TestHandleApprovalCommand_ReplyComment_NoAwaitingStage_SkipsSilently
+// locks in the core E17.3 contract: when source is ReplyComment, an
+// "issue has no awaiting-approval plan stage" condition does NOT
+// produce an unsolicited reply. The operator's "+1" might have been
+// agreeing with another comment unrelated to Fishhawk.
+func TestHandleApprovalCommand_ReplyComment_NoAwaitingStage_SkipsSilently(t *testing.T) {
+	rr := newOrchestratorRepo()
+	// No run for this issue — findAwaitingApprovalStage returns
+	// found=false.
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+		Source:         webhook.ApprovalSourceReplyComment,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gh.calls(); len(got) != 0 {
+		t.Errorf("reply-comment with no awaiting stage should produce no reply; got %d: %v",
+			len(got), commentBodies(got))
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("no approval row should be written; got %+v", ar.all)
+	}
+}
+
+// TestHandleApprovalCommand_ReplyComment_ReviewStage_SkipsSilently
+// covers the second silent-skip branch: when the awaiting stage is
+// a review (not plan), the reply-comment path skips rather than
+// posting the review-stage help reply. ADR-018 owns the review
+// approval surface; a generic "+1" on the issue thread isn't
+// scoped to that.
+func TestHandleApprovalCommand_ReplyComment_ReviewStage_SkipsSilently(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+	prURL := "https://github.com/x/y/pull/42"
+	r.PullRequestURL = &prURL
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypeReview
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+		Source:   webhook.ApprovalSourceReplyComment,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gh.calls(); len(got) != 0 {
+		t.Errorf("reply-comment on review stage should produce no reply; got %d: %v",
+			len(got), commentBodies(got))
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("no approval row should be written; got %+v", ar.all)
+	}
+}
+
+// TestHandleApprovalCommand_SlashCommand_NoAwaitingStage_StillReplies
+// is the inverse regression: the silent-skip behavior is gated on
+// Source=ReplyComment, NOT a behavior change for the slash path.
+// Slash commands keep their explicit help replies.
+func TestHandleApprovalCommand_SlashCommand_NoAwaitingStage_StillReplies(t *testing.T) {
+	rr := newOrchestratorRepo()
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+		Source:   webhook.ApprovalSourceSlash, // explicit slash → loud reply
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := gh.calls()
+	if len(got) != 1 {
+		t.Fatalf("slash path should still post an explicit reply; got %d", len(got))
+	}
+	if !strings.Contains(got[0].body, "No stage on this issue's run is awaiting approval") {
+		t.Errorf("reply should explain no-awaiting-stage: %q", got[0].body)
+	}
+}
+
 // --- helpers ---
 
 // splitBroadcastAndStatus picks the plan-approved broadcast (the

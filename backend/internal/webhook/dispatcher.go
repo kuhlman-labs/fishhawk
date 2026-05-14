@@ -27,6 +27,33 @@ const FishhawkLabel = "fishhawk"
 // from an issue or PR comment.
 const CommentTrigger = "/fishhawk run"
 
+// ApprovalSource identifies which `issue_comment` matcher produced
+// a MatchActionApprove. The downstream handler branches on this:
+// slash-command approvals error loudly when no awaiting plan stage
+// exists (the reviewer typed an explicit command); reply-comment
+// approvals skip silently (the reviewer may have been replying to
+// something else on the same issue thread).
+//
+// E17.3 / #338 introduced ApprovalSourceReplyComment after a
+// late-discovery during impl: GitHub does not fire webhooks for
+// reactions on issue comments (verified at
+// https://docs.github.com/en/webhooks/webhook-events-and-payloads).
+// ADR-020 / #321 pivoted to reply-comment patterns as the primary
+// "lightweight" approval surface; a polling worker (E17.3b / #360)
+// will catch the click-only-thumbs-up case as a follow-up.
+type ApprovalSource string
+
+// ApprovalSource values.
+const (
+	// ApprovalSourceSlash tags the explicit `/fishhawk approve` /
+	// `/fishhawk reject` slash-command path (E5.2 / #238).
+	ApprovalSourceSlash ApprovalSource = "slash"
+	// ApprovalSourceReplyComment tags the reply-pattern path
+	// (E17.3 / #338): `+1`, `👍`, `lgtm`, etc. as a fresh comment
+	// on the issue thread. No explicit slash, no required prefix.
+	ApprovalSourceReplyComment ApprovalSource = "reply_comment"
+)
+
 // CommentApprove and CommentReject are the chat-style commands that
 // submit a gate decision against an issue's currently-awaiting-
 // approval stage (#238). The reviewer can leave an optional comment
@@ -36,6 +63,25 @@ const (
 	CommentApprove = "/fishhawk approve"
 	CommentReject  = "/fishhawk reject"
 )
+
+// approvalReplyPatterns is the closed set of body prefixes that
+// approve a plan comment without requiring an explicit slash
+// command (E17.3 / #338). Matched case-insensitively against the
+// trimmed body's first token. ADR-020 / #321 picked these because
+// they are the conventions developers already use on GitHub PRs and
+// issues; nothing here is Fishhawk-specific.
+//
+// A pattern matches when the body's first whitespace-delimited
+// token equals one of these (case-insensitive). Trailing text
+// becomes the optional comment. Bodies that contain the token
+// elsewhere ("Should we lgtm this?") do NOT match — the pattern
+// must anchor the body, same posture as the slash-command matcher.
+var approvalReplyPatterns = []string{
+	"+1",
+	"👍",
+	":+1:",
+	"lgtm",
+}
 
 // MatchAction tags how a matched event should be handled. Run is
 // the historical default (create + workflow_dispatch); approve and
@@ -102,6 +148,15 @@ type Match struct {
 	// approve / reject so the approval row's `comment` column gets
 	// the reviewer's rationale.
 	CommentBody string
+
+	// ApprovalSource identifies which `issue_comment` matcher
+	// produced a MatchActionApprove (E17.3 / #338). Empty means the
+	// slash-command path (default; backwards-compat). The
+	// reply-comment path sets it to ApprovalSourceReplyComment so
+	// the downstream handler knows to skip silently when no
+	// awaiting plan stage exists (a generic `+1` reply isn't an
+	// error if the issue happens not to have a Fishhawk plan).
+	ApprovalSource ApprovalSource
 
 	// WorkflowRunID is the GitHub Actions run id from a
 	// `workflow_run.completed` event. Set for
@@ -250,19 +305,21 @@ func matchIssueComment(ev Event) Match {
 	switch {
 	case isCommand(body, CommentApprove):
 		return Match{
-			Action:        MatchActionApprove,
-			TriggerSource: run.TriggerGitHubIssue,
-			TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
-			IssueRef:      &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
-			CommentBody:   trailingComment(body, CommentApprove),
+			Action:         MatchActionApprove,
+			ApprovalSource: ApprovalSourceSlash,
+			TriggerSource:  run.TriggerGitHubIssue,
+			TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.Number),
+			IssueRef:       &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
+			CommentBody:    trailingComment(body, CommentApprove),
 		}
 	case isCommand(body, CommentReject):
 		return Match{
-			Action:        MatchActionReject,
-			TriggerSource: run.TriggerGitHubIssue,
-			TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
-			IssueRef:      &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
-			CommentBody:   trailingComment(body, CommentReject),
+			Action:         MatchActionReject,
+			ApprovalSource: ApprovalSourceSlash,
+			TriggerSource:  run.TriggerGitHubIssue,
+			TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.Number),
+			IssueRef:       &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
+			CommentBody:    trailingComment(body, CommentReject),
 		}
 	case isCommand(body, CommentTrigger):
 		return Match{
@@ -273,9 +330,63 @@ func matchIssueComment(ev Event) Match {
 			IssueRef:      &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
 		}
 	}
+	// Reply-comment approval (E17.3 / #338). Tried after the slash
+	// matches so an explicit "/fishhawk approve lgtm" still routes
+	// through the slash path. Patterns are anchored at the start of
+	// the body, same shape as isCommand. Reject reply patterns are
+	// intentionally absent: the rejection conventions ("-1", "👎")
+	// have weaker industry consensus and a typed-reply reject lacks
+	// the slash command's explicit-confirmation property; reviewers
+	// wanting to reject use the slash command or the dashboard.
+	if pat, trailing, ok := matchApprovalReplyPattern(body); ok {
+		_ = pat
+		return Match{
+			Action:         MatchActionApprove,
+			ApprovalSource: ApprovalSourceReplyComment,
+			TriggerSource:  run.TriggerGitHubIssue,
+			TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.Number),
+			IssueRef:       &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
+			CommentBody:    trailing,
+		}
+	}
 	return Match{Skip: true,
-		Reason: fmt.Sprintf("comment does not start with a Fishhawk command (recognized: %q, %q, %q)",
+		Reason: fmt.Sprintf("comment does not start with a Fishhawk command (recognized: %q, %q, %q) or an approval-reply pattern",
 			CommentTrigger, CommentApprove, CommentReject)}
+}
+
+// matchApprovalReplyPattern returns the matched pattern + trailing
+// text + ok when body's first token is one of approvalReplyPatterns.
+// Token matching is case-insensitive; only the literal token must
+// match — surrounding whitespace and trailing text are fine.
+//
+// Examples (all match):
+//   - "+1"            → pat="+1",  trailing=""
+//   - "+1 looks good" → pat="+1",  trailing="looks good"
+//   - "LGTM"          → pat="lgtm", trailing=""
+//   - "👍"             → pat="👍",  trailing=""
+//
+// Examples (no match):
+//   - "Should we lgtm this?"  → pattern is not the first token
+//   - "+10 percent improvement" → first token "+10" isn't in the
+//     pattern list (we don't substring-match)
+func matchApprovalReplyPattern(body string) (pattern, trailing string, ok bool) {
+	if body == "" {
+		return "", "", false
+	}
+	// Split on the first whitespace boundary; first chunk is the
+	// candidate token, second (if present) is the trailing comment.
+	first, rest, _ := strings.Cut(body, " ")
+	// Body might use \n / \t / etc. as the boundary; normalize.
+	if idx := strings.IndexAny(first, "\t\n\r"); idx >= 0 {
+		rest = strings.TrimLeft(first[idx:]+" "+rest, "\t\n\r ")
+		first = first[:idx]
+	}
+	for _, pat := range approvalReplyPatterns {
+		if strings.EqualFold(first, pat) {
+			return pat, strings.TrimSpace(rest), true
+		}
+	}
+	return "", "", false
 }
 
 // isCommand returns true when body starts with command followed by
@@ -563,6 +674,12 @@ type ApprovalCommandParams struct {
 	SenderLogin    string
 	Decision       MatchAction // approve | reject
 	Comment        string      // optional reviewer rationale (the trailing line on the slash command)
+	// Source identifies which matcher produced this. The handler
+	// branches on it: slash-command approvals surface a help reply
+	// when no awaiting plan stage exists; reply-comment approvals
+	// (E17.3 / #338) skip silently (the comment may have been
+	// unrelated to a Fishhawk plan).
+	Source ApprovalSource
 }
 
 // Dispatcher orchestrates the I/O side: it consumes a Match,
@@ -929,6 +1046,7 @@ func (d *Dispatcher) handleApprovalCommand(ctx context.Context, ev Event, m Matc
 		SenderLogin:    ev.Sender,
 		Decision:       m.Action,
 		Comment:        m.CommentBody,
+		Source:         m.ApprovalSource,
 	}); err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
 			"slash-command approval failed",
