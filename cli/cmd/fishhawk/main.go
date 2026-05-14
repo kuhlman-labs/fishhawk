@@ -11,6 +11,7 @@
 //	fishhawk run retry    <stage-id> [--output text|json]
 //	fishhawk plan approve <run-id> [--reason ...] [--output text|json]
 //	fishhawk plan reject  <run-id> [--reason ...] [--output text|json]
+//	fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
 //
 // Auth is the same `bearerToken` scheme defined in the OpenAPI:
 // CLI sends `Authorization: Bearer <token>` from --token /
@@ -55,6 +56,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runRun(rest, stdout, stderr)
 	case "plan":
 		return runPlan(rest, stdout, stderr)
+	case "audit":
+		return runAudit(rest, stdout, stderr)
 	case "validate":
 		return runValidate(rest, stdout, stderr)
 	case "version", "--version":
@@ -97,6 +100,7 @@ func printUsage(w io.Writer) {
 		"  run retry    Retry a failed stage (takes a stage id, not a run id).",
 		"  plan approve Approve the plan stage on a run.",
 		"  plan reject  Reject the plan stage on a run (category-D failure).",
+		"  audit list   List audit entries for a run.",
 		"  validate     Validate a workflow spec file locally.",
 		"  version      Print the CLI version and exit.",
 		"  help         Show this help.",

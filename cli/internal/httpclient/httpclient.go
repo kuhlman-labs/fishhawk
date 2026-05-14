@@ -240,6 +240,69 @@ func (c *Client) SubmitApproval(ctx context.Context, stageID uuid.UUID, in Submi
 	return &stage, nil
 }
 
+// AuditEntry is the CLI-side projection of the OpenAPI AuditEntry
+// schema. Payload is left as raw JSON so the CLI can render or pass
+// through whatever shape a given category emits — categories grow
+// over time and the CLI shouldn't need to track each one.
+type AuditEntry struct {
+	ID           uuid.UUID       `json:"id"`
+	Sequence     int64           `json:"sequence"`
+	RunID        uuid.UUID       `json:"run_id"`
+	StageID      *uuid.UUID      `json:"stage_id"`
+	Timestamp    time.Time       `json:"ts"`
+	Category     string          `json:"category"`
+	ActorKind    *string         `json:"actor_kind"`
+	ActorSubject *string         `json:"actor_subject"`
+	Payload      json.RawMessage `json:"payload"`
+	PrevHash     *string         `json:"prev_hash"`
+	EntryHash    string          `json:"entry_hash"`
+}
+
+// ListRunAuditFilter scopes a ListRunAudit call. Empty values are
+// dropped from the query string; zero Limit lets the server pick its
+// default (50, per the OpenAPI default; 500 max).
+type ListRunAuditFilter struct {
+	Category string
+	StageID  string
+	Limit    int
+	Cursor   string
+}
+
+// ListRunAuditResult is the paginated response envelope.
+type ListRunAuditResult struct {
+	Items      []AuditEntry `json:"items"`
+	NextCursor string       `json:"next_cursor"`
+}
+
+// ListRunAudit calls GET /v0/runs/{run_id}/audit with optional
+// category / stage / pagination filters. Entries come back
+// sequence-ascending; the cursor stays opaque to the CLI — the
+// server defines its encoding.
+func (c *Client) ListRunAudit(ctx context.Context, runID uuid.UUID, f ListRunAuditFilter) (*ListRunAuditResult, error) {
+	q := url.Values{}
+	if f.Category != "" {
+		q.Set("category", f.Category)
+	}
+	if f.StageID != "" {
+		q.Set("stage_id", f.StageID)
+	}
+	if f.Limit > 0 {
+		q.Set("limit", strconv.Itoa(f.Limit))
+	}
+	if f.Cursor != "" {
+		q.Set("cursor", f.Cursor)
+	}
+	path := "/v0/runs/" + runID.String() + "/audit"
+	if encoded := q.Encode(); encoded != "" {
+		path = path + "?" + encoded
+	}
+	var res ListRunAuditResult
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // RetryStage calls POST /v0/stages/{stage_id}/retry. The response is
 // the post-retry Stage — typically `dispatched` after orchestrator
 // handoff for category A/C, or `awaiting_approval` for the
