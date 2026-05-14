@@ -240,6 +240,20 @@ func (c *Client) SubmitApproval(ctx context.Context, stageID uuid.UUID, in Submi
 	return &stage, nil
 }
 
+// RetryStage calls POST /v0/stages/{stage_id}/retry. The response is
+// the post-retry Stage — typically `dispatched` after orchestrator
+// handoff for category A/C, or `awaiting_approval` for the
+// D-timeout path. Server-side rejections (non-failed stage,
+// non-retryable failure category) surface as *APIError with the
+// envelope's code (e.g. `retry_not_applicable`).
+func (c *Client) RetryStage(ctx context.Context, stageID uuid.UUID) (*Stage, error) {
+	var stage Stage
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/retry", nil, &stage); err != nil {
+		return nil, err
+	}
+	return &stage, nil
+}
+
 // do performs the request and decodes the JSON body into out (or
 // reads the error envelope on non-2xx and returns *APIError).
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {

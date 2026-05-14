@@ -22,7 +22,7 @@ import (
 // token) live in newClient and are consumed by every subcommand.
 func runRun(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(stderr, `fishhawk run: subcommand required (start|status|list|cancel|open)`)
+		_, _ = fmt.Fprintln(stderr, `fishhawk run: subcommand required (start|status|list|cancel|open|retry)`)
 		return exitUsage
 	}
 	sub, rest := args[0], args[1:]
@@ -37,6 +37,8 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return runCancel(rest, stdout, stderr)
 	case "open":
 		return runOpen(rest, stdout, stderr)
+	case "retry":
+		return runRetry(rest, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "fishhawk run: unknown subcommand %q\n", sub)
 		return exitUsage
@@ -252,6 +254,56 @@ func runOpen(args []string, stdout, stderr io.Writer) int {
 		return exitFailure
 	}
 	_, _ = fmt.Fprintln(stdout, url)
+	return exitOK
+}
+
+// runRetry implements `fishhawk run retry <stage-id> [--output text|json]`.
+// Takes a STAGE id, not a run id: retry is stage-scoped per
+// docs/MVP_SPEC §6 (only failed stages are retryable, and the
+// retryable failure categories differ). The CLI doesn't try to
+// resolve which stage the user means — they pass the failed stage's
+// id directly. Server-side rejections (non-failed stage,
+// non-retryable failure category) come back as *APIError with the
+// envelope's code (e.g. `retry_not_applicable`); the CLI surfaces
+// the API error message verbatim.
+func runRetry(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("fishhawk run retry", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cf := bindCommonFlags(fs)
+	outputFmt := fs.String("output", "text", "output format: text | json")
+	fs.StringVar(outputFmt, "o", "text", "output format: text | json (shorthand)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if err := validateOutputFormat(*outputFmt); err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk run retry: %v\n", err)
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		_, _ = fmt.Fprintln(stderr, "fishhawk run retry: <stage-id> required")
+		return exitUsage
+	}
+	stageID, err := uuid.Parse(fs.Arg(0))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk run retry: %q is not a UUID: %v\n", fs.Arg(0), err)
+		return exitUsage
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
+	defer cancel()
+	stage, err := newClient(cf).RetryStage(ctx, stageID)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk run retry: %v\n", err)
+		return exitOnAPIError(err)
+	}
+	switch *outputFmt {
+	case "json":
+		if err := json.NewEncoder(stdout).Encode(stage); err != nil {
+			_, _ = fmt.Fprintf(stderr, "fishhawk run retry: encode: %v\n", err)
+			return exitFailure
+		}
+	default:
+		printStage(stdout, stage)
+	}
 	return exitOK
 }
 

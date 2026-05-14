@@ -8,6 +8,7 @@
 //	fishhawk run list     [--repo R] [--workflow W] [--state S] [--limit N]
 //	fishhawk run cancel   <run-id>
 //	fishhawk run open     <run-id>
+//	fishhawk run retry    <stage-id> [--output text|json]
 //	fishhawk plan approve <run-id> [--reason ...] [--output text|json]
 //	fishhawk plan reject  <run-id> [--reason ...] [--output text|json]
 //
@@ -93,6 +94,7 @@ func printUsage(w io.Writer) {
 		"  run list     List runs with optional filters.",
 		"  run cancel   Cancel an in-flight run.",
 		"  run open     Open a run's detail page in the browser.",
+		"  run retry    Retry a failed stage (takes a stage id, not a run id).",
 		"  plan approve Approve the plan stage on a run.",
 		"  plan reject  Reject the plan stage on a run (category-D failure).",
 		"  validate     Validate a workflow spec file locally.",
