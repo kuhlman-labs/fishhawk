@@ -560,11 +560,19 @@ func (g *slashGitHubRecorder) calls() []slashCommentCall {
 }
 
 // CreateIssueComment satisfies issuecomment.IssueCommenter.
-func (g *slashGitHubRecorder) CreateIssueComment(_ context.Context, _ int64, repo githubclient.RepoRef, issueNumber int, body string) error {
+func (g *slashGitHubRecorder) CreateIssueComment(_ context.Context, _ int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.stored = append(g.stored, slashCommentCall{repo: repo.String(), issueNumber: issueNumber, body: body})
-	return nil
+	return &githubclient.IssueComment{ID: int64(len(g.stored)), Body: body}, nil
+}
+
+// UpdateIssueComment satisfies the IssueCommenter interface
+// extended in #328. Slash-approval tests don't exercise the
+// update path; returning a happy response keeps the interface
+// satisfied.
+func (g *slashGitHubRecorder) UpdateIssueComment(_ context.Context, _ int64, _ githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
+	return &githubclient.IssueComment{ID: commentID, Body: body}, nil
 }
 
 // orchestratorRepoFailingList wraps orchestratorRepo to inject a

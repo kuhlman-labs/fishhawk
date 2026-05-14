@@ -936,27 +936,33 @@ func (c *Client) GetWorkflowRun(ctx context.Context, installationID int64, repo 
 //
 //	POST /repos/{owner}/{repo}/issues/{number}/comments
 //
+// Returns the created IssueComment (id, body, html_url) so callers
+// can record the id for later edits — required by the sticky-status-
+// comment flow (E20 / #326) and the plan-as-issue-comment flow
+// (E17 / #323), both of which need to call UpdateIssueComment on a
+// previously-posted row.
+//
 // Returns ErrNotFound when the issue or repo isn't visible to the
 // installation, ErrForbidden when the App lacks `issues:write`.
 // Caller is responsible for any rate-limit / dedup logic — this
 // helper is the thin wrapper around the wire call.
-func (c *Client) CreateIssueComment(ctx context.Context, installationID int64, repo RepoRef, issueNumber int, body string) error {
+func (c *Client) CreateIssueComment(ctx context.Context, installationID int64, repo RepoRef, issueNumber int, body string) (*IssueComment, error) {
 	if c.Tokens == nil {
-		return errors.New("githubclient: client missing TokenProvider")
+		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
 	if repo.Owner == "" || repo.Name == "" {
-		return errors.New("githubclient: repo owner and name required")
+		return nil, errors.New("githubclient: repo owner and name required")
 	}
 	if issueNumber <= 0 {
-		return errors.New("githubclient: issue number must be > 0")
+		return nil, errors.New("githubclient: issue number must be > 0")
 	}
 	if body == "" {
-		return errors.New("githubclient: comment body must be non-empty")
+		return nil, errors.New("githubclient: comment body must be non-empty")
 	}
 
 	raw, err := json.Marshal(map[string]string{"body": body})
 	if err != nil {
-		return fmt.Errorf("githubclient: marshal issue comment: %w", err)
+		return nil, fmt.Errorf("githubclient: marshal issue comment: %w", err)
 	}
 
 	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
@@ -966,17 +972,24 @@ func (c *Client) CreateIssueComment(ctx context.Context, installationID int64, r
 
 	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("githubclient: create issue comment: %w", err)
+		return nil, fmt.Errorf("githubclient: create issue comment: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	return classifyStatus("create issue comment", resp)
+	if err := classifyStatus("create issue comment", resp); err != nil {
+		return nil, err
+	}
+	var out IssueComment
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("githubclient: decode create issue comment: %w", err)
+	}
+	return &out, nil
 }
 
 // IssueComment is the subset of GitHub's issue-comment shape Fishhawk

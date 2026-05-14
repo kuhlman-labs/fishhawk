@@ -32,6 +32,7 @@ package issuecomment
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -51,6 +52,23 @@ import (
 // (`ListForRunByCategory`) can index on it.
 const CategoryIssueCommented = "issue_commented"
 
+// CategoryStatusCommentPosted records that Fishhawk created or
+// edited the run's sticky status comment (E20 / #326). Distinct
+// from CategoryIssueCommented because the lookup pattern is
+// different — for the status comment we want "the latest comment
+// id for this run" (so we know what to edit next time); for the
+// other notifications we want "did we already post this kind"
+// (one-shot dedup). A separate category makes the lookup query
+// cleaner and lets compliance consumers index on intent.
+//
+// Each transition that triggers a status update appends a fresh
+// row; the most-recent row carries the canonical `github_comment_id`.
+// The audit log therefore records the timeline of state changes
+// (one row per transition) AND the comment id (same id across all
+// rows for a run, until the operator deletes it manually and the
+// notifier falls back to creating a new one).
+const CategoryStatusCommentPosted = "status_comment_posted"
+
 // Kind enumerates which moment a comment recorded. Stored in the
 // audit entry's payload so a single category covers both moments
 // while staying queryable per kind.
@@ -68,14 +86,26 @@ const (
 	// same check_run.completed event don't double-post but a fresh
 	// retry round (attempt N → N+1) still announces itself.
 	KindCIRetry Kind = "ci_retry"
+	// KindStatusUpdate tags the sticky-status-comment audit row
+	// (E20.2 / #328). Lives on CategoryStatusCommentPosted, not
+	// CategoryIssueCommented. Distinct enum lets future analytics
+	// answer "how many status updates fired per run" without
+	// scanning payload kinds.
+	KindStatusUpdate Kind = "status_update"
 )
 
 // IssueCommenter is the slice of githubclient.Client this package
 // needs. Defining it as an interface keeps the unit tests free of a
 // fake api.github.com and lets the dispatcher's existing GitHubAPI
 // shape stay focused.
+//
+// CreateIssueComment returns the created IssueComment so the
+// sticky-status-comment flow (E20.2 / #328) and the plan
+// `update_on_change` flow (E17.2 / #337) can persist the comment
+// id for later edits via UpdateIssueComment.
 type IssueCommenter interface {
-	CreateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) error
+	CreateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
+	UpdateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error)
 }
 
 // Notifier owns the comment-back I/O. Construct once with New and
@@ -322,7 +352,7 @@ func (n *Notifier) alreadyPostedAttempt(ctx context.Context, runID uuid.UUID, at
 // post() but stamps retry_attempt into the payload so dedup can
 // scope per-attempt.
 func (n *Notifier) postCIRetry(ctx context.Context, ctxv commentContext, attempt int, body string) error {
-	if err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
+	if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
 		return fmt.Errorf("issuecomment: create comment: %w", err)
 	}
 	systemKind := audit.ActorSystem
@@ -342,6 +372,168 @@ func (n *Notifier) postCIRetry(ctx context.Context, ctxv commentContext, attempt
 		return fmt.Errorf("issuecomment: audit append: %w", err)
 	}
 	return nil
+}
+
+// NotifyStatusUpdate creates or edits the run's sticky status
+// comment per E20 / #326. The status comment is a single comment
+// per run that reflects the run's current stage + state; rather
+// than firing a new comment on every transition, the notifier
+// finds the existing comment via audit-log lookup and edits it in
+// place. Operators watching the issue thread see live state
+// without leaving GitHub — the framing of ADR-019 / #320.
+//
+// Caller provides the rendered body (template is E20.3 / #329).
+// Caller decides when to call (every meaningful transition,
+// wired in E20.4 / #330).
+//
+// Best-effort throughout:
+//   - Nil receiver / non-issue-trigger / missing run / empty body
+//     return nil; the caller doesn't need to branch.
+//   - GitHub create / edit failures are logged via the wrapped
+//     error but don't unwind the underlying transition.
+//   - Audit-append failures after a successful edit log but don't
+//     fail the call — the next status update would re-record the
+//     comment id from the GitHub response.
+//   - 404 on update (operator manually deleted the comment) falls
+//     back to creating a fresh one + appending a new audit row.
+//
+// The audit row's payload carries `kind: status_update`,
+// `issue_number`, `repo`, and `github_comment_id`. Subsequent
+// reads use the most-recent row's comment id.
+func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body string) error {
+	if n == nil {
+		return nil
+	}
+	if body == "" {
+		// Caller decided there's nothing to render. Skip without
+		// touching GitHub or the audit log.
+		return nil
+	}
+	ctxv, ok, err := n.contextForStatus(ctx, runID)
+	if err != nil || !ok {
+		return err
+	}
+
+	// Look up the run's existing status comment id, if any.
+	existingID, err := n.findStatusCommentID(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: lookup status comment: %w", err)
+	}
+
+	if existingID > 0 {
+		// Try to edit in place. If the comment was deleted, fall
+		// through to create.
+		got, updErr := n.github.UpdateIssueComment(ctx, *ctxv.run.InstallationID,
+			ctxv.repo, existingID, body)
+		switch {
+		case updErr == nil:
+			return n.appendStatusAudit(ctx, ctxv, got.ID)
+		case errors.Is(updErr, githubclient.ErrNotFound):
+			// Operator deleted the comment between updates. Fall
+			// through to create a fresh one; the next call will
+			// edit that one.
+		default:
+			return fmt.Errorf("issuecomment: update status comment: %w", updErr)
+		}
+	}
+
+	created, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID,
+		ctxv.repo, ctxv.issueNumber, body)
+	if err != nil {
+		return fmt.Errorf("issuecomment: create status comment: %w", err)
+	}
+	return n.appendStatusAudit(ctx, ctxv, created.ID)
+}
+
+// contextForStatus is the status-comment variant of contextFor — it
+// resolves run + repo + issue without the per-kind dedup check that
+// contextFor enforces. The status comment's "dedup" is "use the
+// most-recent comment id from the audit log"; that lookup happens
+// in findStatusCommentID instead.
+func (n *Notifier) contextForStatus(ctx context.Context, runID uuid.UUID) (commentContext, bool, error) {
+	runRow, err := n.runs.GetRun(ctx, runID)
+	if err != nil {
+		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
+	}
+	if runRow.TriggerSource != run.TriggerGitHubIssue {
+		return commentContext{}, false, nil
+	}
+	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
+		return commentContext{}, false, nil
+	}
+	number, ok := parseIssueRef(*runRow.TriggerRef)
+	if !ok {
+		return commentContext{}, false, nil
+	}
+	repo, err := parseRepo(runRow.Repo)
+	if err != nil {
+		return commentContext{}, false, nil
+	}
+	return commentContext{
+		run:         runRow,
+		repo:        repo,
+		issueNumber: number,
+		runURL:      n.externalURL + "/runs/" + runID.String(),
+	}, true, nil
+}
+
+// findStatusCommentID returns the most-recent status comment id
+// the audit log records for this run, or 0 when none exists.
+// Errors propagate; corrupt payloads are treated as "no id" so
+// the notifier falls back to creating a fresh comment.
+func (n *Notifier) findStatusCommentID(ctx context.Context, runID uuid.UUID) (int64, error) {
+	entries, err := n.audit.ListForRunByCategory(ctx, runID, CategoryStatusCommentPosted)
+	if err != nil {
+		return 0, err
+	}
+	// ListForRunByCategory returns ascending-by-sequence; the
+	// most-recent row carries the canonical id. Walk from the end.
+	for i := len(entries) - 1; i >= 0; i-- {
+		if id := extractGithubCommentID(entries[i].Payload); id > 0 {
+			return id, nil
+		}
+	}
+	return 0, nil
+}
+
+// appendStatusAudit records that the run's status comment is at
+// `commentID` as of now. Called from both the edit-in-place and
+// fresh-create paths.
+func (n *Notifier) appendStatusAudit(ctx context.Context, ctxv commentContext, commentID int64) error {
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"kind":              string(KindStatusUpdate),
+		"issue_number":      ctxv.issueNumber,
+		"repo":              ctxv.repo.String(),
+		"github_comment_id": commentID,
+	})
+	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     ctxv.run.ID,
+		Timestamp: n.now().UTC(),
+		Category:  CategoryStatusCommentPosted,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("issuecomment: audit append: %w", err)
+	}
+	return nil
+}
+
+// extractGithubCommentID pulls the integer comment id out of a
+// status_comment_posted audit payload. Returns 0 on parse failure
+// or absent field — the caller treats 0 as "no prior id; create a
+// new comment."
+func extractGithubCommentID(payload []byte) int64 {
+	if len(payload) == 0 {
+		return 0
+	}
+	var p struct {
+		GithubCommentID int64 `json:"github_comment_id"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return 0
+	}
+	return p.GithubCommentID
 }
 
 // renderCIRetryBody renders the CI-failure auto-retry comment.
@@ -410,7 +602,7 @@ func (n *Notifier) NotifySlashApprovalReply(ctx context.Context, p SlashApproval
 	if err != nil {
 		return nil
 	}
-	if err := n.github.CreateIssueComment(ctx, p.InstallationID, repo, p.IssueNumber, p.Body); err != nil {
+	if _, err := n.github.CreateIssueComment(ctx, p.InstallationID, repo, p.IssueNumber, p.Body); err != nil {
 		return fmt.Errorf("issuecomment: create reply: %w", err)
 	}
 	return nil
@@ -494,7 +686,7 @@ func (n *Notifier) alreadyPosted(ctx context.Context, runID uuid.UUID, kind Kind
 // the comment as posted — the next NotifyXxx call would re-post
 // (rare; the audit log is highly available).
 func (n *Notifier) post(ctx context.Context, ctxv commentContext, kind Kind, body string) error {
-	if err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
+	if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
 		return fmt.Errorf("issuecomment: create comment: %w", err)
 	}
 	systemKind := audit.ActorSystem

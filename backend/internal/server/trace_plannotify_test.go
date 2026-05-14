@@ -294,11 +294,19 @@ func (c *commentRecorder) calls() []commentCall {
 	return out
 }
 
-func (c *commentRecorder) CreateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) error {
+func (c *commentRecorder) CreateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.stored = append(c.stored, commentCall{installationID: installationID, repo: repo, issueNumber: issueNumber, body: body})
-	return nil
+	return &githubclient.IssueComment{ID: int64(len(c.stored)), Body: body}, nil
+}
+
+// UpdateIssueComment is a stub for the IssueCommenter interface
+// extension landed in #328. trace_plannotify tests don't exercise
+// the update path; returning a happy response keeps the interface
+// satisfied without changing the test surface.
+func (c *commentRecorder) UpdateIssueComment(_ context.Context, _ int64, _ githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
+	return &githubclient.IssueComment{ID: commentID, Body: body}, nil
 }
 
 // planReadyAuditFake is a tiny in-memory audit.Repository that the
