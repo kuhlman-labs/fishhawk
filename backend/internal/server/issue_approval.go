@@ -161,6 +161,11 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 	} else {
 		s.replyApproval(ctx, p, formatSuccessReply(decision, subject, runRow.ID, advanced))
 	}
+
+	// Sticky status comment (E20.4 / #330). Mirrors the HTTP
+	// approval path: every approval (approve / reject, any stage
+	// type) updates the sticky comment.
+	s.notifyStatusUpdate(ctx, advanced.RunID, "slash_approval")
 	return nil
 }
 

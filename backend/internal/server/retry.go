@@ -117,6 +117,11 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Sticky status comment (E20.4 / #330). A retry flips a failed
+	// stage back to pending / dispatched / awaiting_approval; the
+	// status comment should reflect the new shape.
+	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "stage_retry")
+
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
 }
 

@@ -530,6 +530,10 @@ type IssueNotifier interface {
 	// Per-attempt dedup via the audit log; failures log but don't
 	// unwind the dispatch.
 	NotifyCIRetry(ctx context.Context, runID uuid.UUID, parentRunID uuid.UUID, checkName string, attempt, max int) error
+	// NotifyStatusUpdateForRun creates-or-edits the run's sticky
+	// status comment (E20.4 / #330). Best-effort; failures here
+	// don't unwind the calling transition.
+	NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error
 }
 
 // ApprovalCommandHandler executes a slash-command approval / reject
@@ -804,6 +808,20 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 			d.logger().LogAttrs(ctx, slog.LevelWarn,
 				"pickup comment-back failed",
 				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("run_id", created.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+		// Sticky-status seed (E20.4 / #330): post the initial
+		// status comment so the operator sees current stage/state
+		// in the issue thread. Subsequent transitions edit this
+		// comment in place. Best-effort, separate from the pickup
+		// post: pickup is a one-shot acknowledgment; the status
+		// comment is the durable live view.
+		if err := d.IssueNotifier.NotifyStatusUpdateForRun(ctx, created.ID); err != nil {
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"status comment update failed",
+				slog.String("source", "dispatcher.create_run"),
 				slog.String("run_id", created.ID.String()),
 				slog.String("error", err.Error()),
 			)

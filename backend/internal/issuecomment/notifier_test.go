@@ -551,6 +551,112 @@ func TestNotifyPickup_AndPlan_ShareCategoryButDistinctKinds(t *testing.T) {
 	}
 }
 
+// happyDepsWithStages returns the happyDeps fixtures plus a stage
+// list so NotifyStatusUpdateForRun has something to render against.
+func happyDepsWithStages(t *testing.T) (uuid.UUID, *fakeGitHub, *fakeAudit, *fakeRuns, *issuecomment.Notifier) {
+	t.Helper()
+	runID := uuid.New()
+	triggerRef := "issue:42"
+	stages := []*run.Stage{
+		{ID: uuid.New(), RunID: runID, Sequence: 1, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+		{ID: uuid.New(), RunID: runID, Sequence: 2, Type: run.StageTypeImplement, State: run.StageStateRunning},
+	}
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID:             runID,
+			Repo:           "x/y",
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerGitHubIssue,
+			TriggerRef:     &triggerRef,
+			InstallationID: int64Ptr(99),
+			State:          run.StateRunning,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: stages},
+	}
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        repoRuns,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+		Now:         func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) },
+	})
+	if n == nil {
+		t.Fatal("notifier nil")
+	}
+	return runID, gh, au, repoRuns, n
+}
+
+func TestNotifyStatusUpdateForRun_FirstCall_CreatesAndRenders(t *testing.T) {
+	runID, gh, au, _, n := happyDepsWithStages(t)
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	// Should carry the rendered header + stage list.
+	for _, want := range []string{"Fishhawk run", "feature_change", "plan", "implement"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n---\n%s", want, body)
+		}
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("expected 1 audit row; got %d", len(au.appended))
+	}
+	if au.appended[0].Category != issuecomment.CategoryStatusCommentPosted {
+		t.Errorf("audit category = %q", au.appended[0].Category)
+	}
+}
+
+func TestNotifyStatusUpdateForRun_SubsequentCall_EditsSameComment(t *testing.T) {
+	// Pre-seed an existing status comment audit row; the convenience
+	// method should resolve to UpdateIssueComment with that id.
+	runID, gh, au, _, n := happyDepsWithStages(t)
+	au.preSeed(runID, issuecomment.CategoryStatusCommentPosted, map[string]any{
+		"kind":              string(issuecomment.KindStatusUpdate),
+		"issue_number":      42,
+		"repo":              "x/y",
+		"github_comment_id": 4242,
+	})
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("expected 0 create calls on edit path; got %d", len(gh.calls))
+	}
+	if len(gh.updateCalls) != 1 {
+		t.Fatalf("expected 1 update call; got %d", len(gh.updateCalls))
+	}
+	if gh.updateCalls[0].commentID != 4242 {
+		t.Errorf("update.commentID = %d, want 4242", gh.updateCalls[0].commentID)
+	}
+}
+
+func TestNotifyStatusUpdateForRun_NonIssueTrigger_SkipsSilently(t *testing.T) {
+	runID, gh, au, runs, n := happyDepsWithStages(t)
+	runs.runs[runID].TriggerSource = run.TriggerCLI
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls)+len(gh.updateCalls) != 0 {
+		t.Errorf("non-issue trigger should skip; got %d creates + %d updates",
+			len(gh.calls), len(gh.updateCalls))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("non-issue trigger should not append audit rows; got %d", len(au.appended))
+	}
+}
+
+func TestNotifyStatusUpdateForRun_NilReceiver_NoOp(t *testing.T) {
+	var n *issuecomment.Notifier
+	if err := n.NotifyStatusUpdateForRun(context.Background(), uuid.New()); err != nil {
+		t.Errorf("nil receiver should be a no-op; got %v", err)
+	}
+}
+
 func TestNew_NilDepsReturnsNilNotifier(t *testing.T) {
 	cases := []struct {
 		name string
@@ -881,7 +987,8 @@ func (f *fakeGitHub) UpdateIssueComment(_ context.Context, installationID int64,
 
 type fakeRuns struct {
 	run.Repository
-	runs map[uuid.UUID]*run.Run
+	runs   map[uuid.UUID]*run.Run
+	stages map[uuid.UUID][]*run.Stage
 }
 
 func (f *fakeRuns) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
@@ -890,6 +997,13 @@ func (f *fakeRuns) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 		return nil, run.ErrNotFound
 	}
 	return r, nil
+}
+
+func (f *fakeRuns) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*run.Stage, error) {
+	if f.stages == nil {
+		return nil, nil
+	}
+	return f.stages[id], nil
 }
 
 type fakeAudit struct {
@@ -923,6 +1037,18 @@ func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, cat
 	out := []*audit.Entry{}
 	for _, e := range f.preSeeds {
 		if e.RunID != nil && *e.RunID == runID && e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []*audit.Entry{}
+	for _, e := range f.preSeeds {
+		if e.RunID != nil && *e.RunID == runID {
 			out = append(out, e)
 		}
 	}

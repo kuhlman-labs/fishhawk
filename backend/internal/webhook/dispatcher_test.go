@@ -1880,10 +1880,11 @@ workflows:
 // dispatcher's pickup-ack hook can be asserted on without standing
 // up the full issuecomment package wiring.
 type stubIssueNotifier struct {
-	mu         sync.Mutex
-	calls      []stubNotifyCall
-	retryCalls []stubCIRetryCall
-	err        error
+	mu          sync.Mutex
+	calls       []stubNotifyCall
+	retryCalls  []stubCIRetryCall
+	statusCalls []uuid.UUID
+	err         error
 }
 
 type stubNotifyCall struct {
@@ -1917,6 +1918,13 @@ func (s *stubIssueNotifier) NotifyCIRetry(_ context.Context, runID, parentRunID 
 		runID: runID, parentRunID: parentRunID,
 		checkName: checkName, attempt: attempt, max: max,
 	})
+	return s.err
+}
+
+func (s *stubIssueNotifier) NotifyStatusUpdateForRun(_ context.Context, runID uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statusCalls = append(s.statusCalls, runID)
 	return s.err
 }
 
@@ -1964,6 +1972,65 @@ func TestHandle_NotifyPickupError_DoesntFailDispatch(t *testing.T) {
 	}
 	if len(notifier.calls) != 1 {
 		t.Errorf("notifier should still be called once; got %d", len(notifier.calls))
+	}
+}
+
+// TestHandle_IssueTrigger_FiresStatusUpdate is the dispatcher-side
+// integration test for E20.4 / #330. After CreateRun succeeds, the
+// dispatcher seeds the sticky status comment so the operator sees
+// the run's initial stage list in the issue thread without needing
+// to wait for the first trace upload.
+func TestHandle_IssueTrigger_FiresStatusUpdate(t *testing.T) {
+	d, _, runs, _ := newDispatcherWithStubs(t)
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(notifier.statusCalls) != 1 {
+		t.Fatalf("expected 1 NotifyStatusUpdateForRun call; got %d", len(notifier.statusCalls))
+	}
+	created := runs.created[0]
+	if notifier.statusCalls[0] != created.ID {
+		t.Errorf("status-update runID = %s, want %s", notifier.statusCalls[0], created.ID)
+	}
+}
+
+// TestHandle_DispatchFailure_SuppressesStatusUpdate locks the
+// failure-path behavior in: the dispatcher only seeds the sticky
+// status comment when the workflow_dispatch call succeeded —
+// commenting "Plan stage: dispatched" on a run whose dispatch
+// returned 422 would be misleading. Mirrors the pickup-comment
+// gate at the same call site.
+func TestHandle_DispatchFailure_SuppressesStatusUpdate(t *testing.T) {
+	d, gh, _, _ := newDispatcherWithStubs(t)
+	gh.dispatchErr = errors.New("422 invalid ref")
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(notifier.statusCalls) != 0 {
+		t.Errorf("status update should not fire when dispatch failed; got %d calls", len(notifier.statusCalls))
+	}
+}
+
+// TestHandle_StatusUpdateError_DoesntFailDispatch covers the
+// best-effort posture: a status-comment write failure logs but
+// never unwinds the dispatch. The run is already in the DB; the
+// status comment is operator UI, not state.
+func TestHandle_StatusUpdateError_DoesntFailDispatch(t *testing.T) {
+	d, _, _, _ := newDispatcherWithStubs(t)
+	notifier := &stubIssueNotifier{err: errors.New("403 forbidden")}
+	d.IssueNotifier = notifier
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Errorf("Handle should swallow status-update errors; got %v", err)
+	}
+	if len(notifier.statusCalls) != 1 {
+		t.Errorf("notifier should still be called once; got %d", len(notifier.statusCalls))
 	}
 }
 

@@ -138,6 +138,9 @@ func (s *Server) handlePullRequestClosed(ctx context.Context, raw []byte) {
 			"pull_request.closed: no review stage on run; audit-only",
 			slog.String("pr_url", prURL),
 			slog.String("run_id", target.ID.String()))
+		// Sticky status comment (E20.4 / #330) — the audit row
+		// reflects the merge; the comment should too.
+		s.notifyStatusUpdate(ctx, target.ID, "pr_merged_no_review")
 		return
 	}
 
@@ -163,6 +166,11 @@ func (s *Server) handlePullRequestClosed(ctx context.Context, raw []byte) {
 		slog.String("stage_id", reviewStage.ID.String()),
 		slog.String("merger", mergerLogin(p)),
 	)
+
+	// Sticky status comment (E20.4 / #330). The PR merging is the
+	// terminal state for review-gated workflows; this is one of the
+	// most operator-visible moments of the run lifecycle.
+	s.notifyStatusUpdate(ctx, target.ID, "pr_merged")
 }
 
 // handlePullRequestReviewSubmitted handles
@@ -307,6 +315,9 @@ func (s *Server) handlePullRequestClosedWithoutMerge(ctx context.Context, target
 			slog.String("pr_url", p.PullRequest.HTMLURL),
 			slog.String("run_id", target.ID.String()),
 			slog.String("closer", p.Sender.Login))
+		// Sticky status comment (E20.4 / #330) — audit row is in;
+		// surface the close in the issue thread.
+		s.notifyStatusUpdate(ctx, target.ID, "pr_closed_no_review")
 		return
 	}
 	if _, err := s.cfg.RunRepo.TransitionStage(ctx,
@@ -325,6 +336,11 @@ func (s *Server) handlePullRequestClosedWithoutMerge(ctx context.Context, target
 		slog.String("stage_id", reviewStage.ID.String()),
 		slog.String("closer", p.Sender.Login),
 	)
+
+	// Sticky status comment (E20.4 / #330). Review stage cancelled
+	// is a terminal-ish surface state — the user should see the
+	// run's review row flip to cancelled in the comment.
+	s.notifyStatusUpdate(ctx, target.ID, "pr_closed_without_merge")
 }
 
 // writePRClosedWithoutMergeAudit appends a pr_closed_without_merge
