@@ -45,6 +45,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // CategoryIssueCommented is the audit-log category the notifier writes
@@ -92,6 +93,19 @@ const (
 	// answer "how many status updates fired per run" without
 	// scanning payload kinds.
 	KindStatusUpdate Kind = "status_update"
+	// KindPlanFull tags the full-plan-document post (E17.2 / #337).
+	// Distinct from KindPlan (the legacy summary post) because the
+	// payload carries github_comment_id and the comment is editable
+	// via UpdateIssueComment on subsequent plan re-uploads when the
+	// spec opts in to `update_on_change`. Audit-log dedup uses this
+	// kind plus KindPlanUpdated to find the most-recent comment id
+	// for a run.
+	KindPlanFull Kind = "plan_full"
+	// KindPlanUpdated tags an edit-in-place of the full-plan
+	// comment. Each re-upload that lands a UpdateIssueComment call
+	// appends one row carrying the (unchanged) github_comment_id so
+	// the audit chain records every revision.
+	KindPlanUpdated Kind = "plan_updated"
 )
 
 // IssueCommenter is the slice of githubclient.Client this package
@@ -189,6 +203,22 @@ func (n *Notifier) NotifyPickup(ctx context.Context, runID uuid.UUID, senderLogi
 // `planArtifact` is the typed `*plan.Plan` from its standard_v1
 // artifact. Both are required — if either is nil the call skips.
 //
+// Two surfaces today (E17.2 / #337):
+//
+//   - **Full-plan-as-comment**: when the workflow spec declares the
+//     plan stage's `produces.persistence` with
+//     `target: originating_issue, mode: rendered_comment`, the call
+//     renders the whole standard_v1 plan as a markdown document and
+//     posts it on the issue. If `update_on_change: true` is also set
+//     and a prior full-plan comment exists for the run, the call
+//     edits the existing comment in place via UpdateIssueComment.
+//     Per ADR-020 / #321 this is the canonical plan-review surface.
+//
+//   - **Summary-only**: when the spec opts out (no
+//     originating_issue persistence), the legacy path posts a short
+//     summary comment that links to the SPA's plan-document page.
+//     Behavior unchanged from #234.
+//
 // The comment routes to the approval-surface URL when the plan
 // stage requires approval (v0's typical workflow); to the run page
 // otherwise (`routine_change`-style flows).
@@ -196,12 +226,263 @@ func (n *Notifier) NotifyPlanReady(ctx context.Context, runID uuid.UUID, planSta
 	if n == nil || planStage == nil || planArtifact == nil {
 		return nil
 	}
+	runRow, err := n.runs.GetRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: get run: %w", err)
+	}
+	// Per-stage persistence config lives on the cached workflow
+	// spec (the dispatcher snapshotted it onto the run row per
+	// #283). Read once; nil means "use the legacy summary path".
+	persistence := planOriginatingIssuePersistence(runRow.WorkflowSpec, runRow.WorkflowID, planStage)
+	if persistence != nil && persistence.Mode == spec.ModeRenderedComment {
+		return n.notifyFullPlan(ctx, runID, planStage, planArtifact, *persistence)
+	}
+	// Legacy path: summary post with audit-log dedup.
 	ctxv, ok, err := n.contextFor(ctx, runID, KindPlan)
 	if err != nil || !ok {
 		return err
 	}
 	body := renderPlanBody(ctxv, planStage, planArtifact, n.externalURL)
 	return n.post(ctx, ctxv, KindPlan, body)
+}
+
+// MaxIssueCommentBodyBytes mirrors GitHub's per-comment body cap.
+// Render output that exceeds this is truncated with a "View full
+// plan →" link to the SPA's plan-document page. Documented at
+// https://docs.github.com/en/rest/issues/comments — the practical
+// cap is 65,536 characters; we treat the limit as bytes since UTF-8
+// payloads can be longer than rune counts.
+const MaxIssueCommentBodyBytes = 65_536
+
+// notifyFullPlan is the post-or-edit path for the full-plan-on-issue
+// surface (E17.2 / #337). Resolves the plan-comment id from the
+// audit log; CreateIssueComment when none exists, UpdateIssueComment
+// when one does AND update_on_change is set, no-op when one exists
+// but update_on_change is unset (the post is one-shot in that mode).
+func (n *Notifier) notifyFullPlan(ctx context.Context, runID uuid.UUID, planStage *run.Stage, planArtifact *plan.Plan, persistence spec.Persistence) error {
+	ctxv, ok, err := n.contextForStatus(ctx, runID)
+	if err != nil || !ok {
+		return err
+	}
+
+	existingID, err := n.findPlanCommentID(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: lookup plan comment: %w", err)
+	}
+
+	body := renderFullPlanBody(ctxv, planStage, planArtifact, n.externalURL)
+
+	if existingID > 0 {
+		if !persistence.UpdateOnChange {
+			// First plan post is the final post for this surface;
+			// re-fires shouldn't re-edit. Skip silently.
+			return nil
+		}
+		got, updErr := n.github.UpdateIssueComment(ctx, *ctxv.run.InstallationID,
+			ctxv.repo, existingID, body)
+		switch {
+		case updErr == nil:
+			return n.appendPlanCommentAudit(ctx, ctxv, got.ID, KindPlanUpdated)
+		case errors.Is(updErr, githubclient.ErrNotFound):
+			// Operator deleted the comment; fall through to create.
+		default:
+			return fmt.Errorf("issuecomment: update plan comment: %w", updErr)
+		}
+	}
+
+	created, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID,
+		ctxv.repo, ctxv.issueNumber, body)
+	if err != nil {
+		return fmt.Errorf("issuecomment: create plan comment: %w", err)
+	}
+	return n.appendPlanCommentAudit(ctx, ctxv, created.ID, KindPlanFull)
+}
+
+// findPlanCommentID returns the most-recent github_comment_id from
+// the run's audit log across KindPlanFull and KindPlanUpdated rows.
+// Returns 0 when none exists (the first-post case).
+func (n *Notifier) findPlanCommentID(ctx context.Context, runID uuid.UUID) (int64, error) {
+	entries, err := n.audit.ListForRunByCategory(ctx, runID, CategoryIssueCommented)
+	if err != nil {
+		return 0, err
+	}
+	// ListForRunByCategory returns ascending-by-sequence; walk from
+	// the end so the latest comment id wins.
+	for i := len(entries) - 1; i >= 0; i-- {
+		k := extractKind(entries[i].Payload)
+		if k != KindPlanFull && k != KindPlanUpdated {
+			continue
+		}
+		if id := extractGithubCommentID(entries[i].Payload); id > 0 {
+			return id, nil
+		}
+	}
+	return 0, nil
+}
+
+// appendPlanCommentAudit records a full-plan create/update on the
+// issue_commented category. Payload carries the kind + comment id +
+// issue/repo for compliance consumers that index on intent.
+func (n *Notifier) appendPlanCommentAudit(ctx context.Context, ctxv commentContext, commentID int64, kind Kind) error {
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"kind":              string(kind),
+		"issue_number":      ctxv.issueNumber,
+		"repo":              ctxv.repo.String(),
+		"github_comment_id": commentID,
+	})
+	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     ctxv.run.ID,
+		Timestamp: n.now().UTC(),
+		Category:  CategoryIssueCommented,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("issuecomment: audit append: %w", err)
+	}
+	return nil
+}
+
+// planOriginatingIssuePersistence pulls the plan stage's
+// originating_issue persistence config out of the cached workflow
+// spec. Returns nil when the spec opts out — that's the signal for
+// NotifyPlanReady to use the legacy summary-post path.
+//
+// The lookup walks the workflow named by `workflowID` (the run's
+// WorkflowID column, which is the dispatcher-resolved key into the
+// spec's Workflows map) and finds the first stage of type plan.
+// v0 workflows have at most one plan stage per workflow.
+//
+// Best-effort: a parse failure falls through to the legacy path.
+// The spec was validated at dispatch time per #283, so this is
+// defensive against future shape drift.
+func planOriginatingIssuePersistence(workflowSpec []byte, workflowID string, planStage *run.Stage) *spec.Persistence {
+	if len(workflowSpec) == 0 || planStage == nil || workflowID == "" {
+		return nil
+	}
+	parsed, err := spec.ParseBytes(workflowSpec)
+	if err != nil {
+		return nil
+	}
+	wf, ok := parsed.Workflows[workflowID]
+	if !ok {
+		return nil
+	}
+	for i := range wf.Stages {
+		if string(wf.Stages[i].Type) != string(planStage.Type) {
+			continue
+		}
+		for _, p := range wf.Stages[i].Produces {
+			if p.Artifact != spec.ArtifactPlan {
+				continue
+			}
+			for _, ps := range p.Persistence {
+				if ps.Target == spec.PersistenceOriginatingIssue {
+					pp := ps
+					return &pp
+				}
+			}
+		}
+		// First plan stage wins; later plan stages (if a future
+		// workflow shape allows them) would need a more specific
+		// match — file a follow-up if that happens.
+		return nil
+	}
+	return nil
+}
+
+// renderFullPlanBody renders the entire standard_v1 plan as a
+// markdown document for the issue thread (E17.2 / #337). Sections:
+//
+//	**Fishhawk plan** (header + run + workflow link)
+//	**Summary**: <plan.Summary>
+//	**Scope**: bullet list of plan.Scope.Files
+//	**Approach**:
+//	  1. step 1
+//	  2. step 2
+//	**Verification**:
+//	  Test strategy: ...
+//	  Rollback plan: ...
+//	**Risks & assumptions**: bullets
+//	[Approve in the dashboard →](url) | [Reject →](url)
+//
+// When the rendered body exceeds MaxIssueCommentBodyBytes the
+// renderer truncates at a safe rune boundary and appends a
+// "View full plan →" link to the SPA's plan-document page so the
+// reviewer can see the untruncated body.
+func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, externalURL string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Fishhawk plan** for Run [`%s`](%s)\n\n", shortID(c.run.ID), c.runURL)
+	fmt.Fprintf(&b, "Workflow: `%s`\n\n", c.run.WorkflowID)
+
+	if p.Summary != "" {
+		fmt.Fprintf(&b, "**Summary**\n\n%s\n\n", p.Summary)
+	}
+	if files := renderFileList(p.Scope.Files, len(p.Scope.Files)); files != "" {
+		b.WriteString("**Scope**\n\n")
+		b.WriteString(files)
+		b.WriteString("\n")
+	}
+	if len(p.Approach) > 0 {
+		b.WriteString("**Approach**\n\n")
+		for _, s := range p.Approach {
+			fmt.Fprintf(&b, "%d. %s\n", s.Step, s.Description)
+		}
+		b.WriteString("\n")
+	}
+	if p.Verification.TestStrategy != "" || p.Verification.RollbackPlan != "" {
+		b.WriteString("**Verification**\n\n")
+		if p.Verification.TestStrategy != "" {
+			fmt.Fprintf(&b, "- **Test strategy**: %s\n", p.Verification.TestStrategy)
+		}
+		if p.Verification.RollbackPlan != "" {
+			fmt.Fprintf(&b, "- **Rollback plan**: %s\n", p.Verification.RollbackPlan)
+		}
+		b.WriteString("\n")
+	}
+	if len(p.RisksAndAssumptions) > 0 {
+		b.WriteString("**Risks & assumptions**\n\n")
+		for _, r := range p.RisksAndAssumptions {
+			fmt.Fprintf(&b, "- %s\n", r)
+		}
+		b.WriteString("\n")
+	}
+
+	if planStage.RequiresApproval {
+		fmt.Fprintf(&b, "[Approve in the dashboard →](%s/runs/%s/stages/%s)\n",
+			externalURL, c.run.ID.String(), planStage.ID.String())
+	} else {
+		fmt.Fprintf(&b, "[View run →](%s)\n", c.runURL)
+	}
+	return truncateForGitHubComment(b.String(), c.runURL, planStage.ID.String(), externalURL, c.run.ID.String())
+}
+
+// truncateForGitHubComment caps body at MaxIssueCommentBodyBytes,
+// dropping bytes from the end and appending a "View full plan →"
+// link to the SPA so the reviewer can see the rest. Pure function;
+// safe to call when the body is already short — returns body
+// unchanged.
+func truncateForGitHubComment(body, runURL, stageID, externalURL, runID string) string {
+	if len(body) <= MaxIssueCommentBodyBytes {
+		return body
+	}
+	tail := fmt.Sprintf("\n\n_…truncated — [view full plan →](%s/runs/%s/stages/%s)_\n",
+		externalURL, runID, stageID)
+	// Reserve room for the tail; trim conservatively.
+	budget := MaxIssueCommentBodyBytes - len(tail)
+	if budget < 0 {
+		// Tail itself exceeds the cap (would be a very long URL).
+		// Render only the bare run URL as a fallback so the
+		// reviewer can navigate without leaving the comment.
+		return fmt.Sprintf("_Plan exceeds GitHub's comment size; view at %s_\n", runURL)
+	}
+	cut := budget
+	// Back off any UTF-8 continuation bytes so we land on a rune
+	// boundary — same defense the summary path's truncate uses.
+	for cut > 0 && (body[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return strings.TrimRight(body[:cut], " \n") + tail
 }
 
 // NotifyPlanApproved posts the "plan approved → implementing now"
