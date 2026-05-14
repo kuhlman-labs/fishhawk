@@ -3,11 +3,12 @@
 //
 // Subcommands:
 //
-//	fishhawk run start  --repo R --workflow W --workflow-sha S [--trigger-ref REF]
-//	fishhawk run status <run-id> [--output text|json]
-//	fishhawk run list   [--repo R] [--workflow W] [--state S] [--limit N]
-//	fishhawk run cancel <run-id>
-//	fishhawk run open   <run-id>
+//	fishhawk run start    --repo R --workflow W --workflow-sha S [--trigger-ref REF]
+//	fishhawk run status   <run-id> [--output text|json]
+//	fishhawk run list     [--repo R] [--workflow W] [--state S] [--limit N]
+//	fishhawk run cancel   <run-id>
+//	fishhawk run open     <run-id>
+//	fishhawk plan approve <run-id> [--reason ...] [--output text|json]
 //
 // Auth is the same `bearerToken` scheme defined in the OpenAPI:
 // CLI sends `Authorization: Bearer <token>` from --token /
@@ -50,6 +51,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	case "run":
 		return runRun(rest, stdout, stderr)
+	case "plan":
+		return runPlan(rest, stdout, stderr)
 	case "validate":
 		return runValidate(rest, stdout, stderr)
 	case "version", "--version":
@@ -89,6 +92,7 @@ func printUsage(w io.Writer) {
 		"  run list     List runs with optional filters.",
 		"  run cancel   Cancel an in-flight run.",
 		"  run open     Open a run's detail page in the browser.",
+		"  plan approve Approve the plan stage on a run.",
 		"  validate     Validate a workflow spec file locally.",
 		"  version      Print the CLI version and exit.",
 		"  help         Show this help.",

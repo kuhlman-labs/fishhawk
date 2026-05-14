@@ -78,13 +78,23 @@ type fakeBackend struct {
 	cancelledID string
 	listQuery   string
 
+	// E18.1 / #332 — captures the last plan-approve request.
+	stagesForRun map[uuid.UUID][]httpclient.Stage
+	approvedID   string
+	approvalBody httpclient.SubmitApprovalInput
+
 	startResp Run
 	getResp   Run
 	listResp  ListResp
 
-	startStatus int
-	getStatus   int
-	listStatus  int
+	// approvalResp returned by POST /v0/stages/{id}/approvals
+	approvalResp httpclient.Stage
+
+	startStatus    int
+	getStatus      int
+	listStatus     int
+	stagesStatus   int
+	approvalStatus int
 }
 
 // Local copies — main.go doesn't import these from the httpclient
@@ -95,9 +105,12 @@ type ListResp = httpclient.ListRunsResult
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
-		startStatus: http.StatusCreated,
-		getStatus:   http.StatusOK,
-		listStatus:  http.StatusOK,
+		startStatus:    http.StatusCreated,
+		getStatus:      http.StatusOK,
+		listStatus:     http.StatusOK,
+		stagesStatus:   http.StatusOK,
+		approvalStatus: http.StatusOK,
+		stagesForRun:   map[uuid.UUID][]httpclient.Stage{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v0/runs", func(w http.ResponseWriter, r *http.Request) {
@@ -130,6 +143,40 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(httpclient.Run{ID: uuid.MustParse(r.PathValue("run_id")), State: "cancelled"})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("run_id"))
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "validation_failed"}})
+			return
+		}
+		w.WriteHeader(fb.stagesStatus)
+		fb.mu.Lock()
+		items := fb.stagesForRun[id]
+		fb.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(httpclient.ListStagesResult{Items: items})
+	})
+	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
+		var in httpclient.SubmitApprovalInput
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		fb.mu.Lock()
+		fb.approvedID = r.PathValue("stage_id")
+		fb.approvalBody = in
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(fb.approvalStatus)
+		if fb.approvalStatus >= 400 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"code":    "invalid_state_transition",
+					"message": "stage is not awaiting_approval",
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(fb.approvalResp)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -443,6 +490,187 @@ func TestRun_UnknownRunSubcommand(t *testing.T) {
 	got := run([]string{"run", "frobnicate"}, io.Discard, &stderr)
 	if got != exitUsage {
 		t.Errorf("status = %d, want exitUsage", got)
+	}
+}
+
+// --- plan approve (E18.1 / #332) ---
+
+// planApproveStages builds a stage list with a plan stage in the
+// given state plus an implement stage at sequence 2 for shape.
+func planApproveStages(runID uuid.UUID, planState string) []httpclient.Stage {
+	return []httpclient.Stage{
+		{ID: uuid.New(), RunID: runID, Sequence: 1, Type: "plan", State: planState,
+			Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"}},
+		{ID: uuid.New(), RunID: runID, Sequence: 2, Type: "implement", State: "pending",
+			Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"}},
+	}
+}
+
+func TestPlanApprove_HappyPath(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	planStageID := stages[0].ID
+	fb.stagesForRun[runID] = stages
+	fb.approvalResp = httpclient.Stage{
+		ID: planStageID, RunID: runID, Sequence: 1, Type: "plan",
+		State:    "succeeded",
+		Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"plan", "approve", "--reason", "looks good", runID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if fb.approvedID != planStageID.String() {
+		t.Errorf("approved stage_id = %s, want %s", fb.approvedID, planStageID)
+	}
+	if fb.approvalBody.Decision != httpclient.ApprovalApprove {
+		t.Errorf("decision = %q, want approve", fb.approvalBody.Decision)
+	}
+	if fb.approvalBody.Comment != "looks good" {
+		t.Errorf("comment = %q, want 'looks good'", fb.approvalBody.Comment)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, planStageID.String()) {
+		t.Errorf("stdout missing stage id: %s", out)
+	}
+	if !strings.Contains(out, "succeeded") {
+		t.Errorf("stdout missing post-approval state: %s", out)
+	}
+}
+
+func TestPlanApprove_NoAwaitingPlanStage(t *testing.T) {
+	// Plan stage already settled — the operator missed the window
+	// or someone else approved. Surface a clear, actionable message
+	// pointing back at run status.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	fb.stagesForRun[runID] = planApproveStages(runID, "succeeded")
+
+	var stderr strings.Builder
+	got := run([]string{"plan", "approve", runID.String()}, io.Discard, &stderr)
+	if got != exitFailure {
+		t.Errorf("status = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), "no plan stage awaiting approval") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+	// Approval endpoint must not be reached.
+	if fb.approvedID != "" {
+		t.Errorf("approval endpoint reached with no awaiting plan stage; stage_id=%s", fb.approvedID)
+	}
+}
+
+func TestPlanApprove_BadUUID(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"plan", "approve", "not-a-uuid"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "not a UUID") {
+		t.Errorf("stderr missing 'not a UUID': %s", stderr.String())
+	}
+}
+
+func TestPlanApprove_MissingArg(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"plan", "approve"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "<run-id> required") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+}
+
+func TestPlanApprove_ServerRejection(t *testing.T) {
+	// Server returns 409 invalid_state_transition (e.g. someone else
+	// just approved). The CLI surfaces the API error and exits non-zero.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	fb.stagesForRun[runID] = planApproveStages(runID, "awaiting_approval")
+	fb.approvalStatus = http.StatusConflict
+
+	var stderr strings.Builder
+	got := run([]string{"plan", "approve", runID.String()}, io.Discard, &stderr)
+	if got != exitFailure {
+		t.Errorf("status = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), "invalid_state_transition") {
+		t.Errorf("stderr missing api error code: %s", stderr.String())
+	}
+}
+
+func TestPlanApprove_JSONOutput(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	planStageID := stages[0].ID
+	fb.stagesForRun[runID] = stages
+	fb.approvalResp = httpclient.Stage{
+		ID: planStageID, RunID: runID, Sequence: 1, Type: "plan", State: "succeeded",
+		Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"plan", "approve", "--output", "json", runID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d", got)
+	}
+	var decoded httpclient.Stage
+	if err := json.NewDecoder(strings.NewReader(stdout.String())).Decode(&decoded); err != nil {
+		t.Fatalf("decode json: %v\nstdout: %s", err, stdout.String())
+	}
+	if decoded.ID != planStageID {
+		t.Errorf("ID = %s, want %s", decoded.ID, planStageID)
+	}
+	if decoded.State != "succeeded" {
+		t.Errorf("State = %q, want succeeded", decoded.State)
+	}
+}
+
+func TestPlanApprove_BadOutputValue(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"plan", "approve", "--output", "xml", uuid.New().String()}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "invalid --output") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+}
+
+func TestPlan_UnknownSubcommand(t *testing.T) {
+	var stderr strings.Builder
+	got := run([]string{"plan", "frobnicate"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "unknown subcommand") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+}
+
+func TestPlan_NoSubcommand(t *testing.T) {
+	var stderr strings.Builder
+	got := run([]string{"plan"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "subcommand required") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
 	}
 }
 

@@ -171,6 +171,75 @@ func (c *Client) CancelRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return &run, nil
 }
 
+// Stage is the CLI-side projection of the OpenAPI Stage schema.
+// Field names + types match the wire shape verbatim. The pointer
+// fields mirror the OpenAPI `[string, "null"]` shape.
+type Stage struct {
+	ID              uuid.UUID     `json:"id"`
+	RunID           uuid.UUID     `json:"run_id"`
+	Sequence        int           `json:"sequence"`
+	Type            string        `json:"type"`
+	Executor        StageExecutor `json:"executor"`
+	State           string        `json:"state"`
+	StartedAt       *time.Time    `json:"started_at"`
+	EndedAt         *time.Time    `json:"ended_at"`
+	FailureCategory *string       `json:"failure_category"`
+	FailureReason   *string       `json:"failure_reason"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+}
+
+// StageExecutor mirrors the OpenAPI executor sub-schema.
+type StageExecutor struct {
+	Kind string `json:"kind"`
+	Ref  string `json:"ref"`
+}
+
+// ListStagesResult is the response envelope for GET /v0/runs/{id}/stages.
+type ListStagesResult struct {
+	Items []Stage `json:"items"`
+}
+
+// ListRunStages calls GET /v0/runs/{run_id}/stages. Stages come back
+// ordered by sequence ascending.
+func (c *Client) ListRunStages(ctx context.Context, runID uuid.UUID) (*ListStagesResult, error) {
+	var res ListStagesResult
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+runID.String()+"/stages", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// ApprovalDecision is the typed enum the approvals endpoint accepts.
+type ApprovalDecision string
+
+// Approval decisions.
+const (
+	ApprovalApprove ApprovalDecision = "approve"
+	ApprovalReject  ApprovalDecision = "reject"
+)
+
+// SubmitApprovalInput is the request body for POST /v0/stages/{id}/approvals.
+type SubmitApprovalInput struct {
+	Decision ApprovalDecision `json:"decision"`
+	Comment  string           `json:"comment,omitempty"`
+}
+
+// SubmitApproval calls POST /v0/stages/{stage_id}/approvals.
+// The response is the updated Stage with state transitioned to
+// succeeded (approve) or failed (reject).
+func (c *Client) SubmitApproval(ctx context.Context, stageID uuid.UUID, in SubmitApprovalInput) (*Stage, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	var stage Stage
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/approvals", body, &stage); err != nil {
+		return nil, err
+	}
+	return &stage, nil
+}
+
 // do performs the request and decodes the JSON body into out (or
 // reads the error envelope on non-2xx and returns *APIError).
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {
