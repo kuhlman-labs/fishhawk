@@ -238,6 +238,145 @@ func TestMatchEvent_IssueComment_NotMistakenForLongerCommandPrefix(t *testing.T)
 	}
 }
 
+// --- MatchEvent: issue_comment reply-pattern approvals (E17.3 / #338) ---
+
+func TestMatchEvent_IssueComment_ApproveCommand_TaggedSlashSource(t *testing.T) {
+	body := []byte(`{"comment":{"body":"/fishhawk approve"},"issue":{"number":42}}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 1, RawBody: body}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want match", got)
+	}
+	if got.ApprovalSource != ApprovalSourceSlash {
+		t.Errorf("ApprovalSource = %q, want %q", got.ApprovalSource, ApprovalSourceSlash)
+	}
+}
+
+func TestMatchEvent_IssueComment_ReplyPatternApproval(t *testing.T) {
+	// Pattern matrix — each variant must classify as a reply-comment
+	// approval with the right Source tag. Trailing text becomes the
+	// optional comment.
+	cases := []struct {
+		name      string
+		body      string
+		wantTrail string
+	}{
+		{"plus-one-bare", "+1", ""},
+		{"plus-one-trailing", "+1 looks good", "looks good"},
+		{"thumbs-up-emoji", "👍", ""},
+		{"plus-one-emoji-shortcode", ":+1:", ""},
+		{"lgtm-lowercase", "lgtm", ""},
+		{"lgtm-uppercase", "LGTM", ""},
+		{"lgtm-trailing-multiline", "lgtm\n\nbut watch the retry cap", "but watch the retry cap"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := json.Marshal(map[string]any{
+				"comment": map[string]any{"body": tc.body},
+				"issue":   map[string]any{"number": 42},
+			})
+			ev := Event{Type: "issue_comment", Action: "created", InstallationID: 1, RawBody: raw}
+			got := MatchEvent(ev)
+			if got.Skip {
+				t.Fatalf("got = %+v, want match", got)
+			}
+			if got.Action != MatchActionApprove {
+				t.Errorf("Action = %q, want approve", got.Action)
+			}
+			if got.ApprovalSource != ApprovalSourceReplyComment {
+				t.Errorf("ApprovalSource = %q, want %q", got.ApprovalSource, ApprovalSourceReplyComment)
+			}
+			if got.IssueRef == nil || got.IssueRef.Number != 42 {
+				t.Errorf("IssueRef = %+v", got.IssueRef)
+			}
+			if got.CommentBody != tc.wantTrail {
+				t.Errorf("CommentBody = %q, want %q", got.CommentBody, tc.wantTrail)
+			}
+		})
+	}
+}
+
+func TestMatchEvent_IssueComment_ReplyPattern_OnlyMatchesAtStart(t *testing.T) {
+	// "Should we lgtm this?" must NOT classify as a reply-pattern
+	// approval — the pattern must anchor the body. Same posture as
+	// the slash command's quoted-reply guard.
+	cases := []string{
+		"Should we lgtm this?",
+		"hmm, +1 maybe later",
+		"see https://example.com/+1",
+		"+10 percent improvement",
+	}
+	for _, body := range cases {
+		t.Run(body, func(t *testing.T) {
+			raw, _ := json.Marshal(map[string]any{
+				"comment": map[string]any{"body": body},
+				"issue":   map[string]any{"number": 1},
+			})
+			ev := Event{Type: "issue_comment", Action: "created", InstallationID: 1, RawBody: raw}
+			got := MatchEvent(ev)
+			if !got.Skip {
+				t.Errorf("body %q should not match approval-reply patterns; got %+v", body, got)
+			}
+		})
+	}
+}
+
+func TestMatchEvent_IssueComment_SlashCommandWinsOverReplyPattern(t *testing.T) {
+	// "/fishhawk approve lgtm" — the slash matcher fires first; the
+	// trailing "lgtm" goes into CommentBody rather than triggering
+	// the reply-pattern arm. Source is Slash.
+	body := []byte(`{"comment":{"body":"/fishhawk approve lgtm"},"issue":{"number":42}}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 1, RawBody: body}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want match", got)
+	}
+	if got.Action != MatchActionApprove {
+		t.Errorf("Action = %q, want approve", got.Action)
+	}
+	if got.ApprovalSource != ApprovalSourceSlash {
+		t.Errorf("ApprovalSource = %q, want slash", got.ApprovalSource)
+	}
+	if got.CommentBody != "lgtm" {
+		t.Errorf("CommentBody = %q, want lgtm", got.CommentBody)
+	}
+}
+
+// TestHandle_ReplyPatternApprove_RoutesWithSource is the dispatch
+// integration: a reply-pattern comment lands on Handle, which
+// forwards an ApprovalCommandParams carrying Source=ReplyComment to
+// the handler. The handler's behavior for that source is server-
+// side (issue_approval.go) and tested separately.
+func TestHandle_ReplyPatternApprove_RoutesWithSource(t *testing.T) {
+	d, _, _, _ := newDispatcherWithStubs(t)
+	stub := &stubApprovalHandler{}
+	d.ApprovalHandler = stub
+
+	body := []byte(`{"comment":{"body":"+1"},"issue":{"number":42}}`)
+	if err := d.Handle(context.Background(), Event{
+		Type: "issue_comment", Action: "created", InstallationID: 99, Sender: "alice",
+		Repo: "x/y", RawBody: body,
+	}); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 approval call; got %d", len(stub.calls))
+	}
+	got := stub.calls[0]
+	if got.Source != ApprovalSourceReplyComment {
+		t.Errorf("Source = %q, want reply_comment", got.Source)
+	}
+	if got.Decision != MatchActionApprove {
+		t.Errorf("Decision = %q", got.Decision)
+	}
+	if got.IssueNumber != 42 {
+		t.Errorf("IssueNumber = %d", got.IssueNumber)
+	}
+	if got.SenderLogin != "alice" {
+		t.Errorf("SenderLogin = %q", got.SenderLogin)
+	}
+}
+
 // --- MatchEvent: workflow_run ---
 
 func workflowRunBody(t *testing.T, fields map[string]any) []byte {

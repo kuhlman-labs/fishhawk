@@ -55,6 +55,14 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 
+	// Reply-comment approvals (E17.3 / #338) skip silently on every
+	// "no, this comment isn't an approval" branch — an operator who
+	// types "+1 yes I agree" on an issue thread that happens not to
+	// have a Fishhawk plan should not get an unsolicited reply.
+	// Slash-command approvals keep their explicit help replies; the
+	// reviewer typed a deliberate command.
+	silent := p.Source == webhook.ApprovalSourceReplyComment
+
 	runRow, stage, found, err := s.findAwaitingApprovalStage(ctx, p.Repo, p.IssueNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -62,10 +70,16 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 			slog.String("repo", p.Repo),
 			slog.Int("issue", p.IssueNumber),
 			slog.String("error", err.Error()))
+		if silent {
+			return nil
+		}
 		s.replyApproval(ctx, p, "Could not look up the run for this issue. Try the dashboard.")
 		return nil
 	}
 	if !found {
+		if silent {
+			return nil
+		}
 		s.replyApproval(ctx, p, fmt.Sprintf("No stage on this issue's run is awaiting approval. (Subject: @%s)", subject))
 		return nil
 	}
@@ -74,8 +88,13 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 	// The PR merge event (#312) advances the stage; branch protection's
 	// required-reviewers enforces the approver list. Reply with a help
 	// message pointing at the PR rather than submitting an approval.
-	// Plan-stage slash approvals continue to work.
+	// Plan-stage slash approvals continue to work. Reply-comment
+	// approvals skip silently: the operator wasn't necessarily talking
+	// about the review stage either.
 	if stage.Type == run.StageTypeReview {
+		if silent {
+			return nil
+		}
 		s.replyApproval(ctx, p, reviewStageHelpReply(runRow, subject))
 		return nil
 	}
