@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,13 +23,15 @@ import (
 // alt-tab to inspect a run).
 func runAudit(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(stderr, `fishhawk audit: subcommand required (list)`)
+		_, _ = fmt.Fprintln(stderr, `fishhawk audit: subcommand required (list|tail)`)
 		return exitUsage
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "list":
 		return auditList(rest, stdout, stderr)
+	case "tail":
+		return auditTail(rest, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "fishhawk audit: unknown subcommand %q\n", sub)
 		return exitUsage
@@ -143,6 +148,165 @@ func truncateColumn(s string, max int) string {
 		return s[:max]
 	}
 	return s[:max-1] + "…"
+}
+
+// auditTail implements `fishhawk audit tail <run-id> [--interval D] [--output text|json] [--max-polls N]`.
+//
+// Polls the audit endpoint on a loop, printing entries with a
+// sequence strictly greater than the high-water mark seen so far.
+// The first poll prints the current page so the operator has
+// context; subsequent polls are forward-only.
+//
+// Polling rather than SSE because no `text/event-stream` endpoint
+// exists today (verified before adding this verb per the issue).
+// If customers ask for streaming we'd add a server-side SSE
+// endpoint and migrate this client to consume it.
+//
+// Lifecycle:
+//   - Exits 0 on SIGINT / SIGTERM (operator hits Ctrl-C).
+//   - Exits 0 when --max-polls is set and reached (primarily for
+//     tests; an operator might use it to cap a scripted tail).
+//   - Exits 1 after N consecutive transport failures (the API has
+//     been unreachable long enough that "tailing" is misleading).
+//     Transient single-poll failures are warned to stderr and the
+//     loop continues — operators tailing during a deploy shouldn't
+//     have to restart.
+func auditTail(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("fishhawk audit tail", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cf := bindCommonFlags(fs)
+	interval := fs.Duration("interval", 2*time.Second, "poll interval (min 500ms, default 2s)")
+	outputFmt := fs.String("output", "text", "output format: text | json (ndjson)")
+	fs.StringVar(outputFmt, "o", "text", "output format: text | json (shorthand)")
+	// --max-polls primarily exists so tests can bound the loop;
+	// operators can also use it to script a "tail until quiet"
+	// without writing a kill loop themselves.
+	maxPolls := fs.Int("max-polls", 0, "stop after this many polls (0 = forever)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if err := validateOutputFormat(*outputFmt); err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk audit tail: %v\n", err)
+		return exitUsage
+	}
+	if *interval < 500*time.Millisecond {
+		_, _ = fmt.Fprintf(stderr, "fishhawk audit tail: --interval %s is below the 500ms minimum\n", *interval)
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		_, _ = fmt.Fprintln(stderr, "fishhawk audit tail: <run-id> required")
+		return exitUsage
+	}
+	runID, err := uuid.Parse(fs.Arg(0))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk audit tail: %q is not a UUID: %v\n", fs.Arg(0), err)
+		return exitUsage
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return runAuditTail(ctx, newClient(cf), runID, auditTailOptions{
+		interval:  *interval,
+		outputFmt: *outputFmt,
+		maxPolls:  *maxPolls,
+	}, stdout, stderr)
+}
+
+type auditTailOptions struct {
+	interval  time.Duration
+	outputFmt string
+	maxPolls  int
+}
+
+// auditTailAPI is the slice of *httpclient.Client runAuditTail needs.
+// Factored as an interface so tests can drive the loop without
+// standing up an httptest server when they want fine-grained
+// per-poll control over what the API returns (e.g. injecting
+// transient errors).
+type auditTailAPI interface {
+	ListRunAudit(ctx context.Context, runID uuid.UUID, f httpclient.ListRunAuditFilter) (*httpclient.ListRunAuditResult, error)
+}
+
+// runAuditTail is the testable loop body. Polls the audit endpoint
+// on `opts.interval`, tracks the high-water sequence, prints new
+// entries, and exits cleanly on ctx cancellation or after
+// `opts.maxPolls` iterations.
+func runAuditTail(ctx context.Context, api auditTailAPI, runID uuid.UUID, opts auditTailOptions, stdout, stderr io.Writer) int {
+	var highWater int64
+	pollCount := 0
+	consecFailures := 0
+	const maxConsecFailures = 5
+
+	enc := json.NewEncoder(stdout)
+	emit := func(e *httpclient.AuditEntry) {
+		if opts.outputFmt == "json" {
+			_ = enc.Encode(e)
+			return
+		}
+		printAuditEntryLine(stdout, e)
+	}
+
+	for {
+		// Pull a full page each poll. Limit=500 (the server max) so
+		// we don't paginate per cycle; for v0 demos the per-run
+		// audit chain is comfortably under that.
+		res, err := api.ListRunAudit(ctx, runID, httpclient.ListRunAuditFilter{Limit: 500})
+		if err != nil {
+			// Treat context-cancel as a clean exit; the SIGINT
+			// handler tripped or the caller bounded the loop.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return exitOK
+			}
+			consecFailures++
+			_, _ = fmt.Fprintf(stderr,
+				"fishhawk audit tail: poll failed (%d/%d): %v\n",
+				consecFailures, maxConsecFailures, err)
+			if consecFailures >= maxConsecFailures {
+				_, _ = fmt.Fprintf(stderr,
+					"fishhawk audit tail: %d consecutive poll failures; bailing\n",
+					consecFailures)
+				return exitFailure
+			}
+		} else {
+			consecFailures = 0
+			for i := range res.Items {
+				e := &res.Items[i]
+				if e.Sequence <= highWater {
+					continue
+				}
+				emit(e)
+				if e.Sequence > highWater {
+					highWater = e.Sequence
+				}
+			}
+		}
+		pollCount++
+		if opts.maxPolls > 0 && pollCount >= opts.maxPolls {
+			return exitOK
+		}
+		select {
+		case <-ctx.Done():
+			return exitOK
+		case <-time.After(opts.interval):
+		}
+	}
+}
+
+// printAuditEntryLine renders one audit entry as a single-line text
+// row. Same column shape as `audit list` so a user piping tail
+// output side-by-side with a list page sees consistent formatting.
+func printAuditEntryLine(w io.Writer, e *httpclient.AuditEntry) {
+	actor := "system"
+	if e.ActorSubject != nil && *e.ActorSubject != "" {
+		actor = *e.ActorSubject
+	}
+	_, _ = fmt.Fprintf(w, "%-6d  %-30s  %-15s  %-20s  %s\n",
+		e.Sequence,
+		truncateColumn(e.Category, 30),
+		truncateColumn(actor, 15),
+		e.Timestamp.UTC().Format(time.RFC3339),
+		summarizePayload(e.Payload),
+	)
 }
 
 // summarizePayload picks one operator-relevant field out of an
