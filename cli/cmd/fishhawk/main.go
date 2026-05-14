@@ -12,6 +12,7 @@
 //	fishhawk plan approve <run-id> [--reason ...] [--output text|json]
 //	fishhawk plan reject  <run-id> [--reason ...] [--output text|json]
 //	fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
+//	fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
 //
 // Auth is the same `bearerToken` scheme defined in the OpenAPI:
 // CLI sends `Authorization: Bearer <token>` from --token /
@@ -101,6 +102,7 @@ func printUsage(w io.Writer) {
 		"  plan approve Approve the plan stage on a run.",
 		"  plan reject  Reject the plan stage on a run (category-D failure).",
 		"  audit list   List audit entries for a run.",
+		"  audit tail   Follow the audit log of a run in real time.",
 		"  validate     Validate a workflow spec file locally.",
 		"  version      Print the CLI version and exit.",
 		"  help         Show this help.",

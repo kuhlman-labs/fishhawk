@@ -13,7 +13,7 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 
 ## Status
 
-E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335) added `plan approve`, `plan reject`, `run retry`, `audit list`.
+E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`.
 
 ## Subcommands
 
@@ -27,6 +27,7 @@ fishhawk run retry    <stage-id> [--output text|json]
 fishhawk plan approve <run-id> [--reason R] [--output text|json]
 fishhawk plan reject  <run-id> [--reason R] [--output text|json]
 fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
+fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
 fishhawk version
 ```
@@ -34,6 +35,8 @@ fishhawk version
 `run retry` takes a **stage** id, not a run id — retry is stage-scoped per the state machine. Pick the failed stage from `fishhawk run status <run-id> --output json` (`.stages[].id`).
 
 `audit list` outputs NDJSON (one entry per line) when `--output json` is set so a long page can be piped through `head`/`tail` without breaking the parser.
+
+`audit tail` polls the audit endpoint on a configurable interval (default 2s, minimum 500ms) and prints new entries as they land. It exits cleanly on Ctrl-C. There's no server-side SSE today — if streaming demand grows we'd add one and migrate the client.
 
 ## Global flags
 
@@ -84,6 +87,9 @@ Or from this directory directly:
     # Inspect the audit log without leaving the terminal
     fishhawk audit list <run-id>
     fishhawk audit list <run-id> --category approval_submitted --output json | jq .
+
+    # Follow a run's audit log in a side terminal
+    fishhawk audit tail <run-id> --interval 1s
 
 ## See also
 
