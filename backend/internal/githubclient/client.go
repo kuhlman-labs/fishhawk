@@ -979,6 +979,76 @@ func (c *Client) CreateIssueComment(ctx context.Context, installationID int64, r
 	return classifyStatus("create issue comment", resp)
 }
 
+// IssueComment is the subset of GitHub's issue-comment shape Fishhawk
+// reads back from PATCH responses. The wire shape carries more fields
+// (user, reactions, timing); we surface only what callers verify.
+type IssueComment struct {
+	ID      int64  `json:"id"`
+	Body    string `json:"body"`
+	HTMLURL string `json:"html_url"`
+}
+
+// UpdateIssueComment edits an existing issue comment in place. ADR-019
+// / #320 (Fishhawk as coordination layer) leans on this for the
+// sticky status comment (E20 / #326) and `update_on_change` plan
+// comments (E17.2 / #337) — both flows need to mutate a previously-
+// posted comment instead of spamming new ones.
+//
+//	PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}
+//
+// Returns ErrNotFound when the comment was deleted by the operator or
+// isn't visible to the installation, ErrForbidden when the App lacks
+// `issues:write`. Same permission scope as CreateIssueComment, so no
+// new manifest entry needed.
+//
+// Caller is responsible for finding the comment id (typically via
+// the run's audit log — the existing `issue_commented` rows record
+// the id for sticky-comment lookups).
+func (c *Client) UpdateIssueComment(ctx context.Context, installationID int64, repo RepoRef, commentID int64, body string) (*IssueComment, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if commentID <= 0 {
+		return nil, errors.New("githubclient: comment id must be > 0")
+	}
+	if body == "" {
+		return nil, errors.New("githubclient: comment body must be non-empty")
+	}
+
+	raw, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: marshal issue comment: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/issues/comments/" + url.PathEscape(fmt.Sprintf("%d", commentID)))
+
+	req, err := c.buildRequest(ctx, http.MethodPatch, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: update issue comment: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("update issue comment", resp); err != nil {
+		return nil, err
+	}
+	var out IssueComment
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("githubclient: decode update issue comment: %w", err)
+	}
+	return &out, nil
+}
+
 // CheckRunStatus is the GitHub Checks API `status` enum.
 // Closed set; passing anything else returns ErrValidation.
 type CheckRunStatus string
