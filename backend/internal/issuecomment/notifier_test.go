@@ -657,6 +657,216 @@ func TestNotifyStatusUpdateForRun_NilReceiver_NoOp(t *testing.T) {
 	}
 }
 
+// TestStatusComment_Lifecycle drives the sticky-status comment through
+// the operator-visible transitions of a representative run lifecycle
+// (E20.5 / #331): pickup → plan-ready → plan-approved → implementing →
+// PR-open → merged. Each transition mutates the underlying run/stage
+// state and fires NotifyStatusUpdateForRun; the test verifies that the
+// notifier (1) creates exactly one comment, (2) edits the same comment
+// id on every subsequent transition, and (3) renders the right state
+// content at each step.
+//
+// This is the cross-cutting integration test promised by #331's
+// acceptance criteria. The wiring of each handler is unit-tested per
+// transition (dispatcher_test, trace_plannotify_test, issue_approval_test,
+// pullrequest_review_events_test); this test sits one level up and
+// verifies the audit-log-based edit-in-place loop survives a real
+// sequence of transitions.
+func TestStatusComment_Lifecycle(t *testing.T) {
+	runID := uuid.New()
+	triggerRef := "issue:42"
+	r := &run.Run{
+		ID:             runID,
+		Repo:           "x/y",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: int64Ptr(99),
+		State:          run.StatePending,
+	}
+	planStage := &run.Stage{ID: uuid.New(), RunID: runID, Sequence: 1, Type: run.StageTypePlan, State: run.StageStatePending}
+	implementStage := &run.Stage{ID: uuid.New(), RunID: runID, Sequence: 2, Type: run.StageTypeImplement, State: run.StageStatePending}
+	reviewStage := &run.Stage{ID: uuid.New(), RunID: runID, Sequence: 3, Type: run.StageTypeReview, State: run.StageStatePending}
+	stages := []*run.Stage{planStage, implementStage, reviewStage}
+
+	repoRuns := &fakeRuns{
+		runs:   map[uuid.UUID]*run.Run{runID: r},
+		stages: map[uuid.UUID][]*run.Stage{runID: stages},
+	}
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        repoRuns,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+		Now:         func() time.Time { return time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC) },
+	})
+
+	ctx := context.Background()
+
+	// Step 1: pickup (dispatcher seed). Run is pending, plan stage is
+	// pending — the first transition fires after CreateRun. Expect a
+	// create call landing comment id=1.
+	r.State = run.StateRunning
+	planStage.State = run.StageStateDispatched
+	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
+		t.Fatalf("step 1 pickup: %v", err)
+	}
+	if len(gh.calls) != 1 || len(gh.updateCalls) != 0 {
+		t.Fatalf("step 1: expected 1 create + 0 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
+	}
+
+	// Step 2: plan terminal (trace handler). Plan stage moves to
+	// awaiting_approval (the workflow requires approval). Expect an
+	// edit on comment id=1.
+	planStage.State = run.StageStateAwaitingApproval
+	planStage.RequiresApproval = true
+	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
+		t.Fatalf("step 2 plan terminal: %v", err)
+	}
+	if len(gh.calls) != 1 || len(gh.updateCalls) != 1 {
+		t.Fatalf("step 2: expected 1 create + 1 update; got %d + %d", len(gh.calls), len(gh.updateCalls))
+	}
+	if gh.updateCalls[0].commentID != 1 {
+		t.Errorf("step 2: edit commentID = %d, want 1", gh.updateCalls[0].commentID)
+	}
+
+	// Step 3: plan approved (approval handler). Plan succeeds, implement
+	// dispatches.
+	planStage.State = run.StageStateSucceeded
+	implementStage.State = run.StageStateDispatched
+	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
+		t.Fatalf("step 3 plan approved: %v", err)
+	}
+	if len(gh.calls) != 1 || len(gh.updateCalls) != 2 {
+		t.Fatalf("step 3: expected 1 create + 2 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
+	}
+
+	// Step 4: implement terminal (trace handler). Implement succeeds.
+	implementStage.State = run.StageStateSucceeded
+	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
+		t.Fatalf("step 4 implement terminal: %v", err)
+	}
+	if len(gh.calls) != 1 || len(gh.updateCalls) != 3 {
+		t.Fatalf("step 4: expected 1 create + 3 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
+	}
+
+	// Step 5: PR opened (pullrequest handler). PR URL is stamped on
+	// the run; review stage moves to awaiting_approval.
+	prURL := "https://github.com/x/y/pull/42"
+	r.PullRequestURL = &prURL
+	reviewStage.State = run.StageStateAwaitingApproval
+	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
+		t.Fatalf("step 5 PR opened: %v", err)
+	}
+	if len(gh.calls) != 1 || len(gh.updateCalls) != 4 {
+		t.Fatalf("step 5: expected 1 create + 4 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
+	}
+	if !strings.Contains(gh.updateCalls[3].body, prURL) {
+		t.Errorf("step 5: comment body should contain PR URL: %q", gh.updateCalls[3].body)
+	}
+
+	// Step 6: PR merged (PR-events handler). Review stage succeeds,
+	// run state moves to succeeded.
+	reviewStage.State = run.StageStateSucceeded
+	r.State = run.StateSucceeded
+	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
+		t.Fatalf("step 6 PR merged: %v", err)
+	}
+	if len(gh.calls) != 1 || len(gh.updateCalls) != 5 {
+		t.Fatalf("step 6: expected 1 create + 5 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
+	}
+
+	// All updates must target the same comment id — the test fails
+	// loudly if the dedup ever races and creates a second comment.
+	for i, upd := range gh.updateCalls {
+		if upd.commentID != 1 {
+			t.Errorf("update %d targeted comment id %d; expected stable id=1 across lifecycle",
+				i, upd.commentID)
+		}
+	}
+
+	// Final body should reflect the succeeded state and carry both
+	// the run link and the PR link.
+	finalBody := gh.updateCalls[len(gh.updateCalls)-1].body
+	for _, want := range []string{"succeeded", "Pull request", prURL, "View run"} {
+		if !strings.Contains(finalBody, want) {
+			t.Errorf("final body missing %q\n---\n%s", want, finalBody)
+		}
+	}
+
+	// Audit-log accounting: one status_comment_posted row per
+	// transition (6 total). The chain is what production reads from
+	// to find the comment id on subsequent calls, so the count is a
+	// load-bearing invariant.
+	statusRows := 0
+	for _, p := range au.appended {
+		if p.Category == issuecomment.CategoryStatusCommentPosted {
+			statusRows++
+		}
+	}
+	if statusRows != 6 {
+		t.Errorf("expected 6 status_comment_posted audit rows (one per transition); got %d", statusRows)
+	}
+}
+
+// TestStatusComment_ConcurrentUpdates_TargetSameComment locks in the
+// dedup property under concurrent fire (E20.5 / #331 case 3): once a
+// status comment exists, concurrent NotifyStatusUpdateForRun calls
+// all resolve to UpdateIssueComment with the same id rather than
+// racing into multiple CreateIssueComment calls. The production
+// path's `ListForRunByCategory` query returns the existing row to
+// every concurrent reader, so all callers find the seeded comment id
+// and take the edit path.
+//
+// First-call concurrency (no prior comment) is NOT exercised by this
+// test — that's a TOCTOU race the audit-log dedup cannot prevent on
+// its own, and the dispatcher's seed step happens before any other
+// transition so in practice the race window is bounded.
+func TestStatusComment_ConcurrentUpdates_TargetSameComment(t *testing.T) {
+	runID, gh, au, _, n := happyDepsWithStages(t)
+
+	// Pre-seed an existing status comment so every concurrent caller
+	// reads the same id from the dedup query.
+	au.preSeed(runID, issuecomment.CategoryStatusCommentPosted, map[string]any{
+		"kind":              string(issuecomment.KindStatusUpdate),
+		"issue_number":      42,
+		"repo":              "x/y",
+		"github_comment_id": 4242,
+	})
+
+	const N = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- n.NotifyStatusUpdateForRun(context.Background(), runID)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent NotifyStatusUpdateForRun: %v", err)
+		}
+	}
+
+	if len(gh.calls) != 0 {
+		t.Errorf("no concurrent caller should have taken the create path; got %d", len(gh.calls))
+	}
+	if len(gh.updateCalls) != N {
+		t.Fatalf("expected %d update calls (one per caller); got %d", N, len(gh.updateCalls))
+	}
+	for i, upd := range gh.updateCalls {
+		if upd.commentID != 4242 {
+			t.Errorf("update %d targeted comment id %d; want 4242 (seeded)", i, upd.commentID)
+		}
+	}
+}
+
 func TestNew_NilDepsReturnsNilNotifier(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1031,11 +1241,37 @@ func (f *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 	return &audit.Entry{ID: uuid.New(), RunID: &r}, nil
 }
 
+// appendedToEntries projects the recorded ChainAppendParams back to
+// *audit.Entry rows so the lifecycle / lookup queries can see what the
+// production code wrote. Sequence is the 1-indexed position; the
+// caller's slice order is the canonical chronological order.
+func (f *fakeAudit) appendedToEntries() []*audit.Entry {
+	out := make([]*audit.Entry, 0, len(f.appended))
+	for i, p := range f.appended {
+		r := p.RunID
+		out = append(out, &audit.Entry{
+			ID:        uuid.New(),
+			Sequence:  int64(i + 1),
+			RunID:     &r,
+			StageID:   p.StageID,
+			Timestamp: p.Timestamp,
+			Category:  p.Category,
+			Payload:   p.Payload,
+		})
+	}
+	return out
+}
+
 func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := []*audit.Entry{}
 	for _, e := range f.preSeeds {
+		if e.RunID != nil && *e.RunID == runID && e.Category == category {
+			out = append(out, e)
+		}
+	}
+	for _, e := range f.appendedToEntries() {
 		if e.RunID != nil && *e.RunID == runID && e.Category == category {
 			out = append(out, e)
 		}
@@ -1048,6 +1284,11 @@ func (f *fakeAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Ent
 	defer f.mu.Unlock()
 	out := []*audit.Entry{}
 	for _, e := range f.preSeeds {
+		if e.RunID != nil && *e.RunID == runID {
+			out = append(out, e)
+		}
+	}
+	for _, e := range f.appendedToEntries() {
 		if e.RunID != nil && *e.RunID == runID {
 			out = append(out, e)
 		}
