@@ -652,6 +652,114 @@ func TestPlanApprove_BadOutputValue(t *testing.T) {
 	}
 }
 
+// --- plan reject (E18.2 / #333) ---
+
+func TestPlanReject_HappyPath(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	planStageID := stages[0].ID
+	fb.stagesForRun[runID] = stages
+	cat := "D"
+	reason := "scope too wide"
+	fb.approvalResp = httpclient.Stage{
+		ID: planStageID, RunID: runID, Sequence: 1, Type: "plan", State: "failed",
+		FailureCategory: &cat,
+		FailureReason:   &reason,
+		Executor:        httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+	}
+
+	var stdout, stderr strings.Builder
+	got := run([]string{"plan", "reject", "--reason", "scope too wide", runID.String()}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK; stderr=%s", got, stderr.String())
+	}
+	if fb.approvedID != planStageID.String() {
+		t.Errorf("approved stage_id = %s, want %s", fb.approvedID, planStageID)
+	}
+	if fb.approvalBody.Decision != httpclient.ApprovalReject {
+		t.Errorf("decision = %q, want reject", fb.approvalBody.Decision)
+	}
+	if fb.approvalBody.Comment != "scope too wide" {
+		t.Errorf("comment = %q", fb.approvalBody.Comment)
+	}
+	out := stdout.String()
+	// Output should reflect the failed-D state and the rejection
+	// reason, otherwise the user runs an extra `run status` to
+	// understand what happened.
+	if !strings.Contains(out, "failed") {
+		t.Errorf("stdout missing 'failed' state: %s", out)
+	}
+	if !strings.Contains(out, "D") {
+		t.Errorf("stdout missing failure category 'D': %s", out)
+	}
+	// --reason was provided so no warning should fire.
+	if strings.Contains(stderr.String(), "warning") {
+		t.Errorf("unexpected warning when --reason set: %s", stderr.String())
+	}
+}
+
+func TestPlanReject_NoReasonWarns(t *testing.T) {
+	// Reject without --reason is wire-legal but produces an empty
+	// audit comment. The CLI emits a soft warning to stderr and
+	// proceeds — exit code stays exitOK.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	planStageID := stages[0].ID
+	fb.stagesForRun[runID] = stages
+	fb.approvalResp = httpclient.Stage{
+		ID: planStageID, RunID: runID, Sequence: 1, Type: "plan", State: "failed",
+		Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+	}
+
+	var stdout, stderr strings.Builder
+	got := run([]string{"plan", "reject", runID.String()}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if !strings.Contains(stderr.String(), "--reason not provided") {
+		t.Errorf("stderr missing soft warning: %s", stderr.String())
+	}
+	if fb.approvalBody.Comment != "" {
+		t.Errorf("comment = %q, want empty", fb.approvalBody.Comment)
+	}
+}
+
+func TestPlanReject_NoAwaitingPlanStage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	fb.stagesForRun[runID] = planApproveStages(runID, "succeeded")
+
+	var stderr strings.Builder
+	got := run([]string{"plan", "reject", "--reason", "x", runID.String()}, io.Discard, &stderr)
+	if got != exitFailure {
+		t.Errorf("status = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), "no plan stage awaiting approval") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+	if fb.approvedID != "" {
+		t.Errorf("approval endpoint reached with no awaiting plan stage; stage_id=%s", fb.approvedID)
+	}
+}
+
+func TestPlanReject_BadUUID(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	var stderr strings.Builder
+	got := run([]string{"plan", "reject", "--reason", "x", "not-a-uuid"}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "not a UUID") {
+		t.Errorf("stderr missing 'not a UUID': %s", stderr.String())
+	}
+}
+
 func TestPlan_UnknownSubcommand(t *testing.T) {
 	var stderr strings.Builder
 	got := run([]string{"plan", "frobnicate"}, io.Discard, &stderr)
