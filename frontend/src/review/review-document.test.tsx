@@ -257,6 +257,27 @@ describe('<ReviewDocument> activity panel (#314)', () => {
     });
   });
 
+  it('renders pr_closed_without_merge with the closer name (#316)', async () => {
+    vi.spyOn(api, 'listRunAudit').mockResolvedValue({
+      items: [
+        auditEntry({
+          id: 'cl1',
+          sequence: 5,
+          category: 'pr_closed_without_merge',
+          actor_subject: 'erin',
+          payload: { closer: 'erin' },
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderDoc();
+    await waitFor(() => {
+      const panel = screen.getByTestId('review-activity');
+      expect(panel).toHaveTextContent('@erin');
+      expect(panel).toHaveTextContent(/closed without merging/i);
+    });
+  });
+
   it('picks the right verb for non-approve review states', async () => {
     vi.spyOn(api, 'listRunAudit').mockResolvedValue({
       items: [
