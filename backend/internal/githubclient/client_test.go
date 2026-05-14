@@ -830,8 +830,9 @@ func TestCreateIssueComment_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	if err := c.CreateIssueComment(context.Background(), 42,
-		RepoRef{Owner: "x", Name: "y"}, 17, "Fishhawk picked this up."); err != nil {
+	got, err := c.CreateIssueComment(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 17, "Fishhawk picked this up.")
+	if err != nil {
 		t.Fatalf("CreateIssueComment: %v", err)
 	}
 	if fg.gotMethod != http.MethodPost {
@@ -849,6 +850,13 @@ func TestCreateIssueComment_HappyPath(t *testing.T) {
 	}
 	if body["body"] != "Fishhawk picked this up." {
 		t.Errorf("body = %q", body["body"])
+	}
+	// Caller can now read the created comment id back — used by the
+	// sticky-status-comment flow (E20.2 / #328) and the plan-comment
+	// update-on-change flow (E17.2 / #337). The fake server's
+	// default body is `{"id":11111}`.
+	if got == nil || got.ID != 11111 {
+		t.Errorf("returned IssueComment = %+v, want id=11111", got)
 	}
 }
 
@@ -868,7 +876,7 @@ func TestCreateIssueComment_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := c.CreateIssueComment(context.Background(), 1, tc.repo, tc.number, tc.body)
+			_, err := c.CreateIssueComment(context.Background(), 1, tc.repo, tc.number, tc.body)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -882,7 +890,7 @@ func TestCreateIssueComment_GitHubError(t *testing.T) {
 	fg.createIssueCommentBody = `{"message":"Resource not accessible by integration"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.CreateIssueComment(context.Background(), 1,
+	_, err := c.CreateIssueComment(context.Background(), 1,
 		RepoRef{Owner: "x", Name: "y"}, 1, "hi")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v want ErrForbidden", err)

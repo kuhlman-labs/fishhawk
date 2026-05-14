@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -359,6 +360,179 @@ func TestNotifyCIRetry_SkipsNonIssueTrigger(t *testing.T) {
 	}
 }
 
+// --- NotifyStatusUpdate (E20.2 / #328) ---
+
+func TestNotifyStatusUpdate_NilReceiver_NoOp(t *testing.T) {
+	var n *issuecomment.Notifier
+	if err := n.NotifyStatusUpdate(context.Background(), uuid.New(), "body"); err != nil {
+		t.Errorf("nil receiver should return nil; got %v", err)
+	}
+}
+
+func TestNotifyStatusUpdate_EmptyBody_NoOp(t *testing.T) {
+	// Caller didn't render anything (no transition worth surfacing).
+	// Skip without touching GitHub or the audit log.
+	runID, gh, au, n := happyDeps(t)
+	if err := n.NotifyStatusUpdate(context.Background(), runID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls)+len(gh.updateCalls) != 0 {
+		t.Errorf("expected no GitHub activity on empty body; got %d/%d", len(gh.calls), len(gh.updateCalls))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("expected no audit activity on empty body; got %d", len(au.appended))
+	}
+}
+
+func TestNotifyStatusUpdate_NonIssueTrigger_NoOp(t *testing.T) {
+	// CLI / PR-triggered runs don't have an originating issue;
+	// the status comment has nowhere to land.
+	runID := uuid.New()
+	cliRef := "cli:adhoc"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y",
+			TriggerSource:  run.TriggerCLI,
+			TriggerRef:     &cliRef,
+			InstallationID: int64Ptr(99),
+		}},
+	}
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if err := n.NotifyStatusUpdate(context.Background(), runID, "body"); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls)+len(gh.updateCalls) != 0 || len(au.appended) != 0 {
+		t.Errorf("expected no activity for non-issue-trigger; got gh=%d/%d audit=%d",
+			len(gh.calls), len(gh.updateCalls), len(au.appended))
+	}
+}
+
+func TestNotifyStatusUpdate_FirstCall_CreatesCommentAndAuditRow(t *testing.T) {
+	runID, gh, au, n := happyDeps(t)
+	if err := n.NotifyStatusUpdate(context.Background(), runID, "status v1"); err != nil {
+		t.Fatalf("NotifyStatusUpdate: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	}
+	if gh.calls[0].body != "status v1" {
+		t.Errorf("body = %q", gh.calls[0].body)
+	}
+	if len(gh.updateCalls) != 0 {
+		t.Errorf("expected no update calls on first invocation; got %d", len(gh.updateCalls))
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("expected 1 audit row; got %d", len(au.appended))
+	}
+	row := au.appended[0]
+	if row.Category != issuecomment.CategoryStatusCommentPosted {
+		t.Errorf("category = %q, want %q", row.Category, issuecomment.CategoryStatusCommentPosted)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(row.Payload, &body); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	if body["kind"] != string(issuecomment.KindStatusUpdate) {
+		t.Errorf("payload.kind = %v, want status_update", body["kind"])
+	}
+	// fakeGitHub assigns id=1 to the first create.
+	if id, _ := body["github_comment_id"].(float64); int64(id) != 1 {
+		t.Errorf("payload.github_comment_id = %v, want 1", body["github_comment_id"])
+	}
+}
+
+func TestNotifyStatusUpdate_SubsequentCall_EditsExistingComment(t *testing.T) {
+	// Pre-seed an existing status comment audit row; the second
+	// call should call UpdateIssueComment with the seeded id instead
+	// of creating a new comment.
+	runID, gh, au, n := happyDeps(t)
+	au.preSeed(runID, issuecomment.CategoryStatusCommentPosted, map[string]any{
+		"kind":              string(issuecomment.KindStatusUpdate),
+		"issue_number":      42,
+		"repo":              "x/y",
+		"github_comment_id": 4242,
+	})
+
+	if err := n.NotifyStatusUpdate(context.Background(), runID, "status v2"); err != nil {
+		t.Fatalf("NotifyStatusUpdate: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("expected no create on edit path; got %d", len(gh.calls))
+	}
+	if len(gh.updateCalls) != 1 {
+		t.Fatalf("expected 1 update call; got %d", len(gh.updateCalls))
+	}
+	upd := gh.updateCalls[0]
+	if upd.commentID != 4242 {
+		t.Errorf("update.commentID = %d, want 4242 (from preseed)", upd.commentID)
+	}
+	if upd.body != "status v2" {
+		t.Errorf("update.body = %q", upd.body)
+	}
+	// Fresh audit row for the updated state.
+	if len(au.appended) != 1 {
+		t.Fatalf("expected 1 audit row; got %d", len(au.appended))
+	}
+}
+
+func TestNotifyStatusUpdate_404OnUpdate_FallsBackToCreate(t *testing.T) {
+	// Operator manually deleted the prior status comment. PATCH
+	// returns 404 → ErrNotFound; notifier falls back to creating a
+	// fresh comment and recording its id in a new audit row.
+	runID, gh, au, n := happyDeps(t)
+	au.preSeed(runID, issuecomment.CategoryStatusCommentPosted, map[string]any{
+		"kind":              string(issuecomment.KindStatusUpdate),
+		"github_comment_id": 9999,
+	})
+	gh.updateErr = githubclient.ErrNotFound
+
+	if err := n.NotifyStatusUpdate(context.Background(), runID, "status after delete"); err != nil {
+		t.Fatalf("NotifyStatusUpdate: %v", err)
+	}
+	if len(gh.updateCalls) != 1 {
+		t.Errorf("expected 1 update attempt; got %d", len(gh.updateCalls))
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("expected 1 create fallback; got %d", len(gh.calls))
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("expected 1 audit row; got %d", len(au.appended))
+	}
+	var body map[string]any
+	_ = json.Unmarshal(au.appended[0].Payload, &body)
+	// New comment id from the fallback create (fakeGitHub's len-based
+	// id assignment; first create returns id=1).
+	if id, _ := body["github_comment_id"].(float64); int64(id) != 1 {
+		t.Errorf("payload.github_comment_id = %v, want 1 (fresh id from fallback create)", body["github_comment_id"])
+	}
+}
+
+func TestNotifyStatusUpdate_UpdateErrorOtherThan404_SurfacesError(t *testing.T) {
+	// 403 / 500 / other errors should propagate, not fall through
+	// to create. The caller decides whether to retry.
+	runID, gh, au, n := happyDeps(t)
+	au.preSeed(runID, issuecomment.CategoryStatusCommentPosted, map[string]any{
+		"github_comment_id": 4242,
+	})
+	gh.updateErr = githubclient.ErrForbidden
+
+	err := n.NotifyStatusUpdate(context.Background(), runID, "x")
+	if err == nil {
+		t.Fatalf("expected error on non-404 update failure")
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("non-404 update failure should not fall back to create; got %d creates", len(gh.calls))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("non-404 update failure should not append audit row; got %d", len(au.appended))
+	}
+}
+
 func TestNotifyPickup_AndPlan_ShareCategoryButDistinctKinds(t *testing.T) {
 	runID, gh, au, n := happyDeps(t)
 	if err := n.NotifyPickup(context.Background(), runID, "alice"); err != nil {
@@ -656,17 +830,53 @@ type ghCommentCall struct {
 	body           string
 }
 
-type fakeGitHub struct {
-	mu    sync.Mutex
-	calls []ghCommentCall
-	err   error
+type ghUpdateCommentCall struct {
+	installationID int64
+	repo           githubclient.RepoRef
+	commentID      int64
+	body           string
 }
 
-func (f *fakeGitHub) CreateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) error {
+type fakeGitHub struct {
+	mu          sync.Mutex
+	calls       []ghCommentCall
+	updateCalls []ghUpdateCommentCall
+	err         error
+	updateErr   error
+}
+
+func (f *fakeGitHub) CreateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, ghCommentCall{installationID: installationID, repo: repo, issueNumber: issueNumber, body: body})
-	return f.err
+	if f.err != nil {
+		return nil, f.err
+	}
+	// Synthesize an id deterministically from the call index so
+	// status-comment tests can predict the comment id without
+	// extra plumbing. The +1 keeps ids positive (1, 2, 3, …).
+	id := int64(len(f.calls))
+	return &githubclient.IssueComment{
+		ID:      id,
+		Body:    body,
+		HTMLURL: fmt.Sprintf("https://github.com/%s/issues/%d#issuecomment-%d", repo.String(), issueNumber, id),
+	}, nil
+}
+
+// UpdateIssueComment records the edit call alongside the existing
+// create-call log. Status-comment tests assert on both surfaces.
+func (f *fakeGitHub) UpdateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updateCalls = append(f.updateCalls, ghUpdateCommentCall{installationID: installationID, repo: repo, commentID: commentID, body: body})
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
+	return &githubclient.IssueComment{
+		ID:      commentID,
+		Body:    body,
+		HTMLURL: fmt.Sprintf("https://github.com/%s#issuecomment-%d", repo.String(), commentID),
+	}, nil
 }
 
 type fakeRuns struct {
