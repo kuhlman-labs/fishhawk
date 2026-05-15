@@ -74,6 +74,10 @@ func run(ctx context.Context, stderr io.Writer) int {
 		return exitFailure
 	}
 	srv := buildServer(cfg)
+	registerTools(srv, &runResolver{
+		api:    newAPIClient(cfg),
+		getenv: os.Getenv,
+	})
 	if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: transport error: %v\n", err)
 		return exitFailure
@@ -114,21 +118,14 @@ func loadConfig(getenv func(string) string) (config, error) {
 	return c, nil
 }
 
-// buildServer constructs the MCP server with the tool registry. In
-// E19.2 the registry is empty by design; subsequent E19.x tickets
-// register tools here. Splitting the constructor out of run keeps
-// the test surface small — the test exercises loadConfig + this
-// builder without driving stdio.
-func buildServer(cfg config) *mcp.Server {
-	srv := mcp.NewServer(&mcp.Implementation{
+// buildServer constructs the MCP server shell without any tools.
+// Splitting the constructor out of run + registerTools keeps the
+// test surface small — buildServer is the empty server every test
+// can start from, registerTools is the part each tool's test
+// exercises.
+func buildServer(_ config) *mcp.Server {
+	return mcp.NewServer(&mcp.Implementation{
 		Name:    serverName,
 		Version: serverVersion,
 	}, nil)
-	// Tools register here as they land:
-	//   E19.3 / #343 — fishhawk_get_active_run
-	//   E19.4 / #344 — fishhawk_get_plan
-	//   E19.5 / #345 — fishhawk_get_run_status
-	//   E19.6 / #346 — fishhawk_list_audit
-	_ = cfg // cfg threads through to the tool registrars
-	return srv
 }
