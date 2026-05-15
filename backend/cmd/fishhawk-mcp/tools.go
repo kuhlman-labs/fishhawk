@@ -285,13 +285,21 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 		if err != nil {
 			return nil, GetPlanOutput{}, fmt.Errorf("get run for parent walk: %w", err)
 		}
-		if runRow.ParentRunID == nil {
+		if runRow.ParentRunID == nil || *runRow.ParentRunID == "" {
 			return nil, GetPlanOutput{
 				Status:  "no_plan_yet",
 				Message: fmt.Sprintf("no terminal plan artifact on run %s (chain root reached at depth %d)", runID, depth),
 			}, nil
 		}
-		current = *runRow.ParentRunID
+		// Parse the parent id back to uuid.UUID for the next GetRun
+		// call. The Run shape carries IDs as strings so the MCP SDK
+		// can infer a string schema; the API client signatures still
+		// take uuid.UUID for the path segment.
+		parent, parseErr := uuid.Parse(*runRow.ParentRunID)
+		if parseErr != nil {
+			return nil, GetPlanOutput{}, fmt.Errorf("parse parent_run_id %q: %w", *runRow.ParentRunID, parseErr)
+		}
+		current = parent
 	}
 	return nil, GetPlanOutput{
 		Status:  "no_plan_yet",
@@ -308,15 +316,19 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 	if err != nil {
 		return nil, false, fmt.Errorf("list stages: %w", err)
 	}
-	var planStageID uuid.UUID
+	var planStageIDStr string
 	for _, st := range stages {
 		if st.Type == "plan" {
-			planStageID = st.ID
+			planStageIDStr = st.ID
 			break
 		}
 	}
-	if planStageID == uuid.Nil {
+	if planStageIDStr == "" {
 		return nil, false, nil
+	}
+	planStageID, parseErr := uuid.Parse(planStageIDStr)
+	if parseErr != nil {
+		return nil, false, fmt.Errorf("parse plan stage id %q: %w", planStageIDStr, parseErr)
 	}
 	arts, err := r.api.ListStageArtifacts(ctx, planStageID)
 	if err != nil {
@@ -338,15 +350,24 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 	if picked == nil {
 		return nil, false, nil
 	}
-	if len(picked.Content) == 0 {
+	if picked.Content == nil {
 		// Backend invariant: ListStageArtifacts returns content
-		// inline. An empty content suggests a partial response we
+		// inline. An absent content suggests a partial response we
 		// shouldn't try to parse — surface as not-yet rather than
 		// a confusing JSON parse error.
 		return nil, false, nil
 	}
+	// Content is typed `any` so the MCP SDK's output schema infers
+	// an unconstrained shape (rather than RawMessage's []byte =
+	// array). Re-marshal to bytes here so we can decode into the
+	// typed PlanContent. The extra round-trip is cheap and lives
+	// only on the plan-fetch path.
+	raw, err := json.Marshal(picked.Content)
+	if err != nil {
+		return nil, false, fmt.Errorf("re-encode plan artifact content: %w", err)
+	}
 	var p PlanContent
-	if err := json.Unmarshal(picked.Content, &p); err != nil {
+	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, false, fmt.Errorf("decode plan artifact: %w", err)
 	}
 	return &p, true, nil
