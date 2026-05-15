@@ -91,13 +91,7 @@ function StageDetailView({
 
       {stage.type === 'plan' &&
         (planArtifact ? (
-          <PlanArtifact
-            artifactId={planArtifact.id}
-            stage={stage}
-            runId={runId}
-            onStageUpdate={setStage}
-            onStageRollback={setStage}
-          />
+          <PlanArtifact artifactId={planArtifact.id} stage={stage} runId={runId} />
         ) : (
           <p className="text-sm text-neutral-500">
             No standard_v1 plan artifact attached to this stage yet.
@@ -139,17 +133,9 @@ interface PlanArtifactProps {
   artifactId: string;
   stage: Stage;
   runId: string;
-  onStageUpdate: (next: Stage) => void;
-  onStageRollback: (prev: Stage) => void;
 }
 
-function PlanArtifact({
-  artifactId,
-  stage,
-  runId,
-  onStageUpdate,
-  onStageRollback,
-}: PlanArtifactProps) {
+function PlanArtifact({ artifactId, stage, runId }: PlanArtifactProps) {
   const result = useAsync(() => api.getArtifact<unknown>(artifactId), [artifactId]);
 
   if (result.status === 'loading') {
@@ -174,15 +160,7 @@ function PlanArtifact({
     );
   }
 
-  return (
-    <PlanDocument
-      plan={content as StandardV1Plan}
-      stage={stage}
-      runId={runId}
-      onStageUpdate={onStageUpdate}
-      onStageRollback={onStageRollback}
-    />
-  );
+  return <PlanDocument plan={content as StandardV1Plan} stage={stage} runId={runId} />;
 }
 
 interface ImplementSessionArtifactProps {
