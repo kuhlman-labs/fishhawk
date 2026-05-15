@@ -11,6 +11,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -668,6 +669,228 @@ func TestHandleApprovalCommand_SlashCommand_NoAwaitingStage_StillReplies(t *test
 	}
 	if !strings.Contains(got[0].body, "No stage on this issue's run is awaiting approval") {
 		t.Errorf("reply should explain no-awaiting-stage: %q", got[0].body)
+	}
+}
+
+// TestHandleApprovalCommand_ReplyComment_HappyPath covers the
+// E17.4 / #339 happy path end-to-end: an authorized reviewer types
+// "+1" → the matcher (E17.3) routes Source=reply_comment →
+// HandleApprovalCommand writes the approval with
+// SurfaceGitHubReplyComment, advances the stage, fires the
+// NotifyPlanApproved broadcast, and posts NO inline reply.
+func TestHandleApprovalCommand_ReplyComment_HappyPath(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypePlan
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ApprovalRepo: ar,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ExternalURL:  "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+		Source:   webhook.ApprovalSourceReplyComment,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stage transitioned.
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded", stage.State)
+	}
+
+	// Approval row carries the new Surface value.
+	if len(ar.all) != 1 {
+		t.Fatalf("expected 1 approval row; got %d", len(ar.all))
+	}
+	got := ar.all[0]
+	if got.Surface != approval.SurfaceGitHubReplyComment {
+		t.Errorf("Surface = %q, want %q", got.Surface, approval.SurfaceGitHubReplyComment)
+	}
+	if got.ApproverSubject != "alice" {
+		t.Errorf("approver = %q, want alice", got.ApproverSubject)
+	}
+	if got.Decision != approval.DecisionApprove {
+		t.Errorf("decision = %q", got.Decision)
+	}
+
+	// Exactly one comment expected: the NotifyPlanApproved
+	// broadcast. The per-call success reply is suppressed for the
+	// reply path (would echo "Approved" back at a "+1", which is
+	// noise), AND the sticky-status seed comment fires too. So
+	// two GitHub calls total — broadcast + status seed.
+	calls := gh.calls()
+	broadcast, status := splitBroadcastAndStatus(calls)
+	if broadcast == "" {
+		t.Errorf("expected plan-approved broadcast; got bodies %v", commentBodies(calls))
+	}
+	if status == "" {
+		t.Errorf("expected sticky-status comment; got bodies %v", commentBodies(calls))
+	}
+	for _, c := range calls {
+		if strings.HasPrefix(c.body, "Approved by ") {
+			t.Errorf("reply-comment path should not echo a per-call success reply: %q", c.body)
+		}
+	}
+}
+
+// TestHandleApprovalCommand_ReplyComment_NonApprover_SkipsSilently
+// finishes the silent-skip contract from E17.3: a "+1" from a user
+// not in the gate's approver list is dropped without a reply.
+func TestHandleApprovalCommand_ReplyComment_NonApprover_SkipsSilently(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+	r.WorkflowID = "feature_change"
+	// Workflow spec restricts plan-stage approvers to the tech_lead
+	// role; the stub team lister returns no members for that team,
+	// so any subject (including "passerby") fails the role check.
+	r.WorkflowSpec = []byte(`version: "0.3"
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        inputs:
+          - source: github_issue
+            required: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`)
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypePlan
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	resolver := role.NewResolver(&stubTeamLister{teamMembers: nil})
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		RoleResolver: resolver,
+		ExternalURL:  "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99,
+		SenderLogin: "passerby", // not in any role
+		Decision:    webhook.MatchActionApprove,
+		Source:      webhook.ApprovalSourceReplyComment,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ar.all) != 0 {
+		t.Errorf("no approval row should be written for non-approver; got %+v", ar.all)
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state advanced unexpectedly: %q", stage.State)
+	}
+	if calls := gh.calls(); len(calls) != 0 {
+		t.Errorf("non-approver reply should not produce any GitHub comment; got %d: %v",
+			len(calls), commentBodies(calls))
+	}
+}
+
+// TestHandleApprovalCommand_ReplyComment_DuplicateIdempotent locks in
+// the idempotency guarantee. A second "+1" from the same reviewer
+// finds the existing approval row (dedup on (stage_id, subject)) and
+// silently no-ops on the reply path.
+func TestHandleApprovalCommand_ReplyComment_DuplicateIdempotent(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	params := webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+		Source:   webhook.ApprovalSourceReplyComment,
+	}
+	// Two "+1" replies from alice — the second is a re-fire after
+	// the first stage transition has already settled.
+	if err := s.HandleApprovalCommand(context.Background(), params); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.HandleApprovalCommand(context.Background(), params); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ar.all) != 1 {
+		t.Errorf("approval row should be deduped to 1; got %d", len(ar.all))
+	}
+	// Body scan: only the first attempt's broadcast + sticky status
+	// fire. The second attempt finds no awaiting stage (it
+	// transitioned on the first call) and silent-skips.
+	calls := gh.calls()
+	for _, c := range calls {
+		if strings.HasPrefix(c.body, "Approved by ") {
+			t.Errorf("reply-comment duplicate must not echo a success reply: %q", c.body)
+		}
+		if strings.Contains(c.body, "already submitted") {
+			t.Errorf("reply-comment duplicate must not surface the 'prior decision' reply: %q", c.body)
+		}
 	}
 }
 

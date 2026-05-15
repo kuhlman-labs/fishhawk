@@ -202,16 +202,28 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0021 added
-	// runs.max_retries_snapshot (#280); the down migration drops
-	// the column. Confirm: max_retries_snapshot is gone, but every
-	// prior migration's effect is still present (retry_attempt from
-	// 0020, workflow_spec from 0019, stages.gate_blocking_checks
-	// dropped by 0018, required_checks_snapshot from 0017,
-	// parent_run_id + pull_request_url from 0016, stage_checks table
-	// from 0015, stages.gate_type from 0014, stages.requires_approval
-	// from 0013, signing_keys.id from 0012, runs.idempotency_key from
-	// 0011, users + sessions from 0010, etc.).
+	// MigrateDown rolls back one step. 0022 (E17.4 / #339) extended
+	// approvals.surface_check with `github_reply_comment`; the down
+	// migration restores the pre-E17.4 CHECK set. Confirm: the new
+	// surface value is no longer permitted, but every prior
+	// migration's effect is still present (max_retries_snapshot
+	// from 0021, retry_attempt from 0020, workflow_spec from 0019,
+	// etc.).
+	var surfaceCheckRejectsReplyComment bool
+	if err := pool.QueryRow(context.Background(),
+		`SELECT consrc IS NOT NULL FROM (
+			SELECT pg_get_constraintdef(oid) AS consrc
+			FROM pg_constraint
+			WHERE conname = 'approvals_surface_check'
+		) c WHERE consrc LIKE '%github_reply_comment%'`,
+	).Scan(&surfaceCheckRejectsReplyComment); err != nil {
+		// No row → constraint doesn't mention the new value; that's
+		// the expected post-MigrateDown state.
+		surfaceCheckRejectsReplyComment = false
+	}
+	if surfaceCheckRejectsReplyComment {
+		t.Errorf("approvals_surface_check still references github_reply_comment after MigrateDown; 0022 down should have removed it")
+	}
 	var maxRetriesCol, retryAttemptCol, workflowSpecCol, gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -219,8 +231,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&maxRetriesCol); err != nil {
 		t.Fatalf("query runs.max_retries_snapshot column: %v", err)
 	}
-	if maxRetriesCol != 0 {
-		t.Errorf("runs.max_retries_snapshot count after MigrateDown = %d, want 0 (0021 down dropped it)", maxRetriesCol)
+	if maxRetriesCol != 1 {
+		t.Errorf("runs.max_retries_snapshot count after MigrateDown = %d, want 1 (0021 still applied; only 0022 rolled back)", maxRetriesCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns

@@ -100,6 +100,19 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 	}
 
 	if msg, allowed := s.authorizeSlashApprover(ctx, stage, subject); !allowed {
+		if silent {
+			// Reply-comment approvals (E17.4 / #339) from a
+			// non-approver are silently dropped: a random "+1"
+			// from a passerby shouldn't get a help reply explaining
+			// the role-resolution failure. The slash path keeps its
+			// help reply — the reviewer typed a deliberate command.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
+				"reply-comment approval: unauthorized approver, skipping",
+				slog.String("repo", p.Repo),
+				slog.Int("issue", p.IssueNumber),
+				slog.String("subject", subject))
+			return nil
+		}
 		s.replyApproval(ctx, p, msg)
 		return nil
 	}
@@ -121,20 +134,30 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		ApproverSubject: subject,
 		Decision:        decision,
 		Comment:         commentPtr,
-		Surface:         approval.SurfaceGitHubComment,
+		Surface:         approvalSurfaceForSource(p.Source),
 	})
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 			"slash-command approval: submit failed",
 			slog.String("stage_id", stage.ID.String()),
 			slog.String("error", err.Error()))
+		if silent {
+			return nil
+		}
 		s.replyApproval(ctx, p, "Could not record the approval. Try the dashboard.")
 		return nil
 	}
 	if !res.Inserted {
 		// A previous submission from the same approver already
-		// settled the gate. Surface that fact rather than
-		// re-running the transition.
+		// settled the gate. Reply-comment approvals (E17.4 / #339)
+		// rely on the existing dedup as an idempotency guarantee:
+		// a duplicate "+1" from the same reviewer is a no-op.
+		// Slash commands surface the prior decision so the
+		// reviewer who deliberately typed the command knows what
+		// happened.
+		if silent {
+			return nil
+		}
 		s.replyApproval(ctx, p, fmt.Sprintf("@%s already submitted a `%s` decision on this stage; the prior decision wins.", subject, res.Approval.Decision))
 		return nil
 	}
@@ -145,6 +168,9 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 			"slash-command approval: advance stage failed",
 			slog.String("stage_id", stage.ID.String()),
 			slog.String("error", err.Error()))
+		if silent {
+			return nil
+		}
 		s.replyApproval(ctx, p, "Approval recorded but the run could not advance. Check the dashboard.")
 		return nil
 	}
@@ -177,7 +203,14 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 				slog.String("stage_id", advanced.ID.String()),
 				slog.String("error", err.Error()))
 		}
-	} else {
+	} else if !silent {
+		// Reply-comment approvals (E17.4 / #339) skip the per-call
+		// success reply: the NotifyPlanApproved broadcast (#274)
+		// covers plan-approve, and other cases (plan-reject or
+		// review-stage rejection that reaches here) wouldn't
+		// happen on the reply path — the matcher only emits
+		// MatchActionApprove. Silence keeps a "+1" reply from
+		// echoing back a confirmation.
 		s.replyApproval(ctx, p, formatSuccessReply(decision, subject, runRow.ID, advanced))
 	}
 
@@ -329,6 +362,21 @@ func (s *Server) replyApproval(ctx context.Context, p webhook.ApprovalCommandPar
 			slog.Int("issue", p.IssueNumber),
 			slog.String("error", err.Error()))
 	}
+}
+
+// approvalSurfaceForSource maps the dispatcher's ApprovalSource onto
+// the approval.Surface stamped on the persisted row. The two paths
+// stay distinguishable in the audit log so a post-hoc reviewer can
+// tell a deliberate slash command from a reply-pattern "+1".
+//
+// Empty / unknown sources default to SurfaceGitHubComment to match
+// pre-E17.4 behavior — defensive against any future caller that
+// fails to set Source.
+func approvalSurfaceForSource(src webhook.ApprovalSource) approval.Surface {
+	if src == webhook.ApprovalSourceReplyComment {
+		return approval.SurfaceGitHubReplyComment
+	}
+	return approval.SurfaceGitHubComment
 }
 
 // decodeMatchAction translates the dispatcher's tagged action into
