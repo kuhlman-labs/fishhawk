@@ -30,8 +30,8 @@ type runResolver struct {
 func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerGetActiveRun(srv, resolver)
 	registerGetPlan(srv, resolver)
+	registerGetRunStatus(srv, resolver)
 	// Subsequent tools register here:
-	//   E19.5 / #345 — fishhawk_get_run_status
 	//   E19.6 / #346 — fishhawk_list_audit
 }
 
@@ -351,6 +351,109 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 		return nil, false, fmt.Errorf("decode plan artifact: %w", err)
 	}
 	return &p, true, nil
+}
+
+// auditLimitDefault is the default value for the get_run_status
+// tool's audit_limit input. Five is enough for "what's happening
+// right now" without overwhelming the agent's reasoning window.
+const auditLimitDefault = 5
+
+// auditLimitMax caps the audit_limit input. The backend's /v0/audit
+// endpoint accepts up to 500; we cap lower because the get_run_
+// status tool's job is to surface recent activity, not to paginate
+// the full chain. Agents wanting more rows can use the dedicated
+// fishhawk_list_audit tool (E19.6 / #346).
+const auditLimitMax = 50
+
+// GetRunStatusInput is the tool's input schema.
+type GetRunStatusInput struct {
+	RunID      string `json:"run_id" jsonschema:"the Fishhawk run UUID"`
+	AuditLimit int    `json:"audit_limit,omitempty" jsonschema:"how many recent audit entries to include (default 5, capped at 50)"`
+}
+
+// GetRunStatusOutput bundles the three /v0 reads into one
+// agent-friendly response. Stages come back sequence-ascending so
+// the agent reads them in the order the pipeline executes; audit
+// rows come back time-descending so "most recent" is item 0.
+type GetRunStatusOutput struct {
+	Run         Run          `json:"run"`
+	Stages      []Stage      `json:"stages" jsonschema:"ordered by sequence ascending"`
+	RecentAudit []AuditEntry `json:"recent_audit" jsonschema:"time-descending; item 0 is the most recent"`
+}
+
+// registerGetRunStatus wires the fishhawk_get_run_status tool. The
+// handler aggregates three backend calls (GetRun + ListRunStages +
+// ListRecentRunAudit) into one MCP tool call so the agent saves
+// the round-trip-back latency that a sequential chain of
+// individual tool calls would impose. Read-only per ADR-021.
+func registerGetRunStatus(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_get_run_status",
+		Description: strings.TrimSpace(`
+Snapshot a Fishhawk run's current state in one call.
+
+Returns the Run row (state, workflow, trigger, PR URL when stamped),
+the full ordered stage list (each stage's id / type / state /
+executor / timing / failure category if any), and the N most-recent
+audit entries time-descending (default 5; capped at 50).
+
+Use this as the agent's "where are we" query — replaces a sequential
+chain of GetRun / ListStages / ListAudit calls with a single
+round-trip. For deeper audit pagination, use fishhawk_list_audit.
+`),
+	}, resolver.getRunStatus)
+}
+
+// getRunStatus is the tool handler.
+func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, in GetRunStatusInput) (*mcp.CallToolResult, GetRunStatusOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, GetRunStatusOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+
+	limit := clampAuditLimit(in.AuditLimit)
+
+	runRow, err := r.api.GetRun(ctx, runID)
+	if err != nil {
+		return nil, GetRunStatusOutput{}, fmt.Errorf("get run: %w", err)
+	}
+
+	stages, err := r.api.ListRunStages(ctx, runID)
+	if err != nil {
+		return nil, GetRunStatusOutput{}, fmt.Errorf("list stages: %w", err)
+	}
+	// Defensive sort. The backend returns sequence-ascending, but
+	// re-sorting locally insulates the agent from any future
+	// ordering change and costs nothing on a list of < 10 stages.
+	sort.SliceStable(stages, func(i, j int) bool {
+		return stages[i].Sequence < stages[j].Sequence
+	})
+
+	recent, err := r.api.ListRecentRunAudit(ctx, runID, limit)
+	if err != nil {
+		return nil, GetRunStatusOutput{}, fmt.Errorf("list recent audit: %w", err)
+	}
+
+	return nil, GetRunStatusOutput{
+		Run:         *runRow,
+		Stages:      stages,
+		RecentAudit: recent,
+	}, nil
+}
+
+// clampAuditLimit applies the default + cap. Negative or zero
+// falls back to auditLimitDefault; values over auditLimitMax clamp
+// to the cap. The backend would reject too-large values with a
+// 400; we clamp client-side so the agent's bad input doesn't
+// surface as a confusing API error.
+func clampAuditLimit(n int) int {
+	if n <= 0 {
+		return auditLimitDefault
+	}
+	if n > auditLimitMax {
+		return auditLimitMax
+	}
+	return n
 }
 
 // findMostRecent returns the most-recent run from a filter-scoped

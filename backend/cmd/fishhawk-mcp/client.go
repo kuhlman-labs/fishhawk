@@ -102,15 +102,33 @@ func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return &r, nil
 }
 
-// Stage mirrors the wire shape, scoped to the fields the MCP tools
-// need: id, run_id, type, state. Other fields (executor, sequence,
-// failure_*) are surfaced in E19.5's get_run_status output but the
-// get_plan tool only needs to find the plan stage on a run.
+// Stage mirrors the wire shape. The fields cover both get_plan's
+// "find the plan stage" use case and get_run_status's "tell me
+// what's happening" view: type/state for the lifecycle, sequence
+// for ordering, executor + timestamps + failure fields for the
+// agent's context.
 type Stage struct {
-	ID    uuid.UUID `json:"id"`
-	RunID uuid.UUID `json:"run_id"`
-	Type  string    `json:"type"`
-	State string    `json:"state"`
+	ID              uuid.UUID     `json:"id"`
+	RunID           uuid.UUID     `json:"run_id"`
+	Sequence        int           `json:"sequence"`
+	Type            string        `json:"type"`
+	Executor        StageExecutor `json:"executor"`
+	State           string        `json:"state"`
+	StartedAt       *time.Time    `json:"started_at,omitempty"`
+	EndedAt         *time.Time    `json:"ended_at,omitempty"`
+	FailureCategory *string       `json:"failure_category,omitempty"`
+	FailureReason   *string       `json:"failure_reason,omitempty"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+}
+
+// StageExecutor mirrors the OpenAPI sub-schema. The closed-set
+// kind field (`agent` | `human`) is what an agent reads to know
+// whether a downstream stage will be self-driven or wait for a
+// human.
+type StageExecutor struct {
+	Kind string `json:"kind"`
+	Ref  string `json:"ref"`
 }
 
 type listStagesResult struct {
@@ -153,6 +171,53 @@ type listArtifactsResult struct {
 func (c *apiClient) ListStageArtifacts(ctx context.Context, stageID uuid.UUID) ([]Artifact, error) {
 	var res listArtifactsResult
 	if err := c.do(ctx, http.MethodGet, "/v0/stages/"+stageID.String()+"/artifacts", nil, &res); err != nil {
+		return nil, err
+	}
+	return res.Items, nil
+}
+
+// AuditEntry mirrors the OpenAPI AuditEntry schema. Payload is
+// left as json.RawMessage so the MCP tool can pass the typed shape
+// directly through to the client without re-encoding category-
+// specific payloads — the agent introspects them as JSON.
+type AuditEntry struct {
+	ID           uuid.UUID       `json:"id"`
+	Sequence     int64           `json:"sequence"`
+	RunID        uuid.UUID       `json:"run_id"`
+	StageID      *uuid.UUID      `json:"stage_id,omitempty"`
+	Timestamp    time.Time       `json:"ts"`
+	Category     string          `json:"category"`
+	ActorKind    *string         `json:"actor_kind,omitempty"`
+	ActorSubject *string         `json:"actor_subject,omitempty"`
+	Payload      json.RawMessage `json:"payload,omitempty"`
+	PrevHash     *string         `json:"prev_hash,omitempty"`
+	EntryHash    string          `json:"entry_hash"`
+}
+
+type listAuditResult struct {
+	Items      []AuditEntry `json:"items"`
+	NextCursor string       `json:"next_cursor,omitempty"`
+}
+
+// ListRecentRunAudit calls GET /v0/audit?run_id=<id>&limit=<N>.
+// Returns rows time-descending — exactly the order an agent wants
+// when surfacing "what's happened recently" in the get_run_status
+// view. The cross-chain endpoint is the only way to get
+// descending order without a paginate-to-end walk; per-run rows
+// for the queried run are the only thing returned because global
+// rows have run_id IS NULL and don't match the filter.
+//
+// The MCP tool layer is responsible for clamping limit to the
+// server's range before calling this; the client passes it
+// through verbatim.
+func (c *apiClient) ListRecentRunAudit(ctx context.Context, runID uuid.UUID, limit int) ([]AuditEntry, error) {
+	q := url.Values{}
+	q.Set("run_id", runID.String())
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var res listAuditResult
+	if err := c.do(ctx, http.MethodGet, "/v0/audit?"+q.Encode(), nil, &res); err != nil {
 		return nil, err
 	}
 	return res.Items, nil

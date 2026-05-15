@@ -45,6 +45,13 @@ type fakeBackend struct {
 	artifactsStatus   int
 	stagesCalledByID  map[uuid.UUID]int
 	artifactsCalledID map[uuid.UUID]int
+
+	// E19.5 fixtures: per-run audit responses. Captured limit lets
+	// tests verify clamping behavior end-to-end.
+	auditByRun      map[uuid.UUID][]AuditEntry
+	auditStatus     int
+	lastAuditLimit  string
+	auditCalledByID map[uuid.UUID]int
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -54,12 +61,15 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		getStatus:         http.StatusOK,
 		stagesStatus:      http.StatusOK,
 		artifactsStatus:   http.StatusOK,
+		auditStatus:       http.StatusOK,
 		listByQuery:       map[string]listRunsResult{},
 		getRunByID:        map[uuid.UUID]Run{},
 		stagesByRun:       map[uuid.UUID][]Stage{},
 		artifactsByStage:  map[uuid.UUID][]Artifact{},
 		stagesCalledByID:  map[uuid.UUID]int{},
 		artifactsCalledID: map[uuid.UUID]int{},
+		auditByRun:        map[uuid.UUID][]AuditEntry{},
+		auditCalledByID:   map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/runs", func(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +115,25 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Unlock()
 		w.WriteHeader(fb.stagesStatus)
 		_ = json.NewEncoder(w).Encode(listStagesResult{Items: items})
+	})
+	mux.HandleFunc("GET /v0/audit", func(w http.ResponseWriter, r *http.Request) {
+		runIDQ := r.URL.Query().Get("run_id")
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(runIDQ)
+		if perr != nil {
+			// /v0/audit allows missing run_id (global feed); the
+			// MCP tool always sets it, so a missing one in tests
+			// is a programming error.
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.lastAuditLimit = r.URL.Query().Get("limit")
+		fb.auditCalledByID[id]++
+		items := fb.auditByRun[id]
+		fb.mu.Unlock()
+		w.WriteHeader(fb.auditStatus)
+		_ = json.NewEncoder(w).Encode(listAuditResult{Items: items})
 	})
 	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", func(w http.ResponseWriter, r *http.Request) {
 		id, perr := uuid.Parse(r.PathValue("stage_id"))
@@ -669,6 +698,228 @@ func TestGetPlan_BackendError_StagesList_Surfaced(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "list stages") {
 		t.Errorf("error wording: %v", err)
+	}
+}
+
+// --- get_run_status (E19.5 / #345) ---
+
+func auditFixture(seq int64, runID uuid.UUID, category, actor string, offset time.Duration) AuditEntry {
+	body, _ := json.Marshal(map[string]any{"actor": actor})
+	return AuditEntry{
+		ID:           uuid.New(),
+		Sequence:     seq,
+		RunID:        runID,
+		Timestamp:    time.Now().UTC().Add(-offset),
+		Category:     category,
+		ActorSubject: &actor,
+		Payload:      body,
+		EntryHash:    "h",
+	}
+}
+
+func TestGetRunStatus_HappyPath_BundlesThreeReads(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		State: "running",
+	}
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID, RunID: runID, Sequence: 1, Type: "plan", State: "succeeded",
+			Executor: StageExecutor{Kind: "agent", Ref: "claude-code"}},
+		{ID: implStageID, RunID: runID, Sequence: 2, Type: "implement", State: "running",
+			Executor: StageExecutor{Kind: "agent", Ref: "claude-code"}},
+	}
+	fb.auditByRun[runID] = []AuditEntry{
+		// Returned time-descending — the fake serves what's there
+		// without re-sorting; the production /v0/audit endpoint
+		// orders so. Tests load these in the expected order.
+		auditFixture(3, runID, "approval_submitted", "alice", 1*time.Minute),
+		auditFixture(2, runID, "plan_generated", "system", 10*time.Minute),
+		auditFixture(1, runID, "run_dispatched", "github-webhook", 15*time.Minute),
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+
+	if out.Run.ID != runID {
+		t.Errorf("Run.ID = %s, want %s", out.Run.ID, runID)
+	}
+	if len(out.Stages) != 2 {
+		t.Fatalf("expected 2 stages; got %d", len(out.Stages))
+	}
+	if out.Stages[0].Type != "plan" || out.Stages[1].Type != "implement" {
+		t.Errorf("stages not in sequence order: %+v", out.Stages)
+	}
+	if len(out.RecentAudit) != 3 {
+		t.Fatalf("expected 3 audit rows; got %d", len(out.RecentAudit))
+	}
+	if out.RecentAudit[0].Category != "approval_submitted" {
+		t.Errorf("first audit row should be newest (approval_submitted); got %q", out.RecentAudit[0].Category)
+	}
+}
+
+func TestGetRunStatus_StagesReSortedBySequence(t *testing.T) {
+	// Defensive sort: even if the backend ever stops ordering by
+	// sequence, the agent still sees the pipeline in order.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.New(), Sequence: 3, Type: "review", State: "pending"},
+		{ID: uuid.New(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.New(), Sequence: 2, Type: "implement", State: "running"},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := []int{out.Stages[0].Sequence, out.Stages[1].Sequence, out.Stages[2].Sequence}
+	if got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Errorf("stage sequences = %v, want [1,2,3]", got)
+	}
+}
+
+func TestGetRunStatus_AuditLimit_DefaultsToFive(t *testing.T) {
+	// audit_limit unset → request goes out with limit=5.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID}
+
+	r := newResolver(srv, nil)
+	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fb.lastAuditLimit != "5" {
+		t.Errorf("audit request limit = %q, want 5", fb.lastAuditLimit)
+	}
+}
+
+func TestGetRunStatus_AuditLimit_ClampedToFifty(t *testing.T) {
+	// audit_limit > 50 → request goes out with limit=50.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID}
+
+	r := newResolver(srv, nil)
+	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{
+		RunID:      runID.String(),
+		AuditLimit: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fb.lastAuditLimit != "50" {
+		t.Errorf("audit request limit = %q, want 50 (clamped)", fb.lastAuditLimit)
+	}
+}
+
+func TestGetRunStatus_AuditLimit_ExplicitValueForwarded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID}
+
+	r := newResolver(srv, nil)
+	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{
+		RunID:      runID.String(),
+		AuditLimit: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fb.lastAuditLimit != "20" {
+		t.Errorf("audit request limit = %q, want 20", fb.lastAuditLimit)
+	}
+}
+
+func TestGetRunStatus_RejectsInvalidUUID(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: "not-a-uuid"})
+	if err == nil {
+		t.Fatal("expected error on malformed run_id")
+	}
+	if !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("error wording: %v", err)
+	}
+}
+
+func TestGetRunStatus_MissingRun_404Surfaced(t *testing.T) {
+	// GetRun returns 404 → the wrapped error reaches the caller.
+	fb, srv := newFakeBackend(t)
+	fb.getStatus = http.StatusNotFound
+
+	r := newResolver(srv, nil)
+	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: uuid.New().String()})
+	if err == nil {
+		t.Fatal("expected 404 to surface")
+	}
+	if !strings.Contains(err.Error(), "get run") {
+		t.Errorf("error wording: %v", err)
+	}
+}
+
+func TestGetRunStatus_StagesEndpointError_Surfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID}
+	fb.stagesStatus = http.StatusInternalServerError
+
+	r := newResolver(srv, nil)
+	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected stages 500 to surface")
+	}
+	if !strings.Contains(err.Error(), "list stages") {
+		t.Errorf("error wording: %v", err)
+	}
+}
+
+func TestGetRunStatus_AuditEndpointError_Surfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID}
+	fb.auditStatus = http.StatusInternalServerError
+
+	r := newResolver(srv, nil)
+	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected audit 500 to surface")
+	}
+	if !strings.Contains(err.Error(), "list recent audit") {
+		t.Errorf("error wording: %v", err)
+	}
+}
+
+func TestGetRunStatus_EmptyStagesAndAudit_OK(t *testing.T) {
+	// Brand-new run before any stages or audit rows landed —
+	// still returns Status=ok with empty arrays rather than erroring.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID, State: "pending"}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Run.ID != runID {
+		t.Errorf("Run.ID = %s", out.Run.ID)
+	}
+	if got := len(out.Stages); got != 0 {
+		t.Errorf("Stages length = %d, want 0", got)
+	}
+	if got := len(out.RecentAudit); got != 0 {
+		t.Errorf("RecentAudit length = %d, want 0", got)
 	}
 }
 
