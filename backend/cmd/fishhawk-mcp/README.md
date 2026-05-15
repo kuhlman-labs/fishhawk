@@ -45,21 +45,39 @@ Two env vars; both honored from the OS environment when the binary launches.
 
 The binary exits non-zero on startup if `FISHHAWK_API_TOKEN` is missing.
 
-## Wiring into Claude Code
+## Install (operators)
 
-After building, register the binary as an MCP server in your Claude Code config:
+Pre-built binaries ship with every `mcp/vX.Y.Z` GitHub Release: darwin-arm64, darwin-amd64, linux-amd64, linux-arm64. Full install path including cosign verification and `claude mcp add` registration lives at [`docs/mcp/install.md`](../../../docs/mcp/install.md).
+
+Short version for operators on Apple Silicon Macs:
 
 ```sh
-claude mcp add fishhawk --binary $(pwd)/fishhawk-mcp
+curl -fSL "https://github.com/kuhlman-labs/fishhawk/releases/download/mcp/vX.Y.Z/fishhawk-mcp-vX.Y.Z-darwin-arm64" \
+  -o /usr/local/bin/fishhawk-mcp
+chmod +x /usr/local/bin/fishhawk-mcp
+export FISHHAWK_API_TOKEN="<token>"
+claude mcp add fishhawk --command /usr/local/bin/fishhawk-mcp \
+  --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN
 ```
 
-Provide the env vars via your shell or the `claude mcp` config (path varies by client version — see Claude Code's docs).
+## Release pipeline
 
-Once registered, the agent has the Fishhawk tool surface available alongside other MCP servers. Interactive sessions can ask "what's the status of my Fishhawk run" and the agent picks the right tool.
+`.github/workflows/mcp-release.yml` (E19.7 / #347) — triggered by `mcp/v*` tags. Re-runs lint + tests at the tag commit, cross-builds the four-platform matrix with CGO disabled, generates an SPDX-JSON SBOM, signs `SHA256SUMS` with cosign keyless, publishes the GitHub Release.
 
-## Distribution (planned)
+Verification (after `cosign install`):
 
-E19.7 / #347 wires the binary into the GitHub Release pipeline alongside `fishhawk` (CLI) and `fishhawk-runner`. Once landed, operators can `claude mcp add` from a published archive rather than building locally.
+```sh
+cosign verify-blob \
+  --certificate-identity-regexp 'https://github.com/kuhlman-labs/fishhawk/\.github/workflows/mcp-release\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --signature SHA256SUMS.sig \
+  --certificate SHA256SUMS.pem \
+  SHA256SUMS
+```
+
+## Runner integration
+
+E19.8 / future wires `fishhawk-mcp` into the runner's container image. Until then the MCP surface is interactive-Claude-Code-only.
 
 ## See also
 

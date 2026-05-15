@@ -1,0 +1,155 @@
+# MCP server release workflow (E19.7 / #347).
+#
+# Triggered by a tag push matching `mcp/v*` (path-prefixed module
+# tag, same convention as runner / backend / verifier releases).
+# The workflow:
+#
+#  1. Re-runs lint + tests at the tag's commit (catches a tag
+#     pushed from a dirty branch).
+#  2. Builds `fishhawk-mcp` for four platforms via a single Go
+#     loop (darwin-arm64, darwin-amd64, linux-amd64, linux-arm64).
+#     CGO disabled so the binary is statically linked and works
+#     across libc variants.
+#  3. Generates an SPDX-JSON SBOM of the backend module (the MCP
+#     binary lives under `backend/cmd/fishhawk-mcp/`, so the SBOM
+#     covers the whole module's dependency tree — including the
+#     MCP SDK pulled in by E19.2).
+#  4. Computes SHA-256 checksums of every release artifact.
+#  5. Signs the SHA256SUMS file with cosign (keyless / OIDC).
+#  6. Publishes a GitHub Release with the artifacts attached.
+#
+# Versioning convention: `mcp/vX.Y.Z`. Go's module system doesn't
+# strictly require a path-prefixed tag for `backend/cmd/fishhawk-
+# mcp/` because it's a sub-package, not its own module — but using
+# the same prefix shape as the other releases keeps the operator
+# mental model uniform.
+
+name: MCP Release
+
+on:
+  push:
+    tags:
+      - 'mcp/v*'
+
+permissions:
+  contents: write   # create release + upload assets
+  id-token: write   # cosign keyless signing via GitHub OIDC
+
+jobs:
+  release:
+    name: Build, sign, and publish MCP release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Full history so release-notes generation works.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
+
+      - name: Verify the tagged commit passes lint + tests
+        run: |
+          set -eu
+          GOLANGCI_LINT="$(go env GOPATH)/bin/golangci-lint"
+          (
+            cd backend
+            "$GOLANGCI_LINT" run ./...
+            go build ./...
+            go test -race ./...
+          )
+
+      - name: Compute version and build binaries
+        id: build
+        run: |
+          set -eu
+          # refs/tags/mcp/v0.1.0 → v0.1.0
+          version="${GITHUB_REF#refs/tags/mcp/}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          # Operator-facing targets:
+          #   darwin-arm64 / amd64 — most dev machines run macOS.
+          #   linux-amd64 / arm64 — server installs + the runner
+          #   container image.
+          # CGO disabled so the static binary works against any libc.
+          for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+            goos="${target%-*}"
+            goarch="${target#*-}"
+            out="dist/fishhawk-mcp-${version}-${target}"
+            (
+              cd backend
+              CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build \
+                -ldflags="-s -w" \
+                -o "../${out}" \
+                ./cmd/fishhawk-mcp
+            )
+            echo "built ${out}"
+          done
+          # No sanity-check exec on the linux-amd64 binary: the
+          # server has no --help flag and would block on stdin
+          # waiting for an MCP handshake. The build itself proves
+          # the binary is well-formed; downstream verification is
+          # SHA256SUMS + cosign.
+
+      - name: Generate SBOM (SPDX-JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./backend
+          format: spdx-json
+          output-file: ./dist/mcp-${{ steps.build.outputs.version }}.sbom.spdx.json
+
+      - name: Compute checksums
+        run: |
+          set -eu
+          cd dist
+          # `./*` keeps shellcheck happy: filenames starting with `-`
+          # would otherwise be interpreted as flags.
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums (keyless)
+        run: |
+          set -eu
+          cd dist
+          # Verify downstream with:
+          #
+          #   cosign verify-blob \
+          #     --certificate-identity-regexp 'https://github.com/kuhlman-labs/fishhawk/.+' \
+          #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          #     --signature SHA256SUMS.sig \
+          #     --certificate SHA256SUMS.pem \
+          #     SHA256SUMS
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MCP ${{ steps.build.outputs.version }}
+          generate_release_notes: true
+          body_path: .github/release-notes/mcp.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/fishhawk-mcp-${{ steps.build.outputs.version }}-darwin-arm64
+            dist/fishhawk-mcp-${{ steps.build.outputs.version }}-darwin-amd64
+            dist/fishhawk-mcp-${{ steps.build.outputs.version }}-linux-amd64
+            dist/fishhawk-mcp-${{ steps.build.outputs.version }}-linux-arm64
+            dist/mcp-${{ steps.build.outputs.version }}.sbom.spdx.json
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
