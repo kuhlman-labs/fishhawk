@@ -666,6 +666,86 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 	return nil, fmt.Errorf("upload: ship pull-request exhausted retries: %w", lastErr)
 }
 
+// FetchMCPTokenArgs collects the inputs for FetchMCPToken.
+type FetchMCPTokenArgs struct {
+	RunID      string
+	PrivateKey ed25519.PrivateKey
+}
+
+// FetchMCPTokenResult is the wire shape the backend echoes when
+// the runner POSTs the empty body. Token is the plaintext bearer
+// the runner stamps into the agent's environment as
+// FISHHAWK_API_TOKEN; the agent passes it to the MCP server which
+// authenticates against the backend on its behalf.
+type FetchMCPTokenResult struct {
+	Token     string    `json:"token"`
+	TokenID   string    `json:"token_id"`
+	RunID     string    `json:"run_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// FetchMCPToken calls POST /v0/runs/{run_id}/mcp-token (E19.8 / #348)
+// and returns the short-lived bearer token scoped to the run. Uses
+// the same Ed25519 signing-key auth as FetchInstallationToken — the
+// runner already has the per-run private key from its IssueKey call
+// at stage start; signing over the empty body proves possession.
+//
+// Single-attempt: token issuance is cheap on the backend (a single
+// row insert + audit append); a transient failure here should
+// surface so the caller can degrade gracefully (the agent loses its
+// FISHHAWK_API_TOKEN but the run continues — MCP awareness is best-
+// effort per ADR-021).
+func (c *Client) FetchMCPToken(ctx context.Context, args FetchMCPTokenArgs) (*FetchMCPTokenResult, error) {
+	if args.RunID == "" {
+		return nil, errors.New("upload: run_id required")
+	}
+	if len(args.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("upload: invalid private key length")
+	}
+
+	body := []byte{}
+	digest := sha256.Sum256(body)
+	signature := ed25519.Sign(args.PrivateKey, digest[:])
+	sigHex := hex.EncodeToString(signature)
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/mcp-token",
+		c.BaseURL, url.PathEscape(args.RunID))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("upload: build mcp-token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Fishhawk-Signature", sigHex)
+	req.Header.Set("Accept", "application/json")
+	req.ContentLength = 0
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upload: fetch mcp token: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusCreated:
+		var out FetchMCPTokenResult
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return nil, fmt.Errorf("upload: decode mcp-token response: %w", err)
+		}
+		if out.Token == "" {
+			return nil, errors.New("upload: mcp-token response missing token")
+		}
+		return &out, nil
+	case http.StatusUnauthorized:
+		detail := readBriefBody(resp)
+		return nil, fmt.Errorf("%w: %s", ErrSignatureRejected, detail)
+	case http.StatusNotFound:
+		return nil, ErrNotFound
+	default:
+		return nil, statusError("fetch mcp token", resp)
+	}
+}
+
 // FetchInstallationTokenArgs collects the inputs for FetchInstallationToken.
 type FetchInstallationTokenArgs struct {
 	RunID      string

@@ -45,6 +45,15 @@ type Invocation struct {
 	// mean "no limit from this layer" — the runner sets sensible
 	// defaults; the workflow spec can override them per stage.
 	Budget Budget
+
+	// Env carries additional environment variables to layer onto
+	// the child process. The harness seeds the child env from
+	// os.Environ() first, then overlays these; later keys win.
+	// Used by the runner (E19.8 / #348) to pass the MCP token +
+	// backend URL so the agent can call the Fishhawk MCP server
+	// mid-execution. Empty / nil is fine — the child inherits the
+	// parent env unchanged.
+	Env map[string]string
 }
 
 // Budget caps an agent invocation. Per MVP_SPEC §4.2 (`budget`

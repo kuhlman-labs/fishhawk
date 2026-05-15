@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -128,6 +129,7 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
 		cfg.StageCheckRepo = stagecheck.NewPostgresRepository(pool)
 		cfg.APITokenRepo = apitoken.NewPostgresRepository(pool)
+		cfg.MCPTokenRepo = mcptoken.NewPostgresRepository(pool)
 		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
 		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth)", slog.String("driver", "postgres"))
 	} else {

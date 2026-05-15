@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 )
 
 // apitokenAuthenticator is the slice of apitoken.Repository
@@ -18,6 +19,14 @@ import (
 // a stub directly without pulling in the whole repository.
 type apitokenAuthenticator interface {
 	Authenticate(ctx context.Context, plaintext string) (*apitoken.Token, error)
+}
+
+// mcptokenAuthenticator is the runner-side counterpart to
+// apitokenAuthenticator (E19.8 / #348). The middleware routes by
+// prefix — `fhm_` to this; `fhk_` to apitokenAuthenticator —
+// so the two interfaces never conflict on a single token string.
+type mcptokenAuthenticator interface {
+	Authenticate(ctx context.Context, plaintext string) (*mcptoken.Token, error)
 }
 
 // sessionAuthenticator is the slice of auth.Repository the
@@ -178,7 +187,7 @@ func recovery(logger *slog.Logger) func(http.Handler) http.Handler {
 // Either repo may be nil — the bootstrap path can run without
 // either backend, in which case the corresponding credential
 // never resolves.
-func bearerAuth(tokens apitokenAuthenticator, sessions sessionAuthenticator) func(http.Handler) http.Handler {
+func bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, sessions sessionAuthenticator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id := Identity{Subject: "anonymous"}
@@ -198,14 +207,38 @@ func bearerAuth(tokens apitokenAuthenticator, sessions sessionAuthenticator) fun
 				}
 			}
 
-			// Bearer token, only if no session resolved.
-			if id.IsAnonymous() && tokens != nil {
+			// Bearer token, only if no session resolved. Routes by
+			// prefix: `fhm_` to the MCP authenticator, `fhk_` (or
+			// anything else) to the apitoken authenticator. The
+			// prefix check is cheap (string compare, no allocation)
+			// so the routing decision doesn't cost a DB round-trip.
+			if id.IsAnonymous() {
 				if tok, ok := tokenFromHeader(r); ok {
-					if rec, err := tokens.Authenticate(r.Context(), tok); err == nil {
-						id = Identity{
-							Subject: rec.Subject,
-							TokenID: rec.ID.String(),
-							Scopes:  append([]string(nil), rec.Scopes...),
+					switch {
+					case mcpTokens != nil && mcptoken.HasPrefix(tok):
+						if rec, err := mcpTokens.Authenticate(r.Context(), tok); err == nil {
+							id = Identity{
+								// Subject encodes the run scope so
+								// handlers that audit auth or
+								// enforce per-run access can read
+								// it directly. Format mirrors the
+								// existing "github:<login>" /
+								// "service:<name>" convention.
+								Subject: "mcp:run:" + rec.RunID.String(),
+								TokenID: rec.ID.String(),
+								// All MCP tokens carry one
+								// informational scope. Future per-
+								// endpoint enforcement reads this.
+								Scopes: []string{"mcp:read"},
+							}
+						}
+					case tokens != nil:
+						if rec, err := tokens.Authenticate(r.Context(), tok); err == nil {
+							id = Identity{
+								Subject: rec.Subject,
+								TokenID: rec.ID.String(),
+								Scopes:  append([]string(nil), rec.Scopes...),
+							}
 						}
 					}
 				}

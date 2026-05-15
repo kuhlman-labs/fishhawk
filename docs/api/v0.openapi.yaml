@@ -1845,6 +1845,103 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/mcp-token:
+    post:
+      operationId: issueMCPToken
+      summary: Mint a short-lived MCP bearer token for the run
+      description: |
+        Per ADR-021 / #322 (resolved E19.1) the runner-side Claude
+        Code agent gets a per-run, read-only bearer token to call
+        the Fishhawk MCP server (`backend/cmd/fishhawk-mcp/`)
+        mid-execution. This endpoint mints that token (E19.8 /
+        #348).
+
+        Token shape:
+        - `fhm_` prefix + 32 random bytes URL-safe base64. Distinct
+          from the operator-facing `fhk_` API tokens so the bearer-
+          auth middleware can route to the right authenticator.
+        - TTL: 60 minutes (load-bearing protection per ADR-021;
+          per-endpoint scope enforcement lands as a separate
+          ticket if needed).
+        - Stored as sha256 in `mcp_tokens`; plaintext is shown
+          exactly once on issue. Subject of `mcp:run:<run_id>` is
+          stamped on requests authenticated with the token.
+
+        Auth: Ed25519 signing-key path. The runner proves
+        possession by signing the (empty) request body with the
+        per-run private key it received from `signing-key`. Same
+        Ed25519 shape `installation-token` uses; no OIDC fallback
+        because this endpoint is runner-only (operators issue
+        interactive MCP tokens via the `/v0/tokens` flow).
+
+        Issuance is audited (`mcp_token_issued`). Payload carries
+        the token id, expiry, TTL, and the prefix — never the
+        plaintext bearer string.
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: X-Fishhawk-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+            description: |
+              Hex-encoded 64-byte Ed25519 signature over sha256 of
+              the request body (typically empty).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Empty in v0; reserved for future fields.
+      responses:
+        '201':
+          description: MCP token issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, token_id, run_id, expires_at]
+                properties:
+                  token:
+                    type: string
+                    description: |
+                      Plaintext bearer token. The runner stores this
+                      in the agent's environment as
+                      `FISHHAWK_API_TOKEN` and discards it. Shown
+                      exactly once; no read path returns it.
+                  token_id:
+                    $ref: '#/components/schemas/UUID'
+                  run_id:
+                    $ref: '#/components/schemas/UUID'
+                  expires_at:
+                    type: string
+                    format: date-time
+        '400':
+          description: |
+            run_id is malformed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            X-Fishhawk-Signature missing, malformed, or didn't
+            verify against the run's stored public key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503':
+          description: |
+            The backend doesn't have the MCP token / run / signing
+            repositories wired (dev backends running without the
+            full set).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   # ---------------------------------------------------------------------
   # Webhook ingestion (unversioned; GitHub controls request shape)
   # ---------------------------------------------------------------------
