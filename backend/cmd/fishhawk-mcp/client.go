@@ -199,6 +199,48 @@ type listAuditResult struct {
 	NextCursor string       `json:"next_cursor,omitempty"`
 }
 
+// ListRunAuditFilter scopes a per-run audit query. Empty values
+// drop from the query string; zero Limit lets the server pick its
+// default (100, per the OpenAPI; 500 max). The MCP tool layer
+// clamps to a lower cap before calling.
+type ListRunAuditFilter struct {
+	Category string
+	StageID  string
+	Limit    int
+	Cursor   string
+}
+
+// ListRunAudit calls GET /v0/runs/{run_id}/audit with optional
+// category / stage_id / limit / cursor filters. Returns entries
+// sequence-ascending (matches the API surface: per-run scope for
+// the run-detail UI + verifier path). For "most-recent-first"
+// queries use ListRecentRunAudit which hits the cross-chain
+// endpoint with time-descending order.
+func (c *apiClient) ListRunAudit(ctx context.Context, runID uuid.UUID, f ListRunAuditFilter) ([]AuditEntry, string, error) {
+	q := url.Values{}
+	if f.Category != "" {
+		q.Set("category", f.Category)
+	}
+	if f.StageID != "" {
+		q.Set("stage_id", f.StageID)
+	}
+	if f.Limit > 0 {
+		q.Set("limit", strconv.Itoa(f.Limit))
+	}
+	if f.Cursor != "" {
+		q.Set("cursor", f.Cursor)
+	}
+	path := "/v0/runs/" + runID.String() + "/audit"
+	if encoded := q.Encode(); encoded != "" {
+		path = path + "?" + encoded
+	}
+	var res listAuditResult
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
+		return nil, "", err
+	}
+	return res.Items, res.NextCursor, nil
+}
+
 // ListRecentRunAudit calls GET /v0/audit?run_id=<id>&limit=<N>.
 // Returns rows time-descending — exactly the order an agent wants
 // when surfacing "what's happened recently" in the get_run_status
