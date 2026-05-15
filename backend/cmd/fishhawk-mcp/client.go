@@ -102,6 +102,62 @@ func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return &r, nil
 }
 
+// Stage mirrors the wire shape, scoped to the fields the MCP tools
+// need: id, run_id, type, state. Other fields (executor, sequence,
+// failure_*) are surfaced in E19.5's get_run_status output but the
+// get_plan tool only needs to find the plan stage on a run.
+type Stage struct {
+	ID    uuid.UUID `json:"id"`
+	RunID uuid.UUID `json:"run_id"`
+	Type  string    `json:"type"`
+	State string    `json:"state"`
+}
+
+type listStagesResult struct {
+	Items []Stage `json:"items"`
+}
+
+// ListRunStages calls GET /v0/runs/{run_id}/stages. Stages come back
+// ordered by sequence ascending; the tool layer picks the plan
+// stage from the list.
+func (c *apiClient) ListRunStages(ctx context.Context, runID uuid.UUID) ([]Stage, error) {
+	var res listStagesResult
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+runID.String()+"/stages", nil, &res); err != nil {
+		return nil, err
+	}
+	return res.Items, nil
+}
+
+// Artifact is the wire shape with content inline. The backend
+// returns content directly on the listStageArtifacts endpoint (per
+// the OpenAPI Artifact schema), so the MCP tool doesn't need a
+// separate /v0/artifacts/{id} fetch.
+type Artifact struct {
+	ID            uuid.UUID       `json:"id"`
+	StageID       uuid.UUID       `json:"stage_id"`
+	Kind          string          `json:"kind"`
+	SchemaVersion *string         `json:"schema_version,omitempty"`
+	ContentHash   string          `json:"content_hash"`
+	Content       json.RawMessage `json:"content,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
+type listArtifactsResult struct {
+	Items []Artifact `json:"items"`
+}
+
+// ListStageArtifacts calls GET /v0/stages/{stage_id}/artifacts.
+// Artifacts come back ordered by created_at ascending; callers
+// pick the most-recent (the SPA pre-trace does the same — see
+// `frontend/src/routes/stage-detail.tsx`).
+func (c *apiClient) ListStageArtifacts(ctx context.Context, stageID uuid.UUID) ([]Artifact, error) {
+	var res listArtifactsResult
+	if err := c.do(ctx, http.MethodGet, "/v0/stages/"+stageID.String()+"/artifacts", nil, &res); err != nil {
+		return nil, err
+	}
+	return res.Items, nil
+}
+
 func (c *apiClient) ListRuns(ctx context.Context, f listRunsFilter) (*listRunsResult, error) {
 	q := url.Values{}
 	if f.Repo != "" {

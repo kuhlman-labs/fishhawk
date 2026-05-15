@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -27,8 +29,8 @@ type runResolver struct {
 // ordering for clients that index on position.
 func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerGetActiveRun(srv, resolver)
+	registerGetPlan(srv, resolver)
 	// Subsequent tools register here:
-	//   E19.4 / #344 — fishhawk_get_plan
 	//   E19.5 / #345 — fishhawk_get_run_status
 	//   E19.6 / #346 — fishhawk_list_audit
 }
@@ -144,6 +146,211 @@ func (r *runResolver) getActiveRun(ctx context.Context, _ *mcp.CallToolRequest, 
 	// Path 4: nothing to resolve from. Tell the caller exactly
 	// what they could pass.
 	return nil, GetActiveRunOutput{}, errors.New("no active run resolvable from context; pass pr_number or trigger_ref, or set FISHHAWK_RUN_ID in the environment")
+}
+
+// retryPlanChainDepth caps the parent-walk so a corrupt
+// parent_run_id cycle can't loop forever. Mirrors the constant of
+// the same name in `backend/internal/server/prompt.go` — keep them
+// aligned so the MCP tool returns the same plan the backend's
+// prompt builder would resolve for the same run.
+const retryPlanChainDepth = 8
+
+// GetPlanInput is the get_plan tool's input schema. run_id is the
+// only field — the resolver walks the parent chain itself; agents
+// don't need to know about the retry-chain mechanism.
+type GetPlanInput struct {
+	RunID string `json:"run_id" jsonschema:"the Fishhawk run UUID; the tool walks parent_run_id internally for CI-retry chains"`
+}
+
+// PlanContent mirrors the standard_v1 plan shape. Fields the agent
+// reads to reason about scope, approach, and verification expectations.
+// Kept flat for jsonschema friendliness; the SDK turns the struct
+// into an output schema the MCP client can introspect.
+type PlanContent struct {
+	PlanVersion         string             `json:"plan_version"`
+	TicketReference     PlanTicketRef      `json:"ticket_reference"`
+	GeneratedBy         PlanGeneratedBy    `json:"generated_by"`
+	Summary             string             `json:"summary"`
+	Scope               PlanScope          `json:"scope"`
+	Approach            []PlanApproachStep `json:"approach"`
+	Verification        PlanVerification   `json:"verification"`
+	RisksAndAssumptions []string           `json:"risks_and_assumptions,omitempty"`
+}
+
+// PlanTicketRef identifies the ticket that originated the run.
+type PlanTicketRef struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
+	ID   string `json:"id"`
+}
+
+// PlanGeneratedBy identifies the agent + model + timestamp that
+// produced the plan artifact.
+type PlanGeneratedBy struct {
+	Agent     string    `json:"agent"`
+	Model     string    `json:"model"`
+	Version   string    `json:"version,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// PlanScope lists the files the agent intends to touch + estimate.
+type PlanScope struct {
+	Files                 []PlanScopeFile `json:"files"`
+	EstimatedLinesChanged int             `json:"estimated_lines_changed,omitempty"`
+}
+
+// PlanScopeFile is one path the plan covers.
+type PlanScopeFile struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+}
+
+// PlanApproachStep is one numbered step in the approach list.
+type PlanApproachStep struct {
+	Step        int    `json:"step"`
+	Description string `json:"description"`
+}
+
+// PlanVerification carries the test_strategy and rollback_plan.
+type PlanVerification struct {
+	TestStrategy string `json:"test_strategy"`
+	RollbackPlan string `json:"rollback_plan"`
+}
+
+// GetPlanOutput is the response shape. Status is `available` or
+// `no_plan_yet`; on `no_plan_yet` Plan is nil and Message explains
+// why so an agent reading the response can branch on the state
+// without parsing prose.
+type GetPlanOutput struct {
+	Status      string       `json:"status" jsonschema:"either 'available' or 'no_plan_yet'"`
+	Message     string       `json:"message,omitempty" jsonschema:"human-readable explanation when status=no_plan_yet"`
+	Plan        *PlanContent `json:"plan,omitempty"`
+	ResolvedVia string       `json:"resolved_via,omitempty" jsonschema:"'self' when the plan came from the requested run; 'parent:<run_id>' when the parent-walk resolved it for a CI-retry chain"`
+}
+
+// registerGetPlan wires the fishhawk_get_plan tool. The handler
+// mirrors `backend/internal/server/prompt.go::loadApprovedPlanForRun`
+// — find the plan stage on the run, fall back to parent_run_id when
+// no plan stage exists (the CI-retry case per #279 / E16). Read-only
+// per ADR-021; never modifies state.
+func registerGetPlan(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_get_plan",
+		Description: strings.TrimSpace(`
+Fetch the approved plan for a Fishhawk run.
+
+Walks parent_run_id up to 8 levels so CI-retry runs (which skip the
+plan stage and re-execute against the parent's plan) resolve to the
+canonical plan. Returns the parsed standard_v1 plan shape: summary,
+scope.files, approach steps, verification (test_strategy +
+rollback_plan), and risks_and_assumptions when present.
+
+Response status:
+  - "available"     — Plan is populated; ResolvedVia tells you whether
+                      it came from the requested run ("self") or a
+                      parent in the retry chain ("parent:<run_id>").
+  - "no_plan_yet"   — The run (and its parents) have no terminal plan
+                      artifact yet. Message names the chain depth
+                      searched.
+`),
+	}, resolver.getPlan)
+}
+
+// getPlan is the tool handler.
+func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in GetPlanInput) (*mcp.CallToolResult, GetPlanOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, GetPlanOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+
+	// Walk the chain. Cap at retryPlanChainDepth so a corrupt
+	// parent cycle can't loop the agent.
+	current := runID
+	for depth := 0; depth < retryPlanChainDepth; depth++ {
+		p, found, err := r.tryGetPlanForRun(ctx, current)
+		if err != nil {
+			return nil, GetPlanOutput{}, err
+		}
+		if found {
+			resolvedVia := "self"
+			if current != runID {
+				resolvedVia = "parent:" + current.String()
+			}
+			return nil, GetPlanOutput{
+				Status:      "available",
+				Plan:        p,
+				ResolvedVia: resolvedVia,
+			}, nil
+		}
+		runRow, err := r.api.GetRun(ctx, current)
+		if err != nil {
+			return nil, GetPlanOutput{}, fmt.Errorf("get run for parent walk: %w", err)
+		}
+		if runRow.ParentRunID == nil {
+			return nil, GetPlanOutput{
+				Status:  "no_plan_yet",
+				Message: fmt.Sprintf("no terminal plan artifact on run %s (chain root reached at depth %d)", runID, depth),
+			}, nil
+		}
+		current = *runRow.ParentRunID
+	}
+	return nil, GetPlanOutput{
+		Status:  "no_plan_yet",
+		Message: fmt.Sprintf("no terminal plan artifact on run %s after walking %d parent levels (chain depth cap)", runID, retryPlanChainDepth),
+	}, nil
+}
+
+// tryGetPlanForRun mirrors prompt.go's tryLoadPlanForRun. Returns
+// (plan, true, nil) on a hit; (nil, false, nil) when the run has no
+// plan stage or no usable plan artifact (caller walks to parent);
+// (nil, false, err) on transport / decode failure.
+func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*PlanContent, bool, error) {
+	stages, err := r.api.ListRunStages(ctx, runID)
+	if err != nil {
+		return nil, false, fmt.Errorf("list stages: %w", err)
+	}
+	var planStageID uuid.UUID
+	for _, st := range stages {
+		if st.Type == "plan" {
+			planStageID = st.ID
+			break
+		}
+	}
+	if planStageID == uuid.Nil {
+		return nil, false, nil
+	}
+	arts, err := r.api.ListStageArtifacts(ctx, planStageID)
+	if err != nil {
+		return nil, false, fmt.Errorf("list plan stage artifacts: %w", err)
+	}
+	var picked *Artifact
+	for i := range arts {
+		a := &arts[i]
+		if a.Kind != "plan" {
+			continue
+		}
+		if a.SchemaVersion == nil || *a.SchemaVersion != "standard_v1" {
+			continue
+		}
+		if picked == nil || a.CreatedAt.After(picked.CreatedAt) {
+			picked = a
+		}
+	}
+	if picked == nil {
+		return nil, false, nil
+	}
+	if len(picked.Content) == 0 {
+		// Backend invariant: ListStageArtifacts returns content
+		// inline. An empty content suggests a partial response we
+		// shouldn't try to parse — surface as not-yet rather than
+		// a confusing JSON parse error.
+		return nil, false, nil
+	}
+	var p PlanContent
+	if err := json.Unmarshal(picked.Content, &p); err != nil {
+		return nil, false, fmt.Errorf("decode plan artifact: %w", err)
+	}
+	return &p, true, nil
 }
 
 // findMostRecent returns the most-recent run from a filter-scoped
