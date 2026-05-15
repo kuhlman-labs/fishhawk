@@ -46,12 +46,21 @@ const (
 	SurfaceUI            Surface = "ui"
 	SurfaceCLI           Surface = "cli"
 	SurfaceGitHubComment Surface = "github_comment"
+	// SurfaceGitHubReplyComment tags approvals submitted via a
+	// typed reply pattern (+1 / lgtm / 👍) on the originating
+	// issue thread (E17.4 / #339). Distinct from
+	// SurfaceGitHubComment (the explicit slash command) so the
+	// audit log can attribute the decision to the right UX
+	// affordance — slash commands carry a typed rationale and
+	// produce explicit replies on misuse; reply-pattern approvals
+	// have no rationale and silently skip on misuse.
+	SurfaceGitHubReplyComment Surface = "github_reply_comment"
 )
 
 // Valid reports whether s is one of the closed-set values.
 func (s Surface) Valid() bool {
 	switch s {
-	case SurfaceAPI, SurfaceUI, SurfaceCLI, SurfaceGitHubComment:
+	case SurfaceAPI, SurfaceUI, SurfaceCLI, SurfaceGitHubComment, SurfaceGitHubReplyComment:
 		return true
 	}
 	return false
