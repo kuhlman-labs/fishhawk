@@ -454,6 +454,7 @@ func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, ex
 	} else {
 		fmt.Fprintf(&b, "[View run →](%s)\n", c.runURL)
 	}
+	b.WriteString("\n_Or approve from this thread by replying " + "`+1`" + " / " + "`lgtm`" + "; reply " + "`/fishhawk reject <reason>`" + " to block with a rationale._\n")
 	return truncateForGitHubComment(b.String(), c.runURL, planStage.ID.String(), externalURL, c.run.ID.String())
 }
 

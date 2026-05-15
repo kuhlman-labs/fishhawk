@@ -223,6 +223,15 @@ func TestNotifyPlanReady_GatedRun_LinksToApprovalSurface(t *testing.T) {
 	if !strings.Contains(body, wantURL) {
 		t.Errorf("body should link to %q (run-scoped stage URL): %q", wantURL, body)
 	}
+	// The typed-reply / slash-reject discovery hint is plan-on-issue-
+	// only (E17.5 / #373). The legacy summary path must not advertise
+	// the approval reply tokens, or reviewers reading the summary
+	// comment will try +1 there and get silence.
+	for _, unwanted := range []string{"+1", "/fishhawk reject"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("legacy summary body should not contain %q: %q", unwanted, body)
+		}
+	}
 }
 
 func TestNotifyPlanReady_GatelessRun_LinksToRunPage(t *testing.T) {
@@ -406,6 +415,8 @@ func TestNotifyPlanReady_FullPlanSpec_PostsFullDocument(t *testing.T) {
 		"Rollback plan",
 		"Risks & assumptions",
 		"Approve in the dashboard",
+		"+1",
+		"/fishhawk reject",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n---\n%s", want, body)
