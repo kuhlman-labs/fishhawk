@@ -63,6 +63,7 @@ type uploadClient interface {
 	ShipPullRequest(ctx context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error)
 	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
 	FetchInstallationToken(ctx context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error)
+	FetchMCPToken(ctx context.Context, args upload.FetchMCPTokenArgs) (*upload.FetchMCPTokenResult, error)
 }
 
 // newUploadClient returns the production uploadClient for the
@@ -161,6 +162,30 @@ func run(args []string, logSink io.Writer) int {
 			MaxTokens: cfg.maxTokens,
 			Timeout:   cfg.timeout,
 		},
+		Env: map[string]string{},
+	}
+
+	// E19.8 / #348: mint a short-lived MCP token for the agent and
+	// layer it onto the invocation env. Best-effort — if the token
+	// fetch fails we log and continue. The agent loses Fishhawk
+	// MCP awareness but the run still produces a valid trace /
+	// plan / PR per the rest of the stage flow.
+	if issuedKey != nil {
+		mcpTok, err := client.FetchMCPToken(context.Background(), upload.FetchMCPTokenArgs{
+			RunID:      cfg.runID,
+			PrivateKey: issuedKey.PrivateKey,
+		})
+		if err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"mcp_token_fetch_failed","run_id":%q,"detail":%q}`+"\n",
+				cfg.runID, err.Error())
+		} else {
+			inv.Env["FISHHAWK_API_TOKEN"] = mcpTok.Token
+			inv.Env["FISHHAWK_BACKEND_URL"] = cfg.backendURL
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"mcp_token_issued","run_id":%q,"token_id":%q,"expires_at":%q}`+"\n",
+				cfg.runID, mcpTok.TokenID, mcpTok.ExpiresAt.Format(time.RFC3339))
+		}
 	}
 
 	invoker := newInvoker(os.Getenv("ANTHROPIC_API_KEY"))

@@ -2,7 +2,7 @@
 // versions:
 //   sqlc v1.31.1
 
-package apitokendb
+package mcptokendb
 
 import (
 	"github.com/google/uuid"

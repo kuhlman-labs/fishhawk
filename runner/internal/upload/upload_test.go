@@ -539,3 +539,111 @@ func TestFetchPrompt_RejectsBadKey(t *testing.T) {
 		t.Errorf("err = %v, want private key length error", err)
 	}
 }
+
+// --- FetchMCPToken (E19.8 / #348) ---
+
+func TestFetchMCPToken_HappyPath(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	var receivedSig string
+	var receivedBody []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/mcp-token", func(w http.ResponseWriter, r *http.Request) {
+		receivedSig = r.Header.Get("X-Fishhawk-Signature")
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(FetchMCPTokenResult{
+			Token:     "fhm_serverissued",
+			TokenID:   "tok-123",
+			RunID:     r.PathValue("run_id"),
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	got, err := c.FetchMCPToken(context.Background(), FetchMCPTokenArgs{
+		RunID:      "run-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchMCPToken: %v", err)
+	}
+	if got.Token != "fhm_serverissued" {
+		t.Errorf("Token = %q", got.Token)
+	}
+	if got.RunID != "run-abc" {
+		t.Errorf("RunID = %q", got.RunID)
+	}
+	if receivedSig == "" {
+		t.Error("server didn't see X-Fishhawk-Signature")
+	}
+	// Verify the signature against the body the server received.
+	sigBytes, decErr := hex.DecodeString(receivedSig)
+	if decErr != nil {
+		t.Fatal(decErr)
+	}
+	digest := sha256.Sum256(receivedBody)
+	if !ed25519.Verify(pub, digest[:], sigBytes) {
+		t.Error("signature does not verify against received body digest")
+	}
+}
+
+func TestFetchMCPToken_SignatureRejected(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(nil)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/mcp-token", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"code":"signature_invalid"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	_, err := c.FetchMCPToken(context.Background(), FetchMCPTokenArgs{
+		RunID: "run-abc", PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrSignatureRejected) {
+		t.Errorf("err = %v, want ErrSignatureRejected", err)
+	}
+}
+
+func TestFetchMCPToken_NotFound(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(nil)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/mcp-token", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	_, err := c.FetchMCPToken(context.Background(), FetchMCPTokenArgs{
+		RunID: "run-abc", PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestFetchMCPToken_RejectsEmptyRunID(t *testing.T) {
+	c := New("http://nowhere")
+	_, err := c.FetchMCPToken(context.Background(), FetchMCPTokenArgs{
+		RunID: "", PrivateKey: make(ed25519.PrivateKey, ed25519.PrivateKeySize),
+	})
+	if err == nil || !strings.Contains(err.Error(), "run_id") {
+		t.Errorf("err = %v, want run_id error", err)
+	}
+}
+
+func TestFetchMCPToken_RejectsBadKey(t *testing.T) {
+	c := New("http://nowhere")
+	_, err := c.FetchMCPToken(context.Background(), FetchMCPTokenArgs{
+		RunID:      "run-abc",
+		PrivateKey: ed25519.PrivateKey{0x01},
+	})
+	if err == nil || !strings.Contains(err.Error(), "private key") {
+		t.Errorf("err = %v, want private key length error", err)
+	}
+}

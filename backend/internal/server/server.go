@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -141,6 +142,15 @@ type Config struct {
 	// `Authorization: Bearer <fhk_…>` requests resolving to the
 	// anonymous identity.
 	APITokenRepo apitoken.Repository
+
+	// MCPTokenRepo persists the short-lived per-run bearer
+	// tokens runner-side Claude Code agents use to call the
+	// MCP server (E19.8 / #348). Wired by the /v0/runs/{id}/
+	// mcp-token handler; nil leaves the endpoint returning 503
+	// and `Authorization: Bearer <fhm_…>` requests resolving to
+	// the anonymous identity. The bearer-auth middleware routes
+	// to apitoken or mcptoken by inspecting the prefix.
+	MCPTokenRepo mcptoken.Repository
 
 	// AuthRepo persists users + sessions for the OAuth
 	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil
@@ -294,7 +304,7 @@ func (s *Server) buildHandler() http.Handler {
 
 	var h http.Handler = mux
 	h = s.csrf(h)
-	h = bearerAuth(s.cfg.APITokenRepo, s.cfg.AuthRepo)(h)
+	h = bearerAuth(s.cfg.APITokenRepo, s.cfg.MCPTokenRepo, s.cfg.AuthRepo)(h)
 	h = logging(s.cfg.Logger)(h)
 	h = requestID(h)
 	h = recovery(s.cfg.Logger)(h)

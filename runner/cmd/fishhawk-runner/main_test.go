@@ -49,9 +49,14 @@ type fakeInvoker struct {
 	canned    agent.Result
 	returnErr error
 	gotAPIKey string
+	// gotInv captures the Invocation the harness handed in, so
+	// tests can assert on plumbed Env (E19.8 / #348 wiring).
+	gotInv *agent.Invocation
 }
 
-func (f *fakeInvoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Result, error) {
+func (f *fakeInvoker) Invoke(_ context.Context, inv agent.Invocation) (agent.Result, error) {
+	i := inv
+	f.gotInv = &i
 	return f.canned, f.returnErr
 }
 
@@ -79,6 +84,7 @@ type fakeUploader struct {
 	planErr      error
 	prErr        error
 	instTokenErr error
+	mcpTokenErr  error
 
 	// Recorded calls.
 	gotIssueRunID string
@@ -95,6 +101,7 @@ type fakeUploader struct {
 	gotPlanArgs      *upload.ShipPlanArgs
 	gotPRArgs        *upload.ShipPullRequestArgs
 	gotInstTokenArgs *upload.FetchInstallationTokenArgs
+	gotMCPTokenArgs  *upload.FetchMCPTokenArgs
 
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
@@ -207,6 +214,24 @@ func (f *fakeUploader) FetchInstallationToken(_ context.Context, args upload.Fet
 		return nil, f.instTokenErr
 	}
 	return &upload.FetchInstallationTokenResult{Token: "ghs_app_token"}, nil
+}
+
+// FetchMCPToken stubs the E19.8 / #348 endpoint. The default
+// happy-path response is sufficient for tests that just need the
+// agent invocation to proceed; the per-test fields below let
+// individual tests assert on arguments or inject errors.
+func (f *fakeUploader) FetchMCPToken(_ context.Context, args upload.FetchMCPTokenArgs) (*upload.FetchMCPTokenResult, error) {
+	a := args
+	f.gotMCPTokenArgs = &a
+	if f.mcpTokenErr != nil {
+		return nil, f.mcpTokenErr
+	}
+	return &upload.FetchMCPTokenResult{
+		Token:     "fhm_stubmcptokenforuse",
+		TokenID:   "t-id-stub",
+		RunID:     args.RunID,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}, nil
 }
 
 // withFakeUploader swaps newUploadClient. Caller restores via
@@ -1185,6 +1210,97 @@ func TestRun_FetchPrompt_HappyPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"signing_key_issued"`) {
 		t.Errorf("missing signing_key_issued log: %s", stderr.String())
+	}
+}
+
+// TestRun_FetchPrompt_FetchesMCPToken_AndStampsAgentEnv covers the
+// E19.8 / #348 wiring: after the per-run signing key is issued,
+// the runner fetches an MCP token via FetchMCPToken and layers
+// FISHHAWK_API_TOKEN + FISHHAWK_BACKEND_URL onto the agent
+// Invocation.Env. The fake uploader returns "fhm_stubmcptoken…"
+// by default; assertions check both the call site and the
+// downstream env wiring.
+func TestRun_FetchPrompt_FetchesMCPToken_AndStampsAgentEnv(t *testing.T) {
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "Hello agent.",
+		PromptHash: "deadbeef",
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fu.gotMCPTokenArgs == nil {
+		t.Fatal("FetchMCPToken not called")
+	}
+	if fu.gotMCPTokenArgs.RunID != "11111111-2222-3333-4444-555555555555" {
+		t.Errorf("FetchMCPToken RunID = %q", fu.gotMCPTokenArgs.RunID)
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invoker.gotInv nil — invocation not captured")
+	}
+	if got := invoker.gotInv.Env["FISHHAWK_API_TOKEN"]; got != "fhm_stubmcptokenforuse" {
+		t.Errorf("FISHHAWK_API_TOKEN = %q, want stub", got)
+	}
+	if got := invoker.gotInv.Env["FISHHAWK_BACKEND_URL"]; got != "https://api.fishhawk.test" {
+		t.Errorf("FISHHAWK_BACKEND_URL = %q", got)
+	}
+	if !strings.Contains(stderr.String(), `"event":"mcp_token_issued"`) {
+		t.Errorf("missing mcp_token_issued log line: %s", stderr.String())
+	}
+}
+
+// TestRun_FetchPrompt_MCPTokenFetchFailure_StillProceeds locks
+// in the best-effort posture: if FetchMCPToken errors, the runner
+// logs the failure but continues invoking the agent (without the
+// FISHHAWK_API_TOKEN env). Aligns with ADR-021's "MCP awareness
+// is best-effort" framing.
+func TestRun_FetchPrompt_MCPTokenFetchFailure_StillProceeds(t *testing.T) {
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "Hello agent.",
+		PromptHash: "deadbeef",
+	}
+	fu.mcpTokenErr = errors.New("backend offline")
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (failure is best-effort):\n%s", got, stderr.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invoker.gotInv nil")
+	}
+	if _, ok := invoker.gotInv.Env["FISHHAWK_API_TOKEN"]; ok {
+		t.Errorf("FISHHAWK_API_TOKEN should be absent when fetch failed; got %q",
+			invoker.gotInv.Env["FISHHAWK_API_TOKEN"])
+	}
+	if !strings.Contains(stderr.String(), `"event":"mcp_token_fetch_failed"`) {
+		t.Errorf("missing mcp_token_fetch_failed log line: %s", stderr.String())
 	}
 }
 

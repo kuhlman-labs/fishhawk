@@ -52,6 +52,16 @@ type AuditEntry struct {
 	EntryHash    string             `json:"entry_hash"`
 }
 
+type McpToken struct {
+	ID         pgtype.UUID        `json:"id"`
+	RunID      pgtype.UUID        `json:"run_id"`
+	TokenHash  string             `json:"token_hash"`
+	IssuedAt   pgtype.Timestamptz `json:"issued_at"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
+	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type Run struct {
 	ID                     pgtype.UUID        `json:"id"`
 	Repo                   string             `json:"repo"`

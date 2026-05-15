@@ -137,6 +137,17 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 	if i.APIKey != "" {
 		cmd.Env = append(cmd.Env, "ANTHROPIC_API_KEY="+i.APIKey)
 	}
+	// Layer Invocation.Env on top so per-run secrets (FISHHAWK_API_TOKEN,
+	// FISHHAWK_BACKEND_URL, etc. set by the runner per E19.8 / #348)
+	// reach the agent process. The agent's MCP server reads these to
+	// authenticate against the Fishhawk backend; missing them is
+	// fine — MCP awareness is best-effort per ADR-021.
+	for k, v := range inv.Env {
+		if k == "" {
+			continue
+		}
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
