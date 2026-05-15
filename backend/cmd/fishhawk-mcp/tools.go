@@ -31,8 +31,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerGetActiveRun(srv, resolver)
 	registerGetPlan(srv, resolver)
 	registerGetRunStatus(srv, resolver)
-	// Subsequent tools register here:
-	//   E19.6 / #346 — fishhawk_list_audit
+	registerListAudit(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All
@@ -452,6 +451,106 @@ func clampAuditLimit(n int) int {
 	}
 	if n > auditLimitMax {
 		return auditLimitMax
+	}
+	return n
+}
+
+// listAuditLimitDefault / listAuditLimitMax cap the
+// fishhawk_list_audit tool's limit input. The backend's
+// /v0/runs/{id}/audit endpoint accepts up to 500; the MCP tool
+// caps lower (200) because the agent's reasoning window has a
+// practical limit on how many entries it can process per call.
+// Pagination via cursor covers the > 200 case.
+const (
+	listAuditLimitDefault = 50
+	listAuditLimitMax     = 200
+)
+
+// ListAuditInput is the tool's input schema. category / stage_id
+// are optional filters; limit / cursor drive pagination through
+// the per-run audit endpoint.
+type ListAuditInput struct {
+	RunID    string `json:"run_id" jsonschema:"the Fishhawk run UUID"`
+	Category string `json:"category,omitempty" jsonschema:"single category filter (e.g. 'approval_submitted', 'plan_generated', 'ci_failure_retry_dispatched')"`
+	StageID  string `json:"stage_id,omitempty" jsonschema:"scope entries to a specific stage UUID"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"max items per page (default 50, capped at 200)"`
+	Cursor   string `json:"cursor,omitempty" jsonschema:"pagination cursor returned by a prior list call as next_cursor"`
+}
+
+// ListAuditOutput mirrors the OpenAPI paginated list envelope.
+// NextCursor is the opaque token the agent feeds back into the
+// next call to walk past the current page; empty when the page
+// reached the end of the chain.
+type ListAuditOutput struct {
+	Items      []AuditEntry `json:"items"`
+	NextCursor string       `json:"next_cursor,omitempty" jsonschema:"opaque pagination cursor; empty when no more pages remain"`
+}
+
+// registerListAudit wires the fishhawk_list_audit tool. Forwards
+// filters verbatim to GET /v0/runs/{id}/audit — the same endpoint
+// the CLI's `fishhawk audit list` uses (E18.4 / #335). Read-only
+// per ADR-021.
+func registerListAudit(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_list_audit",
+		Description: strings.TrimSpace(`
+List audit entries for a Fishhawk run with optional filters.
+
+Returns rows sequence-ascending (matches the per-run scope the
+backend exposes for the run-detail UI + verifier path). For "most-
+recent N" queries, use fishhawk_get_run_status which uses the
+cross-chain endpoint for time-descending order.
+
+Inputs:
+  - run_id    (required) — Fishhawk run UUID.
+  - category  — single category filter (e.g. 'approval_submitted').
+  - stage_id  — scope to a stage's entries.
+  - limit     — default 50, capped at 200. For deeper paging use
+                the returned next_cursor.
+  - cursor    — opaque pagination token from a prior call.
+
+Response: items[] (AuditEntry shape) + next_cursor (empty when the
+chain is exhausted).
+`),
+	}, resolver.listAudit)
+}
+
+// listAudit is the tool handler.
+func (r *runResolver) listAudit(ctx context.Context, _ *mcp.CallToolRequest, in ListAuditInput) (*mcp.CallToolResult, ListAuditOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, ListAuditOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+	// Validate stage_id locally before the API round-trip so a
+	// malformed input surfaces as a clean tool error rather than
+	// a generic backend 400. Mirrors the CLI's E18.4 posture.
+	if in.StageID != "" {
+		if _, err := uuid.Parse(in.StageID); err != nil {
+			return nil, ListAuditOutput{}, fmt.Errorf("stage_id %q is not a valid UUID: %w", in.StageID, err)
+		}
+	}
+	limit := clampListAuditLimit(in.Limit)
+	items, nextCursor, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: in.Category,
+		StageID:  in.StageID,
+		Limit:    limit,
+		Cursor:   in.Cursor,
+	})
+	if err != nil {
+		return nil, ListAuditOutput{}, fmt.Errorf("list audit: %w", err)
+	}
+	return nil, ListAuditOutput{Items: items, NextCursor: nextCursor}, nil
+}
+
+// clampListAuditLimit applies the default + cap. Centralized so
+// the test surface can exercise the clamp directly without driving
+// the full tool flow.
+func clampListAuditLimit(n int) int {
+	if n <= 0 {
+		return listAuditLimitDefault
+	}
+	if n > listAuditLimitMax {
+		return listAuditLimitMax
 	}
 	return n
 }

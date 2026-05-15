@@ -52,24 +52,38 @@ type fakeBackend struct {
 	auditStatus     int
 	lastAuditLimit  string
 	auditCalledByID map[uuid.UUID]int
+
+	// E19.6 fixtures: per-run audit responses + recorded query
+	// state for the /v0/runs/{id}/audit endpoint. Distinct from
+	// the cross-chain capture above so tests can verify which
+	// surface a tool routed to (and let the same backend serve
+	// both shapes for the test suite that mixes them).
+	perRunAuditByRun         map[uuid.UUID][]AuditEntry
+	perRunAuditNextByRun     map[uuid.UUID]string
+	perRunAuditStatus        int
+	perRunAuditLastQueryByID map[uuid.UUID]string
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
-		listStatus:        http.StatusOK,
-		getStatus:         http.StatusOK,
-		stagesStatus:      http.StatusOK,
-		artifactsStatus:   http.StatusOK,
-		auditStatus:       http.StatusOK,
-		listByQuery:       map[string]listRunsResult{},
-		getRunByID:        map[uuid.UUID]Run{},
-		stagesByRun:       map[uuid.UUID][]Stage{},
-		artifactsByStage:  map[uuid.UUID][]Artifact{},
-		stagesCalledByID:  map[uuid.UUID]int{},
-		artifactsCalledID: map[uuid.UUID]int{},
-		auditByRun:        map[uuid.UUID][]AuditEntry{},
-		auditCalledByID:   map[uuid.UUID]int{},
+		listStatus:               http.StatusOK,
+		getStatus:                http.StatusOK,
+		stagesStatus:             http.StatusOK,
+		artifactsStatus:          http.StatusOK,
+		auditStatus:              http.StatusOK,
+		perRunAuditStatus:        http.StatusOK,
+		listByQuery:              map[string]listRunsResult{},
+		getRunByID:               map[uuid.UUID]Run{},
+		stagesByRun:              map[uuid.UUID][]Stage{},
+		artifactsByStage:         map[uuid.UUID][]Artifact{},
+		stagesCalledByID:         map[uuid.UUID]int{},
+		artifactsCalledID:        map[uuid.UUID]int{},
+		auditByRun:               map[uuid.UUID][]AuditEntry{},
+		auditCalledByID:          map[uuid.UUID]int{},
+		perRunAuditByRun:         map[uuid.UUID][]AuditEntry{},
+		perRunAuditNextByRun:     map[uuid.UUID]string{},
+		perRunAuditLastQueryByID: map[uuid.UUID]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/runs", func(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +129,21 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Unlock()
 		w.WriteHeader(fb.stagesStatus)
 		_ = json.NewEncoder(w).Encode(listStagesResult{Items: items})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/audit", func(w http.ResponseWriter, r *http.Request) {
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		w.Header().Set("Content-Type", "application/json")
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.perRunAuditLastQueryByID[id] = r.URL.RawQuery
+		items := fb.perRunAuditByRun[id]
+		next := fb.perRunAuditNextByRun[id]
+		fb.mu.Unlock()
+		w.WriteHeader(fb.perRunAuditStatus)
+		_ = json.NewEncoder(w).Encode(listAuditResult{Items: items, NextCursor: next})
 	})
 	mux.HandleFunc("GET /v0/audit", func(w http.ResponseWriter, r *http.Request) {
 		runIDQ := r.URL.Query().Get("run_id")
@@ -947,5 +976,219 @@ func TestGetPlan_IgnoresNonStandardV1PlanArtifacts(t *testing.T) {
 	}
 	if out.Status != "no_plan_yet" {
 		t.Errorf("Status = %q, want no_plan_yet (future schema is invisible)", out.Status)
+	}
+}
+
+// --- list_audit (E19.6 / #346) ---
+
+func TestListAudit_HappyPath_DefaultsLimit(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.perRunAuditByRun[runID] = []AuditEntry{
+		auditFixture(1, runID, "run_dispatched", "github-webhook", 30*time.Minute),
+		auditFixture(2, runID, "plan_generated", "system", 15*time.Minute),
+		auditFixture(3, runID, "approval_submitted", "alice", 5*time.Minute),
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("listAudit: %v", err)
+	}
+	if got := len(out.Items); got != 3 {
+		t.Errorf("Items length = %d, want 3", got)
+	}
+	q := fb.perRunAuditLastQueryByID[runID]
+	if !strings.Contains(q, "limit=50") {
+		t.Errorf("expected default limit=50; got %q", q)
+	}
+	// No filters → no category / stage_id / cursor in the query.
+	for _, unwanted := range []string{"category=", "stage_id=", "cursor="} {
+		if strings.Contains(q, unwanted) {
+			t.Errorf("unfiltered call should not carry %q; got %q", unwanted, q)
+		}
+	}
+}
+
+func TestListAudit_FiltersForwarded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	r := newResolver(srv, nil)
+	_, _, err := r.listAudit(context.Background(), nil, ListAuditInput{
+		RunID:    runID.String(),
+		Category: "approval_submitted",
+		StageID:  stageID.String(),
+		Limit:    25,
+		Cursor:   "tok-abc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := fb.perRunAuditLastQueryByID[runID]
+	for _, want := range []string{
+		"category=approval_submitted",
+		"stage_id=" + stageID.String(),
+		"limit=25",
+		"cursor=tok-abc",
+	} {
+		if !strings.Contains(q, want) {
+			t.Errorf("query missing %q: %s", want, q)
+		}
+	}
+}
+
+func TestListAudit_Limit_ClampedTo200(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+
+	r := newResolver(srv, nil)
+	_, _, err := r.listAudit(context.Background(), nil, ListAuditInput{
+		RunID: runID.String(),
+		Limit: 5000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := fb.perRunAuditLastQueryByID[runID]
+	if !strings.Contains(q, "limit=200") {
+		t.Errorf("limit should clamp to 200; got %q", q)
+	}
+}
+
+func TestListAudit_NextCursorPropagated(t *testing.T) {
+	// Page 1 returns a next_cursor; the tool surfaces it so the
+	// agent can call again with cursor=<token>. Verify both the
+	// outbound forwarding and the inbound round-trip.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.perRunAuditByRun[runID] = []AuditEntry{
+		auditFixture(1, runID, "run_dispatched", "github-webhook", time.Hour),
+	}
+	fb.perRunAuditNextByRun[runID] = "tok-page2"
+
+	r := newResolver(srv, nil)
+	_, out, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.NextCursor != "tok-page2" {
+		t.Errorf("NextCursor = %q, want tok-page2", out.NextCursor)
+	}
+
+	// Round-trip: feed the cursor back in.
+	_, _, err = r.listAudit(context.Background(), nil, ListAuditInput{
+		RunID:  runID.String(),
+		Cursor: "tok-page2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := fb.perRunAuditLastQueryByID[runID]
+	if !strings.Contains(q, "cursor=tok-page2") {
+		t.Errorf("page-2 call should forward cursor; got %q", q)
+	}
+}
+
+func TestListAudit_BadRunUUID(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: "not-a-uuid"})
+	if err == nil {
+		t.Fatal("expected error on malformed run_id")
+	}
+	if !strings.Contains(err.Error(), "run_id") || !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("error wording: %v", err)
+	}
+}
+
+func TestListAudit_BadStageUUID_RejectedBeforeAPICall(t *testing.T) {
+	// stage_id parses locally so a malformed input surfaces as a
+	// clean tool error rather than a confusing backend 400.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.listAudit(context.Background(), nil, ListAuditInput{
+		RunID:   uuid.New().String(),
+		StageID: "nope",
+	})
+	if err == nil {
+		t.Fatal("expected error on malformed stage_id")
+	}
+	if !strings.Contains(err.Error(), "stage_id") {
+		t.Errorf("error should name the stage_id field: %v", err)
+	}
+	// Defensive: the backend must NOT have been hit when local
+	// validation failed.
+	if len(fb.perRunAuditLastQueryByID) != 0 {
+		t.Errorf("backend hit despite local validation failure: %v", fb.perRunAuditLastQueryByID)
+	}
+}
+
+func TestListAudit_BackendError_Surfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.perRunAuditStatus = http.StatusInternalServerError
+
+	r := newResolver(srv, nil)
+	_, _, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected 500 to surface")
+	}
+	if !strings.Contains(err.Error(), "list audit") {
+		t.Errorf("error wording: %v", err)
+	}
+}
+
+func TestListAudit_MissingRun_404Surfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.perRunAuditStatus = http.StatusNotFound
+
+	r := newResolver(srv, nil)
+	_, _, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: uuid.New().String()})
+	if err == nil {
+		t.Fatal("expected 404 to surface")
+	}
+}
+
+func TestListAudit_EmptyPage_OK(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// perRunAuditByRun left empty for this id.
+	_ = fb
+
+	r := newResolver(srv, nil)
+	_, out, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(out.Items); got != 0 {
+		t.Errorf("expected empty items; got %d", got)
+	}
+	if out.NextCursor != "" {
+		t.Errorf("empty page should have empty cursor; got %q", out.NextCursor)
+	}
+}
+
+func TestClampListAuditLimit(t *testing.T) {
+	// Centralized clamp logic — test directly without the full
+	// tool flow so future tweaks have a fast feedback loop.
+	cases := []struct {
+		in, want int
+	}{
+		{0, listAuditLimitDefault},
+		{-1, listAuditLimitDefault},
+		{1, 1},
+		{50, 50},
+		{200, 200},
+		{201, listAuditLimitMax},
+		{99999, listAuditLimitMax},
+	}
+	for _, tc := range cases {
+		if got := clampListAuditLimit(tc.in); got != tc.want {
+			t.Errorf("clampListAuditLimit(%d) = %d, want %d", tc.in, got, tc.want)
+		}
 	}
 }
