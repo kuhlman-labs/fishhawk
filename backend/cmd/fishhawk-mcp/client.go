@@ -61,20 +61,28 @@ func (e *apiError) Error() string {
 // tags match the backend exactly so the renderer in tools.go can
 // pass the decoded struct straight back to the MCP client without
 // re-mapping.
+//
+// IDs are typed as `string` rather than `uuid.UUID` so the MCP
+// SDK's auto-generated JSON schema (which uses reflection over the
+// Go type) sees a string. `uuid.UUID` is a 16-byte array under the
+// hood, which would surface in the schema as `type: array` and
+// fail the SDK's response validation at the wire boundary — even
+// though the JSON payload itself is a string. Tools that need a
+// typed UUID parse the string locally (e.g. `uuid.Parse(in.RunID)`).
 type Run struct {
-	ID                 uuid.UUID  `json:"id"`
-	Repo               string     `json:"repo"`
-	WorkflowID         string     `json:"workflow_id"`
-	WorkflowSHA        string     `json:"workflow_sha"`
-	TriggerSource      string     `json:"trigger_source"`
-	TriggerRef         *string    `json:"trigger_ref"`
-	State              string     `json:"state"`
-	ParentRunID        *uuid.UUID `json:"parent_run_id"`
-	PullRequestURL     *string    `json:"pull_request_url"`
-	RetryAttempt       int        `json:"retry_attempt"`
-	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID                 string    `json:"id"`
+	Repo               string    `json:"repo"`
+	WorkflowID         string    `json:"workflow_id"`
+	WorkflowSHA        string    `json:"workflow_sha"`
+	TriggerSource      string    `json:"trigger_source"`
+	TriggerRef         *string   `json:"trigger_ref"`
+	State              string    `json:"state"`
+	ParentRunID        *string   `json:"parent_run_id"`
+	PullRequestURL     *string   `json:"pull_request_url"`
+	RetryAttempt       int       `json:"retry_attempt"`
+	MaxRetriesSnapshot int       `json:"max_retries_snapshot"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type listRunsResult struct {
@@ -108,8 +116,8 @@ func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 // for ordering, executor + timestamps + failure fields for the
 // agent's context.
 type Stage struct {
-	ID              uuid.UUID     `json:"id"`
-	RunID           uuid.UUID     `json:"run_id"`
+	ID              string        `json:"id"`
+	RunID           string        `json:"run_id"`
 	Sequence        int           `json:"sequence"`
 	Type            string        `json:"type"`
 	Executor        StageExecutor `json:"executor"`
@@ -150,14 +158,21 @@ func (c *apiClient) ListRunStages(ctx context.Context, runID uuid.UUID) ([]Stage
 // returns content directly on the listStageArtifacts endpoint (per
 // the OpenAPI Artifact schema), so the MCP tool doesn't need a
 // separate /v0/artifacts/{id} fetch.
+// Content is typed as `any` rather than `json.RawMessage` so the MCP
+// SDK's schema reflection sees an unconstrained value. `RawMessage`
+// is `[]byte` under the hood, which would surface as `type: array`
+// and reject the object/scalar payloads each artifact kind carries.
+// The decode side (tryGetPlanForRun) re-marshals + unmarshals into
+// the typed PlanContent shape; the cost is one extra round-trip
+// through json.Marshal per plan fetch, which is negligible.
 type Artifact struct {
-	ID            uuid.UUID       `json:"id"`
-	StageID       uuid.UUID       `json:"stage_id"`
-	Kind          string          `json:"kind"`
-	SchemaVersion *string         `json:"schema_version,omitempty"`
-	ContentHash   string          `json:"content_hash"`
-	Content       json.RawMessage `json:"content,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
+	ID            string    `json:"id"`
+	StageID       string    `json:"stage_id"`
+	Kind          string    `json:"kind"`
+	SchemaVersion *string   `json:"schema_version,omitempty"`
+	ContentHash   string    `json:"content_hash"`
+	Content       any       `json:"content,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type listArtifactsResult struct {
@@ -180,18 +195,22 @@ func (c *apiClient) ListStageArtifacts(ctx context.Context, stageID uuid.UUID) (
 // left as json.RawMessage so the MCP tool can pass the typed shape
 // directly through to the client without re-encoding category-
 // specific payloads — the agent introspects them as JSON.
+// Payload is typed `any` for the same reason Artifact.Content is —
+// the SDK's schema reflection treats `json.RawMessage` as an array,
+// but per-category payloads are arbitrary JSON objects. Agents
+// reading the response introspect each category's shape directly.
 type AuditEntry struct {
-	ID           uuid.UUID       `json:"id"`
-	Sequence     int64           `json:"sequence"`
-	RunID        uuid.UUID       `json:"run_id"`
-	StageID      *uuid.UUID      `json:"stage_id,omitempty"`
-	Timestamp    time.Time       `json:"ts"`
-	Category     string          `json:"category"`
-	ActorKind    *string         `json:"actor_kind,omitempty"`
-	ActorSubject *string         `json:"actor_subject,omitempty"`
-	Payload      json.RawMessage `json:"payload,omitempty"`
-	PrevHash     *string         `json:"prev_hash,omitempty"`
-	EntryHash    string          `json:"entry_hash"`
+	ID           string    `json:"id"`
+	Sequence     int64     `json:"sequence"`
+	RunID        string    `json:"run_id"`
+	StageID      *string   `json:"stage_id,omitempty"`
+	Timestamp    time.Time `json:"ts"`
+	Category     string    `json:"category"`
+	ActorKind    *string   `json:"actor_kind,omitempty"`
+	ActorSubject *string   `json:"actor_subject,omitempty"`
+	Payload      any       `json:"payload,omitempty"`
+	PrevHash     *string   `json:"prev_hash,omitempty"`
+	EntryHash    string    `json:"entry_hash"`
 }
 
 type listAuditResult struct {

@@ -201,7 +201,7 @@ func sampleRun(id uuid.UUID, repo string, age time.Duration) Run {
 	pr := "https://github.com/" + repo + "/pull/42"
 	tr := "issue:42"
 	return Run{
-		ID: id, Repo: repo, WorkflowID: "feature_change",
+		ID: id.String(), Repo: repo, WorkflowID: "feature_change",
 		TriggerSource:  "github_issue",
 		TriggerRef:     &tr,
 		State:          "running",
@@ -224,8 +224,8 @@ func TestGetActiveRun_ByPRNumber_QueriesPullRequestURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getActiveRun: %v", err)
 	}
-	if out.Run.ID != id {
-		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id)
+	if out.Run.ID != id.String() {
+		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id.String())
 	}
 	// Verify the filter actually hit the backend.
 	for _, want := range []string{
@@ -269,8 +269,8 @@ func TestGetActiveRun_ByPRNumber_FallsBackToGitHubRepositoryEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getActiveRun: %v", err)
 	}
-	if out.Run.ID != id {
-		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id)
+	if out.Run.ID != id.String() {
+		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id.String())
 	}
 }
 
@@ -286,8 +286,8 @@ func TestGetActiveRun_ByTriggerRef_QueriesTriggerRefFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getActiveRun: %v", err)
 	}
-	if out.Run.ID != id {
-		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id)
+	if out.Run.ID != id.String() {
+		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id.String())
 	}
 	for _, want := range []string{"repo=x%2Fy", "trigger_ref=issue%3A42"} {
 		if !strings.Contains(fb.lastListQuery, want) {
@@ -308,8 +308,8 @@ func TestGetActiveRun_ByEnvRunID_DirectFetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getActiveRun: %v", err)
 	}
-	if out.Run.ID != id {
-		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id)
+	if out.Run.ID != id.String() {
+		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id.String())
 	}
 }
 
@@ -386,8 +386,8 @@ func TestGetActiveRun_PicksMostRecentByCreatedAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getActiveRun: %v", err)
 	}
-	if out.Run.ID != newer {
-		t.Errorf("Run.ID = %s, want newer %s", out.Run.ID, newer)
+	if out.Run.ID != newer.String() {
+		t.Errorf("Run.ID = %s, want newer %s", out.Run.ID, newer.String())
 	}
 }
 
@@ -428,8 +428,8 @@ func TestGetActiveRun_ResolutionOrder_PRNumberBeatsTriggerRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Run.ID != id {
-		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id)
+	if out.Run.ID != id.String() {
+		t.Errorf("Run.ID = %s, want %s", out.Run.ID, id.String())
 	}
 	if !strings.Contains(fb.lastListQuery, "pull_request_url=") {
 		t.Errorf("expected pull_request_url filter (pr_number wins); got %s", fb.lastListQuery)
@@ -497,14 +497,20 @@ func samplePlanContent() PlanContent {
 // distinguish older vs newer when the most-recent-wins rule fires.
 func seedPlanArtifact(fb *fakeBackend, stageID uuid.UUID, content PlanContent, createdAge time.Duration) Artifact {
 	v := "standard_v1"
+	// Round-trip through JSON so Content holds the same shape it
+	// would on the wire (decoded objects/arrays, not the typed
+	// struct). The Artifact.Content field is `any` to match the
+	// MCP SDK's schema reflection.
 	body, _ := json.Marshal(content)
+	var decoded any
+	_ = json.Unmarshal(body, &decoded)
 	art := Artifact{
-		ID:            uuid.New(),
-		StageID:       stageID,
+		ID:            uuid.New().String(),
+		StageID:       stageID.String(),
 		Kind:          "plan",
 		SchemaVersion: &v,
 		ContentHash:   "h",
-		Content:       body,
+		Content:       decoded,
 		CreatedAt:     time.Now().UTC().Add(-createdAge),
 	}
 	fb.mu.Lock()
@@ -531,8 +537,8 @@ func TestGetPlan_FromCurrentRun_StatusAvailableResolvedViaSelf(t *testing.T) {
 	runID := uuid.New()
 	planStageID := uuid.New()
 	fb.stagesByRun[runID] = []Stage{
-		{ID: planStageID, RunID: runID, Type: "plan", State: "succeeded"},
-		{ID: uuid.New(), RunID: runID, Type: "implement", State: "pending"},
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		{ID: uuid.New().String(), RunID: runID.String(), Type: "implement", State: "pending"},
 	}
 	expectedSummary := "Add a dryRun flag to the dispatcher."
 	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
@@ -565,7 +571,7 @@ func TestGetPlan_PicksMostRecentArtifactWhenMultipleExist(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	planStageID := uuid.New()
-	fb.stagesByRun[runID] = []Stage{{ID: planStageID, RunID: runID, Type: "plan", State: "succeeded"}}
+	fb.stagesByRun[runID] = []Stage{{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"}}
 
 	older := samplePlanContent()
 	older.Summary = "stale plan"
@@ -594,20 +600,21 @@ func TestGetPlan_RetryChain_WalksParentRunID(t *testing.T) {
 	childID := uuid.New()
 	parentPlanStage := uuid.New()
 
+	parentIDStr := parentID.String()
 	fb.getRunByID[childID] = Run{
-		ID:          childID,
-		ParentRunID: &parentID,
+		ID:          childID.String(),
+		ParentRunID: &parentIDStr,
 		State:       "running",
 		Repo:        "x/y",
 	}
-	fb.getRunByID[parentID] = Run{ID: parentID, State: "running", Repo: "x/y"}
+	fb.getRunByID[parentID] = Run{ID: parentID.String(), State: "running", Repo: "x/y"}
 	// Child has only an implement stage (the retry's shape).
 	fb.stagesByRun[childID] = []Stage{
-		{ID: uuid.New(), RunID: childID, Type: "implement", State: "running"},
+		{ID: uuid.New().String(), RunID: childID.String(), Type: "implement", State: "running"},
 	}
 	// Parent has the plan stage carrying the artifact.
 	fb.stagesByRun[parentID] = []Stage{
-		{ID: parentPlanStage, RunID: parentID, Type: "plan", State: "succeeded"},
+		{ID: parentPlanStage.String(), RunID: parentID.String(), Type: "plan", State: "succeeded"},
 	}
 	seedPlanArtifact(fb, parentPlanStage, samplePlanContent(), time.Hour)
 
@@ -633,7 +640,7 @@ func TestGetPlan_NoPlanYet_ChainRootReached(t *testing.T) {
 	// since the root is the requested run itself).
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID, State: "running", Repo: "x/y"}
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
 	fb.stagesByRun[runID] = nil // no stages — plan stage absent
 
 	r := newResolver(srv, nil)
@@ -659,9 +666,9 @@ func TestGetPlan_NoPlanYet_PlanStagePending(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	planStageID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID, State: "running"}
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running"}
 	fb.stagesByRun[runID] = []Stage{
-		{ID: planStageID, RunID: runID, Type: "plan", State: "running"},
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "running"},
 	}
 	// Artifacts map: empty — no plan uploaded yet.
 
@@ -687,9 +694,10 @@ func TestGetPlan_RetryChain_DepthCap_NoPlanYet(t *testing.T) {
 		ids[i] = uuid.New()
 	}
 	for i := 0; i < chainLen; i++ {
-		row := Run{ID: ids[i], Repo: "x/y", State: "running"}
+		row := Run{ID: ids[i].String(), Repo: "x/y", State: "running"}
 		if i+1 < chainLen {
-			row.ParentRunID = &ids[i+1]
+			parentStr := ids[i+1].String()
+			row.ParentRunID = &parentStr
 		}
 		fb.getRunByID[ids[i]] = row
 		fb.stagesByRun[ids[i]] = nil
@@ -717,7 +725,7 @@ func TestGetPlan_RetryChain_DepthCap_NoPlanYet(t *testing.T) {
 func TestGetPlan_BackendError_StagesList_Surfaced(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID}
+	fb.getRunByID[runID] = Run{ID: runID.String()}
 	fb.stagesStatus = http.StatusInternalServerError
 
 	r := newResolver(srv, nil)
@@ -735,9 +743,9 @@ func TestGetPlan_BackendError_StagesList_Surfaced(t *testing.T) {
 func auditFixture(seq int64, runID uuid.UUID, category, actor string, offset time.Duration) AuditEntry {
 	body, _ := json.Marshal(map[string]any{"actor": actor})
 	return AuditEntry{
-		ID:           uuid.New(),
+		ID:           uuid.New().String(),
 		Sequence:     seq,
-		RunID:        runID,
+		RunID:        runID.String(),
 		Timestamp:    time.Now().UTC().Add(-offset),
 		Category:     category,
 		ActorSubject: &actor,
@@ -750,15 +758,15 @@ func TestGetRunStatus_HappyPath_BundlesThreeReads(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	fb.getRunByID[runID] = Run{
-		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change",
 		State: "running",
 	}
 	planStageID := uuid.New()
 	implStageID := uuid.New()
 	fb.stagesByRun[runID] = []Stage{
-		{ID: planStageID, RunID: runID, Sequence: 1, Type: "plan", State: "succeeded",
+		{ID: planStageID.String(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded",
 			Executor: StageExecutor{Kind: "agent", Ref: "claude-code"}},
-		{ID: implStageID, RunID: runID, Sequence: 2, Type: "implement", State: "running",
+		{ID: implStageID.String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running",
 			Executor: StageExecutor{Kind: "agent", Ref: "claude-code"}},
 	}
 	fb.auditByRun[runID] = []AuditEntry{
@@ -776,7 +784,7 @@ func TestGetRunStatus_HappyPath_BundlesThreeReads(t *testing.T) {
 		t.Fatalf("getRunStatus: %v", err)
 	}
 
-	if out.Run.ID != runID {
+	if out.Run.ID != runID.String() {
 		t.Errorf("Run.ID = %s, want %s", out.Run.ID, runID)
 	}
 	if len(out.Stages) != 2 {
@@ -798,11 +806,11 @@ func TestGetRunStatus_StagesReSortedBySequence(t *testing.T) {
 	// sequence, the agent still sees the pipeline in order.
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID}
+	fb.getRunByID[runID] = Run{ID: runID.String()}
 	fb.stagesByRun[runID] = []Stage{
-		{ID: uuid.New(), Sequence: 3, Type: "review", State: "pending"},
-		{ID: uuid.New(), Sequence: 1, Type: "plan", State: "succeeded"},
-		{ID: uuid.New(), Sequence: 2, Type: "implement", State: "running"},
+		{ID: uuid.New().String(), Sequence: 3, Type: "review", State: "pending"},
+		{ID: uuid.New().String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.New().String(), Sequence: 2, Type: "implement", State: "running"},
 	}
 
 	r := newResolver(srv, nil)
@@ -820,7 +828,7 @@ func TestGetRunStatus_AuditLimit_DefaultsToFive(t *testing.T) {
 	// audit_limit unset → request goes out with limit=5.
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID}
+	fb.getRunByID[runID] = Run{ID: runID.String()}
 
 	r := newResolver(srv, nil)
 	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
@@ -836,7 +844,7 @@ func TestGetRunStatus_AuditLimit_ClampedToFifty(t *testing.T) {
 	// audit_limit > 50 → request goes out with limit=50.
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID}
+	fb.getRunByID[runID] = Run{ID: runID.String()}
 
 	r := newResolver(srv, nil)
 	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{
@@ -854,7 +862,7 @@ func TestGetRunStatus_AuditLimit_ClampedToFifty(t *testing.T) {
 func TestGetRunStatus_AuditLimit_ExplicitValueForwarded(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID}
+	fb.getRunByID[runID] = Run{ID: runID.String()}
 
 	r := newResolver(srv, nil)
 	_, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{
@@ -900,7 +908,7 @@ func TestGetRunStatus_MissingRun_404Surfaced(t *testing.T) {
 func TestGetRunStatus_StagesEndpointError_Surfaced(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID}
+	fb.getRunByID[runID] = Run{ID: runID.String()}
 	fb.stagesStatus = http.StatusInternalServerError
 
 	r := newResolver(srv, nil)
@@ -916,7 +924,7 @@ func TestGetRunStatus_StagesEndpointError_Surfaced(t *testing.T) {
 func TestGetRunStatus_AuditEndpointError_Surfaced(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID}
+	fb.getRunByID[runID] = Run{ID: runID.String()}
 	fb.auditStatus = http.StatusInternalServerError
 
 	r := newResolver(srv, nil)
@@ -934,14 +942,14 @@ func TestGetRunStatus_EmptyStagesAndAudit_OK(t *testing.T) {
 	// still returns Status=ok with empty arrays rather than erroring.
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
-	fb.getRunByID[runID] = Run{ID: runID, State: "pending"}
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "pending"}
 
 	r := newResolver(srv, nil)
 	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Run.ID != runID {
+	if out.Run.ID != runID.String() {
 		t.Errorf("Run.ID = %s", out.Run.ID)
 	}
 	if got := len(out.Stages); got != 0 {
@@ -959,12 +967,12 @@ func TestGetPlan_IgnoresNonStandardV1PlanArtifacts(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	planStageID := uuid.New()
-	fb.stagesByRun[runID] = []Stage{{ID: planStageID, RunID: runID, Type: "plan", State: "succeeded"}}
+	fb.stagesByRun[runID] = []Stage{{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"}}
 
 	v := "future_v2"
 	body, _ := json.Marshal(map[string]any{"plan_version": "future_v2"})
 	fb.artifactsByStage[planStageID] = []Artifact{{
-		ID: uuid.New(), StageID: planStageID, Kind: "plan",
+		ID: uuid.New().String(), StageID: planStageID.String(), Kind: "plan",
 		SchemaVersion: &v, Content: body,
 		CreatedAt: time.Now().UTC(),
 	}}
