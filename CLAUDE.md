@@ -69,6 +69,7 @@ python3 scripts/check-coverage.py --threshold 80 --exclude '/db/' "${profiles[@]
    - New package / HTTP route / env var / flag → `docs/ARCHITECTURE.md` "Where to look" table; operator-facing inputs also → component `README.md`.
    - Spec or schema change → `docs/spec/<x>.md` + every embedded copy (CI's schema-sync diff fails otherwise).
    - HTTP API change → `docs/api/v0.openapi.yaml` (source of truth) + `docs/api/v0.md`.
+   - Add / remove / rename an issue-comment surface (Notifier method or audit kind) → `docs/issue-comment-surfaces.md`.
    - Voice/naming → `BRAND_FOUNDATIONS.md`. New trap / build workflow → `CLAUDE.md`. Autonomy convention → `METHODOLOGY.md`.
 5. **File issues for deferred work** before the PR opens. Any TODO, "follow-up PR", "deferred to E…", or obvious operability gap gets a tracking issue: title `[E<parent>.<n>]` (or `[ADR-NNN]`), same `area:*/autonomy:*/phase:*/type:*` labels as siblings, add to Project #7 with `Status=Backlog`, link from the parent epic's Children list, and reference from the PR body's `## Notes` so the deferral is reviewable.
 6. Open PR — body uses `## Summary` / `## Test plan` / optional `## Notes` / `Closes #<issue>`. Match #80, #81.
