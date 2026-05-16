@@ -77,8 +77,7 @@ type Kind string
 
 // Kind values.
 const (
-	KindPlan         Kind = "plan"
-	KindPlanApproved Kind = "plan_approved"
+	KindPlan Kind = "plan"
 	// KindCIRetry tags a comment posted when the dispatcher fires a
 	// CI-failure auto-retry (#279 / E16). Dedup is per-attempt: the
 	// payload also carries `retry_attempt`, and the dedup query
@@ -241,7 +240,17 @@ func (n *Notifier) notifyFullPlan(ctx context.Context, runID uuid.UUID, planStag
 		return fmt.Errorf("issuecomment: lookup plan comment: %w", err)
 	}
 
-	body := renderFullPlanBody(ctxv, planStage, planArtifact, n.externalURL)
+	// Plan-status footer (#377): drives the `_Status: approved by
+	// @x · implementing now_` / rejected line at the bottom of the
+	// comment so subscribers see the approval result without a
+	// second broadcast. Nil status = no approval row yet (the
+	// awaiting-approval first post).
+	status, err := n.latestPlanApproval(ctx, runID, planStage.ID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: lookup plan approval: %w", err)
+	}
+
+	body := renderFullPlanBody(ctxv, planStage, planArtifact, n.externalURL, status)
 
 	if existingID > 0 {
 		if !persistence.UpdateOnChange {
@@ -267,6 +276,34 @@ func (n *Notifier) notifyFullPlan(ctx context.Context, runID uuid.UUID, planStag
 		return fmt.Errorf("issuecomment: create plan comment: %w", err)
 	}
 	return n.appendPlanCommentAudit(ctx, ctxv, created.ID, KindPlanFull)
+}
+
+// latestPlanApproval walks the run's `approval_submitted` audit
+// rows newest-first and returns the latest one scoped to the plan
+// stage. Returns (nil, nil) when no row exists yet (the
+// awaiting-approval first post). #377.
+func (n *Notifier) latestPlanApproval(ctx context.Context, runID, planStageID uuid.UUID) (*planStatus, error) {
+	entries, err := n.audit.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil {
+		return nil, err
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.StageID == nil || *e.StageID != planStageID {
+			continue
+		}
+		var p struct {
+			Decision string `json:"decision"`
+			Approver string `json:"approver"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			// Defensive: a malformed row shouldn't block the
+			// comment render. Treat as no-status-yet.
+			continue
+		}
+		return &planStatus{decision: approval.Decision(p.Decision), approver: p.Approver}, nil
+	}
+	return nil, nil
 }
 
 // findPlanCommentID returns the most-recent github_comment_id from
@@ -362,6 +399,15 @@ func planOriginatingIssuePersistence(workflowSpec []byte, workflowID string, pla
 	return nil
 }
 
+// planStatus carries the latest approval state for the plan stage,
+// used by renderFullPlanBody to render the `_Status:_` footer
+// introduced in #377. Nil status renders as "awaiting approval";
+// approve / reject render named after the actor.
+type planStatus struct {
+	decision approval.Decision
+	approver string
+}
+
 // renderFullPlanBody renders the entire standard_v1 plan as a
 // markdown document for the issue thread (E17.2 / #337). Sections:
 //
@@ -376,12 +422,13 @@ func planOriginatingIssuePersistence(workflowSpec []byte, workflowID string, pla
 //	  Rollback plan: ...
 //	**Risks & assumptions**: bullets
 //	[Approve in the dashboard →](url) | [Reject →](url)
+//	_Status: …_  (when status is non-nil; #377)
 //
 // When the rendered body exceeds MaxIssueCommentBodyBytes the
 // renderer truncates at a safe rune boundary and appends a
 // "View full plan →" link to the SPA's plan-document page so the
 // reviewer can see the untruncated body.
-func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, externalURL string) string {
+func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, externalURL string, status *planStatus) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**Fishhawk plan** for Run [`%s`](%s)\n\n", shortID(c.run.ID), c.runURL)
 	fmt.Fprintf(&b, "Workflow: `%s`\n\n", c.run.WorkflowID)
@@ -426,7 +473,42 @@ func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, ex
 		fmt.Fprintf(&b, "[View run →](%s)\n", c.runURL)
 	}
 	b.WriteString("\n_Or approve from this thread by replying " + "`+1`" + " / " + "`lgtm`" + "; reply " + "`/fishhawk reject <reason>`" + " to block with a rationale._\n")
+	if footer := renderPlanStatusFooter(status); footer != "" {
+		b.WriteString("\n")
+		b.WriteString(footer)
+		b.WriteString("\n")
+	}
 	return truncateForGitHubComment(b.String(), c.runURL, planStage.ID.String(), externalURL, c.run.ID.String())
+}
+
+// renderPlanStatusFooter returns the italic status line appended to
+// the plan-on-issue comment, naming the actor that cleared or
+// blocked the gate. Empty when no approval audit row exists yet
+// (the comment first lands awaiting approval).
+func renderPlanStatusFooter(s *planStatus) string {
+	if s == nil {
+		return ""
+	}
+	actor := renderApproverHandle(s.approver)
+	switch s.decision {
+	case approval.DecisionApprove:
+		return fmt.Sprintf("_Status: approved by %s · implementing now_", actor)
+	case approval.DecisionReject:
+		return fmt.Sprintf("_Status: rejected by %s_", actor)
+	}
+	return ""
+}
+
+// renderApproverHandle picks the human-facing form of the audit
+// row's subject: `@<login>` for real GitHub logins, "an approver"
+// for the literal "anonymous" or empty (matches the convention the
+// retired renderPlanApprovedBody used so the issue thread never
+// leaks `@anonymous`).
+func renderApproverHandle(subject string) string {
+	if validApproverLogin(subject) {
+		return "@" + subject
+	}
+	return "an approver"
 }
 
 // truncateForGitHubComment caps body at MaxIssueCommentBodyBytes,
@@ -455,50 +537,6 @@ func truncateForGitHubComment(body, runURL, stageID, externalURL, runID string) 
 		cut--
 	}
 	return strings.TrimRight(body[:cut], " \n") + tail
-}
-
-// NotifyPlanApproved posts the "plan approved → implementing now"
-// comment back on the originating issue (#274). Closes the
-// feedback-loop gap between NotifyPlanReady ("here's the plan,
-// approve in the dashboard") and the eventual PR-open signal:
-// without this comment the conversation goes "plan ready → … long
-// silence → PR opened" from the labeler's POV.
-//
-// Best-effort: returns errors so callers can log them, but a
-// comment failure should NOT unwind the approval — the gate is
-// already cleared and the audit row is in place.
-//
-// Skips silently when:
-//   - The receiver is nil.
-//   - `decision != approve` — reject already gets a tailored
-//     reply via NotifySlashApprovalReply on the slash path, and
-//     the HTTP path lands the reviewer back on the dashboard.
-//     Broadcasting reject to the issue thread is a separate UX.
-//   - The run isn't issue-triggered (CLI / PR / etc.), is missing
-//     installation_id, or has an unparseable trigger_ref.
-//   - A plan_approved comment already landed for this run
-//     (audit-log dedup mirrors the pickup / plan-ready paths).
-//
-// `approverLogin` is the GitHub login resolved from the approval
-// surface — `IdentityFrom(ctx).Subject` on the HTTP path,
-// `ApprovalCommandParams.SenderLogin` on the slash path. Empty
-// or `"anonymous"` renders as "Plan approved by an approver"
-// rather than `@anonymous` (the audit log still carries the real
-// subject; the comment-side wording is the only thing that
-// changes).
-func (n *Notifier) NotifyPlanApproved(ctx context.Context, runID uuid.UUID, approverLogin string, decision approval.Decision) error {
-	if n == nil {
-		return nil
-	}
-	if decision != approval.DecisionApprove {
-		return nil
-	}
-	ctxv, ok, err := n.contextFor(ctx, runID, KindPlanApproved)
-	if err != nil || !ok {
-		return err
-	}
-	body := renderPlanApprovedBody(ctxv, approverLogin)
-	return n.post(ctx, ctxv, KindPlanApproved, body)
 }
 
 // NotifyCIRetry posts the CI-failure auto-retry comment for an
@@ -867,7 +905,7 @@ type SlashApprovalReply struct {
 
 // NotifySlashApprovalReply posts a reply comment to a /fishhawk
 // approve or /fishhawk reject command (#238). Unlike
-// NotifyPlanReady / NotifyPlanApproved, replies are NOT deduped — every
+// NotifyPlanReady, replies are NOT deduped — every
 // command attempt should produce its own reply, even if the
 // reviewer fires the same command twice. The reply is fire-and-
 // forget for the slash-command handler: a failure here logs but
@@ -1015,25 +1053,6 @@ func renderPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, extern
 			externalURL, c.run.ID.String(), planStage.ID.String())
 	} else {
 		fmt.Fprintf(&b, "\n[View run →](%s)\n", c.runURL)
-	}
-	return b.String()
-}
-
-// renderPlanApprovedBody renders the "plan approved → implementing
-// now" comment (#274). Names the approver when we have a real
-// GitHub login; falls back to a generic "an approver" when the
-// subject is anonymous or empty so the comment never says
-// "Plan approved by `@anonymous`."
-func renderPlanApprovedBody(c commentContext, approverLogin string) string {
-	var b strings.Builder
-	if validApproverLogin(approverLogin) {
-		// Bare @login (no backticks) so GitHub fires a real mention
-		// notification to the approver and autolinks the handle.
-		fmt.Fprintf(&b, "Plan approved by @%s. Implementing now — [View run →](%s).\n",
-			approverLogin, c.runURL)
-	} else {
-		fmt.Fprintf(&b, "Plan approved by an approver. Implementing now — [View run →](%s).\n",
-			c.runURL)
 	}
 	return b.String()
 }

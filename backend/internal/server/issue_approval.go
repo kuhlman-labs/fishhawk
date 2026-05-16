@@ -188,29 +188,23 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		}
 	}
 
-	// Plan-approved comment-back (#274, #304): NotifyPlanApproved is
-	// the single source of truth for the plan-approve confirmation
-	// on the issue thread. The slash reply duplicates that broadcast
-	// for the plan-approve path, so it is deliberately skipped here.
-	// The slash reply still fires for plan-reject (no broadcast on
-	// that path), review-stage approve/reject (NotifyPlanApproved is
-	// plan-scoped), and authorization/error paths handled above.
-	if advanced.Type == run.StageTypePlan && decision == approval.DecisionApprove {
-		if err := s.issueNotifier.NotifyPlanApproved(ctx, advanced.RunID, p.SenderLogin, decision); err != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"slash-command approval: plan-approved comment-back failed",
-				slog.String("run_id", advanced.RunID.String()),
-				slog.String("stage_id", advanced.ID.String()),
-				slog.String("error", err.Error()))
-		}
-	} else if !silent {
+	// Plan-comment re-render (#377): a plan-stage approve or
+	// reject re-fires the plan-on-issue hook, which edits the
+	// existing comment in place and appends a `_Status:_` footer
+	// naming the actor. Replaces the retired NotifyPlanApproved
+	// broadcast (#274). The per-sender slash reply below still
+	// covers the sender's own typed-command confirmation.
+	if advanced.Type == run.StageTypePlan {
+		s.notifyPlanReady(ctx, advanced.RunID, advanced)
+	}
+
+	if !silent {
 		// Reply-comment approvals (E17.4 / #339) skip the per-call
-		// success reply: the NotifyPlanApproved broadcast (#274)
-		// covers plan-approve, and other cases (plan-reject or
-		// review-stage rejection that reaches here) wouldn't
-		// happen on the reply path — the matcher only emits
-		// MatchActionApprove. Silence keeps a "+1" reply from
-		// echoing back a confirmation.
+		// success reply because the typed `+1` IS the user's
+		// confirmation. Slash-command callers still get the
+		// named-stage reply since their command had no inherent
+		// "you said it" feedback. Plan-stage approvals also get
+		// the plan-comment edit above (the broadcast equivalent).
 		s.replyApproval(ctx, p, formatSuccessReply(decision, subject, runRow.ID, advanced))
 	}
 
