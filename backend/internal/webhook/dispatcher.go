@@ -630,20 +630,22 @@ type GitHubAPI interface {
 }
 
 // IssueNotifier is the slice of issuecomment.Notifier the dispatcher
-// uses for the pickup-acknowledgment hook. Defining it as an
-// interface keeps the import boundary clean and lets tests substitute
-// a recording stub. Nil at the dispatcher means no comment is posted
+// uses for issue-thread comment-backs. Defining it as an interface
+// keeps the import boundary clean and lets tests substitute a
+// recording stub. Nil at the dispatcher means no comment is posted
 // (the demo loop pre-#234 posture).
 type IssueNotifier interface {
-	NotifyPickup(ctx context.Context, runID uuid.UUID, senderLogin string) error
 	// NotifyCIRetry posts a comment on the originating issue when
 	// the dispatcher fires a CI-failure auto-retry (#279 / E16).
 	// Per-attempt dedup via the audit log; failures log but don't
 	// unwind the dispatch.
 	NotifyCIRetry(ctx context.Context, runID uuid.UUID, parentRunID uuid.UUID, checkName string, attempt, max int) error
 	// NotifyStatusUpdateForRun creates-or-edits the run's sticky
-	// status comment (E20.4 / #330). Best-effort; failures here
-	// don't unwind the calling transition.
+	// status comment (E20.4 / #330). The first call seeds the
+	// comment — that's the "Fishhawk picked it up" beat now that
+	// the standalone pickup broadcast has been retired (#376).
+	// Best-effort; failures here don't unwind the calling
+	// transition.
 	NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error
 }
 
@@ -914,27 +916,17 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// pinning it to the trigger.
 	d.writeDispatchAudit(ctx, ev, m, created, specFile.SHA, dispatchErr, now)
 
-	// Step 8.5: comment back on the triggering issue (#234) so the
-	// labeler sees that Fishhawk picked it up. Only fires for
-	// issue-triggered runs; the notifier itself is the source of
-	// truth on whether to skip (see issuecomment.Notifier).
-	// Best-effort: a failure logs at WARN but doesn't unwind the
-	// dispatch — the run is in the DB regardless of the comment.
+	// Step 8.5: seed the sticky status comment on the triggering
+	// issue (E20.4 / #330) — this is the "Fishhawk picked it up"
+	// beat as of #376; the standalone pickup broadcast was
+	// retired because the status comment fires on the same event
+	// and already shows the run id, workflow, trigger, and live
+	// state. Subsequent transitions edit this comment in place.
+	// Only fires for issue-triggered runs; the notifier is the
+	// source of truth on whether to skip. Best-effort: a failure
+	// logs at WARN but doesn't unwind the dispatch — the run is
+	// in the DB regardless of the comment.
 	if d.IssueNotifier != nil && dispatchErr == nil && m.TriggerSource == run.TriggerGitHubIssue {
-		if err := d.IssueNotifier.NotifyPickup(ctx, created.ID, ev.Sender); err != nil {
-			d.logger().LogAttrs(ctx, slog.LevelWarn,
-				"pickup comment-back failed",
-				slog.String("delivery_id", ev.DeliveryID),
-				slog.String("run_id", created.ID.String()),
-				slog.String("error", err.Error()),
-			)
-		}
-		// Sticky-status seed (E20.4 / #330): post the initial
-		// status comment so the operator sees current stage/state
-		// in the issue thread. Subsequent transitions edit this
-		// comment in place. Best-effort, separate from the pickup
-		// post: pickup is a one-shot acknowledgment; the status
-		// comment is the durable live view.
 		if err := d.IssueNotifier.NotifyStatusUpdateForRun(ctx, created.ID); err != nil {
 			d.logger().LogAttrs(ctx, slog.LevelWarn,
 				"status comment update failed",

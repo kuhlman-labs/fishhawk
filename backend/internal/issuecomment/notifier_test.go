@@ -52,142 +52,6 @@ func happyDeps(t *testing.T) (uuid.UUID, *fakeGitHub, *fakeAudit, *issuecomment.
 	return runID, gh, au, n
 }
 
-func TestNotifyPickup_PostsCommentAndAuditEntry(t *testing.T) {
-	runID, gh, au, n := happyDeps(t)
-	if err := n.NotifyPickup(context.Background(), runID, "alice"); err != nil {
-		t.Fatalf("NotifyPickup: %v", err)
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 GitHub call; got %d", len(gh.calls))
-	}
-	c := gh.calls[0]
-	if c.repo.Owner != "x" || c.repo.Name != "y" {
-		t.Errorf("repo = %+v", c.repo)
-	}
-	if c.issueNumber != 42 {
-		t.Errorf("issueNumber = %d", c.issueNumber)
-	}
-	if !strings.Contains(c.body, "Fishhawk picked this up") {
-		t.Errorf("body should reference pickup: %q", c.body)
-	}
-	if !strings.Contains(c.body, "feature_change") {
-		t.Errorf("body should reference workflow_id: %q", c.body)
-	}
-	if !strings.Contains(c.body, "@alice") {
-		t.Errorf("body should reference triggering user: %q", c.body)
-	}
-	// Regression guard for #305: the @login must NOT be wrapped in
-	// backticks — a backticked "`@alice`" suppresses the GitHub
-	// mention notification that lets the labeler know we picked up.
-	if strings.Contains(c.body, "`@") {
-		t.Errorf("body must not backtick-wrap the @mention (breaks GitHub notification): %q", c.body)
-	}
-	if !strings.Contains(c.body, runID.String()[:8]) {
-		t.Errorf("body should include short run id: %q", c.body)
-	}
-
-	if len(au.appended) != 1 {
-		t.Fatalf("expected 1 audit append; got %d", len(au.appended))
-	}
-	if au.appended[0].Category != issuecomment.CategoryIssueCommented {
-		t.Errorf("audit category = %q", au.appended[0].Category)
-	}
-	var p map[string]any
-	if err := json.Unmarshal(au.appended[0].Payload, &p); err != nil {
-		t.Fatalf("decode payload: %v", err)
-	}
-	if p["kind"] != "pickup" {
-		t.Errorf("payload.kind = %v", p["kind"])
-	}
-}
-
-func TestNotifyPickup_DedupsViaAuditLog(t *testing.T) {
-	runID, gh, au, n := happyDeps(t)
-
-	// Pre-seed an existing pickup audit entry — the notifier must
-	// short-circuit without posting a second time.
-	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{"kind": "pickup"})
-
-	if err := n.NotifyPickup(context.Background(), runID, "alice"); err != nil {
-		t.Fatalf("NotifyPickup: %v", err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("expected 0 GitHub calls (deduped); got %d", len(gh.calls))
-	}
-}
-
-func TestNotifyPickup_SkipsNonIssueTrigger(t *testing.T) {
-	runID := uuid.New()
-	repoRuns := &fakeRuns{
-		runs: map[uuid.UUID]*run.Run{runID: {
-			ID: runID, Repo: "x/y",
-			TriggerSource:  run.TriggerCLI, // not github_issue
-			InstallationID: int64Ptr(99),
-		}},
-	}
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: repoRuns, Audit: au,
-		ExternalURL: "https://app.fishhawk.example.com",
-	})
-
-	if err := n.NotifyPickup(context.Background(), runID, "alice"); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("expected no calls for CLI-triggered run")
-	}
-}
-
-func TestNotifyPickup_SkipsMalformedTriggerRef(t *testing.T) {
-	runID := uuid.New()
-	bad := "not-an-issue-ref"
-	repoRuns := &fakeRuns{
-		runs: map[uuid.UUID]*run.Run{runID: {
-			ID: runID, Repo: "x/y",
-			TriggerSource:  run.TriggerGitHubIssue,
-			TriggerRef:     &bad,
-			InstallationID: int64Ptr(99),
-		}},
-	}
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: repoRuns, Audit: au,
-		ExternalURL: "https://app.fishhawk.example.com",
-	})
-	if err := n.NotifyPickup(context.Background(), runID, "alice"); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("expected no calls when trigger_ref is malformed")
-	}
-}
-
-func TestNotifyPickup_GitHubErrorReturned_NoAuditEntry(t *testing.T) {
-	runID, gh, au, n := happyDeps(t)
-	gh.err = errors.New("403 forbidden")
-
-	err := n.NotifyPickup(context.Background(), runID, "alice")
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if len(au.appended) != 0 {
-		t.Errorf("audit append should not happen on comment failure; got %d", len(au.appended))
-	}
-}
-
-func TestNotifyPickup_NoSenderRendersWithoutTriggeredBy(t *testing.T) {
-	runID, gh, _, n := happyDeps(t)
-	if err := n.NotifyPickup(context.Background(), runID, ""); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(gh.calls[0].body, "Triggered by") {
-		t.Errorf("body should not reference triggering user when sender is empty: %q", gh.calls[0].body)
-	}
-}
-
 func TestNotifyPlanReady_GatedRun_LinksToApprovalSurface(t *testing.T) {
 	runID, gh, _, n := happyDeps(t)
 	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
@@ -919,24 +783,6 @@ func TestNotifyStatusUpdate_UpdateErrorOtherThan404_SurfacesError(t *testing.T) 
 	}
 }
 
-func TestNotifyPickup_AndPlan_ShareCategoryButDistinctKinds(t *testing.T) {
-	runID, gh, au, n := happyDeps(t)
-	if err := n.NotifyPickup(context.Background(), runID, "alice"); err != nil {
-		t.Fatal(err)
-	}
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	p := &plan.Plan{Summary: "x"}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, p); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.calls) != 2 {
-		t.Errorf("expected 2 GitHub calls; got %d", len(gh.calls))
-	}
-	if len(au.appended) != 2 {
-		t.Errorf("expected 2 audit entries; got %d", len(au.appended))
-	}
-}
-
 // happyDepsWithStages returns the happyDeps fixtures plus a stage
 // list so NotifyStatusUpdateForRun has something to render against.
 func happyDepsWithStages(t *testing.T) (uuid.UUID, *fakeGitHub, *fakeAudit, *fakeRuns, *issuecomment.Notifier) {
@@ -1045,12 +891,12 @@ func TestNotifyStatusUpdateForRun_NilReceiver_NoOp(t *testing.T) {
 
 // TestStatusComment_Lifecycle drives the sticky-status comment through
 // the operator-visible transitions of a representative run lifecycle
-// (E20.5 / #331): pickup → plan-ready → plan-approved → implementing →
-// PR-open → merged. Each transition mutates the underlying run/stage
-// state and fires NotifyStatusUpdateForRun; the test verifies that the
-// notifier (1) creates exactly one comment, (2) edits the same comment
-// id on every subsequent transition, and (3) renders the right state
-// content at each step.
+// (E20.5 / #331): dispatch seed → plan-ready → plan-approved →
+// implementing → PR-open → merged. Each transition mutates the
+// underlying run/stage state and fires NotifyStatusUpdateForRun; the
+// test verifies that the notifier (1) creates exactly one comment,
+// (2) edits the same comment id on every subsequent transition, and
+// (3) renders the right state content at each step.
 //
 // This is the cross-cutting integration test promised by #331's
 // acceptance criteria. The wiring of each handler is unit-tested per
@@ -1091,13 +937,15 @@ func TestStatusComment_Lifecycle(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Step 1: pickup (dispatcher seed). Run is pending, plan stage is
-	// pending — the first transition fires after CreateRun. Expect a
-	// create call landing comment id=1.
+	// Step 1: dispatcher seed. Run is pending, plan stage is
+	// pending — the first transition fires after CreateRun. Expect
+	// a create call landing comment id=1. This is now the
+	// "Fishhawk picked it up" beat (#376 retired the standalone
+	// pickup-broadcast).
 	r.State = run.StateRunning
 	planStage.State = run.StageStateDispatched
 	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
-		t.Fatalf("step 1 pickup: %v", err)
+		t.Fatalf("step 1 dispatcher seed: %v", err)
 	}
 	if len(gh.calls) != 1 || len(gh.updateCalls) != 0 {
 		t.Fatalf("step 1: expected 1 create + 0 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
@@ -1340,9 +1188,6 @@ func TestNotifySlashApprovalReply_SkipsBadParams(t *testing.T) {
 
 func TestNotify_NilReceiver_NoOp(t *testing.T) {
 	var n *issuecomment.Notifier
-	if err := n.NotifyPickup(context.Background(), uuid.New(), "x"); err != nil {
-		t.Errorf("nil pickup should be a no-op; got %v", err)
-	}
 	if err := n.NotifyPlanReady(context.Background(), uuid.New(),
 		&run.Stage{ID: uuid.New(), Type: run.StageTypePlan}, &plan.Plan{}); err != nil {
 		t.Errorf("nil plan should be a no-op; got %v", err)
@@ -1499,8 +1344,8 @@ func TestNotifyPlanApproved_SkipsNonIssueTrigger(t *testing.T) {
 
 func TestNotifyPlanApproved_GitHubErrorReturned_NoAuditEntry(t *testing.T) {
 	// Comment-side failure surfaces as a non-nil error so the
-	// caller can log + carry on. Same posture as NotifyPickup:
-	// the audit row is only written after the comment lands.
+	// caller can log + carry on. The audit row is only written
+	// after the comment lands.
 	runID, gh, au, n := happyDeps(t)
 	gh.err = errors.New("github rate-limited")
 	err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove)
