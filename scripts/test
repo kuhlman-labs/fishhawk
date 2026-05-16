@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# scripts/test — wraps the multi-module Go test + coverage gates.
+#
+# Mirrors the loop CI uses for the Go lane: reads registered modules
+# from go.work, runs each module's tests in its own directory.
+# Fail-fast on the first module whose tests fail.
+#
+# Usage:
+#   scripts/test              run `go test -race ./...` in every module
+#   scripts/test coverage     the gate above + scripts/check-coverage.py
+#   scripts/test single ARGS  pass-through to `go test -race ARGS`
+#                             example:
+#                             scripts/test single -run TestX ./backend/internal/version/...
+#
+# Frontend gates (pnpm format:check / typecheck / test) are NOT
+# covered here — they have their own conventions per docs/.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+modules() {
+  go work edit -json | jq -r '.Use[].DiskPath'
+}
+
+cmd_test() {
+  while IFS= read -r m; do
+    printf '>>> %s\n' "$m"
+    (cd "$m" && go test -race ./...)
+  done < <(modules)
+}
+
+cmd_coverage() {
+  local profiles=()
+  while IFS= read -r m; do
+    printf '>>> %s\n' "$m"
+    (cd "$m" && go test -race -coverprofile=coverage.out -covermode=atomic ./...)
+    profiles+=("$m/coverage.out")
+  done < <(modules)
+  python3 "$ROOT/scripts/check-coverage.py" --threshold 80 --exclude '/db/' "${profiles[@]}"
+}
+
+cmd_single() {
+  if [ "$#" -eq 0 ]; then
+    cat >&2 <<'EOF'
+usage: scripts/test single <args>
+example: scripts/test single -run TestNotifyPlanReady ./backend/internal/issuecomment/...
+EOF
+    exit 1
+  fi
+  go test -race "$@"
+}
+
+usage() {
+  cat <<'EOF'
+usage: scripts/test [SUBCOMMAND] [ARGS]
+
+  test                 (default) run `go test -race ./...` in every module
+  coverage             run tests + aggregate coverage gate
+  single ARGS          pass-through to `go test -race ARGS`
+  -h | --help | help   show this message
+EOF
+}
+
+case "${1:-test}" in
+  test|"")          cmd_test ;;
+  coverage|cover)   cmd_coverage ;;
+  single)           shift; cmd_single "$@" ;;
+  -h|--help|help)   usage ;;
+  *)
+    echo "scripts/test: unknown subcommand: $1" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

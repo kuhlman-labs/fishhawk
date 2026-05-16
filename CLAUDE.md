@@ -24,26 +24,24 @@ Pre-alpha. Most code referenced in `docs/MVP_SPEC.md` doesn't exist yet — it's
 
 ## Build, test, lint
 
-Multi-module Go workspace; **no root `go.mod`**, so `go build ./...` from root fails. Use:
+Multi-module Go workspace; **no root `go.mod`**, so `go build ./...` from root fails. The common gates are wrapped by `scripts/test`:
+
+```sh
+scripts/test               # `go test -race ./...` in every registered module
+scripts/test coverage      # the same, plus the aggregate coverage gate
+scripts/test single -run TestName ./backend/internal/version/   # passthrough
+```
+
+Per-module without the wrapper (still useful for `go build` and `golangci-lint`):
 
 ```sh
 go build ./backend/...
-go test -race ./backend/...
 golangci-lint run ./backend/...
-go test -race -run TestName ./backend/internal/version/   # single test
-```
-
-CI loops over registered modules — adding `use ./<dir>` to `go.work` auto-includes it:
-
-```sh
-for m in $(go work edit -json | jq -r '.Use[].DiskPath'); do
-  (cd "$m" && go build ./... && go test -race ./...)
-done
 ```
 
 `.golangci.yml` is **v2 format** (`version: "2"` at top). Local install must be golangci-lint v2.x; v1 binaries reject this config.
 
-**Coverage gate**: aggregate ≥ 80% across **all** registered modules, excluding sqlc-generated `*/db/` packages (CI uses `--exclude '/db/'` so new sqlc packages auto-skip). Tiered targets in `docs/ARCHITECTURE.md` §9. CI fails `CI Pass` if the threshold drops. Reproduce locally:
+**Coverage gate**: aggregate ≥ 80% across **all** registered modules, excluding sqlc-generated `*/db/` packages (CI uses `--exclude '/db/'` so new sqlc packages auto-skip). Tiered targets in `docs/ARCHITECTURE.md` §9. CI fails `CI Pass` if the threshold drops. `scripts/test coverage` runs the same check. The underlying loop (CI uses the same shape):
 
 ```sh
 profiles=()
