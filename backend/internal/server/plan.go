@@ -238,7 +238,7 @@ func (s *Server) notifyPlanReadyIfReady(r *http.Request, runID uuid.UUID, stage 
 	if !stage.State.IsTerminal() && stage.State != run.StageStateAwaitingApproval {
 		return
 	}
-	s.notifyPlanReady(r, runID, stage)
+	s.notifyPlanReady(r.Context(), runID, stage)
 }
 
 // planResponse is the JSON returned to the runner on plan upload.

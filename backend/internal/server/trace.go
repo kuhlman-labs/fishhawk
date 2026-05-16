@@ -326,7 +326,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// log but don't unwind the upload — the run's plan is already
 	// attached, the stage is already advanced.
 	if stage.Type == run.StageTypePlan {
-		s.notifyPlanReady(r, runID, stage)
+		s.notifyPlanReady(r.Context(), runID, stage)
 	}
 
 	// Sticky status comment (E20.4 / #330). Every terminal stage
@@ -350,13 +350,13 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 //     POST, but defensive against that ordering changing.)
 //   - The notifier itself decides to skip (non-issue-triggered run,
 //     dedup hit).
-func (s *Server) notifyPlanReady(r *http.Request, runID uuid.UUID, stage *run.Stage) {
+func (s *Server) notifyPlanReady(ctx context.Context, runID uuid.UUID, stage *run.Stage) {
 	if s.issueNotifier == nil {
 		return
 	}
-	planArtifact, err := s.loadApprovedPlanForRun(r.Context(), runID)
+	planArtifact, err := s.loadApprovedPlanForRun(ctx, runID)
 	if err != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"plan-ready notify: load plan failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stage.ID.String()),
@@ -374,15 +374,15 @@ func (s *Server) notifyPlanReady(r *http.Request, runID uuid.UUID, stage *run.St
 		// branch fires for an unexpected reason (e.g. the runner's
 		// upload order changed and the plan never lands) the
 		// absence is recoverable from logs instead of silent.
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelDebug,
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
 			"plan-ready notify: no plan artifact yet — will retry on plan-upload hook",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stage.ID.String()),
 		)
 		return
 	}
-	if err := s.issueNotifier.NotifyPlanReady(r.Context(), runID, stage, planArtifact); err != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+	if err := s.issueNotifier.NotifyPlanReady(ctx, runID, stage, planArtifact); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"plan-ready notify: comment-back failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stage.ID.String()),

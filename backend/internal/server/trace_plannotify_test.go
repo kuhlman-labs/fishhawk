@@ -69,7 +69,7 @@ func TestNotifyPlanReady_FiresNotifierOnPlanStageTransition(t *testing.T) {
 	// after advanceStageAfterTrace on plan stages, so this exercises
 	// the same code path without the full multipart upload setup.
 	req := httptest.NewRequest("POST", "/", nil)
-	s.notifyPlanReady(req, r.ID, planStage)
+	s.notifyPlanReady(req.Context(), r.ID, planStage)
 
 	if got := gh.calls(); len(got) != 1 {
 		t.Fatalf("expected 1 GitHub call; got %d", len(got))
@@ -101,7 +101,7 @@ func TestNotifyPlanReady_NoNotifier_NoOp(t *testing.T) {
 	}
 	// Should not panic, should be a no-op.
 	req := httptest.NewRequest("POST", "/", nil)
-	s.notifyPlanReady(req, r.ID, planStage)
+	s.notifyPlanReady(req.Context(), r.ID, planStage)
 }
 
 // TestNotifyPlanReady_RealRunnerOrder_TracePrecedesPlan covers the
@@ -141,7 +141,7 @@ func TestNotifyPlanReady_RealRunnerOrder_TracePrecedesPlan(t *testing.T) {
 	// Step 1: trace lands first (the runner's actual order). The
 	// trace-handler's notify hook fires; no plan artifact exists
 	// yet; we should silently skip without commenting.
-	s.notifyPlanReady(req, r.ID, planStage)
+	s.notifyPlanReady(req.Context(), r.ID, planStage)
 	if got := gh.calls(); len(got) != 0 {
 		t.Fatalf("trace-handler hook commented before plan artifact existed; got %d calls", len(got))
 	}
@@ -263,7 +263,7 @@ func TestNotifyPlanReady_NoPlanArtifact_SkipsCleanly(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("POST", "/", nil)
-	s.notifyPlanReady(req, r.ID, planStage)
+	s.notifyPlanReady(req.Context(), r.ID, planStage)
 
 	if got := gh.calls(); len(got) != 0 {
 		t.Errorf("expected 0 GitHub calls when no plan artifact attached; got %d", len(got))

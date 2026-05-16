@@ -3,7 +3,6 @@ package issuecomment_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -353,6 +351,144 @@ func TestNotifyPlanReady_FullPlanSpec_UpdateOnChange_EditsExistingComment(t *tes
 	_ = json.Unmarshal(au.appended[0].Payload, &pl)
 	if pl["kind"] != string(issuecomment.KindPlanUpdated) {
 		t.Errorf("audit kind = %v, want plan_updated", pl["kind"])
+	}
+}
+
+// TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Approve covers
+// #377: re-fire after a plan-approve writes an `_Status: approved
+// by @x · implementing now_` footer onto the edited plan comment,
+// reading the approver from the audit chain's latest approval row.
+func TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Approve(t *testing.T) {
+	runID := uuid.New()
+	planStageID := uuid.New()
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	// Pre-seed the prior plan comment so notifyFullPlan takes the
+	// edit-in-place path on this call.
+	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{
+		"kind":              string(issuecomment.KindPlanFull),
+		"issue_number":      42,
+		"repo":              "x/y",
+		"github_comment_id": 4242,
+	})
+	// Pre-seed the approval row on the plan stage. notifyFullPlan
+	// reads this via latestPlanApproval and feeds it to the renderer.
+	au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{
+		"stage_id": planStageID.String(),
+		"decision": "approve",
+		"approver": "alice",
+	})
+
+	runs := map[uuid.UUID]*run.Run{runID: {
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     ptrStr("issue:42"),
+		InstallationID: int64Ptr(99),
+		WorkflowSpec:   fullPlanSpecYAML(true),
+	}}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{runs: runs},
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+		Now:         func() time.Time { return time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC) },
+	})
+	planStage := &run.Stage{ID: planStageID, Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
+	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
+		t.Fatalf("NotifyPlanReady: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("approval re-render should edit, not create: %d new comments", len(gh.calls))
+	}
+	if len(gh.updateCalls) != 1 {
+		t.Fatalf("expected 1 edit; got %d", len(gh.updateCalls))
+	}
+	body := gh.updateCalls[0].body
+	if !strings.Contains(body, "_Status: approved by @alice · implementing now_") {
+		t.Errorf("edited body should carry the approval footer; got:\n%s", body)
+	}
+}
+
+// TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Reject covers
+// the reject side of #377: a plan-reject audit row produces the
+// `_Status: rejected by @x_` footer on the next re-render. No
+// reason rendered because v0 doesn't store one on the approval
+// row.
+func TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Reject(t *testing.T) {
+	runID := uuid.New()
+	planStageID := uuid.New()
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{
+		"kind":              string(issuecomment.KindPlanFull),
+		"issue_number":      42,
+		"repo":              "x/y",
+		"github_comment_id": 4243,
+	})
+	au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{
+		"stage_id": planStageID.String(),
+		"decision": "reject",
+		"approver": "bob",
+	})
+
+	runs := map[uuid.UUID]*run.Run{runID: {
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     ptrStr("issue:42"),
+		InstallationID: int64Ptr(99),
+		WorkflowSpec:   fullPlanSpecYAML(true),
+	}}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{runs: runs},
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+		Now:         func() time.Time { return time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC) },
+	})
+	planStage := &run.Stage{ID: planStageID, Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
+	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
+		t.Fatalf("NotifyPlanReady: %v", err)
+	}
+	if len(gh.updateCalls) != 1 {
+		t.Fatalf("expected 1 edit; got %d", len(gh.updateCalls))
+	}
+	body := gh.updateCalls[0].body
+	if !strings.Contains(body, "_Status: rejected by @bob_") {
+		t.Errorf("edited body should carry the reject footer; got:\n%s", body)
+	}
+}
+
+// TestNotifyPlanReady_FullPlanSpec_NoApprovalYet_NoFooter pins the
+// awaiting-approval first-post case: no `approval_submitted` rows
+// for the plan stage → no status footer in the body.
+func TestNotifyPlanReady_FullPlanSpec_NoApprovalYet_NoFooter(t *testing.T) {
+	runID := uuid.New()
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	runs := map[uuid.UUID]*run.Run{runID: {
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     ptrStr("issue:42"),
+		InstallationID: int64Ptr(99),
+		WorkflowSpec:   fullPlanSpecYAML(true),
+	}}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{runs: runs},
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+		Now:         func() time.Time { return time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC) },
+	})
+	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
+	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
+		t.Fatalf("NotifyPlanReady: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	if strings.Contains(body, "_Status:") {
+		t.Errorf("body should NOT carry a status footer pre-approval; got:\n%s", body)
 	}
 }
 
@@ -1199,171 +1335,6 @@ func TestNotify_NilReceiver_NoOp(t *testing.T) {
 	}
 }
 
-// --- NotifyPlanApproved (#274) ---
-
-func TestNotifyPlanApproved_HappyPath_NamesApprover(t *testing.T) {
-	// The whole point of the comment is naming who approved. The
-	// rendered body MUST carry `@<login>` so observers can see who
-	// cleared the gate. Approve-decision-only — reject doesn't fire
-	// here.
-	runID, gh, au, n := happyDeps(t)
-	if err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove); err != nil {
-		t.Fatalf("NotifyPlanApproved: %v", err)
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 GitHub call; got %d", len(gh.calls))
-	}
-	c := gh.calls[0]
-	if !strings.Contains(c.body, "Plan approved by @alice") {
-		t.Errorf("body should name the approver: %q", c.body)
-	}
-	// Regression guard for #305: the @login must NOT be wrapped in
-	// backticks — GitHub only fires a mention notification when the
-	// handle is bare, and a backticked "`@alice`" silently broke that.
-	if strings.Contains(c.body, "`@") {
-		t.Errorf("body must not backtick-wrap the @mention (breaks GitHub notification): %q", c.body)
-	}
-	if !strings.Contains(c.body, "Implementing now") {
-		t.Errorf("body should mention implementing: %q", c.body)
-	}
-	if !strings.Contains(c.body, "View run") {
-		t.Errorf("body should link to the run page: %q", c.body)
-	}
-
-	// Audit entry recorded with kind=plan_approved so the dedup
-	// check on subsequent calls works.
-	if len(au.appended) != 1 {
-		t.Fatalf("expected 1 audit append; got %d", len(au.appended))
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
-		t.Fatalf("decode payload: %v", err)
-	}
-	if payload["kind"] != "plan_approved" {
-		t.Errorf("payload.kind = %v, want plan_approved", payload["kind"])
-	}
-}
-
-func TestNotifyPlanApproved_EmptyApprover_RendersGenericFallback(t *testing.T) {
-	// Empty subject means the HTTP middleware didn't resolve an
-	// identity. Don't render "@" (a stray @ in the body would look
-	// like a broken mention).
-	runID, gh, _, n := happyDeps(t)
-	if err := n.NotifyPlanApproved(context.Background(), runID, "", approval.DecisionApprove); err != nil {
-		t.Fatalf("NotifyPlanApproved: %v", err)
-	}
-	c := gh.calls[0]
-	if !strings.Contains(c.body, "Plan approved by an approver") {
-		t.Errorf("empty subject should fall back to generic wording: %q", c.body)
-	}
-	if strings.Contains(c.body, "@") {
-		t.Errorf("body should not contain a stray @: %q", c.body)
-	}
-}
-
-func TestNotifyPlanApproved_AnonymousApprover_RendersGenericFallback(t *testing.T) {
-	// The HTTP handler stamps "anonymous" when bearer auth doesn't
-	// resolve. Match the empty-string treatment so we never render
-	// `@anonymous` (it's not a real GitHub login and would look like
-	// a broken mention or worse, a real user named "anonymous").
-	runID, gh, _, n := happyDeps(t)
-	if err := n.NotifyPlanApproved(context.Background(), runID, "anonymous", approval.DecisionApprove); err != nil {
-		t.Fatalf("NotifyPlanApproved: %v", err)
-	}
-	c := gh.calls[0]
-	if !strings.Contains(c.body, "Plan approved by an approver") {
-		t.Errorf("anonymous subject should fall back to generic wording: %q", c.body)
-	}
-	if strings.Contains(c.body, "@anonymous") {
-		t.Errorf("body should not surface @anonymous: %q", c.body)
-	}
-}
-
-func TestNotifyPlanApproved_RejectIsNoOp(t *testing.T) {
-	// Reject decisions have their own surfaces (slash reply, the
-	// SPA's dashboard); we don't broadcast them to the issue
-	// thread. The receiver returns nil before touching GitHub.
-	runID, gh, au, n := happyDeps(t)
-	if err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionReject); err != nil {
-		t.Fatalf("NotifyPlanApproved: %v", err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("reject should not post a comment: %d calls", len(gh.calls))
-	}
-	if len(au.appended) != 0 {
-		t.Errorf("reject should not append an audit row: %d", len(au.appended))
-	}
-}
-
-func TestNotifyPlanApproved_DedupsViaAuditLog(t *testing.T) {
-	// A pre-seeded plan_approved audit entry means we already
-	// commented. Re-approve (e.g. idempotent re-submit from the
-	// SPA) should NOT re-post.
-	runID, gh, au, n := happyDeps(t)
-	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{"kind": "plan_approved"})
-
-	if err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove); err != nil {
-		t.Fatalf("NotifyPlanApproved: %v", err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("dedup should skip the GitHub call: %d", len(gh.calls))
-	}
-	if len(au.appended) != 0 {
-		t.Errorf("dedup should skip the audit append: %d", len(au.appended))
-	}
-}
-
-func TestNotifyPlanApproved_SkipsNonIssueTrigger(t *testing.T) {
-	// CLI / UI / PR triggers don't have an originating issue
-	// thread to comment on. Skip cleanly.
-	runID := uuid.New()
-	triggerRef := "cli:operator"
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	repoRuns := &fakeRuns{
-		runs: map[uuid.UUID]*run.Run{runID: {
-			ID:             runID,
-			Repo:           "x/y",
-			WorkflowID:     "feature_change",
-			TriggerSource:  run.TriggerCLI,
-			TriggerRef:     &triggerRef,
-			InstallationID: int64Ptr(99),
-		}},
-	}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: repoRuns, Audit: au,
-		ExternalURL: "https://app.fishhawk.example.com",
-	})
-	if err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove); err != nil {
-		t.Fatalf("NotifyPlanApproved: %v", err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("CLI-triggered run should not comment: %d", len(gh.calls))
-	}
-}
-
-func TestNotifyPlanApproved_GitHubErrorReturned_NoAuditEntry(t *testing.T) {
-	// Comment-side failure surfaces as a non-nil error so the
-	// caller can log + carry on. The audit row is only written
-	// after the comment lands.
-	runID, gh, au, n := happyDeps(t)
-	gh.err = errors.New("github rate-limited")
-	err := n.NotifyPlanApproved(context.Background(), runID, "alice", approval.DecisionApprove)
-	if err == nil {
-		t.Fatal("expected error from GitHub failure")
-	}
-	if len(au.appended) != 0 {
-		t.Errorf("audit entry should not land when the comment fails: %d", len(au.appended))
-	}
-}
-
-func TestNotifyPlanApproved_NilReceiver_NoOp(t *testing.T) {
-	var n *issuecomment.Notifier // nil
-	if err := n.NotifyPlanApproved(context.Background(), uuid.New(), "alice", approval.DecisionApprove); err != nil {
-		t.Errorf("nil receiver should be a no-op; got %v", err)
-	}
-}
-
 // --- helpers ---
 
 func int64Ptr(v int64) *int64 { return &v }
@@ -1462,6 +1433,19 @@ func (f *fakeAudit) preSeed(runID uuid.UUID, category string, payload map[string
 	r := runID
 	f.preSeeds = append(f.preSeeds, &audit.Entry{
 		ID: uuid.New(), RunID: &r, Category: category, Payload: body,
+	})
+}
+
+// preSeedWithStage is the stage-scoped variant — needed for
+// approval rows since the plan-status renderer reads stage_id.
+func (f *fakeAudit) preSeedWithStage(runID, stageID uuid.UUID, category string, payload map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	body, _ := json.Marshal(payload)
+	r := runID
+	s := stageID
+	f.preSeeds = append(f.preSeeds, &audit.Entry{
+		ID: uuid.New(), RunID: &r, StageID: &s, Category: category, Payload: body,
 	})
 }
 

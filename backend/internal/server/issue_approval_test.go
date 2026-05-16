@@ -23,7 +23,7 @@ import (
 // repos; swaps in a recording GitHub commenter so reply text can
 // be asserted on.
 
-func TestHandleApprovalCommand_PlanApprove_PostsOnlyBroadcast(t *testing.T) {
+func TestHandleApprovalCommand_PlanApprove_PostsSlashReplyAndStatus(t *testing.T) {
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
 	r.TriggerSource = run.TriggerGitHubIssue
@@ -78,27 +78,36 @@ func TestHandleApprovalCommand_PlanApprove_PostsOnlyBroadcast(t *testing.T) {
 		t.Errorf("approver = %q, want alice", ar.all[0].ApproverSubject)
 	}
 
-	// Two comments expected: the plan-approved broadcast (#274) and
-	// the sticky-status seed (E20.4 / #330). The redundant slash
-	// reply is suppressed on the plan-approve path (#304) so the
-	// issue thread sees a single canonical broadcast confirmation
-	// plus the live-status comment.
+	// Two comments expected: the per-sender slash reply
+	// (#377 unsuppressed it once the redundant broadcast went away)
+	// plus the sticky-status seed (E20.4 / #330). The slash reply
+	// names the approver + the stage + the run id so the actor
+	// gets a typed-command confirmation; the status comment carries
+	// the live run state for everyone else watching.
 	got := gh.calls()
-	broadcast, status := splitBroadcastAndStatus(got)
-	if broadcast == "" {
-		t.Fatalf("expected a plan-approved broadcast comment; got bodies %v", commentBodies(got))
+	if len(got) != 2 {
+		t.Fatalf("expected 2 comments (slash reply + status); got %d bodies %v", len(got), commentBodies(got))
+	}
+	var reply, status string
+	for _, c := range got {
+		if strings.HasPrefix(c.body, "Approved by ") {
+			reply = c.body
+		} else if strings.Contains(c.body, "Fishhawk run") {
+			status = c.body
+		}
+	}
+	if reply == "" {
+		t.Fatalf("expected a slash success reply; got bodies %v", commentBodies(got))
 	}
 	if status == "" {
 		t.Fatalf("expected a sticky-status comment; got bodies %v", commentBodies(got))
 	}
-	if !strings.Contains(broadcast, "@alice") {
-		t.Errorf("plan-approved broadcast should mention approver: %q", broadcast)
+	if !strings.Contains(reply, "@alice") {
+		t.Errorf("slash reply should mention approver: %q", reply)
 	}
-	// Regression guard for #305: the @login must NOT be wrapped in
-	// backticks — GitHub only fires a mention notification when the
-	// handle is bare.
-	if strings.Contains(broadcast, "`@") {
-		t.Errorf("plan-approved broadcast must not backtick-wrap the @mention (breaks GitHub notification): %q", broadcast)
+	// Regression guard for #305: the @login must not be backticked.
+	if strings.Contains(reply, "`@") {
+		t.Errorf("slash reply must not backtick-wrap the @mention: %q", reply)
 	}
 }
 
@@ -676,8 +685,14 @@ func TestHandleApprovalCommand_SlashCommand_NoAwaitingStage_StillReplies(t *test
 // E17.4 / #339 happy path end-to-end: an authorized reviewer types
 // "+1" → the matcher (E17.3) routes Source=reply_comment →
 // HandleApprovalCommand writes the approval with
-// SurfaceGitHubReplyComment, advances the stage, fires the
-// NotifyPlanApproved broadcast, and posts NO inline reply.
+// SurfaceGitHubReplyComment, advances the stage, and posts NO
+// inline slash reply because the typed `+1` is the user's
+// confirmation. After #377, no plan-approved broadcast is posted
+// either — the plan-comment edit (when a plan comment exists)
+// carries the new approval state in its footer; the sticky-status
+// comment surfaces it in the activity feed. In this fixture no
+// plan artifact is seeded, so the plan-comment refire silent-skips
+// and only the sticky-status seed comment fires.
 func TestHandleApprovalCommand_ReplyComment_HappyPath(t *testing.T) {
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
@@ -736,18 +751,17 @@ func TestHandleApprovalCommand_ReplyComment_HappyPath(t *testing.T) {
 		t.Errorf("decision = %q", got.Decision)
 	}
 
-	// Exactly one comment expected: the NotifyPlanApproved
-	// broadcast. The per-call success reply is suppressed for the
-	// reply path (would echo "Approved" back at a "+1", which is
-	// noise), AND the sticky-status seed comment fires too. So
-	// two GitHub calls total — broadcast + status seed.
+	// Only the sticky-status seed fires here: the per-call slash
+	// reply is suppressed on the reply path (would echo "Approved"
+	// back at a "+1"), the plan-approved broadcast was retired
+	// (#377), and no plan artifact is seeded so the plan-comment
+	// refire silent-skips.
 	calls := gh.calls()
-	broadcast, status := splitBroadcastAndStatus(calls)
-	if broadcast == "" {
-		t.Errorf("expected plan-approved broadcast; got bodies %v", commentBodies(calls))
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 comment (sticky status only); got %d bodies %v", len(calls), commentBodies(calls))
 	}
-	if status == "" {
-		t.Errorf("expected sticky-status comment; got bodies %v", commentBodies(calls))
+	if !strings.Contains(calls[0].body, "Fishhawk run") {
+		t.Errorf("expected sticky-status comment; got %q", calls[0].body)
 	}
 	for _, c := range calls {
 		if strings.HasPrefix(c.body, "Approved by ") {
