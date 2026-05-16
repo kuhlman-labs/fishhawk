@@ -15,11 +15,11 @@
 // helper avoids spreading that code through both call sites.
 //
 // Idempotency: every successful post writes an `issue_commented`
-// chained audit entry with `payload.kind ∈ {pickup, plan}`. Before
-// each post we read back the run's audit log and skip if a matching
-// row already exists. Audit-log dedup matches the integrity story —
-// "we said we did it" lives next to "we did it" — and survives
-// process restarts.
+// chained audit entry with `payload.kind` naming the kind (plan,
+// plan_approved, etc.). Before each post we read back the run's
+// audit log and skip if a matching row already exists. Audit-log
+// dedup matches the integrity story — "we said we did it" lives
+// next to "we did it" — and survives process restarts.
 //
 // What this package does NOT do:
 //   - Comment on PR-triggered or CLI-triggered runs. The trigger
@@ -77,7 +77,6 @@ type Kind string
 
 // Kind values.
 const (
-	KindPickup       Kind = "pickup"
 	KindPlan         Kind = "plan"
 	KindPlanApproved Kind = "plan_approved"
 	// KindCIRetry tags a comment posted when the dispatcher fires a
@@ -146,7 +145,7 @@ type Deps struct {
 }
 
 // New returns a Notifier. Returns nil when the deps don't add up to
-// a working notifier so callers can `notifier.NotifyPickup(...)`
+// a working notifier so callers can `notifier.NotifyPlanReady(...)`
 // without nil-checking the receiver — the methods short-circuit on
 // a nil receiver.
 //
@@ -168,34 +167,6 @@ func New(d Deps) *Notifier {
 		externalURL: strings.TrimRight(d.ExternalURL, "/"),
 		now:         now,
 	}
-}
-
-// NotifyPickup posts the pickup-acknowledgment comment for an issue-
-// triggered run. Best-effort: returns errors so callers can log
-// them, but a comment failure should NOT unwind the dispatch — the
-// run is in the DB and the user can navigate without the comment.
-//
-// Skips silently when:
-//   - The receiver is nil.
-//   - The run isn't issue-triggered (CLI / PR / etc.).
-//   - The run is missing installation_id, parseable repo, or a
-//     decodable issue number.
-//   - A pickup comment already landed for this run (audit-log
-//     dedup).
-//
-// `senderLogin` is the GitHub login of the user who fired the
-// trigger (labeled the issue, etc.). Empty is fine — the comment
-// just won't include the "Triggered by @x" line.
-func (n *Notifier) NotifyPickup(ctx context.Context, runID uuid.UUID, senderLogin string) error {
-	if n == nil {
-		return nil
-	}
-	ctxv, ok, err := n.contextFor(ctx, runID, KindPickup)
-	if err != nil || !ok {
-		return err
-	}
-	body := renderPickupBody(ctxv, senderLogin)
-	return n.post(ctx, ctxv, KindPickup, body)
 }
 
 // NotifyPlanReady posts the plan-ready comment after the plan stage
@@ -896,7 +867,7 @@ type SlashApprovalReply struct {
 
 // NotifySlashApprovalReply posts a reply comment to a /fishhawk
 // approve or /fishhawk reject command (#238). Unlike
-// NotifyPickup / NotifyPlanReady, replies are NOT deduped — every
+// NotifyPlanReady / NotifyPlanApproved, replies are NOT deduped — every
 // command attempt should produce its own reply, even if the
 // reviewer fires the same command twice. The reply is fire-and-
 // forget for the slash-command handler: a failure here logs but
@@ -1021,25 +992,6 @@ func (n *Notifier) post(ctx context.Context, ctxv commentContext, kind Kind, bod
 		return fmt.Errorf("issuecomment: audit append: %w", err)
 	}
 	return nil
-}
-
-func renderPickupBody(c commentContext, senderLogin string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Fishhawk picked this up — Run [`%s`](%s) started.\n\n",
-		shortID(c.run.ID), c.runURL)
-	fmt.Fprintf(&b, "Workflow: `%s`", c.run.WorkflowID)
-	switch {
-	case validApproverLogin(senderLogin):
-		// Bare @login (no backticks) so GitHub renders a real mention
-		// — the labeler gets a notification and the handle autolinks.
-		fmt.Fprintf(&b, " · Triggered by @%s", senderLogin)
-	case senderLogin != "":
-		// "anonymous" or other non-displayable subjects fall through to
-		// a generic phrase rather than leaking `@anonymous`.
-		b.WriteString(" · Triggered by an actor")
-	}
-	b.WriteString("\n")
-	return b.String()
 }
 
 func renderPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, externalURL string) string {
