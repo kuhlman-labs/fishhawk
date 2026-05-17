@@ -57,6 +57,9 @@ type fakeGitHub struct {
 	updateIssueCommentStatus int
 	updateIssueCommentBody   string
 
+	listReactionsStatus int
+	listReactionsBody   string
+
 	getWorkflowRunStatus int
 	getWorkflowRunBody   string
 
@@ -97,6 +100,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		createIssueCommentBody:    `{"id":11111}`,
 		updateIssueCommentStatus:  http.StatusOK,
 		updateIssueCommentBody:    `{"id":11111,"body":"edited body","html_url":"https://github.com/x/y/issues/17#issuecomment-11111"}`,
+		listReactionsStatus:       http.StatusOK,
+		listReactionsBody:         `[]`,
 		getWorkflowRunStatus:      http.StatusOK,
 		getWorkflowRunBody:        `{"id":987654321,"html_url":"https://github.com/x/y/actions/runs/987654321","conclusion":"failure","status":"completed","event":"workflow_dispatch","head_branch":"main","head_sha":"abc","inputs":{"stage_id":"22222222-2222-2222-2222-222222222222","run_id":"11111111-1111-1111-1111-111111111111"}}`,
 		getBranchProtectionStatus: http.StatusOK,
@@ -233,6 +238,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.getPullRequestStatus)
 			if fg.getPullRequestBody != "" {
 				_, _ = io.WriteString(w, fg.getPullRequestBody)
+			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/comments/{id}/reactions",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.listReactionsStatus)
+			if fg.listReactionsBody != "" {
+				_, _ = io.WriteString(w, fg.listReactionsBody)
 			}
 		})
 
@@ -1455,6 +1470,66 @@ func TestGetPullRequest_ValidationErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := c.GetPullRequest(context.Background(), 1, tc.repo, tc.prNumber)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestListIssueCommentReactions_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listReactionsBody = `[
+		{"id":1,"content":"+1","user":{"login":"alice"}},
+		{"id":2,"content":"rocket","user":{"login":"bob"}}
+	]`
+
+	c, _ := newTestClient(t, srv, nil)
+	got, err := c.ListIssueCommentReactions(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 4242)
+	if err != nil {
+		t.Fatalf("ListIssueCommentReactions: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 reactions; got %d", len(got))
+	}
+	if got[0].Content != ReactPlusOne || got[0].User.Login != "alice" {
+		t.Errorf("got[0] = %+v", got[0])
+	}
+	if got[1].Content != ReactRocket || got[1].User.Login != "bob" {
+		t.Errorf("got[1] = %+v", got[1])
+	}
+	if !strings.Contains(fg.gotPath, "/issues/comments/4242/reactions") {
+		t.Errorf("path = %q, want comment-id 4242", fg.gotPath)
+	}
+}
+
+func TestListIssueCommentReactions_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listReactionsStatus = http.StatusNotFound
+	fg.listReactionsBody = `{"message":"Not Found"}`
+
+	c, _ := newTestClient(t, srv, nil)
+	_, err := c.ListIssueCommentReactions(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 4242)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestListIssueCommentReactions_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		commentID int64
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, 1, "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, 1, "owner and name"},
+		{"zero comment id", RepoRef{Owner: "x", Name: "y"}, 0, "comment id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.ListIssueCommentReactions(context.Background(), 1, tc.repo, tc.commentID)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}

@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -80,6 +81,18 @@ func runServe(args []string, logSink io.Writer) int {
 	dispatchWatchdogInterval := fs.Duration("dispatch-watchdog-interval",
 		60*time.Second,
 		"dispatch watchdog scan interval")
+	enableReactionPoller := fs.Bool("enable-reaction-poller",
+		envOr("FISHHAWKD_ENABLE_REACTION_POLLER", "false") == "true",
+		"start the reaction-polling worker (#360); polls Fishhawk plan comments for approval-shaped reactions GitHub doesn't deliver via webhooks. Off by default — only useful when there's a GitHub App + audit repo wired")
+	reactionPollerFastInterval := fs.Duration("reaction-poller-fast-interval",
+		reactionpoller.DefaultFastInterval,
+		"fast-tier cadence for the reaction poller — applies to plan comments younger than --reaction-poller-age-threshold")
+	reactionPollerSlowInterval := fs.Duration("reaction-poller-slow-interval",
+		reactionpoller.DefaultSlowInterval,
+		"slow-tier cadence for the reaction poller — applies to plan comments older than --reaction-poller-age-threshold")
+	reactionPollerAgeThreshold := fs.Duration("reaction-poller-age-threshold",
+		reactionpoller.DefaultAgeThreshold,
+		"plan-comment age at which the reaction poller switches from fast to slow cadence")
 	oidcAudience := fs.String("oidc-audience",
 		envOr("FISHHAWKD_OIDC_AUDIENCE", ""),
 		"GitHub Actions OIDC audience the signing-key endpoint requires; when set, callers must present a valid id_token whose aud matches this value")
@@ -395,6 +408,40 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Info("dispatch watchdog started",
 				slog.Duration("interval", *dispatchWatchdogInterval),
 				slog.Duration("timeout", *dispatchWatchdogTimeout))
+		}
+	}
+
+	// Reaction-polling worker (#360). Catches the 👍-as-approval
+	// path GitHub doesn't deliver via webhooks. Off by default; on
+	// requires RunRepo + AuditRepo + a GitHub client + a server
+	// implementing the approval handler. Same fall-through posture
+	// as the SLA / dispatch watchdog tickers.
+	if *enableReactionPoller {
+		switch {
+		case cfg.RunRepo == nil || cfg.AuditRepo == nil:
+			logger.Warn("--enable-reaction-poller set but RunRepo or AuditRepo unconfigured; ticker not started")
+		case cfg.GitHub == nil:
+			logger.Warn("--enable-reaction-poller set but GitHub client unconfigured (no app id?); ticker not started")
+		default:
+			ticker := &reactionpoller.Ticker{
+				Runs:         cfg.RunRepo,
+				Audit:        cfg.AuditRepo,
+				Reactions:    cfg.GitHub,
+				Approvals:    srv,
+				Logger:       logger,
+				FastInterval: *reactionPollerFastInterval,
+				SlowInterval: *reactionPollerSlowInterval,
+				AgeThreshold: *reactionPollerAgeThreshold,
+			}
+			go func() {
+				if err := ticker.Run(ctx); err != nil {
+					logger.Error("reaction poller exited with error", slog.String("error", err.Error()))
+				}
+			}()
+			logger.Info("reaction poller started",
+				slog.Duration("fast_interval", *reactionPollerFastInterval),
+				slog.Duration("slow_interval", *reactionPollerSlowInterval),
+				slog.Duration("age_threshold", *reactionPollerAgeThreshold))
 		}
 	}
 
