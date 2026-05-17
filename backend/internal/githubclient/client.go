@@ -1206,6 +1206,95 @@ func (c *Client) CreateCheckRun(ctx context.Context, installationID int64, repo 
 	return &CreateCheckRunResult{ID: out.ID, HTMLURL: out.HTMLURL}, nil
 }
 
+// IssueCommentReaction is the subset of GitHub's reaction payload
+// Fishhawk reads from
+// `GET /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions`.
+// Used by the reaction-polling worker (#360) to catch
+// 👍-as-approval without polling the PR or replying in text.
+type IssueCommentReaction struct {
+	ID      int64                 `json:"id"`
+	Content IssueCommentReactKind `json:"content"`
+	User    struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// IssueCommentReactKind is the closed set GitHub uses for the
+// `content` field on a reaction. Spelled "+1" / "-1" rather than
+// "thumbs_up" because that's GitHub's wire format.
+type IssueCommentReactKind string
+
+// IssueCommentReactKind values.
+const (
+	ReactPlusOne  IssueCommentReactKind = "+1"
+	ReactMinusOne IssueCommentReactKind = "-1"
+	ReactLaugh    IssueCommentReactKind = "laugh"
+	ReactConfused IssueCommentReactKind = "confused"
+	ReactHeart    IssueCommentReactKind = "heart"
+	ReactHooray   IssueCommentReactKind = "hooray"
+	ReactRocket   IssueCommentReactKind = "rocket"
+	ReactEyes     IssueCommentReactKind = "eyes"
+)
+
+// ListIssueCommentReactions returns every reaction on an issue
+// comment (#360).
+//
+//	GET /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions
+//
+// The endpoint is paginated (30 per page default). v0's polling
+// worker walks pages until the response is short of a full page —
+// reactions accumulate slowly on a plan comment so the all-pages
+// fetch is cheap.
+//
+// Returns ErrNotFound when the comment was deleted, ErrForbidden
+// when the installation lacks `issues:read` (covered by the
+// existing `issues:write` scope; this is a defensive check).
+func (c *Client) ListIssueCommentReactions(ctx context.Context, installationID int64, repo RepoRef, commentID int64) ([]IssueCommentReaction, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if commentID <= 0 {
+		return nil, errors.New("githubclient: comment id must be > 0")
+	}
+
+	out := []IssueCommentReaction{}
+	const perPage = 100
+	for page := 1; ; page++ {
+		endpoint := fmt.Sprintf(
+			"%s/repos/%s/%s/issues/comments/%d/reactions?per_page=%d&page=%d",
+			c.endpoint(""), url.PathEscape(repo.Owner), url.PathEscape(repo.Name), commentID, perPage, page,
+		)
+		req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("githubclient: list reactions: %w", err)
+		}
+		closeErr := classifyStatus("list issue comment reactions", resp)
+		if closeErr != nil {
+			_ = resp.Body.Close()
+			return nil, closeErr
+		}
+		var batch []IssueCommentReaction
+		if err := json.NewDecoder(resp.Body).Decode(&batch); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("githubclient: decode reactions: %w", err)
+		}
+		_ = resp.Body.Close()
+		out = append(out, batch...)
+		if len(batch) < perPage {
+			break
+		}
+	}
+	return out, nil
+}
+
 // buildRequest constructs an http.Request with the standard
 // GitHub headers (auth, accept, version). Centralized so every
 // call site uses the same shape.

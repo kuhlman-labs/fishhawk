@@ -16,6 +16,11 @@ it.
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
 
 Notes:
+- The reaction-polling worker (#360) is a *read-side* concern that reads
+  Fishhawk-posted plan comments rather than writing new surfaces; it records
+  observed reactions under the separate `plan_reaction_observed` audit
+  category and forwards approval-shaped reactions through the same handler
+  the typed-reply path uses. Not a surface in its own right.
 - The plan-on-issue full surface chooses between create + edit by reading the
   most-recent `plan_full` or `plan_updated` row in the run's audit log
   (`findPlanCommentID`). 404 on edit (operator deleted the comment) falls

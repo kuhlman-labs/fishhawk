@@ -52,6 +52,14 @@ const (
 	// (E17.3 / #338): `+1`, `👍`, `lgtm`, etc. as a fresh comment
 	// on the issue thread. No explicit slash, no required prefix.
 	ApprovalSourceReplyComment ApprovalSource = "reply_comment"
+	// ApprovalSourceReactionEmoji tags the reaction-polling path
+	// (#360): the operator clicked an approval-shaped reaction
+	// (👍 / ❤️ / 🎉 / 🚀) on a Fishhawk plan comment. Reactions
+	// don't fire webhooks so the reactionpoller worker discovers
+	// them on a cadence. Same downstream handling as
+	// ApprovalSourceReplyComment — silent skip when no awaiting
+	// plan stage matches.
+	ApprovalSourceReactionEmoji ApprovalSource = "reaction_emoji"
 )
 
 // CommentApprove and CommentReject are the chat-style commands that
