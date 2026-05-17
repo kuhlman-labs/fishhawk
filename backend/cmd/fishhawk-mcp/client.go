@@ -110,6 +110,67 @@ func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return &r, nil
 }
 
+// createRunRequest mirrors the backend's `POST /v0/runs` request body
+// (`backend/internal/server/runs.go::createRunRequest`). Repeated here
+// rather than imported because the MCP server's apiClient is
+// deliberately a thin local copy — the import-direction rule is
+// `cli → backend`, not the other way around, and the same applies
+// to this binary.
+type createRunRequest struct {
+	Repo          string  `json:"repo"`
+	WorkflowID    string  `json:"workflow_id"`
+	WorkflowSHA   string  `json:"workflow_sha"`
+	TriggerSource string  `json:"trigger_source"`
+	TriggerRef    *string `json:"trigger_ref,omitempty"`
+}
+
+// StartRunParams is the typed input the apiClient takes for run
+// creation. `IdempotencyKey` is optional and travels in the HTTP
+// header per the backend's E8.2 contract — when set, a previously-
+// created run with the same `(repo, key)` returns 200 instead of a
+// fresh 201.
+type StartRunParams struct {
+	Repo           string
+	WorkflowID     string
+	WorkflowSHA    string
+	TriggerSource  string
+	TriggerRef     string
+	IdempotencyKey string
+}
+
+// StartRun creates a new run. Returns the created (or replayed) run
+// plus an `idempotent` flag indicating whether the backend served
+// 200 (replay against an existing run) versus 201 (fresh). 4xx
+// surfaces as *apiError; the MCP tool layer reads the code field to
+// translate validation errors into clean tool errors.
+func (c *apiClient) StartRun(ctx context.Context, p StartRunParams) (*Run, bool, error) {
+	req := createRunRequest{
+		Repo:          p.Repo,
+		WorkflowID:    p.WorkflowID,
+		WorkflowSHA:   p.WorkflowSHA,
+		TriggerSource: p.TriggerSource,
+	}
+	if p.TriggerRef != "" {
+		ref := p.TriggerRef
+		req.TriggerRef = &ref
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal start_run: %w", err)
+	}
+	headers := map[string]string{}
+	if p.IdempotencyKey != "" {
+		headers["Idempotency-Key"] = p.IdempotencyKey
+	}
+	var run Run
+	status, err := c.doWithStatus(ctx, http.MethodPost, "/v0/runs", body, headers, &run)
+	if err != nil {
+		return nil, false, err
+	}
+	// 200 = idempotent replay; 201 = newly created. Both are success.
+	return &run, status == http.StatusOK, nil
+}
+
 // Stage mirrors the wire shape. The fields cover both get_plan's
 // "find the plan stage" use case and get_run_status's "tell me
 // what's happening" view: type/state for the lifecycle, sequence
@@ -309,12 +370,24 @@ func (c *apiClient) ListRuns(ctx context.Context, f listRunsFilter) (*listRunsRe
 	return &res, nil
 }
 
-// do performs the request and decodes the JSON body into out. On
-// non-2xx the body is parsed as the OpenAPI error envelope and
-// returned as *apiError. Same posture as the CLI's httpclient.do.
+// do is the no-extra-headers wrapper around doWithStatus that
+// discards the response status code. Most readers only need to
+// know that the call succeeded; the StartRun path needs the 200
+// vs 201 distinction (idempotent replay vs fresh create) so it
+// reaches for doWithStatus directly.
 func (c *apiClient) do(ctx context.Context, method, path string, body []byte, out any) error {
+	_, err := c.doWithStatus(ctx, method, path, body, nil, out)
+	return err
+}
+
+// doWithStatus performs the request and decodes the JSON body into
+// out. On non-2xx the body is parsed as the OpenAPI error envelope
+// and returned as *apiError. `extraHeaders` is merged into the
+// request — used for E8.2's Idempotency-Key on POST /v0/runs. Same
+// posture as the CLI's httpclient.do.
+func (c *apiClient) doWithStatus(ctx context.Context, method, path string, body []byte, extraHeaders map[string]string, out any) (int, error) {
 	if c.baseURL == "" {
-		return errors.New("apiClient: baseURL not set")
+		return 0, errors.New("apiClient: baseURL not set")
 	}
 	var rdr io.Reader
 	if body != nil {
@@ -322,7 +395,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte, ou
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return 0, fmt.Errorf("build request: %w", err)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -331,14 +404,17 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte, ou
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("http: %w", err)
+		return 0, fmt.Errorf("http: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read body: %w", err)
+		return resp.StatusCode, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode >= 400 {
 		ae := &apiError{StatusCode: resp.StatusCode}
@@ -354,13 +430,13 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte, ou
 			ae.Message = env.Error.Message
 			ae.Details = env.Error.Details
 		}
-		return ae
+		return resp.StatusCode, ae
 	}
 	if out == nil {
-		return nil
+		return resp.StatusCode, nil
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return resp.StatusCode, fmt.Errorf("decode response: %w", err)
 	}
-	return nil
+	return resp.StatusCode, nil
 }

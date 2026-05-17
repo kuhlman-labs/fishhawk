@@ -32,6 +32,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerGetPlan(srv, resolver)
 	registerGetRunStatus(srv, resolver)
 	registerListAudit(srv, resolver)
+	registerStartRun(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All
@@ -593,4 +594,101 @@ func (r *runResolver) findMostRecent(ctx context.Context, f listRunsFilter) (*Ru
 		return items[i].CreatedAt.After(items[j].CreatedAt)
 	})
 	return &items[0], nil
+}
+
+// validStartRunTriggerSources mirrors `server/runs.go::validTriggerSources`.
+// Kept narrow because the MCP tool sets a sensible default; agents
+// passing a bad value get a clean tool error before the HTTP call.
+var validStartRunTriggerSources = map[string]struct{}{
+	"github_issue": {},
+	"cli":          {},
+	"ui":           {},
+}
+
+// StartRunInput is the fishhawk_start_run tool's input schema
+// (E22.1 / #390). Mirrors `POST /v0/runs`'s body shape so an
+// operator running Claude Code can mint a run without dropping to
+// the CLI. trigger_source defaults to "cli" when omitted because
+// that's the dominant case for an operator-driven MCP call.
+type StartRunInput struct {
+	Repo           string `json:"repo" jsonschema:"GitHub repo as owner/name; the workflow spec must live at .fishhawk/workflows.yaml in this repo"`
+	WorkflowID     string `json:"workflow_id" jsonschema:"workflow key in .fishhawk/workflows.yaml (e.g. 'feature_change')"`
+	WorkflowSHA    string `json:"workflow_sha" jsonschema:"blob SHA of the spec file at the trigger ref; pin this to a known-good revision"`
+	TriggerSource  string `json:"trigger_source,omitempty" jsonschema:"one of 'cli', 'github_issue', 'ui'; defaults to 'cli' when omitted"`
+	TriggerRef     string `json:"trigger_ref,omitempty" jsonschema:"optional reference (e.g. 'issue:42') threading the run to its trigger"`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"E8.2 idempotency token; a second call with the same (repo, key) returns the existing run with Idempotent=true instead of fresh-creating"`
+}
+
+// StartRunOutput is the response shape. Run is the canonical Run
+// row. Idempotent is true when the backend returned 200 against an
+// existing run for the same (repo, idempotency_key) — clients that
+// react to "fresh run" (e.g. notify a Slack channel) can branch on
+// the flag.
+type StartRunOutput struct {
+	Run        Run  `json:"run"`
+	Idempotent bool `json:"idempotent" jsonschema:"true when this call replayed against an existing run via Idempotency-Key; false on fresh create"`
+}
+
+// registerStartRun wires the fishhawk_start_run tool (E22.1 / #390).
+// Mirrors the CLI's `fishhawk run start`. Operator-side flow: the
+// agent constructs the spec ref + sha (today via direct repo
+// inspection; future via a get_workflow_spec helper that lives
+// outside v0 scope), then calls this to mint the run.
+//
+// Auth: this is a write tool. Operator-side fhk_* tokens with
+// scope `write:runs` will succeed; runner-side fhm_* tokens (per
+// the bearer middleware's prefix routing) will surface a 403 as a
+// tool error.
+func registerStartRun(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_start_run",
+		Description: strings.TrimSpace(`
+Create a new Fishhawk run.
+
+Mirrors the CLI's "fishhawk run start" verb. The new run is created
+in pending state and dispatched immediately via the existing
+workflow_dispatch path (when the dispatcher is wired) or by the
+in-flight local-runner mode (per #389's Phase C).
+
+Idempotency: when idempotency_key is set, a previously-created run
+with the same (repo, key) returns 200 with Idempotent=true instead
+of fresh-creating a duplicate. Re-running this call after a network
+hiccup is safe.
+
+Returns the canonical Run row + an Idempotent flag.
+`),
+	}, resolver.startRun)
+}
+
+// startRun is the tool handler.
+func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in StartRunInput) (*mcp.CallToolResult, StartRunOutput, error) {
+	if in.Repo == "" {
+		return nil, StartRunOutput{}, errors.New("repo is required (owner/name)")
+	}
+	if in.WorkflowID == "" {
+		return nil, StartRunOutput{}, errors.New("workflow_id is required")
+	}
+	if in.WorkflowSHA == "" {
+		return nil, StartRunOutput{}, errors.New("workflow_sha is required")
+	}
+	triggerSource := in.TriggerSource
+	if triggerSource == "" {
+		triggerSource = "cli"
+	}
+	if _, ok := validStartRunTriggerSources[triggerSource]; !ok {
+		return nil, StartRunOutput{}, fmt.Errorf("trigger_source %q is not one of cli, github_issue, ui", triggerSource)
+	}
+
+	created, idempotent, err := r.api.StartRun(ctx, StartRunParams{
+		Repo:           in.Repo,
+		WorkflowID:     in.WorkflowID,
+		WorkflowSHA:    in.WorkflowSHA,
+		TriggerSource:  triggerSource,
+		TriggerRef:     in.TriggerRef,
+		IdempotencyKey: in.IdempotencyKey,
+	})
+	if err != nil {
+		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)
+	}
+	return nil, StartRunOutput{Run: *created, Idempotent: idempotent}, nil
 }

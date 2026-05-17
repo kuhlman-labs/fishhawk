@@ -62,6 +62,24 @@ type fakeBackend struct {
 	perRunAuditNextByRun     map[uuid.UUID]string
 	perRunAuditStatus        int
 	perRunAuditLastQueryByID map[uuid.UUID]string
+
+	// E22.1 fixtures: POST /v0/runs.
+	// createRunBody captures the last decoded request body so tests
+	// can assert what fields were sent.
+	// createRunIdempKey captures the last Idempotency-Key header.
+	// createRunResp drives the response Run when set; the fake
+	// allocates a fresh UUID when CreateRunResp.ID is empty so the
+	// dominant test pattern doesn't have to seed it.
+	// createRunStatus drives the HTTP status code returned (default
+	// 201 Created; tests overriding to 200 simulate the idempotent-
+	// replay path).
+	// createRunErrBody, when set, is written verbatim as the
+	// response body — used to drive 4xx error-envelope tests.
+	createRunBody     createRunRequest
+	createRunIdempKey string
+	createRunResp     Run
+	createRunStatus   int
+	createRunErrBody  string
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -84,8 +102,39 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		perRunAuditByRun:         map[uuid.UUID][]AuditEntry{},
 		perRunAuditNextByRun:     map[uuid.UUID]string{},
 		perRunAuditLastQueryByID: map[uuid.UUID]string{},
+		createRunStatus:          http.StatusCreated,
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body createRunRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.createRunBody = body
+		fb.createRunIdempKey = r.Header.Get("Idempotency-Key")
+		status := fb.createRunStatus
+		errBody := fb.createRunErrBody
+		resp := fb.createRunResp
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if resp.ID == "" {
+			resp.ID = uuid.NewString()
+		}
+		if resp.Repo == "" {
+			resp.Repo = body.Repo
+		}
+		if resp.WorkflowID == "" {
+			resp.WorkflowID = body.WorkflowID
+		}
+		if resp.State == "" {
+			resp.State = "pending"
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
 	mux.HandleFunc("GET /v0/runs", func(w http.ResponseWriter, r *http.Request) {
 		fb.mu.Lock()
 		fb.lastListQuery = r.URL.RawQuery
@@ -1198,5 +1247,172 @@ func TestClampListAuditLimit(t *testing.T) {
 		if got := clampListAuditLimit(tc.in); got != tc.want {
 			t.Errorf("clampListAuditLimit(%d) = %d, want %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+// --- fishhawk_start_run (E22.1 / #390) ---
+
+func TestStartRun_HappyPath_PostsBodyReturnsRun(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, out, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:          "x/y",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: "cli",
+		TriggerRef:    "issue:42",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if out.Run.ID == "" {
+		t.Errorf("Run.ID empty; expected the fake to allocate one")
+	}
+	if out.Run.Repo != "x/y" || out.Run.WorkflowID != "feature_change" || out.Run.State != "pending" {
+		t.Errorf("Run = %+v, want repo=x/y workflow=feature_change state=pending", out.Run)
+	}
+	if out.Idempotent {
+		t.Errorf("Idempotent = true, want false (fresh create returns 201)")
+	}
+	// Backend received the right body.
+	if fb.createRunBody.Repo != "x/y" {
+		t.Errorf("backend got Repo = %q", fb.createRunBody.Repo)
+	}
+	if fb.createRunBody.WorkflowSHA != "deadbeef" {
+		t.Errorf("backend got WorkflowSHA = %q", fb.createRunBody.WorkflowSHA)
+	}
+	if fb.createRunBody.TriggerSource != "cli" {
+		t.Errorf("backend got TriggerSource = %q", fb.createRunBody.TriggerSource)
+	}
+	if fb.createRunBody.TriggerRef == nil || *fb.createRunBody.TriggerRef != "issue:42" {
+		t.Errorf("backend got TriggerRef = %+v, want pointer to 'issue:42'", fb.createRunBody.TriggerRef)
+	}
+	if fb.createRunIdempKey != "" {
+		t.Errorf("Idempotency-Key set without input: %q", fb.createRunIdempKey)
+	}
+}
+
+func TestStartRun_TriggerSourceDefault_CLI(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:        "x/y",
+		WorkflowID:  "feature_change",
+		WorkflowSHA: "deadbeef",
+		// TriggerSource omitted — defaults to "cli"
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.TriggerSource != "cli" {
+		t.Errorf("default TriggerSource = %q, want cli", fb.createRunBody.TriggerSource)
+	}
+}
+
+func TestStartRun_IdempotencyKey_SetsHeader(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:           "x/y",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef",
+		TriggerSource:  "cli",
+		IdempotencyKey: "abc-123",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunIdempKey != "abc-123" {
+		t.Errorf("Idempotency-Key header = %q, want abc-123", fb.createRunIdempKey)
+	}
+}
+
+func TestStartRun_IdempotentReplay_FlagsTrue(t *testing.T) {
+	// Backend returns 200 (instead of 201) to signal idempotent
+	// replay. The MCP tool surfaces this on the Idempotent output
+	// field so callers can branch.
+	fb, srv := newFakeBackend(t)
+	fb.createRunStatus = http.StatusOK
+	r := newResolver(srv, nil)
+
+	_, out, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:           "x/y",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef",
+		TriggerSource:  "cli",
+		IdempotencyKey: "abc-123",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if !out.Idempotent {
+		t.Errorf("Idempotent = false, want true (backend served 200)")
+	}
+}
+
+func TestStartRun_BackendValidationError_PropagatesAsToolError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createRunStatus = http.StatusBadRequest
+	fb.createRunErrBody = `{"error":{"code":"validation_failed","message":"repo is required","details":{"field":"repo"}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:          "x/y", // input passes our local validation
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: "cli",
+	})
+	if err == nil {
+		t.Fatal("expected error from backend 400; got nil")
+	}
+	// Backend's typed error code should bubble through the wrap.
+	if !strings.Contains(err.Error(), "validation_failed") {
+		t.Errorf("err = %v, want it to mention validation_failed", err)
+	}
+}
+
+func TestStartRun_LocalValidationCatchesBadInputs(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	cases := []struct {
+		name string
+		in   StartRunInput
+		want string
+	}{
+		{
+			name: "missing repo",
+			in:   StartRunInput{WorkflowID: "x", WorkflowSHA: "y", TriggerSource: "cli"},
+			want: "repo is required",
+		},
+		{
+			name: "missing workflow_id",
+			in:   StartRunInput{Repo: "x/y", WorkflowSHA: "y", TriggerSource: "cli"},
+			want: "workflow_id is required",
+		},
+		{
+			name: "missing workflow_sha",
+			in:   StartRunInput{Repo: "x/y", WorkflowID: "x", TriggerSource: "cli"},
+			want: "workflow_sha is required",
+		},
+		{
+			name: "bad trigger_source",
+			in:   StartRunInput{Repo: "x/y", WorkflowID: "x", WorkflowSHA: "y", TriggerSource: "bogus"},
+			want: "trigger_source",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := r.startRun(context.Background(), nil, tc.in)
+			if err == nil {
+				t.Fatalf("expected validation error for %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want substring %q", err, tc.want)
+			}
+		})
 	}
 }
