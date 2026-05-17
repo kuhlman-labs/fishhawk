@@ -80,6 +80,20 @@ type fakeBackend struct {
 	createRunResp     Run
 	createRunStatus   int
 	createRunErrBody  string
+
+	// E22.2 fixtures: POST /v0/runs/{id}/cancel.
+	// cancelResp lets a test seed the post-cancel Run body. When
+	// empty the fake echoes the run from getRunByID (if seeded) or
+	// builds a minimal Run with State="cancelled".
+	// cancelStatus drives the HTTP status code (default 200).
+	// cancelErrBody, when set, is written verbatim as the response
+	// body so tests can drive the 404 / 409 paths.
+	// cancelCalledByID counts cancel calls per run id for idempotency
+	// / dedup tests.
+	cancelResp       map[uuid.UUID]Run
+	cancelStatus     int
+	cancelErrBody    string
+	cancelCalledByID map[uuid.UUID]int
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -103,8 +117,34 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		perRunAuditNextByRun:     map[uuid.UUID]string{},
 		perRunAuditLastQueryByID: map[uuid.UUID]string{},
 		createRunStatus:          http.StatusCreated,
+		cancelResp:               map[uuid.UUID]Run{},
+		cancelStatus:             http.StatusOK,
+		cancelCalledByID:         map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.cancelCalledByID[id]++
+		status := fb.cancelStatus
+		errBody := fb.cancelErrBody
+		resp, ok := fb.cancelResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = Run{ID: id.String(), State: "cancelled"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
 	mux.HandleFunc("POST /v0/runs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		var body createRunRequest
@@ -1414,5 +1454,103 @@ func TestStartRun_LocalValidationCatchesBadInputs(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// --- fishhawk_cancel_run (E22.2 / #391) ---
+
+func TestCancelRun_HappyPath_TransitionsToCancelled(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled", Repo: "x/y"}
+
+	_, out, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("cancelRun: %v", err)
+	}
+	if out.Run.State != "cancelled" {
+		t.Errorf("State = %q, want cancelled", out.Run.State)
+	}
+	if out.Run.ID != runID.String() {
+		t.Errorf("ID = %q, want %s", out.Run.ID, runID.String())
+	}
+	if fb.cancelCalledByID[runID] != 1 {
+		t.Errorf("cancel called %d times, want 1", fb.cancelCalledByID[runID])
+	}
+}
+
+func TestCancelRun_InvalidUUID_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: "not-a-uuid"})
+	if err == nil {
+		t.Fatal("expected validation error for bad UUID")
+	}
+	if !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("err = %v, want UUID parse error", err)
+	}
+	// The backend was never called — invalid UUID short-circuits.
+	if len(fb.cancelCalledByID) != 0 {
+		t.Errorf("backend cancel called %d times, want 0 (local validation should short-circuit)", len(fb.cancelCalledByID))
+	}
+}
+
+func TestCancelRun_NotFound_PropagatesAsToolError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.cancelStatus = http.StatusNotFound
+	fb.cancelErrBody = `{"error":{"code":"run_not_found","message":"no run with that id"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("expected error from backend 404; got nil")
+	}
+	if !strings.Contains(err.Error(), "run_not_found") {
+		t.Errorf("err = %v, want it to mention run_not_found", err)
+	}
+}
+
+func TestCancelRun_AlreadyTerminal_PropagatesConflict(t *testing.T) {
+	// Cancelling a run that's already terminal (succeeded / failed)
+	// surfaces the backend's `invalid_state_transition` code as a
+	// tool error. The state machine is the source of truth.
+	fb, srv := newFakeBackend(t)
+	fb.cancelStatus = http.StatusConflict
+	fb.cancelErrBody = `{"error":{"code":"invalid_state_transition","message":"cannot transition succeeded → cancelled","details":{"from":"succeeded","to":"cancelled"}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("expected error from backend 409; got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid_state_transition") {
+		t.Errorf("err = %v, want invalid_state_transition", err)
+	}
+}
+
+func TestCancelRun_Idempotent_ReCancelSucceeds(t *testing.T) {
+	// The backend treats re-cancel as idempotent (200 with the
+	// cancelled run). The MCP tool surfaces both calls' results
+	// without error.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled"}
+
+	_, out1, err1 := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: runID.String()})
+	if err1 != nil {
+		t.Fatalf("first cancel: %v", err1)
+	}
+	_, out2, err2 := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: runID.String()})
+	if err2 != nil {
+		t.Fatalf("second cancel: %v", err2)
+	}
+	if out1.Run.State != "cancelled" || out2.Run.State != "cancelled" {
+		t.Errorf("states = %q/%q, want cancelled/cancelled", out1.Run.State, out2.Run.State)
+	}
+	if fb.cancelCalledByID[runID] != 2 {
+		t.Errorf("cancel called %d times, want 2", fb.cancelCalledByID[runID])
 	}
 }

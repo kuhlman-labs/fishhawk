@@ -33,6 +33,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerGetRunStatus(srv, resolver)
 	registerListAudit(srv, resolver)
 	registerStartRun(srv, resolver)
+	registerCancelRun(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All
@@ -691,4 +692,56 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)
 	}
 	return nil, StartRunOutput{Run: *created, Idempotent: idempotent}, nil
+}
+
+// CancelRunInput is the fishhawk_cancel_run tool's input schema
+// (E22.2 / #391). Mirrors `POST /v0/runs/{run_id}/cancel`.
+type CancelRunInput struct {
+	RunID string `json:"run_id" jsonschema:"the Fishhawk run UUID to cancel"`
+}
+
+// CancelRunOutput surfaces the post-cancel Run row. State should be
+// `cancelled` on success; the rest of the row is unchanged.
+type CancelRunOutput struct {
+	Run Run `json:"run"`
+}
+
+// registerCancelRun wires the fishhawk_cancel_run tool (E22.2 /
+// #391). Idempotent: cancelling an already-cancelled run succeeds.
+// Cancelling a terminally-succeeded / failed run surfaces a clean
+// `invalid_state_transition` tool error from the backend.
+//
+// Auth: write tool. Operator-side fhk_* tokens with `write:runs`
+// scope succeed; runner-side fhm_* tokens surface 403 as a tool
+// error.
+func registerCancelRun(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_cancel_run",
+		Description: strings.TrimSpace(`
+Cancel a Fishhawk run.
+
+Mirrors the CLI's "fishhawk run cancel" verb. Transitions the run to
+the cancelled state via the existing state-machine rules.
+
+Idempotent on re-cancel (200 with the cancelled run). Returns a
+clean tool error on:
+  - invalid UUID (caught before the HTTP hop)
+  - run_not_found (404)
+  - invalid_state_transition (409 — the run is already terminal in
+    a non-cancelled state like succeeded / failed)
+`),
+	}, resolver.cancelRun)
+}
+
+// cancelRun is the tool handler.
+func (r *runResolver) cancelRun(ctx context.Context, _ *mcp.CallToolRequest, in CancelRunInput) (*mcp.CallToolResult, CancelRunOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, CancelRunOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+	cancelled, err := r.api.CancelRun(ctx, runID)
+	if err != nil {
+		return nil, CancelRunOutput{}, fmt.Errorf("cancel run: %w", err)
+	}
+	return nil, CancelRunOutput{Run: *cancelled}, nil
 }
