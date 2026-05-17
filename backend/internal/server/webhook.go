@@ -106,14 +106,19 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// `check_run` events update the gate's blocking-check states
-	// (#228). Distinct from the dispatcher path: those events
+	// (#228) AND re-fire the implement-stage policy evaluator's
+	// `ci_green` signal (#300). The two consumers run sequentially:
+	// ingestCheckRun first so the stage_checks row is written; then
+	// reevaluateCIPolicy reads the fresh state to compute the
+	// aggregate. Distinct from the dispatcher path — those events
 	// don't trigger runs, they update existing ones. Best-effort
-	// — per-row failures inside ingestCheckRun log but don't
+	// — per-row failures inside either consumer log but don't
 	// surface as a 5xx, since the audit log keeps the canonical
 	// trail and a missed delivery just leaves the SPA showing
 	// stale state until the next event.
 	if ev.Type == "check_run" {
 		s.ingestCheckRun(r.Context(), ev.RawBody)
+		s.reevaluateCIPolicy(r.Context(), ev.RawBody)
 	}
 
 	// `pull_request.synchronize` fires whenever the PR's head_sha
