@@ -138,6 +138,20 @@ type StartRunParams struct {
 	IdempotencyKey string
 }
 
+// CancelRun transitions a run to the cancelled state via
+// `POST /v0/runs/{run_id}/cancel`. Idempotent: cancelling an already-
+// cancelled run returns 200 with the same body. 4xx surfaces:
+//   - 404 run_not_found
+//   - 409 invalid_state_transition (the run is already terminal in a
+//     non-cancelled state, e.g. succeeded / failed)
+func (c *apiClient) CancelRun(ctx context.Context, id uuid.UUID) (*Run, error) {
+	var r Run
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+id.String()+"/cancel", nil, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
 // StartRun creates a new run. Returns the created (or replayed) run
 // plus an `idempotent` flag indicating whether the backend served
 // 200 (replay against an existing run) versus 201 (fresh). 4xx
