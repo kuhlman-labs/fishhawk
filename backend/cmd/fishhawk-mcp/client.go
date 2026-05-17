@@ -138,6 +138,22 @@ type StartRunParams struct {
 	IdempotencyKey string
 }
 
+// RetryStage re-fires a failed stage via
+// `POST /v0/stages/{stage_id}/retry`. Returns the updated Stage row
+// (failed → pending → dispatched for category A/C; failed →
+// awaiting_approval for category-D SLA-timeout). 4xx surfaces:
+//   - 404 stage_not_found
+//   - 422 retry_not_applicable (category B / gate-rejected D — the
+//     workflow or spec needs to change first; a fresh run is the
+//     right next step)
+func (c *apiClient) RetryStage(ctx context.Context, id uuid.UUID) (*Stage, error) {
+	var s Stage
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+id.String()+"/retry", nil, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 // CancelRun transitions a run to the cancelled state via
 // `POST /v0/runs/{run_id}/cancel`. Idempotent: cancelling an already-
 // cancelled run returns 200 with the same body. 4xx surfaces:

@@ -34,6 +34,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerListAudit(srv, resolver)
 	registerStartRun(srv, resolver)
 	registerCancelRun(srv, resolver)
+	registerRetryStage(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All
@@ -744,4 +745,72 @@ func (r *runResolver) cancelRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return nil, CancelRunOutput{}, fmt.Errorf("cancel run: %w", err)
 	}
 	return nil, CancelRunOutput{Run: *cancelled}, nil
+}
+
+// RetryStageInput is the fishhawk_retry_stage tool's input schema
+// (E22.3 / #392). Mirrors `POST /v0/stages/{stage_id}/retry`.
+type RetryStageInput struct {
+	StageID string `json:"stage_id" jsonschema:"the Fishhawk stage UUID to retry"`
+}
+
+// RetryStageOutput surfaces the post-retry Stage row. Category-A/C
+// retries land in `pending` (orchestrator advances to dispatched
+// before the response returns); category-D SLA-timeout retries land
+// in `awaiting_approval`. Category-B / gate-rejected don't reach
+// this output — they surface as a tool error from the backend's
+// 422.
+type RetryStageOutput struct {
+	Stage Stage `json:"stage"`
+}
+
+// registerRetryStage wires the fishhawk_retry_stage tool (E22.3 /
+// #392). Mirrors the CLI's `fishhawk run retry <stage-id>`.
+//
+// Per-category retry semantics live in `server/retry.go` /
+// `run.RetryStage`. The MCP tool is a thin wrapper; failures of
+// the form "this category isn't retryable" surface as the
+// backend's `retry_not_applicable` 422 propagated as a tool error.
+//
+// Auth: write tool. Operator-side fhk_* tokens with `write:stages`
+// scope succeed; runner-side fhm_* tokens surface 403.
+func registerRetryStage(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_retry_stage",
+		Description: strings.TrimSpace(`
+Retry a failed Fishhawk stage.
+
+Mirrors the CLI's "fishhawk run retry <stage-id>" verb. The backend's
+state machine decides whether the stage is retryable per its failure
+category:
+
+  - A (agent failure)  : retried — flips failed → pending →
+                         dispatched (orchestrator fires fresh
+                         workflow_dispatch).
+  - B (constraint)     : NOT retryable — the workflow or spec
+                         needs to change first. Surfaces as a
+                         retry_not_applicable tool error.
+  - C (infrastructure) : retried — same flow as A.
+  - D (gate-related)   : depends — SLA timeout retries (flip back
+                         to awaiting_approval), gate-rejected does
+                         not (file a fresh run instead).
+
+Returns the updated Stage row on retry. Returns a tool error on:
+  - invalid UUID (caught before the HTTP hop)
+  - stage_not_found (404)
+  - retry_not_applicable (422)
+`),
+	}, resolver.retryStage)
+}
+
+// retryStage is the tool handler.
+func (r *runResolver) retryStage(ctx context.Context, _ *mcp.CallToolRequest, in RetryStageInput) (*mcp.CallToolResult, RetryStageOutput, error) {
+	stageID, err := uuid.Parse(in.StageID)
+	if err != nil {
+		return nil, RetryStageOutput{}, fmt.Errorf("stage_id %q is not a valid UUID: %w", in.StageID, err)
+	}
+	retried, err := r.api.RetryStage(ctx, stageID)
+	if err != nil {
+		return nil, RetryStageOutput{}, fmt.Errorf("retry stage: %w", err)
+	}
+	return nil, RetryStageOutput{Stage: *retried}, nil
 }

@@ -94,6 +94,20 @@ type fakeBackend struct {
 	cancelStatus     int
 	cancelErrBody    string
 	cancelCalledByID map[uuid.UUID]int
+
+	// E22.3 fixtures: POST /v0/stages/{id}/retry.
+	// retryResp seeds the post-retry Stage body keyed by stage id;
+	// when not seeded the fake builds a minimal Stage with
+	// State="pending" (the dominant category-A/C outcome).
+	// retryStatus drives the HTTP status code (default 200).
+	// retryErrBody, when set, is written verbatim — used for the
+	// 404 / 422 error-path tests.
+	// retryCalledByID counts retry calls per stage id so tests can
+	// verify short-circuits.
+	retryResp       map[uuid.UUID]Stage
+	retryStatus     int
+	retryErrBody    string
+	retryCalledByID map[uuid.UUID]int
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -120,8 +134,34 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		cancelResp:               map[uuid.UUID]Run{},
 		cancelStatus:             http.StatusOK,
 		cancelCalledByID:         map[uuid.UUID]int{},
+		retryResp:                map[uuid.UUID]Stage{},
+		retryStatus:              http.StatusOK,
+		retryCalledByID:          map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.retryCalledByID[id]++
+		status := fb.retryStatus
+		errBody := fb.retryErrBody
+		resp, ok := fb.retryResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = Stage{ID: id.String(), State: "pending"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
 	mux.HandleFunc("POST /v0/runs/{run_id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		id, perr := uuid.Parse(r.PathValue("run_id"))
@@ -1552,5 +1592,111 @@ func TestCancelRun_Idempotent_ReCancelSucceeds(t *testing.T) {
 	}
 	if fb.cancelCalledByID[runID] != 2 {
 		t.Errorf("cancel called %d times, want 2", fb.cancelCalledByID[runID])
+	}
+}
+
+// --- fishhawk_retry_stage (E22.3 / #392) ---
+
+func TestRetryStage_HappyPath_CategoryA_PendingTransition(t *testing.T) {
+	// Category-A retry (agent failure): backend flips failed →
+	// pending and the orchestrator advances it. Test fixture
+	// returns a Stage in State="pending" (the orchestrator advance
+	// is a backend-internal concern).
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.retryResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "pending",
+	}
+
+	_, out, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: stageID.String()})
+	if err != nil {
+		t.Fatalf("retryStage: %v", err)
+	}
+	if out.Stage.State != "pending" {
+		t.Errorf("State = %q, want pending", out.Stage.State)
+	}
+	if out.Stage.ID != stageID.String() {
+		t.Errorf("ID = %q, want %s", out.Stage.ID, stageID.String())
+	}
+	if fb.retryCalledByID[stageID] != 1 {
+		t.Errorf("retry called %d times, want 1", fb.retryCalledByID[stageID])
+	}
+}
+
+func TestRetryStage_HappyPath_CategoryD_SLATimeout_BackToAwaitingApproval(t *testing.T) {
+	// Category-D SLA-timeout retry flips the stage back to
+	// awaiting_approval (no workflow_dispatch, just re-opens the
+	// gate). Backend returns the stage in that state.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	fb.retryResp[stageID] = Stage{
+		ID:    stageID.String(),
+		Type:  "plan",
+		State: "awaiting_approval",
+	}
+
+	_, out, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: stageID.String()})
+	if err != nil {
+		t.Fatalf("retryStage: %v", err)
+	}
+	if out.Stage.State != "awaiting_approval" {
+		t.Errorf("State = %q, want awaiting_approval", out.Stage.State)
+	}
+}
+
+func TestRetryStage_InvalidUUID_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: "not-a-uuid"})
+	if err == nil {
+		t.Fatal("expected validation error for bad UUID")
+	}
+	if !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("err = %v, want UUID parse error", err)
+	}
+	// Local validation short-circuits — backend never called.
+	if len(fb.retryCalledByID) != 0 {
+		t.Errorf("backend retry called %d times, want 0", len(fb.retryCalledByID))
+	}
+}
+
+func TestRetryStage_NotFound_PropagatesAsToolError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.retryStatus = http.StatusNotFound
+	fb.retryErrBody = `{"error":{"code":"stage_not_found","message":"no stage with that id"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("expected error from backend 404; got nil")
+	}
+	if !strings.Contains(err.Error(), "stage_not_found") {
+		t.Errorf("err = %v, want it to mention stage_not_found", err)
+	}
+}
+
+func TestRetryStage_NotApplicable_CategoryB_PropagatesAs422(t *testing.T) {
+	// Category-B (constraint / policy) retries are explicitly NOT
+	// applicable — the workflow or spec needs to change first. The
+	// backend surfaces this as a 422 with code retry_not_applicable;
+	// the MCP tool propagates the error envelope verbatim.
+	fb, srv := newFakeBackend(t)
+	fb.retryStatus = http.StatusUnprocessableEntity
+	fb.retryErrBody = `{"error":{"code":"retry_not_applicable","message":"category B failures require a workflow change"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("expected error from backend 422; got nil")
+	}
+	if !strings.Contains(err.Error(), "retry_not_applicable") {
+		t.Errorf("err = %v, want retry_not_applicable", err)
 	}
 }
