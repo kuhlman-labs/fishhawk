@@ -8,6 +8,10 @@ Implementation: `backend/internal/webhook/dispatcher.go` (`MatchEvent` pure + `D
 
 (#251 / ADR-017) Between spec validation and run-create, `resolveRequiredChecks` calls `githubclient.GetBranchProtection` + `ListRulesetRequiredChecks` and unions the results into `run.RequiredChecksSnapshot{Contexts, Sources}`, persisted to `runs.required_checks_snapshot` (JSONB, migration 0017). No protection covers the target ref → `errNoBranchProtection` → refuse the run with a `webhook dispatch refused: branch protection` WARN log; missing `administration:read` scope → `errProtectionScopeMissing` so the log line names the operator-side fix (re-install per #252). `branch_protection_rule` and `repository_ruleset` webhook events are recognized by `MatchEvent` and skip-with-reason in v0 — the receiver acknowledges so a future cache layer has a path without changing the webhook contract.
 
+## CI policy re-evaluation
+
+(#300) `check_run.completed` events on a Fishhawk-managed PR's required checks re-fire the implement-stage policy evaluator. Runs server-side (`server/policy_reeval.go::reevaluateCIPolicy`, called from `server/webhook.go` after `ingestCheckRun` writes the stage_checks row) so it sees the fresh state. Semantics: per-check completion with audit-row dedup — every event triggers the re-eval; only events that change the aggregate `ci_green` value write a new `policy_evaluated` row. Aggregate rule: `true` when every required check is in the pass bucket, `false` on the first fail-bucket check (failure is decisive; we don't wait for siblings), `nil` while some required checks haven't reported. `fishhawk_audit_complete` is excluded from the aggregate (Fishhawk's own derived check, would circularly depend on the policy eval). The dispatcher's CI-retry path below is a sibling concern that handles the failure-bucket conclusions for follow-up dispatch.
+
 ## CI-failure retry
 
 ### Trigger

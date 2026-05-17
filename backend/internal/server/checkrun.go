@@ -10,9 +10,11 @@ import (
 )
 
 // checkRunPayload is the slice of GitHub's check_run webhook payload
-// the ingester reads. Defined in `server` because v0 only consumes
-// it here; if a second consumer lands we'll lift it into a shared
-// types package. Doc: https://docs.github.com/en/webhooks/webhook-events-and-payloads#check_run
+// the server reads. Used by both ingestCheckRun (writes to
+// stage_checks) and reevaluateCIPolicy (#300). Defined in `server`
+// because both consumers live here; if a third consumer lands
+// elsewhere we'll lift it into a shared types package. Doc:
+// https://docs.github.com/en/webhooks/webhook-events-and-payloads#check_run
 type checkRunPayload struct {
 	Action   string `json:"action"`
 	CheckRun struct {
@@ -27,6 +29,9 @@ type checkRunPayload struct {
 			Number int `json:"number"`
 		} `json:"pull_requests"`
 	} `json:"check_run"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
 }
 
 // ingestCheckRun handles a GitHub `check_run` event by walking the
