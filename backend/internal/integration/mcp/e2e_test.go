@@ -39,6 +39,7 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
@@ -56,6 +57,9 @@ type e2eFixture struct {
 	runID        uuid.UUID
 	signingPriv  ed25519.PrivateKey
 	mcpTokenRepo mcptoken.Repository
+	runRepo      runpkg.Repository
+	apitokenRepo apitoken.Repository
+	operatorTok  string // fhk_* apitoken with the full operator write scopes
 	mcpBinary    string // path to the built fishhawk-mcp binary
 }
 
@@ -104,17 +108,21 @@ func newFixture(t *testing.T) *e2eFixture {
 
 	// 3. Build the real repos + the backend server. SigningRepo,
 	// RunRepo, MCPTokenRepo, AuditRepo are the four the
-	// mcp-token + bearerAuth + tool paths consult.
+	// mcp-token + bearerAuth + tool paths consult. APITokenRepo
+	// is wired so the operator-side write tools (E22 / #389) have
+	// a real authenticator to resolve against.
 	runRepo := runpkg.NewPostgresRepository(pool)
 	signingRepo := signing.NewPostgresRepository(pool)
 	auditRepo := audit.NewPostgresRepository(pool)
 	mcpRepo := mcptoken.NewPostgresRepository(pool)
+	apiRepo := apitoken.NewPostgresRepository(pool)
 	s := server.New(server.Config{
 		Addr:         "127.0.0.1:0",
 		RunRepo:      runRepo,
 		SigningRepo:  signingRepo,
 		AuditRepo:    auditRepo,
 		MCPTokenRepo: mcpRepo,
+		APITokenRepo: apiRepo,
 	})
 	httpSrv := httptest.NewServer(s.Handler())
 	t.Cleanup(httpSrv.Close)
@@ -135,6 +143,17 @@ func newFixture(t *testing.T) *e2eFixture {
 	issued, err := signingRepo.Issue(ctx, r.ID, time.Hour)
 	if err != nil {
 		t.Fatalf("Issue signing key: %v", err)
+	}
+
+	// Issue an operator-side apitoken with the full write scopes
+	// E22's Phase A tools require. Same shape `fishhawkd token
+	// issue` produces in dev.
+	operatorTok, err := apiRepo.Issue(ctx, "brett@e2e-test", []string{
+		"read:runs", "read:audit",
+		"write:runs", "write:approvals", "write:stages",
+	})
+	if err != nil {
+		t.Fatalf("Issue operator apitoken: %v", err)
 	}
 
 	// 5. Build the fishhawk-mcp binary into a temp dir. We use a
@@ -161,6 +180,9 @@ func newFixture(t *testing.T) *e2eFixture {
 		runID:        r.ID,
 		signingPriv:  issued.PrivateKey,
 		mcpTokenRepo: mcpRepo,
+		runRepo:      runRepo,
+		apitokenRepo: apiRepo,
+		operatorTok:  operatorTok.PlainText,
 		mcpBinary:    binary,
 	}
 }
@@ -394,4 +416,91 @@ func isDockerUnavailable(err error) bool {
 		}
 	}
 	return errors.Is(err, exec.ErrNotFound)
+}
+
+// TestE2E_MCPLoop_OperatorWritePath_StartRun covers E22.6's "exercise
+// one write tool end-to-end" acceptance criterion. The flow:
+//
+//  1. Operator-side fhk_* apitoken (with write:runs scope) registers
+//     with the spawned fishhawk-mcp binary via FISHHAWK_API_TOKEN.
+//  2. Calls fishhawk_start_run with valid params.
+//  3. Asserts the backend response carries a fresh run id.
+//  4. Verifies the run row exists in Postgres directly — proves the
+//     MCP → backend → DB write path is intact end-to-end.
+//
+// Distinct from the existing read-only tests (#371) because this is
+// the first time we exercise a write tool through the real MCP
+// binary + real backend + real DB stack.
+func TestE2E_MCPLoop_OperatorWritePath_StartRun(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_start_run",
+		Arguments: map[string]any{
+			"repo":           "kuhlman-labs/fishhawk",
+			"workflow_id":    "feature_change",
+			"workflow_sha":   "deadbeef-mcp-e2e",
+			"trigger_source": "cli",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_start_run: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("tool returned error: %+v", result.Content)
+	}
+
+	// Extract the created run id from the structured output. The
+	// tool surfaces {run: {id, ...}, idempotent} per StartRunOutput.
+	if result.StructuredContent == nil {
+		t.Fatal("tool returned no StructuredContent")
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out struct {
+		Run struct {
+			ID    string `json:"id"`
+			Repo  string `json:"repo"`
+			State string `json:"state"`
+		} `json:"run"`
+		Idempotent bool `json:"idempotent"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode structured output: %v", err)
+	}
+	if out.Run.ID == "" {
+		t.Fatalf("created run has no id; structured output: %s", raw)
+	}
+	if out.Idempotent {
+		t.Errorf("fresh start_run returned Idempotent=true; expected false")
+	}
+	if out.Run.Repo != "kuhlman-labs/fishhawk" {
+		t.Errorf("run.Repo = %q, want kuhlman-labs/fishhawk", out.Run.Repo)
+	}
+	if out.Run.State != "pending" {
+		t.Errorf("run.State = %q, want pending", out.Run.State)
+	}
+
+	// Verify the run actually landed in the DB. Closes the "MCP →
+	// backend → DB" loop end-to-end.
+	createdID, err := uuid.Parse(out.Run.ID)
+	if err != nil {
+		t.Fatalf("created run id %q is not a UUID: %v", out.Run.ID, err)
+	}
+	got, err := fx.runRepo.GetRun(ctx, createdID)
+	if err != nil {
+		t.Fatalf("GetRun for created id: %v", err)
+	}
+	if got.WorkflowID != "feature_change" {
+		t.Errorf("DB row WorkflowID = %q, want feature_change", got.WorkflowID)
+	}
+	if got.WorkflowSHA != "deadbeef-mcp-e2e" {
+		t.Errorf("DB row WorkflowSHA = %q, want deadbeef-mcp-e2e", got.WorkflowSHA)
+	}
 }
