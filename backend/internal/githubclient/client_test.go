@@ -78,6 +78,9 @@ type fakeGitHub struct {
 	graphqlStatus int
 	graphqlBody   string
 
+	getInstallationStatus int
+	getInstallationBody   string
+
 	gotAuth        string
 	gotPath        string
 	gotQuery       string
@@ -114,6 +117,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		getPullRequestBody:        `{"number":42,"node_id":"PR_kwDOABcDEf","state":"open","merged":false,"head":{"sha":"abc123"}}`,
 		graphqlStatus:             http.StatusOK,
 		graphqlBody:               `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
+		getInstallationStatus:     http.StatusOK,
+		getInstallationBody:       `{"id":12345,"app_id":1}`,
 	}
 	mux := http.NewServeMux()
 
@@ -261,6 +266,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			}
 		})
 
+	mux.HandleFunc("GET /repos/{owner}/{repo}/installation",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.getInstallationStatus)
+			if fg.getInstallationBody != "" {
+				_, _ = io.WriteString(w, fg.getInstallationBody)
+			}
+		})
+
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return fg, srv
@@ -274,6 +289,7 @@ func newTestClient(t *testing.T, srv *httptest.Server, tokenErr error) (*Client,
 		BaseURL: srv.URL,
 		Tokens:  stub,
 		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_app_jwt", nil },
 	}, stub
 }
 
@@ -1534,5 +1550,110 @@ func TestListIssueCommentReactions_ValidationErrors(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
 		})
+	}
+}
+
+// --- GetRepoInstallation (#413) ---
+
+func TestGetRepoInstallation_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, stub := newTestClient(t, srv, nil)
+
+	id, err := c.GetRepoInstallation(context.Background(), RepoRef{Owner: "x", Name: "y"})
+	if err != nil {
+		t.Fatalf("GetRepoInstallation: %v", err)
+	}
+	if id != 12345 {
+		t.Errorf("installation id = %d, want 12345", id)
+	}
+	// Must use App JWT, not an installation token. Token() should NOT
+	// be called on the installation-token provider.
+	if stub.installationCalled != 0 {
+		t.Errorf("Token() called with installationID %d; App-JWT path must not use installation tokens",
+			stub.installationCalled)
+	}
+	if fg.gotAuth != "Bearer ghs_app_jwt" {
+		t.Errorf("Authorization = %q, want App JWT", fg.gotAuth)
+	}
+	if fg.gotPath != "/repos/x/y/installation" {
+		t.Errorf("path = %q, want /repos/x/y/installation", fg.gotPath)
+	}
+	if fg.gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", fg.gotMethod)
+	}
+	if fg.gotAcceptHdr != "application/vnd.github+json" {
+		t.Errorf("Accept = %q", fg.gotAcceptHdr)
+	}
+	if fg.gotAPIVersion != "2022-11-28" {
+		t.Errorf("X-GitHub-Api-Version = %q", fg.gotAPIVersion)
+	}
+}
+
+func TestGetRepoInstallation_NotInstalled(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getInstallationStatus = http.StatusNotFound
+	fg.getInstallationBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetRepoInstallation(context.Background(), RepoRef{Owner: "x", Name: "y"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, ErrNotInstalled) {
+		t.Errorf("err = %v, want ErrNotInstalled", err)
+	}
+	// ErrNotInstalled must NOT be ErrNotFound — callers switch on both.
+	if errors.Is(err, ErrNotFound) {
+		t.Errorf("ErrNotInstalled must be distinct from ErrNotFound; err = %v", err)
+	}
+}
+
+func TestGetRepoInstallation_OtherError(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getInstallationStatus = http.StatusInternalServerError
+	fg.getInstallationBody = `{"message":"upstream timeout"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetRepoInstallation(context.Background(), RepoRef{Owner: "x", Name: "y"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("err = %v, want status code 500 in message", err)
+	}
+	if errors.Is(err, ErrNotInstalled) {
+		t.Errorf("non-404 must not become ErrNotInstalled; err = %v", err)
+	}
+}
+
+func TestGetRepoInstallation_ValidationErrors(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, "owner and name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.GetRepoInstallation(context.Background(), tc.repo)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestGetRepoInstallation_NoAppJWT(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+	c.AppJWT = nil // remove the AppJWT configured by newTestClient
+
+	_, err := c.GetRepoInstallation(context.Background(), RepoRef{Owner: "x", Name: "y"})
+	if err == nil || !strings.Contains(err.Error(), "AppJWT") {
+		t.Errorf("err = %v, want AppJWT-not-configured error", err)
 	}
 }

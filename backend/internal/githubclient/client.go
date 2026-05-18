@@ -50,6 +50,11 @@ var (
 	// ErrValidation means GitHub rejected the request as malformed
 	// (422). Typical: bad ref name, missing required input.
 	ErrValidation = errors.New("githubclient: validation failed")
+	// ErrNotInstalled means the GitHub App is not installed on the
+	// target repo (GET /repos/{owner}/{repo}/installation returned
+	// 404). Distinct from ErrNotFound so callers can surface a
+	// precise user-facing error instead of a generic "not found".
+	ErrNotInstalled = errors.New("githubclient: app not installed on repo")
 )
 
 // RepoRef identifies a GitHub repository by owner + name.
@@ -82,6 +87,13 @@ type Client struct {
 
 	// HTTP is the underlying client. Defaults applied by New.
 	HTTP *http.Client
+
+	// AppJWT, when non-nil, returns a fresh App-level JWT for
+	// endpoints that authenticate as the GitHub App itself rather
+	// than as an installation (e.g. GetRepoInstallation). In
+	// production this wraps githubapp.Signer.Sign(0); tests inject
+	// a stub that returns a fixed string.
+	AppJWT func() (string, error)
 }
 
 // New returns a Client with sensible defaults. tokens is required;
@@ -1293,6 +1305,76 @@ func (c *Client) ListIssueCommentReactions(ctx context.Context, installationID i
 		}
 	}
 	return out, nil
+}
+
+// GetRepoInstallation returns the GitHub App's installation ID for
+// the given repo. Requires the App JWT (not an installation token)
+// because the endpoint is App-level, not installation-level.
+//
+//	GET /repos/{owner}/{repo}/installation
+//
+// Returns ErrNotInstalled when the App is not installed on the repo
+// (GitHub returns 404 for that case). Returns a wrapped error with
+// the HTTP status code for other non-2xx responses.
+func (c *Client) GetRepoInstallation(ctx context.Context, repo RepoRef) (int64, error) {
+	if repo.Owner == "" || repo.Name == "" {
+		return 0, errors.New("githubclient: repo owner and name required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/installation")
+
+	req, err := c.buildAppJWTRequest(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("githubclient: get repo installation: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		body := readBriefBody(resp.Body)
+		return 0, fmt.Errorf("%w: %s", ErrNotInstalled, body)
+	}
+	if err := classifyStatus("get repo installation", resp); err != nil {
+		return 0, err
+	}
+
+	var body struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return 0, fmt.Errorf("githubclient: decode installation: %w", err)
+	}
+	if body.ID == 0 {
+		return 0, errors.New("githubclient: installation response missing id")
+	}
+	return body.ID, nil
+}
+
+// buildAppJWTRequest constructs an http.Request authenticated as the
+// GitHub App itself (App JWT). Used for endpoints that require App-level
+// auth rather than installation-level auth (e.g. GetRepoInstallation).
+func (c *Client) buildAppJWTRequest(ctx context.Context, method, rawURL string, body io.Reader) (*http.Request, error) {
+	if c.AppJWT == nil {
+		return nil, errors.New("githubclient: AppJWT not configured for App-level requests")
+	}
+	jwt, err := c.AppJWT()
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: get app jwt: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	return req, nil
 }
 
 // buildRequest constructs an http.Request with the standard
