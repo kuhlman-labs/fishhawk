@@ -2134,3 +2134,183 @@ func TestRun_ImplementStage_PassesAgentAuthoredPRTitle(t *testing.T) {
 		t.Errorf("shipped artifact title = %v, want agent-authored", got)
 	}
 }
+
+// --- Local-runner mode (E22.8 / #406) ---
+
+func TestRun_ImplementStage_NoPRFlag_SkipsPushAndOpen(t *testing.T) {
+	// Local-runner mode: --no-pr makes the implement stage finish
+	// after the trace upload. No push, no PR open, no
+	// pull_request artifact shipped. Working tree stays dirty for
+	// the operator to commit themselves.
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: "22222222-3333-4444-5555-666666666666", StageType: "implement",
+		Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--upload-trace",
+		"--no-pr",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if fp.gotArgs != nil {
+		t.Errorf("CommitAndPush should not be called under --no-pr; got %+v", fp.gotArgs)
+	}
+	if fpr.gotArgs != nil {
+		t.Errorf("OpenPR should not be called under --no-pr; got %+v", fpr.gotArgs)
+	}
+	if fu.gotPRArgs != nil {
+		t.Errorf("ShipPullRequest should not be called under --no-pr; got %+v", fu.gotPRArgs)
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_pr_skipped"`) {
+		t.Errorf("missing implement_pr_skipped log line:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"reason":"no_pr_flag"`) {
+		t.Errorf("skip line missing reason:\n%s", stderr.String())
+	}
+}
+
+func TestRun_ImplementStage_GithubRepoFlag_OverridesEnv(t *testing.T) {
+	// --github-repo flag takes precedence over GITHUB_REPOSITORY env.
+	// Confirms the local-runner path (where the env isn't set) can
+	// substitute via the flag without disturbing GHA mode (where
+	// the env IS set; flag takes precedence when both present).
+	implementEnv(t, "wrong/repo", "wrong-branch")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: "22222222-3333-4444-5555-666666666666", StageType: "implement",
+		Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--upload-trace",
+		"--github-repo", "kuhlman-labs/fishhawk",
+		"--base-branch", "main",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR not called")
+	}
+	if fpr.gotArgs.Owner != "kuhlman-labs" || fpr.gotArgs.Repo != "fishhawk" {
+		t.Errorf("owner/repo = %q/%q, want flag-derived values", fpr.gotArgs.Owner, fpr.gotArgs.Repo)
+	}
+	if fpr.gotArgs.Base != "main" {
+		t.Errorf("base = %q, want flag-derived 'main'", fpr.gotArgs.Base)
+	}
+}
+
+func TestRun_ImplementStage_NoEnv_FlagsCarryEnoughInfo(t *testing.T) {
+	// Local-runner posture: GITHUB_REPOSITORY / GITHUB_REF_NAME
+	// are unset (operator workstation, not GHA). The flags alone
+	// should be enough.
+	t.Setenv("GITHUB_REPOSITORY", "")
+	t.Setenv("GITHUB_REF_NAME", "")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: "22222222-3333-4444-5555-666666666666", StageType: "implement",
+		Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--upload-trace",
+		"--github-repo", "operator/scratch",
+		"--base-branch", "develop",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR not called")
+	}
+	if fpr.gotArgs.Owner != "operator" || fpr.gotArgs.Repo != "scratch" {
+		t.Errorf("owner/repo = %q/%q, want operator/scratch", fpr.gotArgs.Owner, fpr.gotArgs.Repo)
+	}
+	if fpr.gotArgs.Base != "develop" {
+		t.Errorf("base = %q, want develop", fpr.gotArgs.Base)
+	}
+}
+
+func TestParseFlags_LocalRunnerFields(t *testing.T) {
+	// Direct test of parseFlags so the new fields are exercised
+	// without spinning up the full agent loop.
+	var out strings.Builder
+	cfg, err := parseFlags([]string{
+		"--run-id", "1",
+		"--backend-url", "https://x",
+		"--workflow", "w",
+		"--stage", "s",
+		"--github-repo", "owner/repo",
+		"--base-branch", "release",
+		"--no-pr",
+	}, &out)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if cfg.githubRepo != "owner/repo" {
+		t.Errorf("githubRepo = %q", cfg.githubRepo)
+	}
+	if cfg.baseBranch != "release" {
+		t.Errorf("baseBranch = %q", cfg.baseBranch)
+	}
+	if !cfg.noPR {
+		t.Errorf("noPR = %v, want true", cfg.noPR)
+	}
+}
+
+func TestParseFlags_LocalRunnerFields_DefaultsEmpty(t *testing.T) {
+	// Existing callers without the new flags get the GHA-equivalent
+	// defaults: flag empty → fall back to env on the implement-stage
+	// read path.
+	var out strings.Builder
+	cfg, err := parseFlags([]string{
+		"--run-id", "1",
+		"--backend-url", "https://x",
+		"--workflow", "w",
+		"--stage", "s",
+	}, &out)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if cfg.githubRepo != "" || cfg.baseBranch != "" || cfg.noPR {
+		t.Errorf("local-runner fields not zero-valued: %+v", cfg)
+	}
+}
