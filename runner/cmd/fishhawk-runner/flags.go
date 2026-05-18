@@ -34,6 +34,21 @@ type config struct {
 	uploadTrace     bool
 	stageID         string
 	fetchPrompt     bool
+
+	// Local-runner mode (E22.8 / #406). The runner's GHA-specific
+	// assumptions are narrow — `GITHUB_REPOSITORY` and
+	// `GITHUB_REF_NAME` env vars on the implement-stage push path.
+	// These flags substitute for the env vars when the runner runs
+	// outside GHA (operator's workstation, future K8s pods, etc.).
+	// Flag-precedence on read: explicit flag > env var > default.
+	//
+	// `noPR`, when true, skips the implement-stage push + PR open
+	// entirely — the trace still uploads, but the working tree
+	// stays dirty for the operator to commit themselves. Default
+	// posture for local-runner dev loops; GHA runs leave it false.
+	githubRepo string
+	baseBranch string
+	noPR       bool
 }
 
 // parseFlags reads args and populates a config. Returns a usage
@@ -76,6 +91,12 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"stage UUID for trace upload (distinct from --stage which is the workflow-spec stage name); required with --upload-trace")
 	fs.BoolVar(&cfg.fetchPrompt, "fetch-prompt", false,
 		"fetch the constructed prompt from --backend-url's /v0/stages/{stage-id}/prompt before invoking the agent; --prompt-file wins when both are set, useful for local replay")
+	fs.StringVar(&cfg.githubRepo, "github-repo", "",
+		"GitHub repo as owner/name for the implement-stage push + PR open path; falls back to GITHUB_REPOSITORY env when empty (E22.8 / #406)")
+	fs.StringVar(&cfg.baseBranch, "base-branch", "",
+		"base branch for the implement-stage PR; falls back to GITHUB_REF_NAME env then to 'main' when both empty")
+	fs.BoolVar(&cfg.noPR, "no-pr", false,
+		"skip the implement-stage git push + PR open; the working tree stays dirty for the operator to commit themselves. Default posture for local-runner dev loops")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err

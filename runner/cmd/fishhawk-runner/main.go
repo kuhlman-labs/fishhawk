@@ -909,6 +909,20 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 		return errors.New("upload: signing key not issued (caller must hoist IssueKey before openPRAndShipArtifact)")
 	}
 
+	// Local-runner mode (E22.8 / #406): --no-pr skips the entire
+	// push + PR-open + artifact-ship chain. The trace has already
+	// uploaded above; the working tree stays dirty for the operator
+	// to commit themselves. Emitting a structured log line so the
+	// audit story is "we deliberately skipped" rather than "we lost
+	// the PR step somewhere."
+	if cfg.noPR {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"implement_pr_skipped","run_id":%q,"stage_id":%q,"reason":"no_pr_flag"}`+"\n",
+			cfg.runID, cfg.stageID,
+		)
+		return nil
+	}
+
 	ctx := context.Background()
 
 	// Always mint a fresh App installation token at this point in
@@ -940,15 +954,27 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 		cfg.runID, cfg.stageID,
 	)
 
-	repoSlug := os.Getenv("GITHUB_REPOSITORY") // "owner/name"
+	// Repo: --github-repo flag > GITHUB_REPOSITORY env. The flag
+	// path is used by local-runner (Phase C of E22 / #389); the env
+	// var stays the GHA-native source. Either way the value is the
+	// canonical "owner/name" form.
+	repoSlug := cfg.githubRepo
 	if repoSlug == "" {
-		return errors.New("upload: GITHUB_REPOSITORY env var is required for implement-stage push + PR")
+		repoSlug = os.Getenv("GITHUB_REPOSITORY")
+	}
+	if repoSlug == "" {
+		return errors.New("upload: --github-repo flag or GITHUB_REPOSITORY env var is required for implement-stage push + PR")
 	}
 	owner, repoName, ok := strings.Cut(repoSlug, "/")
 	if !ok || owner == "" || repoName == "" {
-		return fmt.Errorf("upload: GITHUB_REPOSITORY %q is not owner/name", repoSlug)
+		return fmt.Errorf("upload: github repo %q is not owner/name", repoSlug)
 	}
-	baseRef := os.Getenv("GITHUB_REF_NAME")
+	// Base branch: --base-branch flag > GITHUB_REF_NAME env > "main"
+	// default. Same precedence pattern as the repo lookup above.
+	baseRef := cfg.baseBranch
+	if baseRef == "" {
+		baseRef = os.Getenv("GITHUB_REF_NAME")
+	}
 	if baseRef == "" {
 		baseRef = "main"
 	}
