@@ -296,6 +296,24 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 		return
 	}
 
+	// Local-runner runs skip the GHA dispatcher's
+	// pending → dispatched step (there's no workflow_dispatch fire
+	// to gate on), so the stage arrives here in `pending`. Walk it
+	// through dispatched first so the rest of the chain — which
+	// the state machine forbids from pending — stays uniform.
+	if stage.State == run.StageStatePending {
+		if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
+			run.StageStateDispatched, nil); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"trace upload: transition to dispatched failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()),
+			)
+			return
+		}
+	}
+
 	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
 		run.StageStateRunning, nil); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,

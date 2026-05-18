@@ -147,6 +147,16 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		"--fetch-prompt",
 		"--upload-trace",
 	}
+	// For plan stages, the agent's prompt instructs it to write
+	// the plan to /tmp/fishhawk-plan.json (backend's
+	// prompt.PlanArtifactPath). The runner only validates and
+	// uploads when --plan-out is set; without it the agent
+	// writes the file but the stage never transitions to
+	// awaiting_approval. Mirror the GHA action.yml's default so
+	// the local loop matches.
+	if *stage == "plan" {
+		argv = append(argv, "--plan-out", "/tmp/fishhawk-plan.json")
+	}
 	if repo != "" {
 		argv = append(argv, "--github-repo", repo)
 	}
