@@ -226,9 +226,32 @@ type Run struct {
 	// Legacy rows (created before migration 0024) carry the
 	// migration's column-level default of `github_actions`.
 	RunnerKind string
-	State      State
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// IssueContext caches the triggering GitHub issue's title,
+	// body, url, and number at run-create time (#415). Populated
+	// by the CLI's operator-side `gh issue view` fetch for runs
+	// minted outside the webhook flow — the runs the backend can't
+	// fetch the issue for because they carry no installation_id.
+	// Webhook-dispatched runs leave this nil and fall through to
+	// the existing GitHub fetch path in prompt.fillIssueContext.
+	IssueContext *IssueContext
+	State        State
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// IssueContext is the cached payload from `gh issue view --json
+// title,body,url,number`. Persisted on the run row as JSONB; the
+// prompt builder reads it back into a prompt.Trigger.
+//
+// Fields mirror the GitHub REST API's issue shape; URL is the
+// canonical github.com URL rather than the api.github.com URL so
+// the agent and any rendered surfaces link directly to what humans
+// see.
+type IssueContext struct {
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	URL    string `json:"url"`
+	Number int    `json:"number"`
 }
 
 // RunnerKind enumerates the execution backends Fishhawk supports.

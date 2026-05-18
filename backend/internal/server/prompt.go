@@ -439,18 +439,26 @@ func (s *Server) emitPlanMissingForImplement(ctx context.Context, runID, stageID
 }
 
 // fillIssueContext populates the trigger's IssueTitle, IssueBody,
-// and IssueURL by fetching from GitHub. Best-effort: failure to
-// fetch logs and returns silently — the prompt will fall back to
-// "no issue context provided" which the agent can handle.
+// and IssueURL.
+//
+// Resolution order (#415):
+//  1. The run row's cached IssueContext — present when the CLI
+//     ran `gh issue view` at run-create time and shipped the
+//     payload inline. Used as-is; no GitHub call.
+//  2. The webhook-dispatched path: when the run carries an
+//     installation_id but no cached payload, fetch via GitHub
+//     App token (unchanged behavior).
+//  3. Otherwise leave the title + body empty; the prompt
+//     template falls back to a "URL only" shape the agent can
+//     navigate via its own tools.
 //
 // IssueURL is derived from `repo + IssueNumber` rather than the
 // API response's html_url — the canonical github.com URL is fully
 // determined by those two fields, and avoiding the response
 // dependency means the field is set even on a partial fetch.
 func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRow *run.Run, issueNumber int, trigger *prompt.Trigger) {
-	if runRow.InstallationID == nil {
-		return
-	}
+	// Set the URL up front so any of the three branches below
+	// leave the link-only renderer with a working fallback.
 	repo, err := parseRepoOwnerName(runRow.Repo)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse repo failed",
@@ -460,11 +468,24 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 		)
 		return
 	}
-	// Set the URL up front so the link-only renderer in the
-	// implement prompt has a fallback even when the API call below
-	// fails (App permission flap, issue temporarily inaccessible).
 	trigger.IssueURL = fmt.Sprintf("https://github.com/%s/%s/issues/%d",
 		repo.Owner, repo.Name, issueNumber)
+
+	// Branch 1: operator's `gh` fetch at run-create time
+	// pre-populated the title + body on the row. Prefer this
+	// over a fresh GitHub call so local-runner runs (which lack
+	// an installation_id) get the full prompt context.
+	if runRow.IssueContext != nil {
+		trigger.IssueTitle = runRow.IssueContext.Title
+		trigger.IssueBody = runRow.IssueContext.Body
+		return
+	}
+
+	// Branch 2: webhook-dispatched runs — fetch via the App's
+	// installation token. Unchanged from the pre-#415 behavior.
+	if runRow.InstallationID == nil {
+		return
+	}
 	issue, err := github.GetIssue(ctx, *runRow.InstallationID, repo, issueNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: get issue failed",

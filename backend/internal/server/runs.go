@@ -19,24 +19,35 @@ import (
 // `Run` schema exactly so there's never a translation step between
 // the OpenAPI doc and the wire format.
 type runResponse struct {
-	ID                 uuid.UUID  `json:"id"`
-	Repo               string     `json:"repo"`
-	WorkflowID         string     `json:"workflow_id"`
-	WorkflowSHA        string     `json:"workflow_sha"`
-	TriggerSource      string     `json:"trigger_source"`
-	TriggerRef         *string    `json:"trigger_ref"`
-	State              string     `json:"state"`
-	ParentRunID        *uuid.UUID `json:"parent_run_id,omitempty"`
-	PullRequestURL     *string    `json:"pull_request_url,omitempty"`
-	RetryAttempt       int        `json:"retry_attempt"`
-	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
-	RunnerKind         string     `json:"runner_kind"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID                 uuid.UUID            `json:"id"`
+	Repo               string               `json:"repo"`
+	WorkflowID         string               `json:"workflow_id"`
+	WorkflowSHA        string               `json:"workflow_sha"`
+	TriggerSource      string               `json:"trigger_source"`
+	TriggerRef         *string              `json:"trigger_ref"`
+	State              string               `json:"state"`
+	ParentRunID        *uuid.UUID           `json:"parent_run_id,omitempty"`
+	PullRequestURL     *string              `json:"pull_request_url,omitempty"`
+	RetryAttempt       int                  `json:"retry_attempt"`
+	MaxRetriesSnapshot int                  `json:"max_retries_snapshot"`
+	RunnerKind         string               `json:"runner_kind"`
+	IssueContext       *issueContextPayload `json:"issue_context,omitempty"`
+	CreatedAt          time.Time            `json:"created_at"`
+	UpdatedAt          time.Time            `json:"updated_at"`
+}
+
+// issueContextPayload mirrors run.IssueContext on the wire. Kept
+// distinct from the domain type so a future field change in the
+// store doesn't accidentally leak through the API surface.
+type issueContextPayload struct {
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	URL    string `json:"url"`
+	Number int    `json:"number"`
 }
 
 func toRunResponse(r *run.Run) runResponse {
-	return runResponse{
+	resp := runResponse{
 		ID:                 r.ID,
 		Repo:               r.Repo,
 		WorkflowID:         r.WorkflowID,
@@ -52,6 +63,15 @@ func toRunResponse(r *run.Run) runResponse {
 		CreatedAt:          r.CreatedAt,
 		UpdatedAt:          r.UpdatedAt,
 	}
+	if r.IssueContext != nil {
+		resp.IssueContext = &issueContextPayload{
+			Title:  r.IssueContext.Title,
+			Body:   r.IssueContext.Body,
+			URL:    r.IssueContext.URL,
+			Number: r.IssueContext.Number,
+		}
+	}
+	return resp
 }
 
 // createRunRequest mirrors POST /v0/runs's request body in
@@ -82,6 +102,16 @@ type createRunRequest struct {
 	// the bytes via auto-discovery of `.fishhawk/workflows.yaml`
 	// or the explicit --spec-file flag.
 	WorkflowSpec string `json:"workflow_spec,omitempty"`
+	// IssueContext is the cached payload from the operator's
+	// `gh issue view` for issue-triggered runs minted outside the
+	// webhook flow (#415). The CLI fetches the issue locally and
+	// ships title/body/url/number inline so the prompt builder
+	// has the full context — webhook-dispatched runs leave this
+	// nil and fall through to the existing GitHub-fetch path
+	// inside prompt.fillIssueContext. Only honored when
+	// trigger_source=github_issue; ignored otherwise so the
+	// shape can't be abused to attach prose to non-issue runs.
+	IssueContext *issueContextPayload `json:"issue_context,omitempty"`
 }
 
 // validTriggerSources is the closed set per the workflow-spec and
@@ -142,6 +172,18 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"field": "runner_kind", "got": req.RunnerKind})
 			return
 		}
+	}
+
+	// IssueContext is only meaningful for issue-triggered runs
+	// (#415). Reject the field on non-issue triggers up front so
+	// the shape stays narrow — better a clear 400 now than a
+	// prompt-time surprise when the cached payload turns out to
+	// refer to nothing the prompt template will reference.
+	if req.IssueContext != nil && req.TriggerSource != string(run.TriggerGitHubIssue) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"issue_context is only valid with trigger_source=github_issue",
+			map[string]any{"field": "issue_context", "trigger_source": req.TriggerSource})
+		return
 	}
 
 	// Parse + validate the optional workflow_spec up front (#411).
@@ -225,6 +267,14 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		// path; see dispatcher.createRun).
 		createParams.WorkflowSpec = []byte(req.WorkflowSpec)
 		createParams.MaxRetriesSnapshot = maxRetriesSnap
+	}
+	if req.IssueContext != nil {
+		createParams.IssueContext = &run.IssueContext{
+			Title:  req.IssueContext.Title,
+			Body:   req.IssueContext.Body,
+			URL:    req.IssueContext.URL,
+			Number: req.IssueContext.Number,
+		}
 	}
 	if idempKey != "" {
 		k := idempKey

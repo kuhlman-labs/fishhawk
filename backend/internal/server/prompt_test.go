@@ -292,6 +292,105 @@ func TestGetStagePrompt_GitHubFetchFails_StillReturns200(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_PrefersCachedIssueContext is the #415
+// headline check: when the run row carries a cached IssueContext
+// (operator-side `gh issue view` shipped the payload inline at
+// run-create), the prompt builder reads from it and never calls
+// GitHub. Local-runner runs that have no installation_id depend
+// on this path; webhook flows that DO have installation_id should
+// still prefer the cache when present (cheaper, no rate-limit
+// pressure).
+func TestGetStagePrompt_PrefersCachedIssueContext(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    &triggerRef,
+		// No InstallationID — the local-runner shape. The cache
+		// MUST work without one.
+		IssueContext: &run.IssueContext{
+			Number: 42,
+			Title:  "Cached title",
+			Body:   "Cached body — operator's gh fetched this.",
+			URL:    "https://github.com/kuhlman-labs/example/issues/42",
+		},
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if gh.called {
+		t.Errorf("GetIssue should NOT be called when IssueContext is cached on the run row")
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	// Plan stage renders the issue body verbatim (unlike implement
+	// which links only). Cached body should appear.
+	if !contains(resp.Prompt, "Cached body — operator's gh fetched this.") {
+		t.Errorf("prompt missing cached body:\n%s", resp.Prompt)
+	}
+	if !contains(resp.Prompt, "Cached title") {
+		t.Errorf("prompt missing cached title:\n%s", resp.Prompt)
+	}
+}
+
+// TestGetStagePrompt_CachedIssueContext_PreferredOverGitHubFetch
+// guards the resolution-order invariant: even when InstallationID
+// is set (webhook-dispatched run that ALSO happened to carry
+// inline context — an unlikely cohabitation, but worth pinning),
+// the cache wins and the GitHub fetch is skipped. Prevents a
+// future "let's just always re-fetch" regression.
+func TestGetStagePrompt_CachedIssueContext_PreferredOverGitHubFetch(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	installation := int64(99)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+		IssueContext: &run.IssueContext{
+			Number: 42,
+			Title:  "Cached",
+			Body:   "Cached body",
+		},
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+	// If the GitHub fetch wins (regression), this would clobber
+	// the cache values; the assertions below catch it.
+	gh.issue = &githubclient.Issue{Number: 42, Title: "FROM GITHUB", Body: "FROM GITHUB"}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if gh.called {
+		t.Errorf("GetIssue should NOT be called when cache is populated")
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !contains(resp.Prompt, "Cached body") {
+		t.Errorf("cache should win; prompt missing cached body:\n%s", resp.Prompt)
+	}
+	if contains(resp.Prompt, "FROM GITHUB") {
+		t.Errorf("cache should win; prompt unexpectedly contained GitHub fetch:\n%s", resp.Prompt)
+	}
+}
+
 func TestGetStagePrompt_UnsupportedStageType(t *testing.T) {
 	s, rr, sf, _ := newPromptServer(t)
 	runID := uuid.New()

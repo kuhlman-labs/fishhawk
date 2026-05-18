@@ -60,6 +60,14 @@ type CreateRunParams struct {
 	// explicitly. The backend rejects unknown values at the API
 	// boundary; only callers known to be valid reach the repo.
 	RunnerKind string
+	// IssueContext caches the triggering GitHub issue's title,
+	// body, url, and number on the run row (#415). Set by the API
+	// runs handler when the CLI ships an `issue_context` body
+	// alongside `workflow_spec`; the operator's `gh` CLI is the
+	// source of truth on the local path. Nil for webhook-dispatched
+	// runs and for non-issue triggers — the prompt builder falls
+	// back to the existing GitHub fetch path in those cases.
+	IssueContext *IssueContext
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

@@ -71,20 +71,32 @@ type errorEnvelope struct {
 // Run is the CLI-side projection of the OpenAPI Run schema. Field
 // names + types match the wire shape verbatim.
 type Run struct {
-	ID                 uuid.UUID  `json:"id"`
-	Repo               string     `json:"repo"`
-	WorkflowID         string     `json:"workflow_id"`
-	WorkflowSHA        string     `json:"workflow_sha"`
-	TriggerSource      string     `json:"trigger_source"`
-	TriggerRef         *string    `json:"trigger_ref"`
-	State              string     `json:"state"`
-	ParentRunID        *uuid.UUID `json:"parent_run_id"`
-	PullRequestURL     *string    `json:"pull_request_url"`
-	RetryAttempt       int        `json:"retry_attempt"`
-	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
-	RunnerKind         string     `json:"runner_kind"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID                 uuid.UUID     `json:"id"`
+	Repo               string        `json:"repo"`
+	WorkflowID         string        `json:"workflow_id"`
+	WorkflowSHA        string        `json:"workflow_sha"`
+	TriggerSource      string        `json:"trigger_source"`
+	TriggerRef         *string       `json:"trigger_ref"`
+	State              string        `json:"state"`
+	ParentRunID        *uuid.UUID    `json:"parent_run_id"`
+	PullRequestURL     *string       `json:"pull_request_url"`
+	RetryAttempt       int           `json:"retry_attempt"`
+	MaxRetriesSnapshot int           `json:"max_retries_snapshot"`
+	RunnerKind         string        `json:"runner_kind"`
+	IssueContext       *IssueContext `json:"issue_context,omitempty"`
+	CreatedAt          time.Time     `json:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at"`
+}
+
+// IssueContext mirrors the OpenAPI shape: the GitHub issue payload
+// the CLI fetches via `gh issue view` and ships inline at
+// run-create (#415). Stored on the run row so the prompt builder
+// reads it without needing a backend-side GitHub fetch.
+type IssueContext struct {
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	URL    string `json:"url"`
+	Number int    `json:"number"`
 }
 
 // CreateRunInput is what StartRun marshals into the request body.
@@ -107,6 +119,13 @@ type CreateRunInput struct {
 	// no-stages create path; useful for integration tests that
 	// just want to seed a run row.
 	WorkflowSpec string `json:"workflow_spec,omitempty"`
+	// IssueContext, when set, carries the title/body/url/number
+	// for an issue-triggered run that was minted outside the
+	// webhook flow (#415). The CLI shells to `gh issue view` at
+	// run-create time and ships the payload inline so the
+	// backend's prompt builder doesn't need an installation_id
+	// to look up the issue.
+	IssueContext *IssueContext `json:"issue_context,omitempty"`
 }
 
 // StartRun calls POST /v0/runs.
