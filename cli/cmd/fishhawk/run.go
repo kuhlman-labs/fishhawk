@@ -82,6 +82,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	workflowID := fs.String("workflow", "", "workflow ID matching .fishhawk/workflows.yaml (required)")
 	workflowSHA := fs.String("workflow-sha", "", "git SHA of .fishhawk/workflows.yaml (required)")
 	triggerRef := fs.String("trigger-ref", "", "optional trigger reference (e.g. issue:1247)")
+	runnerKind := fs.String("runner-kind", "",
+		"execution backend tag (ADR-022): github_actions | local; empty uses the backend's default")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -96,6 +98,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		WorkflowID:    *workflowID,
 		WorkflowSHA:   *workflowSHA,
 		TriggerSource: "cli",
+		RunnerKind:    *runnerKind,
 	}
 	if *triggerRef != "" {
 		in.TriggerRef = triggerRef
@@ -338,6 +341,9 @@ func printRun(w io.Writer, r *httpclient.Run) {
 		_, _ = fmt.Fprintf(w, "trigger_ref:    %s\n", *r.TriggerRef)
 	}
 	_, _ = fmt.Fprintf(w, "state:          %s\n", r.State)
+	if r.RunnerKind != "" {
+		_, _ = fmt.Fprintf(w, "runner_kind:    %s\n", r.RunnerKind)
+	}
 	_, _ = fmt.Fprintf(w, "created_at:     %s\n", r.CreatedAt.Format(time.RFC3339))
 	_, _ = fmt.Fprintf(w, "updated_at:     %s\n", r.UpdatedAt.Format(time.RFC3339))
 }

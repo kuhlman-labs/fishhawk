@@ -292,6 +292,66 @@ func TestRunStart_TriggerRefForwarded(t *testing.T) {
 	}
 }
 
+func TestRunStart_RunnerKindForwarded(t *testing.T) {
+	// E22.7 / #410: --runner-kind local should land in the wire
+	// body. Empty (omitted) leaves the field unset → backend
+	// applies its github_actions default.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	fb.startResp = httpclient.Run{ID: uuid.New(), State: "pending", RunnerKind: "local"}
+
+	if rc := run([]string{
+		"run", "start",
+		"--repo", "x/y", "--workflow", "w", "--workflow-sha", "abc",
+		"--runner-kind", "local",
+	}, io.Discard, io.Discard); rc != exitOK {
+		t.Fatalf("status = %d", rc)
+	}
+	if fb.startedRun.RunnerKind != "local" {
+		t.Errorf("RunnerKind = %q, want local", fb.startedRun.RunnerKind)
+	}
+}
+
+func TestRunStart_RunnerKindOmitted_DefaultsAtBackend(t *testing.T) {
+	// When --runner-kind isn't set the field is empty; the
+	// httpclient's `omitempty` tag drops it from the wire JSON
+	// entirely so the backend applies its default. This test
+	// asserts the CLI layer doesn't fill in a default itself.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	fb.startResp = httpclient.Run{ID: uuid.New(), State: "pending"}
+
+	if rc := run([]string{
+		"run", "start",
+		"--repo", "x/y", "--workflow", "w", "--workflow-sha", "abc",
+	}, io.Discard, io.Discard); rc != exitOK {
+		t.Fatalf("status = %d", rc)
+	}
+	if fb.startedRun.RunnerKind != "" {
+		t.Errorf("RunnerKind = %q, want empty (backend defaults)", fb.startedRun.RunnerKind)
+	}
+}
+
+func TestRunStart_RunnerKindShownInTextOutput(t *testing.T) {
+	// printRun surfaces runner_kind so operators see the tag on
+	// the response. Empty omits the line (legacy parity).
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	fb.startResp = httpclient.Run{ID: uuid.New(), State: "pending", RunnerKind: "local"}
+
+	var stdout strings.Builder
+	if rc := run([]string{
+		"run", "start",
+		"--repo", "x/y", "--workflow", "w", "--workflow-sha", "abc",
+		"--runner-kind", "local",
+	}, &stdout, io.Discard); rc != exitOK {
+		t.Fatalf("status = %d", rc)
+	}
+	if !strings.Contains(stdout.String(), "runner_kind:    local") {
+		t.Errorf("text output missing runner_kind line:\n%s", stdout.String())
+	}
+}
+
 func TestRunStart_MissingRequiredFlags(t *testing.T) {
 	_, srv := newFakeBackend(t)
 	withBackend(t, srv)
