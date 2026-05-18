@@ -783,6 +783,12 @@ func (n *Notifier) contextForStatus(ctx context.Context, runID uuid.UUID) (comme
 	if runRow.TriggerSource != run.TriggerGitHubIssue {
 		return commentContext{}, false, nil
 	}
+	// Local-runner runs (#416) carry no installation_id by design:
+	// the backend can't mint an App token for the operator's repo,
+	// and the operator's own `gh` does the posting from the CLI
+	// side. The nil-installation_id branch below silently skips —
+	// the GHA flow keeps working unchanged, and the CLI's
+	// ghcomment package handles the local case directly.
 	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
 		return commentContext{}, false, nil
 	}

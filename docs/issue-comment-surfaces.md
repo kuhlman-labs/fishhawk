@@ -44,6 +44,36 @@ The `Notifier`'s `contextFor` / `contextForStatus` helpers gate the skip:
 missing `installation_id`, unparseable `trigger_ref`, or non-issue
 `trigger_source` short-circuits before any GitHub call.
 
+## Local-runner runs (#416)
+
+For runs minted with `runner_kind=local`, the backend's `IssueNotifier` is a
+no-op by design: the run carries no `installation_id` (the operator's local
+flow doesn't go through a GitHub App webhook), so `contextForStatus` returns
+early. Comment posting moves to the CLI side, where the operator's authed
+`gh` is available:
+
+| CLI verb | Renderer | Posted when |
+|---|---|---|
+| `fishhawk run start --issue N` | `ghcomment.RenderKickoff` | run-create succeeds |
+| `fishhawk plan approve <run-id>` | `ghcomment.RenderPlanApproved` | approval submitted |
+| `fishhawk plan reject <run-id>` | `ghcomment.RenderPlanRejected` | rejection submitted |
+| `fishhawk run cancel <run-id>` | `ghcomment.RenderRunCancelled` | cancellation accepted |
+| `fishhawk runner start --run-id …` | `ghcomment.RenderStageComplete` | runner subprocess exits cleanly |
+
+Renderers live in `cli/internal/ghcomment`; the post step shells to
+`gh issue comment <N> --repo <owner/name> --body …`. v0 scope is append-only
+(each transition gets a new comment); edit-in-place against a sticky
+comment-id is deferred to a follow-up. Missing or unauthed `gh` warns to
+stderr and proceeds — the run still records, the issue thread just stays
+quiet.
+
+Authorship side note: local-run comments are authored by the operator's
+GitHub identity (whoever ran `gh auth login`), not by the Fishhawk App. For
+local dev this is arguably more honest — the operator IS the one running
+the workflow — but the authorship pattern differs from the GHA flow's
+bot-authored comments. Reviewers consuming both kinds of runs should keep
+this in mind when filtering by author.
+
 ## Updating this doc
 
 If you add, remove, or rename a Notifier method (the public surface) or its

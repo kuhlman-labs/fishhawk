@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/cli/internal/ghcomment"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
 
@@ -222,6 +223,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return exitFailure
 	}
 	printRun(stdout, r)
+
+	// #416: for local-runner runs triggered by a GitHub issue,
+	// post the "Fishhawk picked this up" comment via the
+	// operator's `gh`. Best-effort; nil-safe when not applicable.
+	maybePostLocalComment(stderr, r,
+		ghcomment.RenderKickoff(toGhCommentRun(r, *cf.backendURL)))
 	return exitOK
 }
 
@@ -334,6 +341,11 @@ func runCancel(args []string, stdout, stderr io.Writer) int {
 		return exitOnAPIError(err)
 	}
 	printRun(stdout, r)
+
+	// #416: comment on the issue thread for local-runner runs.
+	maybePostLocalComment(stderr, r,
+		ghcomment.RenderRunCancelled(toGhCommentRun(r, *cf.backendURL),
+			resolveGitHubHandle()))
 	return exitOK
 }
 
