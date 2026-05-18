@@ -82,17 +82,23 @@ type Run struct {
 	PullRequestURL     *string    `json:"pull_request_url"`
 	RetryAttempt       int        `json:"retry_attempt"`
 	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
+	RunnerKind         string     `json:"runner_kind"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 // CreateRunInput is what StartRun marshals into the request body.
+// RunnerKind (ADR-022 / #388) is optional; empty omits the field
+// from the wire body, letting the backend apply its `github_actions`
+// default. The local-runner CLI flow (Phase C / E22) passes "local"
+// to mint a run that runs on the operator's workstation.
 type CreateRunInput struct {
 	Repo          string  `json:"repo"`
 	WorkflowID    string  `json:"workflow_id"`
 	WorkflowSHA   string  `json:"workflow_sha"`
 	TriggerSource string  `json:"trigger_source"`
 	TriggerRef    *string `json:"trigger_ref,omitempty"`
+	RunnerKind    string  `json:"runner_kind,omitempty"`
 }
 
 // StartRun calls POST /v0/runs.
