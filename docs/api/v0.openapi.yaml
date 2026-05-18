@@ -212,12 +212,42 @@ components:
             pre-pluggable-backends view via
             `GET /v0/runs?runner_kind=github_actions`.
           example: github_actions
+        issue_context:
+          $ref: '#/components/schemas/IssueContext'
+          description: |
+            Cached payload from the operator's `gh issue view`
+            (#415). Populated for issue-triggered runs minted
+            outside the webhook flow (CLI / MCP) so the prompt
+            builder reads the title + body from the row instead
+            of refetching from GitHub. Null on webhook-dispatched
+            runs (which fetch fresh from GitHub at prompt-build
+            time) and on non-issue triggers.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    IssueContext:
+      type: object
+      description: |
+        Cached GitHub issue payload — title, body, url, and
+        number — fetched by the operator's `gh issue view` at
+        run-create time so the backend's prompt builder doesn't
+        need an installation_id to look up the issue (#415).
+      required: [title, body, url, number]
+      properties:
+        title:
+          type: string
+        body:
+          type: string
+        url:
+          type: string
+          format: uri
+        number:
+          type: integer
+          minimum: 1
 
     Stage:
       type: object
@@ -920,6 +950,20 @@ paths:
                     of the local checkout or the `--spec-file` flag.
                     A malformed or unrecognised-workflow_id body
                     returns 400 before the run row is created.
+                issue_context:
+                  $ref: '#/components/schemas/IssueContext'
+                  description: |
+                    Optional. Cached payload from the operator's
+                    `gh issue view` (#415). Carries the triggering
+                    GitHub issue's title, body, url, and number so
+                    the backend's prompt builder reads from the row
+                    instead of needing an installation_id to fetch
+                    from GitHub. Only valid with
+                    `trigger_source: github_issue` — a 400 fires
+                    when shipped with any other trigger source.
+                    Webhook-dispatched runs leave this empty and
+                    the backend falls back to the existing
+                    GitHub-fetch path.
       responses:
         '200':
           description: Idempotent replay — existing run returned unchanged.

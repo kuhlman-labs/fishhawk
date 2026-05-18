@@ -82,6 +82,7 @@ type Run struct {
 	RetryAttempt           int32              `json:"retry_attempt"`
 	MaxRetriesSnapshot     int32              `json:"max_retries_snapshot"`
 	RunnerKind             string             `json:"runner_kind"`
+	IssueContext           []byte             `json:"issue_context"`
 }
 
 type Session struct {

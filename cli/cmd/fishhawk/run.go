@@ -86,6 +86,13 @@ func newClient(cf commonFlags) *httpclient.Client {
 // retrospective run against a known commit. When no spec is found
 // and --workflow-sha was not supplied, the verb errors with both
 // remediation options.
+//
+// Issue context (#415): when --issue is set (or trigger-ref is in
+// `issue:N` shape), the CLI shells to `gh issue view` and ships
+// the title/body/url/number inline so the backend's prompt
+// builder reads the cached payload instead of needing an
+// installation_id. Best-effort: a missing or unauthed gh emits a
+// warning to stderr and the run proceeds without the cache.
 func runStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fishhawk run start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -101,6 +108,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		"directory to search for .fishhawk/workflows.yaml (walks up to the .git boundary)")
 	specFile := fs.String("spec-file", "",
 		"explicit path to a workflow spec file; overrides auto-discovery")
+	issueArg := fs.String("issue", "",
+		"GitHub issue number, #N, or .../issues/N URL; CLI fetches via `gh` and ships inline")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -108,6 +117,20 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "fishhawk run start: --repo and --workflow are required")
 		fs.Usage()
 		return exitUsage
+	}
+
+	// Parse the explicit --issue argument up front so a typo
+	// surfaces before any backend round-trip.
+	issueNumber, err := resolveIssueRef(*issueArg)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk run start: %v\n", err)
+		return exitUsage
+	}
+	// When --issue isn't set but trigger-ref is `issue:N`, derive
+	// the number from the trigger ref. Saves the operator typing
+	// the number twice.
+	if issueNumber == 0 {
+		issueNumber = inferIssueNumberFromTriggerRef(*triggerRef)
 	}
 
 	// Resolve the workflow spec. Errors here come from explicit
@@ -145,16 +168,50 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return exitFailure
 	}
 
+	// Default trigger_source to "cli"; an --issue argument (or an
+	// issue:N trigger-ref) bumps it to "github_issue" so the
+	// backend accepts the optional issue_context payload and
+	// the prompt-builder picks the issue-driven template.
+	triggerSource := "cli"
+	if issueNumber > 0 {
+		triggerSource = "github_issue"
+		// Normalize trigger_ref to the canonical issue:N form
+		// when the operator only passed --issue, so threading +
+		// audit surfaces (#216) keep working.
+		if *triggerRef == "" {
+			derived := fmt.Sprintf("issue:%d", issueNumber)
+			triggerRef = &derived
+		}
+	}
+
 	in := httpclient.CreateRunInput{
 		Repo:          *repo,
 		WorkflowID:    *workflowID,
 		WorkflowSHA:   effectiveSHA,
-		TriggerSource: "cli",
+		TriggerSource: triggerSource,
 		RunnerKind:    *runnerKind,
 		WorkflowSpec:  string(specBytes),
 	}
 	if *triggerRef != "" {
 		in.TriggerRef = triggerRef
+	}
+
+	// Fetch the issue locally via gh and bundle the payload.
+	// Best-effort: a missing or unauthed gh emits a warning and
+	// the run proceeds without the cache (degraded prompt =
+	// pre-#415 shape).
+	if issueNumber > 0 {
+		ic, ferr := fetchIssueViaGh(*repo, issueNumber)
+		switch {
+		case ferr == nil:
+			in.IssueContext = ic
+		case errors.Is(ferr, ErrGhNotInstalled):
+			_, _ = fmt.Fprintln(stderr,
+				"fishhawk run start: gh CLI not on PATH; proceeding without inline issue context. Install https://cli.github.com for the full prompt.")
+		default:
+			_, _ = fmt.Fprintf(stderr,
+				"fishhawk run start: warning: %v — proceeding without inline issue context\n", ferr)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)

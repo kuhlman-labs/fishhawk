@@ -50,6 +50,14 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		}
 		snapshotBytes = b
 	}
+	var issueContextBytes []byte
+	if p.IssueContext != nil {
+		b, err := json.Marshal(p.IssueContext)
+		if err != nil {
+			return nil, fmt.Errorf("marshal issue_context: %w", err)
+		}
+		issueContextBytes = b
+	}
 
 	// The migration's column-level DEFAULT 1 only applies when the
 	// column is omitted from INSERT — since sqlc lists it in every
@@ -85,6 +93,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		RetryAttempt:           int32(p.RetryAttempt),
 		MaxRetriesSnapshot:     int32(maxRetries),
 		RunnerKind:             runnerKind,
+		IssueContext:           issueContextBytes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -430,6 +439,15 @@ func rowToRun(r rundb.Run) *Run {
 		var snap RequiredChecksSnapshot
 		if err := json.Unmarshal(r.RequiredChecksSnapshot, &snap); err == nil {
 			out.RequiredChecksSnapshot = &snap
+		}
+	}
+	// Same tolerance posture as RequiredChecksSnapshot: drop a
+	// corrupt blob rather than 500 the run-detail page. The audit
+	// log records what was captured at run-create.
+	if len(r.IssueContext) > 0 {
+		var ic IssueContext
+		if err := json.Unmarshal(r.IssueContext, &ic); err == nil {
+			out.IssueContext = &ic
 		}
 	}
 	return out
