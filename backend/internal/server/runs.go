@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -191,14 +192,19 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// spec from creating a half-formed run row. parsed is nil when
 	// the caller didn't ship a spec — handled at the create-stages
 	// step below.
+	//
+	// specBytes holds the raw YAML that gets cached on the run row.
+	// Set by the inline-spec path or the GitHub-fetch fallback (#413).
 	var (
 		parsed         *spec.Spec
 		workflowDef    spec.Workflow
 		haveStageDefs  bool
 		maxRetriesSnap int
+		specBytes      []byte
 	)
 	if req.WorkflowSpec != "" {
-		p, err := spec.ParseBytes([]byte(req.WorkflowSpec))
+		specBytes = []byte(req.WorkflowSpec)
+		p, err := spec.ParseBytes(specBytes)
 		if err != nil {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 				"workflow_spec failed to parse",
@@ -215,6 +221,70 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		if len(wf.Stages) == 0 {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 				"workflow has no stages",
+				map[string]any{"field": "workflow_id", "got": req.WorkflowID})
+			return
+		}
+		parsed = p
+		workflowDef = wf
+		haveStageDefs = true
+		maxRetriesSnap = webhook.WorkflowMaxRetries(wf)
+	} else if s.cfg.GitHub != nil {
+		// workflow_spec omitted but GitHub client is configured (#413).
+		// Resolve the App's installation for the repo, then fetch the
+		// spec at workflow_sha. Used by MCP-driven runs and cross-repo
+		// CLI invocations that can't easily ship the spec inline.
+		owner, name, ok := strings.Cut(req.Repo, "/")
+		if !ok || owner == "" || name == "" {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"repo must be in owner/name format",
+				map[string]any{"field": "repo", "got": req.Repo})
+			return
+		}
+		repoRef := githubclient.RepoRef{Owner: owner, Name: name}
+		installationID, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), repoRef)
+		if err != nil {
+			if errors.Is(err, githubclient.ErrNotInstalled) {
+				s.writeError(w, r, http.StatusUnprocessableEntity, "repo_not_installed",
+					"GitHub App is not installed on the target repository",
+					map[string]any{"repo": req.Repo})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not resolve installation for repo",
+				map[string]any{"error": err.Error()})
+			return
+		}
+		fc, err := s.cfg.GitHub.GetWorkflowSpec(r.Context(), installationID, repoRef, req.WorkflowSHA)
+		if err != nil {
+			if errors.Is(err, githubclient.ErrNotFound) {
+				s.writeError(w, r, http.StatusUnprocessableEntity, "spec_not_found",
+					"workflow spec not found at the given sha",
+					map[string]any{"repo": req.Repo, "workflow_sha": req.WorkflowSHA})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not fetch workflow spec from repo",
+				map[string]any{"error": err.Error()})
+			return
+		}
+		specBytes = fc.Content
+		p, err := spec.ParseBytes(specBytes)
+		if err != nil {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "spec_not_found",
+				"fetched workflow spec failed to parse",
+				map[string]any{"error": err.Error()})
+			return
+		}
+		wf, ok := p.Workflows[req.WorkflowID]
+		if !ok {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "spec_not_found",
+				"workflow_id not defined in fetched workflow spec",
+				map[string]any{"field": "workflow_id", "got": req.WorkflowID})
+			return
+		}
+		if len(wf.Stages) == 0 {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "spec_not_found",
+				"workflow in fetched spec has no stages",
 				map[string]any{"field": "workflow_id", "got": req.WorkflowID})
 			return
 		}
@@ -264,8 +334,9 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		// Cache the validated spec bytes on the row so the trace
 		// handler's policy re-evaluation reads constraints from
 		// storage instead of refetching (mirrors the dispatcher
-		// path; see dispatcher.createRun).
-		createParams.WorkflowSpec = []byte(req.WorkflowSpec)
+		// path; see dispatcher.createRun). specBytes is set by
+		// either the inline-spec or the GitHub-fetch path above.
+		createParams.WorkflowSpec = specBytes
 		createParams.MaxRetriesSnapshot = maxRetriesSnap
 	}
 	if req.IssueContext != nil {

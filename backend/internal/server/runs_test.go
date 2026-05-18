@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -1479,5 +1481,237 @@ func TestCreateRun_IssueContext_RejectedOnNonIssueTrigger(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "issue_context") {
 		t.Errorf("body should reference issue_context: %s", w.Body.String())
+	}
+}
+
+// --- GitHub fetch fallback for workflow_spec (#413) ---
+
+// ghTokensStub satisfies githubapp.TokenProvider for runs_test GitHub
+// client construction without importing the githubapp package.
+type ghTokensStub struct{ tok string }
+
+func (s *ghTokensStub) Token(_ context.Context, _ int64) (string, error) { return s.tok, nil }
+
+// fakeGitHubForRuns is a minimal stub server used by the GitHub-fetch
+// fallback tests. It handles:
+//
+//	GET /repos/{owner}/{repo}/installation → returns a canned installation ID
+//	GET /repos/{owner}/{repo}/contents/   → returns base64-encoded spec YAML
+type fakeGitHubForRuns struct {
+	installationStatus int
+	installationBody   string
+	specStatus         int
+	specBody           string
+
+	// call counters let tests assert which endpoints were hit.
+	installationCalls int
+	specCalls         int
+}
+
+func newFakeGitHubForRuns(specYAML string) *fakeGitHubForRuns {
+	encoded := base64.StdEncoding.EncodeToString([]byte(specYAML))
+	specJSON := `{"path":".fishhawk/workflows.yaml","sha":"spec_sha","content":"` +
+		encoded + `","encoding":"base64","type":"file"}`
+	return &fakeGitHubForRuns{
+		installationStatus: http.StatusOK,
+		installationBody:   `{"id":12345,"app_id":1}`,
+		specStatus:         http.StatusOK,
+		specBody:           specJSON,
+	}
+}
+
+func (f *fakeGitHubForRuns) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/installation", func(w http.ResponseWriter, r *http.Request) {
+		f.installationCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.installationStatus)
+		_, _ = io.WriteString(w, f.installationBody)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/", func(w http.ResponseWriter, r *http.Request) {
+		f.specCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.specStatus)
+		if f.specBody != "" {
+			_, _ = io.WriteString(w, f.specBody)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// newServerWithGitHub builds a Server with a githubclient.Client pointing
+// at ghSrv. Used to exercise the GitHub-fetch fallback path (#413).
+func newServerWithGitHub(t *testing.T, repo run.Repository, ghSrv *httptest.Server) *Server {
+	t.Helper()
+	gh := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt_test", nil },
+	}
+	return New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitHub: gh})
+}
+
+// TestCreateRun_GitHubFetch_HappyPath verifies that omitting
+// workflow_spec triggers a GitHub fetch and produces Stage rows
+// identical to the inline-spec path.
+func TestCreateRun_GitHubFetch_HappyPath(t *testing.T) {
+	repo := newFakeRepo()
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	ghSrv := fake.server(t)
+	s := newServerWithGitHub(t, repo, ghSrv)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "deadbeef",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		// workflow_spec intentionally omitted — triggers GitHub fetch.
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	// Both GitHub endpoints must have been called exactly once.
+	if fake.installationCalls != 1 {
+		t.Errorf("installation endpoint called %d times, want 1", fake.installationCalls)
+	}
+	if fake.specCalls != 1 {
+		t.Errorf("spec endpoint called %d times, want 1", fake.specCalls)
+	}
+
+	// Stage rows must match the gatedSpecYAML shape (plan + implement).
+	stages := repo.stagesFor(got.ID)
+	if len(stages) != 2 {
+		t.Fatalf("len(stages) = %d, want 2: %#v", len(stages), stages)
+	}
+	if stages[0].Type != run.StageTypePlan {
+		t.Errorf("stage[0].Type = %q, want plan", stages[0].Type)
+	}
+	if stages[1].Type != run.StageTypeImplement {
+		t.Errorf("stage[1].Type = %q, want implement", stages[1].Type)
+	}
+	if !stages[0].RequiresApproval {
+		t.Error("stage[0].RequiresApproval = false, want true")
+	}
+	if stages[0].GateSLA == nil || *stages[0].GateSLA != "4_business_hours" {
+		t.Errorf("stage[0].GateSLA = %v, want 4_business_hours", stages[0].GateSLA)
+	}
+
+	// The fetched spec bytes must be cached on the run row.
+	if len(repo.lastCreateRunParams.WorkflowSpec) == 0 {
+		t.Error("WorkflowSpec not cached on run row after GitHub fetch")
+	}
+}
+
+// TestCreateRun_GitHubFetch_NotInstalled verifies that a 404 from the
+// installation endpoint produces HTTP 422 with code "repo_not_installed".
+func TestCreateRun_GitHubFetch_NotInstalled(t *testing.T) {
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	fake.installationStatus = http.StatusNotFound
+	fake.installationBody = `{"message":"Not Found"}`
+	ghSrv := fake.server(t)
+	s := newServerWithGitHub(t, newFakeRepo(), ghSrv)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "deadbeef",
+		"trigger_source": "cli",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"repo_not_installed"`) {
+		t.Errorf("body missing repo_not_installed code: %s", w.Body.String())
+	}
+	// Spec endpoint must NOT have been called.
+	if fake.specCalls != 0 {
+		t.Errorf("spec endpoint should not be called after installation failure; calls = %d", fake.specCalls)
+	}
+}
+
+// TestCreateRun_GitHubFetch_SpecNotFound verifies that a 404 from the
+// spec-contents endpoint produces HTTP 422 with code "spec_not_found".
+func TestCreateRun_GitHubFetch_SpecNotFound(t *testing.T) {
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	fake.specStatus = http.StatusNotFound
+	fake.specBody = `{"message":"Not Found"}`
+	ghSrv := fake.server(t)
+	s := newServerWithGitHub(t, newFakeRepo(), ghSrv)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "deadbeef",
+		"trigger_source": "cli",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"spec_not_found"`) {
+		t.Errorf("body missing spec_not_found code: %s", w.Body.String())
+	}
+}
+
+// TestCreateRun_InlineSpec_BypassesFetch verifies that when workflow_spec
+// is provided inline, the GitHub client is never called — even when a
+// GitHub client is configured.
+func TestCreateRun_InlineSpec_BypassesFetch(t *testing.T) {
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	ghSrv := fake.server(t)
+	repo := newFakeRepo()
+	s := newServerWithGitHub(t, repo, ghSrv)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  gatedSpecYAML, // inline — must not trigger fetch
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if fake.installationCalls != 0 {
+		t.Errorf("installation endpoint called %d times; inline spec must bypass GitHub fetch",
+			fake.installationCalls)
+	}
+	if fake.specCalls != 0 {
+		t.Errorf("spec endpoint called %d times; inline spec must bypass GitHub fetch", fake.specCalls)
+	}
+	// Stages are still created from the inline spec.
+	var got runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if len(repo.stagesFor(got.ID)) != 2 {
+		t.Errorf("expected 2 stages from inline spec, got %d", len(repo.stagesFor(got.ID)))
 	}
 }
