@@ -74,31 +74,84 @@ func newClient(cf commonFlags) *httpclient.Client {
 }
 
 // runStart implements `fishhawk run start`.
+//
+// Workflow-spec discovery (#411): when --spec-file is set the CLI
+// reads exactly that file; otherwise it walks up from --working-dir
+// looking for `.fishhawk/workflows.yaml`, stopping at the .git
+// boundary. A discovered spec is pre-parsed locally so a YAML typo
+// fails the verb in ms instead of round-tripping to the backend,
+// and its bytes ride along inline so the backend can create one
+// Stage row per stage definition. The user-supplied --workflow-sha
+// (if any) overrides the computed blob SHA — useful when minting a
+// retrospective run against a known commit. When no spec is found
+// and --workflow-sha was not supplied, the verb errors with both
+// remediation options.
 func runStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fishhawk run start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cf := bindCommonFlags(fs)
 	repo := fs.String("repo", "", "owner/name of the repo (required)")
 	workflowID := fs.String("workflow", "", "workflow ID matching .fishhawk/workflows.yaml (required)")
-	workflowSHA := fs.String("workflow-sha", "", "git SHA of .fishhawk/workflows.yaml (required)")
+	workflowSHA := fs.String("workflow-sha", "",
+		"git blob SHA of .fishhawk/workflows.yaml; auto-computed from the discovered spec when omitted")
 	triggerRef := fs.String("trigger-ref", "", "optional trigger reference (e.g. issue:1247)")
 	runnerKind := fs.String("runner-kind", "",
 		"execution backend tag (ADR-022): github_actions | local; empty uses the backend's default")
+	workingDir := fs.String("working-dir", ".",
+		"directory to search for .fishhawk/workflows.yaml (walks up to the .git boundary)")
+	specFile := fs.String("spec-file", "",
+		"explicit path to a workflow spec file; overrides auto-discovery")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
-	if *repo == "" || *workflowID == "" || *workflowSHA == "" {
-		_, _ = fmt.Fprintln(stderr, "fishhawk run start: --repo, --workflow, and --workflow-sha are required")
+	if *repo == "" || *workflowID == "" {
+		_, _ = fmt.Fprintln(stderr, "fishhawk run start: --repo and --workflow are required")
 		fs.Usage()
 		return exitUsage
+	}
+
+	// Resolve the workflow spec. Errors here come from explicit
+	// --spec-file misses or unreadable candidate files; "no spec
+	// found in the walk" is signalled by a nil return without an
+	// error.
+	found, err := discoverSpec(*workingDir, *specFile)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk run start: %v\n", err)
+		return exitFailure
+	}
+
+	// Compose the effective SHA. Flag wins over auto-computed (an
+	// override hook for minting historic runs); otherwise the
+	// discovered file's blob SHA travels with the bytes.
+	effectiveSHA := *workflowSHA
+	var specBytes []byte
+	if found != nil {
+		if effectiveSHA == "" {
+			effectiveSHA = found.BlobSHA
+		}
+		specBytes = found.Contents
+		// Pre-parse so a YAML typo is a fast local failure
+		// instead of a backend round-trip. The backend also
+		// parses — the CLI check is purely UX.
+		if perr := cliSpecValidate(specBytes); perr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"fishhawk run start: %s: %v\n", found.Path, perr)
+			return exitFailure
+		}
+	}
+	if effectiveSHA == "" {
+		_, _ = fmt.Fprintln(stderr,
+			"fishhawk run start: workflow spec not found in --working-dir (and no --workflow-sha override). Pass --spec-file or run from a checkout that has .fishhawk/workflows.yaml.")
+		return exitFailure
 	}
 
 	in := httpclient.CreateRunInput{
 		Repo:          *repo,
 		WorkflowID:    *workflowID,
-		WorkflowSHA:   *workflowSHA,
+		WorkflowSHA:   effectiveSHA,
 		TriggerSource: "cli",
 		RunnerKind:    *runnerKind,
+		WorkflowSpec:  string(specBytes),
 	}
 	if *triggerRef != "" {
 		in.TriggerRef = triggerRef

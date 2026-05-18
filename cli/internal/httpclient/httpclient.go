@@ -99,6 +99,14 @@ type CreateRunInput struct {
 	TriggerSource string  `json:"trigger_source"`
 	TriggerRef    *string `json:"trigger_ref,omitempty"`
 	RunnerKind    string  `json:"runner_kind,omitempty"`
+	// WorkflowSpec is the YAML bytes of `.fishhawk/workflows.yaml`
+	// at the requested workflow_sha, sent inline so the backend
+	// can create stages for API-minted runs (#411). The CLI
+	// discovers the file locally (auto-walk from --working-dir or
+	// explicit --spec-file). Empty falls back to the legacy
+	// no-stages create path; useful for integration tests that
+	// just want to seed a run row.
+	WorkflowSpec string `json:"workflow_spec,omitempty"`
 }
 
 // StartRun calls POST /v0/runs.

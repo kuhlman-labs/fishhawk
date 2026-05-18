@@ -10,6 +10,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // runResponse is the JSON shape POST /v0/runs and GET /v0/runs/{id}
@@ -67,6 +69,19 @@ type createRunRequest struct {
 	// passes `local`. Validated against `run.ValidRunnerKinds` at
 	// the handler.
 	RunnerKind string `json:"runner_kind,omitempty"`
+	// WorkflowSpec is the YAML bytes of the workflow spec at the
+	// requested workflow_sha, transported as a string. When
+	// supplied (#411), the handler parses it, validates that
+	// workflow_id is defined, persists the bytes on the run row
+	// (matching the dispatcher's caching path), and creates one
+	// Stage row per stage definition. When absent, the run row is
+	// created with no stages — the legacy behaviour, retained so
+	// API callers that just want to register a run record without
+	// driving a lifecycle (e.g. integration test seeding) keep
+	// working. The CLI's `fishhawk run start` flow always sends
+	// the bytes via auto-discovery of `.fishhawk/workflows.yaml`
+	// or the explicit --spec-file flag.
+	WorkflowSpec string `json:"workflow_spec,omitempty"`
 }
 
 // validTriggerSources is the closed set per the workflow-spec and
@@ -129,6 +144,45 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Parse + validate the optional workflow_spec up front (#411).
+	// Failing before idempotency / repository writes keeps a bad
+	// spec from creating a half-formed run row. parsed is nil when
+	// the caller didn't ship a spec — handled at the create-stages
+	// step below.
+	var (
+		parsed         *spec.Spec
+		workflowDef    spec.Workflow
+		haveStageDefs  bool
+		maxRetriesSnap int
+	)
+	if req.WorkflowSpec != "" {
+		p, err := spec.ParseBytes([]byte(req.WorkflowSpec))
+		if err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"workflow_spec failed to parse",
+				map[string]any{"field": "workflow_spec", "error": err.Error()})
+			return
+		}
+		wf, ok := p.Workflows[req.WorkflowID]
+		if !ok {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"workflow_id not defined in workflow_spec",
+				map[string]any{"field": "workflow_id", "got": req.WorkflowID})
+			return
+		}
+		if len(wf.Stages) == 0 {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"workflow has no stages",
+				map[string]any{"field": "workflow_id", "got": req.WorkflowID})
+			return
+		}
+		parsed = p
+		workflowDef = wf
+		haveStageDefs = true
+		maxRetriesSnap = webhook.WorkflowMaxRetries(wf)
+	}
+	_ = parsed // parsed is reserved for future spec-driven checks
+
 	// Idempotency-Key (E8.2 / #40). When set, a previously-created
 	// run with the same (repo, key) is returned 200 instead of
 	// fresh-creating + dispatching a duplicate. Empty header is
@@ -164,6 +218,14 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		// above; only known-good kinds reach the repo.
 		RunnerKind: req.RunnerKind,
 	}
+	if haveStageDefs {
+		// Cache the validated spec bytes on the row so the trace
+		// handler's policy re-evaluation reads constraints from
+		// storage instead of refetching (mirrors the dispatcher
+		// path; see dispatcher.createRun).
+		createParams.WorkflowSpec = []byte(req.WorkflowSpec)
+		createParams.MaxRetriesSnapshot = maxRetriesSnap
+	}
 	if idempKey != "" {
 		k := idempKey
 		createParams.IdempotencyKey = &k
@@ -174,6 +236,22 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"create run failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	// Create one Stage row per stage definition in the spec.
+	// Required-checks-snapshot capture is deliberately skipped for
+	// API-created runs — the snapshot lives behind GitHub's
+	// branch-protection API and the API path doesn't carry an
+	// installation token to query it. Local-runner runs don't need
+	// the snapshot (no PR merge gate enforcement); github_actions
+	// runs minted via this path can be backfilled by the webhook
+	// trace handler if needed.
+	if haveStageDefs {
+		if _, err := webhook.CreateStagesFromSpec(r.Context(), s.cfg.RunRepo, created.ID, workflowDef.Stages); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"create stages failed", map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(created))
