@@ -91,15 +91,19 @@ type listRunsResult struct {
 }
 
 // listRunsFilter scopes a runs query. Empty values drop from the
-// query string. The MCP server only uses three of the backend's
-// supported filters (repo, pull_request_url, trigger_ref) — the
-// resolution logic in tools.go picks the right one per input
-// shape.
+// query string. The MCP server consumes this for two surfaces:
+// `get_active_run`'s resolver (which uses repo, pull_request_url,
+// trigger_ref) and `list_runs`'s broader enumeration (which adds
+// workflow_id, state, and cursor pagination). Same struct, both
+// callers, no separate types.
 type listRunsFilter struct {
 	Repo           string
 	PullRequestURL string
 	TriggerRef     string
+	WorkflowID     string
+	State          string
 	Limit          int
+	Cursor         string
 }
 
 func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
@@ -416,8 +420,17 @@ func (c *apiClient) ListRuns(ctx context.Context, f listRunsFilter) (*listRunsRe
 	if f.TriggerRef != "" {
 		q.Set("trigger_ref", f.TriggerRef)
 	}
+	if f.WorkflowID != "" {
+		q.Set("workflow_id", f.WorkflowID)
+	}
+	if f.State != "" {
+		q.Set("state", f.State)
+	}
 	if f.Limit > 0 {
 		q.Set("limit", strconv.Itoa(f.Limit))
+	}
+	if f.Cursor != "" {
+		q.Set("cursor", f.Cursor)
 	}
 	path := "/v0/runs"
 	if encoded := q.Encode(); encoded != "" {

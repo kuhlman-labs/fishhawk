@@ -1921,3 +1921,148 @@ func TestRejectPlan_NoReason_PassesEmptyComment(t *testing.T) {
 		t.Errorf("comment = %q, want empty", fb.approvalsBody.Comment)
 	}
 }
+
+// --- fishhawk_list_runs (E22.5 / #394) ---
+
+func TestListRuns_HappyPath_ReturnsItemsAndCursor(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	id1, id2 := uuid.New(), uuid.New()
+	fb.listResp = listRunsResult{
+		Items: []Run{
+			sampleRun(id1, "x/y", time.Hour),
+			sampleRun(id2, "x/y", 2*time.Hour),
+		},
+		NextCursor: "b2Zmc2V0OjEw",
+	}
+
+	_, out, err := r.listRuns(context.Background(), nil, ListRunsInput{})
+	if err != nil {
+		t.Fatalf("listRuns: %v", err)
+	}
+	if len(out.Items) != 2 {
+		t.Errorf("got %d items, want 2", len(out.Items))
+	}
+	if out.NextCursor != "b2Zmc2V0OjEw" {
+		t.Errorf("NextCursor = %q, want passthrough", out.NextCursor)
+	}
+}
+
+func TestListRuns_NoFilters_DefaultsLimit(t *testing.T) {
+	// Limit=0 input should clamp to listRunsLimitDefault (50) so
+	// the agent doesn't accidentally fetch the entire chain.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	fb.listResp = listRunsResult{Items: []Run{}}
+
+	_, _, err := r.listRuns(context.Background(), nil, ListRunsInput{})
+	if err != nil {
+		t.Fatalf("listRuns: %v", err)
+	}
+	if !strings.Contains(fb.lastListQuery, "limit=50") {
+		t.Errorf("query missing default limit: %s", fb.lastListQuery)
+	}
+}
+
+func TestListRuns_ForwardsAllFilters(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	fb.listResp = listRunsResult{Items: []Run{}}
+
+	_, _, err := r.listRuns(context.Background(), nil, ListRunsInput{
+		Repo:       "x/y",
+		WorkflowID: "feature_change",
+		State:      "running",
+		Limit:      25,
+		Cursor:     "abc",
+	})
+	if err != nil {
+		t.Fatalf("listRuns: %v", err)
+	}
+	for _, want := range []string{
+		"repo=x%2Fy",
+		"workflow_id=feature_change",
+		"state=running",
+		"limit=25",
+		"cursor=abc",
+	} {
+		if !strings.Contains(fb.lastListQuery, want) {
+			t.Errorf("query missing %q: %s", want, fb.lastListQuery)
+		}
+	}
+}
+
+func TestListRuns_BadState_FailsLocallyWithoutHTTPCall(t *testing.T) {
+	// Closed-set check before the wire hop; backend would 400
+	// either way, but local validation gives the agent a clearer
+	// error.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.listRuns(context.Background(), nil, ListRunsInput{State: "bogus"})
+	if err == nil {
+		t.Fatal("expected validation error for bad state")
+	}
+	if !strings.Contains(err.Error(), "state") {
+		t.Errorf("err = %v, want it to mention state", err)
+	}
+	if fb.lastListQuery != "" {
+		t.Errorf("backend should not be called on bad state; query = %q", fb.lastListQuery)
+	}
+}
+
+func TestListRuns_LimitClamp(t *testing.T) {
+	for _, tc := range []struct {
+		in   int
+		want int
+	}{
+		{0, listRunsLimitDefault},
+		{1, 1},
+		{50, 50},
+		{200, 200},
+		{500, listRunsLimitMax},
+		{-1, listRunsLimitDefault},
+	} {
+		if got := clampListRunsLimit(tc.in); got != tc.want {
+			t.Errorf("clampListRunsLimit(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestListRuns_CursorRoundTrip_WalksPagination(t *testing.T) {
+	// Two-call pagination loop: first call returns a cursor;
+	// second call feeds that cursor back and gets the next page.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	id1, id2 := uuid.New(), uuid.New()
+
+	// Seed two distinct responses keyed by query string.
+	page1 := listRunsResult{
+		Items:      []Run{sampleRun(id1, "x/y", time.Hour)},
+		NextCursor: "next-page-cursor",
+	}
+	page2 := listRunsResult{
+		Items:      []Run{sampleRun(id2, "x/y", 2*time.Hour)},
+		NextCursor: "",
+	}
+	fb.listByQuery[`limit=50`] = page1
+	fb.listByQuery[`cursor=next-page-cursor&limit=50`] = page2
+
+	_, first, err := r.listRuns(context.Background(), nil, ListRunsInput{})
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if first.NextCursor != "next-page-cursor" {
+		t.Fatalf("page 1 cursor = %q, want next-page-cursor", first.NextCursor)
+	}
+	_, second, err := r.listRuns(context.Background(), nil, ListRunsInput{Cursor: first.NextCursor})
+	if err != nil {
+		t.Fatalf("page 2: %v", err)
+	}
+	if second.NextCursor != "" {
+		t.Errorf("page 2 NextCursor = %q, want empty (last page)", second.NextCursor)
+	}
+	if len(second.Items) != 1 || second.Items[0].ID != id2.String() {
+		t.Errorf("page 2 items = %+v, want a single run with id %s", second.Items, id2.String())
+	}
+}
