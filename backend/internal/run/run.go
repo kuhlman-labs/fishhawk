@@ -215,9 +215,34 @@ type Run struct {
 	// migration's column-level default of 1, which matches the
 	// no-block case.
 	MaxRetriesSnapshot int
-	State              State
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// RunnerKind tags the execution backend that runs this run
+	// (ADR-022 / #388 + #404). v0 set: `github_actions` (the
+	// canonical published runner action), `local` (operator-on-
+	// workstation dev loop, Phase C of E22 / #389). The backend
+	// assigns this at run-create time based on the dispatch path;
+	// the runner never self-declares (a falsifiable claim from the
+	// runner defeats the audit-integrity story).
+	//
+	// Legacy rows (created before migration 0024) carry the
+	// migration's column-level default of `github_actions`.
+	RunnerKind string
+	State      State
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// RunnerKind enumerates the execution backends Fishhawk supports.
+// Closed-set; new kinds extend via a migration that updates the
+// CHECK constraint on runs.runner_kind.
+const (
+	RunnerKindGitHubActions = "github_actions"
+	RunnerKindLocal         = "local"
+)
+
+// ValidRunnerKinds is the closed-set membership check.
+var ValidRunnerKinds = map[string]struct{}{
+	RunnerKindGitHubActions: {},
+	RunnerKindLocal:         {},
 }
 
 // RequiredChecksSnapshot captures the required-status-checks list

@@ -28,6 +28,7 @@ type runResponse struct {
 	PullRequestURL     *string    `json:"pull_request_url,omitempty"`
 	RetryAttempt       int        `json:"retry_attempt"`
 	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
+	RunnerKind         string     `json:"runner_kind"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
@@ -45,6 +46,7 @@ func toRunResponse(r *run.Run) runResponse {
 		PullRequestURL:     r.PullRequestURL,
 		RetryAttempt:       r.RetryAttempt,
 		MaxRetriesSnapshot: r.MaxRetriesSnapshot,
+		RunnerKind:         r.RunnerKind,
 		CreatedAt:          r.CreatedAt,
 		UpdatedAt:          r.UpdatedAt,
 	}
@@ -52,13 +54,19 @@ func toRunResponse(r *run.Run) runResponse {
 
 // createRunRequest mirrors POST /v0/runs's request body in
 // v0.openapi.yaml. All four required fields must be present and
-// non-empty; trigger_ref is optional.
+// non-empty; trigger_ref and runner_kind are optional.
 type createRunRequest struct {
 	Repo          string  `json:"repo"`
 	WorkflowID    string  `json:"workflow_id"`
 	WorkflowSHA   string  `json:"workflow_sha"`
 	TriggerSource string  `json:"trigger_source"`
 	TriggerRef    *string `json:"trigger_ref,omitempty"`
+	// RunnerKind tags the execution backend per ADR-022 / #388.
+	// Optional; defaults to github_actions when omitted (the v0
+	// dominant case). The local-runner CLI (Phase C of E22 / #389)
+	// passes `local`. Validated against `run.ValidRunnerKinds` at
+	// the handler.
+	RunnerKind string `json:"runner_kind,omitempty"`
 }
 
 // validTriggerSources is the closed set per the workflow-spec and
@@ -112,6 +120,14 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "trigger_source", "got": req.TriggerSource})
 		return
 	}
+	if req.RunnerKind != "" {
+		if _, ok := run.ValidRunnerKinds[req.RunnerKind]; !ok {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"runner_kind must be one of github_actions, local",
+				map[string]any{"field": "runner_kind", "got": req.RunnerKind})
+			return
+		}
+	}
 
 	// Idempotency-Key (E8.2 / #40). When set, a previously-created
 	// run with the same (repo, key) is returned 200 instead of
@@ -143,6 +159,10 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		WorkflowSHA:   req.WorkflowSHA,
 		TriggerSource: run.TriggerSource(req.TriggerSource),
 		TriggerRef:    req.TriggerRef,
+		// Empty req.RunnerKind → repo layer applies the default
+		// (RunnerKindGitHubActions). Explicit values are validated
+		// above; only known-good kinds reach the repo.
+		RunnerKind: req.RunnerKind,
 	}
 	if idempKey != "" {
 		k := idempKey
@@ -242,6 +262,21 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("trigger_ref"); v != "" {
 		triggerRefFilter = &v
 	}
+	// runner_kind is the ADR-022 / #388 filter — compliance
+	// consumers project to `github_actions` only to reproduce the
+	// pre-pluggable-backends view. Validated against the closed
+	// set so bad values surface as a clean 400 (not a silent
+	// no-results page).
+	var runnerKindFilter *string
+	if v := q.Get("runner_kind"); v != "" {
+		if _, ok := run.ValidRunnerKinds[v]; !ok {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"runner_kind must be one of github_actions, local",
+				map[string]any{"field": "runner_kind", "got": v})
+			return
+		}
+		runnerKindFilter = &v
+	}
 
 	// Fetch one extra row so we can tell whether there's a next
 	// page without a separate COUNT query. The trick: ask for
@@ -252,6 +287,7 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		State:          stateFilter,
 		PullRequestURL: prURLFilter,
 		TriggerRef:     triggerRefFilter,
+		RunnerKind:     runnerKindFilter,
 		Limit:          limit + 1,
 		Offset:         offset,
 	})

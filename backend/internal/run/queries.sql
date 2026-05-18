@@ -3,8 +3,8 @@
 -- into ./db per the config in /backend/sqlc.yaml.
 
 -- name: CreateRun :one
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 RETURNING *;
 
 -- name: GetRun :one
@@ -33,6 +33,7 @@ SELECT * FROM runs
    AND (sqlc.arg('state')::text = '' OR state = sqlc.arg('state'))
    AND (sqlc.narg('pull_request_url')::text IS NULL OR pull_request_url = sqlc.narg('pull_request_url'))
    AND (sqlc.narg('trigger_ref')::text IS NULL OR trigger_ref = sqlc.narg('trigger_ref'))
+   AND (sqlc.narg('runner_kind')::text IS NULL OR runner_kind = sqlc.narg('runner_kind'))
  ORDER BY created_at DESC, id DESC
  LIMIT sqlc.arg('lim') OFFSET sqlc.arg('off');
 

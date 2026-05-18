@@ -868,6 +868,12 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		// Snapshot the CI-retry cap so the SPA can render
 		// "Retry N/M" without re-parsing the spec (#280).
 		MaxRetriesSnapshot: workflowMaxRetries(workflow),
+		// Dispatcher-created runs always come from the GHA
+		// workflow_dispatch path (ADR-022 / #388). Local-runner
+		// mode (Phase C of E22 / #389) takes a different code
+		// path through handleCreateRun and stamps `local`
+		// itself.
+		RunnerKind: run.RunnerKindGitHubActions,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create run: %w", err)
@@ -1282,6 +1288,9 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 		// Carry the parent's snapshotted cap forward so a chained
 		// retry chain sees the same N/M values on every row (#280).
 		MaxRetriesSnapshot: parent.MaxRetriesSnapshot,
+		// Inherit the parent's runner_kind — retries run in the
+		// same backend as the run they're retrying (ADR-022).
+		RunnerKind: parent.RunnerKind,
 	}
 	if triggerRef != "" {
 		params.TriggerRef = &triggerRef

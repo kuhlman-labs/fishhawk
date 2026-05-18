@@ -138,7 +138,7 @@ components:
         table in `backend/internal/run/transition.go`.
       required:
         [id, repo, workflow_id, workflow_sha, trigger_source, state,
-         retry_attempt, max_retries_snapshot, created_at, updated_at]
+         retry_attempt, max_retries_snapshot, runner_kind, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         repo:
@@ -198,6 +198,20 @@ components:
             goalposts on what the SPA renders. Defaults to 1 when
             the workflow has no `on_ci_failure:` block.
           example: 1
+        runner_kind:
+          type: string
+          enum: [github_actions, local]
+          description: |
+            Execution backend the run uses (ADR-022 / #388). Today's
+            published runner (`fishhawk/runner@v1`) on GitHub Actions
+            is `github_actions`; the operator-local dev-loop runner
+            (Phase C of E22 / #389) is `local`. The backend assigns
+            this at run-create time based on the dispatch path; the
+            runner never self-declares. Compliance consumers can
+            filter to `github_actions` to reproduce the
+            pre-pluggable-backends view via
+            `GET /v0/runs?runner_kind=github_actions`.
+          example: github_actions
         created_at:
           type: string
           format: date-time
@@ -812,6 +826,14 @@ paths:
             Used by the threaded-runs view to render every run on the
             same trigger when no PR has landed yet.
           schema: { type: string }
+        - name: runner_kind
+          in: query
+          description: |
+            Equality filter on `run.runner_kind` (ADR-022 / #388).
+            Used by compliance consumers to project to
+            `github_actions` only (or to scope to local-runner
+            dev-loop runs).
+          schema: { type: string, enum: [github_actions, local] }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
@@ -874,6 +896,16 @@ paths:
                   enum: [github_issue, cli, ui]
                 trigger_ref:
                   type: [string, "null"]
+                runner_kind:
+                  type: string
+                  enum: [github_actions, local]
+                  description: |
+                    Optional. Execution backend the run will use
+                    (ADR-022 / #388). Defaults to `github_actions`
+                    when omitted. The local-runner CLI (Phase C of
+                    E22 / #389) passes `local` to mint a run that
+                    runs on the operator's workstation instead of
+                    GitHub Actions.
       responses:
         '200':
           description: Idempotent replay — existing run returned unchanged.

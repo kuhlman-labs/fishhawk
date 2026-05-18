@@ -80,6 +80,7 @@ type Run struct {
 	WorkflowSpec           []byte             `json:"workflow_spec"`
 	RetryAttempt           int32              `json:"retry_attempt"`
 	MaxRetriesSnapshot     int32              `json:"max_retries_snapshot"`
+	RunnerKind             string             `json:"runner_kind"`
 }
 
 type Session struct {

@@ -202,12 +202,23 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0023 (E19.8 / #348) added the
-	// mcp_tokens table; the down migration drops it. Confirm:
-	// mcp_tokens is gone, but every prior migration's effect is
-	// still present (approvals_surface_check still references
-	// github_reply_comment from 0022, max_retries_snapshot from
-	// 0021, retry_attempt from 0020, workflow_spec from 0019, etc.).
+	// MigrateDown rolls back one step. 0024 (E22.7 / #404) added
+	// the runs.runner_kind column; the down migration drops it.
+	// Confirm: runs.runner_kind is gone, but every prior migration's
+	// effect is still present (mcp_tokens from 0023,
+	// approvals_surface_check still references github_reply_comment
+	// from 0022, max_retries_snapshot from 0021, retry_attempt from
+	// 0020, workflow_spec from 0019, etc.).
+	var runnerKindCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'runner_kind'`,
+	).Scan(&runnerKindCol); err != nil {
+		t.Fatalf("query runs.runner_kind column: %v", err)
+	}
+	if runnerKindCol != 0 {
+		t.Errorf("runs.runner_kind count after MigrateDown = %d, want 0 (0024 down dropped it)", runnerKindCol)
+	}
 	var mcpTokensTable int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables
@@ -215,8 +226,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&mcpTokensTable); err != nil {
 		t.Fatalf("query mcp_tokens table: %v", err)
 	}
-	if mcpTokensTable != 0 {
-		t.Errorf("mcp_tokens count after MigrateDown = %d, want 0 (0023 down dropped it)", mcpTokensTable)
+	if mcpTokensTable != 1 {
+		t.Errorf("mcp_tokens table count after MigrateDown = %d, want 1 (0023 still applied; only 0024 rolled back)", mcpTokensTable)
 	}
 	var maxRetriesCol, retryAttemptCol, workflowSpecCol, gateBlockingChecksCol, requiredChecksCol, parentRunIDCol, pullRequestURLCol, stageChecksTable, gateTypeCol, requiresApprovalCol, signingIDCol, idempotencyCol, usersCount, sessionsCount, apiTokensCount, deliveriesCount, approvalsCount, runsCount int
 	if err := pool.QueryRow(context.Background(),

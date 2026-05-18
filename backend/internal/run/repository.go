@@ -53,6 +53,13 @@ type CreateRunParams struct {
 	// pass the explicit value from spec parsing — see
 	// dispatcher.resolveMaxRetriesForCreate.
 	MaxRetriesSnapshot int
+	// RunnerKind tags the execution backend that will run this run
+	// (ADR-022 / #388). Empty string means "use the migration's
+	// default" (RunnerKindGitHubActions); callers stamping a
+	// non-GHA backend (Phase C local-runner; future K8s) pass it
+	// explicitly. The backend rejects unknown values at the API
+	// boundary; only callers known to be valid reach the repo.
+	RunnerKind string
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.
@@ -108,6 +115,11 @@ type ListRunsFilter struct {
 	// "issue:42"). Used by the dispatcher to find prior runs on
 	// the same issue when threading a new follow-up (#216).
 	TriggerRef *string
+	// RunnerKind filters by execution backend (ADR-022 / #388).
+	// Empty = no constraint; equality match against
+	// runs.runner_kind otherwise. Compliance consumers use this
+	// to filter to `github_actions`-only reports.
+	RunnerKind *string
 	Limit      int
 	Offset     int
 }

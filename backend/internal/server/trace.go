@@ -144,16 +144,35 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Audit: append a chained entry tying the upload to this run's
-	// prior history. AppendChained holds a row-lock on runs so two
-	// concurrent uploads can't fork the chain.
-	auditPayload, _ := json.Marshal(map[string]any{
+	// Look up the run's recorded runner_kind so the audit payload
+	// can attest it (ADR-022 / #388). The dispatcher / handleCreateRun
+	// stamps this at run-create time; the trace handler reads and
+	// records it. The runner never self-declares — its claim would
+	// be unverifiable.
+	//
+	// Best-effort: when RunRepo isn't wired (legacy / minimal
+	// config) or the lookup fails, omit the field from the audit
+	// payload. Readers treat missing as legacy per ADR-022's
+	// back-compat semantics (default `github_actions`). Surfacing
+	// an honest "we don't know" beats stamping a default that
+	// might be wrong.
+	auditFields := map[string]any{
 		"run_id":       runID.String(),
 		"stage_id":     stageID.String(),
 		"variant":      string(variant),
 		"content_hash": contentHash,
 		"size_bytes":   len(body),
-	})
+	}
+	if s.cfg.RunRepo != nil {
+		if runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err == nil && runRow.RunnerKind != "" {
+			auditFields["runner_kind"] = runRow.RunnerKind
+		}
+	}
+
+	// Audit: append a chained entry tying the upload to this run's
+	// prior history. AppendChained holds a row-lock on runs so two
+	// concurrent uploads can't fork the chain.
+	auditPayload, _ := json.Marshal(auditFields)
 	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:     runID,
