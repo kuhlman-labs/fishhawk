@@ -37,6 +37,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerRetryStage(srv, resolver)
 	registerApprovePlan(srv, resolver)
 	registerRejectPlan(srv, resolver)
+	registerListRuns(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All
@@ -964,4 +965,107 @@ func (r *runResolver) resolvePlanStage(ctx context.Context, runIDStr string) (*S
 		}
 	}
 	return nil, fmt.Errorf("no plan stage on run %s; this run's workflow may not have a plan stage (e.g. routine_change)", runIDStr)
+}
+
+// listRunsLimitDefault / listRunsLimitMax bound the
+// fishhawk_list_runs tool's limit input. Matches the backend's
+// own defaults (runsDefaultLimit=50, runsMaxLimit=200 per
+// server/runs.go) — clamping client-side means a bad input
+// surfaces as a clean tool error rather than a backend 400.
+const (
+	listRunsLimitDefault = 50
+	listRunsLimitMax     = 200
+)
+
+// validRunStates mirrors `server/runs.go::validRunStates`. The
+// MCP tool catches bad values before the HTTP hop so the agent
+// gets a typed error instead of a generic 400.
+var validRunStates = map[string]struct{}{
+	"pending":   {},
+	"running":   {},
+	"succeeded": {},
+	"failed":    {},
+	"cancelled": {},
+}
+
+// ListRunsInput is the fishhawk_list_runs tool's input schema
+// (E22.5 / #394). Mirrors the CLI's `fishhawk run list`.
+type ListRunsInput struct {
+	Repo       string `json:"repo,omitempty" jsonschema:"filter by GitHub repo as owner/name"`
+	WorkflowID string `json:"workflow_id,omitempty" jsonschema:"filter by workflow key (e.g. 'feature_change')"`
+	State      string `json:"state,omitempty" jsonschema:"filter by run state; one of pending, running, succeeded, failed, cancelled"`
+	Limit      int    `json:"limit,omitempty" jsonschema:"max items per page (default 50, capped at 200)"`
+	Cursor     string `json:"cursor,omitempty" jsonschema:"pagination cursor returned by a prior list call as next_cursor"`
+}
+
+// ListRunsOutput mirrors the OpenAPI paginated list envelope.
+// NextCursor is empty when the page reached the end of the result
+// set.
+type ListRunsOutput struct {
+	Items      []Run  `json:"items"`
+	NextCursor string `json:"next_cursor,omitempty" jsonschema:"opaque pagination cursor; empty when no more pages remain"`
+}
+
+// registerListRuns wires the fishhawk_list_runs tool (E22.5 /
+// #394). Mirrors the CLI's `fishhawk run list` — the operator's
+// "what runs do I have" enumeration with optional filters.
+//
+// Read tool: works with both runner-side fhm_* tokens (the agent
+// can list runs to give the operator context) and operator-side
+// fhk_* tokens.
+func registerListRuns(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_list_runs",
+		Description: strings.TrimSpace(`
+List Fishhawk runs with optional filters.
+
+Mirrors the CLI's "fishhawk run list" verb. Returns runs ordered by
+created_at descending; pagination via opaque cursor (feed back into
+a subsequent call as cursor to walk past the first page).
+
+Inputs:
+  - repo        — filter by GitHub repo (owner/name)
+  - workflow_id — filter by workflow key (e.g. 'feature_change')
+  - state       — filter by run state; one of pending, running,
+                  succeeded, failed, cancelled
+  - limit       — default 50, capped at 200
+  - cursor      — opaque pagination token from a prior call
+
+Response: items[] (Run shape) + next_cursor (empty when the page
+exhausts the result set).
+`),
+	}, resolver.listRuns)
+}
+
+// listRuns is the tool handler.
+func (r *runResolver) listRuns(ctx context.Context, _ *mcp.CallToolRequest, in ListRunsInput) (*mcp.CallToolResult, ListRunsOutput, error) {
+	if in.State != "" {
+		if _, ok := validRunStates[in.State]; !ok {
+			return nil, ListRunsOutput{}, fmt.Errorf("state %q is not one of pending, running, succeeded, failed, cancelled", in.State)
+		}
+	}
+	limit := clampListRunsLimit(in.Limit)
+	page, err := r.api.ListRuns(ctx, listRunsFilter{
+		Repo:       in.Repo,
+		WorkflowID: in.WorkflowID,
+		State:      in.State,
+		Limit:      limit,
+		Cursor:     in.Cursor,
+	})
+	if err != nil {
+		return nil, ListRunsOutput{}, fmt.Errorf("list runs: %w", err)
+	}
+	return nil, ListRunsOutput{Items: page.Items, NextCursor: page.NextCursor}, nil
+}
+
+// clampListRunsLimit applies the default + cap. Centralized so the
+// test surface can exercise the clamp directly.
+func clampListRunsLimit(n int) int {
+	if n <= 0 {
+		return listRunsLimitDefault
+	}
+	if n > listRunsLimitMax {
+		return listRunsLimitMax
+	}
+	return n
 }
