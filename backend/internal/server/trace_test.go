@@ -451,6 +451,69 @@ func TestShipTrace_TransitionsStageToAwaitingApproval(t *testing.T) {
 	}
 }
 
+// TestShipTrace_PendingStage_WalksThroughDispatched is the
+// local-runner counterpart to the GHA flow (#416-followup): the
+// GHA dispatcher transitions pending → dispatched after firing
+// workflow_dispatch, but the local-runner path skips that step
+// (there's no workflow_dispatch fire). Without this branch the
+// trace handler's pending → running transition would be rejected
+// by the state machine and the stage would stay in pending
+// forever. The handler walks pending → dispatched first when it
+// finds the stage in pending, then continues the normal chain.
+func TestShipTrace_PendingStage_WalksThroughDispatched(t *testing.T) {
+	s, sf, _, _ := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStatePending) // the local-runner shape
+	s.cfg.RunRepo = rr
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if rr.stages[stage.ID].State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (pending start should still reach the terminal)",
+			rr.stages[stage.ID].State)
+	}
+	// Three-step walk: pending → dispatched → running → awaiting_approval.
+	if len(rr.transitions) != 3 {
+		t.Fatalf("transitions = %d, want 3 (the extra step is pending → dispatched):\n%+v",
+			len(rr.transitions), rr.transitions)
+	}
+	if rr.transitions[0].To != run.StageStateDispatched {
+		t.Errorf("transitions[0] = %q, want dispatched (the new step)", rr.transitions[0].To)
+	}
+	if rr.transitions[1].To != run.StageStateRunning {
+		t.Errorf("transitions[1] = %q, want running", rr.transitions[1].To)
+	}
+	if rr.transitions[2].To != run.StageStateAwaitingApproval {
+		t.Errorf("transitions[2] = %q, want awaiting_approval", rr.transitions[2].To)
+	}
+}
+
+// TestShipTrace_DispatchedStage_SkipsExtraStep guards the
+// regression direction: when the stage IS already in dispatched
+// (the GHA happy path), we don't accidentally walk it through
+// dispatched again — same-state is a no-op but the audit chain
+// shouldn't grow extra rows.
+func TestShipTrace_DispatchedStage_SkipsExtraStep(t *testing.T) {
+	s, sf, _, _ := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	s.cfg.RunRepo = rr
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	// Still the original two-step walk for the GHA shape.
+	if len(rr.transitions) != 2 {
+		t.Errorf("transitions = %d, want 2 (GHA path is unchanged):\n%+v",
+			len(rr.transitions), rr.transitions)
+	}
+}
+
 func TestShipTrace_GatelessStage_TransitionsStraightToSucceeded(t *testing.T) {
 	// Implement stages have no approval gate per workflows.yaml.
 	// The trace upload handler must walk dispatched → running →

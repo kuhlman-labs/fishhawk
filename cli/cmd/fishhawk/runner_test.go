@@ -110,6 +110,61 @@ func TestRunnerStart_HappyPath_BuildsExpectedArgv(t *testing.T) {
 	}
 }
 
+// TestRunnerStart_PlanStage_PassesPlanOut exercises the
+// local-runner plan-validation wiring: when --stage plan, the CLI
+// auto-appends --plan-out /tmp/fishhawk-plan.json so the runner
+// validates + uploads the plan artifact the agent produces. The
+// GHA action.yml passes the same path; we mirror it here. Without
+// this flag the plan stage uploads a trace but the artifact never
+// lands and the stage is stuck.
+func TestRunnerStart_PlanStage_PassesPlanOut(t *testing.T) {
+	cap := withFakeRunnerSpawn(t)
+	withFakeGitRemote(t, "https://github.com/kuhlman-labs/fishhawk.git", nil)
+
+	var stdout, stderr strings.Builder
+	got := run([]string{
+		"runner", "start",
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--workflow", "feature_change",
+		"--stage", "plan",
+	}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !contains(cap.args, "--plan-out") {
+		t.Errorf("plan-stage argv missing --plan-out: %v", cap.args)
+	}
+	if !contains(cap.args, "/tmp/fishhawk-plan.json") {
+		t.Errorf("plan-stage argv missing /tmp/fishhawk-plan.json: %v", cap.args)
+	}
+}
+
+// TestRunnerStart_NonPlanStage_OmitsPlanOut pins the negative: for
+// implement / review the wrapper does NOT pass --plan-out. The
+// runner only validates + uploads when --plan-out is set; passing
+// it for stages that don't produce a plan would either silently
+// no-op or warn.
+func TestRunnerStart_NonPlanStage_OmitsPlanOut(t *testing.T) {
+	for _, stage := range []string{"implement", "review"} {
+		t.Run(stage, func(t *testing.T) {
+			cap := withFakeRunnerSpawn(t)
+			withFakeGitRemote(t, "https://github.com/x/y.git", nil)
+			got := run([]string{
+				"runner", "start",
+				"--run-id", "1", "--stage-id", "2",
+				"--workflow", "w", "--stage", stage,
+			}, &strings.Builder{}, &strings.Builder{})
+			if got != exitOK {
+				t.Fatalf("run = %d", got)
+			}
+			if contains(cap.args, "--plan-out") {
+				t.Errorf("%s-stage argv should NOT include --plan-out: %v", stage, cap.args)
+			}
+		})
+	}
+}
+
 func TestRunnerStart_GithubRepoFlag_OverridesAutoDetect(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	// Auto-detect would return one repo; the explicit flag should win.
