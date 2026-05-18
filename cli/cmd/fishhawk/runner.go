@@ -9,6 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/cli/internal/ghcomment"
 )
 
 // runRunner dispatches to `fishhawk runner <subcommand>`. v0 ships
@@ -182,6 +186,29 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		}
 		_, _ = fmt.Fprintf(stderr, "fishhawk runner start: spawn failed: %v\n", err)
 		return exitFailure
+	}
+
+	// #416: after the runner exits cleanly, post a stage-complete
+	// comment on the triggering issue for local-runner runs.
+	// Best-effort — failure here does not affect the verb's exit
+	// code. The runner's success is the canonical outcome; the
+	// comment is a courtesy.
+	parsedRunID, perr := uuid.Parse(*runID)
+	if perr == nil {
+		clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
+		defer clientCancel()
+		client := newClient(cf)
+		if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil {
+			// The runner advanced the stage via the trace
+			// upload; the post-upload transition fires on the
+			// backend. We surface the run-level rollup state
+			// here — a follow-up can fetch the specific stage
+			// by id for finer wording when needed.
+			maybePostLocalComment(stderr, r,
+				ghcomment.RenderStageComplete(
+					toGhCommentRun(r, *cf.backendURL),
+					*stage, r.State))
+		}
 	}
 	return exitOK
 }

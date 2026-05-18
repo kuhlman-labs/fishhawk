@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/cli/internal/ghcomment"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
 
@@ -121,6 +122,24 @@ func planDecision(name string, decision httpclient.ApprovalDecision, args []stri
 		}
 	default:
 		printStage(stdout, stage)
+	}
+
+	// #416: comment on the triggering issue when this is a local-
+	// runner run. SubmitApproval returns the stage; we need the
+	// run row to read RunnerKind + IssueContext, so an extra
+	// GetRun is unavoidable. Best-effort — failures don't change
+	// the verb's exit code.
+	if r := fetchRunForComment(ctx, client, runID); r != nil {
+		gcr := toGhCommentRun(r, *cf.backendURL)
+		handle := resolveGitHubHandle()
+		var body string
+		switch decision {
+		case httpclient.ApprovalApprove:
+			body = ghcomment.RenderPlanApproved(gcr, handle)
+		case httpclient.ApprovalReject:
+			body = ghcomment.RenderPlanRejected(gcr, handle, *reason)
+		}
+		maybePostLocalComment(stderr, r, body)
 	}
 	return exitOK
 }
