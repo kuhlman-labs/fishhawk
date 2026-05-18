@@ -14,9 +14,9 @@ import (
 
 const createRun = `-- name: CreateRun :one
 
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind
 `
 
 type CreateRunParams struct {
@@ -34,6 +34,7 @@ type CreateRunParams struct {
 	WorkflowSpec           []byte     `json:"workflow_spec"`
 	RetryAttempt           int32      `json:"retry_attempt"`
 	MaxRetriesSnapshot     int32      `json:"max_retries_snapshot"`
+	RunnerKind             string     `json:"runner_kind"`
 }
 
 // Run / stage queries consumed by the postgres adapter for the
@@ -55,6 +56,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		arg.WorkflowSpec,
 		arg.RetryAttempt,
 		arg.MaxRetriesSnapshot,
+		arg.RunnerKind,
 	)
 	var i Run
 	err := row.Scan(
@@ -75,6 +77,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.WorkflowSpec,
 		&i.RetryAttempt,
 		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
 	)
 	return i, err
 }
@@ -141,7 +144,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot FROM runs WHERE id = $1
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind FROM runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -165,12 +168,13 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.WorkflowSpec,
 		&i.RetryAttempt,
 		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
 	)
 	return i, err
 }
 
 const getRunByIdempotencyKey = `-- name: GetRunByIdempotencyKey :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind FROM runs
  WHERE repo = $1
    AND idempotency_key = $2
 `
@@ -204,6 +208,7 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 		&i.WorkflowSpec,
 		&i.RetryAttempt,
 		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
 	)
 	return i, err
 }
@@ -238,14 +243,15 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 }
 
 const listRuns = `-- name: ListRuns :many
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind FROM runs
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR workflow_id = $2)
    AND ($3::text = '' OR state = $3)
    AND ($4::text IS NULL OR pull_request_url = $4)
    AND ($5::text IS NULL OR trigger_ref = $5)
+   AND ($6::text IS NULL OR runner_kind = $6)
  ORDER BY created_at DESC, id DESC
- LIMIT $7 OFFSET $6
+ LIMIT $8 OFFSET $7
 `
 
 type ListRunsParams struct {
@@ -254,6 +260,7 @@ type ListRunsParams struct {
 	State          string  `json:"state"`
 	PullRequestUrl *string `json:"pull_request_url"`
 	TriggerRef     *string `json:"trigger_ref"`
+	RunnerKind     *string `json:"runner_kind"`
 	Off            int32   `json:"off"`
 	Lim            int32   `json:"lim"`
 }
@@ -273,6 +280,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 		arg.State,
 		arg.PullRequestUrl,
 		arg.TriggerRef,
+		arg.RunnerKind,
 		arg.Off,
 		arg.Lim,
 	)
@@ -301,6 +309,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 			&i.WorkflowSpec,
 			&i.RetryAttempt,
 			&i.MaxRetriesSnapshot,
+			&i.RunnerKind,
 		); err != nil {
 			return nil, err
 		}
@@ -455,7 +464,7 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 }
 
 const lockRunForUpdate = `-- name: LockRunForUpdate :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot FROM runs WHERE id = $1 FOR UPDATE
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind FROM runs WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -479,6 +488,7 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 		&i.WorkflowSpec,
 		&i.RetryAttempt,
 		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
 	)
 	return i, err
 }
@@ -516,7 +526,7 @@ const setRunPullRequestURL = `-- name: SetRunPullRequestURL :one
 UPDATE runs
    SET pull_request_url = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind
 `
 
 type SetRunPullRequestURLParams struct {
@@ -549,6 +559,7 @@ func (q *Queries) SetRunPullRequestURL(ctx context.Context, arg SetRunPullReques
 		&i.WorkflowSpec,
 		&i.RetryAttempt,
 		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
 	)
 	return i, err
 }
@@ -557,7 +568,7 @@ const updateRunState = `-- name: UpdateRunState :one
 UPDATE runs
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind
 `
 
 type UpdateRunStateParams struct {
@@ -586,6 +597,7 @@ func (q *Queries) UpdateRunState(ctx context.Context, arg UpdateRunStateParams) 
 		&i.WorkflowSpec,
 		&i.RetryAttempt,
 		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
 	)
 	return i, err
 }

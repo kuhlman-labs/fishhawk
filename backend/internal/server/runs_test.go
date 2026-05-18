@@ -35,6 +35,11 @@ type fakeRepo struct {
 	getErr        error
 	transitionErr error
 	listErr       error
+
+	// lastListFilter captures the most-recent ListRuns filter for
+	// tests that need to assert filter-forwarding (runner_kind,
+	// pull_request_url, etc.).
+	lastListFilter run.ListRunsFilter
 }
 
 func newFakeRepo() *fakeRepo {
@@ -48,6 +53,12 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		return nil, f.createErr
 	}
 	now := time.Now().UTC()
+	// Mirror the postgres adapter's empty → github_actions default
+	// so the fake's behavior tracks production.
+	runnerKind := p.RunnerKind
+	if runnerKind == "" {
+		runnerKind = run.RunnerKindGitHubActions
+	}
 	r := &run.Run{
 		ID:             uuid.New(),
 		Repo:           p.Repo,
@@ -56,6 +67,7 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		TriggerSource:  p.TriggerSource,
 		TriggerRef:     p.TriggerRef,
 		IdempotencyKey: p.IdempotencyKey,
+		RunnerKind:     runnerKind,
 		State:          run.StatePending,
 		CreatedAt:      now,
 		UpdatedAt:      now,
@@ -121,6 +133,7 @@ func (f *fakeRepo) TransitionRun(_ context.Context, id uuid.UUID, to run.State) 
 func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.Run, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastListFilter = fil
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -979,5 +992,104 @@ func TestRoundTrip_CreateThenGet(t *testing.T) {
 	}
 	if fetched.ID != created.ID {
 		t.Errorf("ID round-trip mismatch: %s vs %s", fetched.ID, created.ID)
+	}
+}
+
+// --- runner_kind (E22.7 / #404) ---
+
+func TestCreateRun_RunnerKind_DefaultsGitHubActions(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := `{
+		"repo": "x/y",
+		"workflow_id": "feature_change",
+		"workflow_sha": "abc",
+		"trigger_source": "cli"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.RunnerKind != run.RunnerKindGitHubActions {
+		t.Errorf("RunnerKind = %q, want github_actions", got.RunnerKind)
+	}
+}
+
+func TestCreateRun_RunnerKind_AcceptsLocal(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := `{
+		"repo": "x/y",
+		"workflow_id": "feature_change",
+		"workflow_sha": "abc",
+		"trigger_source": "cli",
+		"runner_kind": "local"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.RunnerKind != run.RunnerKindLocal {
+		t.Errorf("RunnerKind = %q, want local", got.RunnerKind)
+	}
+}
+
+func TestCreateRun_RunnerKind_RejectsUnknown(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := `{
+		"repo": "x/y",
+		"workflow_id": "feature_change",
+		"workflow_sha": "abc",
+		"trigger_source": "cli",
+		"runner_kind": "k8s"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "runner_kind") {
+		t.Errorf("body should reference runner_kind: %s", w.Body.String())
+	}
+}
+
+func TestListRuns_RunnerKindFilter_Forwards(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs?runner_kind=github_actions", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if repo.lastListFilter.RunnerKind == nil {
+		t.Fatal("RunnerKind filter not forwarded to repo")
+	}
+	if *repo.lastListFilter.RunnerKind != run.RunnerKindGitHubActions {
+		t.Errorf("RunnerKind filter = %q, want github_actions", *repo.lastListFilter.RunnerKind)
+	}
+}
+
+func TestListRuns_RunnerKindFilter_RejectsUnknown(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs?runner_kind=k8s", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
 	}
 }

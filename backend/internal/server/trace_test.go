@@ -555,3 +555,81 @@ func TestShipTrace_RedactedVariant(t *testing.T) {
 		t.Errorf("variant not preserved in BundleRef: %+v", ts.last)
 	}
 }
+
+// TestShipTrace_StampsRunnerKindInAuditPayload pins the E22.7 / #404
+// invariant: when a RunRepo is wired and the run has a runner_kind,
+// the trace_uploaded audit payload carries that field. The backend
+// is the source of truth on provenance — the runner never declares it.
+func TestShipTrace_StampsRunnerKindInAuditPayload(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr := newFakeRepo()
+	// Seed a run with runner_kind=local — the local-runner mode
+	// (Phase C) would create runs tagged this way. Confirms the
+	// audit payload reflects what's actually on the run row.
+	rr.runs[runID] = &run.Run{
+		ID:         runID,
+		Repo:       "x/y",
+		RunnerKind: run.RunnerKindLocal,
+		State:      run.StatePending,
+	}
+
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: sf,
+		TraceStore:  ts,
+		AuditRepo:   au,
+		RunRepo:     rr,
+	})
+
+	w := shipRequest(t, s, runID, stageID, "raw", priv, []byte("body"), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	if len(au.appended) != 1 {
+		t.Fatalf("audit appended %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if got, _ := payload["runner_kind"].(string); got != run.RunnerKindLocal {
+		t.Errorf("payload.runner_kind = %q, want local", got)
+	}
+}
+
+// TestShipTrace_OmitsRunnerKindWhenRunRepoNil pins the back-compat
+// path: when the trace handler runs in a minimal config without a
+// RunRepo (legacy dev backends), the audit payload omits the field
+// rather than stamping a guessed default. Readers treat missing as
+// legacy / github_actions per ADR-022's back-compat semantics.
+func TestShipTrace_OmitsRunnerKindWhenRunRepoNil(t *testing.T) {
+	s, sf, _, au := newTraceServer(t) // no RunRepo wired
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	w := shipRequest(t, s, runID, stageID, "raw", priv, []byte("body"), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if _, present := payload["runner_kind"]; present {
+		t.Errorf("payload should omit runner_kind when no RunRepo; got %v", payload["runner_kind"])
+	}
+}

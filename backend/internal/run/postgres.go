@@ -60,6 +60,15 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 	if maxRetries <= 0 {
 		maxRetries = 1
 	}
+	// runner_kind: empty input → migration default `github_actions`.
+	// Same pattern as max_retries: sqlc emits the column on every
+	// INSERT, so we substitute the default at the repo layer
+	// instead of relying on the column default (which only fires
+	// when the INSERT omits the column).
+	runnerKind := p.RunnerKind
+	if runnerKind == "" {
+		runnerKind = RunnerKindGitHubActions
+	}
 	row, err := q.CreateRun(ctx, rundb.CreateRunParams{
 		ID:                     uuid.New(),
 		Repo:                   p.Repo,
@@ -75,6 +84,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		WorkflowSpec:           p.WorkflowSpec,
 		RetryAttempt:           int32(p.RetryAttempt),
 		MaxRetriesSnapshot:     int32(maxRetries),
+		RunnerKind:             runnerKind,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -123,6 +133,7 @@ func (r *postgresRepo) ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, 
 		State:          f.State,
 		PullRequestUrl: f.PullRequestURL,
 		TriggerRef:     f.TriggerRef,
+		RunnerKind:     f.RunnerKind,
 		Lim:            int32(f.Limit),
 		Off:            int32(f.Offset),
 	})
@@ -403,6 +414,7 @@ func rowToRun(r rundb.Run) *Run {
 		WorkflowSpec:       r.WorkflowSpec,
 		RetryAttempt:       int(r.RetryAttempt),
 		MaxRetriesSnapshot: int(r.MaxRetriesSnapshot),
+		RunnerKind:         r.RunnerKind,
 		State:              State(r.State),
 		CreatedAt:          r.CreatedAt.Time,
 		UpdatedAt:          r.UpdatedAt.Time,
