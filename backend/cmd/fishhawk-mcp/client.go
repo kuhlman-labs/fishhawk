@@ -138,6 +138,36 @@ type StartRunParams struct {
 	IdempotencyKey string
 }
 
+// approvalRequest mirrors the backend's
+// `POST /v0/stages/{stage_id}/approvals` body
+// (`backend/internal/server/approvals.go::approvalRequest`).
+type approvalRequest struct {
+	Decision string `json:"decision"`
+	Comment  string `json:"comment,omitempty"`
+}
+
+// SubmitApproval posts an approve or reject decision against the
+// given stage. `decision` must be "approve" or "reject"; `comment`
+// is optional but recommended on rejects (the CLI emits a warning
+// when missing). Returns the updated Stage. 4xx surfaces:
+//   - 400 validation_failed (decision other than approve/reject)
+//   - 404 stage_not_found
+//   - 409 review_stage_managed_by_github (review-stage approvals
+//     live on GitHub per ADR-018; not relevant for the MCP plan-
+//     approval tools but the wrapper surfaces the code if a future
+//     caller reaches this method with a review-stage id)
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment string) (*Stage, error) {
+	body, err := json.Marshal(approvalRequest{Decision: decision, Comment: comment})
+	if err != nil {
+		return nil, fmt.Errorf("marshal approval: %w", err)
+	}
+	var s Stage
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/approvals", body, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 // RetryStage re-fires a failed stage via
 // `POST /v0/stages/{stage_id}/retry`. Returns the updated Stage row
 // (failed → pending → dispatched for category A/C; failed →

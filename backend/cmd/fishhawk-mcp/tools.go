@@ -35,6 +35,8 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerStartRun(srv, resolver)
 	registerCancelRun(srv, resolver)
 	registerRetryStage(srv, resolver)
+	registerApprovePlan(srv, resolver)
+	registerRejectPlan(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All
@@ -813,4 +815,153 @@ func (r *runResolver) retryStage(ctx context.Context, _ *mcp.CallToolRequest, in
 		return nil, RetryStageOutput{}, fmt.Errorf("retry stage: %w", err)
 	}
 	return nil, RetryStageOutput{Stage: *retried}, nil
+}
+
+// ApprovePlanInput is the fishhawk_approve_plan tool's input
+// schema (E22.4 / #393). Mirrors the CLI's `fishhawk plan approve
+// <run-id> [--reason …]` — takes a run id, the resolver finds the
+// plan stage internally.
+type ApprovePlanInput struct {
+	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being approved"`
+	Reason string `json:"reason,omitempty" jsonschema:"optional reviewer rationale, recorded on the approval row as 'comment'"`
+}
+
+// ApprovePlanOutput surfaces the post-approve Stage row plus the
+// resolved plan-stage id (the caller passed a run id, not a stage
+// id, so the response makes the resolution visible for audit
+// clarity).
+type ApprovePlanOutput struct {
+	Stage   Stage  `json:"stage"`
+	StageID string `json:"stage_id" jsonschema:"the resolved plan-stage UUID the approval was posted to"`
+}
+
+// RejectPlanInput mirrors `fishhawk plan reject <run-id> [--reason
+// …]`. Reason is recommended; the CLI emits a warning when missing
+// because reject without a rationale is poor practice.
+type RejectPlanInput struct {
+	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being rejected"`
+	Reason string `json:"reason,omitempty" jsonschema:"reviewer rationale; recommended on rejects (the CLI warns when missing)"`
+}
+
+// RejectPlanOutput mirrors ApprovePlanOutput.
+type RejectPlanOutput struct {
+	Stage   Stage  `json:"stage"`
+	StageID string `json:"stage_id" jsonschema:"the resolved plan-stage UUID the rejection was posted to"`
+}
+
+// registerApprovePlan wires the fishhawk_approve_plan tool (E22.4
+// / #393). Resolves the plan stage from the run id, then posts an
+// approve decision via the existing /v0/stages/{id}/approvals
+// endpoint. Idempotent at the backend's existing approval-
+// idempotency layer (same authenticated subject re-submitting
+// returns the existing row).
+//
+// Auth: write tool. Operator-side fhk_* tokens with `write:
+// approvals` scope succeed; runner-side fhm_* tokens surface 403
+// (their `mcp:read` scope can't authorize an approval).
+func registerApprovePlan(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_approve_plan",
+		Description: strings.TrimSpace(`
+Approve a Fishhawk plan.
+
+Mirrors the CLI's "fishhawk plan approve <run-id> [--reason …]" verb.
+Takes a run id; the tool resolves the plan stage internally by
+listing the run's stages and finding the one with type=plan.
+
+Returns the updated Stage row (typically State=succeeded after
+approve) and the resolved plan-stage UUID so the response makes
+the resolution visible.
+
+Common error shapes (surfaced as tool errors):
+  - "no plan stage" — the run has no plan stage (a routine_change
+    workflow, or a malformed run)
+  - "plan stage not awaiting approval" — the stage is already
+    terminal or in a non-approvable state
+  - role-based 403 from the backend when the caller's subject
+    isn't in the gate's approver list
+`),
+	}, resolver.approvePlan)
+}
+
+// registerRejectPlan wires the fishhawk_reject_plan tool.
+func registerRejectPlan(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_reject_plan",
+		Description: strings.TrimSpace(`
+Reject a Fishhawk plan.
+
+Mirrors the CLI's "fishhawk plan reject <run-id> [--reason …]" verb.
+Takes a run id; the tool resolves the plan stage internally.
+
+Rejection fails the plan stage as category D (gate didn't pass).
+The reason is stored on the approval row as 'comment' and surfaces
+in the audit log + the plan-on-issue comment's status footer
+(#377). Reason is optional but recommended — the CLI warns when
+missing.
+
+Same resolver + error shapes as fishhawk_approve_plan.
+`),
+	}, resolver.rejectPlan)
+}
+
+// approvePlan is the tool handler.
+func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, in ApprovePlanInput) (*mcp.CallToolResult, ApprovePlanOutput, error) {
+	planStage, err := r.resolvePlanStage(ctx, in.RunID)
+	if err != nil {
+		return nil, ApprovePlanOutput{}, err
+	}
+	stageID, err := uuid.Parse(planStage.ID)
+	if err != nil {
+		return nil, ApprovePlanOutput{}, fmt.Errorf("resolved plan stage has invalid id %q: %w", planStage.ID, err)
+	}
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason)
+	if err != nil {
+		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
+	}
+	return nil, ApprovePlanOutput{Stage: *updated, StageID: updated.ID}, nil
+}
+
+// rejectPlan is the tool handler.
+func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in RejectPlanInput) (*mcp.CallToolResult, RejectPlanOutput, error) {
+	planStage, err := r.resolvePlanStage(ctx, in.RunID)
+	if err != nil {
+		return nil, RejectPlanOutput{}, err
+	}
+	stageID, err := uuid.Parse(planStage.ID)
+	if err != nil {
+		return nil, RejectPlanOutput{}, fmt.Errorf("resolved plan stage has invalid id %q: %w", planStage.ID, err)
+	}
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason)
+	if err != nil {
+		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
+	}
+	return nil, RejectPlanOutput{Stage: *updated, StageID: updated.ID}, nil
+}
+
+// resolvePlanStage walks the run's stages and returns the one with
+// type=plan. Shared by fishhawk_approve_plan and fishhawk_reject_
+// plan because both surface the same input shape (run id, not
+// stage id) — pushing stage-id-from-run-id discovery server-side
+// keeps the agent's reasoning simple.
+//
+// Returns a typed error for the missing-plan-stage case so the
+// tool error message is operator-readable rather than a generic
+// "not found." Local UUID parse on the input is a fast-path that
+// catches obvious typos before the HTTP hop.
+func (r *runResolver) resolvePlanStage(ctx context.Context, runIDStr string) (*Stage, error) {
+	runID, err := uuid.Parse(runIDStr)
+	if err != nil {
+		return nil, fmt.Errorf("run_id %q is not a valid UUID: %w", runIDStr, err)
+	}
+	stages, err := r.api.ListRunStages(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list run stages: %w", err)
+	}
+	for i := range stages {
+		if stages[i].Type == "plan" {
+			return &stages[i], nil
+		}
+	}
+	return nil, fmt.Errorf("no plan stage on run %s; this run's workflow may not have a plan stage (e.g. routine_change)", runIDStr)
 }
