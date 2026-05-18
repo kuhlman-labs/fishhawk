@@ -29,6 +29,15 @@ type fakeRepo struct {
 	mu   sync.Mutex
 	runs map[uuid.UUID]*run.Run
 
+	// stagesByRun tracks CreateStage calls so #411 tests can assert
+	// the API runs handler actually persists stages from the spec.
+	// Ordered by spec sequence (the slice index).
+	stagesByRun map[uuid.UUID][]*run.Stage
+
+	// createStageErr lets a test fail the create-stage path so the
+	// rollback / 500 surface is reachable.
+	createStageErr error
+
 	// createErr / getErr / transitionErr / listErr let tests inject
 	// failures without instrumenting fakeRepo's internals.
 	createErr     error
@@ -40,15 +49,25 @@ type fakeRepo struct {
 	// tests that need to assert filter-forwarding (runner_kind,
 	// pull_request_url, etc.).
 	lastListFilter run.ListRunsFilter
+
+	// lastCreateRunParams captures the most-recent CreateRun call so
+	// tests that need to assert workflow-spec persistence
+	// (WorkflowSpec bytes, MaxRetriesSnapshot) can inspect the
+	// params the handler built.
+	lastCreateRunParams run.CreateRunParams
 }
 
 func newFakeRepo() *fakeRepo {
-	return &fakeRepo{runs: map[uuid.UUID]*run.Run{}}
+	return &fakeRepo{
+		runs:        map[uuid.UUID]*run.Run{},
+		stagesByRun: map[uuid.UUID][]*run.Stage{},
+	}
 }
 
 func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastCreateRunParams = p
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -60,17 +79,19 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		runnerKind = run.RunnerKindGitHubActions
 	}
 	r := &run.Run{
-		ID:             uuid.New(),
-		Repo:           p.Repo,
-		WorkflowID:     p.WorkflowID,
-		WorkflowSHA:    p.WorkflowSHA,
-		TriggerSource:  p.TriggerSource,
-		TriggerRef:     p.TriggerRef,
-		IdempotencyKey: p.IdempotencyKey,
-		RunnerKind:     runnerKind,
-		State:          run.StatePending,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		ID:                 uuid.New(),
+		Repo:               p.Repo,
+		WorkflowID:         p.WorkflowID,
+		WorkflowSHA:        p.WorkflowSHA,
+		TriggerSource:      p.TriggerSource,
+		TriggerRef:         p.TriggerRef,
+		IdempotencyKey:     p.IdempotencyKey,
+		RunnerKind:         runnerKind,
+		WorkflowSpec:       p.WorkflowSpec,
+		MaxRetriesSnapshot: p.MaxRetriesSnapshot,
+		State:              run.StatePending,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	f.runs[r.ID] = r
 	return r, nil
@@ -189,9 +210,42 @@ func (f *fakeRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, url str
 	return r, nil
 }
 
-func (f *fakeRepo) CreateStage(_ context.Context, _ run.CreateStageParams) (*run.Stage, error) {
-	return nil, errors.New("fakeRepo: CreateStage not implemented")
+func (f *fakeRepo) CreateStage(_ context.Context, p run.CreateStageParams) (*run.Stage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createStageErr != nil {
+		return nil, f.createStageErr
+	}
+	now := time.Now().UTC()
+	stage := &run.Stage{
+		ID:               uuid.New(),
+		RunID:            p.RunID,
+		Sequence:         p.Sequence,
+		Type:             p.Type,
+		ExecutorKind:     p.ExecutorKind,
+		ExecutorRef:      p.ExecutorRef,
+		State:            run.StageStatePending,
+		GateSLA:          p.GateSLA,
+		RequiresApproval: p.RequiresApproval,
+		Gate:             p.Gate,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	f.stagesByRun[p.RunID] = append(f.stagesByRun[p.RunID], stage)
+	return stage, nil
 }
+
+// stagesFor returns the stage slice the handler created for the
+// given run, in spec order. Tests use this to assert one Stage row
+// per stage definition lands when workflow_spec is present.
+func (f *fakeRepo) stagesFor(runID uuid.UUID) []*run.Stage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*run.Stage, len(f.stagesByRun[runID]))
+	copy(out, f.stagesByRun[runID])
+	return out
+}
+
 func (f *fakeRepo) GetStage(_ context.Context, _ uuid.UUID) (*run.Stage, error) {
 	return nil, errors.New("fakeRepo: GetStage not implemented")
 }
@@ -1091,5 +1145,261 @@ func TestListRuns_RunnerKindFilter_RejectsUnknown(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+// minimalSpecYAML is the smallest valid workflow spec for the
+// workflow_spec tests below: one workflow with one implement stage,
+// no gates. Mirrors backend/internal/spec/testdata/valid/minimal.yaml.
+const minimalSpecYAML = `version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// gatedSpecYAML carries a plan stage with an approval gate so tests
+// can assert that gate metadata (sla, requires_approval) lands on
+// the corresponding Stage row.
+const gatedSpecYAML = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+            sla: 4_business_hours
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestCreateRun_WorkflowSpec_CreatesStages is the headline #411
+// behavior: posting a workflow_spec inline lands one Stage row per
+// stage in the spec, in spec order, with the right type +
+// executor.
+func TestCreateRun_WorkflowSpec_CreatesStages(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  gatedSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	stages := repo.stagesFor(got.ID)
+	if len(stages) != 2 {
+		t.Fatalf("len(stages) = %d, want 2: %#v", len(stages), stages)
+	}
+	if stages[0].Type != run.StageTypePlan {
+		t.Errorf("stage[0].Type = %q, want plan", stages[0].Type)
+	}
+	if stages[1].Type != run.StageTypeImplement {
+		t.Errorf("stage[1].Type = %q, want implement", stages[1].Type)
+	}
+	// Plan stage carries an approval gate → RequiresApproval true,
+	// GateSLA populated from the spec verbatim.
+	if !stages[0].RequiresApproval {
+		t.Error("stage[0].RequiresApproval = false, want true (plan has approval gate)")
+	}
+	if stages[0].GateSLA == nil || *stages[0].GateSLA != "4_business_hours" {
+		t.Errorf("stage[0].GateSLA = %v, want 4_business_hours", stages[0].GateSLA)
+	}
+	// Implement has no gate → RequiresApproval false, GateSLA nil.
+	if stages[1].RequiresApproval {
+		t.Error("stage[1].RequiresApproval = true, want false")
+	}
+	if stages[1].GateSLA != nil {
+		t.Errorf("stage[1].GateSLA = %v, want nil", stages[1].GateSLA)
+	}
+}
+
+// TestCreateRun_WorkflowSpec_PersistsBytesAndMaxRetries asserts the
+// spec bytes are cached on the run row (so the trace handler's
+// policy re-evaluation can read constraints without refetching)
+// and that MaxRetriesSnapshot is populated from the parsed spec.
+// Matches the dispatcher's cache behavior (#280, #283).
+func TestCreateRun_WorkflowSpec_PersistsBytesAndMaxRetries(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  minimalSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if string(repo.lastCreateRunParams.WorkflowSpec) != minimalSpecYAML {
+		t.Errorf("WorkflowSpec bytes not cached on row; got len=%d, want len=%d",
+			len(repo.lastCreateRunParams.WorkflowSpec), len(minimalSpecYAML))
+	}
+	// The minimal spec has no on_ci_failure → default applies. The
+	// spec package's DefaultMaxRetries is exposed via
+	// webhook.WorkflowMaxRetries which the handler calls; assert
+	// it's a non-zero default rather than coupling the test to the
+	// exact constant.
+	if repo.lastCreateRunParams.MaxRetriesSnapshot == 0 {
+		t.Error("MaxRetriesSnapshot = 0, want default-from-spec")
+	}
+}
+
+// TestCreateRun_WorkflowSpec_MalformedYAML rejects the request
+// with 400 before any DB write — the run row should NOT exist after
+// a parse failure.
+func TestCreateRun_WorkflowSpec_MalformedYAML(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  "this: is: not: valid: yaml: ::",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "workflow_spec") {
+		t.Errorf("body should mention workflow_spec: %s", w.Body.String())
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("expected zero runs created, got %d", len(repo.runs))
+	}
+}
+
+// TestCreateRun_WorkflowSpec_UnknownWorkflowID rejects when the
+// requested workflow_id isn't defined in the supplied spec — same
+// 400 the dispatcher would emit on the GHA path.
+func TestCreateRun_WorkflowSpec_UnknownWorkflowID(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "does_not_exist",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  minimalSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "workflow_id") {
+		t.Errorf("body should reference workflow_id: %s", w.Body.String())
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("expected zero runs created, got %d", len(repo.runs))
+	}
+}
+
+// TestCreateRun_NoWorkflowSpec_LegacyPath documents the legacy
+// shape: when workflow_spec is absent, the handler creates a run
+// row with no stages (the pre-#411 behavior). Kept so integration
+// tests and existing scripts that POST without a spec keep
+// working.
+func TestCreateRun_NoWorkflowSpec_LegacyPath(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body := `{
+		"repo": "x/y",
+		"workflow_id": "trivial",
+		"workflow_sha": "abc",
+		"trigger_source": "cli"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if len(repo.stagesFor(got.ID)) != 0 {
+		t.Errorf("legacy path should not create stages; got %d", len(repo.stagesFor(got.ID)))
+	}
+	if len(repo.lastCreateRunParams.WorkflowSpec) != 0 {
+		t.Error("legacy path should NOT cache workflow spec bytes on the row")
+	}
+}
+
+// TestCreateRun_WorkflowSpec_StageCreateFails_Returns500 covers
+// the unhappy persistence path: parse + spec validation pass, the
+// run row inserts, then CreateStage errors. Server returns 500 and
+// the run row is left behind (orphan) — the dispatcher's behavior
+// on the same failure shape. v0.x can wrap this in a transaction
+// once we have a use case that demands strict atomicity.
+func TestCreateRun_WorkflowSpec_StageCreateFails_Returns500(t *testing.T) {
+	repo := newFakeRepo()
+	repo.createStageErr = errors.New("disk full")
+	s := newServer(t, repo)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  minimalSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "create stages failed") {
+		t.Errorf("body missing diagnostic: %s", w.Body.String())
 	}
 }

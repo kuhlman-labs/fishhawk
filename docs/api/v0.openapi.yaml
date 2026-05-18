@@ -906,6 +906,20 @@ paths:
                     E22 / #389) passes `local` to mint a run that
                     runs on the operator's workstation instead of
                     GitHub Actions.
+                workflow_spec:
+                  type: string
+                  description: |
+                    Optional. YAML body of `.fishhawk/workflows.yaml`
+                    at `workflow_sha`, sent inline so the backend can
+                    create one Stage row per stage definition for
+                    API-minted runs (#411). When omitted, the run row
+                    is created with no stages — the legacy shape kept
+                    for integration tests that just want to seed a
+                    record. The `fishhawk run start` CLI always sends
+                    this field, populated either via auto-discovery
+                    of the local checkout or the `--spec-file` flag.
+                    A malformed or unrecognised-workflow_id body
+                    returns 400 before the run row is created.
       responses:
         '200':
           description: Idempotent replay — existing run returned unchanged.

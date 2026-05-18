@@ -867,7 +867,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		WorkflowSpec: specFile.Content,
 		// Snapshot the CI-retry cap so the SPA can render
 		// "Retry N/M" without re-parsing the spec (#280).
-		MaxRetriesSnapshot: workflowMaxRetries(workflow),
+		MaxRetriesSnapshot: WorkflowMaxRetries(workflow),
 		// Dispatcher-created runs always come from the GHA
 		// workflow_dispatch path (ADR-022 / #388). Local-runner
 		// mode (Phase C of E22 / #389) takes a different code
@@ -884,7 +884,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// dispatched when we fire workflow_dispatch below. Subsequent
 	// stages move forward as the runner reports completion through
 	// the trace upload + state-machine endpoints.
-	stages, err := d.createStages(ctx, created.ID, workflow.Stages)
+	stages, err := CreateStagesFromSpec(ctx, d.Runs, created.ID, workflow.Stages)
 	if err != nil {
 		return fmt.Errorf("dispatcher: create stages: %w", err)
 	}
@@ -1313,7 +1313,7 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 			slog.String("run_id", child.ID.String()))
 		return nil
 	}
-	stages, err := d.createStages(ctx, child.ID, retryStages)
+	stages, err := CreateStagesFromSpec(ctx, d.Runs, child.ID, retryStages)
 	if err != nil {
 		return fmt.Errorf("dispatcher: create retry stages: %w", err)
 	}
@@ -1526,18 +1526,6 @@ func (*Dispatcher) resolveRetryPolicy(_ context.Context, parent *run.Run) (spec.
 		max = wf.OnCIFailure.MaxRetries
 	}
 	return wf, max, true
-}
-
-// workflowMaxRetries returns the spec's on_ci_failure.max_retries
-// value, defaulting to spec.DefaultMaxRetries when the block is
-// absent. Used by the run-create path to snapshot the cap on the
-// runs row (#280) so the SPA can render "Retry N/M" without
-// re-parsing the spec.
-func workflowMaxRetries(wf spec.Workflow) int {
-	if wf.OnCIFailure != nil {
-		return wf.OnCIFailure.MaxRetries
-	}
-	return spec.DefaultMaxRetries
 }
 
 // filterOutPlanStages returns the stages list with all `plan` types
@@ -1824,138 +1812,6 @@ func (d *Dispatcher) writeProtectionRefusalAudit(ctx context.Context, ev Event, 
 		slog.String("workflow_sha", specSHA),
 		slog.String("error", refusalErr.Error()),
 	)
-}
-
-// createStages translates the workflow spec's stage definitions
-// into Stage rows (in StagePending). Returns the created stages
-// in spec order so callers can address the first one.
-//
-// Mapping decisions:
-//   - sequence is the position in the spec's stages array (0-based).
-//   - executorKind comes from spec.Executor: agent → ExecutorAgent,
-//     human → ExecutorHuman.
-//   - executorRef is the agent name for agent stages and a
-//     conventional "human" string for human stages — the field is
-//     non-nullable in the DB schema, and we never read it for human
-//     stages. v0.x can swap to using the role name once approvals
-//     are wired (E3.5 / #45).
-func (d *Dispatcher) createStages(ctx context.Context, runID uuid.UUID, defs []spec.Stage) ([]*run.Stage, error) {
-	out := make([]*run.Stage, 0, len(defs))
-	for i, def := range defs {
-		execKind, execRef := mapExecutor(def)
-		params := run.CreateStageParams{
-			RunID:        runID,
-			Sequence:     i,
-			Type:         run.StageType(def.Type),
-			ExecutorKind: execKind,
-			ExecutorRef:  execRef,
-		}
-		// Persist the first approval gate's SLA string verbatim so
-		// the SLA ticker (E3.11) can scan for timeouts without
-		// re-parsing the spec at every tick. v0 stages typically
-		// carry one approval gate; if multiple are configured we
-		// take the first non-empty SLA. Empty SLA → leave nil
-		// (means "no timeout").
-		if sla := firstApprovalSLA(def.Gates); sla != "" {
-			params.GateSLA = &sla
-		}
-		// Persist whether the stage's spec demands an approval gate
-		// so the trace upload handler can pick the right
-		// post-upload transition (#207). Plan + review have one;
-		// implement does not.
-		params.RequiresApproval = hasApprovalGate(def.Gates)
-		// Persist the primary gate's full shape so the review-stage
-		// UI (and future check-state ingestion) can read
-		// blocking_checks + approvers without re-parsing the spec
-		// (#213). Primary = first approval gate, else first check
-		// gate, else nil.
-		params.Gate = primaryGate(def.Gates)
-		stage, err := d.Runs.CreateStage(ctx, params)
-		if err != nil {
-			return nil, fmt.Errorf("create stage %d (%s): %w", i, def.ID, err)
-		}
-		out = append(out, stage)
-	}
-	return out, nil
-}
-
-// firstApprovalSLA returns the first non-empty SLA from any
-// approval gate in the stage's Gates list. Returns "" when no gate
-// has an SLA (or no approval gate exists).
-func firstApprovalSLA(gates []spec.Gate) string {
-	for _, g := range gates {
-		if g.Type == spec.GateTypeApproval && g.SLA != "" {
-			return g.SLA
-		}
-	}
-	return ""
-}
-
-// hasApprovalGate reports whether any of the stage's gates is the
-// approval type. The trace upload handler reads this through
-// stages.requires_approval to pick the right post-upload state
-// (gated → awaiting_approval, gateless → succeeded). #207.
-func hasApprovalGate(gates []spec.Gate) bool {
-	for _, g := range gates {
-		if g.Type == spec.GateTypeApproval {
-			return true
-		}
-	}
-	return false
-}
-
-// primaryGate picks the gate to persist on the stages row (#213).
-// Approval gates win over check gates so the review-stage UI can
-// always reach the approvers when they're declared. Returns nil for
-// stages with no gate.
-func primaryGate(gates []spec.Gate) *run.Gate {
-	if len(gates) == 0 {
-		return nil
-	}
-	g := pickPrimaryGate(gates)
-	if g == nil {
-		return nil
-	}
-	out := &run.Gate{
-		Kind: run.GateKind(g.Type),
-	}
-	if g.Approvers != nil {
-		out.Approvers = &run.GateApprovers{
-			AnyOf: g.Approvers.AnyOf,
-			AllOf: g.Approvers.AllOf,
-		}
-	}
-	return out
-}
-
-// pickPrimaryGate is the inner choice — first approval gate if any,
-// else first check gate. Split out from primaryGate so the policy
-// is unit-testable without a run.Gate round-trip.
-func pickPrimaryGate(gates []spec.Gate) *spec.Gate {
-	for i := range gates {
-		if gates[i].Type == spec.GateTypeApproval {
-			return &gates[i]
-		}
-	}
-	for i := range gates {
-		if gates[i].Type == spec.GateTypeCheck {
-			return &gates[i]
-		}
-	}
-	return nil
-}
-
-// mapExecutor projects a spec.Executor onto the run-package
-// executor enum. Per the schema, exactly one of Agent / Human is
-// set; we trust that here rather than reasserting it.
-func mapExecutor(s spec.Stage) (run.ExecutorKind, string) {
-	if s.Executor.Human {
-		// Stage is human-driven. ExecutorRef is informational
-		// only for human stages; the run state machine doesn't
-		// dispatch them to a runner.
-		return run.ExecutorHuman, "human"
-	}
-	return run.ExecutorAgent, s.Executor.Agent
 }
 
 // parseRepo splits "owner/name" into a githubclient.RepoRef. Empty
