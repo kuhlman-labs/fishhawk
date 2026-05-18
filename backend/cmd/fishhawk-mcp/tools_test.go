@@ -108,6 +108,21 @@ type fakeBackend struct {
 	retryStatus     int
 	retryErrBody    string
 	retryCalledByID map[uuid.UUID]int
+
+	// E22.4 fixtures: POST /v0/stages/{id}/approvals.
+	// approvalsBody captures the last decoded body so tests can
+	// assert decision + comment threading.
+	// approvalsResp seeds the post-approve Stage keyed by stage id;
+	// default is a minimal Stage with State="succeeded".
+	// approvalsStatus drives the HTTP status (default 200).
+	// approvalsErrBody, when set, is written verbatim — drives the
+	// 404 / 422 error-path tests.
+	// approvalsCalledByID counts approval calls per stage id.
+	approvalsBody       approvalRequest
+	approvalsResp       map[uuid.UUID]Stage
+	approvalsStatus     int
+	approvalsErrBody    string
+	approvalsCalledByID map[uuid.UUID]int
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -137,8 +152,41 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		retryResp:                map[uuid.UUID]Stage{},
 		retryStatus:              http.StatusOK,
 		retryCalledByID:          map[uuid.UUID]int{},
+		approvalsResp:            map[uuid.UUID]Stage{},
+		approvalsStatus:          http.StatusOK,
+		approvalsCalledByID:      map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body approvalRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.approvalsCalledByID[id]++
+		fb.approvalsBody = body
+		status := fb.approvalsStatus
+		errBody := fb.approvalsErrBody
+		resp, ok := fb.approvalsResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			defaultState := "succeeded"
+			if body.Decision == "reject" {
+				defaultState = "failed"
+			}
+			resp = Stage{ID: id.String(), Type: "plan", State: defaultState}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		id, perr := uuid.Parse(r.PathValue("stage_id"))
@@ -1698,5 +1746,178 @@ func TestRetryStage_NotApplicable_CategoryB_PropagatesAs422(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "retry_not_applicable") {
 		t.Errorf("err = %v, want retry_not_applicable", err)
+	}
+}
+
+// --- fishhawk_approve_plan + fishhawk_reject_plan (E22.4 / #393) ---
+
+// seedPlanStage installs a plan stage on the fakeBackend's stages-
+// for-run map so the resolver finds it. Returns the stage id for
+// downstream assertions.
+func seedPlanStage(fb *fakeBackend, runID uuid.UUID) uuid.UUID {
+	stageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: stageID.String(), RunID: runID.String(), Type: "plan", State: "awaiting_approval", Sequence: 0},
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "pending", Sequence: 1},
+	}
+	return stageID
+}
+
+func TestApprovePlan_HappyPath_ResolvesAndPostsApprove(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+
+	_, out, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if out.StageID != stageID.String() {
+		t.Errorf("resolved StageID = %q, want %s", out.StageID, stageID.String())
+	}
+	if out.Stage.State != "succeeded" {
+		t.Errorf("State = %q, want succeeded", out.Stage.State)
+	}
+	if fb.approvalsBody.Decision != "approve" {
+		t.Errorf("decision = %q, want approve", fb.approvalsBody.Decision)
+	}
+	if fb.approvalsBody.Comment != "looks good" {
+		t.Errorf("comment = %q, want 'looks good'", fb.approvalsBody.Comment)
+	}
+	if fb.approvalsCalledByID[stageID] != 1 {
+		t.Errorf("approvals call count = %d, want 1", fb.approvalsCalledByID[stageID])
+	}
+}
+
+func TestRejectPlan_HappyPath_ResolvesAndPostsReject(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+
+	_, out, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
+		RunID:  runID.String(),
+		Reason: "scope is too wide",
+	})
+	if err != nil {
+		t.Fatalf("rejectPlan: %v", err)
+	}
+	if out.StageID != stageID.String() {
+		t.Errorf("resolved StageID = %q, want %s", out.StageID, stageID.String())
+	}
+	if out.Stage.State != "failed" {
+		t.Errorf("State = %q, want failed", out.Stage.State)
+	}
+	if fb.approvalsBody.Decision != "reject" {
+		t.Errorf("decision = %q, want reject", fb.approvalsBody.Decision)
+	}
+	if fb.approvalsBody.Comment != "scope is too wide" {
+		t.Errorf("comment = %q, want 'scope is too wide'", fb.approvalsBody.Comment)
+	}
+}
+
+func TestApprovePlan_NoReason_PassesEmptyComment(t *testing.T) {
+	// Reason is optional on approve; absent comment threads through
+	// as an empty string. Backend treats empty comment as "no
+	// comment recorded" per the existing approval row's nullable
+	// comment column.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.Comment != "" {
+		t.Errorf("comment = %q, want empty", fb.approvalsBody.Comment)
+	}
+}
+
+func TestApprovePlan_NoPlanStage_FailsWithCleanError(t *testing.T) {
+	// A run with no plan stage (e.g. a routine_change workflow that
+	// skips planning) surfaces a clean tool error rather than a
+	// generic "not found" from the backend.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	// Seed only an implement stage — no plan.
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "pending"},
+	}
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected error for run without plan stage")
+	}
+	if !strings.Contains(err.Error(), "no plan stage") {
+		t.Errorf("err = %v, want it to mention 'no plan stage'", err)
+	}
+	// No approvals call should have fired — short-circuit on resolver failure.
+	if len(fb.approvalsCalledByID) != 0 {
+		t.Errorf("approvals called %d times after resolver failure, want 0", len(fb.approvalsCalledByID))
+	}
+}
+
+func TestApprovePlan_InvalidUUID_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: "not-a-uuid"})
+	if err == nil {
+		t.Fatal("expected validation error for bad UUID")
+	}
+	if !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("err = %v, want UUID parse error", err)
+	}
+	// No stages call should have fired either.
+	if len(fb.stagesCalledByID) != 0 {
+		t.Errorf("list-stages called %d times, want 0", len(fb.stagesCalledByID))
+	}
+}
+
+func TestApprovePlan_BackendStateMachineRefusal_PropagatesAsToolError(t *testing.T) {
+	// E.g. plan stage isn't in awaiting_approval anymore. The
+	// backend's state-machine rejects the approve; we surface the
+	// error envelope verbatim.
+	fb, srv := newFakeBackend(t)
+	fb.approvalsStatus = http.StatusConflict
+	fb.approvalsErrBody = `{"error":{"code":"invalid_state_transition","message":"plan stage not in awaiting_approval"}}`
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected error from backend 409")
+	}
+	if !strings.Contains(err.Error(), "invalid_state_transition") {
+		t.Errorf("err = %v, want invalid_state_transition", err)
+	}
+}
+
+func TestRejectPlan_NoReason_PassesEmptyComment(t *testing.T) {
+	// Reason is recommended on reject (CLI warns when missing) but
+	// the MCP tool doesn't enforce — the audit log records the
+	// absence and that's the source of truth.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+
+	_, _, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("rejectPlan: %v", err)
+	}
+	if fb.approvalsBody.Decision != "reject" {
+		t.Errorf("decision = %q, want reject", fb.approvalsBody.Decision)
+	}
+	if fb.approvalsBody.Comment != "" {
+		t.Errorf("comment = %q, want empty", fb.approvalsBody.Comment)
 	}
 }
