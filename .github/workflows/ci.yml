@@ -152,7 +152,7 @@ jobs:
       # action-setup defaults to reading the *root* package.json, so we
       # point it at frontend/ explicitly. Without this it errors out
       # with "No pnpm version is specified."
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: frontend/package.json
 
