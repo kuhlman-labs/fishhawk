@@ -101,7 +101,7 @@ Two audiences with different scopes:
 
 | Tool | What | Required scope |
 |---|---|---|
-| `fishhawk_start_run` | Create a new run; mirrors `fishhawk run start`. Optional `idempotency_key` for safe re-submit. | `write:runs` |
+| `fishhawk_start_run` | Create a new run; mirrors `fishhawk run start`. Local-runner inputs (`working_dir`, `workflow_spec`, `issue`, `runner_kind`) auto-discover the spec + fetch the issue payload — see [Local-runner mint](#local-runner-mint) below. Optional `idempotency_key` for safe re-submit. | `write:runs` |
 | `fishhawk_cancel_run` | Cancel a running run; mirrors `fishhawk run cancel`. Idempotent on re-cancel. | `write:runs` |
 | `fishhawk_retry_stage` | Re-fire a failed stage per its category; mirrors `fishhawk run retry`. Categories A/C re-dispatch; B / gate-rejected D surface as `retry_not_applicable`. | `write:stages` |
 | `fishhawk_approve_plan` | Approve the plan stage of a run (resolves stage from run id); mirrors `fishhawk plan approve`. | `write:approvals` |
@@ -112,6 +112,28 @@ Two audiences with different scopes:
 
 - `fhm_*` mcptokens calling `fishhawk_approve_plan` / `fishhawk_reject_plan` are rejected by the backend's role check (`checkApproverAuthorization`) when `RoleResolver` is wired — the runner's `mcp:run:<id>` subject won't match any team in the gate's approver list.
 - `fhm_*` mcptokens calling the other write tools (`start_run`, `cancel_run`, `retry_stage`) are **not yet** gated on scope at the handler — that enforcement is tracked at [#402](https://github.com/kuhlman-labs/fishhawk/issues/402). Until that lands, the read-only-runner property holds by convention (no production code path in the runner calls write tools) rather than wire enforcement.
+
+## Local-runner mint
+
+For the local-runner flow ([E22 / #389](https://github.com/kuhlman-labs/fishhawk/issues/389)), the agent inside Claude Code can mint a real, stage-bearing run on the operator's workstation without leaving the chat. The MCP server's `fishhawk_start_run` accepts the same convenience inputs the CLI does:
+
+| Input | What | Set by |
+|---|---|---|
+| `working_dir` | Absolute path of the checkout. The MCP server walks up to the `.git` boundary looking for `.fishhawk/workflows.yaml` and ships the bytes inline, computing `workflow_sha` from the discovered file. | Agent (typically the cwd it's working in). |
+| `workflow_spec` | Inline YAML body, if the agent already has it. Skips the disk walk. | Agent. |
+| `spec_file` | Explicit spec path, overrides `working_dir` auto-discovery. | Agent (rare; mostly for test scenarios). |
+| `issue` | GitHub issue number, `#N`, or `https://github.com/owner/repo/issues/N`. The MCP server shells to `gh issue view` and ships the title/body/url/number inline so the prompt builder reads the cache instead of needing an installation_id. Best-effort: a missing `gh` emits a warning on the tool result and the run proceeds without the cache. | Agent. |
+| `issue_context` | Pre-fetched issue payload (alternative to `issue`); only valid with `trigger_source=github_issue`. | Agent — when the agent already fetched the issue itself. |
+| `runner_kind` | `github_actions` (default) or `local`. The local-runner flow uses `local` so the dispatcher skips the workflow_dispatch hop and waits for `fishhawk runner start` to drive each stage. | Agent. |
+
+The composition matches the CLI's `fishhawk run start --working-dir … --issue … --runner-kind local`. With these inputs, the dialogue inside Claude Code can be entirely:
+
+1. Agent calls `fishhawk_start_run` with `working_dir`, `issue`, `runner_kind=local`.
+2. Operator runs `fishhawk runner start --run-id … --stage-id … --stage plan` in a terminal to execute the plan stage.
+3. Agent calls `fishhawk_approve_plan`.
+4. Operator runs `fishhawk runner start … --stage implement` to execute the implement stage.
+
+Closing the terminal-side gap (steps 2 + 4 → MCP) is tracked at [#427](https://github.com/kuhlman-labs/fishhawk/issues/427).
 
 ## Runner integration
 

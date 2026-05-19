@@ -70,19 +70,32 @@ func (e *apiError) Error() string {
 // though the JSON payload itself is a string. Tools that need a
 // typed UUID parse the string locally (e.g. `uuid.Parse(in.RunID)`).
 type Run struct {
-	ID                 string    `json:"id"`
-	Repo               string    `json:"repo"`
-	WorkflowID         string    `json:"workflow_id"`
-	WorkflowSHA        string    `json:"workflow_sha"`
-	TriggerSource      string    `json:"trigger_source"`
-	TriggerRef         *string   `json:"trigger_ref"`
-	State              string    `json:"state"`
-	ParentRunID        *string   `json:"parent_run_id"`
-	PullRequestURL     *string   `json:"pull_request_url"`
-	RetryAttempt       int       `json:"retry_attempt"`
-	MaxRetriesSnapshot int       `json:"max_retries_snapshot"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                 string        `json:"id"`
+	Repo               string        `json:"repo"`
+	WorkflowID         string        `json:"workflow_id"`
+	WorkflowSHA        string        `json:"workflow_sha"`
+	TriggerSource      string        `json:"trigger_source"`
+	TriggerRef         *string       `json:"trigger_ref"`
+	State              string        `json:"state"`
+	ParentRunID        *string       `json:"parent_run_id"`
+	PullRequestURL     *string       `json:"pull_request_url"`
+	RetryAttempt       int           `json:"retry_attempt"`
+	MaxRetriesSnapshot int           `json:"max_retries_snapshot"`
+	RunnerKind         string        `json:"runner_kind,omitempty"`
+	IssueContext       *IssueContext `json:"issue_context,omitempty"`
+	CreatedAt          time.Time     `json:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at"`
+}
+
+// IssueContext mirrors the OpenAPI shape: the GitHub issue payload
+// fetched at run-create and cached on the run row (#415). The MCP
+// server populates this from `gh issue view` when an agent passes
+// the `issue` input — same pattern the CLI uses.
+type IssueContext struct {
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	URL    string `json:"url"`
+	Number int    `json:"number"`
 }
 
 type listRunsResult struct {
@@ -121,11 +134,14 @@ func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 // `cli → backend`, not the other way around, and the same applies
 // to this binary.
 type createRunRequest struct {
-	Repo          string  `json:"repo"`
-	WorkflowID    string  `json:"workflow_id"`
-	WorkflowSHA   string  `json:"workflow_sha"`
-	TriggerSource string  `json:"trigger_source"`
-	TriggerRef    *string `json:"trigger_ref,omitempty"`
+	Repo          string        `json:"repo"`
+	WorkflowID    string        `json:"workflow_id"`
+	WorkflowSHA   string        `json:"workflow_sha"`
+	TriggerSource string        `json:"trigger_source"`
+	TriggerRef    *string       `json:"trigger_ref,omitempty"`
+	RunnerKind    string        `json:"runner_kind,omitempty"`
+	WorkflowSpec  string        `json:"workflow_spec,omitempty"`
+	IssueContext  *IssueContext `json:"issue_context,omitempty"`
 }
 
 // StartRunParams is the typed input the apiClient takes for run
@@ -133,6 +149,11 @@ type createRunRequest struct {
 // header per the backend's E8.2 contract — when set, a previously-
 // created run with the same `(repo, key)` returns 200 instead of a
 // fresh 201.
+//
+// RunnerKind / WorkflowSpec / IssueContext mirror the CLI's
+// CreateRunInput surface (#411, #415, ADR-022) so an agent calling
+// fishhawk_start_run via MCP has the same composition reach the
+// CLI's `fishhawk run start` does.
 type StartRunParams struct {
 	Repo           string
 	WorkflowID     string
@@ -140,6 +161,9 @@ type StartRunParams struct {
 	TriggerSource  string
 	TriggerRef     string
 	IdempotencyKey string
+	RunnerKind     string
+	WorkflowSpec   string
+	IssueContext   *IssueContext
 }
 
 // approvalRequest mirrors the backend's
@@ -213,6 +237,9 @@ func (c *apiClient) StartRun(ctx context.Context, p StartRunParams) (*Run, bool,
 		WorkflowID:    p.WorkflowID,
 		WorkflowSHA:   p.WorkflowSHA,
 		TriggerSource: p.TriggerSource,
+		RunnerKind:    p.RunnerKind,
+		WorkflowSpec:  p.WorkflowSpec,
+		IssueContext:  p.IssueContext,
 	}
 	if p.TriggerRef != "" {
 		ref := p.TriggerRef
