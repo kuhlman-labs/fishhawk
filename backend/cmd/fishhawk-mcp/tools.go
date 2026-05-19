@@ -611,17 +611,64 @@ var validStartRunTriggerSources = map[string]struct{}{
 }
 
 // StartRunInput is the fishhawk_start_run tool's input schema
-// (E22.1 / #390). Mirrors `POST /v0/runs`'s body shape so an
-// operator running Claude Code can mint a run without dropping to
-// the CLI. trigger_source defaults to "cli" when omitted because
-// that's the dominant case for an operator-driven MCP call.
+// (E22.1 / #390, extended in #426). Mirrors `POST /v0/runs`'s body
+// shape so an agent running inside Claude Code can mint a run
+// without dropping to the CLI. trigger_source defaults to "cli"
+// when omitted because that's the dominant case for an operator-
+// driven MCP call.
+//
+// Three of the fields below — workflow_spec, issue_context, and
+// the convenience wrappers (issue, working_dir) — exist for the
+// local-runner flow (E22.7-E22.9 / #406, #411, #415). Without
+// them, an MCP-minted run is stage-less and prompt-degraded, which
+// is useless for the local loop.
 type StartRunInput struct {
 	Repo           string `json:"repo" jsonschema:"GitHub repo as owner/name; the workflow spec must live at .fishhawk/workflows.yaml in this repo"`
 	WorkflowID     string `json:"workflow_id" jsonschema:"workflow key in .fishhawk/workflows.yaml (e.g. 'feature_change')"`
-	WorkflowSHA    string `json:"workflow_sha" jsonschema:"blob SHA of the spec file at the trigger ref; pin this to a known-good revision"`
-	TriggerSource  string `json:"trigger_source,omitempty" jsonschema:"one of 'cli', 'github_issue', 'ui'; defaults to 'cli' when omitted"`
-	TriggerRef     string `json:"trigger_ref,omitempty" jsonschema:"optional reference (e.g. 'issue:42') threading the run to its trigger"`
+	WorkflowSHA    string `json:"workflow_sha,omitempty" jsonschema:"blob SHA of the spec file; auto-computed from the discovered spec when omitted and working_dir resolves a checkout"`
+	TriggerSource  string `json:"trigger_source,omitempty" jsonschema:"one of 'cli', 'github_issue', 'ui'; defaults to 'cli' when omitted, auto-flips to 'github_issue' when issue or issue_context is set"`
+	TriggerRef     string `json:"trigger_ref,omitempty" jsonschema:"optional reference (e.g. 'issue:42') threading the run to its trigger; auto-derived from issue when omitted"`
 	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"E8.2 idempotency token; a second call with the same (repo, key) returns the existing run with Idempotent=true instead of fresh-creating"`
+
+	// RunnerKind tags the execution backend (ADR-022 / #388).
+	// Empty defaults to github_actions at the backend; the local-
+	// runner flow passes "local" so the dispatcher skips the
+	// workflow_dispatch hop and waits for the operator's
+	// `fishhawk runner start` to drive the stage.
+	RunnerKind string `json:"runner_kind,omitempty" jsonschema:"execution backend tag: 'github_actions' (default) or 'local'"`
+
+	// WorkflowSpec is the inline YAML of the workflow file (#411).
+	// When non-empty the backend creates one Stage row per stage
+	// definition; without it, an API-minted run sits stage-less
+	// and can't progress on the local-runner path. Most callers
+	// leave this empty and pass WorkingDir instead — the MCP
+	// server auto-discovers the file and fills this for them.
+	WorkflowSpec string `json:"workflow_spec,omitempty" jsonschema:"inline YAML body of .fishhawk/workflows.yaml; auto-discovered from working_dir when empty"`
+
+	// WorkingDir is the directory the MCP server walks (up to the
+	// .git boundary) looking for `.fishhawk/workflows.yaml`. The
+	// agent passes the checkout it's working in; the resolved
+	// spec's bytes + computed SHA ride along on the create call.
+	// Skipped when WorkflowSpec is already set or when the agent
+	// passes WorkflowSHA explicitly (legacy "no checkout" path).
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"checkout directory to search for .fishhawk/workflows.yaml; auto-discovery only runs when set"`
+
+	// SpecFile overrides the walk-up auto-discovery with an
+	// explicit path. Used when the spec lives outside the
+	// canonical location (rare; mostly for test scenarios).
+	SpecFile string `json:"spec_file,omitempty" jsonschema:"explicit workflow spec path; overrides working_dir auto-discovery"`
+
+	// IssueContext is the cached GitHub issue payload (#415).
+	// Only valid with trigger_source=github_issue (or auto-flip
+	// from Issue). Agents that want the MCP server to fetch this
+	// themselves pass Issue instead.
+	IssueContext *IssueContext `json:"issue_context,omitempty" jsonschema:"pre-fetched issue payload; valid only with trigger_source=github_issue. Most callers pass issue instead and let the MCP server fetch via gh."`
+
+	// Issue is a convenience alternative to IssueContext: the MCP
+	// server shells to `gh issue view` and fills the
+	// IssueContext from the result. Accepts the same forms as
+	// the CLI's --issue (a bare number, #N, or full URL).
+	Issue string `json:"issue,omitempty" jsonschema:"GitHub issue number, #N, or .../issues/N URL; the MCP server fetches via gh and ships inline"`
 }
 
 // StartRunOutput is the response shape. Run is the canonical Run
@@ -634,11 +681,20 @@ type StartRunOutput struct {
 	Idempotent bool `json:"idempotent" jsonschema:"true when this call replayed against an existing run via Idempotency-Key; false on fresh create"`
 }
 
-// registerStartRun wires the fishhawk_start_run tool (E22.1 / #390).
-// Mirrors the CLI's `fishhawk run start`. Operator-side flow: the
-// agent constructs the spec ref + sha (today via direct repo
-// inspection; future via a get_workflow_spec helper that lives
-// outside v0 scope), then calls this to mint the run.
+// registerStartRun wires the fishhawk_start_run tool (E22.1 / #390;
+// field-parity extension #426). Mirrors the CLI's `fishhawk run start`.
+//
+// Two operator-side flows the tool supports:
+//
+//  1. **Stage-less seed** (legacy / integration tests). Agent passes
+//     repo + workflow_id + workflow_sha; backend creates a row, no
+//     stages. Useful only for tests; can't drive a real run.
+//  2. **Full local-runner mint** (#411 + #415 + ADR-022). Agent
+//     passes working_dir (or workflow_spec inline) + optionally
+//     issue + runner_kind=local. The MCP server walks for
+//     `.fishhawk/workflows.yaml`, shells to `gh issue view`, and
+//     ships everything inline so the backend creates Stage rows
+//     and primes the prompt cache.
 //
 // Auth: this is a write tool. Operator-side fhk_* tokens with
 // scope `write:runs` will succeed; runner-side fhm_* tokens (per
@@ -652,8 +708,14 @@ Create a new Fishhawk run.
 
 Mirrors the CLI's "fishhawk run start" verb. The new run is created
 in pending state and dispatched immediately via the existing
-workflow_dispatch path (when the dispatcher is wired) or by the
-in-flight local-runner mode (per #389's Phase C).
+workflow_dispatch path or, for runner_kind=local, waits for the
+operator's "fishhawk runner start" to drive each stage.
+
+For the local-runner flow, pass working_dir (the checkout the agent
+is in) — the MCP server walks for .fishhawk/workflows.yaml and
+ships the bytes inline so the backend creates stages. Pass issue
+(a number, #N, or full URL) and the server shells to gh and ships
+the title/body inline so the prompt builder uses the cached payload.
 
 Idempotency: when idempotency_key is set, a previously-created run
 with the same (repo, key) returns 200 with Idempotent=true instead
@@ -666,6 +728,19 @@ Returns the canonical Run row + an Idempotent flag.
 }
 
 // startRun is the tool handler.
+//
+// Composition order (mirrors cli/cmd/fishhawk/run.go::runStart):
+//  1. validate the obvious inputs (repo, workflow_id).
+//  2. resolve issue number (explicit or trigger_ref-derived).
+//  3. walk for the workflow spec (when working_dir/spec_file are
+//     set and workflow_spec wasn't supplied directly).
+//  4. compose the effective workflow_sha (explicit > computed).
+//  5. compose trigger_source (auto-flip to github_issue when an
+//     issue resolves).
+//  6. fetch the issue via gh (when an issue resolved and IssueContext
+//     wasn't already passed inline).
+//  7. validate the trigger_source / issue_context pairing.
+//  8. hand off to apiClient.StartRun.
 func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in StartRunInput) (*mcp.CallToolResult, StartRunOutput, error) {
 	if in.Repo == "" {
 		return nil, StartRunOutput{}, errors.New("repo is required (owner/name)")
@@ -673,29 +748,141 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 	if in.WorkflowID == "" {
 		return nil, StartRunOutput{}, errors.New("workflow_id is required")
 	}
-	if in.WorkflowSHA == "" {
-		return nil, StartRunOutput{}, errors.New("workflow_sha is required")
+
+	// (2) Parse the explicit issue argument up front so a typo
+	// surfaces before any disk walk or backend round-trip.
+	issueNumber, err := resolveIssueRef(in.Issue)
+	if err != nil {
+		return nil, StartRunOutput{}, err
 	}
+	if issueNumber == 0 {
+		issueNumber = inferIssueNumberFromTriggerRef(in.TriggerRef)
+	}
+
+	// (3) Resolve the workflow spec. Skipped entirely when the
+	// caller supplied workflow_spec inline (the "I already know
+	// what I want to ship" path). Skipped when neither working_dir
+	// nor spec_file was set (the legacy stage-less seed path —
+	// only useful for tests).
+	specBytes := []byte(in.WorkflowSpec)
+	computedSHA := ""
+	if len(specBytes) == 0 && (in.WorkingDir != "" || in.SpecFile != "") {
+		startDir := in.WorkingDir
+		if startDir == "" {
+			startDir = "."
+		}
+		found, derr := discoverSpec(startDir, in.SpecFile)
+		if derr != nil {
+			return nil, StartRunOutput{}, fmt.Errorf("spec discovery: %w", derr)
+		}
+		if found != nil {
+			specBytes = found.Contents
+			computedSHA = found.BlobSHA
+			// Pre-parse so a YAML/schema typo is a fast local
+			// failure instead of a backend round-trip.
+			if perr := specValidate(specBytes); perr != nil {
+				return nil, StartRunOutput{}, fmt.Errorf("%s: %w", found.Path, perr)
+			}
+		}
+	} else if len(specBytes) > 0 {
+		// Caller supplied workflow_spec inline. Compute the SHA so
+		// the backend's content-hash gate still has a value to bind
+		// against, and validate so a bad inline body fails locally.
+		computedSHA = gitBlobSHA(specBytes)
+		if perr := specValidate(specBytes); perr != nil {
+			return nil, StartRunOutput{}, fmt.Errorf("workflow_spec: %w", perr)
+		}
+	}
+
+	// (4) Compose the effective SHA. Explicit input wins (an
+	// override hook for minting historic runs); otherwise the
+	// discovered file's blob SHA travels with the bytes.
+	effectiveSHA := in.WorkflowSHA
+	if effectiveSHA == "" {
+		effectiveSHA = computedSHA
+	}
+	if effectiveSHA == "" {
+		return nil, StartRunOutput{}, errors.New(
+			"workflow_sha is required (or pass working_dir / workflow_spec so the MCP server can compute it)")
+	}
+
+	// (5) Compose trigger_source. When the caller omitted the
+	// field, default to cli unless an issue resolves — then flip
+	// to github_issue (mirrors the CLI's behavior). An explicit
+	// trigger_source is left alone; if it conflicts with the
+	// issue payload, step (7) catches it.
 	triggerSource := in.TriggerSource
 	if triggerSource == "" {
 		triggerSource = "cli"
+		if issueNumber > 0 || in.IssueContext != nil {
+			triggerSource = "github_issue"
+		}
 	}
 	if _, ok := validStartRunTriggerSources[triggerSource]; !ok {
 		return nil, StartRunOutput{}, fmt.Errorf("trigger_source %q is not one of cli, github_issue, ui", triggerSource)
 	}
 
+	// Normalize trigger_ref to the canonical issue:N form when
+	// the operator only passed issue, so threading + audit
+	// surfaces (#216) keep working.
+	triggerRef := in.TriggerRef
+	if issueNumber > 0 && triggerRef == "" {
+		triggerRef = fmt.Sprintf("issue:%d", issueNumber)
+	}
+
+	// (6) Fetch the issue locally via gh and bundle the payload.
+	// Best-effort: a missing or unauthed gh emits a warning on the
+	// tool result and the run proceeds without the cache
+	// (degraded prompt = pre-#415 shape). When the caller already
+	// supplied IssueContext inline, skip the fetch and use what
+	// they sent.
+	issueContext := in.IssueContext
+	var warnings []string
+	if issueNumber > 0 && issueContext == nil {
+		ic, ferr := fetchIssueViaGh(in.Repo, issueNumber)
+		switch {
+		case ferr == nil:
+			issueContext = ic
+		case errors.Is(ferr, ErrGhNotInstalled):
+			warnings = append(warnings,
+				"gh CLI not on PATH; proceeding without inline issue context. Install https://cli.github.com for the full prompt.")
+		default:
+			warnings = append(warnings,
+				fmt.Sprintf("issue fetch warning: %v — proceeding without inline issue context", ferr))
+		}
+	}
+
+	// (7) Validate the trigger_source / issue_context pairing.
+	// Mirrors the backend handler's check — better to fail here
+	// with a clear tool error than round-trip to a 422.
+	if issueContext != nil && triggerSource != "github_issue" {
+		return nil, StartRunOutput{}, fmt.Errorf(
+			"issue_context is only valid with trigger_source=github_issue (got %q)", triggerSource)
+	}
+
+	// (8) Hand off to the backend.
 	created, idempotent, err := r.api.StartRun(ctx, StartRunParams{
 		Repo:           in.Repo,
 		WorkflowID:     in.WorkflowID,
-		WorkflowSHA:    in.WorkflowSHA,
+		WorkflowSHA:    effectiveSHA,
 		TriggerSource:  triggerSource,
-		TriggerRef:     in.TriggerRef,
+		TriggerRef:     triggerRef,
 		IdempotencyKey: in.IdempotencyKey,
+		RunnerKind:     in.RunnerKind,
+		WorkflowSpec:   string(specBytes),
+		IssueContext:   issueContext,
 	})
 	if err != nil {
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)
 	}
-	return nil, StartRunOutput{Run: *created, Idempotent: idempotent}, nil
+
+	var meta *mcp.CallToolResult
+	if len(warnings) > 0 {
+		meta = &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(warnings, "\n")}},
+		}
+	}
+	return meta, StartRunOutput{Run: *created, Idempotent: idempotent}, nil
 }
 
 // CancelRunInput is the fishhawk_cancel_run tool's input schema

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1542,6 +1545,306 @@ func TestStartRun_LocalValidationCatchesBadInputs(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// --- fishhawk_start_run field parity (#426) ---
+
+// validTrivialSpec is a minimal workflow YAML that passes the
+// backend/internal/spec parser. Used across the parity tests so
+// the auto-discover and inline-spec branches have a real bytes
+// payload to ship.
+const validTrivialSpec = "version: \"0.3\"\nworkflows:\n  trivial:\n    stages:\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n"
+
+// TestStartRun_AutoDiscoversSpecFromWorkingDir exercises the
+// headline #426 flow: an agent passes working_dir, the MCP server
+// walks for .fishhawk/workflows.yaml, ships the bytes inline, and
+// pre-computes workflow_sha so the agent doesn't need to.
+func TestStartRun_AutoDiscoversSpecFromWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".fishhawk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".fishhawk", "workflows.yaml"),
+		[]byte(validTrivialSpec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, out, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:       "x/y",
+		WorkflowID: "trivial",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if out.Run.ID == "" {
+		t.Error("Run.ID empty")
+	}
+	if fb.createRunBody.WorkflowSpec != validTrivialSpec {
+		t.Errorf("WorkflowSpec not forwarded; got %q", fb.createRunBody.WorkflowSpec)
+	}
+	if fb.createRunBody.WorkflowSHA != gitBlobSHA([]byte(validTrivialSpec)) {
+		t.Errorf("WorkflowSHA = %q, want auto-computed %q",
+			fb.createRunBody.WorkflowSHA, gitBlobSHA([]byte(validTrivialSpec)))
+	}
+}
+
+// TestStartRun_InlineWorkflowSpec_SkipsDiscovery covers the
+// "agent already has the bytes" path — the MCP server still
+// validates + computes the SHA but doesn't touch the disk.
+func TestStartRun_InlineWorkflowSpec_SkipsDiscovery(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:         "x/y",
+		WorkflowID:   "trivial",
+		WorkflowSpec: validTrivialSpec,
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.WorkflowSpec != validTrivialSpec {
+		t.Errorf("inline spec not forwarded")
+	}
+	if fb.createRunBody.WorkflowSHA == "" {
+		t.Error("SHA should be auto-computed when not provided")
+	}
+}
+
+// TestStartRun_InlineSpec_InvalidYAMLFailsLocally surfaces the
+// schema error without a backend round-trip. Matches the CLI's
+// fast-fail UX.
+func TestStartRun_InlineSpec_InvalidYAMLFailsLocally(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:         "x/y",
+		WorkflowID:   "trivial",
+		WorkflowSpec: "not: valid: yaml: ::\n",
+	})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "workflow_spec") {
+		t.Errorf("err should reference workflow_spec: %v", err)
+	}
+}
+
+// TestStartRun_RunnerKindLocal_ForwardedToBackend covers the
+// ADR-022 dimension: an agent minting a local-runner run passes
+// runner_kind=local, the MCP forwards it verbatim.
+func TestStartRun_RunnerKindLocal_ForwardedToBackend(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:         "x/y",
+		WorkflowID:   "trivial",
+		WorkflowSpec: validTrivialSpec,
+		RunnerKind:   "local",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.RunnerKind != "local" {
+		t.Errorf("RunnerKind = %q, want local", fb.createRunBody.RunnerKind)
+	}
+}
+
+// TestStartRun_IssueFetch_AutoFlipsTriggerSource exercises the
+// gh-fetch convenience: when the agent passes issue, the MCP
+// server fetches via gh and ships the payload inline, AND flips
+// trigger_source to github_issue.
+func TestStartRun_IssueFetch_AutoFlipsTriggerSource(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeGh(t, `{"title":"Add foo","body":"We need foo helpers.","url":"https://github.com/x/y/issues/42","number":42}`)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:         "x/y",
+		WorkflowID:   "trivial",
+		WorkflowSpec: validTrivialSpec,
+		Issue:        "42",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.IssueContext == nil {
+		t.Fatal("IssueContext not forwarded")
+	}
+	if fb.createRunBody.IssueContext.Body != "We need foo helpers." {
+		t.Errorf("body mismatch: %q", fb.createRunBody.IssueContext.Body)
+	}
+	if fb.createRunBody.TriggerSource != "github_issue" {
+		t.Errorf("TriggerSource = %q, want github_issue", fb.createRunBody.TriggerSource)
+	}
+	if fb.createRunBody.TriggerRef == nil || *fb.createRunBody.TriggerRef != "issue:42" {
+		t.Errorf("TriggerRef = %v, want issue:42", fb.createRunBody.TriggerRef)
+	}
+}
+
+// TestStartRun_IssueContextInline_NoFetch confirms that when the
+// agent already has an IssueContext (e.g. fetched once and reused
+// across replays), the MCP server doesn't re-shell to gh.
+func TestStartRun_IssueContextInline_NoFetch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	// Wire a gh that would explode if called.
+	ghIssueCommand = func(_ string, _ ...string) *exec.Cmd {
+		t.Fatal("gh should NOT have been called when IssueContext is inline")
+		return nil
+	}
+	t.Cleanup(func() { ghIssueCommand = exec.Command })
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:          "x/y",
+		WorkflowID:    "trivial",
+		WorkflowSpec:  validTrivialSpec,
+		TriggerSource: "github_issue",
+		IssueContext: &IssueContext{
+			Title:  "Pre-fetched",
+			Body:   "Inline body.",
+			URL:    "https://github.com/x/y/issues/99",
+			Number: 99,
+		},
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.IssueContext == nil || fb.createRunBody.IssueContext.Number != 99 {
+		t.Errorf("IssueContext not forwarded: %+v", fb.createRunBody.IssueContext)
+	}
+}
+
+// TestStartRun_IssueContextRequiresGithubIssueSource mirrors the
+// backend validation: issue_context only valid with
+// trigger_source=github_issue. The MCP server fails locally with
+// a clean message instead of round-tripping to a 422.
+func TestStartRun_IssueContextRequiresGithubIssueSource(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:          "x/y",
+		WorkflowID:    "trivial",
+		WorkflowSpec:  validTrivialSpec,
+		TriggerSource: "ui",
+		IssueContext: &IssueContext{
+			Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "issue_context") {
+		t.Errorf("err should mention issue_context: %v", err)
+	}
+}
+
+// TestStartRun_GhMissing_DoesNotFail keeps the pre-#415 behavior
+// alive: a missing gh emits a warning on the tool result but the
+// run still mints. trigger_source still flips to github_issue
+// because the agent asked for an issue-triggered run.
+func TestStartRun_GhMissing_DoesNotFail(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeGhMissing(t)
+
+	meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:         "x/y",
+		WorkflowID:   "trivial",
+		WorkflowSpec: validTrivialSpec,
+		Issue:        "42",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.IssueContext != nil {
+		t.Errorf("IssueContext should be nil when gh missing")
+	}
+	if fb.createRunBody.TriggerSource != "github_issue" {
+		t.Errorf("TriggerSource = %q, want github_issue", fb.createRunBody.TriggerSource)
+	}
+	if meta == nil {
+		t.Fatal("expected warning metadata on the tool result")
+	}
+}
+
+// TestStartRun_TriggerRefIssue_AutoDerivesNumber: when the agent
+// passes trigger_ref=issue:7 without issue, the MCP server still
+// fetches via gh.
+func TestStartRun_TriggerRefIssue_AutoDerivesNumber(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeGh(t, `{"title":"Auto","body":"Auto-derived.","url":"https://github.com/x/y/issues/7","number":7}`)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:         "x/y",
+		WorkflowID:   "trivial",
+		WorkflowSpec: validTrivialSpec,
+		TriggerRef:   "issue:7",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.IssueContext == nil || fb.createRunBody.IssueContext.Number != 7 {
+		t.Errorf("IssueContext.Number not 7: %+v", fb.createRunBody.IssueContext)
+	}
+}
+
+// TestStartRun_NoSpecNoSHA_FailsWithRemediation echoes the CLI's
+// dual-remediation error when neither the discovery path nor an
+// explicit workflow_sha can produce a SHA.
+func TestStartRun_NoSpecNoSHA_FailsWithRemediation(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:       "x/y",
+		WorkflowID: "trivial",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "workflow_sha") {
+		t.Errorf("err should mention workflow_sha: %v", err)
+	}
+	if !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("err should suggest working_dir: %v", err)
+	}
+}
+
+// TestStartRun_LegacyStagelessSeed_StillWorks documents the
+// "test fixture / no checkout" path: pass repo + workflow_id +
+// workflow_sha, no spec, no issue — backend creates a stage-less
+// row. This is the pre-#411 behavior the MCP tool MUST preserve
+// so integration tests that seed rows directly don't break.
+func TestStartRun_LegacyStagelessSeed_StillWorks(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:        "x/y",
+		WorkflowID:  "trivial",
+		WorkflowSHA: "deadbeef",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.WorkflowSpec != "" {
+		t.Errorf("WorkflowSpec set when none provided: %q", fb.createRunBody.WorkflowSpec)
+	}
+	if fb.createRunBody.WorkflowSHA != "deadbeef" {
+		t.Errorf("WorkflowSHA = %q, want deadbeef", fb.createRunBody.WorkflowSHA)
 	}
 }
 
