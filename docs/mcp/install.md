@@ -107,6 +107,7 @@ Two audiences with different scopes:
 | `fishhawk_approve_plan` | Approve the plan stage of a run (resolves stage from run id); mirrors `fishhawk plan approve`. | `write:approvals` |
 | `fishhawk_reject_plan` | Reject the plan stage with optional rationale; mirrors `fishhawk plan reject`. | `write:approvals` |
 | `fishhawk_list_runs` | Enumerate runs with filters (`repo`, `workflow_id`, `state`) + cursor pagination. | `read:runs` |
+| `fishhawk_run_stage` | Drive one stage of a local-runner run by spawning `fishhawk-runner` as a subprocess; mirrors `fishhawk runner start`. Events stream as MCP `notifications/progress` when the client provides a progress token; the final result carries the full event list and post-run stage state. Cancellation: SIGTERM + 30s grace + SIGKILL (graceful cleanup needs runner-side support, tracked at [#435](https://github.com/kuhlman-labs/fishhawk/issues/435)). Requires the `fishhawk-runner` binary to resolve on the MCP server's host — see [ADR-024](https://github.com/kuhlman-labs/fishhawk/issues/433). | `write:runs` |
 
 **Auth posture** (today, v0):
 
@@ -126,14 +127,16 @@ For the local-runner flow ([E22 / #389](https://github.com/kuhlman-labs/fishhawk
 | `issue_context` | Pre-fetched issue payload (alternative to `issue`); only valid with `trigger_source=github_issue`. | Agent — when the agent already fetched the issue itself. |
 | `runner_kind` | `github_actions` (default) or `local`. The local-runner flow uses `local` so the dispatcher skips the workflow_dispatch hop and waits for `fishhawk runner start` to drive each stage. | Agent. |
 
-The composition matches the CLI's `fishhawk run start --working-dir … --issue … --runner-kind local`. With these inputs, the dialogue inside Claude Code can be entirely:
+The composition matches the CLI's `fishhawk run start --working-dir … --issue … --runner-kind local`. With `fishhawk_run_stage` ([ADR-024](https://github.com/kuhlman-labs/fishhawk/issues/433) / #434), the dialogue inside Claude Code can be entirely agent-driven — no terminal handoff:
 
 1. Agent calls `fishhawk_start_run` with `working_dir`, `issue`, `runner_kind=local`.
-2. Operator runs `fishhawk runner start --run-id … --stage-id … --stage plan` in a terminal to execute the plan stage.
+2. Agent calls `fishhawk_run_stage --stage plan` (the MCP server spawns `fishhawk-runner` and streams events).
 3. Agent calls `fishhawk_approve_plan`.
-4. Operator runs `fishhawk runner start … --stage implement` to execute the implement stage.
+4. Agent calls `fishhawk_run_stage --stage implement`.
 
-Closing the terminal-side gap (steps 2 + 4 → MCP) is tracked at [#427](https://github.com/kuhlman-labs/fishhawk/issues/427).
+The `fishhawk_run_stage` tool requires the `fishhawk-runner` binary on the MCP server's host (`PATH` lookup, overridable via `FISHHAWK_RUNNER_BIN` env or the tool's `runner_binary` input). The MCP server runs locally on an operator's workstation today, so this is always satisfied; a future hosted MCP deployment will surface a clean tool error.
+
+Cancellation: cancelling the `fishhawk_run_stage` tool call sends `SIGTERM` to the runner, waits 30 seconds, then escalates to `SIGKILL`. Graceful partial-trace upload requires runner-side `SIGTERM` handling (tracked at [#435](https://github.com/kuhlman-labs/fishhawk/issues/435)); until that lands, a cancelled stage may sit in `running` until the SLA ticker reaps it as a category-D timeout.
 
 ## Runner integration
 
