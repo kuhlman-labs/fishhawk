@@ -27,7 +27,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
@@ -41,10 +43,23 @@ import (
 )
 
 const (
-	exitOK      = 0
-	exitFailure = 1
-	exitUsage   = 2
+	exitOK        = 0
+	exitFailure   = 1
+	exitUsage     = 2
+	exitCancelled = 130 // 128 + SIGINT; matches the convention for terminate-by-signal exit codes.
 )
+
+// newRunnerContext returns the top-level context for the runner's
+// long-running calls. Production wires signal.NotifyContext for
+// SIGINT + SIGTERM so the MCP fishhawk_run_stage tool's
+// cancellation chain (ADR-024 / #433) translates cleanly into a
+// graceful runner exit (#435).
+//
+// Exposed as a var so tests can swap in a context they can cancel
+// programmatically without raising signals at the test process.
+var newRunnerContext = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
 
 // newInvoker is the seam tests use to swap the real Claude Code
 // adapter for a fake. Production wiring is the only assignment in
@@ -84,7 +99,17 @@ func main() {
 // they can be piped or captured separately. This split lets a
 // caller redirect stderr for diagnostics while keeping the trace
 // stream clean.
-func run(args []string, logSink io.Writer) int {
+//
+// Signal handling (#435): newRunnerContext registers SIGINT +
+// SIGTERM. When either fires before the body returns, the deferred
+// cleanup emits a `runner_cancelled` log line and overrides the
+// exit code to exitCancelled (130). The body itself receives ctx
+// — long-running calls (Invoke, ShipTrace, FetchPrompt, etc.)
+// terminate early via ctx.Done(), which is the cooperative half of
+// the cleanup. The remaining trace bundle (whatever events were
+// captured up to the cancellation point) still packs + ships best-
+// effort if the body gets that far.
+func run(args []string, logSink io.Writer) (exitCode int) {
 	cfg, err := parseFlags(args, logSink)
 	if err != nil {
 		// parseFlags already wrote a usage / error message.
@@ -92,6 +117,22 @@ func run(args []string, logSink io.Writer) int {
 	}
 
 	logStartup(logSink, cfg)
+
+	ctx, stop := newRunnerContext()
+	defer stop()
+	defer func() {
+		// Override whatever the body returned when ctx was the
+		// cause of exit. Emit a structured terminator so the MCP
+		// run_stage tool (and any other consumer parsing the
+		// runner's stdout stream) sees a clean cancellation marker
+		// regardless of where in the body the cancel landed.
+		if ctx.Err() != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_cancelled","run_id":%q,"stage_id":%q,"reason":%q}`+"\n",
+				cfg.runID, cfg.stageID, ctx.Err().Error())
+			exitCode = exitCancelled
+		}
+	}()
 
 	// One uploadClient instance shared by fetch-prompt + upload-trace
 	// paths. Constructed lazily so the scaffold-mode short-circuit
@@ -122,14 +163,14 @@ func run(args []string, logSink io.Writer) int {
 			return exitUsage
 		}
 		client = newUploadClient(cfg.backendURL)
-		key, fetchErr := issueSigningKey(context.Background(), client, cfg, logSink)
+		key, fetchErr := issueSigningKey(ctx, client, cfg, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"issue_key","detail":%q}`+"\n", fetchErr.Error())
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, fetchErr := fetchPromptToFile(context.Background(), client, cfg, key, logSink)
+		path, sType, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -171,7 +212,7 @@ func run(args []string, logSink io.Writer) int {
 	// MCP awareness but the run still produces a valid trace /
 	// plan / PR per the rest of the stage flow.
 	if issuedKey != nil {
-		mcpTok, err := client.FetchMCPToken(context.Background(), upload.FetchMCPTokenArgs{
+		mcpTok, err := client.FetchMCPToken(ctx, upload.FetchMCPTokenArgs{
 			RunID:      cfg.runID,
 			PrivateKey: issuedKey.PrivateKey,
 		})
@@ -189,7 +230,7 @@ func run(args []string, logSink io.Writer) int {
 	}
 
 	invoker := newInvoker(os.Getenv("ANTHROPIC_API_KEY"))
-	res, invokeErr := invoker.Invoke(context.Background(), inv)
+	res, invokeErr := invoker.Invoke(ctx, inv)
 
 	// Plan validation runs only if the agent itself succeeded —
 	// no point re-stating "your plan is malformed" when the
@@ -358,7 +399,7 @@ func run(args []string, logSink io.Writer) int {
 			if client == nil {
 				client = newUploadClient(cfg.backendURL)
 			}
-			key, err := issueSigningKey(context.Background(), client, cfg, logSink)
+			key, err := issueSigningKey(ctx, client, cfg, logSink)
 			if err != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"issue_key","detail":%q}`+"\n", err.Error())
@@ -383,7 +424,7 @@ func run(args []string, logSink io.Writer) int {
 			{name: "raw", bytes: rawBundle},
 			{name: "redacted", bytes: redactedBundle},
 		} {
-			if err := uploadTrace(cfg, v.name, v.bytes, logSink, client, issuedKey); err != nil {
+			if err := uploadTrace(ctx, cfg, v.name, v.bytes, logSink, client, issuedKey); err != nil {
 				// Upload failures are MVP_SPEC §6 category-C (infra).
 				// We DON'T overwrite an earlier A/B failure category;
 				// only stamp C when the agent itself succeeded.
@@ -410,7 +451,7 @@ func run(args []string, logSink io.Writer) int {
 		// body as schema-invalid (ErrPlanInvalid) — that's category-B
 		// since it's the agent's output that's bad, not the network.
 		if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
-			if err := uploadPlan(cfg, logSink, client, issuedKey); err != nil {
+			if err := uploadPlan(ctx, cfg, logSink, client, issuedKey); err != nil {
 				res.OK = false
 				if errors.Is(err, upload.ErrPlanInvalid) {
 					res.FailureCategory = "B"
@@ -433,7 +474,7 @@ func run(args []string, logSink io.Writer) int {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			if err := openPRAndShipArtifact(cfg, logSink, client, issuedKey); err != nil {
+			if err := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey); err != nil {
 				res.OK = false
 				if errors.Is(err, upload.ErrPullRequestInvalid) {
 					res.FailureCategory = "B"
@@ -490,14 +531,13 @@ type traceVariant struct {
 	bytes []byte
 }
 
-func uploadTrace(cfg config, variant string, bundleBytes []byte, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
+func uploadTrace(ctx context.Context, cfg config, variant string, bundleBytes []byte, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
 	if cfg.stageID == "" {
 		return errors.New("upload: --stage-id required with --upload-trace")
 	}
 	if client == nil {
 		client = newUploadClient(cfg.backendURL)
 	}
-	ctx := context.Background()
 
 	if issued == nil {
 		key, err := issueSigningKey(ctx, client, cfg, logSink)
@@ -531,14 +571,13 @@ func uploadTrace(cfg config, variant string, bundleBytes []byte, logSink io.Writ
 // The plan is read fresh from disk rather than handed in; the
 // upstream call site already validated the file and we want one
 // canonical source of bytes for the signature.
-func uploadPlan(cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
+func uploadPlan(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
 	if cfg.stageID == "" {
 		return errors.New("upload: --stage-id required with --plan-out + --upload-trace")
 	}
 	if client == nil {
 		client = newUploadClient(cfg.backendURL)
 	}
-	ctx := context.Background()
 
 	if issued == nil {
 		// One-shot per run; if neither --fetch-prompt nor uploadTrace
@@ -901,7 +940,7 @@ var (
 // is a real workflow signal but not necessarily a failure; we emit
 // a policy_event into the trace via a follow-up bundle so the
 // approver sees "agent decided no changes were needed."
-func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -922,8 +961,6 @@ func openPRAndShipArtifact(cfg config, logSink io.Writer, client uploadClient, i
 		)
 		return nil
 	}
-
-	ctx := context.Background()
 
 	// Always mint a fresh App installation token at this point in
 	// the stage, even if the auth pre-step's OIDC-minted token is

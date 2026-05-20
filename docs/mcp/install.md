@@ -107,7 +107,7 @@ Two audiences with different scopes:
 | `fishhawk_approve_plan` | Approve the plan stage of a run (resolves stage from run id); mirrors `fishhawk plan approve`. | `write:approvals` |
 | `fishhawk_reject_plan` | Reject the plan stage with optional rationale; mirrors `fishhawk plan reject`. | `write:approvals` |
 | `fishhawk_list_runs` | Enumerate runs with filters (`repo`, `workflow_id`, `state`) + cursor pagination. | `read:runs` |
-| `fishhawk_run_stage` | Drive one stage of a local-runner run by spawning `fishhawk-runner` as a subprocess; mirrors `fishhawk runner start`. Events stream as MCP `notifications/progress` when the client provides a progress token; the final result carries the full event list and post-run stage state. Cancellation: SIGTERM + 30s grace + SIGKILL (graceful cleanup needs runner-side support, tracked at [#435](https://github.com/kuhlman-labs/fishhawk/issues/435)). Requires the `fishhawk-runner` binary to resolve on the MCP server's host — see [ADR-024](https://github.com/kuhlman-labs/fishhawk/issues/433). | `write:runs` |
+| `fishhawk_run_stage` | Drive one stage of a local-runner run by spawning `fishhawk-runner` as a subprocess; mirrors `fishhawk runner start`. Events stream as MCP `notifications/progress` when the client provides a progress token; the final result carries the full event list and post-run stage state. Cancellation: SIGTERM + 30s grace + SIGKILL; the runner handles SIGTERM cooperatively ([#435](https://github.com/kuhlman-labs/fishhawk/issues/435)) — exits with code 130 and emits a `runner_cancelled` event. Requires the `fishhawk-runner` binary to resolve on the MCP server's host — see [ADR-024](https://github.com/kuhlman-labs/fishhawk/issues/433). | `write:runs` |
 
 **Auth posture** (today, v0):
 
@@ -136,7 +136,7 @@ The composition matches the CLI's `fishhawk run start --working-dir … --issue 
 
 The `fishhawk_run_stage` tool requires the `fishhawk-runner` binary on the MCP server's host (`PATH` lookup, overridable via `FISHHAWK_RUNNER_BIN` env or the tool's `runner_binary` input). The MCP server runs locally on an operator's workstation today, so this is always satisfied; a future hosted MCP deployment will surface a clean tool error.
 
-Cancellation: cancelling the `fishhawk_run_stage` tool call sends `SIGTERM` to the runner, waits 30 seconds, then escalates to `SIGKILL`. Graceful partial-trace upload requires runner-side `SIGTERM` handling (tracked at [#435](https://github.com/kuhlman-labs/fishhawk/issues/435)); until that lands, a cancelled stage may sit in `running` until the SLA ticker reaps it as a category-D timeout.
+Cancellation: cancelling the `fishhawk_run_stage` tool call sends `SIGTERM` to the runner, waits 30 seconds, then escalates to `SIGKILL`. The runner handles SIGTERM cooperatively (#435) — `ctx.Done()` propagates to the long-running calls (agent invocation + trace/plan/PR uploads), the deferred cancel-emit writes a `runner_cancelled` JSONL line on stdout, and the process exits with code 130 (`128 + SIGINT` convention). The bundle that was packed up to the cancellation point still ships best-effort, so the backend receives whatever events the agent produced.
 
 ## Runner integration
 
