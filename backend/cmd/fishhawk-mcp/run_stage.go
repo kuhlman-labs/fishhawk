@@ -1,0 +1,495 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// runStageCommand is the subprocess fishhawk_run_stage spawns.
+// Exposed as a var so tests can substitute a recording fake without
+// actually running the runner binary. Production wires exec.Command.
+var runStageCommand = exec.Command
+
+// runStageLookPath looks up the fishhawk-runner binary on PATH.
+// Test seam mirroring the CLI's runnerBinaryLookPath.
+var runStageLookPath = exec.LookPath
+
+// runStageGitRemoteOriginURL returns `origin`'s URL for the working
+// dir. Mirrors the CLI's gitRemoteOriginURL — test seam.
+var runStageGitRemoteOriginURL = func(dir string) (string, error) {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// runStageGracePeriod is the time SIGTERM is given to land before
+// the handler escalates to SIGKILL. Exposed as a var so tests can
+// shorten it.
+var runStageGracePeriod = 30 * time.Second
+
+// RunStageInput is the fishhawk_run_stage tool's input schema
+// (ADR-024 / #433, impl #434). Mirrors `fishhawk runner start`'s
+// flags so an agent driving the local-runner loop end-to-end via
+// MCP composes the same arguments the CLI would.
+type RunStageInput struct {
+	RunID         string `json:"run_id" jsonschema:"Fishhawk run UUID minted by fishhawk_start_run"`
+	StageID       string `json:"stage_id" jsonschema:"stage UUID inside the run"`
+	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
+	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review"`
+	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in; defaults to the MCP server's cwd"`
+	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
+	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
+	PushAndOpenPR bool   `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR; default false (the operator commits the changes themselves)"`
+	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; defaults to FISHHAWK_RUNNER_BIN env then exec.LookPath('fishhawk-runner')"`
+}
+
+// RunStageOutput is the structured result of one stage run. The
+// runner's JSONL events accumulate on Events; the final stage state
+// (fetched after the runner exits) lives on StageState; ExitCode is
+// the runner's process exit code so callers can branch on failure
+// categories (the runner uses distinct codes per category).
+//
+// Warnings collects best-effort surfaces: non-JSON runner stdout
+// lines, failed post-run stage fetch, missing github_repo, etc.
+// None of these fail the tool itself — the runner's exit is the
+// canonical outcome.
+type RunStageOutput struct {
+	ExitCode   int           `json:"exit_code"`
+	StageState string        `json:"stage_state,omitempty" jsonschema:"final stage state fetched after the runner exits; empty when the fetch failed"`
+	Events     []RunnerEvent `json:"events" jsonschema:"runner-emitted JSONL events in arrival order"`
+	Warnings   []string      `json:"warnings,omitempty"`
+}
+
+// RunnerEvent wraps an unstructured runner event. Each event is the
+// parsed JSON object the runner emitted on one stdout line. Typed
+// as `any` (not json.RawMessage) for the same reason Artifact.Content
+// and AuditEntry.Payload are: the SDK's schema reflection treats
+// json.RawMessage as `type: array`, which rejects the runner's
+// object-shaped events at wire time.
+type RunnerEvent struct {
+	Payload any `json:"payload"`
+}
+
+// registerRunStage wires the fishhawk_run_stage tool (ADR-024 /
+// #433, impl #434).
+//
+// Spawns the operator's fishhawk-runner binary as a child process,
+// composes argv from the input (mirroring `fishhawk runner start`),
+// parses each JSONL line on stdout as one runner event, and either
+// (a) emits a `notifications/progress` update per event when the
+// client provided a progress token, or (b) accumulates events in
+// memory for the final tool result. The audit log carries the
+// durable record either way.
+//
+// Cancellation: on tool-call context cancellation, the handler
+// sends SIGTERM to the runner subprocess, waits up to
+// runStageGracePeriod, then escalates to SIGKILL. The runner
+// having a SIGTERM handler is a prerequisite for graceful cleanup
+// (#435); without it, cancellation is kill-only with the SLA
+// ticker reaping the stuck stage.
+//
+// Resolution failure modes:
+//   - fishhawk-runner not on PATH (and no override): tool error with
+//     a clean remediation.
+//   - GitHub repo auto-detect failed without push_and_open_pr: tool
+//     error.
+//   - Subprocess spawn failure (rare; permission, missing binary
+//     after lookup): tool error.
+//
+// Auth: write tool. The MCP server's FISHHAWK_API_TOKEN is forwarded
+// to the runner subprocess via env (same shape as the CLI).
+func registerRunStage(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_run_stage",
+		Description: strings.TrimSpace(`
+Drive one stage of a Fishhawk run to completion by spawning the
+fishhawk-runner binary on the operator's host.
+
+Mirrors the CLI's "fishhawk runner start" verb. Pair with
+fishhawk_start_run + fishhawk_approve_plan for the full
+agent-driven local-runner loop:
+
+  1. fishhawk_start_run --working-dir ... --issue ... --runner-kind local
+  2. fishhawk_run_stage --stage plan ...
+  3. fishhawk_approve_plan ...
+  4. fishhawk_run_stage --stage implement ...
+
+Runner output streams as MCP progress notifications when the
+client provides a progress token; the final tool result carries
+the full event list plus the post-run stage state.
+
+Cancellation: cancelling the tool call sends SIGTERM (then SIGKILL
+after a 30s grace) to the runner. Graceful cleanup requires the
+runner-side SIGTERM handler (#435) — until it lands, cancellation
+is kill-only and the stage relies on the SLA ticker to reap.
+
+Requires the fishhawk-runner binary to resolve on the MCP server's
+host; this tool is local-only by design (ADR-024 Q5).
+`),
+	}, resolver.runStage)
+}
+
+// runStage is the tool handler.
+//
+// Composition order:
+//  1. validate the obvious inputs (run_id, stage_id, workflow, stage).
+//  2. resolve the runner binary (input > env > PATH).
+//  3. resolve GitHub repo (input > working-dir origin remote;
+//     soft-failure when push_and_open_pr is false).
+//  4. compose argv mirroring `fishhawk runner start`.
+//  5. spawn the runner; pipe stdout through a JSONL parser that
+//     forwards each event as a progress notification (when a
+//     progress token was given) and accumulates them all.
+//  6. on context cancellation, SIGTERM + grace + SIGKILL the child.
+//  7. wait for exit; fetch the post-run stage state for the result.
+func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in RunStageInput) (*mcp.CallToolResult, RunStageOutput, error) {
+	// (1) Input validation.
+	if in.RunID == "" || in.StageID == "" || in.Workflow == "" || in.Stage == "" {
+		return nil, RunStageOutput{}, errors.New("run_id, stage_id, workflow, and stage are all required")
+	}
+	runUUID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, RunStageOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+	stageUUID, err := uuid.Parse(in.StageID)
+	if err != nil {
+		return nil, RunStageOutput{}, fmt.Errorf("stage_id %q is not a valid UUID: %w", in.StageID, err)
+	}
+
+	// (2) Resolve the runner binary.
+	binary := in.RunnerBinary
+	if binary == "" {
+		if env := r.getenv("FISHHAWK_RUNNER_BIN"); env != "" {
+			binary = env
+		}
+	}
+	if binary == "" {
+		resolved, lerr := runStageLookPath("fishhawk-runner")
+		if lerr != nil {
+			return nil, RunStageOutput{}, errors.New(
+				"fishhawk-runner not on PATH; this tool requires local MCP execution — " +
+					"pass runner_binary or set FISHHAWK_RUNNER_BIN")
+		}
+		binary = resolved
+	}
+
+	workingDir := in.WorkingDir
+	if workingDir == "" {
+		workingDir = "."
+	}
+
+	// (3) Resolve the GitHub repo. push_and_open_pr=false means the
+	// runner won't push, so a missing repo is acceptable — collect
+	// as a warning rather than failing.
+	var warnings []string
+	repo := in.GitHubRepo
+	if repo == "" {
+		detected, derr := runStageDetectGitHubRepo(workingDir)
+		switch {
+		case derr == nil:
+			repo = detected
+		case in.PushAndOpenPR:
+			return nil, RunStageOutput{}, fmt.Errorf(
+				"github_repo not set and could not detect from origin (push_and_open_pr requires a repo): %w", derr)
+		default:
+			warnings = append(warnings,
+				fmt.Sprintf("github_repo not set and origin auto-detect failed (%v); proceeding without push.", derr))
+		}
+	}
+
+	// (4) Build the runner argv. Mirrors
+	// cli/cmd/fishhawk/runner.go::runRunnerStart — keep in sync.
+	argv := []string{
+		"--run-id", in.RunID,
+		"--backend-url", r.api.baseURL,
+		"--workflow", in.Workflow,
+		"--stage", in.Stage,
+		"--stage-id", in.StageID,
+		"--working-dir", workingDir,
+		"--fetch-prompt",
+		"--upload-trace",
+	}
+	if in.Stage == "plan" {
+		argv = append(argv, "--plan-out", "/tmp/fishhawk-plan.json")
+	}
+	if repo != "" {
+		argv = append(argv, "--github-repo", repo)
+	}
+	baseBranch := in.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+	argv = append(argv, "--base-branch", baseBranch)
+	if !in.PushAndOpenPR {
+		argv = append(argv, "--no-pr")
+	}
+
+	cmd := runStageCommand(binary, argv...)
+	cmd.Env = append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
+
+	// (5) Wire stdout to a JSONL parser. Stderr is piped through to
+	// the operator's terminal — the runner's verbose log lines are
+	// meant for humans, not the agent.
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, RunStageOutput{}, fmt.Errorf("attach stdout: %w", err)
+	}
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, RunStageOutput{}, fmt.Errorf("spawn fishhawk-runner: %w", err)
+	}
+
+	// Concurrently: parse stdout into events; watch ctx for
+	// cancellation and signal the child. Both feed into the
+	// wait-for-exit synchronization below.
+	var (
+		events    []RunnerEvent
+		eventsMu  sync.Mutex
+		parseWG   sync.WaitGroup
+		progToken any
+	)
+	if req != nil && req.Params != nil {
+		progToken = req.Params.GetProgressToken()
+	}
+
+	parseWG.Add(1)
+	go func() {
+		defer parseWG.Done()
+		runStageParseEvents(ctx, stdoutPipe, &events, &eventsMu, &warnings, req, progToken)
+	}()
+
+	// (6+7) Wait for the runner to exit, honoring context
+	// cancellation. The wait coordinator owns the single cmd.Wait
+	// call so we don't trigger "no child processes" from a stray
+	// duplicate Wait.
+	waitErr := runStageWaitForExit(ctx, cmd, runStageGracePeriod)
+	parseWG.Wait()
+
+	exitCode := 0
+	switch {
+	case waitErr == nil:
+		exitCode = 0
+	case errors.As(waitErr, new(*exec.ExitError)):
+		var exitErr *exec.ExitError
+		_ = errors.As(waitErr, &exitErr)
+		exitCode = exitErr.ExitCode()
+	default:
+		return nil, RunStageOutput{}, fmt.Errorf("runner subprocess: %w", waitErr)
+	}
+
+	// Fetch the post-run stage state. Best-effort: a backend hiccup
+	// here doesn't fail the tool — the audit log has the canonical
+	// transition record.
+	stageState := ""
+	if fetchErr := func() error {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stages, ferr := r.api.ListRunStages(fetchCtx, runUUID)
+		if ferr != nil {
+			return ferr
+		}
+		for _, s := range stages {
+			if s.ID == stageUUID.String() {
+				stageState = s.State
+				return nil
+			}
+		}
+		return fmt.Errorf("stage %s not found in run %s stage list", stageUUID, runUUID)
+	}(); fetchErr != nil {
+		warnings = append(warnings,
+			fmt.Sprintf("post-run stage fetch failed: %v", fetchErr))
+	}
+
+	// Return-cancellation signal: if the parent ctx was the reason
+	// for exit, surface a clear tool error rather than a 0 / silent
+	// success.
+	if ctx.Err() != nil {
+		return nil, RunStageOutput{
+				ExitCode:   exitCode,
+				StageState: stageState,
+				Events:     events,
+				Warnings:   warnings,
+			},
+			fmt.Errorf("fishhawk_run_stage cancelled: %w", ctx.Err())
+	}
+
+	return nil, RunStageOutput{
+		ExitCode:   exitCode,
+		StageState: stageState,
+		Events:     events,
+		Warnings:   warnings,
+	}, nil
+}
+
+// runStageParseEvents reads JSONL lines from r and appends each
+// parsed event to events. When progToken is non-nil and req has a
+// session, each event also emits as a progress notification (best-
+// effort — a failed notify only adds a warning).
+//
+// Lines that don't parse as JSON land in warnings rather than
+// failing the read; the runner is the authority on its output
+// format and a CLI-style "Running plan stage..." print shouldn't
+// blow up the tool.
+func runStageParseEvents(
+	ctx context.Context,
+	r io.Reader,
+	events *[]RunnerEvent,
+	mu *sync.Mutex,
+	warnings *[]string,
+	req *mcp.CallToolRequest,
+	progToken any,
+) {
+	scanner := bufio.NewScanner(r)
+	// JSONL lines from the runner can be large (trace events with
+	// embedded payloads). Bump from the default 64KiB to 1MiB.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var progress float64
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r\n")
+		if line == "" {
+			continue
+		}
+		var payload any
+		if perr := json.Unmarshal([]byte(line), &payload); perr != nil {
+			mu.Lock()
+			*warnings = append(*warnings, fmt.Sprintf("non-JSON runner stdout: %q", line))
+			mu.Unlock()
+			continue
+		}
+		mu.Lock()
+		*events = append(*events, RunnerEvent{Payload: payload})
+		mu.Unlock()
+		if progToken != nil && req != nil && req.Session != nil {
+			progress++
+			_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+				ProgressToken: progToken,
+				Progress:      progress,
+				Message:       runStageEventMessage(payload),
+			})
+		}
+	}
+	if serr := scanner.Err(); serr != nil && !errors.Is(serr, io.EOF) {
+		mu.Lock()
+		*warnings = append(*warnings, fmt.Sprintf("scan runner stdout: %v", serr))
+		mu.Unlock()
+	}
+}
+
+// runStageEventMessage extracts a short message from a runner event
+// for the progress notification's human-readable summary. Looks for
+// a top-level `kind` or `type` field (the runner's event shape uses
+// `kind`); falls back to the JSON-encoded payload truncated.
+func runStageEventMessage(payload any) string {
+	if m, ok := payload.(map[string]any); ok {
+		for _, key := range []string{"kind", "type", "event"} {
+			if v, ok := m[key].(string); ok && v != "" {
+				return v
+			}
+		}
+	}
+	enc, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	const maxLen = 120
+	if len(enc) > maxLen {
+		return string(enc[:maxLen]) + "..."
+	}
+	return string(enc)
+}
+
+// runStageWaitForExit owns the canonical cmd.Wait() and coordinates
+// cancellation. Flow:
+//
+//   - Start one goroutine doing cmd.Wait(); it's the ONLY Wait on
+//     this process. A duplicate Wait would race the kernel's
+//     wait-status collection and return "no child processes" on
+//     macOS / Linux.
+//   - Block on (waitDone OR ctx.Done()).
+//   - On ctx.Done() before the runner exits: SIGTERM, then up to
+//     grace seconds for the wait to settle, then SIGKILL, then wait
+//     unconditionally for the wait to settle.
+//
+// Returns the error from the canonical Wait — caller branches on
+// exec.ExitError to extract the exit code.
+func runStageWaitForExit(ctx context.Context, cmd *exec.Cmd, grace time.Duration) error {
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+
+	select {
+	case err := <-waitDone:
+		return err
+	case <-ctx.Done():
+		// Operator cancelled; send SIGTERM and wait up to grace.
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+		select {
+		case err := <-waitDone:
+			return err
+		case <-time.After(grace):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			return <-waitDone
+		}
+	}
+}
+
+// runStageDetectGitHubRepo mirrors the CLI's helper. Returns
+// (owner/name, nil) when the working-dir origin resolves to a
+// github.com URL; otherwise a descriptive error.
+func runStageDetectGitHubRepo(workingDir string) (string, error) {
+	raw, err := runStageGitRemoteOriginURL(workingDir)
+	if err != nil {
+		return "", fmt.Errorf("`git remote get-url origin`: %w", err)
+	}
+	owner, name, err := runStageParseGitHubRemote(raw)
+	if err != nil {
+		return "", err
+	}
+	return owner + "/" + name, nil
+}
+
+// runStageParseGitHubRemote turns a remote URL into (owner, name).
+// Mirrors cli/cmd/fishhawk/runner.go::parseGitHubRemote.
+func runStageParseGitHubRemote(raw string) (owner, name string, err error) {
+	s := strings.TrimSpace(raw)
+	switch {
+	case strings.HasPrefix(s, "https://github.com/"):
+		s = strings.TrimPrefix(s, "https://github.com/")
+	case strings.HasPrefix(s, "git@github.com:"):
+		s = strings.TrimPrefix(s, "git@github.com:")
+	case strings.HasPrefix(s, "ssh://git@github.com/"):
+		s = strings.TrimPrefix(s, "ssh://git@github.com/")
+	default:
+		return "", "", fmt.Errorf("remote %q is not a github.com URL", raw)
+	}
+	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	parts := strings.SplitN(s, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("remote %q is not owner/name", raw)
+	}
+	return parts[0], parts[1], nil
+}

@@ -38,6 +38,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerApprovePlan(srv, resolver)
 	registerRejectPlan(srv, resolver)
 	registerListRuns(srv, resolver)
+	registerRunStage(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All
