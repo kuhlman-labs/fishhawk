@@ -69,9 +69,32 @@ func withFakeGitRemote(t *testing.T, url string, err error) {
 	t.Cleanup(func() { gitRemoteOriginURL = orig })
 }
 
+// withNoopAutoPR stubs autoOpenPR's test seams so implement-stage
+// runner_test cases don't run real git/gh against the live checkout.
+// The autopr_test.go suite covers autoOpenPR's behavior; here we
+// just need the seams stubbed so the runner_test stays hermetic.
+// Without this, TestRunnerStart_HappyPath_BuildsExpectedArgv created
+// a real branch + commit in the dev checkout during sub-task 4 of
+// #422 (caught in retro; fixed here as a follow-up).
+func withNoopAutoPR(t *testing.T) {
+	t.Helper()
+	origGit := autoGitCommand
+	origGh := autoGhCommand
+	noop := func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("/usr/bin/false")
+	}
+	autoGitCommand = noop
+	autoGhCommand = noop
+	t.Cleanup(func() {
+		autoGitCommand = origGit
+		autoGhCommand = origGh
+	})
+}
+
 func TestRunnerStart_HappyPath_BuildsExpectedArgv(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	withFakeGitRemote(t, "https://github.com/kuhlman-labs/fishhawk.git", nil)
+	withNoopAutoPR(t)
 
 	var stdout, stderr strings.Builder
 	got := run([]string{
@@ -152,6 +175,9 @@ func TestRunnerStart_NonPlanStage_OmitsPlanOut(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			cap := withFakeRunnerSpawn(t)
 			withFakeGitRemote(t, "https://github.com/x/y.git", nil)
+			if stage == "implement" {
+				withNoopAutoPR(t)
+			}
 			got := run([]string{
 				"runner", "start",
 				"--run-id", "1", "--stage-id", "2",
@@ -171,6 +197,7 @@ func TestRunnerStart_GithubRepoFlag_OverridesAutoDetect(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	// Auto-detect would return one repo; the explicit flag should win.
 	withFakeGitRemote(t, "https://github.com/wrong/auto-detect.git", nil)
+	withNoopAutoPR(t)
 
 	var stdout, stderr strings.Builder
 	got := run([]string{
@@ -194,6 +221,7 @@ func TestRunnerStart_GithubRepoFlag_OverridesAutoDetect(t *testing.T) {
 func TestRunnerStart_AutoDetect_PullsFromGitRemote(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	withFakeGitRemote(t, "git@github.com:operator/scratch.git", nil)
+	withNoopAutoPR(t)
 
 	var stdout, stderr strings.Builder
 	got := run([]string{
