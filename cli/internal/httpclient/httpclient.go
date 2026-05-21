@@ -350,6 +350,46 @@ func (c *Client) RetryStage(ctx context.Context, stageID uuid.UUID) (*Stage, err
 	return &stage, nil
 }
 
+// ShipLocalPullRequestInput is the request body for POST /v0/runs/{run_id}/pull-request.
+// Field names match the backend's pullRequestBody wire shape. BaseSHA is omitempty
+// per the spec but the backend validates it as non-empty at runtime; callers must supply it.
+type ShipLocalPullRequestInput struct {
+	PRNumber          int    `json:"pr_number"`
+	PRURL             string `json:"pr_url"`
+	Branch            string `json:"branch"`
+	HeadSHA           string `json:"head_sha"`
+	BaseSHA           string `json:"base_sha,omitempty"`
+	Title             string `json:"title"`
+	Body              string `json:"body"`
+	FilesChangedCount int    `json:"files_changed_count,omitempty"`
+}
+
+// ShipLocalPullRequestResult mirrors the backend's pullRequestResponse.
+type ShipLocalPullRequestResult struct {
+	ID          uuid.UUID `json:"id"`
+	StageID     uuid.UUID `json:"stage_id"`
+	ContentHash string    `json:"content_hash"`
+	PRNumber    int       `json:"pr_number"`
+	PRURL       string    `json:"pr_url"`
+	HeadSHA     string    `json:"head_sha"`
+	Idempotent  bool      `json:"idempotent"`
+}
+
+// ShipLocalPullRequest calls POST /v0/runs/{run_id}/pull-request?stage_id={stage_id}.
+// Auth is bearer-token only; no X-Fishhawk-Signature is sent.
+func (c *Client) ShipLocalPullRequest(ctx context.Context, runID, stageID uuid.UUID, in ShipLocalPullRequestInput) (*ShipLocalPullRequestResult, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	path := "/v0/runs/" + runID.String() + "/pull-request?stage_id=" + stageID.String()
+	var res ShipLocalPullRequestResult
+	if err := c.do(ctx, http.MethodPost, path, body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // do performs the request and decodes the JSON body into out (or
 // reads the error envelope on non-2xx and returns *APIError).
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {

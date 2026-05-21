@@ -60,13 +60,21 @@ func (p *pullRequestBody) validate() error {
 	return nil
 }
 
+// hasScope reports whether id contains the exact scope string.
+func hasScope(id Identity, scope string) bool {
+	for _, s := range id.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
 // handleShipPullRequest implements POST /v0/runs/{run_id}/pull-request.
 //
-// Mirrors the plan-upload handler in shape: signed body, schema-ish
-// validation, idempotent on (stage_id, head_sha) — re-running a
-// runner job that already pushed the same commits returns the
-// existing artifact. Inserts an `artifacts` row with kind=pull_request
-// and appends a `pull_request_opened` audit entry.
+// Accepts either an Ed25519 X-Fishhawk-Signature (runner path) or a
+// bearer token with write:runs scope (operator path). When neither is
+// present the handler returns 401 signature_or_bearer_required.
 func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.SigningRepo == nil || s.cfg.ArtifactRepo == nil ||
 		s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil {
@@ -105,20 +113,6 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sigHeader := r.Header.Get("X-Fishhawk-Signature")
-	if sigHeader == "" {
-		s.writeError(w, r, http.StatusUnauthorized, "signature_missing",
-			"X-Fishhawk-Signature header is required", nil)
-		return
-	}
-	signature, err := hex.DecodeString(sigHeader)
-	if err != nil {
-		s.writeError(w, r, http.StatusUnauthorized, "signature_invalid",
-			"X-Fishhawk-Signature is not valid hex",
-			map[string]any{"error": err.Error()})
-		return
-	}
-
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxPullRequestBundleBytes+1))
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
@@ -132,22 +126,49 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	message := signing.ComputeMessage(body)
-	if err := s.cfg.SigningRepo.Verify(r.Context(), runID, message, signature); err != nil {
-		switch {
-		case errors.Is(err, signing.ErrNotFound):
-			s.writeError(w, r, http.StatusNotFound, "signing_key_not_found",
-				"no signing key issued for this run", map[string]any{"run_id": runID.String()})
-		case errors.Is(err, signing.ErrExpired):
-			s.writeError(w, r, http.StatusUnauthorized, "signing_key_expired",
-				"signing key TTL has passed", map[string]any{"run_id": runID.String()})
-		case errors.Is(err, signing.ErrSignatureInvalid):
+	var authMethod string
+	var actorKind audit.ActorKind
+	var actorSubject *string
+
+	sigHeader := r.Header.Get("X-Fishhawk-Signature")
+	id := IdentityFrom(r.Context())
+	switch {
+	case sigHeader != "":
+		signature, err := hex.DecodeString(sigHeader)
+		if err != nil {
 			s.writeError(w, r, http.StatusUnauthorized, "signature_invalid",
-				"signature does not match the run's stored public key", nil)
-		default:
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"signature verification failed", map[string]any{"error": err.Error()})
+				"X-Fishhawk-Signature is not valid hex",
+				map[string]any{"error": err.Error()})
+			return
 		}
+		message := signing.ComputeMessage(body)
+		if err := s.cfg.SigningRepo.Verify(r.Context(), runID, message, signature); err != nil {
+			switch {
+			case errors.Is(err, signing.ErrNotFound):
+				s.writeError(w, r, http.StatusNotFound, "signing_key_not_found",
+					"no signing key issued for this run", map[string]any{"run_id": runID.String()})
+			case errors.Is(err, signing.ErrExpired):
+				s.writeError(w, r, http.StatusUnauthorized, "signing_key_expired",
+					"signing key TTL has passed", map[string]any{"run_id": runID.String()})
+			case errors.Is(err, signing.ErrSignatureInvalid):
+				s.writeError(w, r, http.StatusUnauthorized, "signature_invalid",
+					"signature does not match the run's stored public key", nil)
+			default:
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"signature verification failed", map[string]any{"error": err.Error()})
+			}
+			return
+		}
+		authMethod = "ed25519"
+		actorKind = audit.ActorKind("system")
+	case !id.IsAnonymous() && hasScope(id, "write:runs"):
+		authMethod = "bearer"
+		actorKind = audit.ActorKind("operator")
+		subj := id.Subject
+		actorSubject = &subj
+	default:
+		s.writeError(w, r, http.StatusUnauthorized, "signature_or_bearer_required",
+			"request must include X-Fishhawk-Signature or an authenticated bearer token with write:runs scope", nil)
 		return
 	}
 
@@ -216,15 +237,16 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		"base_sha":            pr.BaseSHA,
 		"files_changed_count": pr.FilesChangedCount,
 		"size_bytes":          len(body),
+		"auth_method":         authMethod,
 	})
-	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-		RunID:     runID,
-		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
-		Category:  "pull_request_opened",
-		ActorKind: &systemKind,
-		Payload:   auditPayload,
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "pull_request_opened",
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      auditPayload,
 	}); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"append audit entry failed", map[string]any{"error": err.Error()})

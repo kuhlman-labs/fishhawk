@@ -69,9 +69,32 @@ func withFakeGitRemote(t *testing.T, url string, err error) {
 	t.Cleanup(func() { gitRemoteOriginURL = orig })
 }
 
+// withNoopAutoPR stubs autoOpenPR's test seams so implement-stage
+// runner_test cases don't run real git/gh against the live checkout.
+// The autopr_test.go suite covers autoOpenPR's behavior; here we
+// just need the seams stubbed so the runner_test stays hermetic.
+// Without this, TestRunnerStart_HappyPath_BuildsExpectedArgv created
+// a real branch + commit in the dev checkout during sub-task 4 of
+// #422 (caught in retro; fixed here as a follow-up).
+func withNoopAutoPR(t *testing.T) {
+	t.Helper()
+	origGit := autoGitCommand
+	origGh := autoGhCommand
+	noop := func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("/usr/bin/false")
+	}
+	autoGitCommand = noop
+	autoGhCommand = noop
+	t.Cleanup(func() {
+		autoGitCommand = origGit
+		autoGhCommand = origGh
+	})
+}
+
 func TestRunnerStart_HappyPath_BuildsExpectedArgv(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	withFakeGitRemote(t, "https://github.com/kuhlman-labs/fishhawk.git", nil)
+	withNoopAutoPR(t)
 
 	var stdout, stderr strings.Builder
 	got := run([]string{
@@ -90,7 +113,7 @@ func TestRunnerStart_HappyPath_BuildsExpectedArgv(t *testing.T) {
 		t.Errorf("binary = %q, want /usr/local/bin/fishhawk-runner", cap.binary)
 	}
 	// Required flags surface in the constructed argv. Spot-check the
-	// material ones; --no-pr defaults on per E22.9 spec.
+	// material ones; --no-pr is NOT included by default (default=false).
 	for _, want := range []string{
 		"--run-id", "11111111-2222-3333-4444-555555555555",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
@@ -102,11 +125,13 @@ func TestRunnerStart_HappyPath_BuildsExpectedArgv(t *testing.T) {
 		"--upload-trace",
 		"--github-repo", "kuhlman-labs/fishhawk",
 		"--base-branch", "main",
-		"--no-pr",
 	} {
 		if !contains(cap.args, want) {
 			t.Errorf("argv missing %q: %v", want, cap.args)
 		}
+	}
+	if contains(cap.args, "--no-pr") {
+		t.Errorf("argv should NOT include --no-pr when flag is not passed (default=false): %v", cap.args)
 	}
 }
 
@@ -150,6 +175,9 @@ func TestRunnerStart_NonPlanStage_OmitsPlanOut(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			cap := withFakeRunnerSpawn(t)
 			withFakeGitRemote(t, "https://github.com/x/y.git", nil)
+			if stage == "implement" {
+				withNoopAutoPR(t)
+			}
 			got := run([]string{
 				"runner", "start",
 				"--run-id", "1", "--stage-id", "2",
@@ -169,6 +197,7 @@ func TestRunnerStart_GithubRepoFlag_OverridesAutoDetect(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	// Auto-detect would return one repo; the explicit flag should win.
 	withFakeGitRemote(t, "https://github.com/wrong/auto-detect.git", nil)
+	withNoopAutoPR(t)
 
 	var stdout, stderr strings.Builder
 	got := run([]string{
@@ -192,6 +221,7 @@ func TestRunnerStart_GithubRepoFlag_OverridesAutoDetect(t *testing.T) {
 func TestRunnerStart_AutoDetect_PullsFromGitRemote(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	withFakeGitRemote(t, "git@github.com:operator/scratch.git", nil)
+	withNoopAutoPR(t)
 
 	var stdout, stderr strings.Builder
 	got := run([]string{
@@ -209,8 +239,10 @@ func TestRunnerStart_AutoDetect_PullsFromGitRemote(t *testing.T) {
 
 func TestRunnerStart_AutoDetectFailure_NoPRDefault_StillSucceeds(t *testing.T) {
 	// `git remote get-url origin` fails (not in a git repo). With
-	// --no-pr defaulted on, the runner doesn't need a repo; the
-	// CLI should NOT fail.
+	// --stage plan (not implement), the detection error is silently
+	// skipped even with noPR=false — the guard is *noPR ||
+	// *stage != "implement", so plan stages never need a repo for
+	// PR purposes. The CLI should NOT fail.
 	cap := withFakeRunnerSpawn(t)
 	withFakeGitRemote(t, "", errors.New("not in a git repo"))
 
@@ -228,9 +260,28 @@ func TestRunnerStart_AutoDetectFailure_NoPRDefault_StillSucceeds(t *testing.T) {
 	if contains(cap.args, "--github-repo") {
 		t.Errorf("argv should omit --github-repo when not detectable: %v", cap.args)
 	}
-	// --no-pr should be present.
+	// --no-pr is not in argv by default (default=false).
+	if contains(cap.args, "--no-pr") {
+		t.Errorf("argv should NOT include --no-pr when flag is not passed: %v", cap.args)
+	}
+}
+
+func TestRunnerStart_ExplicitNoPR_FlagReachesSubprocess(t *testing.T) {
+	cap := withFakeRunnerSpawn(t)
+	withFakeGitRemote(t, "https://github.com/kuhlman-labs/fishhawk.git", nil)
+
+	var stdout, stderr strings.Builder
+	got := run([]string{
+		"runner", "start",
+		"--run-id", "1", "--stage-id", "2",
+		"--workflow", "w", "--stage", "implement",
+		"--no-pr",
+	}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d:\n%s", got, stderr.String())
+	}
 	if !contains(cap.args, "--no-pr") {
-		t.Errorf("argv missing --no-pr default: %v", cap.args)
+		t.Errorf("argv missing --no-pr when passed explicitly: %v", cap.args)
 	}
 }
 

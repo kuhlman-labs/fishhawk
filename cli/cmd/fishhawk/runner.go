@@ -88,8 +88,8 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		"GitHub repo as owner/name; auto-detected from `git remote get-url origin` when empty")
 	baseBranch := fs.String("base-branch", "main",
 		"base branch for the implement-stage PR (no effect when --no-pr is set)")
-	noPR := fs.Bool("no-pr", true,
-		"skip implement-stage push + PR open; operator commits the changes themselves. Default for local mode")
+	noPR := fs.Bool("no-pr", false,
+		"skip implement-stage push + PR open; operator commits the changes themselves (legacy local-mode behavior)")
 	runnerBinary := fs.String("runner-binary", envOr("FISHHAWK_RUNNER_BIN", ""),
 		"path to the fishhawk-runner binary; defaults to PATH lookup of `fishhawk-runner`")
 	if err := fs.Parse(args); err != nil {
@@ -124,10 +124,10 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		switch {
 		case err == nil:
 			repo = detected
-		case *noPR:
-			// Local-mode without --no-pr disabled: repo isn't
-			// strictly required because nothing pushes. Skip
-			// silently.
+		case *noPR || *stage != "implement":
+			// No PR will be opened: either the operator set
+			// --no-pr, or this isn't an implement stage. Repo
+			// isn't required; skip silently.
 		default:
 			_, _ = fmt.Fprintf(stderr, "fishhawk runner start: --github-repo not set and could not detect from origin: %v\n", err)
 			return exitFailure
@@ -198,22 +198,42 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		return exitFailure
 	}
 
-	// #416: after the runner exits cleanly, post a stage-complete
-	// comment on the triggering issue for local-runner runs.
-	// Best-effort — failure here does not affect the verb's exit
-	// code. The runner's success is the canonical outcome; the
-	// comment is a courtesy.
+	// #416/#422: after the runner exits cleanly, post a comment on
+	// the triggering issue for local-runner runs. Best-effort —
+	// failures here do not affect the verb's exit code.
 	parsedRunID, perr := uuid.Parse(*runID)
-	if perr == nil {
+	prCommentPosted := false
+	if perr == nil && *stage == "implement" && !*noPR {
+		parsedStageID, serr := uuid.Parse(*stageID)
+		if serr == nil {
+			clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
+			defer clientCancel()
+			client := newClient(cf)
+			result, autoErr := autoOpenPR(clientCtx, client, autoOpenPRArgs{
+				WorkingDir: *workingDir,
+				RunID:      parsedRunID,
+				StageID:    parsedStageID,
+				GitHubRepo: repo,
+				BaseBranch: *baseBranch,
+			})
+			if autoErr != nil {
+				_, _ = fmt.Fprintf(stderr, "fishhawk runner start: auto-PR warning: %v\n", autoErr)
+			} else {
+				if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil {
+					maybePostLocalComment(stderr, r,
+						ghcomment.RenderImplementPROpened(
+							toGhCommentRun(r, *cf.backendURL),
+							result.PRURL, result.PRNumber))
+				}
+				prCommentPosted = true
+			}
+		}
+	}
+	if !prCommentPosted && perr == nil {
 		clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
 		defer clientCancel()
 		client := newClient(cf)
 		if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil {
-			// The runner advanced the stage via the trace
-			// upload; the post-upload transition fires on the
-			// backend. We surface the run-level rollup state
-			// here — a follow-up can fetch the specific stage
-			// by id for finer wording when needed.
 			maybePostLocalComment(stderr, r,
 				ghcomment.RenderStageComplete(
 					toGhCommentRun(r, *cf.backendURL),

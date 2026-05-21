@@ -59,6 +59,7 @@ early. Comment posting moves to the CLI side, where the operator's authed
 | `fishhawk plan reject <run-id>` | `ghcomment.RenderPlanRejected` | rejection submitted |
 | `fishhawk run cancel <run-id>` | `ghcomment.RenderRunCancelled` | cancellation accepted |
 | `fishhawk runner start --run-id …` | `ghcomment.RenderStageComplete` | runner subprocess exits cleanly |
+| `fishhawk runner start --run-id … --stage implement` | `ghcomment.RenderImplementPROpened` | auto-PR succeeded (--no-pr absent and stage type is implement) |
 
 Renderers live in `cli/internal/ghcomment`; the post step shells to
 `gh issue comment <N> --repo <owner/name> --body …`. v0 scope is append-only
