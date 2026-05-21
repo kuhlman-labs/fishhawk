@@ -246,6 +246,19 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	cmd := runStageCommand(binary, argv...)
 	cmd.Env = append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
+	// Run the subprocess in its own process group so signals reach
+	// the whole tree, not just the direct child. The runner spawns
+	// further descendants (the agent it invokes, that agent's tool
+	// processes); without a group, SIGTERM/SIGKILL on the runner
+	// leaves orphans alive that inherit our stdout fd — which keeps
+	// the pipe open and prevents the bufio scanner from ever
+	// reaching EOF. Signalling -pgid hits every descendant in
+	// lockstep. The #446 plan's risk section claimed "SIGKILL
+	// handles orphans" — that's incorrect for Unix fd inheritance,
+	// surfaced by TestRunStage_ContextCancelSendsSIGTERM after the
+	// pipe-drain reorder.
+	runStageSetProcessGroup(cmd)
+
 	// (5) Wire stdout to a JSONL parser. Stderr is piped through to
 	// the operator's terminal — the runner's verbose log lines are
 	// meant for humans, not the agent.
@@ -260,30 +273,54 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 
 	// Concurrently: parse stdout into events; watch ctx for
-	// cancellation and signal the child. Both feed into the
-	// wait-for-exit synchronization below.
+	// cancellation and signal the child. parseDone closes when the
+	// parser goroutine drains stdout to EOF — guaranteeing cmd.Wait
+	// is called after the pipe is fully read (#446).
 	var (
 		events    []RunnerEvent
 		eventsMu  sync.Mutex
-		parseWG   sync.WaitGroup
+		parseDone = make(chan struct{})
 		progToken any
 	)
 	if req != nil && req.Params != nil {
 		progToken = req.Params.GetProgressToken()
 	}
 
-	parseWG.Add(1)
 	go func() {
-		defer parseWG.Done()
+		defer close(parseDone)
 		runStageParseEvents(ctx, stdoutPipe, &events, &eventsMu, &warnings, req, progToken)
 	}()
 
-	// (6+7) Wait for the runner to exit, honoring context
-	// cancellation. The wait coordinator owns the single cmd.Wait
-	// call so we don't trigger "no child processes" from a stray
-	// duplicate Wait.
-	waitErr := runStageWaitForExit(ctx, cmd, runStageGracePeriod)
-	parseWG.Wait()
+	// (6) Cancellation watcher: on ctx.Done(), signal the whole
+	// process group (not just the direct child) so descendants that
+	// inherited stdout die too — only then does the pipe close and
+	// the scanner reach EOF. Escalates to SIGKILL (group-wide)
+	// after the grace period.
+	//
+	// Snapshot the grace period at entry so a test's t.Cleanup
+	// restoring runStageGracePeriod doesn't race the goroutine.
+	grace := runStageGracePeriod
+	go func() {
+		select {
+		case <-parseDone:
+			// Normal exit — subprocess closed stdout, scanner drained.
+		case <-ctx.Done():
+			runStageSignalGroup(cmd, syscall.SIGTERM)
+			select {
+			case <-parseDone:
+				// Subprocess exited within grace; scanner done.
+			case <-time.After(grace):
+				runStageSignalGroup(cmd, syscall.SIGKILL)
+				<-parseDone
+			}
+		}
+	}()
+
+	// (7) Block until the parser goroutine has fully drained stdout,
+	// then call cmd.Wait(). The pipe is guaranteed drained at this
+	// point — no scanner-vs-Wait race.
+	<-parseDone
+	waitErr := cmd.Wait()
 
 	exitCode := 0
 	switch {
@@ -416,44 +453,6 @@ func runStageEventMessage(payload any) string {
 		return string(enc[:maxLen]) + "..."
 	}
 	return string(enc)
-}
-
-// runStageWaitForExit owns the canonical cmd.Wait() and coordinates
-// cancellation. Flow:
-//
-//   - Start one goroutine doing cmd.Wait(); it's the ONLY Wait on
-//     this process. A duplicate Wait would race the kernel's
-//     wait-status collection and return "no child processes" on
-//     macOS / Linux.
-//   - Block on (waitDone OR ctx.Done()).
-//   - On ctx.Done() before the runner exits: SIGTERM, then up to
-//     grace seconds for the wait to settle, then SIGKILL, then wait
-//     unconditionally for the wait to settle.
-//
-// Returns the error from the canonical Wait — caller branches on
-// exec.ExitError to extract the exit code.
-func runStageWaitForExit(ctx context.Context, cmd *exec.Cmd, grace time.Duration) error {
-	waitDone := make(chan error, 1)
-	go func() { waitDone <- cmd.Wait() }()
-
-	select {
-	case err := <-waitDone:
-		return err
-	case <-ctx.Done():
-		// Operator cancelled; send SIGTERM and wait up to grace.
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-		}
-		select {
-		case err := <-waitDone:
-			return err
-		case <-time.After(grace):
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-			return <-waitDone
-		}
-	}
 }
 
 // runStageDetectGitHubRepo mirrors the CLI's helper. Returns
