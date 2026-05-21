@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -181,7 +182,7 @@ func TestShipPullRequest_InvalidPayload_400(t *testing.T) {
 	}
 }
 
-func TestShipPullRequest_SignatureMissing_401(t *testing.T) {
+func TestShipPullRequest_NoAuth_401(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, _, _, _, _ := newPRServer(t, runID, stageID)
 	body := validPRBytes(t)
@@ -191,6 +192,9 @@ func TestShipPullRequest_SignatureMissing_401(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "signature_or_bearer_required") {
+		t.Errorf("body missing signature_or_bearer_required:\n%s", w.Body.String())
 	}
 }
 
@@ -224,5 +228,69 @@ func TestShipPullRequest_Unconfigured_503(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+func TestShipPullRequest_BearerHappyPath_201(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, ar, au, _ := newPRServer(t, runID, stageID)
+	body := validPRBytes(t)
+
+	url := fmt.Sprintf("/v0/runs/%s/pull-request?stage_id=%s", runID, stageID)
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("run_id", runID.String())
+	req.SetPathValue("stage_id", stageID.String())
+	ctx := context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+		Subject: "operator:test",
+		TokenID: "tok-abc",
+		Scopes:  []string{"write:runs"},
+	})
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+	s.handleShipPullRequest(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	if got := au.appended[0].Category; got != "pull_request_opened" {
+		t.Errorf("audit category = %q", got)
+	}
+	payload := string(au.appended[0].Payload)
+	if !strings.Contains(payload, `"auth_method":"bearer"`) {
+		t.Errorf("audit payload missing auth_method=bearer: %s", payload)
+	}
+}
+
+func TestShipPullRequest_BearerInsufficientScope_401(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, _, _, _ := newPRServer(t, runID, stageID)
+	body := validPRBytes(t)
+
+	url := fmt.Sprintf("/v0/runs/%s/pull-request?stage_id=%s", runID, stageID)
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("run_id", runID.String())
+	req.SetPathValue("stage_id", stageID.String())
+	ctx := context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+		Subject: "operator:test",
+		TokenID: "tok-abc",
+		Scopes:  []string{"read:runs"},
+	})
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+	s.handleShipPullRequest(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "signature_or_bearer_required") {
+		t.Errorf("body missing signature_or_bearer_required:\n%s", w.Body.String())
 	}
 }
