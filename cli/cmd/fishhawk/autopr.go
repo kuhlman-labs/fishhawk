@@ -1,0 +1,223 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
+)
+
+// prDescriptionPath is where the runner agent writes the PR title and
+// body. The autoOpenPR function reads this file; override in tests.
+var prDescriptionPath = "/tmp/fishhawk-pr.md"
+
+// autoGitCommand constructs git subprocesses for autoOpenPR.
+// Exposed as a var so tests can inject stubs without spawning real git.
+var autoGitCommand = exec.Command
+
+// autoGhCommand constructs gh subprocesses for autoOpenPR.
+// Exposed as a var so tests can inject stubs without spawning real gh.
+var autoGhCommand = exec.Command
+
+const autoPRFooter = "---\n*Opened automatically by Fishhawk.*"
+
+// shortID strips hyphens from id.String() and returns the leading 8
+// hex characters. Matches the runner/internal/gitops convention.
+func shortID(id uuid.UUID) string {
+	s := strings.ReplaceAll(id.String(), "-", "")
+	return s[:8]
+}
+
+// autoOpenPRArgs is the input bag for autoOpenPR.
+type autoOpenPRArgs struct {
+	WorkingDir string
+	RunID      uuid.UUID
+	StageID    uuid.UUID
+	GitHubRepo string
+	BaseBranch string
+}
+
+// autoOpenPRResult holds the outputs of a successful autoOpenPR call.
+type autoOpenPRResult struct {
+	Branch   string
+	HeadSHA  string
+	PRNumber int
+	PRURL    string
+}
+
+// parsePRDescriptionFile reads the agent-authored PR description at
+// path and returns the title and body. The first non-blank line is the
+// title; everything after the first blank separator line is the body.
+//
+// Falls back to a generated title ("Fishhawk: implement stage
+// <shortRunID>") and empty body when the file is missing or the first
+// line is whitespace-only. The attribution footer is always appended.
+func parsePRDescriptionFile(path, runID string) (title, body string, err error) {
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		if os.IsNotExist(readErr) {
+			return prFallbackTitle(runID), autoPRFooter, nil
+		}
+		return "", "", fmt.Errorf("read pr description: %w", readErr)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return prFallbackTitle(runID), autoPRFooter, nil
+	}
+
+	title = strings.TrimSpace(lines[0])
+
+	// Skip the blank separator line following the title.
+	start := 1
+	if start < len(lines) && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	var bodyLines []string
+	if start < len(lines) {
+		bodyLines = lines[start:]
+	}
+	rawBody := strings.TrimRight(strings.Join(bodyLines, "\n"), "\n")
+	if rawBody != "" {
+		body = rawBody + "\n\n" + autoPRFooter
+	} else {
+		body = autoPRFooter
+	}
+	return title, body, nil
+}
+
+func prFallbackTitle(runID string) string {
+	s := strings.ReplaceAll(runID, "-", "")
+	if len(s) > 8 {
+		s = s[:8]
+	}
+	return "Fishhawk: implement stage " + s
+}
+
+// autoOpenPR orchestrates the implement-stage PR flow:
+//  1. Parse the agent's PR description file.
+//  2. Derive a branch name from the run/stage IDs.
+//  3. Create the branch, commit all staged changes, and push.
+//  4. Open a GitHub PR via gh pr create.
+//  5. Ship the PR artifact to the backend via ShipLocalPullRequest.
+//
+// A clean working tree (nothing to commit) is a warning, not a
+// failure — autoOpenPR pushes the existing HEAD and continues.
+func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRArgs) (*autoOpenPRResult, error) {
+	shortRunID := shortID(args.RunID)
+	shortStageID := shortID(args.StageID)
+
+	title, body, err := parsePRDescriptionFile(prDescriptionPath, args.RunID.String())
+	if err != nil {
+		return nil, fmt.Errorf("autopr: %w", err)
+	}
+
+	branch := "fishhawk/run-" + shortRunID + "/stage-" + shortStageID
+
+	if out, chkErr := autoGitCommand("git", "-C", args.WorkingDir, "checkout", "-b", branch).CombinedOutput(); chkErr != nil {
+		return nil, fmt.Errorf("autopr: git checkout -b %s: %w\n%s", branch, chkErr, out)
+	}
+
+	if out, addErr := autoGitCommand("git", "-C", args.WorkingDir, "add", "-A").CombinedOutput(); addErr != nil {
+		return nil, fmt.Errorf("autopr: git add -A: %w\n%s", addErr, out)
+	}
+
+	commitMsg := title + "\n\n" + body
+	commitOut, commitErr := autoGitCommand("git", "-C", args.WorkingDir,
+		"commit", "--signoff", "-m", commitMsg).CombinedOutput()
+	if commitErr != nil {
+		if strings.Contains(string(commitOut), "nothing to commit") {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"autopr: nothing to commit in %s; pushing existing HEAD\n", args.WorkingDir)
+		} else {
+			return nil, fmt.Errorf("autopr: git commit: %w\n%s", commitErr, commitOut)
+		}
+	}
+
+	if out, pushErr := autoGitCommand("git", "-C", args.WorkingDir, "push", "-u", "origin", branch).CombinedOutput(); pushErr != nil {
+		return nil, fmt.Errorf("autopr: git push: %w\n%s", pushErr, out)
+	}
+
+	headOut, err := autoGitCommand("git", "-C", args.WorkingDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return nil, fmt.Errorf("autopr: git rev-parse HEAD: %w", err)
+	}
+	headSHA := strings.TrimSpace(string(headOut))
+
+	var baseSHA string
+	if baseOut, baseErr := autoGitCommand("git", "-C", args.WorkingDir,
+		"rev-parse", "origin/"+args.BaseBranch).Output(); baseErr == nil {
+		baseSHA = strings.TrimSpace(string(baseOut))
+	}
+
+	var filesChanged int
+	diffRange := "origin/" + args.BaseBranch + "...HEAD"
+	if diffOut, diffErr := autoGitCommand("git", "-C", args.WorkingDir,
+		"diff", "--name-only", diffRange).Output(); diffErr == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(diffOut)), "\n") {
+			if strings.TrimSpace(line) != "" {
+				filesChanged++
+			}
+		}
+	}
+
+	prOut, err := autoGhCommand("gh", "pr", "create",
+		"--repo", args.GitHubRepo,
+		"--title", title,
+		"--body", body,
+		"--base", args.BaseBranch).Output()
+	if err != nil {
+		return nil, fmt.Errorf("autopr: gh pr create: %w", err)
+	}
+
+	prURL, prNumber, err := parsePRCreateOutput(string(prOut))
+	if err != nil {
+		return nil, fmt.Errorf("autopr: %w", err)
+	}
+
+	if _, shipErr := client.ShipLocalPullRequest(ctx, args.RunID, args.StageID,
+		httpclient.ShipLocalPullRequestInput{
+			PRNumber:          prNumber,
+			PRURL:             prURL,
+			Branch:            branch,
+			HeadSHA:           headSHA,
+			BaseSHA:           baseSHA,
+			Title:             title,
+			Body:              body,
+			FilesChangedCount: filesChanged,
+		}); shipErr != nil {
+		return nil, fmt.Errorf("autopr: ship pr: %w", shipErr)
+	}
+
+	return &autoOpenPRResult{
+		Branch:   branch,
+		HeadSHA:  headSHA,
+		PRNumber: prNumber,
+		PRURL:    prURL,
+	}, nil
+}
+
+// parsePRCreateOutput extracts the PR URL from the output of
+// `gh pr create`. gh emits the URL as a standalone line; the PR
+// number is the trailing path segment.
+func parsePRCreateOutput(out string) (prURL string, prNumber int, err error) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "https://") && strings.Contains(line, "/pull/") {
+			parts := strings.Split(line, "/")
+			if len(parts) > 0 {
+				n, parseErr := strconv.Atoi(parts[len(parts)-1])
+				if parseErr == nil && n > 0 {
+					return line, n, nil
+				}
+			}
+		}
+	}
+	return "", 0, fmt.Errorf("no pull request URL found in gh output: %q", strings.TrimSpace(out))
+}
