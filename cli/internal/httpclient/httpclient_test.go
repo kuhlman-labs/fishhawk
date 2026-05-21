@@ -247,6 +247,121 @@ func TestDo_NetworkError(t *testing.T) {
 	}
 }
 
+func TestShipLocalPullRequest_201(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	prID := uuid.New()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		if !strings.Contains(r.URL.Path, runID.String()) {
+			t.Errorf("path %q does not contain run_id %s", r.URL.Path, runID)
+		}
+		if got := r.URL.Query().Get("stage_id"); got != stageID.String() {
+			t.Errorf("stage_id = %q, want %s", got, stageID)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("Authorization = %q, want Bearer test-token", got)
+		}
+		if sig := r.Header.Get("X-Fishhawk-Signature"); sig != "" {
+			t.Errorf("X-Fishhawk-Signature present: %q", sig)
+		}
+		var in ShipLocalPullRequestInput
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if in.PRNumber != 42 || in.PRURL != "https://github.com/x/y/pull/42" {
+			t.Errorf("body round-trip: %+v", in)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ShipLocalPullRequestResult{
+			ID: prID, StageID: stageID, ContentHash: "abc123",
+			PRNumber: 42, PRURL: "https://github.com/x/y/pull/42",
+			HeadSHA: "deadbeef", Idempotent: false,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "test-token")
+	got, err := c.ShipLocalPullRequest(context.Background(), runID, stageID, ShipLocalPullRequestInput{
+		PRNumber: 42, PRURL: "https://github.com/x/y/pull/42",
+		Branch: "feat/x", HeadSHA: "deadbeef", BaseSHA: "cafebabe",
+		Title: "Add feature", Body: "desc", FilesChangedCount: 3,
+	})
+	if err != nil {
+		t.Fatalf("ShipLocalPullRequest: %v", err)
+	}
+	if got.ID != prID {
+		t.Errorf("ID = %s, want %s", got.ID, prID)
+	}
+	if got.Idempotent {
+		t.Errorf("Idempotent = true, want false for 201")
+	}
+}
+
+func TestShipLocalPullRequest_Idempotent(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(ShipLocalPullRequestResult{
+			ID: uuid.New(), StageID: stageID,
+			PRNumber: 7, PRURL: "https://github.com/x/y/pull/7",
+			HeadSHA: "aabbcc", Idempotent: true,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "test-token")
+	got, err := c.ShipLocalPullRequest(context.Background(), runID, stageID, ShipLocalPullRequestInput{
+		PRNumber: 7, PRURL: "https://github.com/x/y/pull/7",
+		Branch: "feat/y", HeadSHA: "aabbcc", BaseSHA: "001122",
+		Title: "Redo feature", Body: "",
+	})
+	if err != nil {
+		t.Fatalf("ShipLocalPullRequest idempotent: %v", err)
+	}
+	if !got.Idempotent {
+		t.Errorf("Idempotent = false, want true for 200 idempotent response")
+	}
+}
+
+func TestShipLocalPullRequest_APIError(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"code":"signature_or_bearer_required","message":"provide a bearer token or a valid HMAC signature","details":null}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	_, err := c.ShipLocalPullRequest(context.Background(), runID, stageID, ShipLocalPullRequestInput{
+		PRNumber: 1, PRURL: "https://github.com/x/y/pull/1",
+		Branch: "b", HeadSHA: "h", BaseSHA: "s", Title: "t", Body: "b",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusUnauthorized {
+		t.Errorf("StatusCode = %d, want 401", apiErr.StatusCode)
+	}
+	if apiErr.Code != "signature_or_bearer_required" {
+		t.Errorf("Code = %q, want signature_or_bearer_required", apiErr.Code)
+	}
+}
+
 func TestAPIError_Error(t *testing.T) {
 	tests := []struct {
 		name string
