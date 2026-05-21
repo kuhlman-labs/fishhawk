@@ -133,6 +133,17 @@ func RenderRunCancelled(r Run, canceller string) string {
 	)
 }
 
+// RenderImplementPROpened is posted by `fishhawk runner start` after
+// the auto-PR flow succeeds (implement stage, --no-pr absent). Links
+// to the PR so the reviewer can click through immediately; also links
+// the run for the audit trail.
+func RenderImplementPROpened(r Run, prURL string, prNumber int) string {
+	return fmt.Sprintf(
+		"✓ Fishhawk implement stage opened [PR #%d](%s).\n\nRun [`%s`](%s) — awaiting review.",
+		prNumber, prURL, shortID(r.ID), runURL(r),
+	)
+}
+
 // RenderStageComplete is posted by `fishhawk runner start` once
 // the runner subprocess exits cleanly. `stageType` is the
 // spec-level type (plan / implement / review); `stateAfter` is

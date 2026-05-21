@@ -1792,12 +1792,32 @@ paths:
       operationId: shipPullRequest
       summary: Upload a pull-request artifact for an implement stage
       description: |
-        Called by the runner after a successful implement-stage run
-        that produced a real GitHub pull request. The body carries
-        `{ pr_number, pr_url, branch, head_sha, base_sha, title,
-        body?, files_changed_count }`. Auth is the per-run Ed25519
-        signature in `X-Fishhawk-Signature` (same scheme as
-        `/v0/runs/{run_id}/trace` and `/v0/runs/{run_id}/plan`).
+        Called after a successful implement-stage run that produced a
+        real GitHub pull request. The body carries `{ pr_number,
+        pr_url, branch, head_sha, base_sha, title, body?,
+        files_changed_count }`.
+
+        Two auth paths are accepted:
+
+        - **Ed25519 signature** (canonical runner path): supply
+          `X-Fishhawk-Signature` — the hex-encoded 64-byte Ed25519
+          signature over sha256(body), using the per-run ephemeral
+          key issued at `/v0/runs/{run_id}/signing-key`. Same scheme
+          as `/v0/runs/{run_id}/trace` and `/v0/runs/{run_id}/plan`.
+
+        - **Bearer token** (local-runner CLI path): supply
+          `Authorization: Bearer <token>` with `write:runs` scope.
+          Used by the CLI wrapper (`autoOpenPR`) when the per-run
+          Ed25519 signing key is unavailable — the key is consumed
+          by the trace and plan uploads inside the runner subprocess
+          and is not accessible to the outer CLI process.
+
+        When both are present the signature path wins. The audit
+        payload's `auth_method` field records `ed25519` or `bearer`
+        to identify which path was taken.
+
+        Returns 401 `signature_or_bearer_required` when neither is
+        present.
 
         Idempotent on (stage_id, content_hash): re-running a runner
         job that pushed the same commits returns the existing
@@ -1813,7 +1833,7 @@ paths:
         - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
         - name: X-Fishhawk-Signature
           in: header
-          required: true
+          required: false
           schema:
             type: string
             description: Hex-encoded 64-byte Ed25519 signature over sha256(body).
@@ -1844,7 +1864,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
-          description: Signature invalid or no signing key for this run.
+          description: |
+            Auth failed. Possible codes:
+            - `signature_invalid` — `X-Fishhawk-Signature` did not verify against the run's public key, or no signing key exists for this run.
+            - `signature_or_bearer_required` — request included neither `X-Fishhawk-Signature` nor an authenticated bearer token with `write:runs` scope.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

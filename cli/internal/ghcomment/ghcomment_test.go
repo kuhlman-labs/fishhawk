@@ -80,6 +80,22 @@ func TestRenderRunCancelled(t *testing.T) {
 	}
 }
 
+func TestRenderImplementPROpened(t *testing.T) {
+	r := mkRun(t)
+	prURL := "https://github.com/kuhlman-labs/fishhawk/pull/99"
+	got := RenderImplementPROpened(r, prURL, 99)
+	for _, want := range []string{
+		"implement stage opened",
+		"PR #99",
+		"11111111",
+		prURL,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("RenderImplementPROpened missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
 func TestRenderStageComplete_WithPR(t *testing.T) {
 	r := mkRun(t)
 	r.PullRequestURL = "https://github.com/x/y/pull/77"
