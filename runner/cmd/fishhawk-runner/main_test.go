@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -599,21 +600,17 @@ func TestRun_BundleWriteFailureSurfacesAsExitFailure(t *testing.T) {
 	}
 }
 
-// validPlanJSON returns a minimal standard_v1 plan that the
-// validator accepts. Inline rather than reading a fixture so the
-// test is self-contained.
+// validPlanJSON returns a minimal standard_v1 plan that the validator
+// accepts, sourced from planfixture.Valid() so required-field additions
+// are caught by TestValid_SchemaCompliant rather than silently breaking
+// these tests. MarshalIndent preserves the "key": "value", substring
+// format so existing strings.Replace-based tamper tests still work.
 func validPlanJSON() string {
-	return `{
-  "plan_version": "standard_v1",
-  "ticket_reference": {"type":"github_issue","url":"https://github.com/x/y/issues/1","id":"x/y#1"},
-  "generated_by": {"agent":"claude-code","model":"claude-opus-4-7","version":"build-1","timestamp":"2026-05-02T10:00:00Z"},
-  "summary": "Add a thing.",
-  "scope": {"files": [{"path":"a.go","operation":"create"}], "estimated_lines_changed": 10},
-  "approach": [{"step":1,"description":"Do."}],
-  "verification": {"test_strategy":"go test","rollback_plan":"revert PR"},
-  "predicted_runtime_minutes": 5,
-  "predicted_runtime_confidence": "medium"
-}`
+	b, err := json.MarshalIndent(planfixture.Valid(), "", "  ")
+	if err != nil {
+		panic("planfixture.Valid marshal: " + err.Error())
+	}
+	return string(b)
 }
 
 func TestRun_PlanValidationOK(t *testing.T) {

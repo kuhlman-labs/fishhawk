@@ -1,6 +1,7 @@
 package plan_test
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 )
 
 func readFixture(t *testing.T, path string) []byte {
@@ -245,21 +247,14 @@ func TestSchemaError_FormatsPathAndMessage(t *testing.T) {
 	}
 }
 
-// validPlanJSON returns a minimal valid standard_v1 plan with the new required
-// runtime fields populated. Tests that need to vary one field use this as a base.
-func validPlanJSON(extras string) []byte {
-	body := `{
-  "plan_version": "standard_v1",
-  "ticket_reference": {"type": "github_issue", "url": "https://x", "id": "x"},
-  "generated_by": {"agent": "a", "model": "m", "timestamp": "2026-01-01T00:00:00Z"},
-  "summary": "x",
-  "scope": {"files": [{"path": "a.go", "operation": "create"}]},
-  "approach": [{"step": 1, "description": "x"}],
-  "verification": {"test_strategy": "x", "rollback_plan": "x"},
-  "predicted_runtime_minutes": 10,
-  "predicted_runtime_confidence": "medium"` + extras + `
-}`
-	return []byte(body)
+// marshalFixture marshals a fixture map to JSON, failing the test on error.
+func marshalFixture(t *testing.T, m map[string]any) []byte {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 // --- predicted_runtime_minutes / predicted_runtime_confidence schema errors ---
@@ -324,13 +319,18 @@ func TestParse_PreD2Shape_NoRuntimeFields_IsSchemaError(t *testing.T) {
 
 func TestParse_DecompositionOneSubPlan_IsSchemaError(t *testing.T) {
 	// minItems:2 violation — a single sub-plan is rejected structurally.
-	_, err := plan.Parse(validPlanJSON(`,
-  "decomposition": {
-    "rationale": "too big",
-    "sub_plans": [
-      {"title": "Part A", "scope_hint": "first half", "predicted_runtime_minutes": 10, "predicted_runtime_confidence": "medium"}
-    ]
-  }`))
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "too big",
+			"sub_plans": []any{
+				map[string]any{
+					"title": "Part A", "scope_hint": "first half",
+					"predicted_runtime_minutes": 10, "predicted_runtime_confidence": "medium",
+				},
+			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
 	var se *plan.SchemaError
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *SchemaError", err)
@@ -340,14 +340,7 @@ func TestParse_DecompositionOneSubPlan_IsSchemaError(t *testing.T) {
 // --- decomposition happy path ---
 
 func TestParse_DecompositionTwoSubPlans_Succeeds(t *testing.T) {
-	p, err := plan.Parse(validPlanJSON(`,
-  "decomposition": {
-    "rationale": "work exceeded budget",
-    "sub_plans": [
-      {"title": "Part A", "scope_hint": "schema changes", "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "high"},
-      {"title": "Part B", "scope_hint": "test updates",   "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
-    ]
-  }`))
+	p, err := plan.Parse(marshalFixture(t, planfixture.Decomposed()))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -362,14 +355,22 @@ func TestParse_DecompositionTwoSubPlans_Succeeds(t *testing.T) {
 // --- decomposition semantic errors ---
 
 func TestParse_DecompositionDuplicateTitles_IsSemanticError(t *testing.T) {
-	_, err := plan.Parse(validPlanJSON(`,
-  "decomposition": {
-    "rationale": "too big",
-    "sub_plans": [
-      {"title": "Same Title", "scope_hint": "first",  "predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low"},
-      {"title": "Same Title", "scope_hint": "second", "predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low"}
-    ]
-  }`))
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "too big",
+			"sub_plans": []any{
+				map[string]any{
+					"title": "Same Title", "scope_hint": "first",
+					"predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low",
+				},
+				map[string]any{
+					"title": "Same Title", "scope_hint": "second",
+					"predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low",
+				},
+			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
 	var se *plan.SemanticError
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *SemanticError", err)

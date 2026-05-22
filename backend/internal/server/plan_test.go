@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -22,40 +23,11 @@ import (
 // tests so the content_hash matches.
 func validPlanBytes(t *testing.T) []byte {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{
-		"plan_version": "standard_v1",
-		"ticket_reference": map[string]any{
-			"type": "github_issue",
-			"url":  "https://github.com/kuhlman-labs/fishhawk/issues/184",
-			"id":   "kuhlman-labs/fishhawk#184",
-		},
-		"generated_by": map[string]any{
-			"agent":     "claude-code",
-			"model":     "claude-opus-4-7",
-			"version":   "test",
-			"timestamp": "2026-05-06T15:04:09Z",
-		},
-		"summary": "Add a make target.",
-		"scope": map[string]any{
-			"files": []map[string]any{
-				{"path": "Makefile", "operation": "modify"},
-			},
-			"estimated_lines_changed": 10,
-		},
-		"approach": []map[string]any{
-			{"step": 1, "description": "Add a make target."},
-		},
-		"verification": map[string]any{
-			"test_strategy": "Run the target twice; second run is a no-op.",
-			"rollback_plan": "Revert the diff.",
-		},
-		"predicted_runtime_minutes":    5,
-		"predicted_runtime_confidence": "medium",
-	})
+	b, err := json.Marshal(planfixture.Valid())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return body
+	return b
 }
 
 // newPlanServer wires SigningRepo + ArtifactRepo + AuditRepo + RunRepo

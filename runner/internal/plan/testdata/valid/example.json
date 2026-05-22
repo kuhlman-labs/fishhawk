@@ -31,6 +31,6 @@
     "Assumes (created_at, entry_id) is the natural sort order.",
     "Risk: very large date ranges; mitigated by per-page limit of 1000 rows."
   ],
-  "predicted_runtime_minutes": 25,
+  "predicted_runtime_minutes": 20,
   "predicted_runtime_confidence": "medium"
 }
