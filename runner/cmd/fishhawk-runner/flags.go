@@ -75,8 +75,8 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"agent CWD; defaults to the runner's CWD")
 	fs.IntVar(&cfg.maxTokens, "max-tokens", 0,
 		"hard cap on agent tokens (input + output); 0 means no cap")
-	fs.DurationVar(&cfg.timeout, "timeout", 15*time.Minute,
-		"wall-clock cap on agent invocation")
+	fs.DurationVar(&cfg.timeout, "timeout", 0,
+		"wall-clock cap on agent invocation; 0 means use server-resolved timeout from --fetch-prompt; falls back to 15m if the server also returns 0")
 	fs.StringVar(&cfg.bundleOut, "bundle-out", "",
 		"path to write the gzipped trace bundle (ADR-007); when empty, events go to stdout as JSONL")
 	fs.StringVar(&cfg.planOut, "plan-out", "",

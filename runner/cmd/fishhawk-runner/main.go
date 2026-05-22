@@ -170,7 +170,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -178,6 +178,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		cfg.promptFile = path
 		stageType = sType
+		// Server-resolved timeout wins when operator didn't pass --timeout explicitly.
+		if cfg.timeout == 0 && agentTimeoutSecs > 0 {
+			cfg.timeout = time.Duration(agentTimeoutSecs) * time.Second
+		}
 	}
 
 	if cfg.promptFile == "" {
@@ -192,6 +196,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"runner_failed","reason":"read_prompt","detail":%q}`+"\n", err.Error())
 		return exitUsage
+	}
+
+	// Apply the 15-minute fallback when no timeout was resolved by the
+	// operator flag or the server-fetch path above. Covers the case where
+	// --fetch-prompt was not used, or the server returned 0.
+	if cfg.timeout == 0 {
+		cfg.timeout = 15 * time.Minute
 	}
 
 	inv := agent.Invocation{
@@ -626,41 +637,43 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 }
 
 // fetchPromptToFile pulls the constructed prompt from the backend,
-// writes it to a temp file, and returns the path plus the stage
-// type from the response. stageType drives per-stage post-processing
-// (plan validation + upload for plan stages, commit+push+PR upload
-// for implement stages). The temp file is 0o600 — bundle-style
-// defense in depth, since prompts may include issue bodies that the
-// customer would prefer not to leave on the runner's filesystem
-// world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (string, string, error) {
-	got, err := client.FetchPrompt(ctx, upload.FetchPromptArgs{
+// writes it to a temp file, and returns the path, stage type, and
+// agent_timeout_seconds from the response. stageType drives per-stage
+// post-processing (plan validation + upload for plan stages,
+// commit+push+PR upload for implement stages). agentTimeoutSecs is the
+// spec-resolved wall-clock cap; 0 means the server didn't resolve one
+// and the caller should apply the local 15-minute fallback. The temp
+// file is 0o600 — bundle-style defense in depth, since prompts may
+// include issue bodies that the customer would prefer not to leave on
+// the runner's filesystem world-readable.
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, err error) {
+	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
-	if err != nil {
-		return "", "", err
+	if fetchErr != nil {
+		return "", "", 0, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
 		got.StageID, got.StageType, got.PromptHash, len(got.Prompt),
 	)
-	tmp, err := os.CreateTemp("", "fishhawk-prompt-*.txt")
-	if err != nil {
-		return "", "", fmt.Errorf("create prompt temp file: %w", err)
+	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
+	if tmpErr != nil {
+		return "", "", 0, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, nil
 }
 
 func logStartup(w io.Writer, cfg config) {

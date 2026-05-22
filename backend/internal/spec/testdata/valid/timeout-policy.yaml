@@ -1,0 +1,26 @@
+version: "0.3"
+
+workflows:
+  feature_change:
+    description: "Workflow with spec-governed timeouts (#452)."
+    policy:
+      max_stage_runtime: "30m"
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: "10m"
+        produces:
+          - artifact: plan
+            schema: standard_v1
+
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
