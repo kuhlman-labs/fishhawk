@@ -150,21 +150,19 @@ func TestBuild_Plan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "implementation plan") {
-		t.Errorf("plan prompt missing 'implementation plan':\n%s", got)
+	wants := []string{
+		"implementation plan",
+		"Do not modify source files",
+		"Triggering issue: #7",
+		PlanArtifactPath,
+		"standard_v1",
+		"scripts/sync-schemas",
+		"docs/spec/",
 	}
-	if !strings.Contains(got, "Do not modify source files") {
-		t.Errorf("plan prompt missing read-only directive:\n%s", got)
-	}
-	if !strings.Contains(got, "Triggering issue: #7") {
-		t.Errorf("plan prompt missing issue ref:\n%s", got)
-	}
-	if !strings.Contains(got, PlanArtifactPath) {
-		t.Errorf("plan prompt missing PlanArtifactPath %q so the runner and agent can't agree on where the plan goes:\n%s",
-			PlanArtifactPath, got)
-	}
-	if !strings.Contains(got, "standard_v1") {
-		t.Errorf("plan prompt missing schema version reference:\n%s", got)
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing %q:\n%s", w, got)
+		}
 	}
 }
 
