@@ -380,7 +380,7 @@ func TestRunStage_GitHubRepoAutoDetectFails_WithPushErrors(t *testing.T) {
 func TestRunStage_JSONLAccumulation_OrderPreserved(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
-	withFakeRunner(t, `printf '%s\n' '{"kind":"runner_started"}' '{"kind":"signing_key_issued"}' '{"kind":"trace_uploaded"}'`)
+	withFakeRunner(t, `printf '%s\n' '{"kind":"runner_started"}' '{"kind":"signing_key_issued"}' '{"kind":"trace_uploaded"}' >&2`)
 
 	runID := uuid.New()
 	stageID := uuid.New()
@@ -421,7 +421,7 @@ func TestRunStage_JSONLAccumulation_OrderPreserved(t *testing.T) {
 func TestRunStage_NonJSONLineWarns(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
-	withFakeRunner(t, `printf '%s\n' 'Running plan stage...' '{"kind":"runner_started"}'`)
+	withFakeRunner(t, `printf '%s\n' 'Running plan stage...' '{"kind":"runner_started"}' >&2`)
 
 	runID := uuid.New()
 	stageID := uuid.New()
@@ -457,7 +457,7 @@ func TestRunStage_NonJSONLineWarns(t *testing.T) {
 func TestRunStage_NonZeroExitPropagated(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
-	withFakeRunner(t, `printf '%s\n' '{"kind":"runner_started"}'; exit 7`)
+	withFakeRunner(t, `printf '%s\n' '{"kind":"runner_started"}' >&2; exit 7`)
 
 	runID := uuid.New()
 	stageID := uuid.New()

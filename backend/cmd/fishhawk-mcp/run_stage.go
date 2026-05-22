@@ -68,7 +68,7 @@ type RunStageInput struct {
 // the runner's process exit code so callers can branch on failure
 // categories (the runner uses distinct codes per category).
 //
-// Warnings collects best-effort surfaces: non-JSON runner stdout
+// Warnings collects best-effort surfaces: non-JSON runner stderr
 // lines, failed post-run stage fetch, missing github_repo, etc.
 // None of these fail the tool itself — the runner's exit is the
 // canonical outcome.
@@ -259,14 +259,16 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// pipe-drain reorder.
 	runStageSetProcessGroup(cmd)
 
-	// (5) Wire stdout to a JSONL parser. Stderr is piped through to
-	// the operator's terminal — the runner's verbose log lines are
-	// meant for humans, not the agent.
-	stdoutPipe, err := cmd.StdoutPipe()
+	// (5) Wire stderr to a JSONL parser via TeeReader so events reach
+	// the accumulator while the raw stream is also forwarded to the
+	// operator's terminal. Stdout carries no structured events when
+	// --upload-trace is set (the runner writes all JSONL to stderr /
+	// logSink), so forward it directly to the terminal.
+	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, RunStageOutput{}, fmt.Errorf("attach stdout: %w", err)
+		return nil, RunStageOutput{}, fmt.Errorf("attach stderr: %w", err)
 	}
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
 
 	if err := cmd.Start(); err != nil {
 		return nil, RunStageOutput{}, fmt.Errorf("spawn fishhawk-runner: %w", err)
@@ -288,7 +290,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 
 	go func() {
 		defer close(parseDone)
-		runStageParseEvents(ctx, stdoutPipe, &events, &eventsMu, &warnings, req, progToken)
+		runStageParseEvents(ctx, io.TeeReader(stderrPipe, os.Stderr), &events, &eventsMu, &warnings, req, progToken)
 	}()
 
 	// (6) Cancellation watcher: on ctx.Done(), signal the whole
@@ -409,7 +411,7 @@ func runStageParseEvents(
 		var payload any
 		if perr := json.Unmarshal([]byte(line), &payload); perr != nil {
 			mu.Lock()
-			*warnings = append(*warnings, fmt.Sprintf("non-JSON runner stdout: %q", line))
+			*warnings = append(*warnings, fmt.Sprintf("non-JSON runner stderr: %q", line))
 			mu.Unlock()
 			continue
 		}
@@ -427,7 +429,7 @@ func runStageParseEvents(
 	}
 	if serr := scanner.Err(); serr != nil && !errors.Is(serr, io.EOF) {
 		mu.Lock()
-		*warnings = append(*warnings, fmt.Sprintf("scan runner stdout: %v", serr))
+		*warnings = append(*warnings, fmt.Sprintf("scan runner stderr: %v", serr))
 		mu.Unlock()
 	}
 }
