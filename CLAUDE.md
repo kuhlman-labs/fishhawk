@@ -52,6 +52,8 @@ done < <(go work edit -json | jq -r '.Use[].DiskPath')
 python3 scripts/check-coverage.py --threshold 80 --exclude '/db/' "${profiles[@]}"
 ```
 
+When editing a schema under `docs/spec/`, run `scripts/sync-schemas` to mirror the change into all embedded copies before committing. CI fails the schema-sync gate otherwise. Opt-in local check: `git config core.hooksPath .githooks`.
+
 ## Adding a Go module
 
 1. `mkdir <name> && cd <name> && go mod init github.com/kuhlman-labs/fishhawk/<name>`

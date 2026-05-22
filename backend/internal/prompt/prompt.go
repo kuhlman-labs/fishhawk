@@ -212,6 +212,9 @@ func buildPlan(t Trigger) string {
 	)
 	b.WriteString("Do not echo the plan in your final response — only write it to the file. ")
 	b.WriteString("Do not modify source files in this stage — the implement stage that follows will execute the plan.\n")
+	b.WriteString("\n")
+	b.WriteString("If your plan scope includes any file under docs/spec/, the verification steps must include: " +
+		"run scripts/sync-schemas after editing the canonical copy; CI schema-sync gate will catch embedded copies that drift.\n")
 	return b.String()
 }
 
