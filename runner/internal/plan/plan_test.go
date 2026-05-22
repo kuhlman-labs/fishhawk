@@ -1,24 +1,25 @@
 package plan
 
 import (
+	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/plan/planfixture"
 )
 
-func mustRead(t *testing.T, path string) []byte {
+func fixtureJSON(t *testing.T, m map[string]any) []byte {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := json.Marshal(m)
 	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+		t.Fatal(err)
 	}
 	return b
 }
 
 func TestValidate_Valid(t *testing.T) {
-	data := mustRead(t, "testdata/valid/example.json")
-	if err := Validate(data); err != nil {
+	if err := Validate(fixtureJSON(t, planfixture.Valid())); err != nil {
 		t.Errorf("Validate: unexpected error: %v", err)
 	}
 }
@@ -46,7 +47,7 @@ func TestValidate_MalformedJSON(t *testing.T) {
 
 func TestValidate_MissingRequired(t *testing.T) {
 	// Drop the `summary` field — schema requires it.
-	src := mustRead(t, "testdata/valid/example.json")
+	src := fixtureJSON(t, planfixture.Valid())
 	tampered := strings.Replace(string(src), `"summary":`, `"summary_renamed":`, 1)
 	var serr *SchemaError
 	err := Validate([]byte(tampered))
@@ -61,8 +62,8 @@ func TestValidate_MissingRequired(t *testing.T) {
 func TestValidate_BadEnum(t *testing.T) {
 	// scope.files[].operation only accepts a closed set; "demolish"
 	// is not a member.
-	src := mustRead(t, "testdata/valid/example.json")
-	tampered := strings.Replace(string(src), `"operation": "create"`, `"operation": "demolish"`, 1)
+	src := fixtureJSON(t, planfixture.Valid())
+	tampered := strings.Replace(string(src), `"create"`, `"demolish"`, 1)
 	var serr *SchemaError
 	err := Validate([]byte(tampered))
 	if !errors.As(err, &serr) {
@@ -75,7 +76,7 @@ func TestValidate_BadEnum(t *testing.T) {
 
 func TestValidate_BadVersion(t *testing.T) {
 	// plan_version is constrained to "standard_v1".
-	src := mustRead(t, "testdata/valid/example.json")
+	src := fixtureJSON(t, planfixture.Valid())
 	tampered := strings.Replace(string(src), `"standard_v1"`, `"standard_v2"`, 1)
 	if err := Validate([]byte(tampered)); err == nil {
 		t.Fatal("expected version error")

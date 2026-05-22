@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -176,39 +177,13 @@ func (a *planAuditRepo) LastForRun(context.Context, uuid.UUID) (*audit.Entry, er
 	return nil, audit.ErrNotFound
 }
 
-// fixturePlanJSON returns a minimal-but-complete standard_v1 plan as
-// the bytes the artifact would carry. Mirrors the runner's upload.
+// fixturePlanJSON returns a minimal standard_v1 plan as the bytes an
+// artifact would carry. Uses planfixture.Valid() so all required schema
+// fields (including predicted_runtime_minutes and predicted_runtime_confidence)
+// are present.
 func fixturePlanJSON(t *testing.T) []byte {
 	t.Helper()
-	body := map[string]any{
-		"plan_version": "standard_v1",
-		"ticket_reference": map[string]any{
-			"type": "github_issue",
-			"url":  "https://github.com/kuhlman-labs/example/issues/42",
-			"id":   "kuhlman-labs/example#42",
-		},
-		"generated_by": map[string]any{
-			"agent":     "claude-code",
-			"model":     "claude-opus-4-7",
-			"timestamp": "2026-05-07T12:00:00Z",
-		},
-		"summary": "Add a foo helper to pkg/bar.",
-		"scope": map[string]any{
-			"files": []any{
-				map[string]any{"path": "pkg/bar/foo.go", "operation": "create"},
-				map[string]any{"path": "pkg/bar/bar.go", "operation": "modify"},
-			},
-		},
-		"approach": []any{
-			map[string]any{"step": 1, "description": "Define Foo on the bar.Service interface."},
-			map[string]any{"step": 2, "description": "Implement Foo with a table-driven test."},
-		},
-		"verification": map[string]any{
-			"test_strategy": "Unit tests in pkg/bar.",
-			"rollback_plan": "Revert the PR.",
-		},
-	}
-	b, err := json.Marshal(body)
+	b, err := json.Marshal(planfixture.Valid())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,9 +264,9 @@ func TestImplementPrompt_LeadsWithApprovedPlan(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Approved plan (binding instruction)",
-		"Add a foo helper to pkg/bar.",
-		"pkg/bar/foo.go (create)",
-		"1. Define Foo on the bar.Service interface.",
+		"Add a thing.",
+		"a.go (create)",
+		"1. Do the work.",
 		"binding instruction",
 		"diverging silently",
 		// Implement-stage prompt links the issue (#244): the body
@@ -446,7 +421,7 @@ func TestImplementPrompt_WalksParentRunForRetry(t *testing.T) {
 	if !strings.Contains(resp.Prompt, "Approved plan (binding instruction)") {
 		t.Errorf("retry prompt missed parent's plan:\n%s", resp.Prompt)
 	}
-	if !strings.Contains(resp.Prompt, "Add a foo helper to pkg/bar.") {
+	if !strings.Contains(resp.Prompt, "Add a thing.") {
 		t.Errorf("retry prompt missed parent plan summary:\n%s", resp.Prompt)
 	}
 	for _, e := range au.appended {
