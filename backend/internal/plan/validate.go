@@ -67,6 +67,9 @@ func Validate(data []byte) error {
 // to calling Validate followed by json.Unmarshal — provided as a
 // single call so the backend (E2 audit log writer, plan-review UI
 // renderer) doesn't need to import encoding/json directly.
+//
+// After JSON decode, semantic checks run via semanticCheck. A non-nil
+// result is a hard rejection (*SemanticError).
 func Parse(data []byte) (*Plan, error) {
 	if err := Validate(data); err != nil {
 		return nil, err
@@ -79,7 +82,53 @@ func Parse(data []byte) (*Plan, error) {
 		// internal type-mapping bug.
 		return nil, fmt.Errorf("internal: decode to Plan: %w", err)
 	}
+	if err := semanticCheck(&p); err != nil {
+		return nil, err
+	}
 	return &p, nil
+}
+
+// semanticCheck enforces invariants that JSON Schema cannot express.
+// Currently: sub-plan titles must be unique within a decomposition.
+func semanticCheck(p *Plan) error {
+	if p.Decomposition == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(p.Decomposition.SubPlans))
+	for _, sp := range p.Decomposition.SubPlans {
+		if _, dup := seen[sp.Title]; dup {
+			return &SemanticError{
+				Message: fmt.Sprintf("decomposition.sub_plans: duplicate title %q", sp.Title),
+			}
+		}
+		seen[sp.Title] = struct{}{}
+	}
+	return nil
+}
+
+// Warnings returns advisory strings for a successfully-parsed Plan.
+// These are soft checks — the plan is valid but the caller may want
+// to surface the messages in review UI or logs. Currently emits one
+// warning when the sum of sub-plan predicted_runtime_minutes is less
+// than the parent's predicted_runtime_minutes (the agent may have
+// legitimately compressed work, so this is not a hard rejection).
+func Warnings(p *Plan) []string {
+	if p.Decomposition == nil || len(p.Decomposition.SubPlans) == 0 {
+		return nil
+	}
+	sum := 0
+	for _, sp := range p.Decomposition.SubPlans {
+		sum += sp.PredictedRuntimeMinutes
+	}
+	if sum < p.PredictedRuntimeMinutes {
+		return []string{
+			fmt.Sprintf(
+				"decomposition sub-plan runtime sum (%d min) is less than parent predicted_runtime_minutes (%d min); agent may have compressed scope",
+				sum, p.PredictedRuntimeMinutes,
+			),
+		}
+	}
+	return nil
 }
 
 // schemaErrorFrom collapses a jsonschema.ValidationError tree to the

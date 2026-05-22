@@ -12,12 +12,10 @@
 //   - Parse validates and returns the typed *Plan. Used by the
 //     backend for rendering, persistence, and audit log writes.
 //
-// Plan artifacts have no graph-shape rules the schema can't express
-// (unlike the workflow spec's stage cross-references), so there is
-// no semantic-validation layer here. Cross-document checks against
-// the producing workflow spec (e.g. scope.files paths must satisfy
-// the stage's allowed_paths constraint) live at the runner / backend
-// layer where both sides are available.
+// Semantic checks (title uniqueness within decomposition) run inside
+// Parse after JSON decode. Cross-document checks against the producing
+// workflow spec live at the runner / backend layer where both sides are
+// available.
 package plan
 
 import "time"
@@ -26,14 +24,43 @@ import "time"
 // artifact. JSON tags mirror the schema; the canonical wire format
 // is JSON.
 type Plan struct {
-	PlanVersion         string          `json:"plan_version"`
-	TicketReference     TicketReference `json:"ticket_reference"`
-	GeneratedBy         GeneratedBy     `json:"generated_by"`
-	Summary             string          `json:"summary"`
-	Scope               Scope           `json:"scope"`
-	Approach            []ApproachStep  `json:"approach"`
-	Verification        Verification    `json:"verification"`
-	RisksAndAssumptions []string        `json:"risks_and_assumptions,omitempty"`
+	PlanVersion                string            `json:"plan_version"`
+	TicketReference            TicketReference   `json:"ticket_reference"`
+	GeneratedBy                GeneratedBy       `json:"generated_by"`
+	Summary                    string            `json:"summary"`
+	Scope                      Scope             `json:"scope"`
+	Approach                   []ApproachStep    `json:"approach"`
+	Verification               Verification      `json:"verification"`
+	RisksAndAssumptions        []string          `json:"risks_and_assumptions,omitempty"`
+	PredictedRuntimeMinutes    int               `json:"predicted_runtime_minutes"`
+	PredictedRuntimeConfidence RuntimeConfidence `json:"predicted_runtime_confidence"`
+	Decomposition              *Decomposition    `json:"decomposition,omitempty"`
+}
+
+// RuntimeConfidence is the agent's confidence level in a runtime estimate.
+type RuntimeConfidence string
+
+// Runtime confidence levels per the schema.
+const (
+	RuntimeConfidenceLow    RuntimeConfidence = "low"
+	RuntimeConfidenceMedium RuntimeConfidence = "medium"
+	RuntimeConfidenceHigh   RuntimeConfidence = "high"
+)
+
+// SubPlanSummary describes one sub-plan within a Decomposition.
+type SubPlanSummary struct {
+	Title                      string            `json:"title"`
+	ScopeHint                  string            `json:"scope_hint"`
+	PredictedRuntimeMinutes    int               `json:"predicted_runtime_minutes"`
+	PredictedRuntimeConfidence RuntimeConfidence `json:"predicted_runtime_confidence"`
+}
+
+// Decomposition holds the rationale and sub-plan summaries when
+// the agent's runtime estimate exceeds the implement-stage budget.
+// Stored in the audit log but not acted upon until D3/D4.
+type Decomposition struct {
+	Rationale string           `json:"rationale"`
+	SubPlans  []SubPlanSummary `json:"sub_plans"`
 }
 
 // TicketReference identifies the originating ticket. v0 closed set:

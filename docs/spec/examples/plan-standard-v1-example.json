@@ -45,5 +45,7 @@
   "risks_and_assumptions": [
     "Assumes audit_entries (created_at, entry_id) is the natural sort order; if a future migration adds an `inserted_at` distinct from `created_at` the cursor format will need to be revisited.",
     "Risk: very large date ranges (months) could pull millions of rows; mitigated by the per-page cap of 1000 rows and a server-side total cap of 100k rows per request, with a clear error advising the caller to narrow the range."
-  ]
+  ],
+  "predicted_runtime_minutes": 45,
+  "predicted_runtime_confidence": "medium"
 }

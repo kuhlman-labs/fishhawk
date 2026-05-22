@@ -332,6 +332,50 @@ func TestBuild_Implement_WithApprovedPlan_IsDeterministic(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_BudgetHintWithTimeouts(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber:           7,
+		IssueTitle:            "Plan a refactor",
+		Repo:                  "x/y",
+		PlanStageTimeout:      30 * time.Minute,
+		ImplementStageTimeout: 60 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"30 minutes",
+		"60 minutes",
+		"ADR-025",
+		"decomposition.sub_plans",
+		"predicted_runtime_minutes",
+		"predicted_runtime_confidence",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Plan_BudgetHintDefaultFallback(t *testing.T) {
+	// Zero durations should resolve to the default (15 minutes).
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+		// PlanStageTimeout and ImplementStageTimeout intentionally zero.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Both slots should show the default value.
+	count := strings.Count(got, "15 minutes")
+	if count < 2 {
+		t.Errorf("expected 'plan stage 15 minutes, implement stage 15 minutes' in default prompt, got count=%d\n---\n%s", count, got)
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop
