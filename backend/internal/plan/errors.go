@@ -36,3 +36,15 @@ type SchemaError struct {
 func (e *SchemaError) Error() string {
 	return fmt.Sprintf("plan: schema: %s: %s", e.Path, e.Message)
 }
+
+// SemanticError is returned when the plan passes schema validation but
+// violates a semantic invariant (e.g. duplicate sub-plan titles). It is
+// a hard rejection — Parse returns this error and the runner treats the
+// plan as invalid.
+type SemanticError struct {
+	Message string
+}
+
+func (e *SemanticError) Error() string {
+	return "plan: semantic: " + e.Message
+}

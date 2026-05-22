@@ -244,3 +244,202 @@ func TestSchemaError_FormatsPathAndMessage(t *testing.T) {
 		t.Errorf("Error() = %q, want %q", got, want)
 	}
 }
+
+// validPlanJSON returns a minimal valid standard_v1 plan with the new required
+// runtime fields populated. Tests that need to vary one field use this as a base.
+func validPlanJSON(extras string) []byte {
+	body := `{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://x", "id": "x"},
+  "generated_by": {"agent": "a", "model": "m", "timestamp": "2026-01-01T00:00:00Z"},
+  "summary": "x",
+  "scope": {"files": [{"path": "a.go", "operation": "create"}]},
+  "approach": [{"step": 1, "description": "x"}],
+  "verification": {"test_strategy": "x", "rollback_plan": "x"},
+  "predicted_runtime_minutes": 10,
+  "predicted_runtime_confidence": "medium"` + extras + `
+}`
+	return []byte(body)
+}
+
+// --- predicted_runtime_minutes / predicted_runtime_confidence schema errors ---
+
+func TestParse_MissingPredictedRuntimeMinutes(t *testing.T) {
+	// Regression guard: plans produced before this PR (without the new required
+	// fields) fail validation after deploy — this is the intentional breaking change.
+	_, err := plan.Parse([]byte(`{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://x", "id": "x"},
+  "generated_by": {"agent": "a", "model": "m", "timestamp": "2026-01-01T00:00:00Z"},
+  "summary": "x",
+  "scope": {"files": [{"path": "a.go", "operation": "create"}]},
+  "approach": [{"step": 1, "description": "x"}],
+  "verification": {"test_strategy": "x", "rollback_plan": "x"},
+  "predicted_runtime_confidence": "medium"
+}`))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+func TestParse_MissingPredictedRuntimeConfidence(t *testing.T) {
+	_, err := plan.Parse([]byte(`{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://x", "id": "x"},
+  "generated_by": {"agent": "a", "model": "m", "timestamp": "2026-01-01T00:00:00Z"},
+  "summary": "x",
+  "scope": {"files": [{"path": "a.go", "operation": "create"}]},
+  "approach": [{"step": 1, "description": "x"}],
+  "verification": {"test_strategy": "x", "rollback_plan": "x"},
+  "predicted_runtime_minutes": 10
+}`))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+// --- Pre-D2 shape regression guard ---
+
+func TestParse_PreD2Shape_NoRuntimeFields_IsSchemaError(t *testing.T) {
+	// Explicit regression guard: the pre-D2 wire format (no predicted_runtime_minutes
+	// or predicted_runtime_confidence) must be rejected as *SchemaError after this PR.
+	_, err := plan.Parse([]byte(`{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://x", "id": "x"},
+  "generated_by": {"agent": "a", "model": "m", "timestamp": "2026-01-01T00:00:00Z"},
+  "summary": "x",
+  "scope": {"files": [{"path": "a.go", "operation": "create"}]},
+  "approach": [{"step": 1, "description": "x"}],
+  "verification": {"test_strategy": "x", "rollback_plan": "x"}
+}`))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("pre-D2 plan shape should produce *SchemaError, got %v", err)
+	}
+}
+
+// --- decomposition schema errors ---
+
+func TestParse_DecompositionOneSubPlan_IsSchemaError(t *testing.T) {
+	// minItems:2 violation — a single sub-plan is rejected structurally.
+	_, err := plan.Parse(validPlanJSON(`,
+  "decomposition": {
+    "rationale": "too big",
+    "sub_plans": [
+      {"title": "Part A", "scope_hint": "first half", "predicted_runtime_minutes": 10, "predicted_runtime_confidence": "medium"}
+    ]
+  }`))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+// --- decomposition happy path ---
+
+func TestParse_DecompositionTwoSubPlans_Succeeds(t *testing.T) {
+	p, err := plan.Parse(validPlanJSON(`,
+  "decomposition": {
+    "rationale": "work exceeded budget",
+    "sub_plans": [
+      {"title": "Part A", "scope_hint": "schema changes", "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "high"},
+      {"title": "Part B", "scope_hint": "test updates",   "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
+    ]
+  }`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Decomposition == nil {
+		t.Fatal("Decomposition should be non-nil")
+	}
+	if got, want := len(p.Decomposition.SubPlans), 2; got != want {
+		t.Errorf("sub_plans len = %d, want %d", got, want)
+	}
+}
+
+// --- decomposition semantic errors ---
+
+func TestParse_DecompositionDuplicateTitles_IsSemanticError(t *testing.T) {
+	_, err := plan.Parse(validPlanJSON(`,
+  "decomposition": {
+    "rationale": "too big",
+    "sub_plans": [
+      {"title": "Same Title", "scope_hint": "first",  "predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low"},
+      {"title": "Same Title", "scope_hint": "second", "predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low"}
+    ]
+  }`))
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "duplicate title") {
+		t.Errorf("SemanticError message should mention duplicate title, got %q", se.Error())
+	}
+}
+
+// --- Warnings ---
+
+func TestWarnings_SubPlanSumLessThanParent_Explicit(t *testing.T) {
+	p, err := plan.Parse([]byte(`{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://x", "id": "x"},
+  "generated_by": {"agent": "a", "model": "m", "timestamp": "2026-01-01T00:00:00Z"},
+  "summary": "x",
+  "scope": {"files": [{"path": "a.go", "operation": "create"}]},
+  "approach": [{"step": 1, "description": "x"}],
+  "verification": {"test_strategy": "x", "rollback_plan": "x"},
+  "predicted_runtime_minutes": 30,
+  "predicted_runtime_confidence": "medium",
+  "decomposition": {
+    "rationale": "split",
+    "sub_plans": [
+      {"title": "Part A", "scope_hint": "a", "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "medium"},
+      {"title": "Part B", "scope_hint": "b", "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
+    ]
+  }
+}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	warns := plan.Warnings(p)
+	if len(warns) == 0 {
+		t.Fatal("expected at least one warning when sub-plan sum < parent runtime")
+	}
+}
+
+func TestWarnings_SubPlanSumGeParent_NoWarnings(t *testing.T) {
+	p, err := plan.Parse([]byte(`{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://x", "id": "x"},
+  "generated_by": {"agent": "a", "model": "m", "timestamp": "2026-01-01T00:00:00Z"},
+  "summary": "x",
+  "scope": {"files": [{"path": "a.go", "operation": "create"}]},
+  "approach": [{"step": 1, "description": "x"}],
+  "verification": {"test_strategy": "x", "rollback_plan": "x"},
+  "predicted_runtime_minutes": 10,
+  "predicted_runtime_confidence": "medium",
+  "decomposition": {
+    "rationale": "split",
+    "sub_plans": [
+      {"title": "Part A", "scope_hint": "a", "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "medium"},
+      {"title": "Part B", "scope_hint": "b", "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
+    ]
+  }
+}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if warns := plan.Warnings(p); len(warns) != 0 {
+		t.Errorf("expected no warnings when sub-plan sum >= parent, got %v", warns)
+	}
+}
+
+func TestSemanticError_FormatsMessage(t *testing.T) {
+	err := &plan.SemanticError{Message: "duplicate title \"Foo\""}
+	want := "plan: semantic: duplicate title \"Foo\""
+	if got := err.Error(); got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}

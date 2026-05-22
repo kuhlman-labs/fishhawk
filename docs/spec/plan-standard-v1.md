@@ -20,7 +20,11 @@ The canonical schema is [`plan-standard-v1.schema.json`](plan-standard-v1.schema
   "approach":     [ { "step": 1, "description": "..." }, ... ],
   "verification": { "test_strategy": "...", "rollback_plan": "..." },
 
-  "risks_and_assumptions": ["..."]
+  "predicted_runtime_minutes":    20,
+  "predicted_runtime_confidence": "medium",
+
+  "risks_and_assumptions": ["..."],
+  "decomposition": { "rationale": "...", "sub_plans": [...] }
 }
 ```
 
@@ -96,6 +100,26 @@ Ordered list of steps. Each step has a 1-indexed `step` number and a `descriptio
 
 Reviewers expect concrete tests, not "add tests." Rollback plans flag whether a change is purely additive or has data migration consequences.
 
+### Runtime prediction
+
+Two required fields capture the agent's estimate of how long the implement stage will take.
+
+#### `predicted_runtime_minutes`
+
+Integer ≥ 1. The agent's estimate in minutes. Used to surface scope problems early: if the estimate exceeds the implement-stage budget (per ADR-025), the agent must also populate `decomposition.sub_plans`.
+
+#### `predicted_runtime_confidence`
+
+One of `"low"`, `"medium"`, or `"high"`.
+
+| Value | Meaning |
+|---|---|
+| `low` | Rough guess; significant unknowns remain |
+| `medium` | Reasonably grounded; agent has read the relevant code |
+| `high` | Well-understood scope; agent has high certainty |
+
+These fields are MUST-populate: every `standard_v1` artifact must carry an estimate. The plan-stage prompt instructs the agent accordingly (ADR-025 D1 framing).
+
 ## Optional fields
 
 ### `risks_and_assumptions`
@@ -109,6 +133,51 @@ Reviewers expect concrete tests, not "add tests." Rollback plans flag whether a 
 
 Free-form strings. The plan-review UI surfaces these in a sidebar. Useful for the agent to flag uncertainty rather than over-claim confidence.
 
+### Decomposition
+
+Populated when `predicted_runtime_minutes` exceeds the implement-stage budget. Signals that the agent believes the work should be split across multiple runs.
+
+```json
+{
+  "decomposition": {
+    "rationale": "Estimated runtime (90 min) exceeds the 60-minute implement-stage budget. Splitting into schema migration (Part A) and application logic + tests (Part B).",
+    "sub_plans": [
+      {
+        "title": "Part A: schema migration",
+        "scope_hint": "Add the new columns and indexes; no application code changes.",
+        "predicted_runtime_minutes": 20,
+        "predicted_runtime_confidence": "high"
+      },
+      {
+        "title": "Part B: application logic and tests",
+        "scope_hint": "Wire up the new columns in service layer and add integration tests.",
+        "predicted_runtime_minutes": 55,
+        "predicted_runtime_confidence": "medium"
+      }
+    ]
+  }
+}
+```
+
+#### `decomposition.rationale`
+
+Required when `decomposition` is present. Explains why the work was split and how the sub-plans relate.
+
+#### `decomposition.sub_plans`
+
+Required array with at least two entries. Each entry is a `SubPlanSummary`:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `title` | string (1–200 chars) | yes | Must be unique within the array |
+| `scope_hint` | string | yes | What this sub-plan covers |
+| `predicted_runtime_minutes` | integer ≥ 1 | yes | Estimate for this sub-plan's implement stage |
+| `predicted_runtime_confidence` | `"low"` / `"medium"` / `"high"` | yes | Confidence in the sub-plan estimate |
+
+**Runtime-sum invariant**: the validator warns (but does not reject) when the sum of `sub_plans[*].predicted_runtime_minutes` is less than the parent `predicted_runtime_minutes`. The agent may legitimately compress work when breaking it into smaller pieces; the soft warning surfaces the gap for human review.
+
+**Lifecycle note**: `decomposition` is validated and stored in the audit log but not acted upon until D3/D4 (automated run splitting is out of scope for D1/D2). Plans with a populated `decomposition` block pass through approval and arrive at the implement stage unchanged; no mechanism routes sub-plans to child runs yet.
+
 ## Validation rules beyond the schema
 
 JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
@@ -116,6 +185,7 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 - `scope.files[].path` matches at least one of the stage's `allowed_paths` (when set) and none of the `forbidden_paths`.
 - `generated_by.timestamp` is within the run's wall-clock window (catches clock-skew or replay).
 - `generated_by.agent` matches the workflow spec's `executor.agent` for the active stage.
+- `decomposition.sub_plans[*].title` must be unique within the array (semantic check in the plan package; returns `*SemanticError` on violation).
 
 These cross-references aren't expressible in JSON Schema cleanly.
 
@@ -135,3 +205,4 @@ The runner ships the canonical JSON to the backend; the backend renders the Mark
 - `MVP_SPEC.md` §4.3 — original specification of required and optional fields.
 - `MVP_SPEC.md` §4.4 — audit log persistence.
 - `workflow-v0.md` — the workflow spec that produces these artifacts.
+- ADR-025 — stage budget framing and the `predicted_runtime_minutes` requirement.

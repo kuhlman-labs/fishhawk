@@ -610,7 +610,9 @@ func validPlanJSON() string {
   "summary": "Add a thing.",
   "scope": {"files": [{"path":"a.go","operation":"create"}], "estimated_lines_changed": 10},
   "approach": [{"step":1,"description":"Do."}],
-  "verification": {"test_strategy":"go test","rollback_plan":"revert PR"}
+  "verification": {"test_strategy":"go test","rollback_plan":"revert PR"},
+  "predicted_runtime_minutes": 5,
+  "predicted_runtime_confidence": "medium"
 }`
 }
 

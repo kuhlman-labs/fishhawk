@@ -13,7 +13,9 @@
     "summary",
     "scope",
     "approach",
-    "verification"
+    "verification",
+    "predicted_runtime_minutes",
+    "predicted_runtime_confidence"
   ],
 
   "properties": {
@@ -41,6 +43,35 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
       "description": "Optional. Things the agent flagged as uncertain or assumed; surfaces in the review UI."
+    },
+    "predicted_runtime_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Agent's estimate of how long the implement stage will take, in minutes. Used to surface scope problems early and to populate decomposition.sub_plans when the estimate exceeds the implement-stage budget."
+    },
+    "predicted_runtime_confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Agent's confidence in predicted_runtime_minutes. low = rough guess; medium = reasonably grounded; high = well-understood scope."
+    },
+    "decomposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rationale", "sub_plans"],
+      "description": "Optional. Populated when predicted_runtime_minutes exceeds the implement-stage budget. Stored in the audit log but not acted upon until D3/D4.",
+      "properties": {
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the work was split and how the sub-plans relate."
+        },
+        "sub_plans": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/sub-plan-summary" },
+          "description": "Ordered list of sub-plans. At least two required when decomposition is present."
+        }
+      }
     }
   },
 
@@ -161,6 +192,34 @@
           "type": "string",
           "minLength": 1,
           "description": "How a regression would be undone. \"Revert PR\" is a valid answer for purely-additive changes; data migrations need more."
+        }
+      }
+    },
+
+    "sub-plan-summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "scope_hint", "predicted_runtime_minutes", "predicted_runtime_confidence"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Short title for this sub-plan. Must be unique within decomposition.sub_plans."
+        },
+        "scope_hint": {
+          "type": "string",
+          "description": "Brief description of what this sub-plan covers. Helps the reviewer understand the split."
+        },
+        "predicted_runtime_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Agent's estimate of how long this sub-plan's implement stage will take."
+        },
+        "predicted_runtime_confidence": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "Agent's confidence in this sub-plan's predicted_runtime_minutes."
         }
       }
     }

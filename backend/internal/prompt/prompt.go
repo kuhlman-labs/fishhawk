@@ -16,9 +16,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
+
+// defaultStageTimeoutMinutes mirrors spec.DefaultStageTimeout (15 minutes,
+// per ADR-025 D1). If that default changes in the spec package, update here.
+const defaultStageTimeoutMinutes = 15
 
 // ErrUnsupportedStage signals the requested stage type isn't yet
 // wired for prompt construction. The handler maps this to HTTP 501.
@@ -81,6 +86,12 @@ type Trigger struct {
 	// to the issue-only prompt and a `plan_missing_for_implement`
 	// audit entry surfaces the gap (#223).
 	ApprovedPlan *plan.Plan
+	// PlanStageTimeout is the max runtime budget for the plan stage.
+	// Zero resolves to defaultStageTimeoutMinutes in buildPlan.
+	PlanStageTimeout time.Duration
+	// ImplementStageTimeout is the max runtime budget for the implement stage.
+	// Zero resolves to defaultStageTimeoutMinutes in buildPlan.
+	ImplementStageTimeout time.Duration
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -180,13 +191,37 @@ func buildPlan(t Trigger) string {
 
 	writeIssueContext(&b, t)
 
+	planMins := resolveMins(t.PlanStageTimeout)
+	implMins := resolveMins(t.ImplementStageTimeout)
+	fmt.Fprintf(&b,
+		"Stage budget (ADR-025): plan stage %d minutes, implement stage %d minutes. "+
+			"Treat overrunning the budget as a scope problem, not a runtime problem — "+
+			"if your work estimate exceeds the implement-stage budget, populate decomposition.sub_plans "+
+			"so the reviewer can split the work into multiple runs.\n\n",
+		planMins, implMins,
+	)
+
 	b.WriteString("Your task: produce a `standard_v1` plan artifact describing the change. ")
 	b.WriteString("Write the plan as a single JSON object to `")
 	b.WriteString(PlanArtifactPath)
-	b.WriteString("`. The schema is documented at docs/spec/plan-standard-v1.md and required fields are: plan_version (\"standard_v1\"), ticket_reference, generated_by, summary, scope, approach, verification. ")
+	b.WriteString("`. The schema is documented at docs/spec/plan-standard-v1.md and required fields are: plan_version (\"standard_v1\"), ticket_reference, generated_by, summary, scope, approach, verification, predicted_runtime_minutes, predicted_runtime_confidence. ")
+	b.WriteString("predicted_runtime_minutes and predicted_runtime_confidence are MUST-populate fields — every plan artifact must carry your runtime estimate and confidence level. ")
+	fmt.Fprintf(&b,
+		"Populate decomposition.sub_plans if and only if your predicted_runtime_minutes estimate exceeds the implement-stage budget (%d minutes). ",
+		implMins,
+	)
 	b.WriteString("Do not echo the plan in your final response — only write it to the file. ")
 	b.WriteString("Do not modify source files in this stage — the implement stage that follows will execute the plan.\n")
 	return b.String()
+}
+
+// resolveMins converts a duration to whole minutes, returning
+// defaultStageTimeoutMinutes for zero durations.
+func resolveMins(d time.Duration) int {
+	if d <= 0 {
+		return defaultStageTimeoutMinutes
+	}
+	return int(d.Minutes())
 }
 
 // writeApprovedPlan renders a standard_v1 plan as readable prose so
@@ -246,6 +281,11 @@ func writeApprovedPlan(b *strings.Builder, p *plan.Plan) {
 			fmt.Fprintf(b, "- %s\n", r)
 		}
 		b.WriteString("\n")
+	}
+
+	if p.PredictedRuntimeMinutes > 0 {
+		fmt.Fprintf(b, "Runtime prediction: %d minutes (%s confidence)\n\n",
+			p.PredictedRuntimeMinutes, p.PredictedRuntimeConfidence)
 	}
 }
 

@@ -49,6 +49,8 @@ func validPlanBytes(t *testing.T) []byte {
 			"test_strategy": "Run the target twice; second run is a no-op.",
 			"rollback_plan": "Revert the diff.",
 		},
+		"predicted_runtime_minutes":    5,
+		"predicted_runtime_confidence": "medium",
 	})
 	if err != nil {
 		t.Fatal(err)
