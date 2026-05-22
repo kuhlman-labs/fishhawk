@@ -68,10 +68,13 @@ export FISHHAWK_BACKEND_URL="https://app.fishhawk.example.com"
 claude mcp add fishhawk \
   --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN \
   --env FISHHAWK_BACKEND_URL=$FISHHAWK_BACKEND_URL \
+  --env FISHHAWK_RUNNER_BIN=/usr/local/bin/fishhawk-runner \
   -- /usr/local/bin/fishhawk-mcp
 ```
 
 `--` separates Claude Code's flags from the binary path. The exact flag shape varies by Claude Code version — `claude mcp add --help` is authoritative. Some clients prefer a config file path; some take env vars inline.
+
+`FISHHAWK_RUNNER_BIN` is required only when `fishhawk-runner` is not in system PATH and not co-located with `fishhawk-mcp`. When both binaries live in the same directory, the MCP server resolves `fishhawk-runner` automatically via its sibling-binary probe (`os.Executable` + `filepath.Dir`).
 
 ### 5. Smoke-test the registration
 
@@ -152,6 +155,7 @@ Cancellation: cancelling the `fishhawk_run_stage` tool call sends `SIGTERM` to t
 | `fishhawk: HTTP 403 (insufficient_scope)` from a write tool | The token doesn't carry the required write scope (see the Write tools table). Reissue with `--scopes` including the right write scopes. |
 | `fishhawk: HTTP 404` from `fishhawk_get_plan` | Run id valid but the plan stage hasn't terminated — the tool returns a structured `no_plan_yet` response, not an error. Other 404s usually mean the run id is wrong. |
 | `no plan stage on run …` from `fishhawk_approve_plan` | The run's workflow doesn't have a plan stage (e.g. `routine_change`). Approve at the stage level directly via the CLI / SPA. |
+| `fishhawk-runner not on PATH` from `fishhawk_run_stage` | The binary could not be resolved via any rung of the resolution chain (input → env → sibling → PATH). Remediate in order of preference: (1) install `fishhawk-runner` in the same directory as `fishhawk-mcp` — the sibling-binary probe resolves it automatically; (2) set `--env FISHHAWK_RUNNER_BIN=<path>` in `claude mcp add` (see step 4); (3) pass `runner_binary` per tool call as a last resort. |
 
 ## See also
 
