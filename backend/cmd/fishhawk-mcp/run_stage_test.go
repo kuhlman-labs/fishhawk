@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +42,24 @@ func withFakeRunnerMissing(t *testing.T) {
 	orig := runStageLookPath
 	runStageLookPath = func(_ string) (string, error) { return "", exec.ErrNotFound }
 	t.Cleanup(func() { runStageLookPath = orig })
+}
+
+// withFakeExecutable stubs runStageExecutable to return a fake fishhawk-mcp
+// path inside dir. When withSibling is true, it also creates a fishhawk-runner
+// file in dir so the sibling-binary probe (os.Stat) succeeds.
+func withFakeExecutable(t *testing.T, dir string, withSibling bool) {
+	t.Helper()
+	if withSibling {
+		f, err := os.Create(filepath.Join(dir, "fishhawk-runner"))
+		if err != nil {
+			t.Fatalf("create fake fishhawk-runner sibling: %v", err)
+		}
+		f.Close()
+	}
+	orig := runStageExecutable
+	fakeExe := filepath.Join(dir, "fishhawk-mcp")
+	runStageExecutable = func() (string, error) { return fakeExe, nil }
+	t.Cleanup(func() { runStageExecutable = orig })
 }
 
 // withFakeGitRemote stubs the origin-detect helper.
@@ -120,6 +140,8 @@ func TestRunStage_MissingBinaryReturnsCleanError(t *testing.T) {
 	_, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 	withFakeRunnerMissing(t)
+	// os.Executable sibling probe must also fail so we reach the error rung.
+	withFakeExecutable(t, t.TempDir(), false /* no sibling */)
 
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID:    uuid.NewString(),
@@ -132,6 +154,126 @@ func TestRunStage_MissingBinaryReturnsCleanError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "fishhawk-runner not on PATH") {
 		t.Errorf("err should mention PATH: %v", err)
+	}
+}
+
+// TestRunStage_RunnerBinaryInputWins verifies rung (a): a runner_binary in
+// the input beats env, sibling, and PATH.
+func TestRunStage_RunnerBinaryInputWins(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, map[string]string{
+		"FISHHAWK_RUNNER_BIN": "/from/env/fishhawk-runner",
+	})
+	withFakeExecutable(t, t.TempDir(), true /* sibling present — must be ignored */)
+	origLook := runStageLookPath
+	runStageLookPath = func(_ string) (string, error) { return "/from/path/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageLookPath = origLook })
+
+	var capturedBinary string
+	origCmd := runStageCommand
+	runStageCommand = func(name string, _ ...string) *exec.Cmd {
+		capturedBinary = name
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:        runID.String(),
+		StageID:      stageID.String(),
+		Workflow:     "w",
+		Stage:        "plan",
+		GitHubRepo:   "x/y",
+		RunnerBinary: "/explicit/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if capturedBinary != "/explicit/fishhawk-runner" {
+		t.Errorf("binary = %q, want /explicit/fishhawk-runner (input rung)", capturedBinary)
+	}
+}
+
+// TestRunStage_ExecutableSiblingFallback verifies rung (c): when input and env
+// are empty but fishhawk-runner lives beside fishhawk-mcp, the sibling path is
+// used even when PATH lookup would fail.
+func TestRunStage_ExecutableSiblingFallback(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	dir := t.TempDir()
+	withFakeExecutable(t, dir, true /* sibling present */)
+	withFakeRunnerMissing(t) // PATH lookup fails — sibling must win
+
+	var capturedBinary string
+	origCmd := runStageCommand
+	runStageCommand = func(name string, _ ...string) *exec.Cmd {
+		capturedBinary = name
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	want := filepath.Join(dir, "fishhawk-runner")
+	if capturedBinary != want {
+		t.Errorf("binary = %q, want sibling %q", capturedBinary, want)
+	}
+}
+
+// TestRunStage_PathFallback verifies rung (d): when input, env, and sibling
+// are all absent, the PATH lookup result is used.
+func TestRunStage_PathFallback(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	// Sibling absent so the os.Executable rung falls through.
+	withFakeExecutable(t, t.TempDir(), false /* no sibling */)
+
+	var capturedBinary string
+	origCmd := runStageCommand
+	origLook := runStageLookPath
+	runStageCommand = func(name string, _ ...string) *exec.Cmd {
+		capturedBinary = name
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/from/path/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = origLook
+	})
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if capturedBinary != "/from/path/fishhawk-runner" {
+		t.Errorf("binary = %q, want /from/path/fishhawk-runner (PATH rung)", capturedBinary)
 	}
 }
 

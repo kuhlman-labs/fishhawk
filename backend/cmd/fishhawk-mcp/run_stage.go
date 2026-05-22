@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +27,11 @@ var runStageCommand = exec.Command
 // runStageLookPath looks up the fishhawk-runner binary on PATH.
 // Test seam mirroring the CLI's runnerBinaryLookPath.
 var runStageLookPath = exec.LookPath
+
+// runStageExecutable returns the path to the running binary (os.Executable).
+// Test seam: allows tests to inject a fake executable path for the
+// sibling-binary resolution rung without needing a real binary on disk.
+var runStageExecutable = os.Executable
 
 // runStageGitRemoteOriginURL returns `origin`'s URL for the working
 // dir. Mirrors the CLI's gitRemoteOriginURL — test seam.
@@ -59,7 +65,7 @@ type RunStageInput struct {
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
 	PushAndOpenPR bool   `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR; default false (the operator commits the changes themselves)"`
-	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; defaults to FISHHAWK_RUNNER_BIN env then exec.LookPath('fishhawk-runner')"`
+	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: FISHHAWK_RUNNER_BIN env, then fishhawk-runner sibling to this binary (os.Executable dir), then PATH"`
 }
 
 // RunStageOutput is the structured result of one stage run. The
@@ -152,7 +158,7 @@ host; this tool is local-only by design (ADR-024 Q5).
 //
 // Composition order:
 //  1. validate the obvious inputs (run_id, stage_id, workflow, stage).
-//  2. resolve the runner binary (input > env > PATH).
+//  2. resolve the runner binary (input > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > error).
 //  3. resolve GitHub repo (input > working-dir origin remote;
 //     soft-failure when push_and_open_pr is false).
 //  4. compose argv mirroring `fishhawk runner start`.
@@ -176,6 +182,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 
 	// (2) Resolve the runner binary.
+	// Resolution order: input > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > error.
 	binary := in.RunnerBinary
 	if binary == "" {
 		if env := r.getenv("FISHHAWK_RUNNER_BIN"); env != "" {
@@ -183,11 +190,19 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		}
 	}
 	if binary == "" {
+		if exe, exeErr := runStageExecutable(); exeErr == nil {
+			sibling := filepath.Join(filepath.Dir(exe), "fishhawk-runner")
+			if _, statErr := os.Stat(sibling); statErr == nil {
+				binary = sibling
+			}
+		}
+	}
+	if binary == "" {
 		resolved, lerr := runStageLookPath("fishhawk-runner")
 		if lerr != nil {
 			return nil, RunStageOutput{}, errors.New(
 				"fishhawk-runner not on PATH; this tool requires local MCP execution — " +
-					"pass runner_binary or set FISHHAWK_RUNNER_BIN")
+					"pass runner_binary, set FISHHAWK_RUNNER_BIN, or co-locate fishhawk-runner with fishhawk-mcp")
 		}
 		binary = resolved
 	}
