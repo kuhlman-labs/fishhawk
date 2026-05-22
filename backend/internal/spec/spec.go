@@ -20,6 +20,80 @@
 // Validate to exercise just the semantic layer.
 package spec
 
+import (
+	"encoding/json"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Duration wraps time.Duration so YAML/JSON values like "30m" or "10m"
+// round-trip cleanly via time.ParseDuration. A zero Duration means "not
+// set" — callers should interpret zero as "fall through to the next
+// precedence level."
+type Duration struct {
+	time.Duration
+}
+
+// UnmarshalJSON decodes a duration string like "30m" into a Duration.
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	if s == "" {
+		return nil
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	d.Duration = dur
+	return nil
+}
+
+// UnmarshalYAML decodes a YAML scalar duration string into a Duration.
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	var s string
+	if err := value.Decode(&s); err != nil {
+		return err
+	}
+	if s == "" {
+		return nil
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	d.Duration = dur
+	return nil
+}
+
+// Policy is the per-workflow execution policy.
+type Policy struct {
+	MaxStageRuntime Duration `json:"max_stage_runtime,omitempty" yaml:"max_stage_runtime,omitempty"`
+}
+
+// DefaultStageTimeout is the value ResolveStageTimeout uses when neither
+// the stage executor nor the workflow policy declares a timeout.
+const DefaultStageTimeout = 15 * time.Minute
+
+// ResolveStageTimeout enforces the three-level timeout precedence:
+// stage executor timeout > workflow policy max_stage_runtime > def.
+// A zero Duration at any level means "not set" and falls through to the next.
+// This is the single source of truth for stage timeout resolution; it is
+// called by the prompt handler to populate agent_timeout_seconds on the
+// fetch-prompt response.
+func ResolveStageTimeout(wf Workflow, st Stage, def time.Duration) time.Duration {
+	if st.Executor.Timeout.Duration != 0 {
+		return st.Executor.Timeout.Duration
+	}
+	if wf.Policy != nil && wf.Policy.MaxStageRuntime.Duration != 0 {
+		return wf.Policy.MaxStageRuntime.Duration
+	}
+	return def
+}
+
 // Spec is a parsed and validated workflow specification document.
 type Spec struct {
 	Version   string              `json:"version" yaml:"version"`
@@ -40,6 +114,7 @@ type Workflow struct {
 	Description string       `json:"description,omitempty" yaml:"description,omitempty"`
 	Stages      []Stage      `json:"stages" yaml:"stages"`
 	OnCIFailure *OnCIFailure `json:"on_ci_failure,omitempty" yaml:"on_ci_failure,omitempty"`
+	Policy      *Policy      `json:"policy,omitempty" yaml:"policy,omitempty"`
 }
 
 // OnCIFailure is the per-workflow auto-retry policy (#276 / #277).
@@ -89,8 +164,9 @@ const (
 // Executor describes what runs the stage. Exactly one of Agent or
 // Human is set. The schema enforces the mutual exclusion.
 type Executor struct {
-	Agent string `json:"agent,omitempty" yaml:"agent,omitempty"`
-	Human bool   `json:"human,omitempty" yaml:"human,omitempty"`
+	Agent   string   `json:"agent,omitempty" yaml:"agent,omitempty"`
+	Human   bool     `json:"human,omitempty" yaml:"human,omitempty"`
+	Timeout Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 }
 
 // Input is either a trigger (Source set) or an artifact handoff from

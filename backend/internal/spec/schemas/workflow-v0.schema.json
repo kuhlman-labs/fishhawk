@@ -12,7 +12,7 @@
     "version": {
       "type": "string",
       "enum": ["0.3"],
-      "description": "Spec syntax version. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
+      "description": "Spec syntax version. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
     },
     "roles": {
       "type": "object",
@@ -64,7 +64,21 @@
           "minItems": 1,
           "items": { "$ref": "#/$defs/stage" }
         },
-        "on_ci_failure": { "$ref": "#/$defs/on_ci_failure" }
+        "on_ci_failure": { "$ref": "#/$defs/on_ci_failure" },
+        "policy": { "$ref": "#/$defs/policy" }
+      }
+    },
+
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-workflow execution policy.",
+      "properties": {
+        "max_stage_runtime": {
+          "type": "string",
+          "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+          "description": "Default wall-clock cap for every agent stage in the workflow. Overridable per-stage via executor.timeout. Parsed by time.ParseDuration. Resolved by spec.ResolveStageTimeout on the backend and delivered to the runner via agent_timeout_seconds on the prompt-fetch response."
+        }
       }
     },
 
@@ -130,6 +144,11 @@
               "type": "string",
               "minLength": 1,
               "description": "Agent identifier. v0 ships with claude-code; v0.x adds cursor and copilot."
+            },
+            "timeout": {
+              "type": "string",
+              "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+              "description": "Wall-clock cap for this stage's agent invocation. Overrides workflow.policy.max_stage_runtime when set. Falls back to the workflow policy or the backend default (15m) when absent. Parsed by time.ParseDuration."
             }
           }
         },

@@ -28,6 +28,7 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
   type: plan | implement | review # closed set; no custom types
   executor: # exactly one of agent or human
     agent: claude-code # any string; v0 ships claude-code
+    timeout: 10m       # optional; stage-level override for agent timeout
     # OR
     human: true
   inputs: [<input>...] # optional
@@ -145,6 +146,42 @@ Two types:
 All surfaces converge on the same `approvals` table row + an `approval_submitted` audit chain entry. The surface-of-origin is recorded in `approval.surface` (closed enum: `api`, `ui`, `cli`, `github_comment`, `github_reply_comment`) so a post-hoc reviewer can attribute the decision to the right UX affordance. The reply-comment surface skips silently on non-approver reactors and unmatched contexts (a generic "+1" reply on an unrelated issue thread isn't an error); the slash and HTTP/CLI paths reply / surface errors loudly. A future polling worker (E17.3b / #360) will add a `github_reaction` surface for click-only thumbs-up reactions GitHub doesn't deliver via webhook.
 
 `blocking_checks` was removed in v0.2 (ADR-017 / #249). Required CI checks are now derived from GitHub branch protection / rulesets at run-create time and snapshotted onto the run row (#251). The `fishhawk_audit_complete` signal is still computed by Fishhawk (#229) and published as a Check Run on the PR (#231) so branch protection can enforce it.
+
+## Agent timeouts (v0.3 additions, #452)
+
+Two optional fields govern the wall-clock cap on agent invocations. Both accept Go duration strings (e.g. `"30m"`, `"1h"`, `"90s"`).
+
+**Three-level precedence** (highest to lowest):
+1. `stage.executor.timeout` — the exception; use when a specific stage SLO differs from the rest.
+2. `workflow.policy.max_stage_runtime` — the spirit; expresses the workflow's overall runtime envelope.
+3. Backend default (15 minutes) — fallback when neither field is set.
+
+```yaml
+version: "0.3"
+workflows:
+  feature_change:
+    policy:
+      max_stage_runtime: "30m" # workflow-level default for all agent stages
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: "10m" # overrides the 30m policy for this stage only
+        produces:
+          - artifact: plan
+            schema: standard_v1
+
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          # no timeout: inherits the 30m workflow policy
+        produces:
+          - artifact: pull_request
+```
+
+`spec.ResolveStageTimeout` on the backend applies this precedence at prompt-fetch time and delivers the resolved value to the runner via `agent_timeout_seconds` in the prompt-fetch response. The runner applies the local 15-minute fallback when the field is 0 (legacy runs with no `workflow_spec` cached on the row, or runs created before this feature landed).
 
 ## On CI failure (auto-retry)
 

@@ -296,13 +296,17 @@ type FetchPromptArgs struct {
 	PrivateKey ed25519.PrivateKey
 }
 
-// FetchedPrompt is the (stage_id, stage_type, prompt, prompt_hash)
-// tuple the backend returns. Mirrors docs/api/v0.openapi.yaml.
+// FetchedPrompt is the (stage_id, stage_type, prompt, prompt_hash,
+// agent_timeout_seconds) tuple the backend returns. Mirrors docs/api/v0.openapi.yaml.
+// AgentTimeoutSeconds is the spec-resolved wall-clock cap for the agent
+// invocation; 0 means the backend could not resolve a spec-governed timeout
+// and the runner should fall back to its own constant.
 type FetchedPrompt struct {
-	StageID    string `json:"stage_id"`
-	StageType  string `json:"stage_type"`
-	Prompt     string `json:"prompt"`
-	PromptHash string `json:"prompt_hash"`
+	StageID             string `json:"stage_id"`
+	StageType           string `json:"stage_type"`
+	Prompt              string `json:"prompt"`
+	PromptHash          string `json:"prompt_hash"`
+	AgentTimeoutSeconds int    `json:"agent_timeout_seconds"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an

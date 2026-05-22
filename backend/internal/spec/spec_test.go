@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -464,6 +465,107 @@ func TestValidate_BuiltProgrammatically(t *testing.T) {
 	}
 	if err := spec.Validate(s); err != nil {
 		t.Errorf("Validate: %v", err)
+	}
+}
+
+// --- Timeout policy (#452) ---
+
+func TestParse_TimeoutPolicy(t *testing.T) {
+	s, err := spec.ParseBytes(readFixture(t, "valid/timeout-policy.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf, ok := s.Workflows["feature_change"]
+	if !ok {
+		t.Fatal(`workflows["feature_change"] missing`)
+	}
+	if wf.Policy == nil {
+		t.Fatal("Policy should be non-nil")
+	}
+	if got, want := wf.Policy.MaxStageRuntime.Duration, 30*time.Minute; got != want {
+		t.Errorf("Policy.MaxStageRuntime = %v, want %v", got, want)
+	}
+	if len(wf.Stages) == 0 {
+		t.Fatal("no stages")
+	}
+	planStage := wf.Stages[0]
+	if got, want := planStage.Executor.Timeout.Duration, 10*time.Minute; got != want {
+		t.Errorf("plan stage Executor.Timeout = %v, want %v", got, want)
+	}
+	// implement stage has no explicit timeout.
+	if len(wf.Stages) < 2 {
+		t.Fatal("expected at least 2 stages")
+	}
+	implStage := wf.Stages[1]
+	if implStage.Executor.Timeout.Duration != 0 {
+		t.Errorf("implement stage Executor.Timeout = %v, want 0", implStage.Executor.Timeout.Duration)
+	}
+}
+
+func TestParse_NoTimeout_BackwardCompat(t *testing.T) {
+	// Existing specs without policy or executor.timeout must still parse.
+	s, err := spec.ParseBytes(readFixture(t, "valid/feature-change.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf := s.Workflows["feature_change"]
+	if wf.Policy != nil {
+		t.Errorf("Policy = %+v, want nil for spec without policy block", wf.Policy)
+	}
+	for _, st := range wf.Stages {
+		if st.Executor.Timeout.Duration != 0 {
+			t.Errorf("stage %q Executor.Timeout = %v, want 0", st.ID, st.Executor.Timeout.Duration)
+		}
+	}
+}
+
+func TestResolveStageTimeout(t *testing.T) {
+	const def = 15 * time.Minute
+
+	makeDur := func(d time.Duration) spec.Duration {
+		return spec.Duration{Duration: d}
+	}
+
+	cases := []struct {
+		name    string
+		policy  *spec.Policy
+		stageTO spec.Duration
+		want    time.Duration
+	}{
+		{
+			name:    "stage timeout wins over workflow policy and default",
+			policy:  &spec.Policy{MaxStageRuntime: makeDur(30 * time.Minute)},
+			stageTO: makeDur(10 * time.Minute),
+			want:    10 * time.Minute,
+		},
+		{
+			name:    "workflow policy wins over default when stage timeout is zero",
+			policy:  &spec.Policy{MaxStageRuntime: makeDur(20 * time.Minute)},
+			stageTO: makeDur(0),
+			want:    20 * time.Minute,
+		},
+		{
+			name:    "default wins when both stage and policy are zero",
+			policy:  nil,
+			stageTO: makeDur(0),
+			want:    def,
+		},
+		{
+			name:    "zero stage timeout falls through to workflow policy",
+			policy:  &spec.Policy{MaxStageRuntime: makeDur(45 * time.Minute)},
+			stageTO: makeDur(0),
+			want:    45 * time.Minute,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wf := spec.Workflow{Policy: tc.policy}
+			st := spec.Stage{Executor: spec.Executor{Timeout: tc.stageTO}}
+			got := spec.ResolveStageTimeout(wf, st, def)
+			if got != tc.want {
+				t.Errorf("ResolveStageTimeout = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

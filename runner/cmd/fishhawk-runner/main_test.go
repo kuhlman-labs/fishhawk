@@ -2314,3 +2314,77 @@ func TestParseFlags_LocalRunnerFields_DefaultsEmpty(t *testing.T) {
 		t.Errorf("local-runner fields not zero-valued: %+v", cfg)
 	}
 }
+
+// TestRun_FetchPrompt_ServerTimeout_Applied verifies that when --timeout is
+// not passed (default 0) and FetchPrompt returns AgentTimeoutSeconds=1800,
+// the agent invocation's Budget.Timeout equals 30 minutes.
+func TestRun_FetchPrompt_ServerTimeout_Applied(t *testing.T) {
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             "22222222-3333-4444-5555-666666666666",
+		StageType:           "plan",
+		Prompt:              "Hello agent.",
+		PromptHash:          "deadbeef",
+		AgentTimeoutSeconds: 1800, // 30 minutes
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		// --timeout intentionally absent (default 0)
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invoker.gotInv nil — invocation not captured")
+	}
+	if invoker.gotInv.Budget.Timeout != 30*time.Minute {
+		t.Errorf("Budget.Timeout = %v, want 30m (from server AgentTimeoutSeconds=1800)",
+			invoker.gotInv.Budget.Timeout)
+	}
+}
+
+// TestRun_FetchPrompt_OperatorTimeoutWins verifies that when --timeout is
+// passed explicitly, the operator value wins over the server-resolved
+// AgentTimeoutSeconds, regardless of what the server returns.
+func TestRun_FetchPrompt_OperatorTimeoutWins(t *testing.T) {
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             "22222222-3333-4444-5555-666666666666",
+		StageType:           "plan",
+		Prompt:              "Hello agent.",
+		PromptHash:          "deadbeef",
+		AgentTimeoutSeconds: 1800, // server says 30m
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--timeout", "5m", // operator explicitly overrides
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invoker.gotInv nil — invocation not captured")
+	}
+	if invoker.gotInv.Budget.Timeout != 5*time.Minute {
+		t.Errorf("Budget.Timeout = %v, want 5m (operator flag wins over server timeout)",
+			invoker.gotInv.Budget.Timeout)
+	}
+}

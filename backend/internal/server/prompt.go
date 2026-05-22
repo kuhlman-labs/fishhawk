@@ -21,16 +21,18 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // promptResponse is the 200 body for GET /v0/stages/{stage_id}/prompt.
 // Wrapped in a JSON object so future fields (template version,
 // hash, redaction notes) can be added without breaking the runner.
 type promptResponse struct {
-	StageID    string `json:"stage_id"`
-	StageType  string `json:"stage_type"`
-	Prompt     string `json:"prompt"`
-	PromptHash string `json:"prompt_hash"`
+	StageID             string `json:"stage_id"`
+	StageType           string `json:"stage_type"`
+	Prompt              string `json:"prompt"`
+	PromptHash          string `json:"prompt_hash"`
+	AgentTimeoutSeconds int    `json:"agent_timeout_seconds"`
 }
 
 // issueGetter is the slice of githubclient.Client the prompt
@@ -145,10 +147,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 
 	hash := signing.ComputeMessage([]byte(text))
 	s.writeJSON(w, r, http.StatusOK, promptResponse{
-		StageID:    stageID.String(),
-		StageType:  string(stage.Type),
-		Prompt:     text,
-		PromptHash: hex.EncodeToString(hash),
+		StageID:             stageID.String(),
+		StageType:           string(stage.Type),
+		Prompt:              text,
+		PromptHash:          hex.EncodeToString(hash),
+		AgentTimeoutSeconds: s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
 	})
 }
 
@@ -242,10 +245,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 
 	hash := signing.ComputeMessage([]byte(text))
 	s.writeJSON(w, r, http.StatusOK, promptResponse{
-		StageID:    stageID.String(),
-		StageType:  string(stage.Type),
-		Prompt:     text,
-		PromptHash: hex.EncodeToString(hash),
+		StageID:             stageID.String(),
+		StageType:           string(stage.Type),
+		Prompt:              text,
+		PromptHash:          hex.EncodeToString(hash),
+		AgentTimeoutSeconds: s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
 	})
 }
 
@@ -511,6 +515,46 @@ func (s *Server) issueGetter() issueGetter {
 		return nil
 	}
 	return s.cfg.GitHub
+}
+
+// resolveAgentTimeout returns the spec-governed timeout in seconds for the
+// given run stage. Returns 0 when the workflow spec is absent or unparseable
+// — the runner falls back to its own 15-minute constant in that case.
+func (s *Server) resolveAgentTimeout(ctx context.Context, runRow *run.Run, stageType run.StageType) int {
+	if runRow.WorkflowSpec == nil {
+		return 0
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse workflow spec for timeout",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return 0
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return 0
+	}
+	// Primary match: spec stage ID == string(stageType) (canonical workflow).
+	// Fallback: spec stage Type == stageType string.
+	var specStage spec.Stage
+	for _, st := range wf.Stages {
+		if st.ID == string(stageType) {
+			specStage = st
+			break
+		}
+	}
+	if specStage.ID == "" {
+		for _, st := range wf.Stages {
+			if string(st.Type) == string(stageType) {
+				specStage = st
+				break
+			}
+		}
+	}
+	resolved := spec.ResolveStageTimeout(wf, specStage, spec.DefaultStageTimeout)
+	return int(resolved.Seconds())
 }
 
 // parseIssueRef extracts the issue number from a TriggerRef of the
