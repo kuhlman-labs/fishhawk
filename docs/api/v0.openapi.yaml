@@ -1524,6 +1524,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `plan_violates_budget` — the plan's
+            `predicted_runtime_minutes` exceeds the spec-resolved
+            implement-stage timeout and neither a
+            `decomposition.sub_plans` block nor an
+            `--override-budget` marker in the comment is present.
+            `details` includes `predicted_minutes`, `budget_minutes`,
+            and `timeout_source` (`stage_executor_timeout`,
+            `workflow_policy_max_stage_runtime`, or
+            `backend_default`). To unblock: either re-plan with a
+            decomposition block, or re-submit the approval with
+            `--override-budget` in the comment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/stages/{stage_id}/retry:
     post:

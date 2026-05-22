@@ -132,6 +132,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		trigger.ApprovedPlan = approvedPlan
 	}
 
+	// Decompose-required hint: when the run's last plan approval was
+	// rejected with --decompose, tell the agent it must populate
+	// decomposition.sub_plans in the next plan attempt.
+	if stage.Type == run.StageTypePlan {
+		if s.loadLastDecomposeRejectionReason(r.Context(), runRow.ID) {
+			trigger.DecomposeRequired = true
+		}
+	}
+
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		if errors.Is(err, prompt.ErrUnsupportedStage) {
@@ -228,6 +237,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			s.emitPlanMissingForImplement(r.Context(), runRow.ID, stage.ID)
 		}
 		trigger.ApprovedPlan = approvedPlan
+	}
+
+	// Decompose-required hint: when the run's last plan approval was
+	// rejected with --decompose, tell the agent it must populate
+	// decomposition.sub_plans in the next plan attempt.
+	if stage.Type == run.StageTypePlan {
+		if s.loadLastDecomposeRejectionReason(r.Context(), runRow.ID) {
+			trigger.DecomposeRequired = true
+		}
 	}
 
 	text, err := prompt.Build(string(stage.Type), trigger)
@@ -580,4 +598,36 @@ func parseRepoOwnerName(s string) (githubclient.RepoRef, error) {
 		return githubclient.RepoRef{}, fmt.Errorf("repo %q is not owner/name", s)
 	}
 	return githubclient.RepoRef{Owner: parts[0], Name: parts[1]}, nil
+}
+
+// loadLastDecomposeRejectionReason scans the run's approval_submitted
+// audit entries (newest-first) and returns true when it finds one with
+// decision=reject and reject_reason=decompose_required. Used by the
+// plan-stage prompt builder to inject a binding decompose hint on
+// re-plan attempts after the approver requested decomposition.
+func (s *Server) loadLastDecomposeRejectionReason(ctx context.Context, runID uuid.UUID) bool {
+	if s.cfg.AuditRepo == nil {
+		return false
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list approval_submitted audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Decision     string `json:"decision"`
+			RejectReason string `json:"reject_reason"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Decision == "reject" && payload.RejectReason == "decompose_required" {
+			return true
+		}
+	}
+	return false
 }

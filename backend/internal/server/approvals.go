@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -151,6 +152,16 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// transition. Subsequent submissions return the prior decision
 	// and the stage's current state.
 	if res.Inserted {
+		// Budget check: plan-stage approvals are gated on the plan's
+		// predicted runtime fitting within the spec-resolved implement-
+		// stage timeout. Decomposition or --override-budget bypasses
+		// the check; a bare over-budget plan returns 422.
+		if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
+			if !s.checkPlanBudget(w, r, stage, req.Comment) {
+				return
+			}
+		}
+
 		stage, err = s.advanceStage(r.Context(), stageID, decision)
 		if err != nil {
 			var inv run.InvalidTransitionError
@@ -166,7 +177,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		s.writeApprovalAudit(r, stage, res.Approval)
+		s.writeApprovalAudit(r, stage, res.Approval, req.Comment)
 
 		// Hand off to the orchestrator on both approve AND reject
 		// — approve dispatches the next stage; reject walks the
@@ -382,14 +393,21 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // writeApprovalAudit appends an entry tying the decision to the
 // run. Best-effort: a failure logs but doesn't unwind, since the
 // approval is already recorded.
-func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval) {
+// When decision is reject and the comment contains "--decompose",
+// reject_reason=decompose_required is added to the payload so the
+// next plan-stage prompt can inject a decompose-required hint.
+func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment string) {
 	systemKind := audit.ActorKind("user")
-	payload, _ := json.Marshal(map[string]any{
+	auditPayload := map[string]any{
 		"stage_id": stage.ID.String(),
 		"decision": string(app.Decision),
 		"surface":  string(app.Surface),
 		"approver": app.ApproverSubject,
-	})
+	}
+	if app.Decision == approval.DecisionReject && strings.Contains(comment, "--decompose") {
+		auditPayload["reject_reason"] = "decompose_required"
+	}
+	payload, _ := json.Marshal(auditPayload)
 
 	approver := app.ApproverSubject
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
@@ -407,4 +425,148 @@ func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *appr
 			"error", err.Error(),
 		)
 	}
+}
+
+// resolveSpecStageForRun parses the run's cached WorkflowSpec and
+// finds the spec.Stage whose ID or Type matches stageType. Returns
+// the parent Workflow, the matched Stage, and the timeout source
+// string used for audit payloads. When WorkflowSpec is absent the
+// function returns zero values with timeoutSource="backend_default"
+// and nil error — callers fall through to spec.DefaultStageTimeout.
+func resolveSpecStageForRun(runRow *run.Run, stageType run.StageType) (spec.Workflow, spec.Stage, string, error) {
+	if len(runRow.WorkflowSpec) == 0 {
+		return spec.Workflow{}, spec.Stage{}, "backend_default", nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		return spec.Workflow{}, spec.Stage{}, "", fmt.Errorf("parse workflow spec: %w", err)
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return spec.Workflow{}, spec.Stage{}, "", fmt.Errorf("workflow %q not in spec", runRow.WorkflowID)
+	}
+
+	// Primary match: spec stage ID == string(stageType).
+	var specStage spec.Stage
+	for _, st := range wf.Stages {
+		if st.ID == string(stageType) {
+			specStage = st
+			break
+		}
+	}
+	// Fallback: spec stage Type == stageType.
+	if specStage.ID == "" {
+		for _, st := range wf.Stages {
+			if string(st.Type) == string(stageType) {
+				specStage = st
+				break
+			}
+		}
+	}
+
+	timeoutSource := "backend_default"
+	if specStage.Executor.Timeout.Duration != 0 {
+		timeoutSource = "stage_executor_timeout"
+	} else if wf.Policy != nil && wf.Policy.MaxStageRuntime.Duration != 0 {
+		timeoutSource = "workflow_policy_max_stage_runtime"
+	}
+	return wf, specStage, timeoutSource, nil
+}
+
+// checkPlanBudget enforces the budget gate on plan-stage approvals.
+// Returns true when the approval should proceed; returns false (and
+// writes the error response) when the plan's predicted runtime
+// exceeds the spec-resolved implement-stage timeout and neither
+// decomposition nor --override-budget is present in the comment.
+//
+// When ArtifactRepo is nil or no plan is found (race / manual run),
+// the check is skipped and the approval proceeds.
+func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *run.Stage, comment string) bool {
+	if s.cfg.ArtifactRepo == nil {
+		return true
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "budget check: get run failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+
+	wf, specStage, timeoutSource, err := resolveSpecStageForRun(runRow, stage.Type)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "budget check: resolve spec stage failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+
+	timeout := spec.ResolveStageTimeout(wf, specStage, spec.DefaultStageTimeout)
+	budgetMinutes := int(timeout.Minutes())
+
+	approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), stage.RunID)
+	if err != nil || approvedPlan == nil {
+		return true
+	}
+
+	if approvedPlan.PredictedRuntimeMinutes <= budgetMinutes {
+		return true
+	}
+
+	// Over budget: decomposition satisfies the gate without override.
+	if approvedPlan.Decomposition != nil {
+		return true
+	}
+
+	auditPayload, _ := json.Marshal(map[string]any{
+		"stage_id":          stage.ID.String(),
+		"predicted_minutes": approvedPlan.PredictedRuntimeMinutes,
+		"budget_minutes":    budgetMinutes,
+		"timeout_source":    timeoutSource,
+	})
+	systemKind := audit.ActorKind("system")
+
+	if strings.Contains(comment, "--override-budget") {
+		if s.cfg.AuditRepo != nil {
+			if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+				RunID:     stage.RunID,
+				StageID:   &stage.ID,
+				Timestamp: time.Now().UTC(),
+				Category:  "plan_budget_override_acknowledged",
+				ActorKind: &systemKind,
+				Payload:   auditPayload,
+			}); err != nil {
+				s.cfg.Logger.Error("audit append failed for budget override",
+					"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+			}
+		}
+		return true
+	}
+
+	if s.cfg.AuditRepo != nil {
+		if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+			RunID:     stage.RunID,
+			StageID:   &stage.ID,
+			Timestamp: time.Now().UTC(),
+			Category:  "plan_violates_budget",
+			ActorKind: &systemKind,
+			Payload:   auditPayload,
+		}); err != nil {
+			s.cfg.Logger.Error("audit append failed for budget violation",
+				"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+		}
+	}
+
+	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_violates_budget",
+		"plan predicted_runtime_minutes exceeds the implement-stage budget; add decomposition.sub_plans or include --override-budget in the comment",
+		map[string]any{
+			"stage_id":          stage.ID.String(),
+			"predicted_minutes": approvedPlan.PredictedRuntimeMinutes,
+			"budget_minutes":    budgetMinutes,
+			"timeout_source":    timeoutSource,
+		})
+	return false
 }

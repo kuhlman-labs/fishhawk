@@ -92,6 +92,12 @@ type Trigger struct {
 	// ImplementStageTimeout is the max runtime budget for the implement stage.
 	// Zero resolves to defaultStageTimeoutMinutes in buildPlan.
 	ImplementStageTimeout time.Duration
+	// DecomposeRequired signals that the previous plan for this run
+	// was rejected because its predicted runtime exceeded the
+	// implement-stage budget without a decomposition block. When true,
+	// buildPlan injects a binding instruction to populate
+	// decomposition.sub_plans.
+	DecomposeRequired bool
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -188,6 +194,12 @@ func buildPlan(t Trigger) string {
 	b.WriteString("You are drafting an implementation plan for a change in the repository ")
 	b.WriteString(quoteRepo(t.Repo))
 	b.WriteString(".\n\n")
+
+	if t.DecomposeRequired {
+		b.WriteString("IMPORTANT: Your previous plan was rejected because predicted_runtime_minutes " +
+			"exceeded the implement-stage budget without a decomposition block. " +
+			"You MUST populate decomposition.sub_plans in this plan — omitting it will block approval again.\n\n")
+	}
 
 	writeIssueContext(&b, t)
 

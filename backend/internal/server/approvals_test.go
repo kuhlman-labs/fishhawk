@@ -15,8 +15,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -1078,5 +1080,213 @@ func TestSubmitApproval_Approve_FallsOpenWhenStageCheckRepoNil(t *testing.T) {
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (no StageCheckRepo wired)", w.Code)
+	}
+}
+
+// seedBudgetPlanArtifact inserts a standard_v1 plan artifact with real content
+// into art for stageID. Uses fakeArtifactRepo.Create so the ListForStage path
+// in loadApprovedPlanForRun finds the decoded plan fields.
+func seedBudgetPlanArtifact(t *testing.T, art *fakeArtifactRepo, stageID uuid.UUID, p *plan.Plan) {
+	t.Helper()
+	b, _ := json.Marshal(p)
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       stageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       b,
+		ContentHash:   "hash",
+	}); err != nil {
+		t.Fatalf("seedBudgetPlanArtifact: %v", err)
+	}
+}
+
+// newBudgetCheckServer wires a Server with an orchestratorRepo and a
+// fakeArtifactRepo so budget-check tests can drive the full approval path.
+func newBudgetCheckServer(t *testing.T, ar artifact.Repository) (*Server, *orchestratorRepo, *approvalAuditFake) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: app,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ArtifactRepo: ar,
+	})
+	return s, rr, au
+}
+
+// seedBudgetRun creates a run and a plan stage in awaiting_approval, seeds the
+// given plan artifact onto the plan stage, and returns them.
+func seedBudgetRun(t *testing.T, rr *orchestratorRepo, art *fakeArtifactRepo, p *plan.Plan) (*run.Run, *run.Stage) {
+	t.Helper()
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	// stage.Type is StageTypePlan by default (see orchestratorRepo.seedStage)
+	seedBudgetPlanArtifact(t, art, stage.ID, p)
+	return r, stage
+}
+
+func TestSubmitApproval_BudgetCheck_OverBudgetNoDecompNoOverride_Returns422(t *testing.T) {
+	// Plan predicts 20 minutes; default budget is 15. No decomposition,
+	// no --override-budget → 422 + plan_violates_budget in audit + orchestrator NOT called.
+	art := newFakeArtifactRepo()
+	s, rr, au := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 20, // exceeds 15m default
+	}
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_violates_budget"`) {
+		t.Errorf("body missing plan_violates_budget: %s", w.Body.String())
+	}
+
+	// Stage must NOT have advanced (orchestrator not called).
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval (orchestrator must not be called)", stage.State)
+	}
+
+	// Audit must contain plan_violates_budget but NOT approval_submitted.
+	var foundViolation bool
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" {
+			foundViolation = true
+		}
+		if e.Category == "approval_submitted" {
+			t.Errorf("unexpected approval_submitted audit entry (advance was blocked)")
+		}
+	}
+	if !foundViolation {
+		t.Errorf("expected plan_violates_budget audit entry, got %+v", au.appended)
+	}
+}
+
+func TestSubmitApproval_BudgetCheck_OverBudgetWithDecomp_Proceeds(t *testing.T) {
+	// Plan is over-budget but includes a decomposition block → proceed (200).
+	art := newFakeArtifactRepo()
+	s, rr, au := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 20,
+		Decomposition: &plan.Decomposition{
+			Rationale: "too big",
+			SubPlans:  []plan.SubPlanSummary{{Title: "part1", PredictedRuntimeMinutes: 10}},
+		},
+	}
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (decomposition satisfies budget):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+	// Must not emit plan_violates_budget.
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" {
+			t.Errorf("unexpected plan_violates_budget audit entry when decomposition present")
+		}
+	}
+}
+
+func TestSubmitApproval_BudgetCheck_OverBudgetWithOverrideComment_Proceeds(t *testing.T) {
+	// Over-budget, no decomposition, but --override-budget in comment → 200 +
+	// plan_budget_override_acknowledged audit + orchestrator called.
+	art := newFakeArtifactRepo()
+	s, rr, au := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 20,
+	}
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"lgtm --override-budget"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (override comment):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+
+	var foundOverride bool
+	for _, e := range au.appended {
+		if e.Category == "plan_budget_override_acknowledged" {
+			foundOverride = true
+		}
+		if e.Category == "plan_violates_budget" {
+			t.Errorf("unexpected plan_violates_budget when --override-budget present")
+		}
+	}
+	if !foundOverride {
+		t.Errorf("expected plan_budget_override_acknowledged audit entry, got %+v", au.appended)
+	}
+}
+
+func TestSubmitApproval_BudgetCheck_WithinBudget_Proceeds(t *testing.T) {
+	// Plan predicts 10 minutes, within 15m default budget → 200, no budget audit.
+	art := newFakeArtifactRepo()
+	s, rr, au := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 10,
+	}
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (within budget):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" || e.Category == "plan_budget_override_acknowledged" {
+			t.Errorf("unexpected budget audit entry when within budget: %s", e.Category)
+		}
+	}
+}
+
+func TestSubmitApproval_Reject_DecomposeComment_SetsRejectReason(t *testing.T) {
+	// Reject with "--decompose" in comment → approval_submitted payload
+	// contains reject_reason=decompose_required.
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	// stage.Type is StageTypePlan (default from seedStage)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject","comment":"please decompose --decompose"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var foundSubmitted bool
+	for _, e := range au.appended {
+		if e.Category != "approval_submitted" {
+			continue
+		}
+		foundSubmitted = true
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal audit payload: %v", err)
+		}
+		if got, ok := payload["reject_reason"]; !ok || got != "decompose_required" {
+			t.Errorf("reject_reason = %v, want decompose_required; payload: %v", got, payload)
+		}
+	}
+	if !foundSubmitted {
+		t.Errorf("expected approval_submitted audit entry, got %+v", au.appended)
 	}
 }
