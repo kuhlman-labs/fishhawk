@@ -362,6 +362,65 @@ func TestShipLocalPullRequest_APIError(t *testing.T) {
 	}
 }
 
+func TestGetStage(t *testing.T) {
+	stageID := uuid.New()
+	runID := uuid.New()
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		wantState   string
+		wantErrCode string
+	}{
+		{
+			name:   "200 decodes stage",
+			status: http.StatusOK,
+			body: `{"id":"` + stageID.String() + `","run_id":"` + runID.String() + `",` +
+				`"sequence":1,"type":"plan","executor":{"kind":"local","ref":"v1"},` +
+				`"state":"awaiting_approval","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}`,
+			wantState: "awaiting_approval",
+		},
+		{
+			name:        "404 returns APIError",
+			status:      http.StatusNotFound,
+			body:        `{"error":{"code":"stage_not_found","message":"no stage with that id"}}`,
+			wantErrCode: "stage_not_found",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(srv.Close)
+
+			c := New(srv.URL, "")
+			got, err := c.GetStage(context.Background(), stageID)
+			if tc.wantErrCode != "" {
+				var apiErr *APIError
+				if !errors.As(err, &apiErr) || apiErr.Code != tc.wantErrCode {
+					t.Errorf("err = %v, want APIError %q", err, tc.wantErrCode)
+				}
+				if apiErr.StatusCode != tc.status {
+					t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tc.status)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetStage: %v", err)
+			}
+			if got.ID != stageID {
+				t.Errorf("ID = %s, want %s", got.ID, stageID)
+			}
+			if got.State != tc.wantState {
+				t.Errorf("State = %q, want %q", got.State, tc.wantState)
+			}
+		})
+	}
+}
+
 func TestAPIError_Error(t *testing.T) {
 	tests := []struct {
 		name string

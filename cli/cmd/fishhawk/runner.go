@@ -45,6 +45,10 @@ var runnerStartCommand = exec.Command
 // when none resolves. Test seam via `var runnerBinaryLookPath`.
 var runnerBinaryLookPath = exec.LookPath
 
+// runnerNewClient is a test seam for runRunnerStart. Production
+// wires to newClient; tests swap to point at an httptest.Server.
+var runnerNewClient = newClient
+
 // gitRemoteOriginURL returns the configured `origin` remote URL for
 // the working directory (or the absolute path it resolves to). Test
 // seam — production wires `git remote get-url origin`.
@@ -202,42 +206,48 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	// the triggering issue for local-runner runs. Best-effort —
 	// failures here do not affect the verb's exit code.
 	parsedRunID, perr := uuid.Parse(*runID)
+	var parsedStageID uuid.UUID
+	var stageParseErr error
+	if perr == nil {
+		parsedStageID, stageParseErr = uuid.Parse(*stageID)
+	}
 	prCommentPosted := false
-	if perr == nil && *stage == "implement" && !*noPR {
-		parsedStageID, serr := uuid.Parse(*stageID)
-		if serr == nil {
-			clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
-			defer clientCancel()
-			client := newClient(cf)
-			result, autoErr := autoOpenPR(clientCtx, client, autoOpenPRArgs{
-				WorkingDir: *workingDir,
-				RunID:      parsedRunID,
-				StageID:    parsedStageID,
-				GitHubRepo: repo,
-				BaseBranch: *baseBranch,
-			})
-			if autoErr != nil {
-				_, _ = fmt.Fprintf(stderr, "fishhawk runner start: auto-PR warning: %v\n", autoErr)
-			} else {
-				if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil {
-					maybePostLocalComment(stderr, r,
-						ghcomment.RenderImplementPROpened(
-							toGhCommentRun(r, *cf.backendURL),
-							result.PRURL, result.PRNumber))
-				}
-				prCommentPosted = true
+	if perr == nil && stageParseErr == nil && *stage == "implement" && !*noPR {
+		clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
+		defer clientCancel()
+		client := runnerNewClient(cf)
+		result, autoErr := autoOpenPR(clientCtx, client, autoOpenPRArgs{
+			WorkingDir: *workingDir,
+			RunID:      parsedRunID,
+			StageID:    parsedStageID,
+			GitHubRepo: repo,
+			BaseBranch: *baseBranch,
+		})
+		if autoErr != nil {
+			_, _ = fmt.Fprintf(stderr, "fishhawk runner start: auto-PR warning: %v\n", autoErr)
+		} else {
+			if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil {
+				maybePostLocalComment(stderr, r,
+					ghcomment.RenderImplementPROpened(
+						toGhCommentRun(r, *cf.backendURL),
+						result.PRURL, result.PRNumber))
 			}
+			prCommentPosted = true
 		}
 	}
 	if !prCommentPosted && perr == nil {
 		clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
 		defer clientCancel()
-		client := newClient(cf)
+		client := runnerNewClient(cf)
 		if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil {
+			stateAfter := "unknown"
+			if fetched := fetchStageForComment(clientCtx, client, parsedStageID); fetched != nil {
+				stateAfter = fetched.State
+			}
 			maybePostLocalComment(stderr, r,
 				ghcomment.RenderStageComplete(
 					toGhCommentRun(r, *cf.backendURL),
-					*stage, r.State))
+					*stage, stateAfter))
 		}
 	}
 	return exitOK

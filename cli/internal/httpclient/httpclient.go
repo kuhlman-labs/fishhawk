@@ -150,6 +150,15 @@ func (c *Client) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return &run, nil
 }
 
+// GetStage calls GET /v0/stages/{id}.
+func (c *Client) GetStage(ctx context.Context, id uuid.UUID) (*Stage, error) {
+	var stage Stage
+	if err := c.do(ctx, http.MethodGet, "/v0/stages/"+id.String(), nil, &stage); err != nil {
+		return nil, err
+	}
+	return &stage, nil
+}
+
 // ListRunsFilter scopes a ListRuns call. Empty values are dropped
 // from the query string.
 type ListRunsFilter struct {

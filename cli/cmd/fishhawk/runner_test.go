@@ -1,10 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
 
 // withFakeRunnerSpawn patches the runner-spawn seam so tests can
@@ -389,6 +398,133 @@ func TestParseGitHubRemote_Variants(t *testing.T) {
 			}
 		})
 	}
+}
+
+// withFakeHTTPClient swaps runnerNewClient so all HTTP calls inside
+// runRunnerStart go to srv instead of the real backend.
+func withFakeHTTPClient(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	orig := runnerNewClient
+	runnerNewClient = func(_ commonFlags) *httpclient.Client {
+		return httpclient.New(srv.URL, "")
+	}
+	t.Cleanup(func() { runnerNewClient = orig })
+}
+
+// withCapturedGhPost swaps ghPost to record the body passed to
+// maybePostLocalComment without shelling to gh.
+func withCapturedGhPost(t *testing.T) *string {
+	t.Helper()
+	captured := new(string)
+	orig := ghPost
+	ghPost = func(_ string, _ int, body string) error {
+		*captured = body
+		return nil
+	}
+	t.Cleanup(func() { ghPost = orig })
+	return captured
+}
+
+func TestRunnerStart_StageCompleteComment(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	makeServer := func(t *testing.T, stageStatus int, stageState string) *httptest.Server {
+		t.Helper()
+		run := httpclient.Run{
+			ID:         runID,
+			Repo:       "x/y",
+			WorkflowID: "w",
+			State:      "running",
+			RunnerKind: "local",
+			IssueContext: &httpclient.IssueContext{
+				Title:  "test issue",
+				Body:   "body",
+				URL:    "https://github.com/x/y/issues/1",
+				Number: 1,
+			},
+			CreatedAt: time.Now().UTC(),
+			UpdatedAt: time.Now().UTC(),
+		}
+		stage := httpclient.Stage{
+			ID:        stageID,
+			RunID:     runID,
+			Sequence:  1,
+			Type:      "plan",
+			State:     stageState,
+			CreatedAt: time.Now().UTC(),
+			UpdatedAt: time.Now().UTC(),
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(run)
+		})
+		mux.HandleFunc("GET /v0/stages/{stage_id}", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if stageStatus >= 400 {
+				w.WriteHeader(stageStatus)
+				_, _ = io.WriteString(w, `{"error":{"code":"internal","message":"server error"}}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(stage)
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	t.Run("stage_state_flows_into_comment", func(t *testing.T) {
+		withFakeRunnerSpawn(t)
+		withFakeGitRemote(t, "", errors.New("no git"))
+		srv := makeServer(t, http.StatusOK, "awaiting_approval")
+		withFakeHTTPClient(t, srv)
+		capturedBody := withCapturedGhPost(t)
+
+		var stdout, stderr strings.Builder
+		got := run([]string{
+			"runner", "start",
+			"--run-id", runID.String(),
+			"--stage-id", stageID.String(),
+			"--workflow", "w",
+			"--stage", "plan",
+			"--backend-url", srv.URL,
+		}, &stdout, &stderr)
+
+		if got != exitOK {
+			t.Fatalf("exit = %d, want exitOK:\n%s", got, stderr.String())
+		}
+		if !strings.Contains(*capturedBody, "awaiting_approval") {
+			t.Errorf("comment body %q does not contain \"awaiting_approval\"", *capturedBody)
+		}
+	})
+
+	t.Run("stage_fetch_error_degrades_to_unknown", func(t *testing.T) {
+		withFakeRunnerSpawn(t)
+		withFakeGitRemote(t, "", errors.New("no git"))
+		srv := makeServer(t, http.StatusInternalServerError, "")
+		withFakeHTTPClient(t, srv)
+		capturedBody := withCapturedGhPost(t)
+
+		var stdout, stderr strings.Builder
+		got := run([]string{
+			"runner", "start",
+			"--run-id", runID.String(),
+			"--stage-id", stageID.String(),
+			"--workflow", "w",
+			"--stage", "plan",
+			"--backend-url", srv.URL,
+		}, &stdout, &stderr)
+
+		if got != exitOK {
+			t.Fatalf("exit = %d, want exitOK:\n%s", got, stderr.String())
+		}
+		if !strings.Contains(*capturedBody, "unknown") {
+			t.Errorf("comment body %q does not contain \"unknown\"", *capturedBody)
+		}
+	})
 }
 
 // contains reports whether s appears anywhere in xs.
