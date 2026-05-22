@@ -14,6 +14,10 @@ import (
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
 
+// ghPost is a test seam for maybePostLocalComment. Production wires
+// to ghcomment.Post; tests swap to capture the comment body.
+var ghPost = ghcomment.Post
+
 // maybePostLocalComment fires the CLI-side issue comment when the
 // run is the local-issue shape that warrants one — `runner_kind=local`
 // AND `issue_context` populated. All failures are best-effort: a
@@ -27,7 +31,7 @@ func maybePostLocalComment(stderr io.Writer, r *httpclient.Run, body string) {
 	if r == nil || r.RunnerKind != "local" || r.IssueContext == nil || body == "" {
 		return
 	}
-	if err := ghcomment.Post(r.Repo, r.IssueContext.Number, body); err != nil {
+	if err := ghPost(r.Repo, r.IssueContext.Number, body); err != nil {
 		if errors.Is(err, ghcomment.ErrGhNotInstalled) {
 			// Don't double-warn — the kickoff path already
 			// surfaced the missing gh; quieter on subsequent
@@ -96,4 +100,17 @@ func fetchRunForComment(ctx context.Context, client *httpclient.Client, runID uu
 		return nil
 	}
 	return r
+}
+
+// fetchStageForComment loads the stage by id. Returns nil on any
+// error (best-effort: same degradation posture as fetchRunForComment).
+func fetchStageForComment(ctx context.Context, client *httpclient.Client, stageID uuid.UUID) *httpclient.Stage {
+	if client == nil {
+		return nil
+	}
+	s, err := client.GetStage(ctx, stageID)
+	if err != nil {
+		return nil
+	}
+	return s
 }
