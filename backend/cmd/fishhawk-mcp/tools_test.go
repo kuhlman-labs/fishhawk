@@ -669,6 +669,8 @@ func samplePlanContent() PlanContent {
 		RisksAndAssumptions: []string{
 			"Operators set dryRun via a feature flag.",
 		},
+		PredictedRuntimeMinutes:    20,
+		PredictedRuntimeConfidence: "high",
 	}
 }
 
@@ -915,6 +917,83 @@ func TestGetPlan_BackendError_StagesList_Surfaced(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "list stages") {
 		t.Errorf("error wording: %v", err)
+	}
+}
+
+func TestGetPlan_WithDecomposition_FieldsSurfaced(t *testing.T) {
+	// Plan artifact carries decomposition.sub_plans (ADR-025 D2 /
+	// #476). The tool must surface Decomposition, its Rationale, the
+	// sub-plans slice, and the runtime prediction fields.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+
+	content := samplePlanContent()
+	content.Decomposition = &PlanDecomposition{
+		Rationale: "Two independent file areas allow parallel execution.",
+		SubPlans: []PlanSubPlan{
+			{Title: "Add dispatcher flag", ScopeHint: "backend/internal/webhook/", PredictedRuntimeMinutes: 10, PredictedRuntimeConfidence: "high"},
+			{Title: "Add unit tests", ScopeHint: "backend/internal/webhook/dispatcher_test.go", PredictedRuntimeMinutes: 8, PredictedRuntimeConfidence: "medium"},
+		},
+	}
+	seedPlanArtifact(fb, planStageID, content, time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" {
+		t.Errorf("Status = %q, want available", out.Status)
+	}
+	if out.Plan == nil {
+		t.Fatal("Plan should be non-nil when Status=available")
+	}
+	if out.Plan.Decomposition == nil {
+		t.Fatal("Plan.Decomposition should be non-nil for a decomposed plan")
+	}
+	if out.Plan.Decomposition.Rationale == "" {
+		t.Error("Plan.Decomposition.Rationale should be non-empty")
+	}
+	if got := len(out.Plan.Decomposition.SubPlans); got != 2 {
+		t.Errorf("len(Plan.Decomposition.SubPlans) = %d, want 2", got)
+	}
+	if out.Plan.PredictedRuntimeMinutes <= 0 {
+		t.Errorf("Plan.PredictedRuntimeMinutes = %d, want > 0", out.Plan.PredictedRuntimeMinutes)
+	}
+}
+
+func TestGetPlan_WithoutDecomposition_RuntimeFieldsPresent(t *testing.T) {
+	// Plan artifact has no decomposition (standalone plan). The D2
+	// runtime-prediction fields must still be surfaced; Decomposition
+	// must be nil so it is omitted from the JSON response.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Plan == nil {
+		t.Fatal("Plan should be non-nil")
+	}
+	if out.Plan.PredictedRuntimeMinutes <= 0 {
+		t.Errorf("Plan.PredictedRuntimeMinutes = %d, want > 0", out.Plan.PredictedRuntimeMinutes)
+	}
+	if out.Plan.PredictedRuntimeConfidence == "" {
+		t.Error("Plan.PredictedRuntimeConfidence should be non-empty")
+	}
+	if out.Plan.Decomposition != nil {
+		t.Errorf("Plan.Decomposition should be nil for a non-decomposed plan; got %+v", out.Plan.Decomposition)
 	}
 }
 
