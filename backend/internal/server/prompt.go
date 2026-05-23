@@ -33,6 +33,10 @@ type promptResponse struct {
 	Prompt              string `json:"prompt"`
 	PromptHash          string `json:"prompt_hash"`
 	AgentTimeoutSeconds int    `json:"agent_timeout_seconds"`
+	// DecomposedFromRunID is the parent run's ID when this run is a
+	// decomposed child. Absent for standalone runs. Runners use this to
+	// route decomposed children onto a shared parent branch.
+	DecomposedFromRunID string `json:"decomposed_from_run_id,omitempty"`
 }
 
 // issueGetter is the slice of githubclient.Client the prompt
@@ -155,13 +159,17 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hash := signing.ComputeMessage([]byte(text))
-	s.writeJSON(w, r, http.StatusOK, promptResponse{
+	resp := promptResponse{
 		StageID:             stageID.String(),
 		StageType:           string(stage.Type),
 		Prompt:              text,
 		PromptHash:          hex.EncodeToString(hash),
 		AgentTimeoutSeconds: s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
-	})
+	}
+	if runRow.DecomposedFrom != nil {
+		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
 // handleGetStagePromptRender implements GET /v0/stages/{stage_id}/prompt-render.
@@ -262,13 +270,17 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	}
 
 	hash := signing.ComputeMessage([]byte(text))
-	s.writeJSON(w, r, http.StatusOK, promptResponse{
+	resp := promptResponse{
 		StageID:             stageID.String(),
 		StageType:           string(stage.Type),
 		Prompt:              text,
 		PromptHash:          hex.EncodeToString(hash),
 		AgentTimeoutSeconds: s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
-	})
+	}
+	if runRow.DecomposedFrom != nil {
+		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
 // verifyPromptSignature reads the X-Fishhawk-Signature header and

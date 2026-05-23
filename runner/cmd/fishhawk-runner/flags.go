@@ -49,6 +49,11 @@ type config struct {
 	githubRepo string
 	baseBranch string
 	noPR       bool
+
+	// decomposedFromRunID is set at runtime (not a flag) when the
+	// fetched prompt reveals that this run is a decomposed child.
+	// Drives shared-branch routing in openPRAndShipArtifact.
+	decomposedFromRunID string
 }
 
 // parseFlags reads args and populates a config. Returns a usage

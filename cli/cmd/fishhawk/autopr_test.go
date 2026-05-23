@@ -290,3 +290,157 @@ func TestAutoOpenPR_PushFails(t *testing.T) {
 		t.Error("ShipLocalPullRequest should not be called when push fails")
 	}
 }
+
+// stubGitCommandDecomposed extends stubGitCommand to handle show-ref and
+// stash/fetch/checkout/pull commands used by the decomposed-child path.
+// showRefExists controls whether show-ref reports the branch as present.
+func stubGitCommandDecomposed(showRefExists bool) func(string, ...string) *exec.Cmd {
+	return func(name string, arg ...string) *exec.Cmd {
+		if len(arg) >= 3 {
+			switch arg[2] {
+			case "show-ref":
+				if showRefExists {
+					return exec.Command("sh", "-c", "exit 0")
+				}
+				return exec.Command("sh", "-c", "exit 1")
+			case "stash", "fetch", "checkout", "pull":
+				return exec.Command("/usr/bin/true")
+			}
+		}
+		return stubGitCommand(name, arg...)
+	}
+}
+
+func TestAutoOpenPR_DecomposedFirstChild(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := f.WriteString("Add feature X\n\nThis adds feature X.\n"); werr != nil {
+		t.Fatal(werr)
+	}
+	f.Close()
+
+	origPath := prDescriptionPath
+	prDescriptionPath = f.Name()
+	t.Cleanup(func() { prDescriptionPath = origPath })
+
+	origGit := autoGitCommand
+	// First child: show-ref exits non-zero (branch not yet on remote).
+	autoGitCommand = stubGitCommandDecomposed(false)
+	t.Cleanup(func() { autoGitCommand = origGit })
+
+	ghCalled := false
+	origGh := autoGhCommand
+	autoGhCommand = func(_ string, _ ...string) *exec.Cmd {
+		ghCalled = true
+		return exec.Command("sh", "-c",
+			"echo https://github.com/owner/repo/pull/42")
+	}
+	t.Cleanup(func() { autoGhCommand = origGh })
+
+	shipCalled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		shipCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(httpclient.ShipLocalPullRequestResult{
+			PRNumber: 42, PRURL: "https://github.com/owner/repo/pull/42",
+		})
+	}))
+	defer srv.Close()
+
+	parentID := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	runID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	stageID := uuid.MustParse("22222222-3333-4444-5555-666666666666")
+
+	result, err := autoOpenPR(context.Background(),
+		httpclient.New(srv.URL, "test-token"),
+		autoOpenPRArgs{
+			WorkingDir:     t.TempDir(),
+			RunID:          runID,
+			StageID:        stageID,
+			GitHubRepo:     "owner/repo",
+			BaseBranch:     "main",
+			DecomposedFrom: &parentID,
+		})
+	if err != nil {
+		t.Fatalf("autoOpenPR: %v", err)
+	}
+	// Shared branch: fishhawk/run-<shortParentID>
+	wantBranch := "fishhawk/run-aaaaaaaa"
+	if result.Branch != wantBranch {
+		t.Errorf("Branch = %q, want %q", result.Branch, wantBranch)
+	}
+	if !ghCalled {
+		t.Error("gh pr create not called for first decomposed child")
+	}
+	if !shipCalled {
+		t.Error("ShipLocalPullRequest not called for first decomposed child")
+	}
+}
+
+func TestAutoOpenPR_DecomposedSubsequentChild(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := f.WriteString("Add feature Y\n\nThis adds feature Y.\n"); werr != nil {
+		t.Fatal(werr)
+	}
+	f.Close()
+
+	origPath := prDescriptionPath
+	prDescriptionPath = f.Name()
+	t.Cleanup(func() { prDescriptionPath = origPath })
+
+	origGit := autoGitCommand
+	// Subsequent child: show-ref exits 0 (branch already on remote).
+	autoGitCommand = stubGitCommandDecomposed(true)
+	t.Cleanup(func() { autoGitCommand = origGit })
+
+	ghCalled := false
+	origGh := autoGhCommand
+	autoGhCommand = func(_ string, _ ...string) *exec.Cmd {
+		ghCalled = true
+		return exec.Command("sh", "-c",
+			"echo https://github.com/owner/repo/pull/42")
+	}
+	t.Cleanup(func() { autoGhCommand = origGh })
+
+	shipCalled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		shipCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	parentID := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	runID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	stageID := uuid.MustParse("22222222-3333-4444-5555-666666666666")
+
+	result, err := autoOpenPR(context.Background(),
+		httpclient.New(srv.URL, "test-token"),
+		autoOpenPRArgs{
+			WorkingDir:     t.TempDir(),
+			RunID:          runID,
+			StageID:        stageID,
+			GitHubRepo:     "owner/repo",
+			BaseBranch:     "main",
+			DecomposedFrom: &parentID,
+		})
+	if err != nil {
+		t.Fatalf("autoOpenPR: %v", err)
+	}
+	wantBranch := "fishhawk/run-aaaaaaaa"
+	if result.Branch != wantBranch {
+		t.Errorf("Branch = %q, want %q", result.Branch, wantBranch)
+	}
+	// Subsequent child: PR was already opened by first child.
+	if ghCalled {
+		t.Error("gh pr create called for subsequent decomposed child — should be skipped")
+	}
+	if shipCalled {
+		t.Error("ShipLocalPullRequest called for subsequent decomposed child — should be skipped")
+	}
+}

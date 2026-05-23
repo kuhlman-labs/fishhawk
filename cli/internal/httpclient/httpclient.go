@@ -79,6 +79,7 @@ type Run struct {
 	TriggerRef         *string       `json:"trigger_ref"`
 	State              string        `json:"state"`
 	ParentRunID        *uuid.UUID    `json:"parent_run_id"`
+	DecomposedFrom     *uuid.UUID    `json:"decomposed_from,omitempty"`
 	PullRequestURL     *string       `json:"pull_request_url"`
 	RetryAttempt       int           `json:"retry_attempt"`
 	MaxRetriesSnapshot int           `json:"max_retries_snapshot"`

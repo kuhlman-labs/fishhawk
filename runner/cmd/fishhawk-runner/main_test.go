@@ -2351,6 +2351,133 @@ func TestRun_FetchPrompt_ServerTimeout_Applied(t *testing.T) {
 	}
 }
 
+// withFakeRemoteBranchExists swaps the remoteBranchExists seam for the
+// duration of a test. exists controls whether the fake reports the branch
+// as present on the remote.
+func withFakeRemoteBranchExists(t *testing.T, exists bool) {
+	t.Helper()
+	orig := remoteBranchExists
+	remoteBranchExists = func(_ context.Context, _, _ string) bool { return exists }
+	t.Cleanup(func() { remoteBranchExists = orig })
+}
+
+// TestRun_ImplementStage_DecomposedFirstChild verifies that when
+// DecomposedFromRunID is set and the shared branch does not yet exist on the
+// remote, the runner uses the shared branch name, pushes with --force-with-lease
+// (ForceWithLease=true), does NOT rebase (RebaseFromRemote=false), and opens a PR.
+func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, false) // first child: branch not yet on remote
+
+	parentRunID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             "22222222-3333-4444-5555-666666666666",
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		DecomposedFromRunID: parentRunID,
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	// shared branch: fishhawk/run-<shortParentID> — first 8 chars of parentRunID without hyphens
+	wantBranch := "fishhawk/run-aaaaaaaa"
+	if fp.gotArgs.Branch != wantBranch {
+		t.Errorf("branch = %q, want %q (shared parent branch)", fp.gotArgs.Branch, wantBranch)
+	}
+	if !fp.gotArgs.ForceWithLease {
+		t.Error("ForceWithLease = false, want true for decomposed child")
+	}
+	if fp.gotArgs.RebaseFromRemote {
+		t.Error("RebaseFromRemote = true, want false for first child (branch not yet on remote)")
+	}
+	// First child: PR must be opened.
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR not called for first decomposed child")
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest not called for first decomposed child")
+	}
+}
+
+// TestRun_ImplementStage_DecomposedSubsequentChild verifies that when
+// DecomposedFromRunID is set and the shared branch already exists on the
+// remote, the runner rebases (RebaseFromRemote=true), pushes with
+// --force-with-lease, and skips OpenPR + ShipPullRequest.
+func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, true) // subsequent child: branch already on remote
+
+	parentRunID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             "22222222-3333-4444-5555-666666666666",
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		DecomposedFromRunID: parentRunID,
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	wantBranch := "fishhawk/run-aaaaaaaa"
+	if fp.gotArgs.Branch != wantBranch {
+		t.Errorf("branch = %q, want %q (shared parent branch)", fp.gotArgs.Branch, wantBranch)
+	}
+	if !fp.gotArgs.ForceWithLease {
+		t.Error("ForceWithLease = false, want true for decomposed child")
+	}
+	if !fp.gotArgs.RebaseFromRemote {
+		t.Error("RebaseFromRemote = false, want true for subsequent child (branch exists on remote)")
+	}
+	// Subsequent child: PR must NOT be opened (first child already did it).
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR called for subsequent decomposed child — should be skipped")
+	}
+	if fu.gotPRArgs != nil {
+		t.Error("ShipPullRequest called for subsequent decomposed child — should be skipped")
+	}
+}
+
 // TestRun_FetchPrompt_OperatorTimeoutWins verifies that when --timeout is
 // passed explicitly, the operator value wins over the server-resolved
 // AgentTimeoutSeconds, regardless of what the server returns.

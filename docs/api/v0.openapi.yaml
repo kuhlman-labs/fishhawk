@@ -1241,6 +1241,13 @@ paths:
                   prompt_hash:
                     type: string
                     description: Hex-encoded sha256 of the prompt bytes.
+                  agent_timeout_seconds:
+                    type: integer
+                    description: Spec-resolved wall-clock cap in seconds; 0 means the runner should apply its own fallback.
+                  decomposed_from_run_id:
+                    type: string
+                    format: uuid
+                    description: Parent run ID when this run is a decomposed child. Absent for standalone runs. Runners use this to route onto a shared parent branch.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1285,6 +1292,13 @@ paths:
                   stage_type: { type: string }
                   prompt: { type: string }
                   prompt_hash: { type: string }
+                  agent_timeout_seconds:
+                    type: integer
+                    description: Spec-resolved wall-clock cap in seconds; 0 means the runner should apply its own fallback.
+                  decomposed_from_run_id:
+                    type: string
+                    format: uuid
+                    description: Parent run ID when this run is a decomposed child. Absent for standalone runs.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '501':
