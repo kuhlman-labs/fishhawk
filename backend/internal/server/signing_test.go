@@ -316,11 +316,13 @@ func (s *stubOIDCVerifier) Verify(_ context.Context, token string, exp githuboid
 	return s.claims, nil
 }
 
-// fakeOIDCRunRepo provides GetRun for OIDC claim binding. Other
-// run.Repository methods panic so accidental calls are loud.
+// fakeOIDCRunRepo provides GetRun for OIDC claim binding and
+// ListStagesForRun for TTL resolution. Other run.Repository methods
+// return errors so accidental calls are loud.
 type fakeOIDCRunRepo struct {
 	runRow *run.Run
 	getErr error
+	stages []*run.Stage
 }
 
 func (r *fakeOIDCRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
@@ -353,8 +355,8 @@ func (r *fakeOIDCRunRepo) CreateStage(context.Context, run.CreateStageParams) (*
 func (r *fakeOIDCRunRepo) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
-func (r *fakeOIDCRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
+func (r *fakeOIDCRunRepo) ListStagesForRun(_ context.Context, _ uuid.UUID) ([]*run.Stage, error) {
+	return r.stages, nil
 }
 func (r *fakeOIDCRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
@@ -569,5 +571,151 @@ func TestIssueSigningKey_OIDC_VerifierWithoutRunRepo(t *testing.T) {
 	w := issueRequestWithAuth(t, s, uuid.New(), "Bearer x")
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+func TestIssueSigningKey_TTLTracksStagePolicy(t *testing.T) {
+	// policy.max_stage_runtime=60m on an active plan stage → TTL = 65m.
+	spec60m := []byte(`version: "0.3"
+workflows:
+  feature_change:
+    policy:
+      max_stage_runtime: "60m"
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{
+		runRow: &run.Run{
+			ID:           runID,
+			Repo:         "kuhlman-labs/example",
+			WorkflowID:   "feature_change",
+			WorkflowSpec: spec60m,
+		},
+		stages: []*run.Stage{
+			{
+				ID:    uuid.New(),
+				RunID: runID,
+				Type:  run.StageTypePlan,
+				State: run.StageStateDispatched,
+			},
+		},
+	}
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: newFakeSigningRepo(),
+		RunRepo:     runRepo,
+	})
+
+	w := issueRequest(t, s, runID, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got signingKeyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := 65 * time.Minute
+	if ttl := got.ExpiresAt.Sub(got.IssuedAt); ttl != want {
+		t.Errorf("TTL = %v, want %v", ttl, want)
+	}
+}
+
+func TestIssueSigningKey_TTLNeverShrinksBelowDefault(t *testing.T) {
+	// executor.timeout=5m on the plan stage → candidate = 10m < DefaultTTL → TTL = 30m.
+	spec5m := []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: "5m"
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{
+		runRow: &run.Run{
+			ID:           runID,
+			Repo:         "kuhlman-labs/example",
+			WorkflowID:   "feature_change",
+			WorkflowSpec: spec5m,
+		},
+		stages: []*run.Stage{
+			{
+				ID:    uuid.New(),
+				RunID: runID,
+				Type:  run.StageTypePlan,
+				State: run.StageStateDispatched,
+			},
+		},
+	}
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: newFakeSigningRepo(),
+		RunRepo:     runRepo,
+	})
+
+	w := issueRequest(t, s, runID, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got signingKeyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if ttl := got.ExpiresAt.Sub(got.IssuedAt); ttl != signing.DefaultTTL {
+		t.Errorf("TTL = %v, want %v (DefaultTTL)", ttl, signing.DefaultTTL)
+	}
+}
+
+func TestIssueSigningKey_NoSpecFallsBackToDefault(t *testing.T) {
+	// WorkflowSpec=nil → DefaultTTL regardless of stage state.
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{
+		runRow: &run.Run{
+			ID:           runID,
+			Repo:         "kuhlman-labs/example",
+			WorkflowID:   "feature_change",
+			WorkflowSpec: nil,
+		},
+	}
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: newFakeSigningRepo(),
+		RunRepo:     runRepo,
+	})
+
+	w := issueRequest(t, s, runID, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got signingKeyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if ttl := got.ExpiresAt.Sub(got.IssuedAt); ttl != signing.DefaultTTL {
+		t.Errorf("TTL = %v, want %v (DefaultTTL)", ttl, signing.DefaultTTL)
 	}
 }
