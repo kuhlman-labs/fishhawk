@@ -145,6 +145,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
+	trigger.ImplementStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)) * time.Second
+
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		if errors.Is(err, prompt.ErrUnsupportedStage) {
@@ -255,6 +258,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			trigger.DecomposeRequired = true
 		}
 	}
+
+	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
+	trigger.ImplementStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)) * time.Second
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {

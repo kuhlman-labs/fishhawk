@@ -645,6 +645,145 @@ func TestGetStagePromptRender_MatchesSignatureAuthedPath(t *testing.T) {
 	}
 }
 
+// planStageSpecYAML is a valid feature_change workflow spec with a
+// workflow-level policy max_stage_runtime of 30m. No per-stage executor
+// timeouts so both plan and implement resolve to the policy value.
+const planStageSpecYAML30m = `version: "0.3"
+workflows:
+  feature_change:
+    policy:
+      max_stage_runtime: "30m"
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// planStageSpecYAML45mImpl is the same workflow but the implement stage
+// declares executor.timeout: "45m", which overrides the 30m workflow policy.
+const planStageSpecYAML45mImpl = `version: "0.3"
+workflows:
+  feature_change:
+    policy:
+      max_stage_runtime: "30m"
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          timeout: "45m"
+        produces:
+          - artifact: pull_request
+`
+
+// TestGetStagePrompt_PlanBudget_WorkflowPolicy exercises the three-level
+// timeout precedence (stage executor > workflow policy > 15m default)
+// through the full server path for a plan-stage prompt. Each case asserts
+// on the "implement stage N minutes" text rendered into the prompt body.
+func TestGetStagePrompt_PlanBudget_WorkflowPolicy(t *testing.T) {
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "x/y",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+		WorkflowSpec:  []byte(planStageSpecYAML30m),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp.Prompt, "implement stage 30 minutes") {
+		t.Errorf("prompt missing 'implement stage 30 minutes' (workflow policy):\n%s", resp.Prompt)
+	}
+}
+
+func TestGetStagePrompt_PlanBudget_StageExecutorOverridesPolicy(t *testing.T) {
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "x/y",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+		WorkflowSpec:  []byte(planStageSpecYAML45mImpl),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp.Prompt, "implement stage 45 minutes") {
+		t.Errorf("prompt missing 'implement stage 45 minutes' (stage executor override):\n%s", resp.Prompt)
+	}
+}
+
+func TestGetStagePrompt_PlanBudget_NilSpecFallsBackTo15m(t *testing.T) {
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "x/y",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+		WorkflowSpec:  nil,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp.Prompt, "implement stage 15 minutes") {
+		t.Errorf("prompt missing 'implement stage 15 minutes' (nil spec default):\n%s", resp.Prompt)
+	}
+}
+
 func TestGetStagePromptRender_StageNotFound(t *testing.T) {
 	s, rr, _, _ := newPromptServer(t)
 	rr.stageErr = run.ErrNotFound
