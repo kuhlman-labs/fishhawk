@@ -45,9 +45,10 @@ func ValidRunTransition(from, to State) bool {
 // Cancelled is reachable from any non-terminal state via manual halt.
 var stageTransitions = map[StageState]map[StageState]struct{}{
 	StageStatePending: {
-		StageStateDispatched: {},
-		StageStateCancelled:  {},
-		StageStateFailed:     {},
+		StageStateDispatched:       {},
+		StageStateCancelled:        {},
+		StageStateFailed:           {},
+		StageStateAwaitingChildren: {},
 	},
 	StageStateDispatched: {
 		StageStateRunning:   {},
@@ -61,6 +62,11 @@ var stageTransitions = map[StageState]map[StageState]struct{}{
 		StageStateCancelled:        {},
 	},
 	StageStateAwaitingApproval: {
+		StageStateSucceeded: {},
+		StageStateFailed:    {},
+		StageStateCancelled: {},
+	},
+	StageStateAwaitingChildren: {
 		StageStateSucceeded: {},
 		StageStateFailed:    {},
 		StageStateCancelled: {},

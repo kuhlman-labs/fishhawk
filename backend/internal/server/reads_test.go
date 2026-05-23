@@ -46,6 +46,10 @@ func (r *stagesRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stag
 	return nil, errors.New("not used")
 }
 
+func (r *stagesRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (r *stagesRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }

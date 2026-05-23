@@ -107,6 +107,10 @@ func (f *fakeRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, er
 	return nil, nil
 }
 
+func (f *fakeRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 type fakeAudit struct {
 	mu        sync.Mutex
 	appended  []audit.ChainAppendParams

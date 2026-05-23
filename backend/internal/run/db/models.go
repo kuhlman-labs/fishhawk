@@ -83,6 +83,7 @@ type Run struct {
 	MaxRetriesSnapshot     int32              `json:"max_retries_snapshot"`
 	RunnerKind             string             `json:"runner_kind"`
 	IssueContext           []byte             `json:"issue_context"`
+	DecomposedFrom         *uuid.UUID         `json:"decomposed_from"`
 }
 
 type Session struct {

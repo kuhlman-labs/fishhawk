@@ -106,6 +106,10 @@ func (r *promptRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stag
 	return nil, errors.New("not used")
 }
 
+func (r *promptRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (r *promptRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }

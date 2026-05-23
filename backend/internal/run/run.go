@@ -58,6 +58,7 @@ const (
 	StageStateDispatched       StageState = "dispatched"
 	StageStateRunning          StageState = "running"
 	StageStateAwaitingApproval StageState = "awaiting_approval"
+	StageStateAwaitingChildren StageState = "awaiting_children"
 	StageStateSucceeded        StageState = "succeeded"
 	StageStateFailed           StageState = "failed"
 	StageStateCancelled        StageState = "cancelled"
@@ -234,9 +235,15 @@ type Run struct {
 	// Webhook-dispatched runs leave this nil and fall through to
 	// the existing GitHub fetch path in prompt.fillIssueContext.
 	IssueContext *IssueContext
-	State        State
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// DecomposedFrom, when non-nil, identifies the parent run that
+	// minted this child run during orchestrator fanout (#455). The
+	// child-completion sweeper uses parent_run_id to find children;
+	// DecomposedFrom provides the direct ancestry link for the SPA's
+	// "decomposed from" breadcrumb.
+	DecomposedFrom *uuid.UUID
+	State          State
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

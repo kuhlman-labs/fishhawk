@@ -68,6 +68,10 @@ type fakeRepo struct {
 	listErr        error
 }
 
+func (f *fakeRepo) ListStagesAwaitingChildren(_ context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 func (f *fakeRepo) ListStagesAwaitingApproval(_ context.Context) ([]*run.Stage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -116,6 +116,10 @@ func (r *policyRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stag
 	return nil, errors.New("not used")
 }
 
+func (r *policyRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (r *policyRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
