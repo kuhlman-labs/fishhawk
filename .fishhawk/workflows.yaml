@@ -26,6 +26,8 @@ workflows:
     description: >-
       Default workflow for feature work and non-trivial changes.
       Human approves plan and PR; agent does the implementation.
+    policy:
+      max_stage_runtime: "30m"
     # Auto-retry once on CI failure (#276). The human approves the
     # plan; the agent should self-heal on a routine test or lint
     # regression without forcing the reviewer back into the loop.
