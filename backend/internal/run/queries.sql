@@ -3,8 +3,8 @@
 -- into ./db per the config in /backend/sqlc.yaml.
 
 -- name: CreateRun :one
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 RETURNING *;
 
 -- name: GetRun :one
@@ -34,6 +34,7 @@ SELECT * FROM runs
    AND (sqlc.narg('pull_request_url')::text IS NULL OR pull_request_url = sqlc.narg('pull_request_url'))
    AND (sqlc.narg('trigger_ref')::text IS NULL OR trigger_ref = sqlc.narg('trigger_ref'))
    AND (sqlc.narg('runner_kind')::text IS NULL OR runner_kind = sqlc.narg('runner_kind'))
+   AND (sqlc.narg('decomposed_from')::uuid IS NULL OR decomposed_from = sqlc.narg('decomposed_from'))
  ORDER BY created_at DESC, id DESC
  LIMIT sqlc.arg('lim') OFFSET sqlc.arg('off');
 
@@ -94,6 +95,14 @@ SELECT * FROM stages
 -- window.
 SELECT * FROM stages
  WHERE state = 'dispatched'
+ ORDER BY updated_at ASC;
+
+-- name: ListStagesAwaitingChildren :many
+-- Used by the child-completion sweeper (#455) to find parent
+-- implement stages whose decomposed child runs may have reached
+-- terminal states. Ordered by updated_at ASC.
+SELECT * FROM stages
+ WHERE state = 'awaiting_children'
  ORDER BY updated_at ASC;
 
 -- name: UpdateStageState :one

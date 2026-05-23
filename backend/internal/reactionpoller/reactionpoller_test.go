@@ -32,6 +32,10 @@ func newFakeRunRepo() *fakeRunRepo {
 	return &fakeRunRepo{runs: map[uuid.UUID]*run.Run{}}
 }
 
+func (f *fakeRunRepo) ListStagesAwaitingChildren(_ context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 func (f *fakeRunRepo) ListStagesAwaitingApproval(_ context.Context) ([]*run.Stage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

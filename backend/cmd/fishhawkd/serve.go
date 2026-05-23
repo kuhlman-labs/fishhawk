@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -93,6 +94,12 @@ func runServe(args []string, logSink io.Writer) int {
 	reactionPollerAgeThreshold := fs.Duration("reaction-poller-age-threshold",
 		reactionpoller.DefaultAgeThreshold,
 		"plan-comment age at which the reaction poller switches from fast to slow cadence")
+	enableChildCompletionSweeper := fs.Bool("enable-child-completion-sweeper",
+		envOr("FISHHAWKD_ENABLE_CHILD_COMPLETION_SWEEPER", "false") == "true",
+		"start the child-completion sweeper (#455 / ADR-025 D4); transitions parent stages parked in awaiting_children once their decomposed children all reach terminal states. Off by default to match the other tickers' dev-loop posture.")
+	childCompletionInterval := fs.Duration("child-completion-interval",
+		60*time.Second,
+		"child-completion sweeper scan interval; 60s is the upper bound on parent latency after the last child terminates")
 	oidcAudience := fs.String("oidc-audience",
 		envOr("FISHHAWKD_OIDC_AUDIENCE", ""),
 		"GitHub Actions OIDC audience the signing-key endpoint requires; when set, callers must present a valid id_token whose aud matches this value")
@@ -274,11 +281,19 @@ func runServe(args []string, logSink io.Writer) int {
 	// to dispatch subsequent stages after a gate passes. Same
 	// dependencies as the dispatcher; without them the approval
 	// handler succeeds but the next stage stays in pending.
+	//
+	// Artifacts + Audit enable the ADR-025 D4 decomposition fanout:
+	// when the approved plan declares sub_plans, the orchestrator
+	// mints child runs and parks the parent's implement stage in
+	// awaiting_children. Either being nil disables the fanout
+	// silently — the parent's implement stage dispatches as today.
 	if cfg.RunRepo != nil {
 		cfg.Orchestrator = &orchestrator.Orchestrator{
-			Runs:   cfg.RunRepo,
-			GitHub: cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
-			Logger: logger,
+			Runs:      cfg.RunRepo,
+			GitHub:    cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
+			Logger:    logger,
+			Artifacts: cfg.ArtifactRepo,
+			Audit:     cfg.AuditRepo,
 		}
 		logger.Info("stage orchestrator configured")
 	}
@@ -445,6 +460,34 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 	}
 
+	// Child-completion sweeper (#455 / ADR-025 D4). Resolves parent
+	// stages parked in awaiting_children when every decomposed
+	// child run reaches a terminal state. Off by default for the
+	// same dev-loop reason as the SLA / dispatch watchdog tickers.
+	if *enableChildCompletionSweeper {
+		switch {
+		case cfg.RunRepo == nil || cfg.AuditRepo == nil:
+			logger.Warn("--enable-child-completion-sweeper set but RunRepo or AuditRepo unconfigured; sweeper not started")
+		case cfg.Orchestrator == nil:
+			logger.Warn("--enable-child-completion-sweeper set but Orchestrator unconfigured; sweeper not started")
+		default:
+			sweeper := &childcompletion.Sweeper{
+				Runs:     cfg.RunRepo,
+				Audit:    cfg.AuditRepo,
+				Advance:  childCompletionAdvancer{cfg.Orchestrator},
+				Logger:   logger,
+				Interval: *childCompletionInterval,
+			}
+			go func() {
+				if err := sweeper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					logger.Error("child-completion sweeper exited with error", slog.String("error", err.Error()))
+				}
+			}()
+			logger.Info("child-completion sweeper started",
+				slog.Duration("interval", *childCompletionInterval))
+		}
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start() }()
 
@@ -549,6 +592,22 @@ func (c *slaTickerConfig) Start(ctx context.Context) {
 	if err := t.Run(ctx); err != nil {
 		c.Logger.Error("sla ticker exited with error", slog.String("error", err.Error()))
 	}
+}
+
+// childCompletionAdvancer adapts *orchestrator.Orchestrator to the
+// childcompletion.Advancer interface (Advance returning just an
+// error). Keeps childcompletion's import graph clean of orchestrator
+// internals like Outcome.
+type childCompletionAdvancer struct {
+	o *orchestrator.Orchestrator
+}
+
+func (a childCompletionAdvancer) Advance(ctx context.Context, runID uuid.UUID) error {
+	if a.o == nil {
+		return nil
+	}
+	_, err := a.o.Advance(ctx, runID)
+	return err
 }
 
 // advanceFuncFor wraps the orchestrator's Advance method as a plain

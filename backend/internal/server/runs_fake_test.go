@@ -251,6 +251,10 @@ func (f *fakeRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, er
 	return nil, errors.New("fakeRepo: ListStagesAwaitingApproval not implemented")
 }
 
+func (f *fakeRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("fakeRepo: ListStagesAwaitingApproval not implemented")
+}
+
 func (f *fakeRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }

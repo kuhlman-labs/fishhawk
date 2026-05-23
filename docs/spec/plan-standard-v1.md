@@ -176,7 +176,7 @@ Required array with at least two entries. Each entry is a `SubPlanSummary`:
 
 **Runtime-sum invariant**: the validator warns (but does not reject) when the sum of `sub_plans[*].predicted_runtime_minutes` is less than the parent `predicted_runtime_minutes`. The agent may legitimately compress work when breaking it into smaller pieces; the soft warning surfaces the gap for human review.
 
-**Lifecycle note**: `decomposition` is validated and stored in the audit log but not acted upon until D3/D4 (automated run splitting is out of scope for D1/D2). Plans with a populated `decomposition` block pass through approval and arrive at the implement stage unchanged; no mechanism routes sub-plans to child runs yet.
+**Lifecycle**: as of ADR-025 D4 (#455), `decomposition` is acted upon by the orchestrator. After plan approval, when the orchestrator's `Advance` would dispatch the parent's implement stage, it checks the approved plan: if `decomposition.sub_plans` is populated, the orchestrator mints one child run per sub-plan (each carrying `parent_run_id = parent.id` and `decomposed_from = parent.id`, with an issue_context built from the parent's title plus the sub-plan's `scope_hint`), parks the parent's implement stage in `awaiting_children`, and emits a `plan_decomposed` audit entry listing the child IDs. The child-completion sweeper (`backend/internal/childcompletion/`) transitions the parent stage to `succeeded` once every child reaches a terminal state successfully, or to `failed-C` if any child failed. Child runs themselves skip the fanout check (their `decomposed_from` is non-nil), so recursion is bounded at one level.
 
 ## Validation rules beyond the schema
 

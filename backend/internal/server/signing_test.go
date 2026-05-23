@@ -360,6 +360,10 @@ func (r *fakeOIDCRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.St
 	return nil, errors.New("not used")
 }
 
+func (r *fakeOIDCRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (r *fakeOIDCRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }

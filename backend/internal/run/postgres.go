@@ -94,6 +94,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		MaxRetriesSnapshot:     int32(maxRetries),
 		RunnerKind:             runnerKind,
 		IssueContext:           issueContextBytes,
+		DecomposedFrom:         p.DecomposedFrom,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -143,6 +144,7 @@ func (r *postgresRepo) ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, 
 		PullRequestUrl: f.PullRequestURL,
 		TriggerRef:     f.TriggerRef,
 		RunnerKind:     f.RunnerKind,
+		DecomposedFrom: f.DecomposedFrom,
 		Lim:            int32(f.Limit),
 		Off:            int32(f.Offset),
 	})
@@ -290,6 +292,19 @@ func (r *postgresRepo) ListStagesDispatched(ctx context.Context) ([]*Stage, erro
 	rows, err := q.ListStagesDispatched(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list stages dispatched: %w", err)
+	}
+	out := make([]*Stage, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToStage(row))
+	}
+	return out, nil
+}
+
+func (r *postgresRepo) ListStagesAwaitingChildren(ctx context.Context) ([]*Stage, error) {
+	q := rundb.New(r.pool)
+	rows, err := q.ListStagesAwaitingChildren(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list stages awaiting children: %w", err)
 	}
 	out := make([]*Stage, 0, len(rows))
 	for _, row := range rows {
@@ -450,6 +465,7 @@ func rowToRun(r rundb.Run) *Run {
 			out.IssueContext = &ic
 		}
 	}
+	out.DecomposedFrom = r.DecomposedFrom
 	return out
 }
 

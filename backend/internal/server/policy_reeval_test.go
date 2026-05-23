@@ -106,6 +106,10 @@ func (r *reevalRunRepo) GetStage(context.Context, uuid.UUID) (*run.Stage, error)
 func (r *reevalRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
+
+func (r *reevalRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
 func (r *reevalRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }

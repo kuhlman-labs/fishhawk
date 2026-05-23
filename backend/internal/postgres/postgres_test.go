@@ -202,11 +202,21 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0025 (#415) added the
-	// runs.issue_context column; the down migration drops it.
-	// Confirm: runs.issue_context is gone, but every prior
-	// migration's effect is still present (runner_kind from 0024,
-	// mcp_tokens from 0023, etc.).
+	// MigrateDown rolls back one step. 0026 (#455) added the
+	// runs.decomposed_from column + awaiting_children stage state;
+	// the down migration drops both. Confirm: runs.decomposed_from
+	// is gone, but every prior migration's effect is still present
+	// (issue_context from 0025, runner_kind from 0024, etc.).
+	var decomposedFromCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'decomposed_from'`,
+	).Scan(&decomposedFromCol); err != nil {
+		t.Fatalf("query runs.decomposed_from column: %v", err)
+	}
+	if decomposedFromCol != 0 {
+		t.Errorf("runs.decomposed_from count after MigrateDown = %d, want 0 (0026 down dropped it)", decomposedFromCol)
+	}
 	var issueContextCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -214,8 +224,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&issueContextCol); err != nil {
 		t.Fatalf("query runs.issue_context column: %v", err)
 	}
-	if issueContextCol != 0 {
-		t.Errorf("runs.issue_context count after MigrateDown = %d, want 0 (0025 down dropped it)", issueContextCol)
+	if issueContextCol != 1 {
+		t.Errorf("runs.issue_context count after MigrateDown = %d, want 1 (0025 still applied; only 0026 rolled back)", issueContextCol)
 	}
 	var runnerKindCol int
 	if err := pool.QueryRow(context.Background(),

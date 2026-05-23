@@ -230,6 +230,10 @@ func (r *approvalRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.St
 	return nil, errors.New("not used")
 }
 
+func (r *approvalRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 func (r *approvalRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
@@ -659,6 +663,10 @@ func (r *orchestratorRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) 
 }
 
 func (r *orchestratorRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
+func (r *orchestratorRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
 

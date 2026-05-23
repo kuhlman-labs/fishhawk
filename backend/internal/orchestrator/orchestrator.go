@@ -18,15 +18,20 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -53,6 +58,17 @@ type Orchestrator struct {
 	GitHub GitHubAPI
 	Logger *slog.Logger
 
+	// Artifacts is the artifact repository the fanout helper reads to
+	// load the approved plan. When nil, decomposition detection is
+	// disabled and Advance falls through to the legacy single-implement
+	// path even on plans that declare sub_plans.
+	Artifacts artifact.Repository
+
+	// Audit emits plan_decomposed entries when the orchestrator mints
+	// child runs. Nil-safe; a nil Audit means the fanout still happens
+	// but the audit is dropped (logged at warn).
+	Audit audit.Repository
+
 	// DefaultRef is the git ref to dispatch against. Matches the
 	// webhook dispatcher's default; v0.x persists the ref on the
 	// run row so subsequent dispatches can target the same ref.
@@ -72,6 +88,7 @@ type Outcome string
 const (
 	OutcomeDispatched   Outcome = "dispatched"    // a next stage was dispatched
 	OutcomeRunCompleted Outcome = "run_completed" // no more stages; run transitioned to succeeded
+	OutcomeDecomposed   Outcome = "decomposed"    // parent's implement stage parked in awaiting_children; N child runs minted
 	OutcomeNoOp         Outcome = "noop"          // run not in a state that accepts advancement
 )
 
@@ -143,7 +160,202 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		return o.completeRun(ctx, r, stages)
 	}
 
+	// ADR-025 D4: when the approved plan declares decomposition,
+	// fan the parent's implement stage out into child runs rather
+	// than dispatching it. Only checked when the next pending stage
+	// is the implement type and Artifacts is wired — the legacy
+	// path runs unchanged otherwise. Children themselves never
+	// fanout (their plans are scoped narrow enough that they fit
+	// the budget) — we skip the check when this run is a child.
+	if next.Type == run.StageTypeImplement && o.Artifacts != nil && r.DecomposedFrom == nil {
+		decomposed, err := o.fanoutIfDecomposed(ctx, r, stages, next)
+		if err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: fanout: %w", err)
+		}
+		if decomposed {
+			return OutcomeDecomposed, nil
+		}
+	}
+
 	return o.dispatchStage(ctx, r, next)
+}
+
+// fanoutIfDecomposed inspects the run's approved plan for a
+// decomposition.sub_plans block. When present, it mints one child
+// run per sub_plan (inheriting parent's workflow + trigger +
+// installation context) and parks the parent's implement stage in
+// awaiting_children. Returns true when fanout happened, false when
+// the plan had no decomposition (caller falls through to dispatch).
+//
+// Each child carries:
+//   - parent_run_id = parent.ID (CI-retry-chain semantic; preserved
+//     for compatibility with existing retry walkers).
+//   - decomposed_from = parent.ID (NEW; disambiguates "decomposition
+//     child" from "CI-retry follow-up").
+//   - issue_context derived from the parent's issue title + the
+//     sub_plan's scope_hint as the body, so the child's plan stage
+//     gets the narrowed context.
+func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, stages []*run.Stage, parentImplement *run.Stage) (bool, error) {
+	approvedPlan, planStageID, err := o.loadApprovedPlan(ctx, stages)
+	if err != nil {
+		return false, fmt.Errorf("load approved plan: %w", err)
+	}
+	if approvedPlan == nil || approvedPlan.Decomposition == nil || len(approvedPlan.Decomposition.SubPlans) == 0 {
+		return false, nil
+	}
+
+	childIDs := make([]string, 0, len(approvedPlan.Decomposition.SubPlans))
+	for _, sub := range approvedPlan.Decomposition.SubPlans {
+		parentID := parent.ID
+		childCtx := childIssueContextFromSubPlan(parent, sub)
+		child, err := o.Runs.CreateRun(ctx, run.CreateRunParams{
+			Repo:           parent.Repo,
+			WorkflowID:     parent.WorkflowID,
+			WorkflowSHA:    parent.WorkflowSHA,
+			TriggerSource:  parent.TriggerSource,
+			TriggerRef:     parent.TriggerRef,
+			InstallationID: parent.InstallationID,
+			ParentRunID:    &parentID,
+			DecomposedFrom: &parentID,
+			RunnerKind:     parent.RunnerKind,
+			IssueContext:   childCtx,
+		})
+		if err != nil {
+			return false, fmt.Errorf("create child run for sub_plan %q: %w", sub.Title, err)
+		}
+		// Each child gets a single implement stage. We skip plan +
+		// review because the parent's plan is the contract (the
+		// child's prompt builder walks parent_run_id to load it),
+		// and review on a sub-PR is the parent's review concern.
+		// Mirror the parent implement stage's executor so the child
+		// dispatches to the same agent runtime.
+		childImpl, err := o.Runs.CreateStage(ctx, run.CreateStageParams{
+			RunID:        child.ID,
+			Sequence:     0,
+			Type:         run.StageTypeImplement,
+			ExecutorKind: parentImplement.ExecutorKind,
+			ExecutorRef:  parentImplement.ExecutorRef,
+		})
+		if err != nil {
+			return false, fmt.Errorf("create child implement stage for sub_plan %q: %w", sub.Title, err)
+		}
+		childIDs = append(childIDs, child.ID.String())
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator minted decomposed child run",
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.String("child_run_id", child.ID.String()),
+			slog.String("child_implement_stage_id", childImpl.ID.String()),
+			slog.String("sub_plan_title", sub.Title),
+		)
+	}
+
+	// Park the parent's implement stage in awaiting_children. The
+	// child-completion sweeper transitions it to succeeded/failed
+	// once every child has reached a terminal run state.
+	if _, err := o.Runs.TransitionStage(ctx, parentImplement.ID, run.StageStateAwaitingChildren, nil); err != nil {
+		return false, fmt.Errorf("transition parent implement to awaiting_children: %w", err)
+	}
+
+	o.emitPlanDecomposed(ctx, parent.ID, planStageID, childIDs, approvedPlan.Decomposition.Rationale)
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parent parked awaiting children",
+		slog.String("parent_run_id", parent.ID.String()),
+		slog.String("parent_stage_id", parentImplement.ID.String()),
+		slog.Int("child_count", len(childIDs)),
+	)
+	return true, nil
+}
+
+// loadApprovedPlan returns the parsed standard_v1 plan from the
+// run's most recent plan-stage artifact, plus the plan stage's ID
+// (used as the audit anchor when fanout fires). (nil, _, nil) means
+// no plan artifact is available — caller falls through to dispatch.
+func (o *Orchestrator) loadApprovedPlan(ctx context.Context, stages []*run.Stage) (*plan.Plan, uuid.UUID, error) {
+	var planStageID uuid.UUID
+	for _, s := range stages {
+		if s.Type == run.StageTypePlan {
+			planStageID = s.ID
+			break
+		}
+	}
+	if planStageID == uuid.Nil {
+		return nil, uuid.Nil, nil
+	}
+
+	arts, err := o.Artifacts.ListForStage(ctx, planStageID)
+	if err != nil {
+		return nil, planStageID, fmt.Errorf("list plan artifacts: %w", err)
+	}
+	var picked *artifact.Artifact
+	for _, a := range arts {
+		if a.Kind != artifact.KindPlan {
+			continue
+		}
+		if a.SchemaVersion == nil || *a.SchemaVersion != "standard_v1" {
+			continue
+		}
+		if picked == nil || a.CreatedAt.After(picked.CreatedAt) {
+			picked = a
+		}
+	}
+	if picked == nil {
+		return nil, planStageID, nil
+	}
+	var p plan.Plan
+	if err := json.Unmarshal(picked.Content, &p); err != nil {
+		return nil, planStageID, fmt.Errorf("decode plan artifact %s: %w", picked.ID, err)
+	}
+	return &p, planStageID, nil
+}
+
+// childIssueContextFromSubPlan derives a child run's issue context
+// from the parent run + sub_plan. The parent's title is reused (so
+// the child's plan stage knows what feature it belongs to); the body
+// is replaced with the sub_plan's title + scope_hint so the agent's
+// narrowed context surfaces in the planning prompt.
+func childIssueContextFromSubPlan(parent *run.Run, sub plan.SubPlanSummary) *run.IssueContext {
+	if parent.IssueContext == nil {
+		return &run.IssueContext{
+			Title: sub.Title,
+			Body:  sub.ScopeHint,
+		}
+	}
+	out := *parent.IssueContext
+	out.Body = fmt.Sprintf("## %s\n\n%s\n\n---\n*Decomposed sub-plan of [%s](%s).*",
+		sub.Title, sub.ScopeHint, parent.IssueContext.Title, parent.IssueContext.URL)
+	return &out
+}
+
+// emitPlanDecomposed writes a plan_decomposed audit entry naming
+// the child run IDs and the rationale string. Best-effort: a failure
+// here logs and returns; the fanout has already taken effect at the
+// data layer.
+func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, parentStageID uuid.UUID, childIDs []string, rationale string) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping plan_decomposed entry",
+			slog.String("parent_run_id", parentRunID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"child_run_ids":   childIDs,
+		"rationale":       rationale,
+		"parent_stage_id": parentStageID.String(),
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal plan_decomposed payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		StageID:   &parentStageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "plan_decomposed",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append plan_decomposed failed",
+			slog.String("error", err.Error()))
+	}
 }
 
 // completeRun transitions the run to a terminal state when every

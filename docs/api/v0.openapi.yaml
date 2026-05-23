@@ -168,6 +168,16 @@ components:
             existed for the same `(repo, trigger_ref)` at create
             time (#216). Lets the SPA render "follow-up to
             <short-id>" + a thread of related runs.
+        decomposed_from:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Set when the orchestrator minted this run as a child of
+            a decomposed parent plan (#455 / ADR-025 D4). Disambiguates
+            "decomposition child" from `parent_run_id`'s CI-retry-chain
+            semantic — both can be non-nil on a child whose CI failed
+            and re-dispatched. SPA breadcrumb: "decomposed sub-plan of
+            <parent short id>".
         pull_request_url:
           type: [string, "null"]
           description: |

@@ -962,6 +962,10 @@ func (s *stubRuns) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, er
 	return nil, errors.New("not used")
 }
 
+func (s *stubRuns) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (s *stubRuns) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }

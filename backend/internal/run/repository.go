@@ -68,6 +68,9 @@ type CreateRunParams struct {
 	// runs and for non-issue triggers — the prompt builder falls
 	// back to the existing GitHub fetch path in those cases.
 	IssueContext *IssueContext
+	// DecomposedFrom, when non-nil, identifies the parent run that
+	// minted this child run during orchestrator fanout (#455).
+	DecomposedFrom *uuid.UUID
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.
@@ -128,8 +131,11 @@ type ListRunsFilter struct {
 	// runs.runner_kind otherwise. Compliance consumers use this
 	// to filter to `github_actions`-only reports.
 	RunnerKind *string
-	Limit      int
-	Offset     int
+	// DecomposedFrom filters to runs minted as children of the
+	// given parent run (#455). Nil = no constraint.
+	DecomposedFrom *uuid.UUID
+	Limit          int
+	Offset         int
 }
 
 // Repository persists runs and stages and applies state-machine
@@ -177,6 +183,12 @@ type Repository interface {
 	// (Postgres adapter orders by updated_at ASC for early-exit
 	// efficiency).
 	ListStagesAwaitingApproval(ctx context.Context) ([]*Stage, error)
+
+	// ListStagesAwaitingChildren returns every stage currently in
+	// awaiting_children state. The child-completion sweeper scans
+	// this to find parent stages whose children may have reached
+	// terminal states. Ordered updated_at ASC.
+	ListStagesAwaitingChildren(ctx context.Context) ([]*Stage, error)
 
 	// ListStagesDispatched returns every stage currently in
 	// 'dispatched' state. The dispatch watchdog (E8.4 #158) scans
