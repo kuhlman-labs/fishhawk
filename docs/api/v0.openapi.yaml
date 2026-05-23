@@ -1648,6 +1648,15 @@ paths:
         key for the run; older rows remain so the standalone audit
         verifier can replay any signature that was valid at upload
         time. Migration 0012.
+
+        TTL: the server sets `expires_at` to
+        `max(30m, resolved_stage_budget + 5m)`, where
+        `resolved_stage_budget` is the spec-governed timeout for the
+        stage currently in `dispatched` or `running` state (sourced
+        from `spec.ResolveStageTimeout`). This ensures a stage that
+        runs its full budget still holds a valid key when it uploads
+        its trace. Runs without a workflow spec, or with no active
+        stage, default to 30m.
       tags: [runner]
       security:
         - githubOIDC: []

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -42,6 +43,49 @@ const (
 	maxTTLSeconds = 3600
 )
 
+// signingKeyTTLBuffer is added to the resolved stage budget when
+// computing the server-side signing key TTL, so a stage that runs
+// its full budget still has a valid key when it uploads its trace.
+const signingKeyTTLBuffer = 5 * time.Minute
+
+// resolveSigningKeyTTL returns the TTL to use when issuing a signing
+// key for runID. It resolves the active stage's budget via
+// resolveAgentTimeout and returns max(DefaultTTL, budget + buffer).
+// Falls back to DefaultTTL when RunRepo is unconfigured, the run
+// cannot be fetched, the spec is absent, or no active stage is found.
+func (s *Server) resolveSigningKeyTTL(ctx context.Context, runID uuid.UUID) time.Duration {
+	if s.cfg.RunRepo == nil {
+		return signing.DefaultTTL
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil || runRow.WorkflowSpec == nil {
+		return signing.DefaultTTL
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return signing.DefaultTTL
+	}
+	var activeStage *run.Stage
+	for _, st := range stages {
+		if st.State == run.StageStateDispatched || st.State == run.StageStateRunning {
+			activeStage = st
+			break
+		}
+	}
+	if activeStage == nil {
+		return signing.DefaultTTL
+	}
+	budgetSeconds := s.resolveAgentTimeout(ctx, runRow, activeStage.Type)
+	if budgetSeconds == 0 {
+		return signing.DefaultTTL
+	}
+	candidate := time.Duration(budgetSeconds)*time.Second + signingKeyTTLBuffer
+	if candidate > signing.DefaultTTL {
+		return candidate
+	}
+	return signing.DefaultTTL
+}
+
 // handleIssueSigningKey implements POST /v0/runs/{run_id}/signing-key.
 //
 // AUTH: per the OpenAPI contract this endpoint requires a GitHub
@@ -71,9 +115,10 @@ func (s *Server) handleIssueSigningKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Body is optional. An empty / missing body uses the default
-	// TTL; a present body must parse cleanly.
-	ttl := signing.DefaultTTL
+	// Body is optional. An empty / missing body uses the spec-resolved
+	// TTL (max of DefaultTTL and the active stage budget + buffer);
+	// a present body must parse cleanly.
+	ttl := s.resolveSigningKeyTTL(r.Context(), runID)
 	if r.ContentLength != 0 {
 		var req signingKeyRequest
 		dec := json.NewDecoder(r.Body)
