@@ -173,14 +173,32 @@ type GetPlanInput struct {
 // Kept flat for jsonschema friendliness; the SDK turns the struct
 // into an output schema the MCP client can introspect.
 type PlanContent struct {
-	PlanVersion         string             `json:"plan_version"`
-	TicketReference     PlanTicketRef      `json:"ticket_reference"`
-	GeneratedBy         PlanGeneratedBy    `json:"generated_by"`
-	Summary             string             `json:"summary"`
-	Scope               PlanScope          `json:"scope"`
-	Approach            []PlanApproachStep `json:"approach"`
-	Verification        PlanVerification   `json:"verification"`
-	RisksAndAssumptions []string           `json:"risks_and_assumptions,omitempty"`
+	PlanVersion                string             `json:"plan_version"`
+	TicketReference            PlanTicketRef      `json:"ticket_reference"`
+	GeneratedBy                PlanGeneratedBy    `json:"generated_by"`
+	Summary                    string             `json:"summary"`
+	Scope                      PlanScope          `json:"scope"`
+	Approach                   []PlanApproachStep `json:"approach"`
+	Verification               PlanVerification   `json:"verification"`
+	RisksAndAssumptions        []string           `json:"risks_and_assumptions,omitempty"`
+	PredictedRuntimeMinutes    int                `json:"predicted_runtime_minutes"`
+	PredictedRuntimeConfidence string             `json:"predicted_runtime_confidence"`
+	Decomposition              *PlanDecomposition `json:"decomposition,omitempty"`
+}
+
+// PlanDecomposition carries the agent's proposal to split the plan
+// into parallel sub-plans (standard_v1 D2 field, ADR-025).
+type PlanDecomposition struct {
+	Rationale string        `json:"rationale"`
+	SubPlans  []PlanSubPlan `json:"sub_plans"`
+}
+
+// PlanSubPlan describes one sub-plan within a decomposed plan.
+type PlanSubPlan struct {
+	Title                      string `json:"title"`
+	ScopeHint                  string `json:"scope_hint"`
+	PredictedRuntimeMinutes    int    `json:"predicted_runtime_minutes"`
+	PredictedRuntimeConfidence string `json:"predicted_runtime_confidence"`
 }
 
 // PlanTicketRef identifies the ticket that originated the run.
@@ -249,7 +267,9 @@ Walks parent_run_id up to 8 levels so CI-retry runs (which skip the
 plan stage and re-execute against the parent's plan) resolve to the
 canonical plan. Returns the parsed standard_v1 plan shape: summary,
 scope.files, approach steps, verification (test_strategy +
-rollback_plan), and risks_and_assumptions when present.
+rollback_plan), risks_and_assumptions when present,
+predicted_runtime_minutes + predicted_runtime_confidence (every plan),
+and decomposition (when the agent proposed sub-plans).
 
 Response status:
   - "available"     — Plan is populated; ResolvedVia tells you whether
