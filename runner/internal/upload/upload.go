@@ -307,6 +307,7 @@ type FetchedPrompt struct {
 	Prompt              string `json:"prompt"`
 	PromptHash          string `json:"prompt_hash"`
 	AgentTimeoutSeconds int    `json:"agent_timeout_seconds"`
+	DecomposedFromRunID string `json:"decomposed_from_run_id,omitempty"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an

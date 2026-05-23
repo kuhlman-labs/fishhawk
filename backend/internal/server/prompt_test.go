@@ -677,3 +677,90 @@ func TestGetStagePromptRender_Unconfigured(t *testing.T) {
 		t.Errorf("status = %d, want 503", w.Code)
 	}
 }
+
+func TestGetStagePrompt_DecomposedFromRunID_Present(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	parentRunID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "x/y",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerCLI,
+		DecomposedFrom: &parentRunID,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DecomposedFromRunID != parentRunID.String() {
+		t.Errorf("DecomposedFromRunID = %q, want %q", resp.DecomposedFromRunID, parentRunID.String())
+	}
+}
+
+func TestGetStagePrompt_DecomposedFromRunID_Absent_ForStandaloneRun(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "x/y",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+		// DecomposedFrom nil → standalone run
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DecomposedFromRunID != "" {
+		t.Errorf("DecomposedFromRunID = %q, want empty for standalone run", resp.DecomposedFromRunID)
+	}
+}
+
+func TestGetStagePromptRender_DecomposedFromRunID_Present(t *testing.T) {
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	parentRunID := uuid.New()
+	stageID := uuid.New()
+
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "x/y",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerCLI,
+		DecomposedFrom: &parentRunID,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DecomposedFromRunID != parentRunID.String() {
+		t.Errorf("DecomposedFromRunID = %q, want %q", resp.DecomposedFromRunID, parentRunID.String())
+	}
+}

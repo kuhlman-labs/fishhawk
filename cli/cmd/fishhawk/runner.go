@@ -216,12 +216,19 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
 		defer clientCancel()
 		client := runnerNewClient(cf)
+		// Fetch the run to resolve DecomposedFrom for shared-branch routing.
+		// Best-effort: if the fetch fails, fall back to standalone branch naming.
+		var decomposedFrom *uuid.UUID
+		if runRow, fetchErr := client.GetRun(clientCtx, parsedRunID); fetchErr == nil {
+			decomposedFrom = runRow.DecomposedFrom
+		}
 		result, autoErr := autoOpenPR(clientCtx, client, autoOpenPRArgs{
-			WorkingDir: *workingDir,
-			RunID:      parsedRunID,
-			StageID:    parsedStageID,
-			GitHubRepo: repo,
-			BaseBranch: *baseBranch,
+			WorkingDir:     *workingDir,
+			RunID:          parsedRunID,
+			StageID:        parsedStageID,
+			GitHubRepo:     repo,
+			BaseBranch:     *baseBranch,
+			DecomposedFrom: decomposedFrom,
 		})
 		if autoErr != nil {
 			_, _ = fmt.Fprintf(stderr, "fishhawk runner start: auto-PR warning: %v\n", autoErr)

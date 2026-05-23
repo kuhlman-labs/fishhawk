@@ -41,6 +41,9 @@ type autoOpenPRArgs struct {
 	StageID    uuid.UUID
 	GitHubRepo string
 	BaseBranch string
+	// DecomposedFrom, when non-nil, routes this child run onto the shared
+	// parent branch fishhawk/run-<shortID> instead of the per-stage branch.
+	DecomposedFrom *uuid.UUID
 }
 
 // autoOpenPRResult holds the outputs of a successful autoOpenPR call.
@@ -102,10 +105,14 @@ func prFallbackTitle(runID string) string {
 
 // autoOpenPR orchestrates the implement-stage PR flow:
 //  1. Parse the agent's PR description file.
-//  2. Derive a branch name from the run/stage IDs.
-//  3. Create the branch, commit all staged changes, and push.
-//  4. Open a GitHub PR via gh pr create.
-//  5. Ship the PR artifact to the backend via ShipLocalPullRequest.
+//  2. Derive a branch name from the run/stage IDs (or shared parent branch
+//     for decomposed children).
+//  3. Create the branch (or rebase onto existing shared branch), commit all
+//     staged changes, and push.
+//  4. Open a GitHub PR via gh pr create (skipped for subsequent children
+//     when a PR already exists on the shared branch).
+//  5. Ship the PR artifact to the backend via ShipLocalPullRequest (skipped
+//     for subsequent children).
 //
 // A clean working tree (nothing to commit) is a warning, not a
 // failure — autoOpenPR pushes the existing HEAD and continues.
@@ -118,10 +125,52 @@ func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRA
 		return nil, fmt.Errorf("autopr: %w", err)
 	}
 
-	branch := "fishhawk/run-" + shortRunID + "/stage-" + shortStageID
+	// Branch routing: decomposed children share a single parent branch.
+	var (
+		branch       string
+		isDecomposed bool
+		isSubsequent bool
+	)
+	if args.DecomposedFrom != nil {
+		isDecomposed = true
+		branch = "fishhawk/run-" + shortID(*args.DecomposedFrom)
+		// Detect first vs subsequent by probing the remote tracking ref.
+		showRefOut, showRefErr := autoGitCommand("git", "-C", args.WorkingDir,
+			"show-ref", "--verify", "refs/remotes/origin/"+branch).CombinedOutput()
+		_ = showRefOut
+		isSubsequent = showRefErr == nil
+	} else {
+		branch = "fishhawk/run-" + shortRunID + "/stage-" + shortStageID
+	}
 
-	if out, chkErr := autoGitCommand("git", "-C", args.WorkingDir, "checkout", "-b", branch).CombinedOutput(); chkErr != nil {
-		return nil, fmt.Errorf("autopr: git checkout -b %s: %w\n%s", branch, chkErr, out)
+	if isSubsequent {
+		// Shared branch already exists on the remote: stash agent edits,
+		// fetch+rebase, restore, then commit on top.
+		if out, stashErr := autoGitCommand("git", "-C", args.WorkingDir,
+			"stash", "--include-untracked").CombinedOutput(); stashErr != nil {
+			return nil, fmt.Errorf("autopr: git stash: %w\n%s", stashErr, out)
+		}
+		if out, fetchErr := autoGitCommand("git", "-C", args.WorkingDir,
+			"fetch", "origin", branch).CombinedOutput(); fetchErr != nil {
+			return nil, fmt.Errorf("autopr: git fetch: %w\n%s", fetchErr, out)
+		}
+		if out, coErr := autoGitCommand("git", "-C", args.WorkingDir,
+			"checkout", branch).CombinedOutput(); coErr != nil {
+			return nil, fmt.Errorf("autopr: git checkout %s: %w\n%s", branch, coErr, out)
+		}
+		if out, rebaseErr := autoGitCommand("git", "-C", args.WorkingDir,
+			"pull", "--rebase", "origin", branch).CombinedOutput(); rebaseErr != nil {
+			return nil, fmt.Errorf("autopr: git pull --rebase: %w\n%s", rebaseErr, out)
+		}
+		if out, popErr := autoGitCommand("git", "-C", args.WorkingDir,
+			"stash", "pop").CombinedOutput(); popErr != nil {
+			return nil, fmt.Errorf("autopr: git stash pop: %w\n%s", popErr, out)
+		}
+	} else {
+		if out, chkErr := autoGitCommand("git", "-C", args.WorkingDir,
+			"checkout", "-b", branch).CombinedOutput(); chkErr != nil {
+			return nil, fmt.Errorf("autopr: git checkout -b %s: %w\n%s", branch, chkErr, out)
+		}
 	}
 
 	if out, addErr := autoGitCommand("git", "-C", args.WorkingDir, "add", "-A").CombinedOutput(); addErr != nil {
@@ -140,7 +189,15 @@ func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRA
 		}
 	}
 
-	if out, pushErr := autoGitCommand("git", "-C", args.WorkingDir, "push", "-u", "origin", branch).CombinedOutput(); pushErr != nil {
+	// Decomposed children always push with --force-with-lease so concurrent
+	// pushes to the shared branch are rejected rather than silently overwritten.
+	var pushArgs []string
+	if isDecomposed {
+		pushArgs = []string{"git", "-C", args.WorkingDir, "push", "--force-with-lease", "origin", branch}
+	} else {
+		pushArgs = []string{"git", "-C", args.WorkingDir, "push", "-u", "origin", branch}
+	}
+	if out, pushErr := autoGitCommand(pushArgs[0], pushArgs[1:]...).CombinedOutput(); pushErr != nil {
 		return nil, fmt.Errorf("autopr: git push: %w\n%s", pushErr, out)
 	}
 
@@ -149,6 +206,15 @@ func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRA
 		return nil, fmt.Errorf("autopr: git rev-parse HEAD: %w", err)
 	}
 	headSHA := strings.TrimSpace(string(headOut))
+
+	// Subsequent decomposed children: PR was already opened by the first child.
+	// Skip gh pr create and ShipLocalPullRequest — the shared branch and PR URL
+	// are stable from the first child's artifact.
+	if isSubsequent {
+		_, _ = fmt.Fprintf(os.Stderr,
+			"autopr: subsequent decomposed child: pushed to shared branch %s\n", branch)
+		return &autoOpenPRResult{Branch: branch, HeadSHA: headSHA}, nil
+	}
 
 	var baseSHA string
 	if baseOut, baseErr := autoGitCommand("git", "-C", args.WorkingDir,

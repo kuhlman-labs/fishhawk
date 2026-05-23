@@ -93,6 +93,19 @@ type CommitAndPushArgs struct {
 	// Empty value (the default) means "use ambient auth" — caller
 	// trusts whatever extraheader the environment set up.
 	PushToken string
+
+	// ForceWithLease, when true, adds --force-with-lease to the push
+	// so concurrent pushes to the shared branch are rejected rather
+	// than silently overwritten. Used for decomposed-child runs.
+	ForceWithLease bool
+
+	// RebaseFromRemote, when true, fetches the remote branch and
+	// rebases the local work on top instead of creating a new branch
+	// with checkout -b. Used for subsequent decomposed-child runs
+	// where the shared branch already exists on the remote.
+	// Uncommitted agent edits are stashed before the fetch+rebase
+	// and restored afterwards.
+	RebaseFromRemote bool
 }
 
 // CommitAndPushResult captures the SHAs the runner needs to populate
@@ -162,8 +175,31 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		return nil, fmt.Errorf("gitops: config user.email: %w", err)
 	}
 
-	if err := p.run(ctx, args.RepoDir, "checkout", "-b", args.Branch); err != nil {
-		return nil, fmt.Errorf("gitops: checkout -b %s: %w", args.Branch, err)
+	if args.RebaseFromRemote {
+		// Shared-branch path for subsequent decomposed children: the remote
+		// branch already exists. Stash uncommitted agent edits, fetch+rebase,
+		// restore the edits, then fall through to add+commit+push.
+		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
+			return nil, fmt.Errorf("gitops: stash: %w", err)
+		}
+		if err := p.run(ctx, args.RepoDir, "fetch", remote, args.Branch); err != nil {
+			return nil, fmt.Errorf("gitops: fetch %s: %w", args.Branch, err)
+		}
+		// DWIM checkout creates a local tracking branch when it doesn't
+		// exist yet; is a no-op (switches to it) when it does.
+		if err := p.run(ctx, args.RepoDir, "checkout", args.Branch); err != nil {
+			return nil, fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)
+		}
+		if err := p.run(ctx, args.RepoDir, "pull", "--rebase", remote, args.Branch); err != nil {
+			return nil, fmt.Errorf("gitops: pull --rebase: %w", err)
+		}
+		if err := p.run(ctx, args.RepoDir, "stash", "pop"); err != nil {
+			return nil, fmt.Errorf("gitops: stash pop: %w", err)
+		}
+	} else {
+		if err := p.run(ctx, args.RepoDir, "checkout", "-b", args.Branch); err != nil {
+			return nil, fmt.Errorf("gitops: checkout -b %s: %w", args.Branch, err)
+		}
 	}
 	if err := p.run(ctx, args.RepoDir, "add", "-A"); err != nil {
 		return nil, fmt.Errorf("gitops: add: %w", err)
@@ -197,7 +233,11 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		}
 	}
 
-	if err := p.run(ctx, args.RepoDir, "push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)); err != nil {
+	pushArgs := []string{"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)}
+	if args.ForceWithLease {
+		pushArgs = append(pushArgs, "--force-with-lease")
+	}
+	if err := p.run(ctx, args.RepoDir, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
 	}
 

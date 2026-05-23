@@ -170,13 +170,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, decomposedFromRunID, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
 			return exitFailure
 		}
 		cfg.promptFile = path
+		cfg.decomposedFromRunID = decomposedFromRunID
 		stageType = sType
 		// Server-resolved timeout wins when operator didn't pass --timeout explicitly.
 		if cfg.timeout == 0 && agentTimeoutSecs > 0 {
@@ -637,22 +638,24 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 }
 
 // fetchPromptToFile pulls the constructed prompt from the backend,
-// writes it to a temp file, and returns the path, stage type, and
-// agent_timeout_seconds from the response. stageType drives per-stage
-// post-processing (plan validation + upload for plan stages,
-// commit+push+PR upload for implement stages). agentTimeoutSecs is the
-// spec-resolved wall-clock cap; 0 means the server didn't resolve one
-// and the caller should apply the local 15-minute fallback. The temp
-// file is 0o600 — bundle-style defense in depth, since prompts may
-// include issue bodies that the customer would prefer not to leave on
+// writes it to a temp file, and returns the path, stage type,
+// agent_timeout_seconds, and decomposed_from_run_id from the response.
+// stageType drives per-stage post-processing (plan validation + upload
+// for plan stages, commit+push+PR upload for implement stages).
+// agentTimeoutSecs is the spec-resolved wall-clock cap; 0 means the
+// server didn't resolve one and the caller should apply the local
+// 15-minute fallback. decomposedFromRunID is non-empty when this run is
+// a decomposed child — the caller threads it into cfg for branch routing.
+// The temp file is 0o600 — bundle-style defense in depth, since prompts
+// may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, decomposedFromRunID string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, fetchErr
+		return "", "", 0, "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -660,20 +663,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.DecomposedFromRunID, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -941,6 +944,17 @@ var (
 	newPROpener = func(token string) prOpener {
 		return &gitops.OpenPRClient{Token: token}
 	}
+
+	// remoteBranchExists reports whether the named branch exists on the
+	// remote. Used to distinguish first vs. subsequent decomposed-child
+	// runs for shared-branch routing. Test seam: production runs
+	// git show-ref; tests swap in a function that reads from a map.
+	remoteBranchExists = func(ctx context.Context, repoDir, branch string) bool {
+		// show-ref exits 0 when the ref exists, non-zero otherwise.
+		cmd := exec.CommandContext(ctx, "git", "show-ref", "--verify", "refs/remotes/origin/"+branch)
+		cmd.Dir = repoDir
+		return cmd.Run() == nil
+	}
 )
 
 // openPRAndShipArtifact is the implement-stage post-processing
@@ -1033,7 +1047,22 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	if repoDir == "" {
 		repoDir = "."
 	}
-	branch := fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
+
+	// Branch routing: decomposed children share a single parent branch;
+	// standalone runs get a per-stage branch.
+	var (
+		branch       string
+		isDecomposed bool
+		isSubsequent bool
+	)
+	if cfg.decomposedFromRunID != "" {
+		isDecomposed = true
+		branch = "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
+		isSubsequent = remoteBranchExists(ctx, repoDir, branch)
+	} else {
+		branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
+	}
+
 	title, body := prTitleAndBody(cfg, branch, logSink)
 	commitMessage := title + "\n\n" + body
 
@@ -1047,7 +1076,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// where the auth pre-step's token (set by actions/checkout)
 		// has expired by the time the agent finishes. See the
 		// FetchInstallationToken call above.
-		PushToken: token,
+		PushToken:        token,
+		ForceWithLease:   isDecomposed,
+		RebaseFromRemote: isSubsequent,
 	})
 	if err != nil {
 		return fmt.Errorf("commit+push: %w", err)
@@ -1060,6 +1091,18 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// No PR to open; no artifact to ship. The stage still
 		// counts as succeeded — the agent decided no edits were
 		// needed. Reviewer will see the empty trace + this log.
+		return nil
+	}
+
+	// Subsequent decomposed children pushed onto the shared branch but
+	// the PR was already created by the first child — skip OpenPR and
+	// ShipPullRequest. The first child's artifact already names the
+	// branch, so no update is needed.
+	if isSubsequent {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"implement_subsequent_child","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
+		)
 		return nil
 	}
 
