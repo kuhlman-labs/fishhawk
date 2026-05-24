@@ -67,3 +67,10 @@ backend/fishhawk-mcp
 runner/fishhawk-runner
 cli/fishhawk
 verifier/fishhawk-verify
+# go build invoked from repo root with `./<module>/cmd/<name>/` produces
+# a binary in cwd named after the package.
+/fishhawkd
+/fishhawk-mcp
+/fishhawk-runner
+/fishhawk
+/fishhawk-verify
