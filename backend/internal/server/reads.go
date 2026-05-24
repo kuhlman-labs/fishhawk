@@ -348,8 +348,11 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 		stageFilter = &stageID
 	}
 
+	chain := q.Get("chain") == "true"
 	var entries []*audit.Entry
-	if category != "" {
+	if chain {
+		entries, err = s.cfg.AuditRepo.ChainsByParent(r.Context(), runID, false)
+	} else if category != "" {
 		entries, err = s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, category)
 	} else {
 		entries, err = s.cfg.AuditRepo.ListForRun(r.Context(), runID)

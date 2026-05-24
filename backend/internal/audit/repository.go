@@ -82,6 +82,13 @@ type Repository interface {
 	// chain partition only; ListAll mixes both chains for human
 	// search.
 	ListAll(ctx context.Context, p ListAllParams) ([]*Entry, error)
+
+	// ChainsByParent returns audit entries for parentRunID and all its
+	// linked descendants, following parent_run_id links recursively.
+	// When includeDecomposed is false, runs where decomposed_from IS
+	// NOT NULL are excluded from the walk (CI-retry chain view).
+	// When true, all descendants are included (compliance export view).
+	ChainsByParent(ctx context.Context, parentRunID uuid.UUID, includeDecomposed bool) ([]*Entry, error)
 }
 
 // ListAllParams collects the optional filters for ListAll. nil means

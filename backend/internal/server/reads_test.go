@@ -583,6 +583,10 @@ func newAuditReadFake() *auditReadFake {
 func (a *auditReadFake) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (a *auditReadFake) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *auditReadFake) AppendChained(context.Context, audit.ChainAppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }

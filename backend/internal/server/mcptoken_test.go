@@ -106,6 +106,10 @@ type auditCapture struct {
 func (a *auditCapture) Append(_ context.Context, _ audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not implemented")
 }
+
+func (a *auditCapture) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *auditCapture) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

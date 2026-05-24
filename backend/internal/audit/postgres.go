@@ -279,6 +279,22 @@ func (r *postgresRepo) ListAll(ctx context.Context, p ListAllParams) ([]*Entry, 
 	return out, nil
 }
 
+func (r *postgresRepo) ChainsByParent(ctx context.Context, parentRunID uuid.UUID, includeDecomposed bool) ([]*Entry, error) {
+	q := auditdb.New(r.pool)
+	rows, err := q.ListAuditEntriesForRunChain(ctx, auditdb.ListAuditEntriesForRunChainParams{
+		ParentRunID:       parentRunID,
+		IncludeDecomposed: includeDecomposed,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("chain audit entries: %w", err)
+	}
+	out := make([]*Entry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToEntry(row))
+	}
+	return out, nil
+}
+
 func rowToEntry(r auditdb.AuditEntry) *Entry {
 	out := &Entry{
 		ID:           r.ID,

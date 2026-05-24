@@ -133,6 +133,10 @@ func newAuditFake() *auditFake { return &auditFake{} }
 func (a *auditFake) Append(_ context.Context, _ audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("auditFake: Append not used")
 }
+
+func (a *auditFake) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *auditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	if a.appendErr != nil {
 		return nil, a.appendErr

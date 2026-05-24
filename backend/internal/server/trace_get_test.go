@@ -123,6 +123,10 @@ func (a *traceReadAuditRepo) ListForRunByCategory(_ context.Context, _ uuid.UUID
 func (a *traceReadAuditRepo) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (a *traceReadAuditRepo) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *traceReadAuditRepo) AppendChained(context.Context, audit.ChainAppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
