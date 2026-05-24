@@ -1251,6 +1251,17 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Stage is not in a runnable state (awaiting_approval, awaiting_children, succeeded, failed, or cancelled).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Error' }
+                  - description: |
+                      `error.code` is `stage_not_runnable`.
+                      `error.details.current_state` holds the stage's current state string.
+                      `error.details.stage_id` holds the stage UUID.
         '501':
           description: Prompt construction not implemented for this stage type.
           content:
@@ -1301,6 +1312,17 @@ paths:
                     description: Parent run ID when this run is a decomposed child. Absent for standalone runs.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Stage is not in a runnable state (awaiting_approval, awaiting_children, succeeded, failed, or cancelled).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Error' }
+                  - description: |
+                      `error.code` is `stage_not_runnable`.
+                      `error.details.current_state` holds the stage's current state string.
+                      `error.details.stage_id` holds the stage UUID.
         '501':
           description: Prompt construction not implemented for this stage type.
           content:

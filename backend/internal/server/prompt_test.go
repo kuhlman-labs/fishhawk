@@ -874,6 +874,139 @@ func TestGetStagePrompt_DecomposedFromRunID_Absent_ForStandaloneRun(t *testing.T
 	}
 }
 
+// TestGetStagePrompt_StateGuard_* cover the 409 state guard on the
+// runner-facing prompt endpoint. One test per non-runnable state, plus
+// three no-regression checks for the runnable states.
+func TestGetStagePrompt_StateGuard_AwaitingApproval(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateAwaitingApproval, http.StatusConflict)
+}
+
+func TestGetStagePrompt_StateGuard_AwaitingChildren(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateAwaitingChildren, http.StatusConflict)
+}
+
+func TestGetStagePrompt_StateGuard_Succeeded(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateSucceeded, http.StatusConflict)
+}
+
+func TestGetStagePrompt_StateGuard_Failed(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateFailed, http.StatusConflict)
+}
+
+func TestGetStagePrompt_StateGuard_Cancelled(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateCancelled, http.StatusConflict)
+}
+
+func TestGetStagePrompt_StateGuard_Pending_Passes(t *testing.T) {
+	testPromptStateGuard(t, run.StageStatePending, http.StatusOK)
+}
+
+func TestGetStagePrompt_StateGuard_Dispatched_Passes(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateDispatched, http.StatusOK)
+}
+
+func TestGetStagePrompt_StateGuard_Running_Passes(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateRunning, http.StatusOK)
+}
+
+func testPromptStateGuard(t *testing.T, state run.StageState, wantStatus int) {
+	t.Helper()
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{ID: runID, Repo: "x/y", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, State: state}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != wantStatus {
+		t.Fatalf("status = %d, want %d:\n%s", w.Code, wantStatus, w.Body.String())
+	}
+	if wantStatus == http.StatusConflict {
+		var env errorEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if env.Error.Code != "stage_not_runnable" {
+			t.Errorf("error.code = %q, want stage_not_runnable", env.Error.Code)
+		}
+		if env.Error.Details["current_state"] != string(state) {
+			t.Errorf("current_state = %v, want %q", env.Error.Details["current_state"], string(state))
+		}
+		if env.Error.Details["stage_id"] != stageID.String() {
+			t.Errorf("stage_id = %v, want %q", env.Error.Details["stage_id"], stageID.String())
+		}
+	}
+}
+
+// TestGetStagePromptRender_StateGuard_* cover the 409 state guard on
+// the SPA-facing prompt-render endpoint.
+func TestGetStagePromptRender_StateGuard_AwaitingApproval(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateAwaitingApproval, http.StatusConflict)
+}
+
+func TestGetStagePromptRender_StateGuard_AwaitingChildren(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateAwaitingChildren, http.StatusConflict)
+}
+
+func TestGetStagePromptRender_StateGuard_Succeeded(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateSucceeded, http.StatusConflict)
+}
+
+func TestGetStagePromptRender_StateGuard_Failed(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateFailed, http.StatusConflict)
+}
+
+func TestGetStagePromptRender_StateGuard_Cancelled(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateCancelled, http.StatusConflict)
+}
+
+func TestGetStagePromptRender_StateGuard_Pending_Passes(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStatePending, http.StatusOK)
+}
+
+func TestGetStagePromptRender_StateGuard_Dispatched_Passes(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateDispatched, http.StatusOK)
+}
+
+func TestGetStagePromptRender_StateGuard_Running_Passes(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateRunning, http.StatusOK)
+}
+
+func testPromptRenderStateGuard(t *testing.T, state run.StageState, wantStatus int) {
+	t.Helper()
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	rr.runRow = &run.Run{ID: runID, Repo: "x/y", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, State: state}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != wantStatus {
+		t.Fatalf("status = %d, want %d:\n%s", w.Code, wantStatus, w.Body.String())
+	}
+	if wantStatus == http.StatusConflict {
+		var env errorEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if env.Error.Code != "stage_not_runnable" {
+			t.Errorf("error.code = %q, want stage_not_runnable", env.Error.Code)
+		}
+		if env.Error.Details["current_state"] != string(state) {
+			t.Errorf("current_state = %v, want %q", env.Error.Details["current_state"], string(state))
+		}
+		if env.Error.Details["stage_id"] != stageID.String() {
+			t.Errorf("stage_id = %v, want %q", env.Error.Details["stage_id"], stageID.String())
+		}
+	}
+}
+
 func TestGetStagePromptRender_DecomposedFromRunID_Present(t *testing.T) {
 	s, rr, _, _ := newPromptServer(t)
 	runID := uuid.New()

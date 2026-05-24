@@ -89,6 +89,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	switch stage.State {
+	case run.StageStateAwaitingApproval, run.StageStateAwaitingChildren,
+		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled:
+		s.writeError(w, r, http.StatusConflict, "stage_not_runnable",
+			"stage is not in a runnable state",
+			map[string]any{"current_state": string(stage.State), "stage_id": stageID.String()})
+		return
+	}
+
 	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -211,6 +220,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"get stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	switch stage.State {
+	case run.StageStateAwaitingApproval, run.StageStateAwaitingChildren,
+		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled:
+		s.writeError(w, r, http.StatusConflict, "stage_not_runnable",
+			"stage is not in a runnable state",
+			map[string]any{"current_state": string(stage.State), "stage_id": stageID.String()})
 		return
 	}
 
