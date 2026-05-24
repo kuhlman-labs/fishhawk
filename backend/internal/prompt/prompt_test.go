@@ -158,6 +158,7 @@ func TestBuild_Plan(t *testing.T) {
 		"standard_v1",
 		"scripts/sync-schemas",
 		"docs/spec/",
+		"citation",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -327,6 +328,30 @@ func TestBuild_Implement_WithApprovedPlan_IsDeterministic(t *testing.T) {
 	b, _ := Build("implement", tr)
 	if a != b {
 		t.Error("Build with ApprovedPlan is non-deterministic across calls")
+	}
+}
+
+func TestBuild_Plan_CitationOrTestRule(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"citation",
+		"test",
+		"risks_and_assumptions",
+		"SIGKILL",
+		"cmd.Wait",
+		"syscall.SysProcAttr",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing citation-or-test rule string %q\n---\n%s", w, got)
+		}
 	}
 }
 
