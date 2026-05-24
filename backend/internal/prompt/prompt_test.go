@@ -513,6 +513,20 @@ func TestBuild_Plan_CalibrationHint_Deterministic(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_ContainsIncrementalVerification(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		Source:      "github_issue",
+		IssueNumber: 7,
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "Incremental verification discipline") {
+		t.Errorf("plan prompt missing 'Incremental verification discipline':\n%s", got)
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop
