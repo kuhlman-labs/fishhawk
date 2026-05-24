@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -52,6 +53,40 @@ var runStageGitRemoteOriginURL = func(dir string) (string, error) {
 // shorten it.
 var runStageGracePeriod = 30 * time.Second
 
+// runStageGitNumstat runs `git show --numstat HEAD` in dir and returns
+// the raw output. Exposed as a var so tests can inject fake output
+// without needing a real git repo.
+var runStageGitNumstat = func(dir string) (string, error) {
+	cmd := exec.Command("git", "show", "--numstat", "HEAD")
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// DiffSummary reports the diff stats for the commit the runner made.
+// Present only when the runner emitted a git_diff event and
+// git show --numstat HEAD succeeded; nil otherwise (e.g. plan stages,
+// or runners that exited without committing).
+type DiffSummary struct {
+	FilesChanged int `json:"files_changed"`
+	Insertions   int `json:"insertions"`
+	Deletions    int `json:"deletions"`
+}
+
+// AuditPointer identifies the most-recent audit entry for the run.
+// Populated after the runner exits via GET /v0/audit?run_id=<id>&limit=1;
+// nil on any fetch failure.
+type AuditPointer struct {
+	LatestSequence int64  `json:"latest_sequence"`
+	EntryHash      string `json:"entry_hash"`
+	URL            string `json:"url"`
+}
+
 // RunStageInput is the fishhawk_run_stage tool's input schema
 // (ADR-024 / #433, impl #434). Mirrors `fishhawk runner start`'s
 // flags so an agent driving the local-runner loop end-to-end via
@@ -78,11 +113,18 @@ type RunStageInput struct {
 // lines, failed post-run stage fetch, missing github_repo, etc.
 // None of these fail the tool itself — the runner's exit is the
 // canonical outcome.
+//
+// DiffSummary, AuditPointer, and RunURL are best-effort enrichment
+// fields; they are omitted (nil / empty) when unavailable and never
+// fail the tool.
 type RunStageOutput struct {
-	ExitCode   int           `json:"exit_code"`
-	StageState string        `json:"stage_state,omitempty" jsonschema:"final stage state fetched after the runner exits; empty when the fetch failed"`
-	Events     []RunnerEvent `json:"events" jsonschema:"runner-emitted JSONL events in arrival order"`
-	Warnings   []string      `json:"warnings,omitempty"`
+	ExitCode     int           `json:"exit_code"`
+	StageState   string        `json:"stage_state,omitempty" jsonschema:"final stage state fetched after the runner exits; empty when the fetch failed"`
+	Events       []RunnerEvent `json:"events" jsonschema:"runner-emitted JSONL events in arrival order"`
+	Warnings     []string      `json:"warnings,omitempty"`
+	DiffSummary  *DiffSummary  `json:"diff_summary,omitempty" jsonschema:"present when the runner emitted a git_diff event and git show --numstat HEAD succeeded; nil for plan stages"`
+	AuditPointer *AuditPointer `json:"audit_pointer,omitempty" jsonschema:"most-recent audit entry for this run with its entry hash; nil on any fetch failure"`
+	RunURL       string        `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
 }
 
 // RunnerEvent wraps an unstructured runner event. Each event is the
@@ -142,6 +184,20 @@ agent-driven local-runner loop:
 Runner output streams as MCP progress notifications when the
 client provides a progress token; the final tool result carries
 the full event list plus the post-run stage state.
+
+Output fields (three additional best-effort fields, omitted when
+unavailable):
+
+  - diff_summary    — present when the runner emitted a git_diff
+                      event and 'git show --numstat HEAD' succeeded;
+                      reports files_changed, insertions, deletions.
+                      nil for plan stages and failed implement stages
+                      that did not commit.
+  - audit_pointer   — the most-recent audit entry for this run:
+                      latest_sequence, entry_hash, and a URL to the
+                      per-run audit API endpoint. nil when the
+                      best-effort fetch fails.
+  - run_url         — direct link to the run-detail view in the SPA.
 
 Cancellation: cancelling the tool call sends SIGTERM (then SIGKILL
 after a 30s grace) to the runner. Graceful cleanup requires the
@@ -374,24 +430,71 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 			fmt.Sprintf("post-run stage fetch failed: %v", fetchErr))
 	}
 
+	// Populate DiffSummary: gate on the git_diff runner event being
+	// present so plan stages (which never emit git_diff) always yield
+	// nil, and failed implement stages that didn't commit also yield nil.
+	var diffSummary *DiffSummary
+	if gitDiffPayload := findGitDiffPayload(events); gitDiffPayload != nil {
+		filesChanged := 0
+		if cf, ok := gitDiffPayload["changed_files"].([]any); ok {
+			filesChanged = len(cf)
+		}
+		if numstatOut, numstatErr := runStageGitNumstat(workingDir); numstatErr == nil {
+			ins, dels := parseNumstat(numstatOut)
+			diffSummary = &DiffSummary{
+				FilesChanged: filesChanged,
+				Insertions:   ins,
+				Deletions:    dels,
+			}
+		}
+	}
+
+	// Populate AuditPointer: best-effort, 5-second timeout. Mirrors
+	// the stageState fetch pattern above. Nil on any failure — no
+	// warning per the acceptance criteria.
+	var auditPointer *AuditPointer
+	func() {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		entries, aerr := r.api.ListRecentRunAudit(fetchCtx, runUUID, 1)
+		if aerr != nil || len(entries) == 0 {
+			return
+		}
+		auditPointer = &AuditPointer{
+			LatestSequence: entries[0].Sequence,
+			EntryHash:      entries[0].EntryHash,
+			URL:            r.api.baseURL + "/v0/runs/" + runUUID.String() + "/audit?limit=1",
+		}
+	}()
+
+	// RunURL is the SPA run-detail link — pure string concatenation,
+	// no failure mode.
+	runURL := r.api.baseURL + "/runs/" + runUUID.String()
+
 	// Return-cancellation signal: if the parent ctx was the reason
 	// for exit, surface a clear tool error rather than a 0 / silent
 	// success.
 	if ctx.Err() != nil {
 		return nil, RunStageOutput{
-				ExitCode:   exitCode,
-				StageState: stageState,
-				Events:     events,
-				Warnings:   warnings,
+				ExitCode:     exitCode,
+				StageState:   stageState,
+				Events:       events,
+				Warnings:     warnings,
+				DiffSummary:  diffSummary,
+				AuditPointer: auditPointer,
+				RunURL:       runURL,
 			},
 			fmt.Errorf("fishhawk_run_stage cancelled: %w", ctx.Err())
 	}
 
 	return nil, RunStageOutput{
-		ExitCode:   exitCode,
-		StageState: stageState,
-		Events:     events,
-		Warnings:   warnings,
+		ExitCode:     exitCode,
+		StageState:   stageState,
+		Events:       events,
+		Warnings:     warnings,
+		DiffSummary:  diffSummary,
+		AuditPointer: auditPointer,
+		RunURL:       runURL,
 	}, nil
 }
 
@@ -485,6 +588,51 @@ func runStageDetectGitHubRepo(workingDir string) (string, error) {
 		return "", err
 	}
 	return owner + "/" + name, nil
+}
+
+// findGitDiffPayload scans events for a runner event with
+// kind=="git_diff" and returns its payload map, or nil when absent.
+func findGitDiffPayload(events []RunnerEvent) map[string]any {
+	for _, ev := range events {
+		m, ok := ev.Payload.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["kind"] == "git_diff" {
+			return m
+		}
+	}
+	return nil
+}
+
+// parseNumstat parses `git show --numstat HEAD` output and sums
+// insertions and deletions across all file rows, skipping binary-file
+// rows where either column is '-'.
+func parseNumstat(output string) (insertions, deletions int) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		if parts[0] == "-" || parts[1] == "-" {
+			continue // binary file — columns are not numeric
+		}
+		ins, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		del, err := strconv.Atoi(parts[1])
+		if err != nil {
+			continue
+		}
+		insertions += ins
+		deletions += del
+	}
+	return
 }
 
 // runStageParseGitHubRemote turns a remote URL into (owner, name).
