@@ -99,6 +99,7 @@ Two audiences with different scopes:
 | `fishhawk_get_plan` | Returns the approved standard_v1 plan; walks `parent_run_id` for CI-retry chains. |
 | `fishhawk_get_run_status` | Bundles Run + ordered stages + recent audit (time-descending) into one tool call. |
 | `fishhawk_list_audit` | Filtered audit access (`category`, `stage_id`) with cursor pagination. |
+| `fishhawk_verify_run` | Verify audit chain integrity for a run — checks every entry hash and chain link. `verified=false` is a halt condition before opening a PR. |
 
 ### Write tools (operator-side only)
 
@@ -136,6 +137,7 @@ The composition matches the CLI's `fishhawk run start --working-dir … --issue 
 2. Agent calls `fishhawk_run_stage --stage plan` (the MCP server spawns `fishhawk-runner` and streams events).
 3. Agent calls `fishhawk_approve_plan`.
 4. Agent calls `fishhawk_run_stage --stage implement`.
+5. Agent calls `fishhawk_verify_run` with the run id. A `verified=false` result is a halt — do not open a PR; file an incident.
 
 The `fishhawk_run_stage` tool requires the `fishhawk-runner` binary on the MCP server's host (`PATH` lookup, overridable via `FISHHAWK_RUNNER_BIN` env or the tool's `runner_binary` input). The MCP server runs locally on an operator's workstation today, so this is always satisfied; a future hosted MCP deployment will surface a clean tool error.
 
