@@ -60,6 +60,7 @@ func TestParse_UnknownUnitWraps(t *testing.T) {
 // -----------------------------------------------------------------
 
 type fakeRepo struct {
+	run.BaseFake
 	mu     sync.Mutex
 	stages []*run.Stage
 
@@ -118,29 +119,6 @@ func (f *fakeRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.Stage
 	return nil, run.ErrNotFound
 }
 
-// Stub the rest of run.Repository so fakeRepo satisfies the interface.
-func (f *fakeRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
-	return nil, errors.New("not used")
-}
-func (f *fakeRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
-	return nil, errors.New("not used")
-}
-func (f *fakeRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
-	return nil, run.ErrNotFound
-}
-func (f *fakeRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
-	return nil, errors.New("not used")
-}
-func (f *fakeRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
-	return nil, errors.New("not used")
-}
-func (f *fakeRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
-	return nil, errors.New("not used")
-}
-func (f *fakeRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
-	return nil, errors.New("not used")
-}
-
 // GetStage backs run.FailStage's pre-flight read of the current
 // stage state. The SLA tick path always sees stages in
 // awaiting_approval, so a single-pass lookup is enough.
@@ -155,23 +133,17 @@ func (f *fakeRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error)
 	return nil, run.ErrNotFound
 }
 
-func (f *fakeRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
-}
-
 type fakeAudit struct {
+	audit.BaseFake
 	mu        sync.Mutex
 	appended  []audit.ChainAppendParams
 	appendErr error
 }
 
-func (a *fakeAudit) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
-	return nil, errors.New("not used")
-}
-
 func (a *fakeAudit) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
 	return nil, nil
 }
+
 func (a *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -182,28 +154,6 @@ func (a *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 	rid := p.RunID
 	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
 }
-func (a *fakeAudit) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
-	return nil, errors.New("not used")
-}
-func (a *fakeAudit) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
-	return nil, audit.ErrNotFound
-}
-func (a *fakeAudit) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, error) {
-	return nil, nil
-}
-func (a *fakeAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
-	return nil, nil
-}
-func (a *fakeAudit) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
-	return nil, nil
-}
-func (a *fakeAudit) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
-	return nil, audit.ErrNotFound
-}
-func (a *fakeAudit) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
-	return nil, nil
-}
-
 func ptrStr(s string) *string { return &s }
 
 func mkStage(updatedAgo time.Duration, sla *string) *run.Stage {
