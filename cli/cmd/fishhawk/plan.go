@@ -69,20 +69,21 @@ func planDecision(name string, decision httpclient.ApprovalDecision, args []stri
 	reason := fs.String("reason", "", "optional comment recorded on the approval row")
 	outputFmt := fs.String("output", "text", "output format: text | json")
 	fs.StringVar(outputFmt, "o", "text", "output format: text | json (shorthand)")
-	if err := fs.Parse(args); err != nil {
+	positionals, err := parseIntermixed(fs, args)
+	if err != nil {
 		return exitUsage
 	}
 	if err := validateOutputFormat(*outputFmt); err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: %v\n", name, err)
 		return exitUsage
 	}
-	if fs.NArg() != 1 {
+	if len(positionals) != 1 {
 		_, _ = fmt.Fprintf(stderr, "%s: <run-id> required\n", name)
 		return exitUsage
 	}
-	runID, err := uuid.Parse(fs.Arg(0))
+	runID, err := uuid.Parse(positionals[0])
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "%s: %q is not a UUID: %v\n", name, fs.Arg(0), err)
+		_, _ = fmt.Fprintf(stderr, "%s: %q is not a UUID: %v\n", name, positionals[0], err)
 		return exitUsage
 	}
 	if decision == httpclient.ApprovalReject && *reason == "" {

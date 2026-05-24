@@ -1254,6 +1254,151 @@ func TestPlanReject_BadUUID(t *testing.T) {
 	}
 }
 
+// TestIntermixedFlagOrder verifies that flags may appear after the positional
+// run-id argument. Go's stdlib flag package stops at the first non-flag arg,
+// so parseIntermixed is needed to resume parsing after each positional.
+func TestIntermixedFlagOrder(t *testing.T) {
+	type checkFn func(*testing.T, *fakeBackend, uuid.UUID, string)
+
+	tests := []struct {
+		name     string
+		wantCode int
+		setup    func(*fakeBackend, uuid.UUID)
+		args     func(string) []string
+		check    checkFn
+	}{
+		{
+			// Reported failure: arg before flag in plan approve.
+			name:     "plan approve arg-then-flag",
+			wantCode: exitOK,
+			setup: func(fb *fakeBackend, runID uuid.UUID) {
+				stages := planApproveStages(runID, "awaiting_approval")
+				fb.stagesForRun[runID] = stages
+				fb.approvalResp = httpclient.Stage{
+					ID: stages[0].ID, RunID: runID, Sequence: 1, Type: "plan",
+					State:    "succeeded",
+					Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+				}
+			},
+			args: func(id string) []string {
+				return []string{"plan", "approve", id, "--reason", "lgtm"}
+			},
+			check: func(t *testing.T, fb *fakeBackend, _ uuid.UUID, _ string) {
+				t.Helper()
+				if fb.approvedID == "" {
+					t.Error("approval endpoint not reached")
+				}
+				if fb.approvalBody.Comment != "lgtm" {
+					t.Errorf("comment = %q, want lgtm", fb.approvalBody.Comment)
+				}
+			},
+		},
+		{
+			// Regression guard: flag before arg must still work.
+			name:     "plan approve flag-then-arg",
+			wantCode: exitOK,
+			setup: func(fb *fakeBackend, runID uuid.UUID) {
+				stages := planApproveStages(runID, "awaiting_approval")
+				fb.stagesForRun[runID] = stages
+				fb.approvalResp = httpclient.Stage{
+					ID: stages[0].ID, RunID: runID, Sequence: 1, Type: "plan",
+					State:    "succeeded",
+					Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+				}
+			},
+			args: func(id string) []string {
+				return []string{"plan", "approve", "--reason", "lgtm", id}
+			},
+			check: func(t *testing.T, fb *fakeBackend, _ uuid.UUID, _ string) {
+				t.Helper()
+				if fb.approvedID == "" {
+					t.Error("approval endpoint not reached")
+				}
+				if fb.approvalBody.Comment != "lgtm" {
+					t.Errorf("comment = %q, want lgtm", fb.approvalBody.Comment)
+				}
+			},
+		},
+		{
+			// plan reject with arg before flag.
+			name:     "plan reject arg-then-flag",
+			wantCode: exitOK,
+			setup: func(fb *fakeBackend, runID uuid.UUID) {
+				stages := planApproveStages(runID, "awaiting_approval")
+				fb.stagesForRun[runID] = stages
+				cat := "D"
+				reason := "too wide"
+				fb.approvalResp = httpclient.Stage{
+					ID: stages[0].ID, RunID: runID, Sequence: 1, Type: "plan",
+					State: "failed", FailureCategory: &cat, FailureReason: &reason,
+					Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+				}
+			},
+			args: func(id string) []string {
+				return []string{"plan", "reject", id, "--reason", "too wide"}
+			},
+			check: func(t *testing.T, fb *fakeBackend, _ uuid.UUID, _ string) {
+				t.Helper()
+				if fb.approvedID == "" {
+					t.Error("approval endpoint not reached")
+				}
+				if fb.approvalBody.Decision != httpclient.ApprovalReject {
+					t.Errorf("decision = %q, want reject", fb.approvalBody.Decision)
+				}
+				if fb.approvalBody.Comment != "too wide" {
+					t.Errorf("comment = %q, want 'too wide'", fb.approvalBody.Comment)
+				}
+			},
+		},
+		{
+			// run status with arg before flag.
+			name:     "run status arg-then-flag",
+			wantCode: exitOK,
+			setup: func(fb *fakeBackend, runID uuid.UUID) {
+				fb.getResp = httpclient.Run{ID: runID, State: "running"}
+			},
+			args: func(id string) []string {
+				return []string{"run", "status", id, "--output", "json"}
+			},
+			check: func(t *testing.T, _ *fakeBackend, runID uuid.UUID, out string) {
+				t.Helper()
+				if !strings.Contains(out, runID.String()) {
+					t.Errorf("stdout missing run-id %s:\n%s", runID, out)
+				}
+			},
+		},
+		{
+			// Missing run-id must still return exitUsage.
+			name:     "plan approve missing run-id",
+			wantCode: exitUsage,
+			setup:    nil,
+			args: func(_ string) []string {
+				return []string{"plan", "approve", "--reason", "x"}
+			},
+			check: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			withBackend(t, srv)
+			runID := uuid.New()
+			if tc.setup != nil {
+				tc.setup(fb, runID)
+			}
+			var stdout strings.Builder
+			got := run(tc.args(runID.String()), &stdout, io.Discard)
+			if got != tc.wantCode {
+				t.Errorf("exit code = %d, want %d", got, tc.wantCode)
+			}
+			if tc.check != nil {
+				tc.check(t, fb, runID, stdout.String())
+			}
+		})
+	}
+}
+
 func TestPlan_UnknownSubcommand(t *testing.T) {
 	var stderr strings.Builder
 	got := run([]string{"plan", "frobnicate"}, io.Discard, &stderr)
