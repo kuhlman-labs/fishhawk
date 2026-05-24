@@ -104,6 +104,9 @@ type fakeAudit struct {
 	appended []audit.ChainAppendParams
 }
 
+func (f *fakeAudit) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (f *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

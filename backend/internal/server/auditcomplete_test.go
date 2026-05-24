@@ -192,6 +192,10 @@ func (f *auditCompleteAuditFake) Append(context.Context, audit.AppendParams) (*a
 // AppendChained is called by writeApprovalAudit on a successful
 // approve. Record-and-return is enough; the entry shape isn't
 // asserted here.
+
+func (f *auditCompleteAuditFake) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (f *auditCompleteAuditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	rid := p.RunID
 	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil

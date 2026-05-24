@@ -148,6 +148,58 @@ func (q *Queries) GetLastGlobalAuditEntry(ctx context.Context) (AuditEntry, erro
 	return i, err
 }
 
+const listAuditEntriesForRunChain = `-- name: ListAuditEntriesForRunChain :many
+WITH RECURSIVE run_chain AS (
+    SELECT id FROM runs WHERE id = $1
+    UNION ALL
+    SELECT r.id FROM runs r
+    JOIN run_chain rc ON r.parent_run_id = rc.id
+    WHERE ($2::boolean OR r.decomposed_from IS NULL)
+)
+SELECT ae.id, ae.sequence, ae.run_id, ae.stage_id, ae.ts, ae.category,
+       ae.actor_kind, ae.actor_subject, ae.payload, ae.prev_hash, ae.entry_hash
+FROM audit_entries ae
+JOIN run_chain rc ON ae.run_id = rc.id
+ORDER BY ae.sequence ASC
+`
+
+type ListAuditEntriesForRunChainParams struct {
+	ParentRunID       uuid.UUID `json:"parent_run_id"`
+	IncludeDecomposed bool      `json:"include_decomposed"`
+}
+
+func (q *Queries) ListAuditEntriesForRunChain(ctx context.Context, arg ListAuditEntriesForRunChainParams) ([]AuditEntry, error) {
+	rows, err := q.db.Query(ctx, listAuditEntriesForRunChain, arg.ParentRunID, arg.IncludeDecomposed)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditEntry
+	for rows.Next() {
+		var i AuditEntry
+		if err := rows.Scan(
+			&i.ID,
+			&i.Sequence,
+			&i.RunID,
+			&i.StageID,
+			&i.Ts,
+			&i.Category,
+			&i.ActorKind,
+			&i.ActorSubject,
+			&i.Payload,
+			&i.PrevHash,
+			&i.EntryHash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAuditEntriesAll = `-- name: ListAuditEntriesAll :many
 SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
  WHERE ($1::text IS NULL OR category = $1::text)

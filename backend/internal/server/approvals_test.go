@@ -278,6 +278,10 @@ func newApprovalAuditFake() *approvalAuditFake { return &approvalAuditFake{} }
 func (a *approvalAuditFake) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (a *approvalAuditFake) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *approvalAuditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

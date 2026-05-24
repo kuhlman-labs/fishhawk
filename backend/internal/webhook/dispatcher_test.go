@@ -1017,6 +1017,10 @@ type stubAudit struct {
 func (s *stubAudit) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (s *stubAudit) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (s *stubAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

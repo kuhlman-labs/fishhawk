@@ -128,6 +128,10 @@ type recordingAudit struct {
 func (r *recordingAudit) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
 	return nil, nil
 }
+
+func (r *recordingAudit) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (r *recordingAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

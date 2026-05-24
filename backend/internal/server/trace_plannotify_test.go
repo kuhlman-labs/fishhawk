@@ -326,6 +326,9 @@ func (f *planReadyAuditFake) Append(context.Context, audit.AppendParams) (*audit
 	return nil, errPlanReadyFakeNotImpl
 }
 
+func (f *planReadyAuditFake) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (f *planReadyAuditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

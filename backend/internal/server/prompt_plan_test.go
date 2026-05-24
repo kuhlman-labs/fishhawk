@@ -154,6 +154,10 @@ type planAuditRepo struct {
 func (a *planAuditRepo) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (a *planAuditRepo) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *planAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	a.appended = append(a.appended, p)
 	rid := p.RunID
