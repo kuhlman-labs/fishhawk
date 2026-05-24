@@ -152,6 +152,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		if s.loadLastDecomposeRejectionReason(r.Context(), runRow.ID) {
 			trigger.DecomposeRequired = true
 		}
+		if hint, err := s.resolveCalibrationHint(r.Context(), runRow.WorkflowID); err != nil {
+			slog.WarnContext(r.Context(), "calibration hint resolution failed", "error", err)
+		} else {
+			trigger.CalibrationHint = hint
+		}
 	}
 
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
@@ -274,6 +279,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	if stage.Type == run.StageTypePlan {
 		if s.loadLastDecomposeRejectionReason(r.Context(), runRow.ID) {
 			trigger.DecomposeRequired = true
+		}
+		if hint, err := s.resolveCalibrationHint(r.Context(), runRow.WorkflowID); err != nil {
+			slog.WarnContext(r.Context(), "calibration hint resolution failed", "error", err)
+		} else {
+			trigger.CalibrationHint = hint
 		}
 	}
 
@@ -404,6 +414,60 @@ func (s *Server) loadApprovedPlanForRun(ctx context.Context, runID uuid.UUID) (*
 		slog.String("run_id", runID.String()),
 		slog.Int("max_depth", retryPlanChainDepth))
 	return nil, nil
+}
+
+// calibrationHintMinSamples is the minimum number of historical implement-
+// stage samples required before the calibration hint is appended to the
+// plan-stage prompt. Below this threshold the section is silently omitted.
+const calibrationHintMinSamples = 5
+
+// resolveCalibrationHint loads runtime_observed audit entries for the
+// workflow, filters to implement-stage samples, and computes calibration
+// statistics. Returns nil when the AuditRepo is unconfigured, when RunRepo
+// is nil (can't resolve workflow_id per entry), or when the sample count
+// is below calibrationHintMinSamples. Errors degrade gracefully — the
+// caller logs at WARN and proceeds with a hint-free prompt.
+func (s *Server) resolveCalibrationHint(ctx context.Context, workflowID string) (*prompt.CalibrationHint, error) {
+	if s.cfg.AuditRepo == nil {
+		return nil, nil
+	}
+	const runtimeObservedCategory = "runtime_observed"
+	cat := runtimeObservedCategory
+	entries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &cat})
+	if err != nil {
+		return nil, fmt.Errorf("list runtime_observed entries: %w", err)
+	}
+	var samples []runtimeObservedPayload
+	for _, e := range entries {
+		var p runtimeObservedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		if p.StageType != "implement" {
+			continue
+		}
+		if e.RunID == nil || s.cfg.RunRepo == nil {
+			continue
+		}
+		runRow, err := s.cfg.RunRepo.GetRun(ctx, *e.RunID)
+		if err != nil || runRow.WorkflowID != workflowID {
+			continue
+		}
+		samples = append(samples, p)
+	}
+	result := computeCalibration(workflowID, "implement", samples)
+	if result.Samples < calibrationHintMinSamples {
+		return nil, nil
+	}
+	bands := make(map[string]prompt.CalibrationBand, len(result.ConfidenceBandAccuracy))
+	for level, b := range result.ConfidenceBandAccuracy {
+		bands[level] = prompt.CalibrationBand{Samples: b.Samples, WithinScale: b.Within1p5x}
+	}
+	return &prompt.CalibrationHint{
+		Samples:          result.Samples,
+		CalibrationRatio: result.CalibrationRatio,
+		ConfidenceBands:  bands,
+	}, nil
 }
 
 // retryPlanChainDepth caps the parent-walk in loadApprovedPlanForRun.
