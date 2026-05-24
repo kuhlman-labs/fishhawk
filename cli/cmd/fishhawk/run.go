@@ -239,7 +239,8 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	cf := bindCommonFlags(fs)
 	outputFmt := fs.String("output", "text", "output format: text | json")
 	fs.StringVar(outputFmt, "o", "text", "output format: text | json (shorthand)")
-	if err := fs.Parse(args); err != nil {
+	positionals, err := parseIntermixed(fs, args)
+	if err != nil {
 		return exitUsage
 	}
 	switch *outputFmt {
@@ -248,13 +249,13 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "fishhawk run status: invalid --output %q (want text|json)\n", *outputFmt)
 		return exitUsage
 	}
-	if fs.NArg() != 1 {
+	if len(positionals) != 1 {
 		_, _ = fmt.Fprintln(stderr, "fishhawk run status: <run-id> required")
 		return exitUsage
 	}
-	id, err := uuid.Parse(fs.Arg(0))
+	id, err := uuid.Parse(positionals[0])
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "fishhawk run status: %q is not a UUID: %v\n", fs.Arg(0), err)
+		_, _ = fmt.Fprintf(stderr, "fishhawk run status: %q is not a UUID: %v\n", positionals[0], err)
 		return exitUsage
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
