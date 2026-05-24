@@ -227,6 +227,17 @@ func buildPlan(t Trigger) string {
 	b.WriteString("\n")
 	b.WriteString("If your plan scope includes any file under docs/spec/, the verification steps must include: " +
 		"run scripts/sync-schemas after editing the canonical copy; CI schema-sync gate will catch embedded copies that drift.\n")
+	b.WriteString("\n")
+	b.WriteString("Citation-or-test rule: for every non-obvious OS, runtime, network, or third-party-API semantic claim in risks_and_assumptions, " +
+		"the entry MUST include either a citation (URL, man page, RFC number) or a concrete test that would fail if the assumption is wrong. " +
+		"An unsupported claim that looks well-reasoned disarms the reviewer's check reflex — if it sounds plausible, reviewers stop verifying.\n")
+	b.WriteString("\n")
+	b.WriteString("Counter-examples from production bugs:\n")
+	b.WriteString("- SIGKILL and orphan file descriptors: SIGKILL kills only the direct child process; grandchildren that inherited stdout " +
+		"via fork keep the pipe writer alive, preventing EOF on the reader. Fix: set syscall.SysProcAttr Setpgid:true and send " +
+		"kill(-pgid, SIGKILL). Cited: syscall.SysProcAttr docs (https://pkg.go.dev/syscall#SysProcAttr).\n")
+	b.WriteString("- cmd.Wait and pipe-read race: cmd.Wait closes the parent-side pipe file descriptors while a goroutine is still reading " +
+		"from them. Fix: drain the pipe before calling Wait, or use io.Pipe indirection. Cited: os/exec.Cmd.Wait docs (https://pkg.go.dev/os/exec#Cmd.Wait).\n")
 	return b.String()
 }
 
