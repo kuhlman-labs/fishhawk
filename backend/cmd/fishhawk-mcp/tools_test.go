@@ -126,6 +126,14 @@ type fakeBackend struct {
 	approvalsStatus     int
 	approvalsErrBody    string
 	approvalsCalledByID map[uuid.UUID]int
+
+	// Calibration fixtures: GET /v0/calibration.
+	// calibrationResp drives the response body.
+	// calibrationStatus drives the HTTP status code (default 200).
+	// lastCalibrationQuery records the raw query string for assertion.
+	calibrationResp      CalibrationResult
+	calibrationStatus    int
+	lastCalibrationQuery string
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -158,6 +166,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		approvalsResp:            map[uuid.UUID]Stage{},
 		approvalsStatus:          http.StatusOK,
 		approvalsCalledByID:      map[uuid.UUID]int{},
+		calibrationStatus:        http.StatusOK,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
@@ -357,6 +366,16 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Unlock()
 		w.WriteHeader(fb.artifactsStatus)
 		_ = json.NewEncoder(w).Encode(listArtifactsResult{Items: items})
+	})
+	mux.HandleFunc("GET /v0/calibration", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.lastCalibrationQuery = r.URL.RawQuery
+		status := fb.calibrationStatus
+		resp := fb.calibrationResp
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -2446,5 +2465,74 @@ func TestListRuns_CursorRoundTrip_WalksPagination(t *testing.T) {
 	}
 	if len(second.Items) != 1 || second.Items[0].ID != id2.String() {
 		t.Errorf("page 2 items = %+v, want a single run with id %s", second.Items, id2.String())
+	}
+}
+
+// ── runtime_calibration tool ──────────────────────────────────────────────────
+
+func TestRuntimeCalibration_HappyPath(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	fb.calibrationResp = CalibrationResult{
+		Samples:             10,
+		PredictedP50Minutes: 15.0,
+		ActualP50Minutes:    12.0,
+		ActualP95Minutes:    20.0,
+		CalibrationRatio:    0.8,
+		ConfidenceBandAccuracy: map[string]any{
+			"medium": map[string]any{"samples": float64(10), "within_1.5x": float64(8)},
+		},
+	}
+
+	_, out, err := r.runtimeCalibration(context.Background(), nil, RuntimeCalibrationInput{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Samples != 10 {
+		t.Errorf("Samples = %d, want 10", out.Samples)
+	}
+	if out.CalibrationRatio != 0.8 {
+		t.Errorf("CalibrationRatio = %f, want 0.8", out.CalibrationRatio)
+	}
+	if out.ActualP95Minutes != 20.0 {
+		t.Errorf("ActualP95Minutes = %f, want 20.0", out.ActualP95Minutes)
+	}
+}
+
+func TestRuntimeCalibration_FiltersForwarded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.runtimeCalibration(context.Background(), nil, RuntimeCalibrationInput{
+		WorkflowID: "my-workflow",
+		StageType:  "implement",
+		Since:      "2026-01-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	q := fb.lastCalibrationQuery
+	if !strings.Contains(q, "workflow_id=my-workflow") {
+		t.Errorf("query %q missing workflow_id", q)
+	}
+	if !strings.Contains(q, "stage_type=implement") {
+		t.Errorf("query %q missing stage_type", q)
+	}
+	if !strings.Contains(q, "since=") {
+		t.Errorf("query %q missing since", q)
+	}
+}
+
+func TestRuntimeCalibration_BackendError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	fb.calibrationStatus = http.StatusInternalServerError
+
+	_, _, err := r.runtimeCalibration(context.Background(), nil, RuntimeCalibrationInput{})
+	if err == nil {
+		t.Fatal("expected error on 500, got nil")
 	}
 }

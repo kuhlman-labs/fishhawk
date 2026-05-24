@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -20,7 +21,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -698,5 +701,173 @@ func TestShipTrace_OmitsRunnerKindWhenRunRepoNil(t *testing.T) {
 	}
 	if _, present := payload["runner_kind"]; present {
 		t.Errorf("payload should omit runner_kind when no RunRepo; got %v", payload["runner_kind"])
+	}
+}
+
+// ── runtime_observed emission from trace upload ───────────────────────────────
+
+// makeTimedBundle builds a minimal gzip JSONL bundle with a manifest
+// (agent_failed=false), two intermediate events at t0 and t1, and a
+// trailer. ExtractTiming will return (t0, t1, true) for this bundle.
+func makeTimedBundle(t *testing.T, t0, t1 time.Time) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		TS   time.Time       `json:"ts"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	lines := []line{
+		{Seq: 1, TS: t0.Add(-time.Second), Kind: bundle.EventKindManifest,
+			Data: json.RawMessage(`{"bundle_schema":"v1","agent_failed":false}`)},
+		{Seq: 2, TS: t0, Kind: "agent_start", Data: json.RawMessage(`{}`)},
+		{Seq: 3, TS: t1, Kind: "agent_end", Data: json.RawMessage(`{}`)},
+		{Seq: 4, TS: t1.Add(time.Second), Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, err := json.Marshal(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// seedPlanArtifactForRun inserts a standard_v1 plan artifact with the
+// given predicted_runtime_minutes into art, associated with planStageID.
+func seedPlanArtifactForRun(t *testing.T, art *fakeArtifactRepo, planStageID uuid.UUID, predictedMinutes int) {
+	t.Helper()
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    predictedMinutes,
+		PredictedRuntimeConfidence: plan.RuntimeConfidenceMedium,
+	}
+	seedBudgetPlanArtifact(t, art, planStageID, p)
+}
+
+// TestShipTrace_EmitRuntimeObserved_ImplementStage verifies that uploading
+// a trace for an implement stage emits exactly one runtime_observed audit
+// entry with stage_type=implement and actual_seconds present.
+func TestShipTrace_EmitRuntimeObserved_ImplementStage(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+
+	// Plan stage (succeeded) with a plan artifact.
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	// planStage.Type is already StageTypePlan.
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+
+	// Implement stage in dispatched state.
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = false
+
+	priv, _ := sf.issue(t, runRow.ID)
+
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(12 * time.Minute)
+	bundleBytes := makeTimedBundle(t, t0, t1)
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+	})
+
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// Find runtime_observed in the audit entries.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var ro *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "runtime_observed" {
+			cp := au.appended[i]
+			ro = &cp
+			break
+		}
+	}
+	if ro == nil {
+		t.Fatal("no runtime_observed audit entry emitted")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(ro.Payload, &payload); err != nil {
+		t.Fatalf("decode runtime_observed payload: %v", err)
+	}
+	if got, _ := payload["stage_type"].(string); got != "implement" {
+		t.Errorf("stage_type = %q, want implement", got)
+	}
+	if _, ok := payload["actual_seconds"]; !ok {
+		t.Error("payload missing actual_seconds")
+	}
+	if got, _ := payload["outcome"].(string); got != "succeeded" {
+		t.Errorf("outcome = %q, want succeeded", got)
+	}
+}
+
+// TestShipTrace_EmitRuntimeObserved_PlanStage verifies that uploading a
+// trace for a plan stage does NOT emit a runtime_observed entry.
+func TestShipTrace_EmitRuntimeObserved_PlanStage(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+
+	// Plan stage in dispatched state.
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	// Type is already StageTypePlan; RequiresApproval=false for simplicity.
+	planStage.RequiresApproval = false
+
+	priv, _ := sf.issue(t, runRow.ID)
+
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(5 * time.Minute)
+	bundleBytes := makeTimedBundle(t, t0, t1)
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+	})
+
+	w := shipRequest(t, s, runRow.ID, planStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == "runtime_observed" {
+			t.Errorf("unexpected runtime_observed entry emitted for plan stage")
+		}
 	}
 }

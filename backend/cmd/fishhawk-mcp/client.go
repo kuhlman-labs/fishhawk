@@ -436,6 +436,57 @@ func (c *apiClient) ListRecentRunAudit(ctx context.Context, runID uuid.UUID, lim
 	return res.Items, nil
 }
 
+// CalibrationParams scopes a GET /v0/calibration request. Empty
+// fields drop from the query string; StageType defaults to "implement"
+// server-side when omitted.
+type CalibrationParams struct {
+	WorkflowID string
+	StageType  string
+	Since      string
+}
+
+// CalibrationResult mirrors the /v0/calibration response body.
+// ConfidenceBandAccuracy is typed as map[string]any so the MCP
+// SDK's schema reflection sees an unconstrained object — the
+// per-level bucket shape (samples + within_1.5x) is stable but
+// the confidence keys ('low', 'medium', 'high') are a variable set.
+type CalibrationResult struct {
+	WorkflowID             string         `json:"workflow_id,omitempty"`
+	StageType              string         `json:"stage_type"`
+	Samples                int            `json:"samples"`
+	PredictedP50Minutes    float64        `json:"predicted_p50_minutes"`
+	ActualP50Minutes       float64        `json:"actual_p50_minutes"`
+	ActualP95Minutes       float64        `json:"actual_p95_minutes"`
+	CalibrationRatio       float64        `json:"calibration_ratio"`
+	ConfidenceBandAccuracy map[string]any `json:"confidence_band_accuracy"`
+}
+
+// GetCalibration calls GET /v0/calibration. Returns aggregate runtime
+// statistics across all runtime_observed audit entries that match the
+// supplied filters. An empty CalibrationParams returns stats across all
+// implement stages.
+func (c *apiClient) GetCalibration(ctx context.Context, p CalibrationParams) (*CalibrationResult, error) {
+	q := url.Values{}
+	if p.WorkflowID != "" {
+		q.Set("workflow_id", p.WorkflowID)
+	}
+	if p.StageType != "" {
+		q.Set("stage_type", p.StageType)
+	}
+	if p.Since != "" {
+		q.Set("since", p.Since)
+	}
+	path := "/v0/calibration"
+	if encoded := q.Encode(); encoded != "" {
+		path = path + "?" + encoded
+	}
+	var res CalibrationResult
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 func (c *apiClient) ListRuns(ctx context.Context, f listRunsFilter) (*listRunsResult, error) {
 	q := url.Values{}
 	if f.Repo != "" {

@@ -243,6 +243,10 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 			// the audit row for the failed stage is the canonical
 			// signal; a stuck run is recoverable.
 			s.advanceAfterFailure(r, runID, stageID)
+			// Best-effort: emit runtime calibration for implement
+			// stages that failed agent-side. Errors logged at WARN
+			// and do not unwind the upload.
+			s.emitRuntimeObserved(r.Context(), runID, stageID, body, "failed")
 			s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
 				RunID:       runID,
 				StageID:     stageID,
@@ -259,9 +263,9 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.RunRepo != nil {
 		if policyPassed {
-			s.advanceStageAfterTrace(r, runID, stageID)
+			s.advanceStageAfterTrace(r, runID, stageID, body)
 		} else {
-			s.failStageCategoryB(r, runID, stageID, "policy violations on backend re-evaluation")
+			s.failStageCategoryB(r, runID, stageID, "policy violations on backend re-evaluation", body)
 		}
 	}
 
@@ -284,7 +288,10 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 // transition path doesn't fault. Errors at any step log but don't
 // unwind: the trace is already stored + audited, and the stage's
 // state is recoverable via GET /v0/runs/{id}/stages.
-func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUID) {
+//
+// bundleBytes is passed through for runtime calibration emit after
+// the terminal transition.
+func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUID, bundleBytes []byte) {
 	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -340,6 +347,10 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 		)
 		return
 	}
+
+	// Best-effort: emit runtime calibration data for implement stages.
+	// The stage's work succeeded regardless of whether it needs approval.
+	s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "succeeded")
 
 	// Gateless stages don't get an approval submission to drive the
 	// next dispatch — fire the orchestrator ourselves so the next
@@ -634,7 +645,9 @@ func isEmptyConstraints(c policy.Constraints) bool {
 // After the stage transitions to failed, advance the run so the
 // orchestrator walks pending → running → failed. Without this the
 // run stays in pending forever once any stage fails.
-func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, reason string) {
+//
+// bundleBytes is used for runtime calibration emit (best-effort).
+func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, reason string, bundleBytes []byte) {
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureB, reason); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"trace upload: transition to failed-B failed",
@@ -643,6 +656,9 @@ func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, r
 			slog.String("error", err.Error()))
 	}
 	s.advanceAfterFailure(r, runID, stageID)
+	// Best-effort: emit runtime calibration for implement stages that
+	// failed policy re-evaluation.
+	s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
 }
 
 // advanceAfterFailure invokes the orchestrator to walk the run's
@@ -662,6 +678,86 @@ func (s *Server) advanceAfterFailure(r *http.Request, runID, stageID uuid.UUID) 
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
+	}
+}
+
+// emitRuntimeObserved appends a runtime_observed audit entry after an
+// implement stage's trace upload. It extracts actual timing from the bundle
+// and compares to the plan's predicted_runtime_minutes to build calibration
+// data operators and agents can consume via GET /v0/calibration.
+//
+// All errors are logged at WARN; the helper never unwinds the caller because
+// the trace is already stored and audited. Exits early when:
+//   - RunRepo or AuditRepo is not wired
+//   - stage lookup fails or stage.Type != implement
+//   - bundle has fewer than two intermediate events (timing unavailable)
+//   - no approved plan exists for the run (plan-less or mid-flight race)
+func (s *Server) emitRuntimeObserved(ctx context.Context, runID, stageID uuid.UUID, bundleBytes []byte, outcome string) {
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return
+	}
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"runtime calibration: get stage failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if stage.Type != run.StageTypeImplement {
+		return
+	}
+	startedAt, endedAt, ok := bundle.ExtractTiming(bundleBytes)
+	if !ok {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"runtime calibration: insufficient timing events in bundle",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()))
+		return
+	}
+	planArtifact, err := s.loadApprovedPlanForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"runtime calibration: load plan failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if planArtifact == nil {
+		return
+	}
+
+	actualDuration := endedAt.Sub(startedAt)
+	actualSeconds := actualDuration.Seconds()
+	actualMinutes := actualDuration.Minutes()
+	predictedMinutes := float64(planArtifact.PredictedRuntimeMinutes)
+	deltaMinutes := actualMinutes - predictedMinutes
+
+	payload, _ := json.Marshal(map[string]any{
+		"stage_type":        string(stage.Type),
+		"predicted_minutes": predictedMinutes,
+		"confidence":        string(planArtifact.PredictedRuntimeConfidence),
+		"actual_seconds":    actualSeconds,
+		"actual_minutes":    actualMinutes,
+		"delta_minutes":     deltaMinutes,
+		"outcome":           outcome,
+	})
+
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "runtime_observed",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"runtime calibration: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
 	}
 }
 
