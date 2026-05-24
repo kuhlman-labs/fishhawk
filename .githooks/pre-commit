@@ -22,3 +22,23 @@ if [ "$FAIL" -eq 1 ]; then
   echo "Run scripts/sync-schemas to mirror the canonical copies, then re-stage." >&2
   exit 1
 fi
+
+# Binary-detection: reject newly-added executable binaries staged outside bin/ or .claude/
+BINARY_FAIL=0
+while IFS= read -r path; do
+  case "$path" in
+    bin/*|.claude/*) continue ;;
+  esac
+  magic=$(git show ":$path" 2>/dev/null | od -An -tx1 -N4 | tr -d ' \n')
+  case "$magic" in
+    cffaedfe*|cafebabe*|7f454c46*|4d5a*)
+      echo "pre-commit: refusing to commit binary file: $path" >&2
+      echo "  Move it to bin/ or add it to .gitignore." >&2
+      BINARY_FAIL=1
+      ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=A)
+
+if [ "$BINARY_FAIL" -eq 1 ]; then
+  exit 1
+fi
