@@ -39,6 +39,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerRejectPlan(srv, resolver)
 	registerListRuns(srv, resolver)
 	registerRunStage(srv, resolver)
+	registerRuntimeCalibration(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All
@@ -1276,4 +1277,79 @@ func clampListRunsLimit(n int) int {
 		return listRunsLimitMax
 	}
 	return n
+}
+
+// RuntimeCalibrationInput is the fishhawk_runtime_calibration tool's
+// input schema. All fields are optional; omitting them returns stats
+// across all implement stages in the audit log.
+type RuntimeCalibrationInput struct {
+	WorkflowID string `json:"workflow_id,omitempty" jsonschema:"filter to a specific workflow (e.g. 'feature_change'); omit for all workflows"`
+	StageType  string `json:"stage_type,omitempty" jsonschema:"stage type to aggregate (default 'implement')"`
+	Since      string `json:"since,omitempty" jsonschema:"RFC 3339 lower-bound on entry timestamp; omit for all time"`
+}
+
+// RuntimeCalibrationOutput mirrors the /v0/calibration response.
+// ConfidenceBandAccuracy is keyed by confidence level (low/medium/high);
+// each value is an object with 'samples' and 'within_1.5x' counts.
+type RuntimeCalibrationOutput struct {
+	WorkflowID             string         `json:"workflow_id,omitempty"`
+	StageType              string         `json:"stage_type"`
+	Samples                int            `json:"samples"`
+	PredictedP50Minutes    float64        `json:"predicted_p50_minutes"`
+	ActualP50Minutes       float64        `json:"actual_p50_minutes"`
+	ActualP95Minutes       float64        `json:"actual_p95_minutes"`
+	CalibrationRatio       float64        `json:"calibration_ratio"`
+	ConfidenceBandAccuracy map[string]any `json:"confidence_band_accuracy"`
+}
+
+// registerRuntimeCalibration wires the fishhawk_runtime_calibration
+// tool. Agents call this before writing a plan to self-correct
+// runtime estimates using calibration_ratio and confidence band
+// accuracy. The tool is read-only and works with both fhm_* and
+// fhk_* tokens.
+func registerRuntimeCalibration(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_runtime_calibration",
+		Description: strings.TrimSpace(`
+Fetch runtime calibration statistics for Fishhawk implement stages.
+
+Call this BEFORE writing a plan to self-correct predicted_runtime_minutes
+using historical actual vs. predicted data. The key fields:
+
+  - calibration_ratio: actual_p50 / predicted_p50. Multiply your raw
+    estimate by this ratio to get a historically calibrated value.
+    A ratio > 1 means past predictions were too optimistic; < 1 means
+    too pessimistic.
+  - confidence_band_accuracy: per-confidence-level sample counts and
+    'within_1.5x' hit counts. A low within_1.5x rate for 'high'
+    confidence entries signals over-confidence in that category.
+  - actual_p95_minutes: the tail; use this to set a conservative
+    budget when the cost of overrun is high.
+
+Inputs (all optional):
+  - workflow_id — scope to a specific workflow (e.g. 'feature_change')
+  - stage_type  — default 'implement'
+  - since       — RFC 3339 lower bound; omit for all-time stats
+
+Zero samples is normal on a fresh installation.
+`),
+	}, resolver.runtimeCalibration)
+}
+
+// runtimeCalibration is the tool handler.
+func (r *runResolver) runtimeCalibration(ctx context.Context, _ *mcp.CallToolRequest, in RuntimeCalibrationInput) (*mcp.CallToolResult, RuntimeCalibrationOutput, error) {
+	res, err := r.api.GetCalibration(ctx, CalibrationParams(in))
+	if err != nil {
+		return nil, RuntimeCalibrationOutput{}, fmt.Errorf("get calibration: %w", err)
+	}
+	return nil, RuntimeCalibrationOutput{
+		WorkflowID:             res.WorkflowID,
+		StageType:              res.StageType,
+		Samples:                res.Samples,
+		PredictedP50Minutes:    res.PredictedP50Minutes,
+		ActualP50Minutes:       res.ActualP50Minutes,
+		ActualP95Minutes:       res.ActualP95Minutes,
+		CalibrationRatio:       res.CalibrationRatio,
+		ConfidenceBandAccuracy: res.ConfidenceBandAccuracy,
+	}, nil
 }

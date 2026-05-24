@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 )
@@ -275,6 +276,58 @@ func TestReadEvents_AllLinesReturned(t *testing.T) {
 		if got[i].Kind != want {
 			t.Errorf("got[%d].Kind = %q, want %q", i, got[i].Kind, want)
 		}
+	}
+}
+
+func TestExtractTiming_HappyPath(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(12 * time.Minute)
+	lines := []Line{
+		{Seq: 1, Kind: EventKindManifest, Timestamp: t0.Add(-1 * time.Second), Data: json.RawMessage(`{}`)},
+		{Seq: 2, Kind: "agent_start", Timestamp: t0, Data: json.RawMessage(`{}`)},
+		{Seq: 3, Kind: "agent_event", Timestamp: t0.Add(6 * time.Minute), Data: json.RawMessage(`{}`)},
+		{Seq: 4, Kind: "agent_end", Timestamp: t1, Data: json.RawMessage(`{}`)},
+		{Seq: 5, Kind: "trailer", Timestamp: t1.Add(time.Second), Data: json.RawMessage(`{}`)},
+	}
+	startedAt, endedAt, ok := ExtractTiming(packLines(t, lines))
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if !startedAt.Equal(t0) {
+		t.Errorf("startedAt = %v, want %v", startedAt, t0)
+	}
+	if !endedAt.Equal(t1) {
+		t.Errorf("endedAt = %v, want %v", endedAt, t1)
+	}
+}
+
+func TestExtractTiming_ManifestAndTrailerOnly_ReturnsFalse(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: EventKindManifest, Data: json.RawMessage(`{}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	_, _, ok := ExtractTiming(packLines(t, lines))
+	if ok {
+		t.Error("ok = true, want false for manifest+trailer-only bundle")
+	}
+}
+
+func TestExtractTiming_SingleIntermediateEvent_ReturnsFalse(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: EventKindManifest, Data: json.RawMessage(`{}`)},
+		{Seq: 2, Kind: "agent_start", Data: json.RawMessage(`{}`)},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	_, _, ok := ExtractTiming(packLines(t, lines))
+	if ok {
+		t.Error("ok = true, want false for single intermediate event")
+	}
+}
+
+func TestExtractTiming_BadBundle_ReturnsFalse(t *testing.T) {
+	_, _, ok := ExtractTiming([]byte("not-gzip"))
+	if ok {
+		t.Error("ok = true, want false for bad bundle bytes")
 	}
 }
 

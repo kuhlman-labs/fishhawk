@@ -152,6 +152,32 @@ func ExtractManifest(bundleBytes []byte) (Manifest, error) {
 	return m, nil
 }
 
+// ExtractTiming returns the Timestamp of the first non-manifest,
+// non-trailer event (agent start proxy) and the Timestamp of the last
+// non-trailer event (agent end proxy). Both timestamps come from the
+// runner host's clock so they are accurate relative to each other.
+//
+// Returns ok=false when the bundle contains fewer than two such
+// intermediate events — e.g. a manifest-plus-trailer-only bundle —
+// so callers can skip calibration emission without emitting a warning.
+func ExtractTiming(bundleBytes []byte) (startedAt, endedAt time.Time, ok bool) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	var intermediate []Line
+	for _, l := range lines {
+		if l.Kind == EventKindManifest || l.Kind == "trailer" {
+			continue
+		}
+		intermediate = append(intermediate, l)
+	}
+	if len(intermediate) < 2 {
+		return time.Time{}, time.Time{}, false
+	}
+	return intermediate[0].Timestamp, intermediate[len(intermediate)-1].Timestamp, true
+}
+
 // ExtractDiff returns the policy.Diff carried in the bundle's
 // git_diff event, or ErrNoDiffEvent if the bundle didn't include
 // one. A bundle without a git_diff event isn't an error — the

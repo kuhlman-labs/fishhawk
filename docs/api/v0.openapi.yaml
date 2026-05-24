@@ -488,6 +488,54 @@ components:
           type: string
           description: Hex sha256 of the canonical hash inputs.
 
+    CalibrationResult:
+      type: object
+      description: |
+        Aggregated runtime calibration statistics derived from
+        `runtime_observed` audit entries. Zero `samples` is normal on
+        a fresh installation.
+      required: [samples, predicted_p50_minutes, actual_p50_minutes, actual_p95_minutes, calibration_ratio, confidence_band_accuracy]
+      properties:
+        workflow_id:
+          type: string
+          description: Workflow ID filter applied, if any.
+        stage_type:
+          type: string
+          example: implement
+        samples:
+          type: integer
+          description: Number of implement stages included in this result set.
+        predicted_p50_minutes:
+          type: number
+          format: double
+          description: Median predicted runtime in minutes across the sample.
+        actual_p50_minutes:
+          type: number
+          format: double
+          description: Median actual runtime in minutes across the sample.
+        actual_p95_minutes:
+          type: number
+          format: double
+          description: 95th-percentile actual runtime in minutes.
+        calibration_ratio:
+          type: number
+          format: double
+          description: |
+            `actual_p50 / predicted_p50`. Multiply raw estimates by this value
+            to calibrate toward historical actuals. Zero when predicted_p50 is 0.
+        confidence_band_accuracy:
+          type: object
+          description: |
+            Per-confidence-level hit rates. Keys are confidence levels (low,
+            medium, high); each value is an object with `samples` (int) and
+            `within_1.5x` (int) counts. A low `within_1.5x / samples` ratio
+            signals over-confidence in that band.
+          additionalProperties:
+            type: object
+            properties:
+              samples: { type: integer }
+              within_1.5x: { type: integer }
+
     User:
       type: object
       required: [id, github_login, name]
@@ -1147,6 +1195,46 @@ paths:
           description: |
             `validation_failed` — `limit` out of range or `run_id` not a UUID;
             `cursor_invalid` — opaque cursor failed to decode.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: Audit repository not configured on this instance.
+
+  /v0/calibration:
+    get:
+      operationId: getCalibration
+      summary: Get runtime calibration statistics
+      description: |
+        Returns aggregated actual-vs-predicted runtime statistics derived
+        from `runtime_observed` audit entries. Agents call this before writing
+        a plan to self-correct `predicted_runtime_minutes` using
+        `calibration_ratio` and `confidence_band_accuracy`.
+
+        All parameters are optional. Omit them to get all-time stats across
+        all implement stages.
+
+        Zero `samples` is a valid response on a fresh installation.
+      tags: [calibration]
+      parameters:
+        - name: workflow_id
+          in: query
+          description: Scope results to a specific workflow ID.
+          schema: { type: string }
+        - name: stage_type
+          in: query
+          description: Stage type to aggregate (default `implement`).
+          schema: { type: string, default: implement }
+        - name: since
+          in: query
+          description: RFC 3339 lower bound; omit for all-time stats.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Calibration statistics (samples may be 0).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalibrationResult' }
+        '400':
+          description: "`bad_since` — `since` is not a valid RFC 3339 timestamp."
         '401': { $ref: '#/components/responses/Unauthorized' }
         '503':
           description: Audit repository not configured on this instance.
