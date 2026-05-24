@@ -48,6 +48,24 @@ const PlanArtifactPath = "/tmp/fishhawk-plan.json"
 // Hardcoded for v0 — same rationale as PlanArtifactPath. (#206.)
 const PullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
 
+// CalibrationBand holds accuracy statistics for a single confidence level
+// (high / medium / low) within a calibration window.
+type CalibrationBand struct {
+	Samples     int
+	WithinScale int
+}
+
+// CalibrationHint carries aggregated calibration statistics for the plan-
+// stage prompt. When non-nil, buildPlan appends a "### Calibration hint"
+// section so the agent can self-correct its predicted_runtime_minutes.
+// Nil when the workflow has fewer than calibrationHintMinSamples recorded
+// implement-stage executions.
+type CalibrationHint struct {
+	Samples          int
+	CalibrationRatio float64
+	ConfidenceBands  map[string]CalibrationBand
+}
+
 // Trigger captures the bits of the originating event needed to
 // construct an issue-driven prompt. Empty IssueTitle / IssueBody
 // for non-issue triggers; for v0, those triggers all come from
@@ -98,6 +116,13 @@ type Trigger struct {
 	// buildPlan injects a binding instruction to populate
 	// decomposition.sub_plans.
 	DecomposeRequired bool
+	// CalibrationHint carries aggregated runtime-calibration statistics
+	// for the workflow. When non-nil, buildPlan appends a Calibration
+	// hint section so the agent can self-correct its
+	// predicted_runtime_minutes. Nil when fewer than the minimum sample
+	// threshold of implement-stage executions have been recorded (mirrors
+	// the DecomposeRequired pattern for plan-stage hint injection).
+	CalibrationHint *CalibrationHint
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -238,6 +263,21 @@ func buildPlan(t Trigger) string {
 		"kill(-pgid, SIGKILL). Cited: syscall.SysProcAttr docs (https://pkg.go.dev/syscall#SysProcAttr).\n")
 	b.WriteString("- cmd.Wait and pipe-read race: cmd.Wait closes the parent-side pipe file descriptors while a goroutine is still reading " +
 		"from them. Fix: drain the pipe before calling Wait, or use io.Pipe indirection. Cited: os/exec.Cmd.Wait docs (https://pkg.go.dev/os/exec#Cmd.Wait).\n")
+	if t.CalibrationHint != nil {
+		b.WriteString("\n### Calibration hint\n\n")
+		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow ran %.2fx over (actual / predicted).\n",
+			t.CalibrationHint.Samples, t.CalibrationHint.CalibrationRatio)
+		b.WriteString("Confidence-band accuracy:\n")
+		for _, level := range []string{"high", "medium", "low"} {
+			band, ok := t.CalibrationHint.ConfidenceBands[level]
+			if !ok || band.Samples == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s: %d samples, %d within 1.5x of prediction\n",
+				level, band.Samples, band.WithinScale)
+		}
+		b.WriteString("Adjust predicted_runtime_minutes to account for your historical overruns.\n")
+	}
 	return b.String()
 }
 

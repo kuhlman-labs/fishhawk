@@ -399,6 +399,92 @@ func TestBuild_Plan_BudgetHintDefaultFallback(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_NoCalibrationHint(t *testing.T) {
+	got, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Calibration hint") {
+		t.Errorf("plan prompt should not contain calibration hint when CalibrationHint is nil:\n%s", got)
+	}
+}
+
+func TestBuild_Plan_CalibrationHintRendered(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          10,
+			CalibrationRatio: 1.18,
+			ConfidenceBands: map[string]CalibrationBand{
+				"high":   {Samples: 4, WithinScale: 3},
+				"medium": {Samples: 6, WithinScale: 4},
+				"low":    {Samples: 2, WithinScale: 2},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Calibration hint",
+		"1.18x",
+		"10 implement-stage",
+		"high: 4 samples, 3 within 1.5x of prediction",
+		"medium: 6 samples, 4 within 1.5x of prediction",
+		"low: 2 samples, 2 within 1.5x of prediction",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing %q:\n%s", w, got)
+		}
+	}
+	// Calibration hint must appear after the cmd.Wait counter-example.
+	hintIdx := strings.Index(got, "### Calibration hint")
+	waitIdx := strings.Index(got, "cmd.Wait")
+	if hintIdx < 0 || waitIdx < 0 || hintIdx < waitIdx {
+		t.Errorf("calibration hint should appear after cmd.Wait (hintIdx=%d waitIdx=%d):\n%s",
+			hintIdx, waitIdx, got)
+	}
+}
+
+func TestBuild_Implement_CalibrationHintIgnored(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo: "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          10,
+			CalibrationRatio: 1.2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Calibration hint") {
+		t.Errorf("implement prompt should not contain calibration hint:\n%s", got)
+	}
+}
+
+func TestBuild_Plan_CalibrationHint_Deterministic(t *testing.T) {
+	tr := Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          10,
+			CalibrationRatio: 1.18,
+			ConfidenceBands: map[string]CalibrationBand{
+				"high":   {Samples: 4, WithinScale: 3},
+				"medium": {Samples: 6, WithinScale: 4},
+				"low":    {Samples: 2, WithinScale: 2},
+			},
+		},
+	}
+	a, _ := Build("plan", tr)
+	b, _ := Build("plan", tr)
+	if a != b {
+		t.Errorf("Build with CalibrationHint is non-deterministic across calls:\nA: %s\nB: %s", a, b)
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop
