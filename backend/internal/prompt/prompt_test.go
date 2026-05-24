@@ -428,11 +428,12 @@ func TestBuild_Plan_CalibrationHintRendered(t *testing.T) {
 	}
 	wants := []string{
 		"### Calibration hint",
-		"1.18x",
+		"actual runtime was 1.18x of predicted",
 		"10 implement-stage",
 		"high: 4 samples, 3 within 1.5x of prediction",
 		"medium: 6 samples, 4 within 1.5x of prediction",
 		"low: 2 samples, 2 within 1.5x of prediction",
+		"Multiply your raw estimate by 1.18",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -445,6 +446,33 @@ func TestBuild_Plan_CalibrationHintRendered(t *testing.T) {
 	if hintIdx < 0 || waitIdx < 0 || hintIdx < waitIdx {
 		t.Errorf("calibration hint should appear after cmd.Wait (hintIdx=%d waitIdx=%d):\n%s",
 			hintIdx, waitIdx, got)
+	}
+}
+
+func TestBuild_Plan_CalibrationHintRendered_RatioBelowOne(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          5,
+			CalibrationRatio: 0.27,
+			ConfidenceBands: map[string]CalibrationBand{
+				"high": {Samples: 5, WithinScale: 2},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Directional words must be absent — they mislead when ratio < 1.
+	for _, bad := range []string{"overruns", "over ("} {
+		if strings.Contains(got, bad) {
+			t.Errorf("calibration hint should not contain directional word %q when ratio < 1:\n%s", bad, got)
+		}
+	}
+	// Neutral multiplier phrase must be present.
+	if !strings.Contains(got, "Multiply your raw estimate by 0.27") {
+		t.Errorf("calibration hint missing neutral multiplier phrase:\n%s", got)
 	}
 }
 

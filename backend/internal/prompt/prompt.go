@@ -265,7 +265,7 @@ func buildPlan(t Trigger) string {
 		"from them. Fix: drain the pipe before calling Wait, or use io.Pipe indirection. Cited: os/exec.Cmd.Wait docs (https://pkg.go.dev/os/exec#Cmd.Wait).\n")
 	if t.CalibrationHint != nil {
 		b.WriteString("\n### Calibration hint\n\n")
-		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow ran %.2fx over (actual / predicted).\n",
+		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow: actual runtime was %.2fx of predicted (actual / predicted).\n",
 			t.CalibrationHint.Samples, t.CalibrationHint.CalibrationRatio)
 		b.WriteString("Confidence-band accuracy:\n")
 		for _, level := range []string{"high", "medium", "low"} {
@@ -276,7 +276,7 @@ func buildPlan(t Trigger) string {
 			fmt.Fprintf(&b, "- %s: %d samples, %d within 1.5x of prediction\n",
 				level, band.Samples, band.WithinScale)
 		}
-		b.WriteString("Adjust predicted_runtime_minutes to account for your historical overruns.\n")
+		fmt.Fprintf(&b, "Multiply your raw estimate by %.2f to get a calibrated value.\n", t.CalibrationHint.CalibrationRatio)
 	}
 	return b.String()
 }
