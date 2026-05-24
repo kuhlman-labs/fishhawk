@@ -58,3 +58,12 @@ node_modules/
 # Local Fishhawk runtime state (when the product can produce it)
 .fishhawk/runs/
 .fishhawk/cache/
+
+# Go build artifacts produced when running `go build` inside a module
+# subdirectory (default output is the package name as a binary in cwd).
+# Repo-canonical binaries live in /bin (already ignored above).
+backend/fishhawkd
+backend/fishhawk-mcp
+runner/fishhawk-runner
+cli/fishhawk
+verifier/fishhawk-verify

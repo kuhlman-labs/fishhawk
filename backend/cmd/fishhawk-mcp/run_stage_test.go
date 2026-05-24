@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -714,5 +715,156 @@ func TestRunStageEventMessage_FallsBackToJSON(t *testing.T) {
 	got := runStageEventMessage(m)
 	if got == "" || !strings.Contains(got, "foo") {
 		t.Errorf("message = %q, want a JSON-ish fallback", got)
+	}
+}
+
+// --- DiffSummary, AuditPointer, RunURL enrichment (#442) ---
+
+// TestRunStage_DiffSummary_NilWhenNoGitDiffEvent verifies acceptance
+// criterion (a): when the runner emits no git_diff event (e.g. a plan
+// stage), DiffSummary is nil.
+func TestRunStage_DiffSummary_NilWhenNoGitDiffEvent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	// Runner emits events but none are git_diff.
+	withFakeRunner(t, `printf '%s\n' '{"kind":"runner_started"}' >&2`)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "awaiting_approval")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.DiffSummary != nil {
+		t.Errorf("DiffSummary should be nil when no git_diff event; got %+v", out.DiffSummary)
+	}
+}
+
+// TestRunStage_DiffSummary_PopulatedFromGitDiffEvent verifies
+// acceptance criterion (b): when the runner emits a git_diff event and
+// git show --numstat succeeds, DiffSummary is populated with correct
+// FilesChanged, Insertions, and Deletions. Binary rows are skipped.
+func TestRunStage_DiffSummary_PopulatedFromGitDiffEvent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	// Runner emits git_diff event with two changed files.
+	withFakeRunner(t, `printf '%s\n' '{"kind":"git_diff","changed_files":["a.go","b.go"]}' >&2`)
+
+	// Inject fake numstat: two normal rows + one binary row.
+	origNumstat := runStageGitNumstat
+	runStageGitNumstat = func(_ string) (string, error) {
+		return "5\t3\ta.go\n10\t7\tb.go\n-\t-\timage.png\n", nil
+	}
+	t.Cleanup(func() { runStageGitNumstat = origNumstat })
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.DiffSummary == nil {
+		t.Fatal("DiffSummary should be non-nil when git_diff event is present")
+	}
+	if out.DiffSummary.FilesChanged != 2 {
+		t.Errorf("FilesChanged = %d, want 2", out.DiffSummary.FilesChanged)
+	}
+	if out.DiffSummary.Insertions != 15 { // 5 + 10
+		t.Errorf("Insertions = %d, want 15 (5+10)", out.DiffSummary.Insertions)
+	}
+	if out.DiffSummary.Deletions != 10 { // 3 + 7
+		t.Errorf("Deletions = %d, want 10 (3+7)", out.DiffSummary.Deletions)
+	}
+}
+
+// TestRunStage_AuditPointer_NilOnBackend500 verifies acceptance
+// criterion (c): when the backend returns HTTP 500 for the audit
+// endpoint, AuditPointer is nil and no warning is added. Also asserts
+// the request went to /v0/audit (the cross-chain endpoint) with
+// run_id and limit=1, not /v0/runs/{id}/audit.
+func TestRunStage_AuditPointer_NilOnBackend500(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "exit 0")
+
+	fb.auditStatus = http.StatusInternalServerError
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	warningsBefore := 0
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.AuditPointer != nil {
+		t.Errorf("AuditPointer should be nil on backend 500; got %+v", out.AuditPointer)
+	}
+	// Warnings count should not grow due to the audit failure.
+	if len(out.Warnings) != warningsBefore {
+		for _, w := range out.Warnings {
+			if strings.Contains(strings.ToLower(w), "audit") {
+				t.Errorf("audit failure should not add a warning; got: %q", w)
+			}
+		}
+	}
+	// The request must have hit /v0/audit (cross-chain endpoint), not
+	// /v0/runs/{id}/audit. auditCalledByID is incremented only by
+	// the /v0/audit handler.
+	if got := fb.auditCalledByID[runID]; got == 0 {
+		t.Errorf("expected /v0/audit to be called; auditCalledByID[runID] = %d", got)
+	}
+	if fb.lastAuditLimit != "1" {
+		t.Errorf("audit limit = %q, want 1", fb.lastAuditLimit)
+	}
+}
+
+// TestRunStage_RunURL_ContainsRunID verifies acceptance criterion (d):
+// RunURL equals the server's base URL + '/runs/' + runID.
+func TestRunStage_RunURL_ContainsRunID(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "exit 0")
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	want := srv.URL + "/runs/" + runID.String()
+	if out.RunURL != want {
+		t.Errorf("RunURL = %q, want %q", out.RunURL, want)
 	}
 }
