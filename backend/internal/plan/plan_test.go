@@ -437,6 +437,60 @@ func TestWarnings_SubPlanSumGeParent_NoWarnings(t *testing.T) {
 	}
 }
 
+func TestWarnings_ExpensiveTestStrategy(t *testing.T) {
+	cases := []struct {
+		name     string
+		strategy string
+		runtime  int
+		wantWarn bool
+	}{
+		{
+			name:     "count100_race_fullrepo_low_runtime",
+			strategy: "go test -count 100 -race ./...",
+			runtime:  10,
+			wantWarn: true,
+		},
+		{
+			name:     "race_fullrepo_low_runtime",
+			strategy: "go test -race ./...",
+			runtime:  5,
+			wantWarn: true,
+		},
+		{
+			name:     "count100_high_runtime",
+			strategy: "go test -count 100 ./internal/foo/...",
+			runtime:  25,
+			wantWarn: false,
+		},
+		{
+			name:     "no_expensive_flags",
+			strategy: "go test ./internal/foo/...",
+			runtime:  5,
+			wantWarn: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &plan.Plan{
+				Verification:            plan.Verification{TestStrategy: tc.strategy},
+				PredictedRuntimeMinutes: tc.runtime,
+			}
+			warns := plan.Warnings(p)
+			hasWarn := false
+			for _, w := range warns {
+				if strings.Contains(w, "expensive gate") {
+					hasWarn = true
+					break
+				}
+			}
+			if hasWarn != tc.wantWarn {
+				t.Errorf("wantWarn=%v hasWarn=%v strategy=%q runtime=%d warns=%v",
+					tc.wantWarn, hasWarn, tc.strategy, tc.runtime, warns)
+			}
+		})
+	}
+}
+
 func TestSemanticError_FormatsMessage(t *testing.T) {
 	err := &plan.SemanticError{Message: "duplicate title \"Foo\""}
 	want := "plan: semantic: duplicate title \"Foo\""

@@ -263,6 +263,11 @@ func buildPlan(t Trigger) string {
 		"kill(-pgid, SIGKILL). Cited: syscall.SysProcAttr docs (https://pkg.go.dev/syscall#SysProcAttr).\n")
 	b.WriteString("- cmd.Wait and pipe-read race: cmd.Wait closes the parent-side pipe file descriptors while a goroutine is still reading " +
 		"from them. Fix: drain the pipe before calling Wait, or use io.Pipe indirection. Cited: os/exec.Cmd.Wait docs (https://pkg.go.dev/os/exec#Cmd.Wait).\n")
+	b.WriteString("\n")
+	b.WriteString("Incremental verification discipline: run relevant tests once after each batch of related changes rather than exhaustively at the end. " +
+		"Run golangci-lint on touched packages only (e.g. `golangci-lint run ./internal/foo/...`), not the whole repo. " +
+		"Reserve expensive gates (e.g. -count >= 50, full-repo -race) for the final iteration once you are confident the implementation is correct. " +
+		"If your plan commits to an expensive step, allocate explicit minutes for it in predicted_runtime_minutes.\n")
 	if t.CalibrationHint != nil {
 		b.WriteString("\n### Calibration hint\n\n")
 		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow: actual runtime was %.2fx of predicted (actual / predicted).\n",

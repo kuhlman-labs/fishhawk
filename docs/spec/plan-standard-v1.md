@@ -100,6 +100,18 @@ Ordered list of steps. Each step has a 1-indexed `step` number and a `descriptio
 
 Reviewers expect concrete tests, not "add tests." Rollback plans flag whether a change is purely additive or has data migration consequences.
 
+### Verification with tiered checkpoints
+
+Plans that include expensive test gates must allocate wall-clock time for them in `predicted_runtime_minutes`. The agent should name cheap per-batch checks separately from the expensive final pass:
+
+```json
+{
+  "test_strategy": "After each batch of changes: run unit tests for the touched package only (e.g. `go test ./internal/foo/...`). Final iteration when implementation is complete: run the full flake check (`go test -count 100 -race ./...`). The expensive final pass is estimated at 15 minutes and is included in predicted_runtime_minutes."
+}
+```
+
+Expensive gates are: `-count >= 50`, or `-race` combined with `./...` (full-repo). These are reserved for the final iteration. The advisory heuristic in `plan.Warnings` surfaces a warning when an expensive gate appears in `test_strategy` but `predicted_runtime_minutes` is below 20, flagging plans where the runtime budget is implausibly short for the stated verification approach.
+
 ### Runtime prediction
 
 Two required fields capture the agent's estimate of how long the implement stage will take.

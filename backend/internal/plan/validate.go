@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -18,6 +20,14 @@ var schemaFS embed.FS
 // once at package init; if the embedded schema is malformed we want
 // to crash loudly at process start, not on the first call.
 var compiledSchema = mustCompileSchema()
+
+// expensiveTestRuntimeThreshold is the minimum predicted_runtime_minutes
+// value that suppresses the expensive-test-strategy advisory warning.
+// Claiming a full-repo race run finishes in under 20 minutes is suspicious.
+const expensiveTestRuntimeThreshold = 20
+
+// expensiveCountRe matches -count N and -count=N flag forms in a test strategy string.
+var expensiveCountRe = regexp.MustCompile(`(?i)-count[= ](\d+)`)
 
 func mustCompileSchema() *jsonschema.Schema {
 	const path = "schemas/plan-standard-v1.schema.json"
@@ -108,27 +118,44 @@ func semanticCheck(p *Plan) error {
 
 // Warnings returns advisory strings for a successfully-parsed Plan.
 // These are soft checks — the plan is valid but the caller may want
-// to surface the messages in review UI or logs. Currently emits one
-// warning when the sum of sub-plan predicted_runtime_minutes is less
-// than the parent's predicted_runtime_minutes (the agent may have
-// legitimately compressed work, so this is not a hard rejection).
+// to surface the messages in review UI or logs. Emits a warning when:
+//   - the sum of sub-plan predicted_runtime_minutes is less than the
+//     parent's (agent may have compressed work — soft signal for review);
+//   - test_strategy names expensive gates (-count >= 50 or full-repo
+//     -race) but predicted_runtime_minutes is below expensiveTestRuntimeThreshold
+//     (runtime budget is likely too optimistic for the stated gates).
 func Warnings(p *Plan) []string {
-	if p.Decomposition == nil || len(p.Decomposition.SubPlans) == 0 {
-		return nil
-	}
-	sum := 0
-	for _, sp := range p.Decomposition.SubPlans {
-		sum += sp.PredictedRuntimeMinutes
-	}
-	if sum < p.PredictedRuntimeMinutes {
-		return []string{
-			fmt.Sprintf(
+	var warns []string
+
+	if p.Decomposition != nil && len(p.Decomposition.SubPlans) > 0 {
+		sum := 0
+		for _, sp := range p.Decomposition.SubPlans {
+			sum += sp.PredictedRuntimeMinutes
+		}
+		if sum < p.PredictedRuntimeMinutes {
+			warns = append(warns, fmt.Sprintf(
 				"decomposition sub-plan runtime sum (%d min) is less than parent predicted_runtime_minutes (%d min); agent may have compressed scope",
 				sum, p.PredictedRuntimeMinutes,
-			),
+			))
 		}
 	}
-	return nil
+
+	strategy := p.Verification.TestStrategy
+	hasExpensiveCount := false
+	if m := expensiveCountRe.FindStringSubmatch(strategy); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n >= 50 {
+			hasExpensiveCount = true
+		}
+	}
+	hasExpensiveRace := strings.Contains(strategy, "-race") && strings.Contains(strategy, "./...")
+	if (hasExpensiveCount || hasExpensiveRace) && p.PredictedRuntimeMinutes < expensiveTestRuntimeThreshold {
+		warns = append(warns, fmt.Sprintf(
+			"test_strategy contains an expensive gate but predicted_runtime_minutes (%d) is below %d; allocate explicit time for the expensive step",
+			p.PredictedRuntimeMinutes, expensiveTestRuntimeThreshold,
+		))
+	}
+
+	return warns
 }
 
 // schemaErrorFrom collapses a jsonschema.ValidationError tree to the
