@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Smoke test for the binary-detection logic in .githooks/pre-commit.
+# Spins up an isolated temp git repo with core.hooksPath pointing at the
+# real .githooks directory, then exercises four cases.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0
+FAIL=0
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+git -C "$tmpdir" init -q
+git -C "$tmpdir" config user.email "test@example.com"
+git -C "$tmpdir" config user.name "Test"
+git -C "$tmpdir" config core.hooksPath "$REPO_ROOT/.githooks"
+
+# Seed an initial commit so HEAD exists (hook references git diff --cached).
+touch "$tmpdir/README"
+git -C "$tmpdir" add README
+git -C "$tmpdir" commit -q -m "init"
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+# Case 1: Mach-O header at repo root — must be rejected
+printf '\xcf\xfa\xed\xfe\x00\x00\x00\x00' > "$tmpdir/macho-binary"
+git -C "$tmpdir" add macho-binary
+output=$(git -C "$tmpdir" commit -m "add macho" 2>&1) && status=0 || status=$?
+if [ "$status" -ne 0 ] && echo "$output" | grep -q 'refusing to commit'; then
+  pass "Mach-O header at root is rejected"
+else
+  fail "Mach-O header at root should be rejected (status=$status, output=$output)"
+fi
+git -C "$tmpdir" restore --staged macho-binary 2>/dev/null || true
+
+# Case 2: ELF header at repo root — must be rejected
+printf '\x7f\x45\x4c\x46\x00\x00\x00\x00' > "$tmpdir/elf-binary"
+git -C "$tmpdir" add elf-binary
+output=$(git -C "$tmpdir" commit -m "add elf" 2>&1) && status=0 || status=$?
+if [ "$status" -ne 0 ] && echo "$output" | grep -q 'refusing to commit'; then
+  pass "ELF header at root is rejected"
+else
+  fail "ELF header at root should be rejected (status=$status, output=$output)"
+fi
+git -C "$tmpdir" restore --staged elf-binary 2>/dev/null || true
+
+# Case 3: Mach-O header under bin/ — must be allowed
+mkdir -p "$tmpdir/bin"
+printf '\xcf\xfa\xed\xfe\x00\x00\x00\x00' > "$tmpdir/bin/tool"
+git -C "$tmpdir" add bin/tool
+output=$(git -C "$tmpdir" commit -m "add bin/tool" 2>&1) && status=0 || status=$?
+if [ "$status" -eq 0 ]; then
+  pass "Mach-O under bin/ is allowed"
+else
+  fail "Mach-O under bin/ should be allowed (status=$status, output=$output)"
+fi
+
+# Case 4: normal Go source file — must be allowed
+cat > "$tmpdir/main.go" <<'EOF'
+package main
+
+import "fmt"
+
+func main() { fmt.Println("hello") }
+EOF
+git -C "$tmpdir" add main.go
+output=$(git -C "$tmpdir" commit -m "add main.go" 2>&1) && status=0 || status=$?
+if [ "$status" -eq 0 ]; then
+  pass "Normal source file is allowed"
+else
+  fail "Normal source file should be allowed (status=$status, output=$output)"
+fi
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
