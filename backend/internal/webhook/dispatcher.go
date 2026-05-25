@@ -1318,35 +1318,46 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 		return fmt.Errorf("dispatcher: create retry stages: %w", err)
 	}
 
-	// Step 8: fire workflow_dispatch on the first retry stage.
-	repo, err := parseRepo(ev.Repo)
-	if err != nil {
-		return fmt.Errorf("dispatcher: parse repo: %w", err)
-	}
-	dispatchRef := d.DefaultRef
-	if dispatchRef == "" {
-		dispatchRef = "main"
-	}
-	actionsFile := d.ActionsWorkflowFile
-	if actionsFile == "" {
-		actionsFile = DefaultActionsWorkflowFile
-	}
+	// Step 8: fire workflow_dispatch on the first retry stage, or skip
+	// for local-runner runs — they stay in pending for the agent to
+	// discover via fishhawk_list_runs / fishhawk_verify_run (ADR-022 / #445).
 	firstStage := stages[0]
-	dispatchErr := d.GitHub.DispatchWorkflow(ctx, installationID, repo,
-		actionsFile, dispatchRef, githubclient.DispatchInputs{
-			"run_id":      child.ID.String(),
-			"stage_id":    firstStage.ID.String(),
-			"workflow_id": parent.WorkflowID,
-			"stage":       firstStage.ExecutorRef,
-		})
-	if dispatchErr == nil {
-		if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,
-			run.StageStateDispatched, nil); err != nil {
-			d.logger().LogAttrs(ctx, slog.LevelWarn,
-				"ci_failure_retry: transition stage to dispatched failed",
-				slog.String("delivery_id", ev.DeliveryID),
-				slog.String("stage_id", firstStage.ID.String()),
-				slog.String("error", err.Error()))
+	var dispatchErr error
+	switch parent.RunnerKind {
+	case run.RunnerKindLocal:
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"ci_failure_retry: local runner — child run pending, no dispatch",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", child.ID.String()))
+	default:
+		repo, err := parseRepo(ev.Repo)
+		if err != nil {
+			return fmt.Errorf("dispatcher: parse repo: %w", err)
+		}
+		dispatchRef := d.DefaultRef
+		if dispatchRef == "" {
+			dispatchRef = "main"
+		}
+		actionsFile := d.ActionsWorkflowFile
+		if actionsFile == "" {
+			actionsFile = DefaultActionsWorkflowFile
+		}
+		dispatchErr = d.GitHub.DispatchWorkflow(ctx, installationID, repo,
+			actionsFile, dispatchRef, githubclient.DispatchInputs{
+				"run_id":      child.ID.String(),
+				"stage_id":    firstStage.ID.String(),
+				"workflow_id": parent.WorkflowID,
+				"stage":       firstStage.ExecutorRef,
+			})
+		if dispatchErr == nil {
+			if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,
+				run.StageStateDispatched, nil); err != nil {
+				d.logger().LogAttrs(ctx, slog.LevelWarn,
+					"ci_failure_retry: transition stage to dispatched failed",
+					slog.String("delivery_id", ev.DeliveryID),
+					slog.String("stage_id", firstStage.ID.String()),
+					slog.String("error", err.Error()))
+			}
 		}
 	}
 
@@ -1565,6 +1576,7 @@ func (d *Dispatcher) writeCIRetryDispatchedAudit(ctx context.Context, ev Event, 
 		"retry_attempt": child.RetryAttempt,
 		"max_retries":   maxRetries,
 		"outcome":       outcome,
+		"runner_kind":   parent.RunnerKind,
 	}
 	if dispatchErr != nil {
 		payload["error"] = dispatchErr.Error()
