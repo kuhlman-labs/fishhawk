@@ -508,6 +508,71 @@ func TestImplementPrompt_BothEndpointsProduceIdenticalBody(t *testing.T) {
 	}
 }
 
+func TestHandleGetStagePromptRender_BudgetContext(t *testing.T) {
+	// Seed a run with a 30m workflow policy and a plan artifact where
+	// predicted_runtime_minutes=9. Assert the implement-stage prompt
+	// render includes the Budget context section with the expected
+	// values, and that the plan-stage prompt does NOT include it.
+	s, rr, ar, _, _, gh := newImplementPromptServer(t)
+	_, planStageID, implStageID, rn := seedRunWithStages(rr)
+
+	// WorkflowSpec with a 30m policy gives resolveAgentTimeout → 1800s → 30 minutes.
+	rn.WorkflowSpec = []byte(planStageSpecYAML30m)
+
+	planJSON, err := json.Marshal(planfixture.Valid(func(m map[string]any) {
+		m["predicted_runtime_minutes"] = 9
+		m["predicted_runtime_confidence"] = "medium"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := "standard_v1"
+	ar.seed(planStageID, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       planJSON,
+		ContentHash:   "budget-ctx-test",
+		CreatedAt:     time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+	})
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Budget test", Body: "ctx"}
+
+	// Implement stage → expect Budget context section.
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", implStageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("implement stage status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var implResp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &implResp); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"### Budget context", "9 minutes", "30 minutes"} {
+		if !strings.Contains(implResp.Prompt, want) {
+			t.Errorf("implement prompt missing %q\n---\n%s", want, implResp.Prompt)
+		}
+	}
+
+	// Plan stage for the same run → Budget context section must be absent.
+	req = httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", planStageID), nil)
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("plan stage status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var planResp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &planResp); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(planResp.Prompt, "### Budget context") {
+		t.Errorf("plan-stage prompt should not contain Budget context section:\n%s", planResp.Prompt)
+	}
+}
+
 // promptRequestForStage signs a GET /v0/stages/{id}/prompt request
 // with the run's private key (mirroring the runner's behavior).
 // Reuses the canonical signing message helper so the signing stays

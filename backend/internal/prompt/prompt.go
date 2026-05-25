@@ -66,6 +66,18 @@ type CalibrationHint struct {
 	ConfidenceBands  map[string]CalibrationBand
 }
 
+// PredictionContext carries the runtime prediction context for the
+// implement-stage prompt's Budget context section. Populated by the
+// server-side prompt handler from the approved plan's
+// predicted_runtime_minutes / predicted_runtime_confidence and the
+// spec-resolved implement-stage timeout. Nil when no plan is available
+// or the stage is not implement-type.
+type PredictionContext struct {
+	PredictedMinutes    int
+	PredictedConfidence string
+	StageBudgetMinutes  int
+}
+
 // Trigger captures the bits of the originating event needed to
 // construct an issue-driven prompt. Empty IssueTitle / IssueBody
 // for non-issue triggers; for v0, those triggers all come from
@@ -123,6 +135,11 @@ type Trigger struct {
 	// threshold of implement-stage executions have been recorded (mirrors
 	// the DecomposeRequired pattern for plan-stage hint injection).
 	CalibrationHint *CalibrationHint
+	// PredictionContext carries runtime prediction data for the implement-
+	// stage prompt. When non-nil, buildImplement appends a Budget context
+	// section surfacing predicted_runtime_minutes, predicted_runtime_confidence,
+	// and the spec-resolved stage budget. Nil → section omitted (#503).
+	PredictionContext *PredictionContext
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -184,6 +201,25 @@ func buildImplement(t Trigger) string {
 		writeIssueLink(&b, t)
 		b.WriteString("Your task: implement the change described in the issue above. Fetch the issue body via your GitHub tooling — the URL resolves with the run's installation token. Make the smallest set of changes that satisfies the issue.\n")
 		b.WriteString("\n")
+	}
+
+	// Budget context (#503): surface the agent's own runtime prediction
+	// alongside the spec-resolved stage budget so it can self-regulate
+	// scope. Only present when an approved plan exists (PredictionContext
+	// is populated by the handler from the plan + resolveAgentTimeout).
+	if t.PredictionContext != nil {
+		pc := t.PredictionContext
+		budgetMins := pc.StageBudgetMinutes
+		b.WriteString("### Budget context\n\n")
+		fmt.Fprintf(&b, "You predicted **%d minutes** (%s confidence) for this work in your plan. ",
+			pc.PredictedMinutes, pc.PredictedConfidence)
+		if budgetMins == 0 {
+			fmt.Fprintf(&b, "No spec budget was resolved for this stage; the backend default is **%d minutes**.",
+				defaultStageTimeoutMinutes)
+		} else {
+			fmt.Fprintf(&b, "The spec-resolved stage budget is **%d minutes**.", budgetMins)
+		}
+		b.WriteString(" Allocate carefully and prefer incremental verification.\n\n")
 	}
 
 	// PR description: write to a known path so the runner can lift

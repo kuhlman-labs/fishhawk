@@ -143,6 +143,14 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			s.emitPlanMissingForImplement(r.Context(), runRow.ID, stage.ID)
 		}
 		trigger.ApprovedPlan = approvedPlan
+		if approvedPlan != nil {
+			budgetSecs := s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)
+			trigger.PredictionContext = &prompt.PredictionContext{
+				PredictedMinutes:    approvedPlan.PredictedRuntimeMinutes,
+				PredictedConfidence: string(approvedPlan.PredictedRuntimeConfidence),
+				StageBudgetMinutes:  budgetSecs / 60,
+			}
+		}
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -271,6 +279,14 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			s.emitPlanMissingForImplement(r.Context(), runRow.ID, stage.ID)
 		}
 		trigger.ApprovedPlan = approvedPlan
+		if approvedPlan != nil {
+			budgetSecs := s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)
+			trigger.PredictionContext = &prompt.PredictionContext{
+				PredictedMinutes:    approvedPlan.PredictedRuntimeMinutes,
+				PredictedConfidence: string(approvedPlan.PredictedRuntimeConfidence),
+				StageBudgetMinutes:  budgetSecs / 60,
+			}
+		}
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
