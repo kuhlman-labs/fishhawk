@@ -76,3 +76,6 @@ verifier/fishhawk-verify
 /fishhawk-runner
 /fishhawk
 /fishhawk-verify
+
+# scripts/dev runtime state (PID file).
+.fishhawk/dev.pid
