@@ -3,13 +3,21 @@ set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-cp "$REPO_ROOT/docs/spec/workflow-v0.schema.json" \
-   "$REPO_ROOT/backend/internal/spec/schemas/workflow-v0.schema.json"
-cp "$REPO_ROOT/docs/spec/workflow-v0.schema.json" \
-   "$REPO_ROOT/cli/internal/spec/schemas/workflow-v0.schema.json"
-cp "$REPO_ROOT/docs/spec/plan-standard-v1.schema.json" \
-   "$REPO_ROOT/backend/internal/plan/schemas/plan-standard-v1.schema.json"
-cp "$REPO_ROOT/docs/spec/plan-standard-v1.schema.json" \
-   "$REPO_ROOT/runner/internal/plan/schemas/plan-standard-v1.schema.json"
+for schema in "$REPO_ROOT"/docs/spec/*.schema.json; do
+  base="$(basename "$schema")"
+  case "$base" in
+    plan-standard-*.schema.json)
+      cp "$schema" "$REPO_ROOT/backend/internal/plan/schemas/$base"
+      cp "$schema" "$REPO_ROOT/runner/internal/plan/schemas/$base"
+      ;;
+    workflow-v*.schema.json)
+      cp "$schema" "$REPO_ROOT/backend/internal/spec/schemas/$base"
+      cp "$schema" "$REPO_ROOT/cli/internal/spec/schemas/$base"
+      ;;
+    *)
+      echo "sync-schemas: unrecognized schema file '$base' — skipping (add a case to route it)" >&2
+      ;;
+  esac
+done
 
 echo "schemas synced from docs/spec/"

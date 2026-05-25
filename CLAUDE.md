@@ -54,6 +54,27 @@ python3 scripts/check-coverage.py --threshold 80 --exclude '/db/' "${profiles[@]
 
 When editing a schema under `docs/spec/`, run `scripts/sync-schemas` to mirror the change into all embedded copies before committing. CI fails the schema-sync gate otherwise. Opt-in local check: `git config core.hooksPath .githooks`.
 
+### Schema change checklist
+
+Before opening a PR that adds or modifies a field in `docs/spec/`:
+
+1. **Additive or breaking?** New optional fields within the current major version (e.g., `standard_v1.x`, `workflow-v0.x`) are additive — proceed. A new *required* field in an existing major version is a breaking change and must be avoided: bump the major version instead (`standard_v2`, `workflow-v1`). Use the `x-intended-required` annotation (see below) to signal a field whose required promotion is deferred through a soak period.
+
+2. **Soak period.** When a field is introduced as optional but is intended to become required in a future version, declare the soak window in the PR body under `## Notes`. The soak period duration is determined per-PR; no minimum is set yet (TBD in a follow-up issue). During the soak, both the old and new schema versions are validated by the backend.
+
+3. **Version advertising.** After the schema change merges, update every surface that advertises supported schema versions:
+   - Plan validator (`backend/internal/plan/`) — add the new version string to the recognized set.
+   - Runner `/healthz` schema-versions endpoint (once #466 lands) — add the new version to the advertised list.
+
+4. **`x-intended-required` annotation.** When a field is optional now but will become required in the next major version, annotate it in the JSON Schema:
+   ```json
+   "some_field": {
+     "type": "string",
+     "x-intended-required": true
+   }
+   ```
+   JSON Schema Draft 2020-12 §10.3 collects unknown keywords as annotations without affecting validation, so this annotation is safe to add to any schema without breaking existing validators.
+
 ### Rebuild matrix
 
 `scripts/dev up` always rebuilds `fishhawkd`. A future enhancement could auto-detect which binaries need rebuilding from `git diff main...HEAD`.

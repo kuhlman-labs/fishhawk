@@ -6,6 +6,25 @@ The canonical schema is [`plan-standard-v1.schema.json`](plan-standard-v1.schema
 
 > **Frozen at Day 21** of the v0 build. Old plans in the audit log remain readable forever — never break this schema in place. Future versions land as `standard_v2` etc., and the plan validator (E1.5 / #20) keeps every version readable.
 
+### Schema evolution policy
+
+`standard_v1.x` is **additive-only**. New fields must be optional; the existing required-field set is frozen. Clients that validate against `standard_v1` must tolerate unknown fields (they are collected as annotations per JSON Schema Draft 2020-12 §10.3 and must not cause validation failure).
+
+**Required-field promotion** requires a major version bump (`standard_v2`). During the deprecation window, the plan validator accepts both `standard_v1` and `standard_v2` artifacts and routes each to its respective schema. The backend advertises which versions it can validate via the `/healthz` schema-versions endpoint (once #466 lands).
+
+**`x-intended-required` annotation** — a non-standard JSON Schema keyword used to signal that a field is currently optional but is a candidate for required promotion in the next major version. Example:
+
+```json
+"some_field": {
+  "type": "string",
+  "x-intended-required": true
+}
+```
+
+This annotation does not affect validation (see §10.3). It is a contract signal for schema authors: the soak period during which the field is optional must be declared in the introducing PR body before the required promotion is merged.
+
+**Removals** follow a longer deprecation window — duration TBD. No fields have been removed from `standard_v1`.
+
 ## Top-level shape
 
 ```json
