@@ -1,0 +1,111 @@
+#!/usr/bin/env zsh
+# scripts/loop-run — create a branch and mint a Fishhawk run for a GitHub issue
+set -euo pipefail
+
+_die() { print -u2 "error: $*"; exit 1 }
+_usage() {
+  print -u2 "usage: scripts/loop-run <issue-number> [--repo owner/name] [--workflow id] [--backend-url URL] [--token TOKEN] [--dry-run]"
+  exit 1
+}
+
+# Defaults
+issue_number=""
+repo=""
+workflow="default"
+backend_url=""
+token=""
+dry_run=0
+
+# Argument parsing
+while (( $# > 0 )); do
+  case "$1" in
+    --repo)        repo="$2";        shift 2 ;;
+    --workflow)    workflow="$2";    shift 2 ;;
+    --backend-url) backend_url="$2"; shift 2 ;;
+    --token)       token="$2";       shift 2 ;;
+    --dry-run)     dry_run=1;        shift   ;;
+    -*)            _usage ;;
+    *)
+      if [[ -z "$issue_number" ]]; then
+        issue_number="$1"
+        shift
+      else
+        _usage
+      fi
+      ;;
+  esac
+done
+
+[[ -n "$issue_number" ]] || _usage
+[[ "$issue_number" =~ ^[0-9]+$ ]] || _die "issue-number must be a positive integer, got: ${issue_number}"
+
+# Require gh
+if ! command -v gh &>/dev/null; then
+  _die "gh CLI not found — install from https://cli.github.com"
+fi
+
+# Auto-detect repo from git remote
+if [[ -z "$repo" ]]; then
+  local origin_url
+  origin_url="$(git remote get-url origin 2>/dev/null)" || _die "could not read git remote 'origin'; pass --repo owner/name"
+
+  # Strip HTTPS: https://github.com/owner/name.git → owner/name
+  # Strip SSH:   git@github.com:owner/name.git   → owner/name
+  repo="${origin_url#https://github.com/}"
+  repo="${repo#git@github.com:}"
+  repo="${repo%.git}"
+
+  [[ "$repo" == */* ]] || _die "could not parse repo from remote URL '${origin_url}'; pass --repo owner/name"
+fi
+
+# Fetch issue title
+print "fetching issue #${issue_number} from ${repo}..."
+issue_title="$(gh issue view "$issue_number" --repo "$repo" --json title --jq .title)" \
+  || _die "gh issue view failed — check authentication and issue number"
+
+# Derive branch slug
+slug="$(
+  print -n "$issue_title" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -cs 'a-z0-9' '-' \
+    | sed 's/^-*//' \
+    | sed 's/-*$//' \
+    | cut -c1-60
+)"
+[[ -n "$slug" ]] || _die "could not derive a slug from issue title: ${issue_title}"
+
+branch="${issue_number}-${slug}"
+
+# Validate branch name
+git check-ref-format --branch "$branch" &>/dev/null \
+  || _die "derived branch name is invalid: ${branch}"
+
+# Build the run start command for display / execution
+typeset -a run_cmd
+run_cmd=(fishhawk run start --issue "$issue_number" --repo "$repo" --workflow "$workflow" --runner-kind local)
+[[ -n "$backend_url" ]] && run_cmd+=(--backend-url "$backend_url")
+[[ -n "$token" ]]       && run_cmd+=(--token "$token")
+
+if (( dry_run )); then
+  print "dry-run mode"
+  print "  branch:  ${branch}"
+  print "  run cmd: ${run_cmd[*]}"
+  exit 0
+fi
+
+# Create branch from origin/main
+git fetch origin main
+git checkout -b "$branch" origin/main
+
+# Start the run
+print "starting Fishhawk run..."
+run_output="$("${run_cmd[@]}")" || _die "fishhawk run start failed"
+
+run_id="$(print -n "$run_output" | grep '^id:' | head -1 | awk '{print $2}')"
+[[ -n "$run_id" ]] || _die "could not extract run ID from fishhawk output:\n${run_output}"
+
+print ""
+print "branch:  ${branch}"
+print "run id:  ${run_id}"
+print ""
+print "In Claude Code: use fishhawk_run_stage with run_id=${run_id} to drive plan → implement"

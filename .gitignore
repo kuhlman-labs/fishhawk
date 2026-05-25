@@ -32,6 +32,7 @@ out/
 *.swp
 *.swo
 *~
+.claude/
 
 # OS
 .DS_Store
@@ -46,6 +47,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
 
 # Node / frontend build artifacts (will land with E7.1)
 node_modules/
