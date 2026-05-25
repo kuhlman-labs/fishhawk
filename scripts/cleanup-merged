@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+git fetch origin main --quiet
+
+count=0
+while IFS= read -r branch; do
+  [ "$branch" = "main" ] && continue
+  if git merge-base --is-ancestor "$branch" origin/main 2>/dev/null; then
+    git branch -D "$branch" >/dev/null
+    echo "deleted (merged): $branch"
+    count=$((count + 1))
+  fi
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+echo "cleaned $count branch(es)"

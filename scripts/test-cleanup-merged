@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Smoke test for scripts/cleanup-merged.
+# Spins up an isolated temp git repo, creates a merged and an unmerged branch,
+# runs the script, and asserts the correct branches are deleted or preserved.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0
+FAIL=0
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+git -C "$tmpdir" init -q
+git -C "$tmpdir" config user.email "test@example.com"
+git -C "$tmpdir" config user.name "Test"
+
+# Seed an initial commit on main so HEAD exists.
+touch "$tmpdir/README"
+git -C "$tmpdir" add README
+git -C "$tmpdir" commit -q -m "init"
+
+# Rename default branch to 'main' for determinism.
+git -C "$tmpdir" branch -m main
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+# Create a branch, commit to it, then merge it back into main.
+git -C "$tmpdir" checkout -q -b merged-branch
+echo "merged" > "$tmpdir/merged.txt"
+git -C "$tmpdir" add merged.txt
+git -C "$tmpdir" commit -q -m "merged commit"
+git -C "$tmpdir" checkout -q main
+git -C "$tmpdir" merge --no-ff -q -m "merge merged-branch" merged-branch
+
+# Create a branch with an unmerged commit.
+git -C "$tmpdir" checkout -q -b unmerged-branch
+echo "unmerged" > "$tmpdir/unmerged.txt"
+git -C "$tmpdir" add unmerged.txt
+git -C "$tmpdir" commit -q -m "unmerged commit"
+git -C "$tmpdir" checkout -q main
+
+# Point origin/main at the local main so merge-base checks work without a remote.
+git -C "$tmpdir" remote add origin "$tmpdir"
+git -C "$tmpdir" fetch -q origin main
+
+# Run the script inside the temp repo directory.
+output=$(cd "$tmpdir" && bash "$REPO_ROOT/scripts/cleanup-merged" 2>&1)
+
+# Case 1: merged-branch should have been deleted.
+if ! git -C "$tmpdir" show-ref --verify --quiet refs/heads/merged-branch; then
+  pass "merged-branch was deleted"
+else
+  fail "merged-branch should have been deleted (output: $output)"
+fi
+
+# Case 2: unmerged-branch should still exist.
+if git -C "$tmpdir" show-ref --verify --quiet refs/heads/unmerged-branch; then
+  pass "unmerged-branch was preserved"
+else
+  fail "unmerged-branch should have been preserved (output: $output)"
+fi
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

@@ -80,6 +80,8 @@ When editing a schema under `docs/spec/`, run `scripts/sync-schemas` to mirror t
    - Update sibling issues if scope shifted (e.g., a CI fix bundled here means another sibling no longer needs it).
    - If an ADR was resolved, edit its body's Decision section and close.
 
+Run `scripts/cleanup-merged` to delete local branches that have been merged into `origin/main` (optional; can be wired into a post-merge git hook).
+
 Force-pushing a feature branch is fine with `--force-with-lease`; ask before force-pushing if there are review comments. Never force-push `main`.
 
 ## Project tracker (#7)
