@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -411,120 +410,87 @@ func withFakeHTTPClient(t *testing.T, srv *httptest.Server) {
 	t.Cleanup(func() { runnerNewClient = orig })
 }
 
-// withCapturedGhPost swaps ghPost to record the body passed to
-// maybePostLocalComment without shelling to gh.
-func withCapturedGhPost(t *testing.T) *string {
-	t.Helper()
-	captured := new(string)
-	orig := ghPost
-	ghPost = func(_ string, _ int, body string) error {
-		*captured = body
-		return nil
-	}
-	t.Cleanup(func() { ghPost = orig })
-	return captured
+// withCapturedPostOrEdit swaps postOrEditStatusComment to record calls
+// without shelling to gh or reaching the backend status-comment endpoints.
+type postOrEditCall struct {
+	backendURL  string
+	runID       string
+	repo        string
+	issueNumber int
 }
 
+func withCapturedPostOrEdit(t *testing.T) *[]postOrEditCall {
+	t.Helper()
+	calls := new([]postOrEditCall)
+	orig := postOrEditStatusComment
+	postOrEditStatusComment = func(backendURL, runID, repo string, issueNumber int) error {
+		*calls = append(*calls, postOrEditCall{backendURL, runID, repo, issueNumber})
+		return nil
+	}
+	t.Cleanup(func() { postOrEditStatusComment = orig })
+	return calls
+}
+
+// TestRunnerStart_StageCompleteComment verifies that after a plan-stage
+// runner exits cleanly for a local-runner issue-triggered run, the CLI
+// calls postOrEditStatusComment with the right coordinates. Rendering is
+// server-side (#428); this test only checks that the seam is invoked.
 func TestRunnerStart_StageCompleteComment(t *testing.T) {
 	runID := uuid.New()
 	stageID := uuid.New()
 
-	makeServer := func(t *testing.T, stageStatus int, stageState string) *httptest.Server {
-		t.Helper()
-		run := httpclient.Run{
-			ID:         runID,
-			Repo:       "x/y",
-			WorkflowID: "w",
-			State:      "running",
-			RunnerKind: "local",
-			IssueContext: &httpclient.IssueContext{
-				Title:  "test issue",
-				Body:   "body",
-				URL:    "https://github.com/x/y/issues/1",
-				Number: 1,
-			},
-			CreatedAt: time.Now().UTC(),
-			UpdatedAt: time.Now().UTC(),
-		}
-		stage := httpclient.Stage{
-			ID:        stageID,
-			RunID:     runID,
-			Sequence:  1,
-			Type:      "plan",
-			State:     stageState,
-			CreatedAt: time.Now().UTC(),
-			UpdatedAt: time.Now().UTC(),
-		}
-		mux := http.NewServeMux()
-		mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(run)
-		})
-		mux.HandleFunc("GET /v0/stages/{stage_id}", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if stageStatus >= 400 {
-				w.WriteHeader(stageStatus)
-				_, _ = io.WriteString(w, `{"error":{"code":"internal","message":"server error"}}`)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(stage)
-		})
-		srv := httptest.NewServer(mux)
-		t.Cleanup(srv.Close)
-		return srv
+	runRow := httpclient.Run{
+		ID:         runID,
+		Repo:       "x/y",
+		WorkflowID: "w",
+		State:      "running",
+		RunnerKind: "local",
+		IssueContext: &httpclient.IssueContext{
+			Title:  "test issue",
+			Body:   "body",
+			URL:    "https://github.com/x/y/issues/1",
+			Number: 1,
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
 	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(runRow)
+	}))
+	t.Cleanup(srv.Close)
 
-	t.Run("stage_state_flows_into_comment", func(t *testing.T) {
-		withFakeRunnerSpawn(t)
-		withFakeGitRemote(t, "", errors.New("no git"))
-		srv := makeServer(t, http.StatusOK, "awaiting_approval")
-		withFakeHTTPClient(t, srv)
-		capturedBody := withCapturedGhPost(t)
+	withFakeRunnerSpawn(t)
+	withFakeGitRemote(t, "", errors.New("no git"))
+	withFakeHTTPClient(t, srv)
+	calls := withCapturedPostOrEdit(t)
 
-		var stdout, stderr strings.Builder
-		got := run([]string{
-			"runner", "start",
-			"--run-id", runID.String(),
-			"--stage-id", stageID.String(),
-			"--workflow", "w",
-			"--stage", "plan",
-			"--backend-url", srv.URL,
-		}, &stdout, &stderr)
+	var stdout, stderr strings.Builder
+	got := run([]string{
+		"runner", "start",
+		"--run-id", runID.String(),
+		"--stage-id", stageID.String(),
+		"--workflow", "w",
+		"--stage", "plan",
+		"--backend-url", srv.URL,
+	}, &stdout, &stderr)
 
-		if got != exitOK {
-			t.Fatalf("exit = %d, want exitOK:\n%s", got, stderr.String())
-		}
-		if !strings.Contains(*capturedBody, "awaiting_approval") {
-			t.Errorf("comment body %q does not contain \"awaiting_approval\"", *capturedBody)
-		}
-	})
-
-	t.Run("stage_fetch_error_degrades_to_unknown", func(t *testing.T) {
-		withFakeRunnerSpawn(t)
-		withFakeGitRemote(t, "", errors.New("no git"))
-		srv := makeServer(t, http.StatusInternalServerError, "")
-		withFakeHTTPClient(t, srv)
-		capturedBody := withCapturedGhPost(t)
-
-		var stdout, stderr strings.Builder
-		got := run([]string{
-			"runner", "start",
-			"--run-id", runID.String(),
-			"--stage-id", stageID.String(),
-			"--workflow", "w",
-			"--stage", "plan",
-			"--backend-url", srv.URL,
-		}, &stdout, &stderr)
-
-		if got != exitOK {
-			t.Fatalf("exit = %d, want exitOK:\n%s", got, stderr.String())
-		}
-		if !strings.Contains(*capturedBody, "unknown") {
-			t.Errorf("comment body %q does not contain \"unknown\"", *capturedBody)
-		}
-	})
+	if got != exitOK {
+		t.Fatalf("exit = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if len(*calls) == 0 {
+		t.Fatal("postOrEditStatusComment was not called")
+	}
+	c := (*calls)[0]
+	if c.runID != runID.String() {
+		t.Errorf("runID = %q, want %q", c.runID, runID.String())
+	}
+	if c.repo != "x/y" {
+		t.Errorf("repo = %q, want x/y", c.repo)
+	}
+	if c.issueNumber != 1 {
+		t.Errorf("issueNumber = %d, want 1", c.issueNumber)
+	}
 }
 
 // contains reports whether s appears anywhere in xs.

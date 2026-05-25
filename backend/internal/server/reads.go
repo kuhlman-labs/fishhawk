@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -511,4 +512,109 @@ func decodeOffsetCursor(cursor string) (int, error) {
 		return 0, fmt.Errorf("cursor offset must be non-negative")
 	}
 	return offset, nil
+}
+
+// statusCommentResponse is the JSON shape GET /v0/runs/{run_id}/status-comment
+// returns. The body field contains the rendered sticky-comment markdown so
+// the CLI can edit the comment in place via the operator's gh binary.
+type statusCommentResponse struct {
+	Body            string `json:"body"`
+	IssueNumber     int    `json:"issue_number"`
+	Repo            string `json:"repo"`
+	GithubCommentID int64  `json:"github_comment_id"`
+}
+
+// handleGetStatusComment implements GET /v0/runs/{run_id}/status-comment.
+// Renders the sticky status comment body via issuecomment.RenderStatusBody
+// and returns the most-recent github_comment_id from the audit log so the
+// CLI can edit the existing comment in place (edit-in-place sticky comment
+// parity with the GHA webhook path, #428).
+func (s *Server) handleGetStatusComment(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RunRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
+			"status-comment endpoint requires a configured run repository", nil)
+		return
+	}
+	if s.cfg.AuditRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "audit_repo_unconfigured",
+			"status-comment endpoint requires a configured audit repository", nil)
+		return
+	}
+	runID, err := uuid.Parse(r.PathValue("run_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"run_id must be a valid UUID",
+			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
+		return
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "run_not_found",
+				"no run with that id", map[string]any{"run_id": runID.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get run failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list stages failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	auditEntries, err := s.cfg.AuditRepo.ListForRun(r.Context(), runID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list audit failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Find the most-recent github_comment_id from status_comment_posted entries.
+	statusEntries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, issuecomment.CategoryStatusCommentPosted)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list audit by category failed", map[string]any{"error": err.Error()})
+		return
+	}
+	var githubCommentID int64
+	for i := len(statusEntries) - 1; i >= 0; i-- {
+		if id := extractStatusCommentID(statusEntries[i].Payload); id > 0 {
+			githubCommentID = id
+			break
+		}
+	}
+
+	body := issuecomment.RenderStatusBody(runRow, stages, auditEntries, s.cfg.ExternalURL, time.Now())
+
+	var issueNumber int
+	if runRow.IssueContext != nil {
+		issueNumber = runRow.IssueContext.Number
+	}
+
+	s.writeJSON(w, r, http.StatusOK, statusCommentResponse{
+		Body:            body,
+		IssueNumber:     issueNumber,
+		Repo:            runRow.Repo,
+		GithubCommentID: githubCommentID,
+	})
+}
+
+// extractStatusCommentID pulls github_comment_id from a status_comment_posted
+// audit payload. Returns 0 on parse failure or absent field.
+func extractStatusCommentID(payload json.RawMessage) int64 {
+	if len(payload) == 0 {
+		return 0
+	}
+	var p struct {
+		GithubCommentID int64 `json:"github_comment_id"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return 0
+	}
+	return p.GithubCommentID
 }

@@ -9,7 +9,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -564,4 +566,85 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, r, http.StatusOK, toRunResponse(got))
+}
+
+// postStatusCommentRequest is the JSON body for POST /v0/runs/{run_id}/status-comment.
+type postStatusCommentRequest struct {
+	GithubCommentID int64 `json:"github_comment_id"`
+}
+
+// handlePostStatusComment implements POST /v0/runs/{run_id}/status-comment.
+// Records the CLI-posted GitHub comment id into a status_comment_posted audit
+// entry using the same payload shape as the GHA sticky-comment path, so that
+// findStatusCommentID in the Notifier picks up local-path entries naturally
+// on subsequent GHA-side transitions (#428).
+func (s *Server) handlePostStatusComment(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RunRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
+			"status-comment endpoint requires a configured run repository", nil)
+		return
+	}
+	if s.cfg.AuditRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "audit_repo_unconfigured",
+			"status-comment endpoint requires a configured audit repository", nil)
+		return
+	}
+	runID, err := uuid.Parse(r.PathValue("run_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"run_id must be a valid UUID",
+			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
+		return
+	}
+
+	var req postStatusCommentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"request body is not valid JSON",
+			map[string]any{"error": err.Error()})
+		return
+	}
+	if req.GithubCommentID <= 0 {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"github_comment_id must be a positive integer",
+			map[string]any{"field": "github_comment_id"})
+		return
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "run_not_found",
+				"no run with that id", map[string]any{"run_id": runID.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get run failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	var issueNumber int
+	if runRow.IssueContext != nil {
+		issueNumber = runRow.IssueContext.Number
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"kind":              string(issuecomment.KindStatusUpdate),
+		"issue_number":      issueNumber,
+		"repo":              runRow.Repo,
+		"github_comment_id": req.GithubCommentID,
+	})
+	systemKind := audit.ActorSystem
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  issuecomment.CategoryStatusCommentPosted,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"audit append failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
 }

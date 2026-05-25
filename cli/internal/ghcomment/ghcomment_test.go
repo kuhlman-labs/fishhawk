@@ -1,7 +1,10 @@
 package ghcomment
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
@@ -203,5 +206,188 @@ func TestPost_ValidationGuards(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantS)
 			}
 		})
+	}
+}
+
+// withFakeGhOutput sets ghCommentCommand to echo the given string to stdout
+// and exit 0. Used by EditOrCreate tests that need a numeric id in the output.
+func withFakeGhOutput(t *testing.T, stdout string) {
+	t.Helper()
+	origLook := ghLookPath
+	ghLookPath = func(_ string) (string, error) { return "/usr/local/bin/gh", nil }
+	origCmd := ghCommentCommand
+	ghCommentCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' '"+stdout+"'")
+	}
+	t.Cleanup(func() {
+		ghLookPath = origLook
+		ghCommentCommand = origCmd
+	})
+}
+
+// withFakeGhOutputOn404 sets ghCommentCommand to behave differently on first
+// vs. subsequent calls: first call exits 1 with "HTTP 404" in stderr (simulating
+// a deleted comment); subsequent calls echo the given id to stdout and exit 0.
+func withFakeGhOutputOn404(t *testing.T, fallbackID string) {
+	t.Helper()
+	origLook := ghLookPath
+	ghLookPath = func(_ string) (string, error) { return "/usr/local/bin/gh", nil }
+	origCmd := ghCommentCommand
+	call := 0
+	ghCommentCommand = func(_ string, _ ...string) *exec.Cmd {
+		call++
+		if call == 1 {
+			return exec.Command("sh", "-c", "echo 'HTTP 404: Not Found' >&2; exit 1")
+		}
+		return exec.Command("sh", "-c", "printf '%s' '"+fallbackID+"'")
+	}
+	t.Cleanup(func() {
+		ghLookPath = origLook
+		ghCommentCommand = origCmd
+	})
+}
+
+func TestEditOrCreate_CreatePath(t *testing.T) {
+	withFakeGhOutput(t, "99")
+	id, err := EditOrCreate("x/y", 42, 0, "hello body")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if id != 99 {
+		t.Errorf("id = %d, want 99", id)
+	}
+}
+
+func TestEditOrCreate_EditPath(t *testing.T) {
+	withFakeGhOutput(t, "55")
+	id, err := EditOrCreate("x/y", 42, 11, "updated body")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if id != 55 {
+		t.Errorf("id = %d, want 55", id)
+	}
+}
+
+func TestEditOrCreate_404FallbackToCreate(t *testing.T) {
+	withFakeGhOutputOn404(t, "77")
+	id, err := EditOrCreate("x/y", 42, 11, "body")
+	if err != nil {
+		t.Fatalf("err = %v, want nil (404 should fall back to create)", err)
+	}
+	if id != 77 {
+		t.Errorf("id = %d, want 77 (from create fallback)", id)
+	}
+}
+
+func TestEditOrCreate_GhMissing(t *testing.T) {
+	withGhMissing(t)
+	_, err := EditOrCreate("x/y", 42, 0, "body")
+	if !errors.Is(err, ErrGhNotInstalled) {
+		t.Errorf("err = %v, want ErrGhNotInstalled", err)
+	}
+}
+
+func TestEditOrCreate_ValidationGuards(t *testing.T) {
+	withFakeGhOutput(t, "1")
+	cases := []struct {
+		name  string
+		repo  string
+		num   int
+		body  string
+		wantS string
+	}{
+		{"empty repo", "", 1, "x", "empty repo"},
+		{"invalid repo format", "noslash", 1, "x", "owner/name"},
+		{"zero issue", "x/y", 0, "x", "invalid issue"},
+		{"empty body", "x/y", 1, "  ", "empty body"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := EditOrCreate(tc.repo, tc.num, 0, tc.body)
+			if err == nil || !strings.Contains(err.Error(), tc.wantS) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantS)
+			}
+		})
+	}
+}
+
+func TestFetchStatus_HappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "wrong method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(StatusCommentResponse{
+			Body:            "**Fishhawk run** ...",
+			IssueNumber:     42,
+			Repo:            "x/y",
+			GithubCommentID: 99,
+		})
+	}))
+	defer srv.Close()
+
+	runID := uuid.New().String()
+	got, err := FetchStatus(srv.URL, runID)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got.GithubCommentID != 99 {
+		t.Errorf("GithubCommentID = %d, want 99", got.GithubCommentID)
+	}
+	if got.Repo != "x/y" {
+		t.Errorf("Repo = %q, want x/y", got.Repo)
+	}
+}
+
+func TestFetchStatus_BackendError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	_, err := FetchStatus(srv.URL, uuid.New().String())
+	if err == nil {
+		t.Fatal("expected error on 404 response")
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("err = %v, want HTTP 404 mention", err)
+	}
+}
+
+func TestRecordCommentID_HappyPath(t *testing.T) {
+	var gotPayload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "wrong method", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotPayload)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	runID := uuid.New().String()
+	if err := RecordCommentID(srv.URL, runID, 42); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if gotPayload["github_comment_id"].(float64) != 42 {
+		t.Errorf("payload github_comment_id = %v, want 42", gotPayload["github_comment_id"])
+	}
+}
+
+func TestRecordCommentID_BackendError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	err := RecordCommentID(srv.URL, uuid.New().String(), 1)
+	if err == nil {
+		t.Fatal("expected error on 500 response")
+	}
+	if !strings.Contains(err.Error(), "HTTP 500") {
+		t.Errorf("err = %v, want HTTP 500 mention", err)
 	}
 }
