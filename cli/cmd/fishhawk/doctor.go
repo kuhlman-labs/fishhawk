@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
@@ -17,8 +18,8 @@ import (
 type checkResult struct {
 	label     string
 	detail    string
-	status    string // "ok" or "fail"
-	remediate string // non-empty on fail
+	status    string // "ok", "warn", or "fail"
+	remediate string // non-empty on warn or fail
 }
 
 // doctorHTTPDo is the HTTP seam for doctor checks that probe the backend.
@@ -55,7 +56,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		checkBackend(*cf.backendURL),
 		checkToken(*cf.backendURL, *cf.token),
 		checkSpec(*workingDir),
-		checkRunnerBinary(*runnerBinary),
+		checkRunnerBinary(*runnerBinary, *workingDir),
 		checkMCPRegistration(),
 		checkGitOrigin(*workingDir),
 		checkGitWorkingTree(*workingDir),
@@ -65,26 +66,43 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	useColor := isTerminal(stdout) && os.Getenv("NO_COLOR") == ""
 
 	failures := 0
+	warnings := 0
 	for _, r := range checks {
 		statusStr := r.status
-		if useColor && r.status == "fail" {
-			statusStr = "\033[31mfail\033[0m"
+		if useColor {
+			switch r.status {
+			case "fail":
+				statusStr = "\033[31mfail\033[0m"
+			case "warn":
+				statusStr = "\033[33mwarn\033[0m"
+			}
 		}
 		_, _ = fmt.Fprintf(stdout, "%-25s %-40s %s\n", r.label, r.detail, statusStr)
 		if r.remediate != "" {
 			_, _ = fmt.Fprintf(stdout, "  hint: %s\n", r.remediate)
 		}
-		if r.status == "fail" {
+		switch r.status {
+		case "fail":
 			failures++
+		case "warn":
+			warnings++
 		}
 	}
 
 	_, _ = fmt.Fprintln(stdout, "")
 	if failures == 0 {
-		_, _ = fmt.Fprintln(stdout, "ready for local loop")
+		if warnings == 0 {
+			_, _ = fmt.Fprintln(stdout, "ready for local loop")
+		} else {
+			_, _ = fmt.Fprintf(stdout, "ready for local loop (%d warning(s))\n", warnings)
+		}
 		return exitOK
 	}
-	_, _ = fmt.Fprintf(stdout, "%d check(s) failed — fix the above before running the loop\n", failures)
+	if warnings == 0 {
+		_, _ = fmt.Fprintf(stdout, "%d check(s) failed — fix the above before running the loop\n", failures)
+	} else {
+		_, _ = fmt.Fprintf(stdout, "%d check(s) failed, %d warning(s) — fix the above before running the loop\n", failures, warnings)
+	}
 	return exitFailure
 }
 
@@ -189,22 +207,31 @@ func checkSpec(workingDir string) checkResult {
 	return checkResult{label: label, detail: detail, status: "ok"}
 }
 
-// checkRunnerBinary resolves the fishhawk-runner binary via flag > env > PATH.
-func checkRunnerBinary(flagVal string) checkResult {
+// checkRunnerBinary resolves the fishhawk-runner binary via flag > env > PATH > repo bin/.
+func checkRunnerBinary(flagVal, workingDir string) checkResult {
 	label := "runner binary found"
 	binary := flagVal
 	if binary == "" {
 		binary = os.Getenv("FISHHAWK_RUNNER_BIN")
 	}
-	if binary == "" {
-		resolved, err := doctorLookPath("fishhawk-runner")
-		if err != nil {
-			return checkResult{label: label, detail: "not found", status: "fail",
-				remediate: "install fishhawk-runner to PATH or set $FISHHAWK_RUNNER_BIN"}
-		}
-		binary = resolved
+	if binary != "" {
+		return checkResult{label: label, detail: binary, status: "ok"}
 	}
-	return checkResult{label: label, detail: binary, status: "ok"}
+	resolved, err := doctorLookPath("fishhawk-runner")
+	if err == nil {
+		return checkResult{label: label, detail: resolved, status: "ok"}
+	}
+	for _, candidate := range []string{
+		filepath.Join(workingDir, "bin", "fishhawk-runner"),
+		filepath.Join(workingDir, "bin", "fishhawk-runner.exe"),
+	} {
+		fi, statErr := os.Stat(candidate)
+		if statErr == nil && !fi.IsDir() {
+			return checkResult{label: label, detail: candidate + " (via repo bin/)", status: "ok"}
+		}
+	}
+	return checkResult{label: label, detail: "not found", status: "fail",
+		remediate: "install fishhawk-runner to PATH or set $FISHHAWK_RUNNER_BIN"}
 }
 
 // checkMCPRegistration verifies `claude mcp get fishhawk` exits 0.
@@ -244,8 +271,8 @@ func checkGitWorkingTree(workingDir string) checkResult {
 			remediate: "ensure you are inside a git repository"}
 	}
 	if strings.TrimSpace(string(out)) != "" {
-		return checkResult{label: label, detail: "uncommitted changes", status: "fail",
-			remediate: "commit or stash changes before starting a run"}
+		return checkResult{label: label, detail: "uncommitted changes", status: "warn",
+			remediate: "in-flight changes are expected mid-loop; commit or stash before starting a new run"}
 	}
 	return checkResult{label: label, detail: "clean", status: "ok"}
 }

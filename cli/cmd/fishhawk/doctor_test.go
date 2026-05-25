@@ -116,7 +116,7 @@ func TestDoctorCheck_MissingRunnerBinary(t *testing.T) {
 		return "", exec.ErrNotFound
 	})
 
-	r := checkRunnerBinary("") // no flag value, no env value
+	r := checkRunnerBinary("", t.TempDir()) // no flag value, no env value, empty bin/
 	if r.status != "fail" {
 		t.Errorf("status = %q, want fail", r.status)
 	}
@@ -206,6 +206,126 @@ func TestRunDoctor_FailsAndPrintsLabel(t *testing.T) {
 	}
 	if !strings.Contains(out, "check(s) failed") {
 		t.Errorf("stdout missing failure summary: %q", out)
+	}
+}
+
+// TestCheckRunnerBinary_RepoBinFallback verifies that checkRunnerBinary
+// returns ok with a "via repo bin/" detail when LookPath misses but
+// <workingDir>/bin/fishhawk-runner exists as a regular file.
+func TestCheckRunnerBinary_RepoBinFallback(t *testing.T) {
+	withFakeDoctorLookPath(t, func(_ string) (string, error) {
+		return "", exec.ErrNotFound
+	})
+
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(binDir, "fishhawk-runner")
+	if err := os.WriteFile(candidate, []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := checkRunnerBinary("", dir)
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok (detail: %s, remediate: %s)", r.status, r.detail, r.remediate)
+	}
+	if !strings.Contains(r.detail, "via repo bin/") {
+		t.Errorf("detail %q should contain 'via repo bin/'", r.detail)
+	}
+}
+
+// TestCheckGitWorkingTree_DirtyTree_Warn verifies that checkGitWorkingTree
+// returns status "warn" (not "fail") when the working tree has uncommitted changes.
+func TestCheckGitWorkingTree_DirtyTree_Warn(t *testing.T) {
+	dir := t.TempDir()
+
+	// Init a real git repo so git status --porcelain works.
+	for _, args := range [][]string{
+		{"init", dir},
+		{"-C", dir, "config", "user.email", "test@example.com"},
+		{"-C", dir, "config", "user.name", "Test"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil { //nolint:gosec
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	// Write an uncommitted file so the tree is dirty.
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("untracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := checkGitWorkingTree(dir)
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn (detail: %s)", r.status, r.detail)
+	}
+}
+
+// TestRunDoctor_DirtyTree_ExitZero verifies that runDoctor returns exitOK
+// when the only imperfect rung is a dirty working tree (which is now a warn).
+func TestRunDoctor_DirtyTree_ExitZero(t *testing.T) {
+	dir := t.TempDir()
+
+	// Init a git repo with an uncommitted file.
+	for _, args := range [][]string{
+		{"init", dir},
+		{"-C", dir, "config", "user.email", "test@example.com"},
+		{"-C", dir, "config", "user.name", "Test"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil { //nolint:gosec
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("untracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a valid spec so the spec rung passes.
+	hidden := filepath.Join(dir, ".fishhawk")
+	if err := os.MkdirAll(hidden, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hidden, "workflows.yaml"), []byte(validateValidYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stub all rungs that require network or external binaries.
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/healthz"):
+			return fakeHTTPResponse(http.StatusOK, `{"status":"ok","version":"v0.0.0-test"}`), nil
+		default:
+			return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
+		}
+	})
+	withFakeDoctorLookPath(t, func(_ string) (string, error) {
+		return "/usr/local/bin/fishhawk-runner", nil
+	})
+	withFakeDoctorRunOutput(t, func(name string, _ ...string) (string, error) {
+		return fmt.Sprintf("%s ok", name), nil
+	})
+	origGitRemote := gitRemoteOriginURL
+	gitRemoteOriginURL = func(_ string) (string, error) {
+		return "https://github.com/kuhlman-labs/fishhawk.git", nil
+	}
+	t.Cleanup(func() { gitRemoteOriginURL = origGitRemote })
+
+	var stdout, stderr strings.Builder
+	got := run([]string{
+		"doctor",
+		"--backend-url", "http://localhost:8080",
+		"--token", "fhk_testtoken",
+		"--working-dir", dir,
+		"--runner-binary", "/usr/local/bin/fishhawk-runner",
+	}, &stdout, &stderr)
+
+	if got != exitOK {
+		t.Errorf("run = %d, want exitOK; stdout:\n%s", got, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "ready for local loop") {
+		t.Errorf("stdout missing 'ready for local loop': %q", stdout.String())
 	}
 }
 
