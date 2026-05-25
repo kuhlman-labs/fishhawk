@@ -527,6 +527,61 @@ func TestBuild_Plan_ContainsIncrementalVerification(t *testing.T) {
 	}
 }
 
+func TestBuild_Implement_BudgetContext_PlanPresent(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		PredictionContext: &PredictionContext{
+			PredictedMinutes:    9,
+			PredictedConfidence: "medium",
+			StageBudgetMinutes:  30,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{"### Budget context", "9 minutes", "medium confidence", "30 minutes"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("prompt missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+func TestBuild_Implement_BudgetContext_NilContext(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// PredictionContext deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Budget context") {
+		t.Errorf("Budget context section should not appear when PredictionContext is nil:\n%s", got)
+	}
+}
+
+func TestBuild_Implement_BudgetContext_DefaultBudget(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		PredictionContext: &PredictionContext{
+			PredictedMinutes:    9,
+			PredictedConfidence: "medium",
+			StageBudgetMinutes:  0, // no spec budget → default 15m
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Budget context") {
+		t.Errorf("Budget context section should appear even when StageBudgetMinutes is 0:\n%s", got)
+	}
+	if !strings.Contains(got, "15 minutes") {
+		t.Errorf("prompt should contain default budget (15 minutes) when StageBudgetMinutes is 0:\n%s", got)
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop
