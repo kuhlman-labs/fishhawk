@@ -63,6 +63,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runValidate(rest, stdout, stderr)
 	case "runner":
 		return runRunner(rest, stdout, stderr)
+	case "doctor":
+		return runDoctor(rest, stdout, stderr)
 	case "version", "--version":
 		_, _ = fmt.Fprintln(stdout, version.Version)
 		return exitOK
@@ -106,6 +108,7 @@ func printUsage(w io.Writer) {
 		"  audit list   List audit entries for a run.",
 		"  audit tail   Follow the audit log of a run in real time.",
 		"  validate     Validate a workflow spec file locally.",
+		"  doctor       Run local-loop install checks.",
 		"  runner start Spawn the fishhawk-runner locally against an already-minted run (Phase C of E22 / #389).",
 		"  version      Print the CLI version and exit.",
 		"  help         Show this help.",

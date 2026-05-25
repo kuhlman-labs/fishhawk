@@ -149,6 +149,8 @@ Cancellation: cancelling the `fishhawk_run_stage` tool call sends `SIGTERM` to t
 
 ## Troubleshooting
 
+- Run `fishhawk doctor` first — it checks backend reachability, token validity, spec presence, runner-binary resolution, MCP registration, git state, and gh CLI auth in one pass and prints a remediation hint for every failing rung.
+
 | Symptom | Likely cause |
 |---|---|
 | `FISHHAWK_API_TOKEN is required` on startup | The env var is unset or empty. Set it (see step 3). |
