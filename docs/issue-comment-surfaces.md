@@ -60,6 +60,9 @@ early. Comment posting moves to the CLI side, where the operator's authed
 | `fishhawk run cancel <run-id>` | `ghcomment.RenderRunCancelled` | cancellation accepted |
 | `fishhawk runner start --run-id …` | `ghcomment.RenderStageComplete` | runner subprocess exits cleanly |
 | `fishhawk runner start --run-id … --stage implement` | `ghcomment.RenderImplementPROpened` | auto-PR succeeded (--no-pr absent and stage type is implement) |
+| _(agent-driven — see note)_ | `ghcomment.RenderCIRetryMinted` | CI-failure auto-retry minted a new child run (`runner_kind=local`); agent posts after discovering the child via `fishhawk_verify_run` or `fishhawk_list_runs` |
+
+The CI-failure retry path (`handleCIFailureRetry`) branches on `runner_kind`: for `local` runs it mints the child run and leaves it in `pending` without firing `workflow_dispatch`. The discovery signal for the agent is a `ci_failure_retry_dispatched` audit entry whose payload contains `"runner_kind":"local"` — the agent polls for this entry, then posts the retry-minted comment via `gh issue comment` and drives the child run forward.
 
 Renderers live in `cli/internal/ghcomment`; the post step shells to
 `gh issue comment <N> --repo <owner/name> --body …`. v0 scope is append-only

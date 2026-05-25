@@ -850,6 +850,7 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		WorkflowSpec:           p.WorkflowSpec,
 		RetryAttempt:           p.RetryAttempt,
 		MaxRetriesSnapshot:     p.MaxRetriesSnapshot,
+		RunnerKind:             p.RunnerKind,
 		State:                  run.StatePending,
 		CreatedAt:              time.Now().UTC(),
 		UpdatedAt:              time.Now().UTC(),
@@ -2569,6 +2570,7 @@ func seedParentRunForRetry(t *testing.T, runs *stubRuns, repo, specYAML string, 
 		WorkflowSpec:       []byte(specYAML),
 		RetryAttempt:       retryAttempt,
 		MaxRetriesSnapshot: 1, // ciRetrySpec sets max_retries: 1
+		RunnerKind:         run.RunnerKindGitHubActions,
 		State:              run.StateRunning,
 		CreatedAt:          time.Now().Add(-time.Minute).UTC(),
 		UpdatedAt:          time.Now().Add(-time.Minute).UTC(),
@@ -2778,5 +2780,93 @@ func TestHandle_CIFailureRetry_DuplicateHeadSHA_Skips(t *testing.T) {
 	}
 	if len(au.appended) != 0 {
 		t.Errorf("audit rows = %d, want 0 (dedup skipped silently)", len(au.appended))
+	}
+}
+
+func TestHandle_CIFailureRetry_LocalRunner_MintsChildSkipsDispatch(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+
+	// Seed a parent run with runner_kind=local instead of using
+	// seedParentRunForRetry so the RunnerKind is explicit.
+	prURL := "https://github.com/kuhlman-labs/fishhawk/pull/42"
+	triggerRef := "issue:1247"
+	installID := int64(42)
+	parent := &run.Run{
+		ID:             uuid.New(),
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "feedf00d",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installID,
+		PullRequestURL: &prURL,
+		RequiredChecksSnapshot: &run.RequiredChecksSnapshot{
+			Contexts: []string{"ci/build"},
+			Sources:  []string{"branch_protection"},
+		},
+		WorkflowSpec:       []byte(ciRetrySpec),
+		RetryAttempt:       0,
+		MaxRetriesSnapshot: 1,
+		RunnerKind:         run.RunnerKindLocal,
+		State:              run.StateRunning,
+		CreatedAt:          time.Now().Add(-time.Minute).UTC(),
+		UpdatedAt:          time.Now().Add(-time.Minute).UTC(),
+	}
+	runs.mu.Lock()
+	runs.created = append(runs.created, parent)
+	runs.mu.Unlock()
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// Child run minted (parent + child = 2).
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (parent + child)", len(runs.created))
+	}
+	child := runs.created[1]
+
+	// Child inherits runner_kind=local.
+	if child.RunnerKind != run.RunnerKindLocal {
+		t.Errorf("child.RunnerKind = %q, want local", child.RunnerKind)
+	}
+
+	// No workflow_dispatch fired for local-runner runs.
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0 (local runner)", gh.dispatchCalls)
+	}
+
+	// Child's first stage remains in pending (not transitioned to dispatched).
+	var childStages []*run.Stage
+	for _, st := range runs.createdStages {
+		if st.RunID == child.ID {
+			childStages = append(childStages, st)
+		}
+	}
+	if len(childStages) == 0 {
+		t.Fatal("no child stages created")
+	}
+	if childStages[0].State != run.StageStatePending {
+		t.Errorf("child stage state = %q, want pending (no dispatch for local)", childStages[0].State)
+	}
+
+	// One ci_failure_retry_dispatched audit row with runner_kind=local and outcome=dispatched.
+	var dispatched *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "ci_failure_retry_dispatched" {
+			dispatched = &au.appended[i]
+			break
+		}
+	}
+	if dispatched == nil {
+		t.Fatalf("expected ci_failure_retry_dispatched audit row; got %+v", au.appended)
+	}
+	payload := string(dispatched.Payload)
+	if !strings.Contains(payload, `"runner_kind":"local"`) {
+		t.Errorf("audit payload missing runner_kind:local: %s", payload)
+	}
+	if !strings.Contains(payload, `"outcome":"dispatched"`) {
+		t.Errorf("audit payload missing outcome:dispatched: %s", payload)
 	}
 }
