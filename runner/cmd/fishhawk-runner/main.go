@@ -320,6 +320,20 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Verify gate: optional in-band test gate that fires after constraint
+	// evaluation and before bundle building. Non-zero exit from the
+	// verify command demotes to category-A (#441).
+	if res.OK && cfg.verifyCmd != "" {
+		ev, demote := runVerifyGate(ctx, cfg, logSink)
+		res.Events = append(res.Events, ev)
+		if demote != nil {
+			res.OK = false
+			res.FailureCategory = "A"
+			res.FailureReason = demote.Error()
+			invokeErr = demote
+		}
+	}
+
 	// Bundle building is shared by --bundle-out and --upload-trace.
 	// We build raw + redacted variants once into memory, then write
 	// to disk and/or upload. When neither is configured, fall back
@@ -910,6 +924,65 @@ func validatePlan(path string) (agent.Event, error) {
 		Kind:    "policy_event",
 		Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "valid", "path": path}),
 	}, nil
+}
+
+// runVerifyGate runs the --verify-cmd shell command as an in-band test
+// gate after the agent exits cleanly. It captures combined output,
+// emits a verify_run event, and returns a non-nil error (which the
+// caller uses to demote the run to category-A) when the command exits
+// non-zero.
+//
+// The command runs via "sh -c <verifyCmd>" so the flag accepts any
+// shell expression. Setpgid=true places the child in a new process
+// group; cmd.Cancel kills the whole group on context cancellation so
+// grandchildren (e.g. go test subprocesses) don't keep the output
+// pipe open and block CombinedOutput.
+func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, error) {
+	timeout := cfg.verifyTimeout
+	if timeout == 0 {
+		timeout = 10 * time.Minute
+	}
+	childCtx, childCancel := context.WithTimeout(ctx, timeout)
+	defer childCancel()
+
+	cmd := exec.CommandContext(childCtx, "sh", "-c", cfg.verifyCmd)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+
+	output, cmdErr := cmd.CombinedOutput()
+
+	exitCode := 0
+	if cmdErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(cmdErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	outcome := "passed"
+	var gateErr error
+	if exitCode != 0 {
+		outcome = "failed"
+		gateErr = fmt.Errorf("verify gate failed: %s exited %d", cfg.verifyCmd, exitCode)
+	}
+
+	ev := agent.Event{
+		Kind: "verify_run",
+		Payload: agent.MakePayload(map[string]any{
+			"command":   cfg.verifyCmd,
+			"exit_code": exitCode,
+			"output":    string(output),
+			"outcome":   outcome,
+		}),
+	}
+	return ev, gateErr
 }
 
 // emitEvents writes one JSON object per line. This is the

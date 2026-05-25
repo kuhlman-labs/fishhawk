@@ -51,6 +51,9 @@ workflows:
         type: implement
         executor:
           agent: claude-code
+          verify:
+            command: 'scripts/test'
+            timeout: '10m'
         inputs:
           - artifact: plan
             from_stage: plan

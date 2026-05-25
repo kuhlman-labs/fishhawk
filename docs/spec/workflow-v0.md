@@ -29,6 +29,9 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
   executor: # exactly one of agent or human
     agent: claude-code # any string; v0 ships claude-code
     timeout: 10m       # optional; stage-level override for agent timeout
+    verify:            # optional; in-band test gate (see ### Verify gate)
+      command: 'scripts/test'
+      timeout: '10m'
     # OR
     human: true
   inputs: [<input>...] # optional
@@ -39,6 +42,24 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
 ```
 
 Stage `id` is unique within the workflow. The `from_stage` field on inputs cross-references it; the validator (E1.3 / #18) enforces this beyond the schema.
+
+### Verify gate
+
+An optional in-band test gate that fires after the agent exits cleanly and before the bundle is committed. When `verify` is absent, the gate is skipped.
+
+```yaml
+executor:
+  agent: claude-code
+  verify:
+    command: 'scripts/test'   # executed via sh -c; non-zero exit → category-A
+    timeout: '10m'            # optional; defaults to 10m when absent
+```
+
+The runner captures combined stdout+stderr into a `verify_run` bundle event so operators can inspect why the gate failed without re-running. Fields: `command`, `exit_code`, `output`, `outcome` (`"passed"` | `"failed"`).
+
+The gate fires only when the agent itself succeeded (i.e., `res.OK` is true) — a failing agent already produces a category-A trace, and re-running the tests against a broken working tree would be misleading.
+
+The full wiring path from spec to runner is deferred: v0 ships `verify` as a documented spec field for authoring surface. The runner reads the gate command from the `--verify-cmd` CLI flag; a follow-up issue will wire the backend to read `executor.verify.command` from the cached spec and deliver it to the runner via the prompt-fetch response.
 
 ## Inputs
 

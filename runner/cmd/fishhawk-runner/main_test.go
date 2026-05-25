@@ -2478,6 +2478,168 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	}
 }
 
+// --- Verify gate (#441) ---
+
+// TestVerify_NoCmd_SkipsGate confirms that when --verify-cmd is absent
+// run() returns exitOK and the bundle contains no verify_run event.
+func TestVerify_NoCmd_SkipsGate(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	_ = os.WriteFile(promptPath, []byte("p"), 0o600)
+
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u",
+		"--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--bundle-out", bundlePath,
+		// --verify-cmd intentionally absent
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if ev.Kind == "verify_run" {
+			t.Errorf("unexpected verify_run event in bundle when --verify-cmd is absent: %+v", ev)
+		}
+	}
+}
+
+// TestVerify_Passes confirms that --verify-cmd 'true' exits 0, the
+// run succeeds, and the bundle contains a verify_run event with outcome=passed.
+func TestVerify_Passes(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	_ = os.WriteFile(promptPath, []byte("p"), 0o600)
+
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u",
+		"--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--bundle-out", bundlePath,
+		"--verify-cmd", "true",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawPassed bool
+	for _, ev := range events {
+		if ev.Kind == "verify_run" && strings.Contains(string(ev.Data), `"outcome":"passed"`) {
+			sawPassed = true
+		}
+	}
+	if !sawPassed {
+		t.Errorf("missing verify_run outcome=passed in bundle:\n%+v", events)
+	}
+}
+
+// TestVerify_Fails confirms that --verify-cmd 'false' exits 1, the run
+// exits with exitFailure, the bundle manifest marks agent_failed=true,
+// and the bundle contains a verify_run event with outcome=failed.
+func TestVerify_Fails(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	_ = os.WriteFile(promptPath, []byte("p"), 0o600)
+
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u",
+		"--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath,
+		"--bundle-out", bundlePath,
+		"--verify-cmd", "false",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("expected category-A on verify failure, got:\n%s", stderr.String())
+	}
+
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !manifest.AgentFailed {
+		t.Errorf("manifest.AgentFailed = false, want true on verify failure")
+	}
+	var sawFailed bool
+	for _, ev := range events {
+		if ev.Kind == "verify_run" && strings.Contains(string(ev.Data), `"outcome":"failed"`) {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Errorf("missing verify_run outcome=failed in bundle:\n%+v", events)
+	}
+}
+
+// TestVerify_CtxCancelledMidGate confirms that when the runner context
+// is cancelled while the verify command is running, run() exits with
+// exitCancelled (130) and emits a runner_cancelled log line.
+func TestVerify_CtxCancelledMidGate(t *testing.T) {
+	prompt := filepath.Join(t.TempDir(), "prompt.txt")
+	_ = os.WriteFile(prompt, []byte("p"), 0o600)
+
+	// Agent returns immediately so the verify gate is reached.
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	cancel := withCancelableRunnerContext(t)
+
+	// Cancel after a brief delay so the verify command is running.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	var out strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u",
+		"--workflow", "w", "--stage", "s",
+		"--prompt-file", prompt,
+		"--verify-cmd", "sleep 60",
+	}, &out)
+
+	if got != exitCancelled {
+		t.Errorf("run = %d, want exitCancelled(%d)", got, exitCancelled)
+	}
+	if !strings.Contains(out.String(), `"event":"runner_cancelled"`) {
+		t.Errorf("missing runner_cancelled log line:\n%s", out.String())
+	}
+}
+
 // TestRun_FetchPrompt_OperatorTimeoutWins verifies that when --timeout is
 // passed explicitly, the operator value wins over the server-resolved
 // AgentTimeoutSeconds, regardless of what the server returns.
