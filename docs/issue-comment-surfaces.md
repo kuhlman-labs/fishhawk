@@ -44,32 +44,46 @@ The `Notifier`'s `contextFor` / `contextForStatus` helpers gate the skip:
 missing `installation_id`, unparseable `trigger_ref`, or non-issue
 `trigger_source` short-circuits before any GitHub call.
 
-## Local-runner runs (#416)
+## Local-runner runs (#416, #428)
 
 For runs minted with `runner_kind=local`, the backend's `IssueNotifier` is a
 no-op by design: the run carries no `installation_id` (the operator's local
 flow doesn't go through a GitHub App webhook), so `contextForStatus` returns
 early. Comment posting moves to the CLI side, where the operator's authed
-`gh` is available:
+`gh` is available.
 
-| CLI verb | Renderer | Posted when |
-|---|---|---|
-| `fishhawk run start --issue N` | `ghcomment.RenderKickoff` | run-create succeeds |
-| `fishhawk plan approve <run-id>` | `ghcomment.RenderPlanApproved` | approval submitted |
-| `fishhawk plan reject <run-id>` | `ghcomment.RenderPlanRejected` | rejection submitted |
-| `fishhawk run cancel <run-id>` | `ghcomment.RenderRunCancelled` | cancellation accepted |
-| `fishhawk runner start --run-id …` | `ghcomment.RenderStageComplete` | runner subprocess exits cleanly |
-| `fishhawk runner start --run-id … --stage implement` | `ghcomment.RenderImplementPROpened` | auto-PR succeeded (--no-pr absent and stage type is implement) |
-| _(agent-driven — see note)_ | `ghcomment.RenderCIRetryMinted` | CI-failure auto-retry minted a new child run (`runner_kind=local`); agent posts after discovering the child via `fishhawk_verify_run` or `fishhawk_list_runs` |
+**Edit-in-place sticky comment (#428).** Every CLI verb that changes run or
+stage state calls `ghcomment.PostOrEditStatusComment`, which:
 
-The CI-failure retry path (`handleCIFailureRetry`) branches on `runner_kind`: for `local` runs it mints the child run and leaves it in `pending` without firing `workflow_dispatch`. The discovery signal for the agent is a `ci_failure_retry_dispatched` audit entry whose payload contains `"runner_kind":"local"` — the agent polls for this entry, then posts the retry-minted comment via `gh issue comment` and drives the child run forward.
+1. `GET /v0/runs/{run_id}/status-comment` — fetches the rendered body (server
+   calls `issuecomment.RenderStatusBody`) and the stored `github_comment_id`.
+2. `EditOrCreate(repo, issueNumber, githubCommentID, body)` — shells to
+   `gh api` to edit the existing comment (if `github_comment_id > 0`) or
+   create a new one. Falls back to create on HTTP 404 (deleted comment).
+3. `POST /v0/runs/{run_id}/status-comment` — records the returned comment ID
+   in the run's audit log (`status_comment_posted` category) so the next call
+   can edit in place.
 
-Renderers live in `cli/internal/ghcomment`; the post step shells to
-`gh issue comment <N> --repo <owner/name> --body …`. v0 scope is append-only
-(each transition gets a new comment); edit-in-place against a sticky
-comment-id is deferred to a follow-up. Missing or unauthed `gh` warns to
-stderr and proceeds — the run still records, the issue thread just stays
-quiet.
+| CLI verb | Sticky comment updated when |
+|---|---|
+| `fishhawk run start --issue N` | run-create succeeds |
+| `fishhawk plan approve <run-id>` | approval submitted |
+| `fishhawk plan reject <run-id>` | rejection submitted |
+| `fishhawk run cancel <run-id>` | cancellation accepted |
+| `fishhawk runner start --run-id … --stage plan` | runner subprocess exits cleanly |
+| `fishhawk runner start --run-id … --stage implement` | auto-PR opened OR runner exits (two idempotent calls) |
+
+The CI-failure retry path (`handleCIFailureRetry`) branches on `runner_kind`:
+for `local` runs it mints the child run and leaves it in `pending` without
+firing `workflow_dispatch`. The discovery signal for the agent is a
+`ci_failure_retry_dispatched` audit entry whose payload contains
+`"runner_kind":"local"` — the agent polls for this entry, then posts a
+retry-minted comment via `gh issue comment` and drives the child run forward.
+(This separate comment is agent-authored and append-only; it is not the
+sticky-comment surface.)
+
+Missing or unauthed `gh` warns to stderr and proceeds — the run still
+records, the issue thread just stays quiet.
 
 Authorship side note: local-run comments are authored by the operator's
 GitHub identity (whoever ran `gh auth login`), not by the Fishhawk App. For

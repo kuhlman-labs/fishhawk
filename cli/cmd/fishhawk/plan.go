@@ -125,22 +125,13 @@ func planDecision(name string, decision httpclient.ApprovalDecision, args []stri
 		printStage(stdout, stage)
 	}
 
-	// #416: comment on the triggering issue when this is a local-
-	// runner run. SubmitApproval returns the stage; we need the
-	// run row to read RunnerKind + IssueContext, so an extra
-	// GetRun is unavoidable. Best-effort — failures don't change
-	// the verb's exit code.
-	if r := fetchRunForComment(ctx, client, runID); r != nil {
-		gcr := toGhCommentRun(r, *cf.backendURL)
-		handle := resolveGitHubHandle()
-		var body string
-		switch decision {
-		case httpclient.ApprovalApprove:
-			body = ghcomment.RenderPlanApproved(gcr, handle)
-		case httpclient.ApprovalReject:
-			body = ghcomment.RenderPlanRejected(gcr, handle, *reason)
+	// #428: post or edit the sticky status comment for local-runner
+	// issue-triggered runs. Needs the run row to check RunnerKind +
+	// IssueContext; best-effort.
+	if r := fetchRunForComment(ctx, client, runID); r != nil && r.RunnerKind == "local" && r.IssueContext != nil {
+		if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+			_, _ = fmt.Fprintf(stderr, "fishhawk: comment on issue #%d failed: %v\n", r.IssueContext.Number, err)
 		}
-		maybePostLocalComment(stderr, r, body)
 	}
 	return exitOK
 }

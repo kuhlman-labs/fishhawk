@@ -488,6 +488,31 @@ components:
           type: string
           description: Hex sha256 of the canonical hash inputs.
 
+    StatusCommentResponse:
+      type: object
+      description: |
+        Rendered sticky-comment body plus the GitHub comment ID stored
+        in the most recent `status_comment_posted` audit entry (0 when
+        no comment has been posted yet). Used by the CLI to drive
+        edit-in-place updates on the issue thread.
+      required: [body, issue_number, repo, github_comment_id]
+      properties:
+        body:
+          type: string
+          description: Rendered Markdown body for the issue comment.
+        issue_number:
+          type: integer
+          description: GitHub issue number the comment belongs to.
+        repo:
+          type: string
+          description: "GitHub repo in owner/name form."
+        github_comment_id:
+          type: integer
+          format: int64
+          description: |
+            GitHub comment ID from the last `status_comment_posted` audit entry.
+            Zero when no comment has been posted yet (create-path).
+
     CalibrationResult:
       type: object
       description: |
@@ -1182,6 +1207,60 @@ paths:
             `validation_failed` — `stage_id` not a UUID, or `limit` out of range.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v0/runs/{run_id}/status-comment:
+    get:
+      operationId: getStatusComment
+      summary: Get rendered sticky-comment body and stored GitHub comment ID
+      description: |
+        Returns the rendered Markdown body for the run's issue thread sticky
+        comment (`RenderStatusBody`) plus the `github_comment_id` from the
+        most recent `status_comment_posted` audit entry (0 when no comment
+        has been posted yet). Used by the CLI to drive edit-in-place updates
+        without re-rendering client-side (#428).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Rendered body and stored comment ID.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatusCommentResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: Run repository unavailable. }
+    post:
+      operationId: recordStatusCommentID
+      summary: Record the GitHub comment ID after posting the sticky comment
+      description: |
+        Called by the CLI after `gh api` creates or edits the issue comment.
+        Appends a `status_comment_posted` audit entry with the returned
+        `github_comment_id` so subsequent GET calls can return it for
+        edit-in-place targeting. Idempotent: multiple POSTs are safe (#428).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [github_comment_id]
+              properties:
+                github_comment_id:
+                  type: integer
+                  format: int64
+                  minimum: 1
+      responses:
+        '201':
+          description: Comment ID recorded.
+        '400':
+          description: "`validation_failed` — `github_comment_id` missing or ≤ 0."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: Run repository unavailable. }
 
   /v0/audit:
     get:

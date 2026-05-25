@@ -202,16 +202,17 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		return exitFailure
 	}
 
-	// #416/#422: after the runner exits cleanly, post a comment on
-	// the triggering issue for local-runner runs. Best-effort —
-	// failures here do not affect the verb's exit code.
+	// #428: after the runner exits cleanly, post or edit the sticky
+	// status comment for local-runner issue-triggered runs. Both the
+	// auto-PR path and the plain stage-complete path call
+	// PostOrEditStatusComment — edit-in-place makes dual calls
+	// idempotent. Best-effort; failures don't affect the verb's exit code.
 	parsedRunID, perr := uuid.Parse(*runID)
 	var parsedStageID uuid.UUID
 	var stageParseErr error
 	if perr == nil {
 		parsedStageID, stageParseErr = uuid.Parse(*stageID)
 	}
-	prCommentPosted := false
 	if perr == nil && stageParseErr == nil && *stage == "implement" && !*noPR {
 		clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
 		defer clientCancel()
@@ -222,7 +223,7 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		if runRow, fetchErr := client.GetRun(clientCtx, parsedRunID); fetchErr == nil {
 			decomposedFrom = runRow.DecomposedFrom
 		}
-		result, autoErr := autoOpenPR(clientCtx, client, autoOpenPRArgs{
+		_, autoErr := autoOpenPR(clientCtx, client, autoOpenPRArgs{
 			WorkingDir:     *workingDir,
 			RunID:          parsedRunID,
 			StageID:        parsedStageID,
@@ -233,28 +234,21 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		if autoErr != nil {
 			_, _ = fmt.Fprintf(stderr, "fishhawk runner start: auto-PR warning: %v\n", autoErr)
 		} else {
-			if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil {
-				maybePostLocalComment(stderr, r,
-					ghcomment.RenderImplementPROpened(
-						toGhCommentRun(r, *cf.backendURL),
-						result.PRURL, result.PRNumber))
+			if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil && r.RunnerKind == "local" && r.IssueContext != nil {
+				if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+					_, _ = fmt.Fprintf(stderr, "fishhawk runner start: comment on issue #%d: %v\n", r.IssueContext.Number, err)
+				}
 			}
-			prCommentPosted = true
 		}
 	}
-	if !prCommentPosted && perr == nil {
+	if perr == nil {
 		clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)
 		defer clientCancel()
 		client := runnerNewClient(cf)
-		if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil {
-			stateAfter := "unknown"
-			if fetched := fetchStageForComment(clientCtx, client, parsedStageID); fetched != nil {
-				stateAfter = fetched.State
+		if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil && r.RunnerKind == "local" && r.IssueContext != nil {
+			if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+				_, _ = fmt.Fprintf(stderr, "fishhawk runner start: comment on issue #%d: %v\n", r.IssueContext.Number, err)
 			}
-			maybePostLocalComment(stderr, r,
-				ghcomment.RenderStageComplete(
-					toGhCommentRun(r, *cf.backendURL),
-					*stage, stateAfter))
 		}
 	}
 	return exitOK

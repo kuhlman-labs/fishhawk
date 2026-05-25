@@ -224,11 +224,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 	printRun(stdout, r)
 
-	// #416: for local-runner runs triggered by a GitHub issue,
-	// post the "Fishhawk picked this up" comment via the
-	// operator's `gh`. Best-effort; nil-safe when not applicable.
-	maybePostLocalComment(stderr, r,
-		ghcomment.RenderKickoff(toGhCommentRun(r, *cf.backendURL)))
+	// #428: for local-runner runs triggered by a GitHub issue, post
+	// or edit the sticky status comment. Best-effort; nil-safe when
+	// not applicable.
+	if r.RunnerKind == "local" && r.IssueContext != nil {
+		if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+			_, _ = fmt.Fprintf(stderr, "fishhawk: comment on issue #%d failed: %v\n", r.IssueContext.Number, err)
+		}
+	}
 	return exitOK
 }
 
@@ -343,10 +346,12 @@ func runCancel(args []string, stdout, stderr io.Writer) int {
 	}
 	printRun(stdout, r)
 
-	// #416: comment on the issue thread for local-runner runs.
-	maybePostLocalComment(stderr, r,
-		ghcomment.RenderRunCancelled(toGhCommentRun(r, *cf.backendURL),
-			resolveGitHubHandle()))
+	// #428: sticky status comment for local-runner issue-triggered runs.
+	if r.RunnerKind == "local" && r.IssueContext != nil {
+		if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+			_, _ = fmt.Fprintf(stderr, "fishhawk: comment on issue #%d failed: %v\n", r.IssueContext.Number, err)
+		}
+	}
 	return exitOK
 }
 
