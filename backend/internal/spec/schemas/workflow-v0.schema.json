@@ -149,6 +149,24 @@
               "type": "string",
               "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
               "description": "Wall-clock cap for this stage's agent invocation. Overrides workflow.policy.max_stage_runtime when set. Falls back to the workflow policy or the backend default (15m) when absent. Parsed by time.ParseDuration."
+            },
+            "verify": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["command"],
+              "description": "Optional in-band test gate. When present, the runner executes the command after the agent exits cleanly. Non-zero exit demotes the run to category-A before the bundle is committed.",
+              "properties": {
+                "command": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Shell command run as the verify gate (executed via sh -c). Non-zero exit code demotes the run to category-A."
+                },
+                "timeout": {
+                  "type": "string",
+                  "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+                  "description": "Wall-clock cap on the verify command. Parsed by time.ParseDuration. Defaults to 10m when absent."
+                }
+              }
             }
           }
         },

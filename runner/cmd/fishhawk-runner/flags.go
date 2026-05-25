@@ -50,6 +50,14 @@ type config struct {
 	baseBranch string
 	noPR       bool
 
+	// verifyCmd is the shell command run as the in-band test gate
+	// after the agent exits cleanly. Empty (default) skips the gate.
+	// Corresponds to executor.verify.command in the workflow spec;
+	// delivered via --verify-cmd until the backend wires the field
+	// through the prompt-fetch response.
+	verifyCmd     string
+	verifyTimeout time.Duration
+
 	// decomposedFromRunID is set at runtime (not a flag) when the
 	// fetched prompt reveals that this run is a decomposed child.
 	// Drives shared-branch routing in openPRAndShipArtifact.
@@ -102,6 +110,10 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"base branch for the implement-stage PR; falls back to GITHUB_REF_NAME env then to 'main' when both empty")
 	fs.BoolVar(&cfg.noPR, "no-pr", false,
 		"skip the implement-stage git push + PR open; the working tree stays dirty for the operator to commit themselves. Default posture for local-runner dev loops")
+	fs.StringVar(&cfg.verifyCmd, "verify-cmd", "",
+		"shell command run as the in-band test gate after the agent exits cleanly (executed via sh -c); empty means skip. Corresponds to executor.verify.command in the workflow spec.")
+	fs.DurationVar(&cfg.verifyTimeout, "verify-timeout", 0,
+		"wall-clock cap on the verify command; 0 means fall back to 10m inside runVerifyGate")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
