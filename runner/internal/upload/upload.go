@@ -302,12 +302,14 @@ type FetchPromptArgs struct {
 // invocation; 0 means the backend could not resolve a spec-governed timeout
 // and the runner should fall back to its own constant.
 type FetchedPrompt struct {
-	StageID             string `json:"stage_id"`
-	StageType           string `json:"stage_type"`
-	Prompt              string `json:"prompt"`
-	PromptHash          string `json:"prompt_hash"`
-	AgentTimeoutSeconds int    `json:"agent_timeout_seconds"`
-	DecomposedFromRunID string `json:"decomposed_from_run_id,omitempty"`
+	StageID              string `json:"stage_id"`
+	StageType            string `json:"stage_type"`
+	Prompt               string `json:"prompt"`
+	PromptHash           string `json:"prompt_hash"`
+	AgentTimeoutSeconds  int    `json:"agent_timeout_seconds"`
+	DecomposedFromRunID  string `json:"decomposed_from_run_id,omitempty"`
+	VerifyCommand        string `json:"verify_command,omitempty"`
+	VerifyTimeoutSeconds int    `json:"verify_timeout_seconds,omitempty"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an

@@ -1336,6 +1336,12 @@ paths:
                     type: string
                     format: uuid
                     description: Parent run ID when this run is a decomposed child. Absent for standalone runs. Runners use this to route onto a shared parent branch.
+                  verify_command:
+                    type: string
+                    description: Shell command for the verify gate; omitted when the spec declares none.
+                  verify_timeout_seconds:
+                    type: integer
+                    description: Wall-clock cap for the verify command in seconds; 0 or absent means the runner applies its 10-minute fallback.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1398,6 +1404,12 @@ paths:
                     type: string
                     format: uuid
                     description: Parent run ID when this run is a decomposed child. Absent for standalone runs.
+                  verify_command:
+                    type: string
+                    description: Shell command for the verify gate; omitted when the spec declares none.
+                  verify_timeout_seconds:
+                    type: integer
+                    description: Wall-clock cap for the verify command in seconds; 0 or absent means the runner applies its 10-minute fallback.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

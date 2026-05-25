@@ -1036,3 +1036,95 @@ func TestGetStagePromptRender_DecomposedFromRunID_Present(t *testing.T) {
 		t.Errorf("DecomposedFromRunID = %q, want %q", resp.DecomposedFromRunID, parentRunID.String())
 	}
 }
+
+// specWithVerifyYAML is a minimal feature_change spec where the implement
+// stage declares executor.verify.command and executor.verify.timeout.
+const specWithVerifyYAML = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "scripts/test"
+            timeout: "5m"
+        produces:
+          - artifact: pull_request
+`
+
+// TestGetStagePrompt_VerifyConfig_Present confirms that when the workflow
+// spec declares executor.verify, the prompt response carries verify_command
+// and verify_timeout_seconds.
+func TestGetStagePrompt_VerifyConfig_Present(t *testing.T) {
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "x/y",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+		WorkflowSpec:  []byte(specWithVerifyYAML),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.VerifyCommand != "scripts/test" {
+		t.Errorf("VerifyCommand = %q, want %q", resp.VerifyCommand, "scripts/test")
+	}
+	if resp.VerifyTimeoutSeconds != 300 {
+		t.Errorf("VerifyTimeoutSeconds = %d, want 300 (5m)", resp.VerifyTimeoutSeconds)
+	}
+}
+
+// TestGetStagePrompt_VerifyConfig_Absent confirms that when the workflow
+// spec declares no executor.verify block, both verify fields are omitted
+// from the JSON response (omitempty).
+func TestGetStagePrompt_VerifyConfig_Absent(t *testing.T) {
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "x/y",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+		WorkflowSpec:  []byte(planStageSpecYAML30m),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	// Assert on the raw JSON bytes so omitempty behaviour is visible.
+	body := w.Body.String()
+	if strings.Contains(body, "verify_command") {
+		t.Errorf("response JSON should not contain verify_command when spec has none:\n%s", body)
+	}
+	if strings.Contains(body, "verify_timeout_seconds") {
+		t.Errorf("response JSON should not contain verify_timeout_seconds when spec has none:\n%s", body)
+	}
+}

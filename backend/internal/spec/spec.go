@@ -164,8 +164,18 @@ const (
 // Executor describes what runs the stage. Exactly one of Agent or
 // Human is set. The schema enforces the mutual exclusion.
 type Executor struct {
-	Agent   string   `json:"agent,omitempty" yaml:"agent,omitempty"`
-	Human   bool     `json:"human,omitempty" yaml:"human,omitempty"`
+	Agent   string        `json:"agent,omitempty" yaml:"agent,omitempty"`
+	Human   bool          `json:"human,omitempty" yaml:"human,omitempty"`
+	Timeout Duration      `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	Verify  *VerifyConfig `json:"verify,omitempty" yaml:"verify,omitempty"`
+}
+
+// VerifyConfig holds the optional in-band test gate for a stage.
+// Command is a shell expression (passed to sh -c) that must exit 0
+// for the stage to succeed. Timeout caps the gate's wall-clock run;
+// zero means the runner applies its own 10-minute fallback.
+type VerifyConfig struct {
+	Command string   `json:"command" yaml:"command"`
 	Timeout Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 }
 

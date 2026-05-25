@@ -36,7 +36,9 @@ type promptResponse struct {
 	// DecomposedFromRunID is the parent run's ID when this run is a
 	// decomposed child. Absent for standalone runs. Runners use this to
 	// route decomposed children onto a shared parent branch.
-	DecomposedFromRunID string `json:"decomposed_from_run_id,omitempty"`
+	DecomposedFromRunID  string `json:"decomposed_from_run_id,omitempty"`
+	VerifyCommand        string `json:"verify_command,omitempty"`
+	VerifyTimeoutSeconds int    `json:"verify_timeout_seconds,omitempty"`
 }
 
 // issueGetter is the slice of githubclient.Client the prompt
@@ -184,12 +186,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hash := signing.ComputeMessage([]byte(text))
+	verifyCmd, verifyTimeoutSecs := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
 	resp := promptResponse{
-		StageID:             stageID.String(),
-		StageType:           string(stage.Type),
-		Prompt:              text,
-		PromptHash:          hex.EncodeToString(hash),
-		AgentTimeoutSeconds: s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
+		StageID:              stageID.String(),
+		StageType:            string(stage.Type),
+		Prompt:               text,
+		PromptHash:           hex.EncodeToString(hash),
+		AgentTimeoutSeconds:  s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
+		VerifyCommand:        verifyCmd,
+		VerifyTimeoutSeconds: verifyTimeoutSecs,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -320,12 +325,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	}
 
 	hash := signing.ComputeMessage([]byte(text))
+	verifyCmd, verifyTimeoutSecs := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
 	resp := promptResponse{
-		StageID:             stageID.String(),
-		StageType:           string(stage.Type),
-		Prompt:              text,
-		PromptHash:          hex.EncodeToString(hash),
-		AgentTimeoutSeconds: s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
+		StageID:              stageID.String(),
+		StageType:            string(stage.Type),
+		Prompt:               text,
+		PromptHash:           hex.EncodeToString(hash),
+		AgentTimeoutSeconds:  s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
+		VerifyCommand:        verifyCmd,
+		VerifyTimeoutSeconds: verifyTimeoutSecs,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -689,6 +697,48 @@ func (s *Server) resolveAgentTimeout(ctx context.Context, runRow *run.Run, stage
 	}
 	resolved := spec.ResolveStageTimeout(wf, specStage, spec.DefaultStageTimeout)
 	return int(resolved.Seconds())
+}
+
+// resolveVerifyConfig returns the verify command and timeout (in seconds)
+// for the given stage from the run's workflow spec. Returns ("", 0) when
+// the spec is absent, the stage declares no executor.verify block, or the
+// timeout is zero. Mirrors resolveAgentTimeout's parse + lookup pattern.
+func (s *Server) resolveVerifyConfig(ctx context.Context, runRow *run.Run, stageType run.StageType) (command string, timeoutSecs int) {
+	if runRow.WorkflowSpec == nil {
+		return "", 0
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse workflow spec for verify config",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return "", 0
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return "", 0
+	}
+	var specStage spec.Stage
+	for _, st := range wf.Stages {
+		if st.ID == string(stageType) {
+			specStage = st
+			break
+		}
+	}
+	if specStage.ID == "" {
+		for _, st := range wf.Stages {
+			if string(st.Type) == string(stageType) {
+				specStage = st
+				break
+			}
+		}
+	}
+	if specStage.Executor.Verify == nil || specStage.Executor.Verify.Command == "" {
+		return "", 0
+	}
+	secs := int(specStage.Executor.Verify.Timeout.Seconds())
+	return specStage.Executor.Verify.Command, secs
 }
 
 // parseIssueRef extracts the issue number from a TriggerRef of the
