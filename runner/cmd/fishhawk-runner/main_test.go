@@ -2676,3 +2676,114 @@ func TestRun_FetchPrompt_OperatorTimeoutWins(t *testing.T) {
 			invoker.gotInv.Budget.Timeout)
 	}
 }
+
+// --- Verify config wire (#504) ---
+
+// TestRun_FetchPrompt_SpecVerifyCmd_NoFlag confirms that when the prompt
+// response carries VerifyCommand and no --verify-cmd flag is set, the verify
+// gate fires with the spec-sourced command.
+func TestRun_FetchPrompt_SpecVerifyCmd_NoFlag(t *testing.T) {
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:              "22222222-3333-4444-5555-666666666666",
+		StageType:            "plan",
+		Prompt:               "Hello agent.",
+		PromptHash:           "deadbeef",
+		VerifyCommand:        "true", // exits 0 — verify passes
+		VerifyTimeoutSeconds: 30,
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--bundle-out", bundlePath,
+		// --verify-cmd intentionally absent; spec-sourced command applies
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (spec verify cmd 'true'):\n%s", got, stderr.String())
+	}
+
+	// The bundle must contain a verify_run event proving the gate fired.
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatalf("bundle not written: %v", err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatalf("open bundle: %v", err)
+	}
+	var sawVerify bool
+	for _, ev := range events {
+		if ev.Kind == "verify_run" && strings.Contains(string(ev.Data), `"outcome":"passed"`) {
+			sawVerify = true
+		}
+	}
+	if !sawVerify {
+		t.Errorf("missing verify_run outcome=passed in bundle (spec verify cmd should have fired):\n%+v", events)
+	}
+}
+
+// TestRun_FetchPrompt_OperatorVerifyCmdWins confirms that when --verify-cmd
+// is set explicitly, the operator flag wins over the spec-sourced command.
+func TestRun_FetchPrompt_OperatorVerifyCmdWins(t *testing.T) {
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:       "22222222-3333-4444-5555-666666666666",
+		StageType:     "plan",
+		Prompt:        "Hello agent.",
+		PromptHash:    "deadbeef",
+		VerifyCommand: "false", // spec says 'false' — would fail if used
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--bundle-out", bundlePath,
+		"--verify-cmd", "true", // operator override wins
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (operator 'true' should win over spec 'false'):\n%s", got, stderr.String())
+	}
+
+	// Verify that the bundle records the operator-supplied command, not the spec command.
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatalf("bundle not written: %v", err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatalf("open bundle: %v", err)
+	}
+	var sawPassed bool
+	for _, ev := range events {
+		if ev.Kind == "verify_run" {
+			payload := string(ev.Data)
+			if strings.Contains(payload, `"command":"true"`) && strings.Contains(payload, `"outcome":"passed"`) {
+				sawPassed = true
+			}
+		}
+	}
+	if !sawPassed {
+		t.Errorf("expected verify_run with command=true outcome=passed (operator wins):\n%+v", events)
+	}
+}
