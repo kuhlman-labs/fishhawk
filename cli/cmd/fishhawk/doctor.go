@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -63,7 +64,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		checkGitWorkingTree(*workingDir),
 		checkGhCLI(),
 		checkBackendSHADrift(*cf.backendURL, *workingDir),
-		checkRunnerSchemaDrift(*cf.backendURL, *runnerBinary),
+		checkRunnerSchemaDrift(*cf.backendURL, *runnerBinary, *workingDir),
 		checkCLIVersion(*cf.backendURL),
 	}
 
@@ -211,19 +212,18 @@ func checkSpec(workingDir string) checkResult {
 	return checkResult{label: label, detail: detail, status: "ok"}
 }
 
-// checkRunnerBinary resolves the fishhawk-runner binary via flag > env > PATH > repo bin/.
-func checkRunnerBinary(flagVal, workingDir string) checkResult {
-	label := "runner binary found"
-	binary := flagVal
-	if binary == "" {
-		binary = os.Getenv("FISHHAWK_RUNNER_BIN")
+// resolveRunnerBinary applies the flag > env > PATH > repo bin/ precedence
+// chain for the fishhawk-runner binary. Returns the resolved path or an error
+// when all sources are exhausted.
+func resolveRunnerBinary(flagVal, workingDir string) (string, error) {
+	if flagVal != "" {
+		return flagVal, nil
 	}
-	if binary != "" {
-		return checkResult{label: label, detail: binary, status: "ok"}
+	if v := os.Getenv("FISHHAWK_RUNNER_BIN"); v != "" {
+		return v, nil
 	}
-	resolved, err := doctorLookPath("fishhawk-runner")
-	if err == nil {
-		return checkResult{label: label, detail: resolved, status: "ok"}
+	if p, err := doctorLookPath("fishhawk-runner"); err == nil {
+		return p, nil
 	}
 	for _, candidate := range []string{
 		filepath.Join(workingDir, "bin", "fishhawk-runner"),
@@ -231,11 +231,25 @@ func checkRunnerBinary(flagVal, workingDir string) checkResult {
 	} {
 		fi, statErr := os.Stat(candidate)
 		if statErr == nil && !fi.IsDir() {
-			return checkResult{label: label, detail: candidate + " (via repo bin/)", status: "ok"}
+			return candidate, nil
 		}
 	}
-	return checkResult{label: label, detail: "not found", status: "fail",
-		remediate: "install fishhawk-runner to PATH or set $FISHHAWK_RUNNER_BIN"}
+	return "", errors.New("fishhawk-runner not found in flag, env, PATH, or repo bin/")
+}
+
+// checkRunnerBinary resolves the fishhawk-runner binary via flag > env > PATH > repo bin/.
+func checkRunnerBinary(flagVal, workingDir string) checkResult {
+	label := "runner binary found"
+	resolved, err := resolveRunnerBinary(flagVal, workingDir)
+	if err != nil {
+		return checkResult{label: label, detail: "not found", status: "fail",
+			remediate: "install fishhawk-runner to PATH or set $FISHHAWK_RUNNER_BIN"}
+	}
+	detail := resolved
+	if filepath.Dir(resolved) == filepath.Join(workingDir, "bin") {
+		detail = resolved + " (via repo bin/)"
+	}
+	return checkResult{label: label, detail: detail, status: "ok"}
 }
 
 // checkMCPRegistration verifies `claude mcp get fishhawk` exits 0.
@@ -346,20 +360,11 @@ func checkBackendSHADrift(backendURL, workingDir string) checkResult {
 // schema hash (from /healthz) against the runner binary's embedded hash
 // (from 'fishhawk-runner version'). A mismatch warns that the plan schema
 // has drifted between the two binaries.
-func checkRunnerSchemaDrift(backendURL, runnerBinary string) checkResult {
+func checkRunnerSchemaDrift(backendURL, runnerBinary, workingDir string) checkResult {
 	label := "runner schema drift"
 
-	// Resolve runner binary path if not given explicitly.
-	runnerBin := runnerBinary
-	if runnerBin == "" {
-		runnerBin = os.Getenv("FISHHAWK_RUNNER_BIN")
-	}
-	if runnerBin == "" {
-		if p, err := doctorLookPath("fishhawk-runner"); err == nil {
-			runnerBin = p
-		}
-	}
-	if runnerBin == "" {
+	runnerBin, err := resolveRunnerBinary(runnerBinary, workingDir)
+	if err != nil {
 		return checkResult{label: label, detail: "runner binary not found, schema drift not checked", status: "warn",
 			remediate: "install fishhawk-runner or set $FISHHAWK_RUNNER_BIN"}
 	}
