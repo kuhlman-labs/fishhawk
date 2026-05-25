@@ -2,7 +2,9 @@ package plan
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,34 @@ var schemaFS embed.FS
 // once at package init; if the embedded schema is malformed we want
 // to crash loudly at process start, not on the first call.
 var compiledSchema = mustCompileSchema()
+
+// embeddedSchemaHash is the hex-encoded SHA-256 of the canonical JSON
+// bytes of the embedded plan-standard-v1 schema. Computed once at init
+// so /healthz can serve it cheaply.
+var embeddedSchemaHash = computeSchemaHash()
+
+func computeSchemaHash() string {
+	const path = "schemas/plan-standard-v1.schema.json"
+	data, err := schemaFS.ReadFile(path)
+	if err != nil {
+		panic(fmt.Sprintf("plan: read embedded schema for hash %s: %v", path, err))
+	}
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		panic(fmt.Sprintf("plan: parse embedded schema for hash %s: %v", path, err))
+	}
+	canonical, err := json.Marshal(raw)
+	if err != nil {
+		panic(fmt.Sprintf("plan: re-marshal embedded schema for hash %s: %v", path, err))
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
+}
+
+// EmbeddedSchemaHash returns the hex-encoded SHA-256 of the canonical JSON
+// bytes of the embedded plan-standard-v1 schema. Callers use this to detect
+// schema drift between the backend and runner at startup.
+func EmbeddedSchemaHash() string { return embeddedSchemaHash }
 
 // expensiveTestRuntimeThreshold is the minimum predicted_runtime_minutes
 // value that suppresses the expensive-test-strategy advisory warning.

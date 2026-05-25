@@ -310,6 +310,11 @@ type FetchedPrompt struct {
 	DecomposedFromRunID  string `json:"decomposed_from_run_id,omitempty"`
 	VerifyCommand        string `json:"verify_command,omitempty"`
 	VerifyTimeoutSeconds int    `json:"verify_timeout_seconds,omitempty"`
+	// MinRunnerVersion is the minimum runner version the backend requires.
+	// Non-empty only when the backend is a release build. The runner compares
+	// this against its own version and exits with exitVersionSkew when it is
+	// older than required.
+	MinRunnerVersion string `json:"min_runner_version,omitempty"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an

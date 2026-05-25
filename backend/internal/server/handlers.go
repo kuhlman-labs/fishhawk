@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
@@ -49,8 +51,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 }
 
 type healthResponse struct {
-	Status  string `json:"status"`
-	Version string `json:"version"`
+	Status           string            `json:"status"`
+	Version          string            `json:"version"`
+	GitSHA           string            `json:"git_sha"`
+	MinRunnerVersion string            `json:"min_runner_version"`
+	Schemas          map[string]string `json:"schemas"`
 }
 
 // handleHealth answers liveness probes with a small JSON payload that
@@ -58,8 +63,14 @@ type healthResponse struct {
 // field to confirm a deploy reached this instance.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{
-		Status:  "ok",
-		Version: version.Version,
+		Status:           "ok",
+		Version:          version.Version,
+		GitSHA:           version.GitSHA,
+		MinRunnerVersion: version.MinRunnerVersion,
+		Schemas: map[string]string{
+			"plan-standard-v1": plan.EmbeddedSchemaHash(),
+			"workflow-v0":      spec.EmbeddedSchemaHash(),
+		},
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

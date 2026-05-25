@@ -631,7 +631,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, version]
+                required: [status, version, git_sha, min_runner_version, schemas]
                 properties:
                   status:
                     type: string
@@ -639,6 +639,32 @@ paths:
                   version:
                     type: string
                     example: dev
+                  git_sha:
+                    type: string
+                    description: |
+                      Git commit SHA the binary was built from. "unknown" for
+                      development builds. Operators use this to confirm a deploy
+                      matches the expected commit.
+                    example: unknown
+                  min_runner_version:
+                    type: string
+                    description: |
+                      Minimum fishhawk-runner version required to interoperate
+                      with this backend. "dev" signals no enforcement (local dev).
+                      Runners older than this value should exit rather than proceed.
+                    example: dev
+                  schemas:
+                    type: object
+                    description: |
+                      Map of schema name to hex-encoded SHA-256 of the backend's
+                      embedded canonical schema bytes. Keys: "plan-standard-v1",
+                      "workflow-v0". Callers compare against their own embedded
+                      hashes to detect schema drift.
+                    additionalProperties:
+                      type: string
+                    example:
+                      plan-standard-v1: "abc123..."
+                      workflow-v0: "def456..."
         '503':
           description: Process is shutting down or otherwise not ready.
           content:
@@ -1342,6 +1368,9 @@ paths:
                   verify_timeout_seconds:
                     type: integer
                     description: Wall-clock cap for the verify command in seconds; 0 or absent means the runner applies its 10-minute fallback.
+                  min_runner_version:
+                    type: string
+                    description: Minimum runner version the backend requires; absent when the backend has no constraint. Runners older than this value must exit with code 3 (version_skew) rather than invoking the agent.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1410,6 +1439,9 @@ paths:
                   verify_timeout_seconds:
                     type: integer
                     description: Wall-clock cap for the verify command in seconds; 0 or absent means the runner applies its 10-minute fallback.
+                  min_runner_version:
+                    type: string
+                    description: Minimum runner version the backend requires; absent when the backend has no constraint.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

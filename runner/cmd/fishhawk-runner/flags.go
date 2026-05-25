@@ -135,8 +135,6 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 }
 
 // runnerVersion returns the build version pulled from
-// internal/version. Wrapped here so the main package doesn't import
-// internal/version directly — that keeps the cmd surface minimal
-// and the version package a true internal detail of the runner
-// module.
-func runnerVersion() string { return version.Version }
+// internal/version. Wrapped as a var so tests can override it to
+// simulate version mismatches without rebuilding the binary.
+var runnerVersion = func() string { return version.Version }
