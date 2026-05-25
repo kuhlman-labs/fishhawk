@@ -54,6 +54,18 @@ python3 scripts/check-coverage.py --threshold 80 --exclude '/db/' "${profiles[@]
 
 When editing a schema under `docs/spec/`, run `scripts/sync-schemas` to mirror the change into all embedded copies before committing. CI fails the schema-sync gate otherwise. Opt-in local check: `git config core.hooksPath .githooks`.
 
+### Rebuild matrix
+
+`scripts/dev up` always rebuilds `fishhawkd`. A future enhancement could auto-detect which binaries need rebuilding from `git diff main...HEAD`.
+
+| If PR touches | Rebuild |
+|---|---|
+| `backend/cmd/fishhawkd/` or `backend/internal/{server,prompt,plan,spec,runner,webhook,notifier,github,storage,db,...}` | `fishhawkd` |
+| `backend/cmd/fishhawk-mcp/` | `fishhawk-mcp` |
+| `runner/cmd/fishhawk-runner/` or `runner/internal/...` | `fishhawk-runner` |
+| `cli/cmd/fishhawk/` or `cli/internal/...` | `fishhawk` CLI |
+| `backend/internal/plan/` or `backend/internal/spec/` (shared libs) | all four binaries |
+
 ## Adding a Go module
 
 1. `mkdir <name> && cd <name> && go mod init github.com/kuhlman-labs/fishhawk/<name>`

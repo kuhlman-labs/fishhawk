@@ -1,0 +1,129 @@
+#!/usr/bin/env zsh
+# scripts/dev — start/stop the local Fishhawk dev stack
+set -euo pipefail
+
+REPO_ROOT="${0:A:h:h}"
+PID_FILE="${REPO_ROOT}/.fishhawk/dev.pid"
+LOG_DIR="${REPO_ROOT}/logs"
+LOG_FILE="${LOG_DIR}/fishhawkd.log"
+BIN="${REPO_ROOT}/bin/fishhawkd"
+
+cmd="${1:-}"
+
+_die() { print -u2 "error: $*"; exit 1 }
+
+_pg_ready() {
+  local host="${PGHOST:-localhost}"
+  local port="${PGPORT:-5432}"
+
+  # Parse host:port from DATABASE_URL if set
+  if [[ -n "${FISHHAWKD_DATABASE_URL:-}" ]]; then
+    local stripped="${FISHHAWKD_DATABASE_URL#*://}"   # drop scheme
+    stripped="${stripped#*@}"                          # drop user:pass@
+    local hostport="${stripped%%/*}"                   # take host:port before /
+    host="${hostport%%:*}"
+    port="${hostport##*:}"
+    [[ "$host" == "$port" ]] && port=5432             # no colon — default port
+  fi
+
+  if command -v pg_isready &>/dev/null; then
+    pg_isready -h "$host" -p "$port" -q
+  else
+    nc -z "$host" "$port" 2>/dev/null
+  fi
+}
+
+_minio_ready() {
+  local endpoint="${MINIO_ENDPOINT:-http://localhost:9000}"
+  curl --silent --fail --max-time 3 "${endpoint}/minio/health/live" &>/dev/null
+}
+
+cmd_up() {
+  # Idempotency: bail if already running
+  if [[ -f "$PID_FILE" ]]; then
+    local existing_pid
+    existing_pid="$(cat "$PID_FILE")"
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      print "fishhawkd already running (pid ${existing_pid})"
+      return 0
+    fi
+    rm -f "$PID_FILE"
+  fi
+
+  # Logs directory
+  mkdir -p "$LOG_DIR"
+
+  # Environment
+  if [[ -f "${REPO_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.env"
+    set +a
+  else
+    print "warning: .env not found — using current shell environment"
+  fi
+
+  # Dependency health checks
+  if _pg_ready; then
+    print "postgres: ready"
+  else
+    print "warning: postgres not reachable — fishhawkd may fail to start"
+  fi
+
+  if _minio_ready; then
+    print "minio: ready"
+  else
+    print "warning: minio not reachable — fishhawkd may fail to start"
+  fi
+
+  # Build
+  print "building fishhawkd..."
+  mkdir -p "${REPO_ROOT}/bin"
+  (cd "${REPO_ROOT}" && go build -o bin/fishhawkd ./backend/cmd/fishhawkd/)
+
+  # Spawn
+  mkdir -p "${REPO_ROOT}/.fishhawk"
+  "${BIN}" serve >> "$LOG_FILE" 2>&1 &
+  local pid=$!
+  print "$pid" > "$PID_FILE"
+  print "fishhawkd started (pid ${pid}) — logs: ${LOG_FILE}"
+}
+
+cmd_down() {
+  if [[ ! -f "$PID_FILE" ]]; then
+    print "fishhawkd is not running (no pid file)"
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "$PID_FILE")"
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    print "fishhawkd already stopped"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+
+  kill -TERM "$pid"
+
+  local i=0
+  while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
+    sleep 1
+    (( i++ ))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid"
+    print "fishhawkd killed (SIGKILL after 5s)"
+  else
+    print "fishhawkd stopped"
+  fi
+
+  rm -f "$PID_FILE"
+}
+
+case "$cmd" in
+  up)   cmd_up ;;
+  down) cmd_down ;;
+  *)    print -u2 "usage: scripts/dev <up|down>"; exit 1 ;;
+esac
