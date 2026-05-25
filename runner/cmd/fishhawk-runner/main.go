@@ -159,14 +159,17 @@ func parseSemver(v string) []int {
 // captured up to the cancellation point) still packs + ships best-
 // effort if the body gets that far.
 func run(args []string, logSink io.Writer) (exitCode int) {
-	// version subcommand: emit JSON {version, plan_schema_hash} and exit.
+	// version subcommand: emit JSON {version, plan_schema_hash} to stdout
+	// and exit. Stdout (not logSink) because this is the command's primary
+	// data output, not a log line — `fishhawk doctor` and operators read it
+	// via `exec.Command().Output()` which captures stdout only.
 	// Must be checked before parseFlags, which requires run-id / backend-url.
 	if len(args) > 0 && args[0] == "version" {
 		out, _ := json.Marshal(map[string]string{
 			"version":          runnerVersion(),
 			"plan_schema_hash": plan.EmbeddedSchemaHash(),
 		})
-		_, _ = fmt.Fprintf(logSink, "%s\n", out)
+		_, _ = fmt.Fprintf(os.Stdout, "%s\n", out)
 		return exitOK
 	}
 

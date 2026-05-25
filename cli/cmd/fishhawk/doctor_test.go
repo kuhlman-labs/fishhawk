@@ -362,7 +362,7 @@ func TestCheckRunnerSchemaDrift_RunnerNotFound(t *testing.T) {
 	withFakeDoctorLookPath(t, func(_ string) (string, error) {
 		return "", errors.New("not found")
 	})
-	r := checkRunnerSchemaDrift("http://localhost:8080", "")
+	r := checkRunnerSchemaDrift("http://localhost:8080", "", t.TempDir())
 	if r.status != "warn" {
 		t.Errorf("status = %q, want warn (no binary = degraded, not fail)", r.status)
 	}
@@ -377,7 +377,7 @@ func TestCheckRunnerSchemaDrift_RunnerLacksVersionSubcommand(t *testing.T) {
 	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
 		return "", errors.New("unknown subcommand: version")
 	})
-	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner")
+	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner", t.TempDir())
 	if r.status != "warn" {
 		t.Errorf("status = %q, want warn (old runner = degraded, not fail)", r.status)
 	}
@@ -394,7 +394,7 @@ func TestCheckRunnerSchemaDrift_InSync(t *testing.T) {
 	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
 		return `{"version":"v0.5.0","plan_schema_hash":"` + hash + `"}`, nil
 	})
-	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner")
+	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner", t.TempDir())
 	if r.status != "ok" {
 		t.Errorf("status = %q, want ok; detail: %s", r.status, r.detail)
 	}
@@ -409,12 +409,44 @@ func TestCheckRunnerSchemaDrift_Mismatch(t *testing.T) {
 	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
 		return `{"version":"v0.5.0","plan_schema_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2222"}`, nil
 	})
-	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner")
+	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner", t.TempDir())
 	if r.status != "warn" {
 		t.Errorf("status = %q, want warn; detail: %s", r.status, r.detail)
 	}
 	if r.remediate == "" {
 		t.Error("remediate should be non-empty on mismatch")
+	}
+}
+
+// TestCheckRunnerSchemaDrift_RepoBinFallback verifies that checkRunnerSchemaDrift
+// resolves the runner via <workingDir>/bin/fishhawk-runner when LookPath misses
+// and no explicit binary is provided, then returns ok when schemas match.
+func TestCheckRunnerSchemaDrift_RepoBinFallback(t *testing.T) {
+	const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "fishhawk-runner"), []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	withFakeDoctorLookPath(t, func(_ string) (string, error) {
+		return "", exec.ErrNotFound
+	})
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK,
+			`{"schemas":{"plan-standard-v1":"`+hash+`"}}`), nil
+	})
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return `{"version":"v0.5.0","plan_schema_hash":"` + hash + `"}`, nil
+	})
+
+	r := checkRunnerSchemaDrift("http://localhost:8080", "", dir)
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok (repo-bin fallback should resolve binary); detail: %s, remediate: %s",
+			r.status, r.detail, r.remediate)
 	}
 }
 

@@ -2820,16 +2820,36 @@ func TestSemverLT(t *testing.T) {
 }
 
 // TestRun_VersionSubcommand verifies that 'fishhawk-runner version' emits
-// JSON with version and plan_schema_hash, then exits 0.
+// JSON with version and plan_schema_hash to STDOUT (not logSink), then
+// exits 0. stdout is the right stream because `fishhawk doctor` parses
+// the output via exec.Command().Output() which captures stdout only.
 func TestRun_VersionSubcommand(t *testing.T) {
-	var out strings.Builder
-	got := run([]string{"version"}, &out)
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = stdoutW
+	t.Cleanup(func() { os.Stdout = origStdout })
+
+	var logSink strings.Builder
+	got := run([]string{"version"}, &logSink)
+	if err := stdoutW.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	stdoutBytes, err := io.ReadAll(stdoutR)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
 	if got != exitOK {
-		t.Fatalf("run version = %d, want exitOK; output: %s", got, out.String())
+		t.Fatalf("run version = %d, want exitOK; stdout: %s; logSink: %s", got, stdoutBytes, logSink.String())
+	}
+	if logSink.Len() != 0 {
+		t.Errorf("logSink must be empty, got: %s", logSink.String())
 	}
 	var body map[string]string
-	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &body); err != nil {
-		t.Fatalf("version output not JSON: %v\n%s", err, out.String())
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(stdoutBytes))), &body); err != nil {
+		t.Fatalf("version output not JSON: %v\n%s", err, stdoutBytes)
 	}
 	if body["version"] == "" {
 		t.Error("version field must not be empty")
