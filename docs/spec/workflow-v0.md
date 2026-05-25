@@ -4,6 +4,14 @@ Reference for `.fishhawk/workflows.yaml`. The canonical schema is [`workflow-v0.
 
 > **Frozen at Day 21** of the v0 build (MVP_SPEC.md §8). Old workflow runs in the audit log remain readable forever; never break this schema in place — bump to a new spec version (`workflow-v1`, `workflow-v2`...) instead.
 
+### Schema evolution policy
+
+`workflow-v0.x` is **additive-only**. New fields are optional; the existing required-field set is frozen. Validators must tolerate unknown fields (JSON Schema Draft 2020-12 §10.3).
+
+**Breaking additions** (required new fields, renamed fields, removed fields, changed semantics of existing fields) require a version bump to `workflow-v1`. During the deprecation window, the backend accepts both `v0` and `v1` workflow specs simultaneously — the version string in the YAML routes each spec to its respective schema and execution path.
+
+**`x-intended-required`** may annotate optional fields that are candidates for required promotion in `workflow-v1`. Annotation semantics and soak-period rules match those in `plan-standard-v1.md`.
+
 ## Top-level shape
 
 ```yaml
