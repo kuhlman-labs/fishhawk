@@ -29,4 +29,19 @@ func TestHandleHealth(t *testing.T) {
 	if body.Version == "" {
 		t.Error("version field must not be empty")
 	}
+	if body.GitSHA == "" {
+		t.Error("git_sha field must not be empty")
+	}
+	if body.MinRunnerVersion == "" {
+		t.Error("min_runner_version field must not be empty")
+	}
+	if len(body.Schemas) == 0 {
+		t.Error("schemas field must not be empty")
+	}
+	if body.Schemas["plan-standard-v1"] == "" {
+		t.Error("schemas[plan-standard-v1] must not be empty")
+	}
+	if body.Schemas["workflow-v0"] == "" {
+		t.Error("schemas[workflow-v0] must not be empty")
+	}
 }

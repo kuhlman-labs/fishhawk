@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
@@ -61,6 +62,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		checkGitOrigin(*workingDir),
 		checkGitWorkingTree(*workingDir),
 		checkGhCLI(),
+		checkBackendSHADrift(*cf.backendURL, *workingDir),
+		checkRunnerSchemaDrift(*cf.backendURL, *runnerBinary),
+		checkCLIVersion(*cf.backendURL),
 	}
 
 	useColor := isTerminal(stdout) && os.Getenv("NO_COLOR") == ""
@@ -290,4 +294,220 @@ func checkGhCLI() checkResult {
 		detail = strings.TrimSpace(first)
 	}
 	return checkResult{label: label, detail: detail, status: "ok"}
+}
+
+// checkBackendSHADrift compares the running backend's git_sha (from /healthz)
+// against the local HEAD commit. A mismatch warns the operator that they may
+// be running a backend built from a different commit.
+func checkBackendSHADrift(backendURL, workingDir string) checkResult {
+	label := "backend SHA drift"
+	req, err := http.NewRequest(http.MethodGet, backendURL+"/healthz", nil)
+	if err != nil {
+		return checkResult{label: label, detail: err.Error(), status: "warn",
+			remediate: "check --backend-url"}
+	}
+	resp, err := doctorHTTPDo(req)
+	if err != nil {
+		return checkResult{label: label, detail: "healthz unreachable", status: "warn",
+			remediate: "backend must be reachable for SHA comparison"}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var body struct {
+		GitSHA string `json:"git_sha"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	backendSHA := body.GitSHA
+	if backendSHA == "" || backendSHA == "unknown" {
+		return checkResult{label: label, detail: "backend SHA unknown (dev build)", status: "ok"}
+	}
+
+	cmd := exec.Command("git", "rev-parse", "HEAD") //nolint:gosec
+	if workingDir != "" && workingDir != "." {
+		cmd.Dir = workingDir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return checkResult{label: label, detail: "git rev-parse failed", status: "warn",
+			remediate: "ensure --working-dir is inside a git repository"}
+	}
+	localSHA := strings.TrimSpace(string(out))
+	if localSHA == backendSHA {
+		return checkResult{label: label, detail: "in sync (" + shortSHA(backendSHA) + ")", status: "ok"}
+	}
+	return checkResult{
+		label:     label,
+		detail:    fmt.Sprintf("backend %s, local %s", shortSHA(backendSHA), shortSHA(localSHA)),
+		status:    "warn",
+		remediate: "backend is running a different commit; rebuild fishhawkd from HEAD or use the matching commit",
+	}
+}
+
+// checkRunnerSchemaDrift compares the backend's embedded plan-standard-v1
+// schema hash (from /healthz) against the runner binary's embedded hash
+// (from 'fishhawk-runner version'). A mismatch warns that the plan schema
+// has drifted between the two binaries.
+func checkRunnerSchemaDrift(backendURL, runnerBinary string) checkResult {
+	label := "runner schema drift"
+
+	// Resolve runner binary path if not given explicitly.
+	runnerBin := runnerBinary
+	if runnerBin == "" {
+		runnerBin = os.Getenv("FISHHAWK_RUNNER_BIN")
+	}
+	if runnerBin == "" {
+		if p, err := doctorLookPath("fishhawk-runner"); err == nil {
+			runnerBin = p
+		}
+	}
+	if runnerBin == "" {
+		return checkResult{label: label, detail: "runner binary not found, schema drift not checked", status: "warn",
+			remediate: "install fishhawk-runner or set $FISHHAWK_RUNNER_BIN"}
+	}
+
+	req, err := http.NewRequest(http.MethodGet, backendURL+"/healthz", nil)
+	if err != nil {
+		return checkResult{label: label, detail: err.Error(), status: "warn",
+			remediate: "check --backend-url"}
+	}
+	resp, err := doctorHTTPDo(req)
+	if err != nil {
+		return checkResult{label: label, detail: "healthz unreachable", status: "warn"}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var healthBody struct {
+		Schemas map[string]string `json:"schemas"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&healthBody)
+	backendHash := healthBody.Schemas["plan-standard-v1"]
+	if backendHash == "" {
+		return checkResult{label: label, detail: "backend does not report schema hashes (old build)", status: "warn",
+			remediate: "upgrade fishhawkd to enable schema drift detection"}
+	}
+
+	runnerOut, err := doctorRunOutput(runnerBin, "version")
+	if err != nil {
+		return checkResult{label: label, detail: "runner does not support version output; rebuild to enable schema drift detection", status: "warn",
+			remediate: "rebuild fishhawk-runner from HEAD to enable schema drift detection"}
+	}
+	var versionInfo struct {
+		PlanSchemaHash string `json:"plan_schema_hash"`
+	}
+	if jsonErr := json.Unmarshal([]byte(runnerOut), &versionInfo); jsonErr != nil {
+		return checkResult{label: label, detail: "runner version output not parseable", status: "warn",
+			remediate: "ensure fishhawk-runner supports the version subcommand"}
+	}
+	if versionInfo.PlanSchemaHash == "" || versionInfo.PlanSchemaHash == backendHash {
+		return checkResult{label: label, detail: "schemas in sync", status: "ok"}
+	}
+	return checkResult{
+		label:     label,
+		detail:    fmt.Sprintf("runner %s, backend %s", shortHash(versionInfo.PlanSchemaHash), shortHash(backendHash)),
+		status:    "warn",
+		remediate: "plan schema differs between runner and backend; rebuild both from the same commit",
+	}
+}
+
+// checkCLIVersion compares the CLI's version against the backend's
+// min_runner_version requirement. Both sides must be release builds
+// (non-dev) for the comparison to run.
+func checkCLIVersion(backendURL string) checkResult {
+	label := "CLI version"
+	req, err := http.NewRequest(http.MethodGet, backendURL+"/healthz", nil)
+	if err != nil {
+		return checkResult{label: label, detail: err.Error(), status: "warn",
+			remediate: "check --backend-url"}
+	}
+	resp, err := doctorHTTPDo(req)
+	if err != nil {
+		return checkResult{label: label, detail: "healthz unreachable", status: "warn"}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var body struct {
+		MinRunnerVersion string `json:"min_runner_version"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	minVersion := body.MinRunnerVersion
+	if minVersion == "" || minVersion == "dev" {
+		return checkResult{label: label, detail: "no minimum version required", status: "ok"}
+	}
+
+	cliVersionStr, err := doctorRunOutput("fishhawk", "version")
+	if err != nil {
+		return checkResult{label: label, detail: "cannot determine CLI version", status: "warn",
+			remediate: "ensure fishhawk is in PATH"}
+	}
+	cliVersionStr = strings.TrimSpace(cliVersionStr)
+	if cliVersionStr == "" || cliVersionStr == "dev" {
+		return checkResult{label: label, detail: "dev build (min version check skipped)", status: "ok"}
+	}
+	if semverLT(cliVersionStr, minVersion) {
+		return checkResult{
+			label:     label,
+			detail:    fmt.Sprintf("%s < min %s", cliVersionStr, minVersion),
+			status:    "warn",
+			remediate: fmt.Sprintf("upgrade fishhawk CLI to at least %s", minVersion),
+		}
+	}
+	return checkResult{label: label,
+		detail: fmt.Sprintf("%s >= %s", cliVersionStr, minVersion), status: "ok"}
+}
+
+// shortSHA returns the first 8 characters of a git SHA for display.
+func shortSHA(sha string) string {
+	if len(sha) < 8 {
+		return sha
+	}
+	return sha[:8]
+}
+
+// shortHash returns the first 12 characters of a hex hash for display.
+func shortHash(h string) string {
+	if len(h) < 12 {
+		return h
+	}
+	return h[:12]
+}
+
+// semverLT reports whether semver string a is strictly less than b.
+// Both strings may have an optional "v" prefix. Returns false whenever
+// either value is "dev" or cannot be parsed — degrades gracefully so
+// local dev builds never trip the version check.
+func semverLT(a, b string) bool {
+	ap := parseSemverParts(a)
+	bp := parseSemverParts(b)
+	if ap == nil || bp == nil {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if ap[i] < bp[i] {
+			return true
+		}
+		if ap[i] > bp[i] {
+			return false
+		}
+	}
+	return false
+}
+
+func parseSemverParts(v string) []int {
+	v = strings.TrimPrefix(v, "v")
+	if v == "dev" || v == "" {
+		return nil
+	}
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) != 3 {
+		return nil
+	}
+	result := make([]int, 3)
+	for i, p := range parts {
+		if idx := strings.IndexByte(p, '-'); idx >= 0 {
+			p = p[:idx]
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil
+		}
+		result[i] = n
+	}
+	return result
 }

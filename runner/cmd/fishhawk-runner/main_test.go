@@ -2787,3 +2787,92 @@ func TestRun_FetchPrompt_OperatorVerifyCmdWins(t *testing.T) {
 		t.Errorf("expected verify_run with command=true outcome=passed (operator wins):\n%+v", events)
 	}
 }
+
+// TestSemverLT covers the semverLT helper including numeric comparison
+// (not string comparison) so v0.9.0 < v0.10.0 is handled correctly.
+func TestSemverLT(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"v0.1.0", "v0.2.0", true},
+		{"v0.2.0", "v0.1.0", false},
+		{"v0.1.0", "v0.1.0", false},
+		{"v0.9.0", "v0.10.0", true},  // numeric, not string
+		{"v0.10.0", "v0.9.0", false}, // numeric, not string
+		{"v1.0.0", "v0.9.9", false},
+		{"v0.4.0", "v0.5.0", true},
+		{"v0.5.0", "v0.4.0", false},
+		// dev builds never trigger skew
+		{"dev", "v0.5.0", false},
+		{"v0.4.0", "dev", false},
+		{"dev", "dev", false},
+		// unparseable
+		{"not-semver", "v0.1.0", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.a+"<"+tc.b, func(t *testing.T) {
+			if got := semverLT(tc.a, tc.b); got != tc.want {
+				t.Errorf("semverLT(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRun_VersionSubcommand verifies that 'fishhawk-runner version' emits
+// JSON with version and plan_schema_hash, then exits 0.
+func TestRun_VersionSubcommand(t *testing.T) {
+	var out strings.Builder
+	got := run([]string{"version"}, &out)
+	if got != exitOK {
+		t.Fatalf("run version = %d, want exitOK; output: %s", got, out.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &body); err != nil {
+		t.Fatalf("version output not JSON: %v\n%s", err, out.String())
+	}
+	if body["version"] == "" {
+		t.Error("version field must not be empty")
+	}
+	if len(body["plan_schema_hash"]) != 64 {
+		t.Errorf("plan_schema_hash = %q, want 64-char hex", body["plan_schema_hash"])
+	}
+}
+
+// TestRun_VersionSkewDetected verifies that run() returns exitVersionSkew
+// when the backend's min_runner_version is newer than the runner's version.
+func TestRun_VersionSkewDetected(t *testing.T) {
+	// Inject a known parseable version so semverLT fires deterministically.
+	origVersion := runnerVersion
+	runnerVersion = func() string { return "v0.4.0" }
+	t.Cleanup(func() { runnerVersion = origVersion })
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:          "22222222-3333-4444-5555-666666666666",
+		StageType:        "plan",
+		Prompt:           "test prompt",
+		PromptHash:       "deadbeef",
+		MinRunnerVersion: "v0.5.0",
+	}
+	withFakeUploader(t, fu)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitVersionSkew {
+		t.Errorf("run = %d, want exitVersionSkew (%d); stderr:\n%s", got, exitVersionSkew, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"version_skew_detected"`) {
+		t.Errorf("missing version_skew_detected log:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"min_required":"v0.5.0"`) {
+		t.Errorf("missing min_required in log:\n%s", stderr.String())
+	}
+}

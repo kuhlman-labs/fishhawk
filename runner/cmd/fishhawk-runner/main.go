@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -43,10 +44,11 @@ import (
 )
 
 const (
-	exitOK        = 0
-	exitFailure   = 1
-	exitUsage     = 2
-	exitCancelled = 130 // 128 + SIGINT; matches the convention for terminate-by-signal exit codes.
+	exitOK          = 0
+	exitFailure     = 1
+	exitUsage       = 2
+	exitVersionSkew = 3   // runner version is older than backend's min_runner_version
+	exitCancelled   = 130 // 128 + SIGINT; matches the convention for terminate-by-signal exit codes.
 )
 
 // newRunnerContext returns the top-level context for the runner's
@@ -91,6 +93,53 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stderr))
 }
 
+// semverLT reports whether semver string a is strictly less than b.
+// Both strings may have an optional "v" prefix. Returns false whenever
+// either value is "dev" or cannot be parsed — degrades gracefully so
+// local dev builds (both sides "dev") never trip the version-skew check.
+func semverLT(a, b string) bool {
+	ap := parseSemver(a)
+	bp := parseSemver(b)
+	if ap == nil || bp == nil {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if ap[i] < bp[i] {
+			return true
+		}
+		if ap[i] > bp[i] {
+			return false
+		}
+	}
+	return false
+}
+
+// parseSemver parses a semver string (with optional "v" prefix) into a
+// [major, minor, patch] int slice. Returns nil when the string is "dev"
+// or cannot be parsed (pre-release suffixes like "-alpha.1" are stripped).
+func parseSemver(v string) []int {
+	v = strings.TrimPrefix(v, "v")
+	if v == "dev" || v == "" {
+		return nil
+	}
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) != 3 {
+		return nil
+	}
+	result := make([]int, 3)
+	for i, p := range parts {
+		if idx := strings.IndexByte(p, '-'); idx >= 0 {
+			p = p[:idx]
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil
+		}
+		result[i] = n
+	}
+	return result
+}
+
 // run is split out so tests can drive it without exiting the test
 // process. Returns the intended process exit code.
 //
@@ -110,6 +159,17 @@ func main() {
 // captured up to the cancellation point) still packs + ships best-
 // effort if the body gets that far.
 func run(args []string, logSink io.Writer) (exitCode int) {
+	// version subcommand: emit JSON {version, plan_schema_hash} and exit.
+	// Must be checked before parseFlags, which requires run-id / backend-url.
+	if len(args) > 0 && args[0] == "version" {
+		out, _ := json.Marshal(map[string]string{
+			"version":          runnerVersion(),
+			"plan_schema_hash": plan.EmbeddedSchemaHash(),
+		})
+		_, _ = fmt.Fprintf(logSink, "%s\n", out)
+		return exitOK
+	}
+
 	cfg, err := parseFlags(args, logSink)
 	if err != nil {
 		// parseFlags already wrote a usage / error message.
@@ -170,11 +230,20 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
 			return exitFailure
+		}
+		// Version-skew check: if the backend requires a newer runner, exit
+		// immediately rather than invoking the agent with potentially
+		// incompatible protocol assumptions.
+		if minRunnerVersion != "" && semverLT(runnerVersion(), minRunnerVersion) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"version_skew_detected","runner_version":%q,"min_required":%q}`+"\n",
+				runnerVersion(), minRunnerVersion)
+			return exitVersionSkew
 		}
 		cfg.promptFile = path
 		cfg.decomposedFromRunID = decomposedFromRunID
@@ -660,25 +729,28 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 
 // fetchPromptToFile pulls the constructed prompt from the backend,
 // writes it to a temp file, and returns the path, stage type,
-// agent_timeout_seconds, verify_command, verify_timeout_seconds, and
-// decomposed_from_run_id from the response. stageType drives per-stage
-// post-processing (plan validation + upload for plan stages,
-// commit+push+PR upload for implement stages). agentTimeoutSecs is the
-// spec-resolved wall-clock cap; 0 means the server didn't resolve one
-// and the caller should apply the local 15-minute fallback.
-// verifyCmd and verifyTimeoutSecs are the spec-resolved verify gate
-// settings; both zero/empty when the spec declares none.
-// decomposedFromRunID is non-empty when this run is a decomposed child.
+// agent_timeout_seconds, verify_command, verify_timeout_seconds,
+// decomposed_from_run_id, and min_runner_version from the response.
+// stageType drives per-stage post-processing (plan validation + upload
+// for plan stages, commit+push+PR upload for implement stages).
+// agentTimeoutSecs is the spec-resolved wall-clock cap; 0 means the
+// server didn't resolve one and the caller should apply the local
+// 15-minute fallback. verifyCmd and verifyTimeoutSecs are the
+// spec-resolved verify gate settings; both zero/empty when the spec
+// declares none. decomposedFromRunID is non-empty when this run is a
+// decomposed child. minRunnerVersion is non-empty when the backend
+// requires a minimum runner version; the caller checks it against
+// runnerVersion() before proceeding.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, "", fetchErr
+		return "", "", 0, "", 0, "", "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -686,20 +758,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, nil
 }
 
 func logStartup(w io.Writer, cfg config) {

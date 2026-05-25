@@ -329,6 +329,140 @@ func TestRunDoctor_DirtyTree_ExitZero(t *testing.T) {
 	}
 }
 
+// TestCheckBackendSHADrift_Unknown returns ok when backend SHA is "unknown"
+// (dev build).
+func TestCheckBackendSHADrift_Unknown(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{"status":"ok","git_sha":"unknown"}`), nil
+	})
+	r := checkBackendSHADrift("http://localhost:8080", t.TempDir())
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok (unknown SHA should be fine)", r.status)
+	}
+}
+
+// TestCheckBackendSHADrift_Unreachable returns warn when the backend is
+// unreachable (not fail, because the SHA check is advisory).
+func TestCheckBackendSHADrift_Unreachable(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	})
+	r := checkBackendSHADrift("http://localhost:8080", ".")
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn", r.status)
+	}
+}
+
+// TestCheckRunnerSchemaDrift_RunnerNotFound returns warn when the runner
+// binary is not found (runner binary resolution fails).
+func TestCheckRunnerSchemaDrift_RunnerNotFound(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{"schemas":{"plan-standard-v1":"abc123"}}`), nil
+	})
+	withFakeDoctorLookPath(t, func(_ string) (string, error) {
+		return "", errors.New("not found")
+	})
+	r := checkRunnerSchemaDrift("http://localhost:8080", "")
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn (no binary = degraded, not fail)", r.status)
+	}
+}
+
+// TestCheckRunnerSchemaDrift_RunnerLacksVersionSubcommand returns warn when
+// the runner binary does not support the 'version' subcommand.
+func TestCheckRunnerSchemaDrift_RunnerLacksVersionSubcommand(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{"schemas":{"plan-standard-v1":"abc123"}}`), nil
+	})
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "", errors.New("unknown subcommand: version")
+	})
+	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner")
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn (old runner = degraded, not fail)", r.status)
+	}
+}
+
+// TestCheckRunnerSchemaDrift_InSync returns ok when backend and runner
+// report the same schema hash.
+func TestCheckRunnerSchemaDrift_InSync(t *testing.T) {
+	const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK,
+			`{"schemas":{"plan-standard-v1":"`+hash+`"}}`), nil
+	})
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return `{"version":"v0.5.0","plan_schema_hash":"` + hash + `"}`, nil
+	})
+	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner")
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok; detail: %s", r.status, r.detail)
+	}
+}
+
+// TestCheckRunnerSchemaDrift_Mismatch returns warn when hashes differ.
+func TestCheckRunnerSchemaDrift_Mismatch(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK,
+			`{"schemas":{"plan-standard-v1":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1111"}}`), nil
+	})
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return `{"version":"v0.5.0","plan_schema_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2222"}`, nil
+	})
+	r := checkRunnerSchemaDrift("http://localhost:8080", "/usr/local/bin/fishhawk-runner")
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn; detail: %s", r.status, r.detail)
+	}
+	if r.remediate == "" {
+		t.Error("remediate should be non-empty on mismatch")
+	}
+}
+
+// TestCheckCLIVersion_NoMinRequired returns ok when the backend doesn't
+// require a minimum version.
+func TestCheckCLIVersion_NoMinRequired(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{"status":"ok","min_runner_version":"dev"}`), nil
+	})
+	r := checkCLIVersion("http://localhost:8080")
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok", r.status)
+	}
+}
+
+// TestCheckCLIVersion_CLITooOld returns warn when the CLI version is older
+// than the backend's minimum.
+func TestCheckCLIVersion_CLITooOld(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{"min_runner_version":"v0.5.0"}`), nil
+	})
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "v0.4.0", nil
+	})
+	r := checkCLIVersion("http://localhost:8080")
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn; detail: %s", r.status, r.detail)
+	}
+	if r.remediate == "" {
+		t.Error("remediate should be non-empty when CLI is too old")
+	}
+}
+
+// TestCheckCLIVersion_CLISufficient returns ok when the CLI version meets
+// the backend's minimum.
+func TestCheckCLIVersion_CLISufficient(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{"min_runner_version":"v0.5.0"}`), nil
+	})
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "v0.5.0", nil
+	})
+	r := checkCLIVersion("http://localhost:8080")
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok; detail: %s", r.status, r.detail)
+	}
+}
+
 // TestRunDoctor_AllPass verifies that runDoctor returns exitOK and prints
 // "ready for local loop" when all checks pass.
 func TestRunDoctor_AllPass(t *testing.T) {

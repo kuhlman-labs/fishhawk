@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
 // promptResponse is the 200 body for GET /v0/stages/{stage_id}/prompt.
@@ -39,6 +40,10 @@ type promptResponse struct {
 	DecomposedFromRunID  string `json:"decomposed_from_run_id,omitempty"`
 	VerifyCommand        string `json:"verify_command,omitempty"`
 	VerifyTimeoutSeconds int    `json:"verify_timeout_seconds,omitempty"`
+	// MinRunnerVersion is the minimum runner version the backend requires.
+	// Runners that are older than this should exit with a version-skew error
+	// rather than proceeding to invoke the agent.
+	MinRunnerVersion string `json:"min_runner_version,omitempty"`
 }
 
 // issueGetter is the slice of githubclient.Client the prompt
@@ -195,6 +200,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		AgentTimeoutSeconds:  s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
+		MinRunnerVersion:     version.MinRunnerVersion,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -334,6 +340,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		AgentTimeoutSeconds:  s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
+		MinRunnerVersion:     version.MinRunnerVersion,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
