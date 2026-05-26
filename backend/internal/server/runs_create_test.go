@@ -27,7 +27,7 @@ func TestCreateRun_HappyPath(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
@@ -64,7 +64,7 @@ func TestCreateRun_OptionalTriggerRef(t *testing.T) {
 	}`
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
@@ -80,7 +80,7 @@ func TestCreateRun_BadJSON(t *testing.T) {
 	s := newServer(t, newFakeRepo())
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader("{not json"))
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
 	}
@@ -94,7 +94,7 @@ func TestCreateRun_UnknownField(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs",
 		strings.NewReader(`{"repo":"r","workflow_id":"w","workflow_sha":"s","trigger_source":"cli","extra":"x"}`))
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	// DisallowUnknownFields → 400.
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 on unknown field", w.Code)
@@ -116,7 +116,7 @@ func TestCreateRun_MissingRequiredFields(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(tc.body))
-			s.Handler().ServeHTTP(w, req)
+			s.handleCreateRun(w, withAuth(req))
 			if w.Code != http.StatusBadRequest {
 				t.Errorf("status = %d, want 400", w.Code)
 			}
@@ -132,7 +132,7 @@ func TestCreateRun_BadTriggerSource(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs",
 		strings.NewReader(`{"repo":"r","workflow_id":"w","workflow_sha":"s","trigger_source":"bogus"}`))
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
 	}
@@ -145,7 +145,7 @@ func TestCreateRun_RepoError(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs",
 		strings.NewReader(`{"repo":"r","workflow_id":"w","workflow_sha":"s","trigger_source":"cli"}`))
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
 	}
@@ -159,7 +159,7 @@ func TestCreateRun_NilRepoConfigured(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs",
 		strings.NewReader(`{"repo":"r","workflow_id":"w","workflow_sha":"s","trigger_source":"cli"}`))
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
 	}
@@ -181,7 +181,7 @@ func TestCreateRun_IdempotencyKey_Replay_Returns200(t *testing.T) {
 	req1.Header.Set("Content-Type", "application/json")
 	req1.Header.Set("Idempotency-Key", "abc123")
 	w1 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w1, req1)
+	s.handleCreateRun(w1, withAuth(req1))
 	if w1.Code != http.StatusCreated {
 		t.Fatalf("first status = %d, want 201:\n%s", w1.Code, w1.Body.String())
 	}
@@ -193,7 +193,7 @@ func TestCreateRun_IdempotencyKey_Replay_Returns200(t *testing.T) {
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Idempotency-Key", "abc123")
 	w2 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w2, req2)
+	s.handleCreateRun(w2, withAuth(req2))
 	if w2.Code != http.StatusOK {
 		t.Fatalf("replay status = %d, want 200:\n%s", w2.Code, w2.Body.String())
 	}
@@ -218,7 +218,7 @@ func TestCreateRun_IdempotencyKey_DifferentRepo_CreatesSeparateRun(t *testing.T)
 	req1.Header.Set("Content-Type", "application/json")
 	req1.Header.Set("Idempotency-Key", "shared")
 	w1 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w1, req1)
+	s.handleCreateRun(w1, withAuth(req1))
 	if w1.Code != http.StatusCreated {
 		t.Fatalf("first status = %d", w1.Code)
 	}
@@ -228,7 +228,7 @@ func TestCreateRun_IdempotencyKey_DifferentRepo_CreatesSeparateRun(t *testing.T)
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Idempotency-Key", "shared")
 	w2 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w2, req2)
+	s.handleCreateRun(w2, withAuth(req2))
 	if w2.Code != http.StatusCreated {
 		t.Fatalf("second status = %d, want 201 (different repo, no collision)", w2.Code)
 	}
@@ -247,7 +247,7 @@ func TestCreateRun_IdempotencyKey_DifferentKey_CreatesSeparateRun(t *testing.T) 
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", key)
 		w := httptest.NewRecorder()
-		s.Handler().ServeHTTP(w, req)
+		s.handleCreateRun(w, withAuth(req))
 		if w.Code != http.StatusCreated {
 			t.Fatalf("status = %d for key=%s", w.Code, key)
 		}
@@ -266,7 +266,7 @@ func TestCreateRun_NoIdempotencyKey_AlwaysCreates(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		s.Handler().ServeHTTP(w, req)
+		s.handleCreateRun(w, withAuth(req))
 		if w.Code != http.StatusCreated {
 			t.Fatalf("iter %d status = %d", i, w.Code)
 		}
@@ -285,14 +285,14 @@ func TestCreateRun_IdempotencyKey_Whitespace_Trimmed(t *testing.T) {
 	req1.Header.Set("Content-Type", "application/json")
 	req1.Header.Set("Idempotency-Key", "abc")
 	w1 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w1, req1)
+	s.handleCreateRun(w1, withAuth(req1))
 
 	// Header with surrounding whitespace should match the original.
 	req2 := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Idempotency-Key", "  abc  ")
 	w2 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w2, req2)
+	s.handleCreateRun(w2, withAuth(req2))
 	if w2.Code != http.StatusOK {
 		t.Errorf("whitespace-padded key didn't match original: status = %d", w2.Code)
 	}
@@ -313,7 +313,7 @@ func TestCreateRun_IdempotencyKey_LookupErrorBubbles(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "abc")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
 	}
@@ -345,7 +345,7 @@ func TestCreateRun_RunnerKind_DefaultsGitHubActions(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d", w.Code)
 	}
@@ -369,7 +369,7 @@ func TestCreateRun_RunnerKind_AcceptsLocal(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 	}
@@ -393,7 +393,7 @@ func TestCreateRun_RunnerKind_RejectsUnknown(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
 	}

@@ -133,6 +133,9 @@ var validTriggerSources = map[string]struct{}{
 // Run JSON. The state machine starts every new run in
 // run.StatePending.
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWriteScope(w, r, "write:runs") {
+		return
+	}
 	if s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
 			"runs endpoint requires a configured run repository", nil)
@@ -533,6 +536,9 @@ var validRunStates = map[string]struct{}{
 // run (succeeded / failed) returns 409 because the state machine
 // rejects the transition.
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWriteScope(w, r, "write:runs") {
+		return
+	}
 	if s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
 			"runs endpoint requires a configured run repository", nil)

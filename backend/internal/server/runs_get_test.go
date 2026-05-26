@@ -89,17 +89,16 @@ func TestGetRun_NilRepoConfigured(t *testing.T) {
 func TestRoundTrip_CreateThenGet(t *testing.T) {
 	s := newServer(t, newFakeRepo())
 
-	w, body := requestPath(t, s, http.MethodPost, "/v0/runs", map[string]any{
-		"repo":           "x/y",
-		"workflow_id":    "w",
-		"workflow_sha":   "abc",
-		"trigger_source": "ui",
-	})
-	if w.Code != http.StatusCreated {
-		t.Fatalf("create status = %d:\n%s", w.Code, body)
+	createBody := `{"repo":"x/y","workflow_id":"w","workflow_sha":"abc","trigger_source":"ui"}`
+	wCreate := httptest.NewRecorder()
+	createReq := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(createBody))
+	createReq.Header.Set("Content-Type", "application/json")
+	s.handleCreateRun(wCreate, withAuth(createReq))
+	if wCreate.Code != http.StatusCreated {
+		t.Fatalf("create status = %d:\n%s", wCreate.Code, wCreate.Body.String())
 	}
 	var created runResponse
-	if err := json.Unmarshal(body, &created); err != nil {
+	if err := json.Unmarshal(wCreate.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
 

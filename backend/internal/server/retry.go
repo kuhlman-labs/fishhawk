@@ -50,6 +50,9 @@ const CategoryStageRetried = "stage_retried"
 // the audit row is in place, the stage is in pending, an operator
 // can re-fire Advance manually if needed.
 func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWriteScope(w, r, "write:stages") {
+		return
+	}
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "retry_unconfigured",
 			"retry endpoint requires run + audit repositories", nil)

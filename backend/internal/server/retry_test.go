@@ -45,8 +45,9 @@ func postRetry(t *testing.T, s *Server, stageID uuid.UUID) *httptest.ResponseRec
 	t.Helper()
 	url := "/v0/stages/" + stageID.String() + "/retry"
 	req := httptest.NewRequest(http.MethodPost, url, nil)
+	req.SetPathValue("stage_id", stageID.String())
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleRetryStage(w, withAuth(req))
 	return w
 }
 

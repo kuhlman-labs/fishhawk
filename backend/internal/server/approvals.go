@@ -44,6 +44,9 @@ type approvalRequest struct {
 // returns the existing approval and the current stage state with
 // a 200. The first decision wins for any_of-style gates.
 func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWriteScope(w, r, "write:approvals") {
+		return
+	}
 	if s.cfg.ApprovalRepo == nil || s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "approvals_unconfigured",
 			"approvals endpoint requires approval, run, and audit repositories", nil)

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sort"
 	"sync"
 	"testing"
@@ -271,4 +272,24 @@ func (f *fakeRepo) TransitionStage(_ context.Context, _ uuid.UUID, _ run.StageSt
 func newServer(t *testing.T, repo run.Repository) *Server {
 	t.Helper()
 	return New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+}
+
+// testOperatorIdentity returns an Identity that represents a
+// cookie-session operator (no TokenID, no Scopes). The requireWriteScope
+// guard lets cookie-session callers through unconditionally, so this
+// is the correct fixture for tests that exercise handler logic past
+// the auth gate.
+func testOperatorIdentity() Identity {
+	return Identity{
+		Subject:   "github:test-operator",
+		UserID:    "00000000-0000-0000-0000-000000000001",
+		SessionID: "00000000-0000-0000-0000-000000000002",
+	}
+}
+
+// withAuth injects a session-user identity into req's context so
+// the scope guard passes when calling handlers directly (not via
+// s.Handler(), which would overwrite the identity via bearerAuth).
+func withAuth(req *http.Request) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, testOperatorIdentity()))
 }

@@ -612,6 +612,8 @@ components:
         session-cookie identity — the `X-CSRF-Token` header didn't
         match the `__Host-csrf` cookie (`error: csrf_required`).
         Bearer-token clients bypass the CSRF check.
+        Bearer tokens that authenticate successfully but lack a required
+        write scope receive `error: insufficient_scope` with HTTP 403.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }

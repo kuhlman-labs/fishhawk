@@ -87,6 +87,28 @@ func IdentityFrom(ctx context.Context) Identity {
 	return v
 }
 
+// requireWriteScope checks that the caller is authenticated and holds
+// scope. Returns true when the caller may proceed. Returns false and
+// writes a 401 (anonymous caller) or 403 (authenticated but missing
+// scope) response when the check fails. Cookie-session callers
+// (TokenID == "") bypass scope enforcement — they authenticate via
+// GitHub OAuth and carry no explicit scope list.
+func (s *Server) requireWriteScope(w http.ResponseWriter, r *http.Request, scope string) bool {
+	id := IdentityFrom(r.Context())
+	if id.IsAnonymous() {
+		s.writeError(w, r, 401, "authentication_required",
+			"an authenticated token is required", nil)
+		return false
+	}
+	if id.TokenID != "" && !hasScope(id, scope) {
+		s.writeError(w, r, 403, "insufficient_scope",
+			"token is missing required scope: "+scope,
+			map[string]any{"required_scope": scope})
+		return false
+	}
+	return true
+}
+
 const requestIDMaxLen = 64
 
 // requestID puts a per-request ID into the context and the
