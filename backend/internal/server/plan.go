@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -133,6 +134,26 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// than retrying — the agent's output is bad and re-shipping the
 	// same bytes won't help.
 	if err := plan.Validate(body); err != nil {
+		// Transition the plan stage to failed-B so the run reflects
+		// the bad output rather than getting stuck in `running` (#527).
+		// The trace handler defers plan-stage transitions to this
+		// handler; we are the only place that knows plan validation
+		// failed. Best-effort: a TransitionStage error logs but
+		// doesn't change the upload response — the operator's signal
+		// is the 400, not the audit row.
+		cat := run.FailureB
+		reason := "plan_invalid: " + err.Error()
+		if _, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
+			run.StageStateFailed, &run.StageCompletion{
+				FailureCategory: &cat,
+				FailureReason:   &reason,
+			}); terr != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"plan upload: transition to failed-B after validation error failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", terr.Error()))
+		}
 		s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
 			"plan does not validate against standard_v1",
 			map[string]any{"error": err.Error()})

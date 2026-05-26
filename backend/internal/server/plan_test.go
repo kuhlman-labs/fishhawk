@@ -140,7 +140,7 @@ func TestShipPlan_Idempotent_SecondUploadReturnsExisting(t *testing.T) {
 
 func TestShipPlan_SchemaInvalid_400(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
-	s, sf, ar, _, _ := newPlanServer(t, runID, stageID)
+	s, sf, ar, _, rr := newPlanServer(t, runID, stageID)
 	priv, _ := sf.issue(t, runID)
 	body := []byte(`{"plan_version":"standard_v1"}`) // missing required fields
 
@@ -153,6 +153,33 @@ func TestShipPlan_SchemaInvalid_400(t *testing.T) {
 	}
 	if len(ar.all) != 0 {
 		t.Errorf("artifacts = %d, want 0 on schema fail", len(ar.all))
+	}
+
+	// #527: when the plan body fails standard_v1 validation, the
+	// plan handler must transition the stage to failed-B so the run
+	// doesn't get stuck in awaiting_approval with no valid plan
+	// attached. The trace handler advances the stage to
+	// awaiting_approval first (trace arrives before plan); this
+	// handler corrects course on the failure path.
+	if len(rr.transitionStageCalls) != 1 {
+		t.Fatalf("transitionStage calls = %d, want 1:\n%+v",
+			len(rr.transitionStageCalls), rr.transitionStageCalls)
+	}
+	call := rr.transitionStageCalls[0]
+	if call.StageID != stageID {
+		t.Errorf("transitioned stage = %s, want %s", call.StageID, stageID)
+	}
+	if call.To != run.StageStateFailed {
+		t.Errorf("transition.To = %q, want failed", call.To)
+	}
+	if call.Completion == nil {
+		t.Fatal("transition.Completion is nil; failed transitions require StageCompletion")
+	}
+	if call.Completion.FailureCategory == nil || *call.Completion.FailureCategory != run.FailureB {
+		t.Errorf("FailureCategory = %v, want B", call.Completion.FailureCategory)
+	}
+	if call.Completion.FailureReason == nil || !strings.HasPrefix(*call.Completion.FailureReason, "plan_invalid:") {
+		t.Errorf("FailureReason = %v, want prefix 'plan_invalid:'", call.Completion.FailureReason)
 	}
 }
 
