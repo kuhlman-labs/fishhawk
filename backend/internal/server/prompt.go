@@ -44,6 +44,16 @@ type promptResponse struct {
 	// Runners that are older than this should exit with a version-skew error
 	// rather than proceeding to invoke the agent.
 	MinRunnerVersion string `json:"min_runner_version,omitempty"`
+	// AgentSelfRetry is true when the workflow spec opts the stage into
+	// ADR-023 runner-side self-retry on category-A/C failures.
+	AgentSelfRetry bool `json:"agent_self_retry,omitempty"`
+	// MaxRetriesSnapshot is the run's max_retries_snapshot at prompt-fetch
+	// time. Together with RetryAttempt it lets the runner compute the
+	// remaining self-retry budget without a separate API call.
+	MaxRetriesSnapshot int `json:"max_retries_snapshot,omitempty"`
+	// RetryAttempt is the run's current retry_attempt counter. 0 for
+	// original runs; incremented by the backend on each auto-retry.
+	RetryAttempt int `json:"retry_attempt,omitempty"`
 }
 
 // issueGetter is the slice of githubclient.Client the prompt
@@ -201,6 +211,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
 		MinRunnerVersion:     version.MinRunnerVersion,
+		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
+		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
+		RetryAttempt:         runRow.RetryAttempt,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -341,6 +354,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
 		MinRunnerVersion:     version.MinRunnerVersion,
+		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
+		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
+		RetryAttempt:         runRow.RetryAttempt,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -771,6 +787,45 @@ func parseRepoOwnerName(s string) (githubclient.RepoRef, error) {
 		return githubclient.RepoRef{}, fmt.Errorf("repo %q is not owner/name", s)
 	}
 	return githubclient.RepoRef{Owner: parts[0], Name: parts[1]}, nil
+}
+
+// resolveAgentSelfRetryForStage returns whether the workflow spec opts the
+// given stage type into runner-side self-retry on category-A/C failures
+// (ADR-023). Mirrors resolveVerifyConfig's parse + lookup pattern. Returns
+// false on any error (nil spec, missing workflow, parse failure) so the
+// runner degrades gracefully to the pre-ADR-023 behavior.
+func (s *Server) resolveAgentSelfRetryForStage(ctx context.Context, runRow *run.Run, stageType run.StageType) bool {
+	if runRow.WorkflowSpec == nil {
+		return false
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse workflow spec for agent_self_retry",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return false
+	}
+	var specStage spec.Stage
+	for _, st := range wf.Stages {
+		if st.ID == string(stageType) {
+			specStage = st
+			break
+		}
+	}
+	if specStage.ID == "" {
+		for _, st := range wf.Stages {
+			if string(st.Type) == string(stageType) {
+				specStage = st
+				break
+			}
+		}
+	}
+	return specStage.Executor.AgentSelfRetry
 }
 
 // loadLastDecomposeRejectionReason scans the run's approval_submitted
