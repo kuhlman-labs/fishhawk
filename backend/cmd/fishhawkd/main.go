@@ -73,6 +73,7 @@ func printUsage(w io.Writer) {
 		"  migrate down  Roll back the most recent migration (dev only).",
 		"  audit-rehash  Rewrite audit_entries.entry_hash with the canonical algorithm (#302).",
 		"  token issue   Mint a bootstrap API token for an identity.",
+		"  token migrate Promote pre-#526 operator tokens to the current default scope set.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}

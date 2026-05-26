@@ -75,6 +75,21 @@ Before opening a PR that adds or modifies a field in `docs/spec/`:
    ```
    JSON Schema Draft 2020-12 §10.3 collects unknown keywords as annotations without affecting validation, so this annotation is safe to add to any schema without breaking existing validators.
 
+### Auth change checklist
+
+Before opening a PR that adds or tightens handler-side authorization (scope check, role check, audience check), the PR body must include:
+
+1. **Impact inventory.** Which active tokens would lose access if the change shipped as-is? Run `fishhawkd token migrate --db $FISHHAWKD_DATABASE_URL` (dry-run, no `--apply`) to enumerate affected tokens. Paste the summary line into `## Notes`.
+
+2. **Migration path.** State how affected tokens will be brought up to the new requirements. Options in order of preference:
+   - `fishhawkd token migrate --apply` — promotes tokens whose scope set is a strict subset of the operator default (see #529).
+   - Re-issue the token with `fishhawkd token issue --subject <s>`.
+   - Manual DB update (last resort; document the exact SQL).
+
+3. **Safe-to-ship determination.** The PR is safe to ship without operator-side action only when the impact inventory is empty (step 1 produced `scanned=N migrated=0`). If the inventory is non-empty, the migration path must be completed before or immediately after deploy, and this must be stated explicitly.
+
+Cross-reference: this checklist codifies the rollout discipline introduced by #529; see #472 for the analogous schema-change discipline.
+
 ### Rebuild matrix
 
 `scripts/dev up` always rebuilds `fishhawkd`. A future enhancement could auto-detect which binaries need rebuilding from `git diff main...HEAD`.

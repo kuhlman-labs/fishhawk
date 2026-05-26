@@ -10,7 +10,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tokenmigrate"
 )
+
+// operatorDefaultScopes is the canonical scope set applied to every
+// non-MCP operator token at issuance time (#526). Shared between
+// runTokenIssue and runTokenMigrate so there is one source of truth.
+var operatorDefaultScopes = []string{
+	"read:runs", "read:audit", "write:runs", "write:approvals", "write:stages",
+}
 
 // runToken dispatches the `token` subcommand. v0 has one operation
 // — issue — for bootstrapping the first API token before OAuth
@@ -22,9 +31,12 @@ func runToken(args []string, logSink io.Writer) int {
 	switch cmd {
 	case "issue":
 		return runTokenIssue(rest, logSink)
+	case "migrate":
+		return runTokenMigrate(rest, logSink)
 	default:
 		_, _ = fmt.Fprintf(logSink, "fishhawkd token: unknown subcommand %q\n", cmd)
 		_, _ = fmt.Fprintln(logSink, "Usage: fishhawkd token issue --subject <s> [--scopes a,b]")
+		_, _ = fmt.Fprintln(logSink, "       fishhawkd token migrate [--db <url>] [--apply]")
 		return exitUsage
 	}
 }
@@ -52,7 +64,7 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 
 	scopes := splitCSV(*scopesCSV)
 	if len(scopes) == 0 && !strings.HasPrefix(*subject, "mcp:") {
-		scopes = []string{"read:runs", "read:audit", "write:runs", "write:approvals", "write:stages"}
+		scopes = operatorDefaultScopes
 		_, _ = fmt.Fprintln(logSink, "fishhawkd token issue: applying default operator scope set")
 	}
 
@@ -76,6 +88,42 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 	_, _ = fmt.Fprintf(logSink,
 		"issued token id=%s subject=%s scopes=%v\n",
 		tok.ID, tok.Subject, tok.Scopes)
+	return exitOK
+}
+
+func runTokenMigrate(args []string, logSink io.Writer) int {
+	fs := flag.NewFlagSet("fishhawkd token migrate", flag.ContinueOnError)
+	fs.SetOutput(logSink)
+	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""), "postgres URL")
+	apply := fs.Bool("apply", false, "write changes (default is dry-run)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *dbURL == "" {
+		_, _ = fmt.Fprintln(logSink, "fishhawkd token migrate: --db (or FISHHAWKD_DATABASE_URL) required")
+		return exitUsage
+	}
+
+	dryRun := !*apply
+	if dryRun {
+		_, _ = fmt.Fprintln(logSink, "fishhawkd token migrate: dry-run (pass --apply to write)")
+	}
+
+	pool, err := postgres.Connect(context.Background(), *dbURL)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink, "fishhawkd token migrate: connect: %v\n", err)
+		return exitFailure
+	}
+	defer pool.Close()
+
+	summary, err := tokenmigrate.MigrateScopes(context.Background(), pool, operatorDefaultScopes, dryRun, logSink)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink, "fishhawkd token migrate: %v\n", err)
+		return exitFailure
+	}
+	_, _ = fmt.Fprintf(logSink,
+		"fishhawkd token migrate: done dry_run=%v scanned=%d migrated=%d skipped=%d\n",
+		dryRun, summary.Scanned, summary.Migrated, summary.Skipped)
 	return exitOK
 }
 
