@@ -81,6 +81,7 @@ type uploadClient interface {
 	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
 	FetchInstallationToken(ctx context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error)
 	FetchMCPToken(ctx context.Context, args upload.FetchMCPTokenArgs) (*upload.FetchMCPTokenResult, error)
+	RetryStage(ctx context.Context, args upload.RetryStageArgs) error
 }
 
 // newUploadClient returns the production uploadClient for the
@@ -233,7 +234,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -262,6 +263,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if cfg.verifyTimeout == 0 && specVerifyTimeoutSecs > 0 {
 			cfg.verifyTimeout = time.Duration(specVerifyTimeoutSecs) * time.Second
 		}
+		// ADR-023 self-retry fields — set from prompt response, not CLI flags.
+		cfg.agentSelfRetry = agentSelfRetry
+		cfg.maxRetriesSnapshot = maxRetriesSnapshot
+		cfg.retryAttempt = retryAttempt
 	}
 
 	if cfg.promptFile == "" {
@@ -321,96 +326,147 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	}
 
 	invoker := newInvoker(os.Getenv("ANTHROPIC_API_KEY"))
-	res, invokeErr := invoker.Invoke(ctx, inv)
 
-	// Plan validation runs only if the agent itself succeeded —
-	// no point re-stating "your plan is malformed" when the
-	// agent already failed. A plan-validation failure overrides
-	// res.OK and demotes the run to category-B (constraint /
-	// policy violation per MVP_SPEC §6).
-	//
-	// Gated on stageType to skip implement / review stages where
-	// the agent legitimately produces no plan file. Empty
-	// stageType (local replay without --fetch-prompt) preserves
-	// the historical behavior: operator's --plan-out flag drives
-	// validation directly.
-	if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
-		if ev, demote := validatePlan(cfg.planOut); demote != nil {
+	// selfRetryBudget is the number of additional in-process retries the
+	// runner may attempt before giving up. Clamped to 0 when negative
+	// (retryAttempt >= maxRetriesSnapshot, e.g. because a prior GHA runner
+	// already exhausted the budget at the orchestration layer).
+	selfRetryBudget := cfg.maxRetriesSnapshot - cfg.retryAttempt
+	if selfRetryBudget < 0 {
+		selfRetryBudget = 0
+	}
+	selfRetryCount := 0
+
+	var (
+		res       agent.Result
+		invokeErr error
+		diff      *constraint.Diff
+		diffErr   error
+	)
+
+	for {
+		res, invokeErr = invoker.Invoke(ctx, inv)
+
+		// Plan validation runs only if the agent itself succeeded —
+		// no point re-stating "your plan is malformed" when the
+		// agent already failed. A plan-validation failure overrides
+		// res.OK and demotes the run to category-B (constraint /
+		// policy violation per MVP_SPEC §6).
+		//
+		// Gated on stageType to skip implement / review stages where
+		// the agent legitimately produces no plan file. Empty
+		// stageType (local replay without --fetch-prompt) preserves
+		// the historical behavior: operator's --plan-out flag drives
+		// validation directly.
+		if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
+			if ev, demote := validatePlan(cfg.planOut); demote != nil {
+				res.Events = append(res.Events, ev)
+				res.OK = false
+				res.FailureCategory = "B"
+				res.FailureReason = demote.Error()
+				invokeErr = demote
+			} else {
+				res.Events = append(res.Events, ev)
+			}
+		}
+
+		// Diff emission: when --check-base-ref is set, compute the
+		// stage's git diff and emit a git_diff event into the bundle.
+		// The backend's policy re-evaluation (E3.13) reads this event
+		// regardless of whether the runner does its own in-band
+		// constraint check; decoupling emission from enforcement (#247)
+		// means the SPA's policy section works even for customers who
+		// don't pass --constraints-file.
+		//
+		// A diff failure on its own doesn't demote res.OK — when the
+		// customer didn't pass constraints-file we have nothing to
+		// enforce. The in-band constraint check below treats a failed
+		// diff as fatal IF constraints-file is set (preserves the
+		// pre-#247 "couldn't enforce constraints → category-B" semantic).
+		diff = nil
+		diffErr = nil
+		if cfg.checkBaseRef != "" {
+			d, ev, err := computeAndEmitDiff(cfg)
 			res.Events = append(res.Events, ev)
-			res.OK = false
-			res.FailureCategory = "B"
-			res.FailureReason = demote.Error()
-			invokeErr = demote
-		} else {
+			if err == nil {
+				diff = &d
+			} else {
+				diffErr = err
+			}
+		}
+
+		// Constraint evaluation: same demotion rules as plan
+		// validation. Only runs if everything before it succeeded so
+		// we don't double-stamp a category-A failure as B.
+		//
+		// Requires both flags. --constraints-file alone is a silent
+		// skip (legitimate for stages that don't produce diffs); the
+		// customer can pass it as a default in their action and only
+		// add --check-base-ref to stages that emit a diff. A diff
+		// failure when both flags are set is fatal — preserves the
+		// pre-#247 "couldn't enforce constraints → category-B"
+		// semantic.
+		if res.OK && cfg.constraintsFile != "" && cfg.checkBaseRef != "" {
+			if diff == nil {
+				res.OK = false
+				res.FailureCategory = "B"
+				res.FailureReason = diffErr.Error()
+				invokeErr = diffErr
+			} else if evs, demote := enforceConstraints(cfg, *diff); demote != nil {
+				res.Events = append(res.Events, evs...)
+				res.OK = false
+				res.FailureCategory = "B"
+				res.FailureReason = demote.Error()
+				invokeErr = demote
+			} else {
+				res.Events = append(res.Events, evs...)
+			}
+		}
+
+		// Verify gate: optional in-band test gate that fires after constraint
+		// evaluation and before bundle building. Non-zero exit from the
+		// verify command demotes to category-A (#441).
+		if res.OK && cfg.verifyCmd != "" {
+			ev, demote := runVerifyGate(ctx, cfg, logSink)
 			res.Events = append(res.Events, ev)
+			if demote != nil {
+				res.OK = false
+				res.FailureCategory = "A"
+				res.FailureReason = demote.Error()
+				invokeErr = demote
+			}
 		}
-	}
 
-	// Diff emission: when --check-base-ref is set, compute the
-	// stage's git diff and emit a git_diff event into the bundle.
-	// The backend's policy re-evaluation (E3.13) reads this event
-	// regardless of whether the runner does its own in-band
-	// constraint check; decoupling emission from enforcement (#247)
-	// means the SPA's policy section works even for customers who
-	// don't pass --constraints-file.
-	//
-	// A diff failure on its own doesn't demote res.OK — when the
-	// customer didn't pass constraints-file we have nothing to
-	// enforce. The in-band constraint check below treats a failed
-	// diff as fatal IF constraints-file is set (preserves the
-	// pre-#247 "couldn't enforce constraints → category-B" semantic).
-	var diff *constraint.Diff
-	var diffErr error
-	if cfg.checkBaseRef != "" {
-		d, ev, err := computeAndEmitDiff(cfg)
-		res.Events = append(res.Events, ev)
-		if err == nil {
-			diff = &d
-		} else {
-			diffErr = err
+		// ADR-023 self-retry: when the stage fails with category A or C,
+		// the spec opts in with agent_self_retry:true, and the budget is
+		// not exhausted, call POST /v0/stages/{id}/retry and re-invoke.
+		// issuedKey != nil guarantees client is non-nil (key comes from
+		// the fetch-prompt path which always constructs the client first).
+		if !res.OK &&
+			(res.FailureCategory == "A" || res.FailureCategory == "C") &&
+			cfg.agentSelfRetry && issuedKey != nil && selfRetryCount < selfRetryBudget {
+			retryErr := client.RetryStage(ctx, upload.RetryStageArgs{
+				StageID:    cfg.stageID,
+				PrivateKey: issuedKey.PrivateKey,
+			})
+			if retryErr == nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"stage_self_retry","run_id":%q,"stage_id":%q,"attempt":%d}`+"\n",
+					cfg.runID, cfg.stageID, selfRetryCount+1)
+				selfRetryCount++
+				// Reset per-attempt state; the next iteration's agent
+				// invocation re-populates res and invokeErr. diff and
+				// diffErr are recomputed inside the loop body too, so
+				// no explicit reset is needed.
+				res = agent.Result{}
+				invokeErr = nil
+				continue
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"retry_stage_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, retryErr.Error())
 		}
-	}
-
-	// Constraint evaluation: same demotion rules as plan
-	// validation. Only runs if everything before it succeeded so
-	// we don't double-stamp a category-A failure as B.
-	//
-	// Requires both flags. --constraints-file alone is a silent
-	// skip (legitimate for stages that don't produce diffs); the
-	// customer can pass it as a default in their action and only
-	// add --check-base-ref to stages that emit a diff. A diff
-	// failure when both flags are set is fatal — preserves the
-	// pre-#247 "couldn't enforce constraints → category-B"
-	// semantic.
-	if res.OK && cfg.constraintsFile != "" && cfg.checkBaseRef != "" {
-		if diff == nil {
-			res.OK = false
-			res.FailureCategory = "B"
-			res.FailureReason = diffErr.Error()
-			invokeErr = diffErr
-		} else if evs, demote := enforceConstraints(cfg, *diff); demote != nil {
-			res.Events = append(res.Events, evs...)
-			res.OK = false
-			res.FailureCategory = "B"
-			res.FailureReason = demote.Error()
-			invokeErr = demote
-		} else {
-			res.Events = append(res.Events, evs...)
-		}
-	}
-
-	// Verify gate: optional in-band test gate that fires after constraint
-	// evaluation and before bundle building. Non-zero exit from the
-	// verify command demotes to category-A (#441).
-	if res.OK && cfg.verifyCmd != "" {
-		ev, demote := runVerifyGate(ctx, cfg, logSink)
-		res.Events = append(res.Events, ev)
-		if demote != nil {
-			res.OK = false
-			res.FailureCategory = "A"
-			res.FailureReason = demote.Error()
-			invokeErr = demote
-		}
+		break
 	}
 
 	// Bundle building is shared by --bundle-out and --upload-trace.
@@ -733,7 +789,8 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // fetchPromptToFile pulls the constructed prompt from the backend,
 // writes it to a temp file, and returns the path, stage type,
 // agent_timeout_seconds, verify_command, verify_timeout_seconds,
-// decomposed_from_run_id, and min_runner_version from the response.
+// decomposed_from_run_id, min_runner_version, agent_self_retry,
+// max_retries_snapshot, and retry_attempt from the response.
 // stageType drives per-stage post-processing (plan validation + upload
 // for plan stages, commit+push+PR upload for implement stages).
 // agentTimeoutSecs is the spec-resolved wall-clock cap; 0 means the
@@ -743,17 +800,18 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // declares none. decomposedFromRunID is non-empty when this run is a
 // decomposed child. minRunnerVersion is non-empty when the backend
 // requires a minimum runner version; the caller checks it against
-// runnerVersion() before proceeding.
+// runnerVersion() before proceeding. agentSelfRetry, maxRetriesSnapshot,
+// and retryAttempt drive the ADR-023 self-retry loop.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, "", "", fetchErr
+		return "", "", 0, "", 0, "", "", false, 0, 0, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -761,20 +819,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, "", "", false, 0, 0, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, "", "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, nil
 }
 
 func logStartup(w io.Writer, cfg config) {

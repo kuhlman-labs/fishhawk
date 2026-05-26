@@ -62,6 +62,14 @@ type config struct {
 	// fetched prompt reveals that this run is a decomposed child.
 	// Drives shared-branch routing in openPRAndShipArtifact.
 	decomposedFromRunID string
+
+	// agentSelfRetry, maxRetriesSnapshot, and retryAttempt are set at
+	// runtime from the fetched prompt response (ADR-023). Not CLI flags.
+	// agentSelfRetry gates the retry loop; the other two compute the
+	// remaining budget (maxRetriesSnapshot - retryAttempt).
+	agentSelfRetry     bool
+	maxRetriesSnapshot int
+	retryAttempt       int
 }
 
 // parseFlags reads args and populates a config. Returns a usage

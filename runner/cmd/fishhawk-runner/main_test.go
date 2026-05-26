@@ -46,6 +46,10 @@ func openBundleForTest(data []byte) (bundle.ManifestData, []bundle.Line, bundle.
 
 // fakeInvoker lets tests drive run() without spawning a child
 // process. Returning (canned, returnErr) keeps the seam tiny.
+//
+// For sequence tests (e.g. self-retry): set cannedSeq + errSeq instead
+// of canned + returnErr. Each Invoke call consumes the next entry; the
+// last entry repeats after the slice is exhausted.
 type fakeInvoker struct {
 	canned    agent.Result
 	returnErr error
@@ -53,11 +57,29 @@ type fakeInvoker struct {
 	// gotInv captures the Invocation the harness handed in, so
 	// tests can assert on plumbed Env (E19.8 / #348 wiring).
 	gotInv *agent.Invocation
+
+	// cannedSeq / errSeq support tests that need different results per
+	// call. When cannedSeq is non-nil it takes precedence over canned.
+	cannedSeq []agent.Result
+	errSeq    []error
+	callIdx   int
 }
 
 func (f *fakeInvoker) Invoke(_ context.Context, inv agent.Invocation) (agent.Result, error) {
 	i := inv
 	f.gotInv = &i
+	if len(f.cannedSeq) > 0 {
+		idx := f.callIdx
+		if idx >= len(f.cannedSeq) {
+			idx = len(f.cannedSeq) - 1
+		}
+		f.callIdx++
+		var err error
+		if idx < len(f.errSeq) {
+			err = f.errSeq[idx]
+		}
+		return f.cannedSeq[idx], err
+	}
 	return f.canned, f.returnErr
 }
 
@@ -79,13 +101,14 @@ func withFakeInvoker(t *testing.T, fake *fakeInvoker) {
 // assertions can confirm the runner wired the right
 // run/stage/variant/bundle.
 type fakeUploader struct {
-	issueErr     error
-	shipErr      error
-	promptErr    error
-	planErr      error
-	prErr        error
-	instTokenErr error
-	mcpTokenErr  error
+	issueErr      error
+	shipErr       error
+	promptErr     error
+	planErr       error
+	prErr         error
+	instTokenErr  error
+	mcpTokenErr   error
+	retryStageErr error
 
 	// Recorded calls.
 	gotIssueRunID string
@@ -103,6 +126,7 @@ type fakeUploader struct {
 	gotPRArgs        *upload.ShipPullRequestArgs
 	gotInstTokenArgs *upload.FetchInstallationTokenArgs
 	gotMCPTokenArgs  *upload.FetchMCPTokenArgs
+	gotRetryArgs     []upload.RetryStageArgs
 
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
@@ -233,6 +257,11 @@ func (f *fakeUploader) FetchMCPToken(_ context.Context, args upload.FetchMCPToke
 		RunID:     args.RunID,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}, nil
+}
+
+func (f *fakeUploader) RetryStage(_ context.Context, args upload.RetryStageArgs) error {
+	f.gotRetryArgs = append(f.gotRetryArgs, args)
+	return f.retryStageErr
 }
 
 // withFakeUploader swaps newUploadClient. Caller restores via
@@ -2894,5 +2923,179 @@ func TestRun_VersionSkewDetected(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"min_required":"v0.5.0"`) {
 		t.Errorf("missing min_required in log:\n%s", stderr.String())
+	}
+}
+
+// selfRetryPromptResp is the promptResp used by ADR-023 self-retry tests.
+// agentSelfRetry:true, budget=1 (maxRetriesSnapshot=1, retryAttempt=0).
+func selfRetryPromptResp(stageID string) *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:            stageID,
+		StageType:          "plan",
+		Prompt:             "retry test prompt",
+		PromptHash:         "deadbeef",
+		AgentSelfRetry:     true,
+		MaxRetriesSnapshot: 1,
+		RetryAttempt:       0,
+	}
+}
+
+const selfRetryStageID = "22222222-3333-4444-5555-666666666666"
+const selfRetryRunID = "11111111-2222-3333-4444-555555555555"
+
+// selfRetryArgs returns the common run() flags for the self-retry tests.
+func selfRetryArgs() []string {
+	return []string{
+		"--run-id", selfRetryRunID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "w", "--stage", "s",
+		"--stage-id", selfRetryStageID,
+		"--fetch-prompt",
+	}
+}
+
+// TestRun_SelfRetry_CategoryA_ThenSuccess verifies the happy path:
+// a category-A failure on the first invoke, RetryStage succeeds,
+// the second invoke succeeds → exit 0, RetryStage called exactly once.
+func TestRun_SelfRetry_CategoryA_ThenSuccess(t *testing.T) {
+	invoker := &fakeInvoker{
+		cannedSeq: []agent.Result{
+			{OK: false, FailureCategory: "A", FailureReason: "agent crash",
+				Events: []agent.Event{{Kind: "invocation_start"}}},
+			{OK: true, TokensUsed: 5,
+				Events: []agent.Event{{Kind: "invocation_start"}}},
+		},
+		errSeq: []error{agent.ErrAgentFailed, nil},
+	}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = selfRetryPromptResp(selfRetryStageID)
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run(selfRetryArgs(), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if len(fu.gotRetryArgs) != 1 {
+		t.Errorf("RetryStage calls = %d, want 1", len(fu.gotRetryArgs))
+	}
+	if fu.gotRetryArgs[0].StageID != selfRetryStageID {
+		t.Errorf("RetryStage StageID = %q, want %q", fu.gotRetryArgs[0].StageID, selfRetryStageID)
+	}
+	if !strings.Contains(stderr.String(), `"event":"stage_self_retry"`) {
+		t.Errorf("missing stage_self_retry log:\n%s", stderr.String())
+	}
+	if invoker.callIdx != 2 {
+		t.Errorf("Invoke call count = %d, want 2", invoker.callIdx)
+	}
+}
+
+// TestRun_SelfRetry_CategoryB_NoRetry verifies that category-B failures
+// do not trigger a self-retry even when agent_self_retry is true.
+func TestRun_SelfRetry_CategoryB_NoRetry(t *testing.T) {
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "B", FailureReason: "constraint violated"},
+		returnErr: nil,
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = selfRetryPromptResp(selfRetryStageID)
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run(selfRetryArgs(), &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if len(fu.gotRetryArgs) != 0 {
+		t.Errorf("RetryStage should not be called for category-B failure; got %d calls", len(fu.gotRetryArgs))
+	}
+}
+
+// TestRun_SelfRetry_ZeroBudget_NoRetry verifies that a zero retry budget
+// (maxRetriesSnapshot == retryAttempt) prevents self-retry even on A failures.
+func TestRun_SelfRetry_ZeroBudget_NoRetry(t *testing.T) {
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent crash"},
+		returnErr: agent.ErrAgentFailed,
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:            selfRetryStageID,
+		StageType:          "plan",
+		Prompt:             "test",
+		PromptHash:         "h",
+		AgentSelfRetry:     true,
+		MaxRetriesSnapshot: 1,
+		RetryAttempt:       1, // budget = 0
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run(selfRetryArgs(), &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if len(fu.gotRetryArgs) != 0 {
+		t.Errorf("RetryStage should not be called when budget is exhausted; got %d calls", len(fu.gotRetryArgs))
+	}
+}
+
+// TestRun_SelfRetry_Disabled_NoRetry verifies that agent_self_retry:false
+// prevents self-retry on category-A failures.
+func TestRun_SelfRetry_Disabled_NoRetry(t *testing.T) {
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent crash"},
+		returnErr: agent.ErrAgentFailed,
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:            selfRetryStageID,
+		StageType:          "plan",
+		Prompt:             "test",
+		PromptHash:         "h",
+		AgentSelfRetry:     false, // opt-out
+		MaxRetriesSnapshot: 1,
+		RetryAttempt:       0,
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run(selfRetryArgs(), &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if len(fu.gotRetryArgs) != 0 {
+		t.Errorf("RetryStage should not be called when agent_self_retry is false; got %d calls", len(fu.gotRetryArgs))
+	}
+}
+
+// TestRun_SelfRetry_RetryStage422_ExitsWithOriginalFailure verifies that
+// when RetryStage returns ErrRetryNotApplicable (422) the runner does not
+// loop and exits with the original category-A failure.
+func TestRun_SelfRetry_RetryStage422_ExitsWithOriginalFailure(t *testing.T) {
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent crash"},
+		returnErr: agent.ErrAgentFailed,
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = selfRetryPromptResp(selfRetryStageID)
+	fu.retryStageErr = upload.ErrRetryNotApplicable
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run(selfRetryArgs(), &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	// RetryStage was called once (the 422 path), then the loop broke.
+	if len(fu.gotRetryArgs) != 1 {
+		t.Errorf("RetryStage calls = %d, want 1 (called but not looped)", len(fu.gotRetryArgs))
+	}
+	if !strings.Contains(stderr.String(), `"event":"retry_stage_failed"`) {
+		t.Errorf("missing retry_stage_failed log:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("original category-A must be preserved:\n%s", stderr.String())
 	}
 }

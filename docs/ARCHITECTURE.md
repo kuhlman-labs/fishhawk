@@ -61,6 +61,19 @@ Per `docs/MVP_SPEC.md` §5.2. Concrete realization in this codebase:
 
 Failure categories (per §6) are captured in the `audit_entries` table with `category` ∈ {A: agent, B: constraint, C: infra, D: approval timeout}. Re-execution is allowed for all four; idempotency keys prevent double-fire.
 
+### 4.1 Self-retry decision tree (ADR-023)
+
+When `executor.agent_self_retry: true` is set on a stage in the workflow spec, the runner applies a four-gate decision after each invocation before exiting with failure:
+
+1. **Spec opt-in** — `cfg.agentSelfRetry == true` (surfaced via the prompt-fetch response). Stages without the flag always exit on failure.
+2. **Signing key available** — `issuedKey != nil`. Only the `--fetch-prompt` path issues the key before the invoke loop; without it the gate closes and no retry fires. Guarantees the runner can authenticate the POST.
+3. **Remaining budget > 0** — `maxRetriesSnapshot - retryAttempt - selfRetryCount > 0`. `maxRetriesSnapshot` and `retryAttempt` are snapshotted from the run row at prompt-fetch time and returned in the prompt response. `selfRetryCount` tracks in-process retries on the current runner invocation.
+4. **Failure category A or C** — category B (constraint/policy) and D (approval timeout) are not retried in-process; those require a spec change or human action.
+
+**Call path on retry**: runner calls `POST /v0/stages/{id}/retry` (signed with the Ed25519 per-run key, same mechanism as trace upload). The backend transitions the stage `failed → pending` and the orchestrator fires `workflow_dispatch`, launching a second GitHub Actions runner. Meanwhile the current runner process emits a `stage_self_retry` log line, resets its result state, and re-invokes the agent in the same for-loop iteration.
+
+**Known v0 limitation**: the `workflow_dispatch` fires a second GHA runner that also fetches the stage prompt (the dispatched state is not blocked by the prompt handler's state guard) and begins a concurrent agent invocation. The two agents race; whichever uploads its trace bundle last wins at the backend's idempotent-store layer. No v0 guard prevents this; the orphaned runner's trace upload races with the winner's. An integration test asserting only one trace-upload call per retried stage is deliberately deferred.
+
 ## 5. Storage model
 
 ### 5.1 Postgres (`fishhawkd` schema)

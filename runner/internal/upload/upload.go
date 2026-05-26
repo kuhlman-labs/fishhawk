@@ -65,6 +65,11 @@ var (
 	// for this stage type. Non-retryable; the runner should fail
 	// the stage rather than guess.
 	ErrUnsupportedStage = errors.New("upload: backend does not support this stage type")
+	// ErrRetryNotApplicable is returned by RetryStage when the backend
+	// responds 422 (retry_not_applicable). The stage's failure category
+	// does not permit a retry (e.g., category-B). Non-retryable; the
+	// runner should exit with the original failure.
+	ErrRetryNotApplicable = errors.New("upload: retry not applicable for this stage")
 )
 
 // Client wraps a net/http.Client with a base URL. Construct via
@@ -315,6 +320,13 @@ type FetchedPrompt struct {
 	// this against its own version and exits with exitVersionSkew when it is
 	// older than required.
 	MinRunnerVersion string `json:"min_runner_version,omitempty"`
+	// AgentSelfRetry is true when the workflow spec opts the stage into
+	// ADR-023 runner-side self-retry on category-A/C failures.
+	AgentSelfRetry bool `json:"agent_self_retry,omitempty"`
+	// MaxRetriesSnapshot and RetryAttempt let the runner compute the
+	// remaining self-retry budget without an additional API call.
+	MaxRetriesSnapshot int `json:"max_retries_snapshot,omitempty"`
+	RetryAttempt       int `json:"retry_attempt,omitempty"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an
@@ -840,5 +852,65 @@ func (c *Client) FetchInstallationToken(ctx context.Context, args FetchInstallat
 		return nil, fmt.Errorf("upload: installation-token: GitHub rejected App JWT or installation: %s", readBriefBody(resp))
 	default:
 		return nil, statusError("fetch installation token", resp)
+	}
+}
+
+// RetryStageArgs collects the inputs for RetryStage.
+type RetryStageArgs struct {
+	StageID    string
+	PrivateKey ed25519.PrivateKey
+}
+
+// RetryStage calls POST /v0/stages/{stage_id}/retry using the same
+// Ed25519 signing-key auth as FetchInstallationToken — signs over the
+// empty body to prove key possession. Single-attempt; the caller
+// decides whether to surface the error as a hard failure or log and
+// break the retry loop.
+//
+//   - 200 → nil (stage transitioned; orchestrator will dispatch)
+//   - 403 → descriptive non-nil error
+//   - 422 (retry_not_applicable) → ErrRetryNotApplicable sentinel
+//   - 404 / 5xx → generic error via statusError
+func (c *Client) RetryStage(ctx context.Context, args RetryStageArgs) error {
+	if args.StageID == "" {
+		return errors.New("upload: stage_id required")
+	}
+	if len(args.PrivateKey) != ed25519.PrivateKeySize {
+		return errors.New("upload: invalid private key length")
+	}
+
+	body := []byte{}
+	digest := sha256.Sum256(body)
+	signature := ed25519.Sign(args.PrivateKey, digest[:])
+	sigHex := hex.EncodeToString(signature)
+
+	endpoint := fmt.Sprintf("%s/v0/stages/%s/retry",
+		c.BaseURL, url.PathEscape(args.StageID))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("upload: build retry request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Fishhawk-Signature", sigHex)
+	req.Header.Set("Accept", "application/json")
+	req.ContentLength = 0
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload: retry stage: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusForbidden:
+		detail := readBriefBody(resp)
+		return fmt.Errorf("upload: retry stage: forbidden: %s", detail)
+	case http.StatusUnprocessableEntity:
+		return ErrRetryNotApplicable
+	default:
+		return statusError("retry stage", resp)
 	}
 }
