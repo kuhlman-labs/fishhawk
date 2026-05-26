@@ -167,6 +167,10 @@
                   "description": "Wall-clock cap on the verify command. Parsed by time.ParseDuration. Defaults to 10m when absent."
                 }
               }
+            },
+            "agent_self_retry": {
+              "type": "boolean",
+              "description": "Opt-in flag (default false, per ADR-023) that tells the runner to allow the agent one self-initiated retry when it detects a recoverable failure before yielding to the workflow's on_ci_failure policy. Only meaningful on agent-executed stages; setting it on a human executor is a schema error (the field is declared in the agent branch only, so unevaluatedProperties rejects it on the human branch)."
             }
           }
         },

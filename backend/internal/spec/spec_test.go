@@ -569,6 +569,102 @@ func TestResolveStageTimeout(t *testing.T) {
 	}
 }
 
+// --- agent_self_retry (ADR-023 / #533) ---
+
+func TestParse_AgentSelfRetry_Absent(t *testing.T) {
+	// Omitted field defaults to false — the zero value.
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ex := s.Workflows["trivial"].Stages[0].Executor
+	if ex.AgentSelfRetry {
+		t.Errorf("AgentSelfRetry = true, want false when field is absent")
+	}
+}
+
+func TestParse_AgentSelfRetry_True(t *testing.T) {
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_self_retry: true
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ex := s.Workflows["trivial"].Stages[0].Executor
+	if !ex.AgentSelfRetry {
+		t.Errorf("AgentSelfRetry = false, want true")
+	}
+}
+
+func TestParse_AgentSelfRetry_ExplicitFalse(t *testing.T) {
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_self_retry: false
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ex := s.Workflows["trivial"].Stages[0].Executor
+	if ex.AgentSelfRetry {
+		t.Errorf("AgentSelfRetry = true, want false when explicitly set to false")
+	}
+}
+
+func TestParse_AgentSelfRetry_WrongType(t *testing.T) {
+	// "yes" is a string, not a boolean — schema rejects it.
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_self_retry: "yes"
+        produces:
+          - artifact: pull_request
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
 // --- Parse via io.Reader ---
 
 func TestParse_ReaderRoundTrip(t *testing.T) {

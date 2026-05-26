@@ -128,6 +128,75 @@ func TestParseError_ErrorString(t *testing.T) {
 	}
 }
 
+// --- agent_self_retry (ADR-023 / #533) ---
+
+func TestValidateBytes_AgentSelfRetry_True(t *testing.T) {
+	yml := `
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_self_retry: true
+        produces:
+          - artifact: pull_request
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("expected valid spec with agent_self_retry: true, got: %v", err)
+	}
+}
+
+func TestValidateBytes_AgentSelfRetry_WrongType(t *testing.T) {
+	yml := `
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_self_retry: "yes"
+        produces:
+          - artifact: pull_request
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+}
+
+// TestValidateBytes_AgentSelfRetry_RejectedOnHumanExecutor pins the
+// contract that agent_self_retry is only allowed inside the agent
+// branch of the executor oneOf. The field is declared in the agent
+// branch and the executor uses unevaluatedProperties: false, so it
+// is rejected when the human branch matches. Catches a future schema
+// refactor that loosens unevaluatedProperties and silently changes
+// the semantic. (ADR-023.)
+func TestValidateBytes_AgentSelfRetry_RejectedOnHumanExecutor(t *testing.T) {
+	yml := `
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+          agent_self_retry: true
+        produces: []
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError (agent_self_retry must be rejected on a human executor)", err)
+	}
+}
+
 func messageStrings(ve *spec.ValidationError) []string {
 	out := make([]string, 0, len(ve.Errors))
 	for _, e := range ve.Errors {
