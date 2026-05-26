@@ -51,6 +51,10 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 	}
 
 	scopes := splitCSV(*scopesCSV)
+	if len(scopes) == 0 && !strings.HasPrefix(*subject, "mcp:") {
+		scopes = []string{"read:runs", "read:audit", "write:runs", "write:approvals", "write:stages"}
+		_, _ = fmt.Fprintln(logSink, "fishhawkd token issue: applying default operator scope set")
+	}
 
 	pool, err := pgxpool.New(context.Background(), *dbURL)
 	if err != nil {

@@ -337,8 +337,9 @@ func submitApproval(t *testing.T, s *Server, stageID uuid.UUID, body string) *ht
 	url := fmt.Sprintf("/v0/stages/%s/approvals", stageID)
 	req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("stage_id", stageID.String())
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleSubmitApproval(w, withAuth(req))
 	return w
 }
 
@@ -429,8 +430,9 @@ func TestSubmitApproval_BadUUID(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost,
 		"/v0/stages/not-a-uuid/approvals",
 		strings.NewReader(`{"decision":"approve"}`))
+	req.SetPathValue("stage_id", "not-a-uuid")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleSubmitApproval(w, withAuth(req))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
 	}

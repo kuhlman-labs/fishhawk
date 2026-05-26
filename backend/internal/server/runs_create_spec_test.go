@@ -81,7 +81,7 @@ func TestCreateRun_WorkflowSpec_CreatesStages(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 	}
@@ -135,7 +135,7 @@ func TestCreateRun_WorkflowSpec_PersistsBytesAndMaxRetries(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 	}
@@ -170,7 +170,7 @@ func TestCreateRun_WorkflowSpec_MalformedYAML(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
 	}
@@ -199,7 +199,7 @@ func TestCreateRun_WorkflowSpec_UnknownWorkflowID(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
 	}
@@ -229,7 +229,7 @@ func TestCreateRun_NoWorkflowSpec_LegacyPath(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 	}
@@ -264,7 +264,7 @@ func TestCreateRun_WorkflowSpec_StageCreateFails_Returns500(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
 	}
@@ -364,7 +364,7 @@ func TestCreateRun_GitHubFetch_HappyPath(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
@@ -424,7 +424,7 @@ func TestCreateRun_GitHubFetch_NotInstalled(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
@@ -456,7 +456,7 @@ func TestCreateRun_GitHubFetch_SpecNotFound(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
@@ -485,7 +485,7 @@ func TestCreateRun_InlineSpec_BypassesFetch(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
+	s.handleCreateRun(w, withAuth(req))
 
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())

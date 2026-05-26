@@ -116,7 +116,7 @@ Two audiences with different scopes:
 **Auth posture** (today, v0):
 
 - `fhm_*` mcptokens calling `fishhawk_approve_plan` / `fishhawk_reject_plan` are rejected by the backend's role check (`checkApproverAuthorization`) when `RoleResolver` is wired — the runner's `mcp:run:<id>` subject won't match any team in the gate's approver list.
-- `fhm_*` mcptokens calling the other write tools (`start_run`, `cancel_run`, `retry_stage`) are **not yet** gated on scope at the handler — that enforcement is tracked at [#402](https://github.com/kuhlman-labs/fishhawk/issues/402). Until that lands, the read-only-runner property holds by convention (no production code path in the runner calls write tools) rather than wire enforcement.
+- Scope enforcement is active at the wire level for all write paths. An `fhm_*` mcptoken calling any write tool receives HTTP 403 `insufficient_scope` (implementing [#402](https://github.com/kuhlman-labs/fishhawk/issues/402)).
 
 ## Local-runner mint
 
