@@ -88,6 +88,7 @@ type Token struct {
 	ExpiresAt  time.Time
 	LastUsedAt *time.Time
 	RevokedAt  *time.Time
+	Scopes     []string
 
 	// PlainText is the bearer string the caller hands to the
 	// agent. Set only on Issue's return value; empty for tokens
@@ -114,6 +115,9 @@ type IssueParams struct {
 	// TTL is the lifetime from now until expires_at. Zero defaults
 	// to DefaultTTL.
 	TTL time.Duration
+	// Scopes is the scope set to persist on the token row. Empty
+	// slice defaults to ["mcp:read"] at the repository layer.
+	Scopes []string
 }
 
 // Repository persists tokens.

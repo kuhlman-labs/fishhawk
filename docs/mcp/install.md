@@ -118,6 +118,11 @@ Two audiences with different scopes:
 - `fhm_*` mcptokens calling `fishhawk_approve_plan` / `fishhawk_reject_plan` are rejected by the backend's role check (`checkApproverAuthorization`) when `RoleResolver` is wired — the runner's `mcp:run:<id>` subject won't match any team in the gate's approver list.
 - Scope enforcement is active at the wire level for all write paths. An `fhm_*` mcptoken calling any write tool receives HTTP 403 `insufficient_scope` (implementing [#402](https://github.com/kuhlman-labs/fishhawk/issues/402)).
 
+**Runner-side scopes** (issued by the backend at stage start):
+
+- All mcptokens carry `mcp:read` (baseline; always present).
+- `write:retries` is NOT in the default set and is NOT issued via `fishhawkd token issue`. It is included in the `fhm_*` mcptoken only when the workflow spec sets `executor.agent_self_retry: true` on the executing stage. Operators opt in at the spec level. This scope allows the in-runner agent to call `POST /v0/stages/{id}/retry` (via `fishhawk_retry_stage`) to re-open its own failed stage without operator intervention — subject-bound to the token's run; cross-run retries are rejected with `cross_run_retry`.
+
 ## Local-runner mint
 
 For the local-runner flow ([E22 / #389](https://github.com/kuhlman-labs/fishhawk/issues/389)), the agent inside Claude Code can mint a real, stage-bearing run on the operator's workstation without leaving the chat. The MCP server's `fishhawk_start_run` accepts the same convenience inputs the CLI does:

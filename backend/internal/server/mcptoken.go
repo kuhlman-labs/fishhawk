@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // CategoryMCPTokenIssued is the audit-log category for the new
@@ -97,9 +98,18 @@ func (s *Server) handleIssueMCPToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Determine scopes for the new token. Start with the baseline
+	// mcp:read and add write:retries when the executing stage's
+	// workflow spec sets executor.agent_self_retry: true.
+	scopes := []string{"mcp:read"}
+	if agentSelfRetry := s.resolveAgentSelfRetry(r, runRow); agentSelfRetry {
+		scopes = append(scopes, "write:retries")
+	}
+
 	tok, err := s.cfg.MCPTokenRepo.Issue(r.Context(), mcptoken.IssueParams{
-		RunID: runRow.ID,
-		TTL:   mcptoken.DefaultTTL,
+		RunID:  runRow.ID,
+		TTL:    mcptoken.DefaultTTL,
+		Scopes: scopes,
 	})
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -109,7 +119,7 @@ func (s *Server) handleIssueMCPToken(w http.ResponseWriter, r *http.Request) {
 
 	// Audit entry. Best-effort — a failure here logs but doesn't
 	// unwind the issuance. The plaintext is NEVER in the payload.
-	s.writeMCPTokenIssuedAudit(r, runID, tok)
+	s.writeMCPTokenIssuedAudit(r, runID, tok, scopes)
 
 	s.writeJSON(w, r, http.StatusCreated, mcpTokenResponse{
 		Token:     tok.PlainText,
@@ -171,7 +181,7 @@ func (s *Server) verifyMCPTokenSignature(w http.ResponseWriter, r *http.Request,
 	return true
 }
 
-func (s *Server) writeMCPTokenIssuedAudit(r *http.Request, runID uuid.UUID, tok *mcptoken.Token) {
+func (s *Server) writeMCPTokenIssuedAudit(r *http.Request, runID uuid.UUID, tok *mcptoken.Token, scopes []string) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}
@@ -183,6 +193,7 @@ func (s *Server) writeMCPTokenIssuedAudit(r *http.Request, runID uuid.UUID, tok 
 		"ttl_seconds":  int(time.Until(tok.ExpiresAt).Seconds()),
 		"run_id":       runID.String(),
 		"token_prefix": mcptoken.TokenPrefix, // not the plaintext — just identifies the kind
+		"scopes":       scopes,
 	})
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
@@ -198,4 +209,45 @@ func (s *Server) writeMCPTokenIssuedAudit(r *http.Request, runID uuid.UUID, tok 
 			slog.String("token_id", tok.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// resolveAgentSelfRetry looks up the active stage for runRow and
+// checks whether executor.agent_self_retry is true in the workflow
+// spec. Returns false on any error (nil spec, missing stage, parse
+// failure) — the token is issued with baseline mcp:read scopes.
+func (s *Server) resolveAgentSelfRetry(r *http.Request, runRow *run.Run) bool {
+	if len(runRow.WorkflowSpec) == 0 || s.cfg.RunRepo == nil {
+		return false
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), runRow.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"list stages for mcp token scopes failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	var activeStage *run.Stage
+	for _, st := range stages {
+		if st.State == run.StageStateDispatched || st.State == run.StageStateRunning {
+			activeStage = st
+			break
+		}
+	}
+	if activeStage == nil {
+		return false
+	}
+	parsed, parseErr := spec.ParseBytes(runRow.WorkflowSpec)
+	if parseErr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"parse workflow spec for mcp token scopes failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", parseErr.Error()))
+		return false
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok || activeStage.Sequence < 1 || activeStage.Sequence > len(wf.Stages) {
+		return false
+	}
+	return wf.Stages[activeStage.Sequence-1].Executor.AgentSelfRetry
 }

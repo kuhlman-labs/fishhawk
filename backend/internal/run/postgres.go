@@ -397,20 +397,14 @@ func (r *postgresRepo) RetryStage(ctx context.Context, id uuid.UUID, to StageSta
 			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(to)}
 		}
 
-		// Clear failure metadata + ended_at by passing nil pointers
-		// and an invalid timestamptz — sqlc's UpdateStageState
-		// writes them through.
-		params := rundb.UpdateStageStateParams{
-			ID:              id,
-			State:           string(to),
-			FailureCategory: nil,
-			FailureReason:   nil,
-			EndedAt:         pgtype.Timestamptz{Valid: false},
-		}
-
-		updated, err := q.UpdateStageState(ctx, params)
+		// RetryStageState atomically clears failure_category,
+		// failure_reason, ended_at and increments self_retry_count.
+		updated, err := q.RetryStageState(ctx, rundb.RetryStageStateParams{
+			ID:    id,
+			State: string(to),
+		})
 		if err != nil {
-			return fmt.Errorf("update stage state: %w", err)
+			return fmt.Errorf("retry stage state: %w", err)
 		}
 		result = rowToStage(updated)
 		return nil
@@ -481,6 +475,7 @@ func rowToStage(s rundb.Stage) *Stage {
 		FailureReason:    s.FailureReason,
 		GateSLA:          s.GateSla,
 		RequiresApproval: s.RequiresApproval,
+		SelfRetryCount:   int(s.SelfRetryCount),
 		CreatedAt:        s.CreatedAt.Time,
 		UpdatedAt:        s.UpdatedAt.Time,
 	}

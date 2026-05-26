@@ -3,8 +3,10 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,9 +52,19 @@ const CategoryStageRetried = "stage_retried"
 // the audit row is in place, the stage is in pending, an operator
 // can re-fire Advance manually if needed.
 func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWriteScope(w, r, "write:stages") {
+	id := IdentityFrom(r.Context())
+	if id.IsAnonymous() {
+		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
+			"an authenticated token is required", nil)
 		return
 	}
+	if id.TokenID != "" && !hasScope(id, "write:stages") && !hasScope(id, "write:retries") {
+		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+			"token is missing required scope: write:stages or write:retries",
+			map[string]any{"required_scope": "write:stages or write:retries"})
+		return
+	}
+
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "retry_unconfigured",
 			"retry endpoint requires run + audit repositories", nil)
@@ -65,6 +77,41 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 			"stage_id must be a valid UUID",
 			map[string]any{"field": "stage_id", "got": r.PathValue("stage_id")})
 		return
+	}
+
+	// Pre-fetch the stage to get the RunID for subject-binding guard.
+	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "stage_not_found",
+				"no stage with that id", nil)
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Subject-binding guard: MCP tokens may only retry stages within
+	// their own run. Subject format is "mcp:run:<uuid>" (set by
+	// bearerAuth middleware at middleware.go).
+	if strings.HasPrefix(id.Subject, "mcp:run:") {
+		runIDStr := strings.TrimPrefix(id.Subject, "mcp:run:")
+		subjectRunID, parseErr := uuid.Parse(runIDStr)
+		if parseErr != nil {
+			s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
+				"mcp token subject is malformed", nil)
+			return
+		}
+		if subjectRunID != stage.RunID {
+			s.writeError(w, r, http.StatusForbidden, "cross_run_retry",
+				"mcp token may only retry stages within its own run",
+				map[string]any{
+					"token_run_id": subjectRunID.String(),
+					"stage_run_id": stage.RunID.String(),
+				})
+			return
+		}
 	}
 
 	dec, err := run.RetryStage(r.Context(), s.cfg.RunRepo, stageID)
@@ -90,10 +137,23 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Best-effort fetch run for budget info in the audit receipt.
+	// A failure here is logged and the audit receipt omits the budget
+	// fields rather than failing the request.
+	var runRow *run.Run
+	if fetched, fetchErr := s.cfg.RunRepo.GetRun(r.Context(), dec.Stage.RunID); fetchErr == nil {
+		runRow = fetched
+	} else {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"get run for retry receipt failed",
+			slog.String("run_id", dec.Stage.RunID.String()),
+			slog.String("error", fetchErr.Error()))
+	}
+
 	// Audit first so the retry intent is recorded even if the
 	// orchestrator handoff below fails. Same posture as the
 	// approvals handler (E7.4 / approvals.go).
-	s.writeRetryAudit(r, dec)
+	s.writeRetryAudit(r, dec, runRow)
 
 	// A/C retries land the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire
@@ -129,10 +189,10 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeRetryAudit appends a stage_retried entry capturing the
-// prior failure category + reason, plus the actor that triggered
-// the retry. Best-effort — the transition is already committed,
-// so a failure here logs but doesn't unwind.
-func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision) {
+// prior failure category + reason, the retry receipt fields, and
+// the actor that triggered the retry. Best-effort — the transition
+// is already committed, so a failure here logs but doesn't unwind.
+func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow *run.Run) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -140,11 +200,29 @@ func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision) {
 	}
 	actorKind := audit.ActorUser
 
-	payload, _ := json.Marshal(map[string]any{
-		"stage_id":       dec.Stage.ID.String(),
-		"prior_category": string(dec.PriorCategory),
-		"prior_reason":   dec.PriorReason,
-	})
+	ordinal := dec.Stage.SelfRetryCount
+
+	fields := map[string]any{
+		"stage_id":            dec.Stage.ID.String(),
+		"prior_category":      string(dec.PriorCategory),
+		"prior_reason":        dec.PriorReason,
+		"prior_failure_class": dec.PriorCategory.Description(),
+		"retry_ordinal":       ordinal,
+		"admissibility_reason": fmt.Sprintf("category %s (%s); retry %d; via %s",
+			string(dec.PriorCategory),
+			dec.PriorCategory.Description(),
+			ordinal,
+			scopeUsed(id)),
+	}
+	if runRow != nil {
+		remaining := runRow.MaxRetriesSnapshot - ordinal
+		if remaining < 0 {
+			remaining = 0
+		}
+		fields["remaining_budget"] = remaining
+	}
+
+	payload, _ := json.Marshal(fields)
 
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        dec.Stage.RunID,
@@ -161,4 +239,16 @@ func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision) {
 			"error", err.Error(),
 		)
 	}
+}
+
+// scopeUsed returns the scope string that authorized the retry for
+// inclusion in the admissibility_reason receipt field.
+func scopeUsed(id Identity) string {
+	if hasScope(id, "write:retries") {
+		return "write:retries"
+	}
+	if hasScope(id, "write:stages") {
+		return "write:stages"
+	}
+	return "session"
 }
