@@ -998,15 +998,41 @@ func validatePlan(path string) (agent.Event, error) {
 			Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "missing", "path": path, "error": err.Error()}),
 		}, fmt.Errorf("plan: read %s: %w", path, err)
 	}
+
+	// Attempt structural coercion (#537) for the known string-elision
+	// failure class — when the agent emits a bare string where the schema
+	// requires an object at /generated_by, /scope/files[], or
+	// /decomposition/sub_plans[]. TryCoerce returns the coerced bytes when
+	// it could fix the plan; the file is rewritten so the subsequent
+	// uploadPlan reads the corrected payload and the backend sees a clean
+	// (already-validated) artifact. The backend's mirror coercion is a
+	// belt-and-suspenders fallback for cases where this runner skips coercion
+	// (older binary, future code path).
+	coercedBytes, coercions, coerceErr := plan.TryCoerce(data, time.Now().UTC())
+	if coerceErr == nil && len(coercions) > 0 {
+		if err := os.WriteFile(path, coercedBytes, 0o600); err != nil {
+			return agent.Event{
+				Kind:    "policy_event",
+				Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "coerce_write_failed", "path": path, "error": err.Error()}),
+			}, fmt.Errorf("plan: write coerced %s: %w", path, err)
+		}
+		data = coercedBytes
+	}
+
 	if vErr := plan.Validate(data); vErr != nil {
 		return agent.Event{
 			Kind:    "policy_event",
 			Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "invalid", "path": path, "error": vErr.Error()}),
 		}, vErr
 	}
+
+	outcomePayload := map[string]string{"check": "plan_validation", "outcome": "valid", "path": path}
+	if len(coercions) > 0 {
+		outcomePayload["coerced"] = fmt.Sprintf("%d field(s)", len(coercions))
+	}
 	return agent.Event{
 		Kind:    "policy_event",
-		Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "valid", "path": path}),
+		Payload: agent.MakePayload(outcomePayload),
 	}, nil
 }
 

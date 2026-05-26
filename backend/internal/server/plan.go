@@ -129,35 +129,65 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate payload against standard_v1. Schema errors are 400 so
-	// the runner maps them to category-B (constraint failure) rather
-	// than retrying — the agent's output is bad and re-shipping the
-	// same bytes won't help.
+	// Validate payload against standard_v1. For the known string-elision
+	// class of schema violations, attempt coercion before returning 400.
+	// For all other errors, category-B maps the failure so the runner
+	// doesn't retry — the agent's output is bad and re-shipping won't help.
 	if err := plan.Validate(body); err != nil {
-		// Transition the plan stage to failed-B so the run reflects
-		// the bad output rather than getting stuck in `running` (#527).
-		// The trace handler defers plan-stage transitions to this
-		// handler; we are the only place that knows plan validation
-		// failed. Best-effort: a TransitionStage error logs but
-		// doesn't change the upload response — the operator's signal
-		// is the 400, not the audit row.
-		cat := run.FailureB
-		reason := "plan_invalid: " + err.Error()
-		if _, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
-			run.StageStateFailed, &run.StageCompletion{
-				FailureCategory: &cat,
-				FailureReason:   &reason,
-			}); terr != nil {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-				"plan upload: transition to failed-B after validation error failed",
-				slog.String("run_id", runID.String()),
-				slog.String("stage_id", stageID.String()),
-				slog.String("error", terr.Error()))
+		coercionOK := false
+		var schemaErr *plan.SchemaError
+		if errors.As(err, &schemaErr) {
+			coercedBytes, coercions, coerceErr := plan.TryCoerce(body, time.Now().UTC())
+			if coerceErr == nil && len(coercions) > 0 {
+				// Coercion produced a valid plan. Record it before
+				// artifact storage so a spike in plan_coerced entries
+				// is visible as a prompt-quality signal.
+				coercionPayload, _ := json.Marshal(map[string]any{
+					"run_id":    runID.String(),
+					"stage_id":  stageID.String(),
+					"coercions": coercions,
+				})
+				systemKind := audit.ActorKind("system")
+				if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+					RunID:     runID,
+					StageID:   &stageID,
+					Timestamp: time.Now().UTC(),
+					Category:  "plan_coerced",
+					ActorKind: &systemKind,
+					Payload:   coercionPayload,
+				}); aerr != nil {
+					s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+						"append coercion audit entry failed", map[string]any{"error": aerr.Error()})
+					return
+				}
+				body = coercedBytes
+				coercionOK = true
+			}
 		}
-		s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
-			"plan does not validate against standard_v1",
-			map[string]any{"error": err.Error()})
-		return
+		if !coercionOK {
+			// Coercion could not help (non-string type or re-validation
+			// still fails). Transition the stage to failed-B so the run
+			// reflects the bad output rather than getting stuck in
+			// `running` (#527). Best-effort: a TransitionStage error
+			// logs but doesn't change the upload response.
+			cat := run.FailureB
+			reason := "plan_invalid: " + err.Error()
+			if _, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
+				run.StageStateFailed, &run.StageCompletion{
+					FailureCategory: &cat,
+					FailureReason:   &reason,
+				}); terr != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"plan upload: transition to failed-B after validation error failed",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", terr.Error()))
+			}
+			s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
+				"plan does not validate against standard_v1",
+				map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	contentHash := sha256Hex(body)

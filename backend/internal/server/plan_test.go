@@ -138,6 +138,79 @@ func TestShipPlan_Idempotent_SecondUploadReturnsExisting(t *testing.T) {
 	}
 }
 
+func TestShipPlan_CoercibleSchemaError_Returns201(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	// Build a plan where generated_by is a bare string (coercible schema error).
+	m := planfixture.Valid()
+	m["generated_by"] = "my-agent"
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (coercion should succeed):\n%s", w.Code, w.Body.String())
+	}
+
+	// Coerced plan should still produce an artifact row.
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+
+	// Two audit entries: plan_coerced then plan_generated.
+	if len(au.appended) != 2 {
+		t.Fatalf("audit entries = %d, want 2 (plan_coerced + plan_generated)", len(au.appended))
+	}
+	if got := au.appended[0].Category; got != "plan_coerced" {
+		t.Errorf("audit[0].category = %q, want plan_coerced", got)
+	}
+	if got := au.appended[1].Category; got != "plan_generated" {
+		t.Errorf("audit[1].category = %q, want plan_generated", got)
+	}
+
+	// Coerced plans must NOT transition to failed-B.
+	if len(rr.transitionStageCalls) != 0 {
+		t.Errorf("transitionStage calls = %d, want 0 (coercion succeeded)", len(rr.transitionStageCalls))
+	}
+}
+
+func TestShipPlan_NonCoercibleSchemaError_400(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, rr := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	// Build a plan where scope.files[0] is an integer — not coercible.
+	m := planfixture.Valid()
+	scope := m["scope"].(map[string]any)
+	scope["files"] = []any{42}
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 on non-coercible schema fail", len(ar.all))
+	}
+
+	// Non-coercible failures must still transition to failed-B.
+	if len(rr.transitionStageCalls) != 1 {
+		t.Fatalf("transitionStage calls = %d, want 1", len(rr.transitionStageCalls))
+	}
+	call := rr.transitionStageCalls[0]
+	if call.Completion == nil || call.Completion.FailureCategory == nil ||
+		*call.Completion.FailureCategory != run.FailureB {
+		t.Errorf("FailureCategory = %v, want B", call.Completion.FailureCategory)
+	}
+}
+
 func TestShipPlan_SchemaInvalid_400(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, _, rr := newPlanServer(t, runID, stageID)

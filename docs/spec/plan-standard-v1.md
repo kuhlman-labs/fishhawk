@@ -220,6 +220,39 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 
 These cross-references aren't expressible in JSON Schema cleanly.
 
+### Server-side coercion
+
+The backend applies a narrow set of coercions when an agent emits a bare string where the schema expects an object — a class of elision errors seen when agents omit wrapper keys. Coercion fires only after schema validation fails with a `*SchemaError`; `*ParseError` and semantic errors bypass it entirely.
+
+**Covered paths and default shapes:**
+
+| Path | Coerced to |
+|---|---|
+| `/generated_by` (bare string `s`) | `{"agent": s, "model": "unknown", "timestamp": "<upload-time>"}` |
+| `/scope/files[i]` (bare string `s`) | `{"path": s, "operation": "modify"}` |
+| `/decomposition/sub_plans[i]` (bare string `s`) | `{"title": s, "scope_hint": "", "predicted_runtime_minutes": 1, "predicted_runtime_confidence": "low"}` |
+
+After coercions are applied, the plan is re-validated against the full schema. If it passes, the coerced bytes are stored as the artifact (not the agent's original bytes) and a `plan_coerced` audit entry is appended with:
+
+```json
+{
+  "run_id": "...",
+  "stage_id": "...",
+  "coercions": [
+    {
+      "field_path": "/generated_by",
+      "original_type": "string",
+      "original_value": "claude-code",
+      "coerced_to": { "agent": "claude-code", "model": "unknown", "timestamp": "2026-05-26T12:00:00Z" }
+    }
+  ]
+}
+```
+
+If re-validation still fails (e.g., the plan has a non-string type at a coercible location, or other schema violations persist), the upload returns 400 and the stage transitions to failed-B as normal.
+
+**Rationale and compliance.** Coercion is a robustness mechanism, not a way to hide bad agent output. A spike in `plan_coerced` audit entries is a prompt-quality signal: the plan-stage prompt is not instructing the agent to emit the correct wrapper structure. Operators should treat rising `plan_coerced` rates as a cue to improve the prompt, not as an acceptable steady state. The coerced artifact is stored verbatim so the audit log reflects what was actually persisted.
+
 ## Persistence
 
 Per `MVP_SPEC.md` §4.3:
