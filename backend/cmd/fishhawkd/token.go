@@ -21,6 +21,17 @@ var operatorDefaultScopes = []string{
 	"read:runs", "read:audit", "write:runs", "write:approvals", "write:stages",
 }
 
+// mcpCapabilityScopes lists the optional scopes that can be granted
+// to mcp tokens beyond the baseline "mcp:read". These are NOT in
+// the operator default set and are NOT issued via `fishhawkd token issue`.
+// They are granted by the backend at mcptoken issuance time (POST
+// /v0/runs/{id}/mcp-token) based on the workflow spec's executor
+// config — specifically, write:retries is included only when
+// executor.agent_self_retry: true is set on the executing stage.
+var mcpCapabilityScopes = []string{
+	"write:retries",
+}
+
 // runToken dispatches the `token` subcommand. v0 has one operation
 // — issue — for bootstrapping the first API token before OAuth
 // (E4.2) is wired. The CLI talks to the database directly rather

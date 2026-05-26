@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -241,4 +242,134 @@ func TestRetryStage_UnconfiguredReturns503(t *testing.T) {
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
 	}
+}
+
+// withMCPRetryAuth injects an MCP identity with write:retries scope
+// bound to runID into req's context.
+func withMCPRetryAuth(req *http.Request, runID uuid.UUID) *http.Request {
+	id := Identity{
+		Subject: "mcp:run:" + runID.String(),
+		TokenID: "tok-test",
+		Scopes:  []string{"mcp:read", "write:retries"},
+	}
+	return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+}
+
+func postRetryMCP(t *testing.T, s *Server, stageID, runID uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+	url := "/v0/stages/" + stageID.String() + "/retry"
+	req := httptest.NewRequest(http.MethodPost, url, nil)
+	req.SetPathValue("stage_id", stageID.String())
+	w := httptest.NewRecorder()
+	s.handleRetryStage(w, withMCPRetryAuth(req, runID))
+	return w
+}
+
+// --- Subject-binding guard ---
+
+func TestRetryStage_MCPTokenMatchingRunAllowed(t *testing.T) {
+	s, repo, au := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureA, "agent crashed")
+
+	w := postRetryMCP(t, s, stage.ID, stage.RunID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageRetried {
+		t.Errorf("expected one stage_retried audit entry, got %+v", au.appended)
+	}
+}
+
+func TestRetryStage_MCPTokenMismatchedRunReturns403(t *testing.T) {
+	s, repo, _ := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureA, "agent crashed")
+	otherRunID := uuid.New() // does not match stage.RunID
+
+	w := postRetryMCP(t, s, stage.ID, otherRunID)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "cross_run_retry") {
+		t.Errorf("body missing cross_run_retry code: %s", w.Body.String())
+	}
+}
+
+func TestRetryStage_MCPTokenMalformedSubjectReturns401(t *testing.T) {
+	s, repo, _ := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureA, "agent crashed")
+
+	// Inject an MCP identity with a malformed subject (no valid UUID suffix).
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/"+stage.ID.String()+"/retry", nil)
+	req.SetPathValue("stage_id", stage.ID.String())
+	badID := Identity{
+		Subject: "mcp:run:not-a-uuid",
+		TokenID: "tok-test",
+		Scopes:  []string{"mcp:read", "write:retries"},
+	}
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, badID))
+	w := httptest.NewRecorder()
+	s.handleRetryStage(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+// --- Category filter with write:retries scope ---
+
+func TestRetryStage_WriteRetriesScope_BReturns422(t *testing.T) {
+	s, repo, _ := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureB, "forbidden_paths violated")
+
+	w := postRetryMCP(t, s, stage.ID, stage.RunID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", w.Code)
+	}
+}
+
+func TestRetryStage_WriteRetriesScope_DRejectedReturns422(t *testing.T) {
+	s, repo, _ := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureD, "gate rejected by approver")
+
+	w := postRetryMCP(t, s, stage.ID, stage.RunID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", w.Code)
+	}
+}
+
+// --- Receipt shape ---
+
+func TestRetryStage_AuditReceiptShape(t *testing.T) {
+	s, repo, au := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureA, "agent crashed: SIGSEGV")
+
+	w := postRetry(t, s, stage.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	for _, key := range []string{"prior_failure_class", "retry_ordinal", "admissibility_reason"} {
+		if _, ok := payload[key]; !ok {
+			t.Errorf("audit payload missing key %q; got keys: %v", key, payloadKeys(payload))
+		}
+	}
+}
+
+func payloadKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

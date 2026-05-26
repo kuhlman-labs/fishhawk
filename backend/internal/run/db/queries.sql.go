@@ -95,7 +95,7 @@ INSERT INTO stages (
     gate_type, gate_approvers
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count
 `
 
 type CreateStageParams struct {
@@ -145,6 +145,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 		&i.RequiresApproval,
 		&i.GateType,
 		&i.GateApprovers,
+		&i.SelfRetryCount,
 	)
 	return i, err
 }
@@ -224,7 +225,7 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 }
 
 const getStage = `-- name: GetStage :one
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages WHERE id = $1
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages WHERE id = $1
 `
 
 func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
@@ -248,6 +249,7 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 		&i.RequiresApproval,
 		&i.GateType,
 		&i.GateApprovers,
+		&i.SelfRetryCount,
 	)
 	return i, err
 }
@@ -337,7 +339,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 }
 
 const listStagesAwaitingApproval = `-- name: ListStagesAwaitingApproval :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
  WHERE state = 'awaiting_approval'
    AND gate_sla IS NOT NULL
  ORDER BY updated_at ASC
@@ -376,6 +378,7 @@ func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, erro
 			&i.RequiresApproval,
 			&i.GateType,
 			&i.GateApprovers,
+			&i.SelfRetryCount,
 		); err != nil {
 			return nil, err
 		}
@@ -388,7 +391,7 @@ func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, erro
 }
 
 const listStagesDispatched = `-- name: ListStagesDispatched :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
  WHERE state = 'dispatched'
  ORDER BY updated_at ASC
 `
@@ -425,6 +428,7 @@ func (q *Queries) ListStagesDispatched(ctx context.Context) ([]Stage, error) {
 			&i.RequiresApproval,
 			&i.GateType,
 			&i.GateApprovers,
+			&i.SelfRetryCount,
 		); err != nil {
 			return nil, err
 		}
@@ -437,7 +441,7 @@ func (q *Queries) ListStagesDispatched(ctx context.Context) ([]Stage, error) {
 }
 
 const listStagesForRun = `-- name: ListStagesForRun :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages WHERE run_id = $1 ORDER BY sequence ASC
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages WHERE run_id = $1 ORDER BY sequence ASC
 `
 
 func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stage, error) {
@@ -467,6 +471,7 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 			&i.RequiresApproval,
 			&i.GateType,
 			&i.GateApprovers,
+			&i.SelfRetryCount,
 		); err != nil {
 			return nil, err
 		}
@@ -511,7 +516,7 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 }
 
 const lockStageForUpdate = `-- name: LockStageForUpdate :one
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages WHERE id = $1 FOR UPDATE
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, error) {
@@ -535,12 +540,13 @@ func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, 
 		&i.RequiresApproval,
 		&i.GateType,
 		&i.GateApprovers,
+		&i.SelfRetryCount,
 	)
 	return i, err
 }
 
 const listStagesAwaitingChildren = `-- name: ListStagesAwaitingChildren :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
  WHERE state = 'awaiting_children'
  ORDER BY updated_at ASC
 `
@@ -575,6 +581,7 @@ func (q *Queries) ListStagesAwaitingChildren(ctx context.Context) ([]Stage, erro
 			&i.RequiresApproval,
 			&i.GateType,
 			&i.GateApprovers,
+			&i.SelfRetryCount,
 		); err != nil {
 			return nil, err
 		}
@@ -678,7 +685,7 @@ UPDATE stages
        failure_category = $5,
        failure_reason   = $6
  WHERE id = $1
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count
 `
 
 type UpdateStageStateParams struct {
@@ -718,6 +725,52 @@ func (q *Queries) UpdateStageState(ctx context.Context, arg UpdateStageStatePara
 		&i.RequiresApproval,
 		&i.GateType,
 		&i.GateApprovers,
+		&i.SelfRetryCount,
+	)
+	return i, err
+}
+
+const retryStageState = `-- name: RetryStageState :one
+UPDATE stages
+   SET state            = $2,
+       failure_category = NULL,
+       failure_reason   = NULL,
+       ended_at         = NULL,
+       self_retry_count = self_retry_count + 1
+ WHERE id = $1
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count
+`
+
+type RetryStageStateParams struct {
+	ID    uuid.UUID `json:"id"`
+	State string    `json:"state"`
+}
+
+// Clears failure metadata + ended_at and increments self_retry_count
+// atomically. Used by the retry handler's explicit out-of-terminal
+// transition path so retry_ordinal is always consistent.
+func (q *Queries) RetryStageState(ctx context.Context, arg RetryStageStateParams) (Stage, error) {
+	row := q.db.QueryRow(ctx, retryStageState, arg.ID, arg.State)
+	var i Stage
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Sequence,
+		&i.StageType,
+		&i.ExecutorKind,
+		&i.ExecutorRef,
+		&i.State,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.FailureCategory,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.GateSla,
+		&i.RequiresApproval,
+		&i.GateType,
+		&i.GateApprovers,
+		&i.SelfRetryCount,
 	)
 	return i, err
 }

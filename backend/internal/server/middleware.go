@@ -248,10 +248,7 @@ func bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, s
 								// "service:<name>" convention.
 								Subject: "mcp:run:" + rec.RunID.String(),
 								TokenID: rec.ID.String(),
-								// All MCP tokens carry one
-								// informational scope. Future per-
-								// endpoint enforcement reads this.
-								Scopes: []string{"mcp:read"},
+								Scopes:  append([]string(nil), rec.Scopes...),
 							}
 						}
 					case tokens != nil:

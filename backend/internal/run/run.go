@@ -337,6 +337,13 @@ type Stage struct {
 	// (#213).
 	Gate *Gate
 
+	// SelfRetryCount tracks how many times this stage has been
+	// retried by an agent via POST /v0/stages/{id}/retry with the
+	// write:retries scope. Incremented atomically by RetryStageState
+	// on each retry; 0 means the stage has not been agent-retried.
+	// Used as retry_ordinal in the stage_retried audit receipt.
+	SelfRetryCount int
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

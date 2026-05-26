@@ -61,6 +61,7 @@ type McpToken struct {
 	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
+	Scopes     []string           `json:"scopes"`
 }
 
 type Run struct {
@@ -122,6 +123,7 @@ type Stage struct {
 	RequiresApproval bool               `json:"requires_approval"`
 	GateType         *string            `json:"gate_type"`
 	GateApprovers    []byte             `json:"gate_approvers"`
+	SelfRetryCount   int32              `json:"self_retry_count"`
 }
 
 type StageCheck struct {

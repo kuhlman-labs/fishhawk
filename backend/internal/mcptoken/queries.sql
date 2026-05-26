@@ -2,8 +2,8 @@
 -- ./db per backend/sqlc.yaml.
 
 -- name: CreateMCPToken :one
-INSERT INTO mcp_tokens (id, run_id, token_hash, expires_at)
-VALUES ($1, $2, $3, $4)
+INSERT INTO mcp_tokens (id, run_id, token_hash, expires_at, scopes)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
 -- name: GetMCPTokenByHash :one

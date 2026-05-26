@@ -114,3 +114,16 @@ UPDATE stages
        failure_reason   = $6
  WHERE id = $1
 RETURNING *;
+
+-- name: RetryStageState :one
+-- Clears failure metadata + ended_at and increments self_retry_count
+-- atomically. Used by the retry handler's explicit out-of-terminal
+-- transition path so retry_ordinal is always consistent.
+UPDATE stages
+   SET state            = $2,
+       failure_category = NULL,
+       failure_reason   = NULL,
+       ended_at         = NULL,
+       self_retry_count = self_retry_count + 1
+ WHERE id = $1
+RETURNING *;

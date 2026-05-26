@@ -14,9 +14,9 @@ import (
 
 const createMCPToken = `-- name: CreateMCPToken :one
 
-INSERT INTO mcp_tokens (id, run_id, token_hash, expires_at)
-VALUES ($1, $2, $3, $4)
-RETURNING id, run_id, token_hash, issued_at, expires_at, last_used_at, revoked_at
+INSERT INTO mcp_tokens (id, run_id, token_hash, expires_at, scopes)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, run_id, token_hash, issued_at, expires_at, last_used_at, revoked_at, scopes
 `
 
 type CreateMCPTokenParams struct {
@@ -24,6 +24,7 @@ type CreateMCPTokenParams struct {
 	RunID     uuid.UUID          `json:"run_id"`
 	TokenHash string             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	Scopes    []string           `json:"scopes"`
 }
 
 // MCP token queries (E19.8 / #348). sqlc generates typed Go into
@@ -34,6 +35,7 @@ func (q *Queries) CreateMCPToken(ctx context.Context, arg CreateMCPTokenParams) 
 		arg.RunID,
 		arg.TokenHash,
 		arg.ExpiresAt,
+		arg.Scopes,
 	)
 	var i McpToken
 	err := row.Scan(
@@ -44,12 +46,13 @@ func (q *Queries) CreateMCPToken(ctx context.Context, arg CreateMCPTokenParams) 
 		&i.ExpiresAt,
 		&i.LastUsedAt,
 		&i.RevokedAt,
+		&i.Scopes,
 	)
 	return i, err
 }
 
 const getMCPTokenByHash = `-- name: GetMCPTokenByHash :one
-SELECT id, run_id, token_hash, issued_at, expires_at, last_used_at, revoked_at FROM mcp_tokens
+SELECT id, run_id, token_hash, issued_at, expires_at, last_used_at, revoked_at, scopes FROM mcp_tokens
  WHERE token_hash = $1
    AND revoked_at IS NULL
 `
@@ -68,12 +71,13 @@ func (q *Queries) GetMCPTokenByHash(ctx context.Context, tokenHash string) (McpT
 		&i.ExpiresAt,
 		&i.LastUsedAt,
 		&i.RevokedAt,
+		&i.Scopes,
 	)
 	return i, err
 }
 
 const getMCPTokenByID = `-- name: GetMCPTokenByID :one
-SELECT id, run_id, token_hash, issued_at, expires_at, last_used_at, revoked_at FROM mcp_tokens
+SELECT id, run_id, token_hash, issued_at, expires_at, last_used_at, revoked_at, scopes FROM mcp_tokens
  WHERE id = $1
 `
 
@@ -90,6 +94,7 @@ func (q *Queries) GetMCPTokenByID(ctx context.Context, id uuid.UUID) (McpToken, 
 		&i.ExpiresAt,
 		&i.LastUsedAt,
 		&i.RevokedAt,
+		&i.Scopes,
 	)
 	return i, err
 }
@@ -98,7 +103,7 @@ const revokeMCPToken = `-- name: RevokeMCPToken :one
 UPDATE mcp_tokens
    SET revoked_at = COALESCE(revoked_at, $2)
  WHERE id = $1
-RETURNING id, run_id, token_hash, issued_at, expires_at, last_used_at, revoked_at
+RETURNING id, run_id, token_hash, issued_at, expires_at, last_used_at, revoked_at, scopes
 `
 
 type RevokeMCPTokenParams struct {
@@ -119,6 +124,7 @@ func (q *Queries) RevokeMCPToken(ctx context.Context, arg RevokeMCPTokenParams) 
 		&i.ExpiresAt,
 		&i.LastUsedAt,
 		&i.RevokedAt,
+		&i.Scopes,
 	)
 	return i, err
 }

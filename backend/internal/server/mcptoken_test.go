@@ -393,6 +393,7 @@ func TestBearerAuth_MCPTokenRoutesToMCPAuthenticator(t *testing.T) {
 			ID:        uuid.New(),
 			RunID:     runID,
 			ExpiresAt: time.Now().UTC().Add(time.Hour),
+			Scopes:    []string{"mcp:read"},
 		},
 	}
 

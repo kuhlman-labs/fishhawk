@@ -46,6 +46,10 @@ func (r *postgresRepo) Issue(ctx context.Context, p IssueParams) (*Token, error)
 		return nil, err
 	}
 
+	scopes := p.Scopes
+	if len(scopes) == 0 {
+		scopes = []string{"mcp:read"}
+	}
 	expiresAt := r.now().Add(ttl)
 	q := tokendb.New(r.pool)
 	row, err := q.CreateMCPToken(ctx, tokendb.CreateMCPTokenParams{
@@ -53,6 +57,7 @@ func (r *postgresRepo) Issue(ctx context.Context, p IssueParams) (*Token, error)
 		RunID:     p.RunID,
 		TokenHash: hash,
 		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
+		Scopes:    scopes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("mcptoken: create: %w", err)
@@ -137,8 +142,9 @@ func (r *postgresRepo) GetByID(ctx context.Context, id uuid.UUID) (*Token, error
 
 func rowToToken(r tokendb.McpToken) *Token {
 	out := &Token{
-		ID:    r.ID,
-		RunID: r.RunID,
+		ID:     r.ID,
+		RunID:  r.RunID,
+		Scopes: append([]string(nil), r.Scopes...),
 	}
 	if r.IssuedAt.Valid {
 		out.IssuedAt = r.IssuedAt.Time
