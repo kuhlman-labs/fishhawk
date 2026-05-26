@@ -35,11 +35,12 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
 - id: plan
   type: plan | implement | review # closed set; no custom types
   executor: # exactly one of agent or human
-    agent: claude-code # any string; v0 ships claude-code
-    timeout: 10m       # optional; stage-level override for agent timeout
-    verify:            # optional; in-band test gate (see ### Verify gate)
+    agent: claude-code        # any string; v0 ships claude-code
+    timeout: 10m              # optional; stage-level override for agent timeout
+    verify:                   # optional; in-band test gate (see ### Verify gate)
       command: 'scripts/test'
       timeout: '10m'
+    agent_self_retry: false   # optional; opt-in per ADR-023 (see ### Agent self-retry)
     # OR
     human: true
   inputs: [<input>...] # optional
@@ -68,6 +69,19 @@ The runner captures combined stdout+stderr into a `verify_run` bundle event so o
 The gate fires only when the agent itself succeeded (i.e., `res.OK` is true) — a failing agent already produces a category-A trace, and re-running the tests against a broken working tree would be misleading.
 
 The full wiring path from spec to runner is deferred: v0 ships `verify` as a documented spec field for authoring surface. The runner reads the gate command from the `--verify-cmd` CLI flag; a follow-up issue will wire the backend to read `executor.verify.command` from the cached spec and deliver it to the runner via the prompt-fetch response.
+
+### Agent self-retry
+
+An opt-in boolean (default `false`, per ADR-023) that enables the agent to perform one self-initiated retry when it detects a recoverable failure, before the workflow's `on_ci_failure` policy kicks in.
+
+```yaml
+executor:
+  agent: claude-code
+  agent_self_retry: true  # opt in; default false
+```
+
+- **Only valid on agent-executed stages.** Declaring `agent_self_retry` on a `human: true` executor is a schema error — the field lives in the agent branch of the executor `oneOf`, so `unevaluatedProperties: false` rejects it on the human branch.
+- **Backend plumbing and runner detection** are handled by separate follow-up tickets. This field documents the authoring surface and is parsed by both the backend and CLI validators; runner behavior is not yet wired.
 
 ## Inputs
 
@@ -238,6 +252,7 @@ Per-workflow auto-retry policy (#276 / E16). When a required CI check fails on t
 | Member refs                 | `^@[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$`                                    | GitHub user or team                                                                                 |
 | Stage `type`                | `plan` \| `implement` \| `review`                                            | closed set                                                                                          |
 | Executor                    | `agent: <string>` xor `human: true`                                          | mutually exclusive                                                                                  |
+| `executor.agent_self_retry` | `true` \| `false` (default `false`)                                          | agent branch only; schema error on human executor                                                   |
 | Input `source`              | `github_issue` \| `pull_request`                                             | v0; v0.x adds Linear/Jira                                                                           |
 | Artifact                    | `plan` \| `pull_request`                                                     | closed set                                                                                          |
 | Persistence target          | `originating_issue` \| `fishhawk_audit_log`                                  | closed set                                                                                          |
