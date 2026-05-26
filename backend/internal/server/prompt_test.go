@@ -21,13 +21,20 @@ import (
 // promptRunRepo is a run.Repository fake that supports GetStage +
 // GetRun. Other methods panic to make accidental calls loud.
 type promptRunRepo struct {
-	stage         *run.Stage
-	stageErr      error
-	runRow        *run.Run
-	runErr        error
-	getStages     map[uuid.UUID]*run.Stage
-	getRuns       map[uuid.UUID]*run.Run
-	setPRURLCalls []promptSetPRURLCall
+	stage                *run.Stage
+	stageErr             error
+	runRow               *run.Run
+	runErr               error
+	getStages            map[uuid.UUID]*run.Stage
+	getRuns              map[uuid.UUID]*run.Run
+	setPRURLCalls        []promptSetPRURLCall
+	transitionStageCalls []promptTransitionStageCall
+}
+
+type promptTransitionStageCall struct {
+	StageID    uuid.UUID
+	To         run.StageState
+	Completion *run.StageCompletion
 }
 
 type promptSetPRURLCall struct {
@@ -117,8 +124,17 @@ func (r *promptRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, err
 func (r *promptRunRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
-func (r *promptRunRepo) TransitionStage(context.Context, uuid.UUID, run.StageState, *run.StageCompletion) (*run.Stage, error) {
-	return nil, errors.New("not used")
+func (r *promptRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.transitionStageCalls = append(r.transitionStageCalls, promptTransitionStageCall{
+		StageID:    id,
+		To:         to,
+		Completion: c,
+	})
+	if st, ok := r.getStages[id]; ok {
+		st.State = to
+		return st, nil
+	}
+	return &run.Stage{ID: id, State: to}, nil
 }
 
 // stubIssueGetter records calls and returns canned issues.
