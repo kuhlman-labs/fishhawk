@@ -1,0 +1,331 @@
+// Package localrunnere2e_test is the cross-component integration test
+// for the local-runner plan-stage loop: real backend HTTP server →
+// real Postgres → real fishhawk-runner binary → fake claude shim →
+// assertions on stage state and plan artifact. Catches the two
+// regression classes from #419 (missing --plan-out and pending→
+// dispatched state-machine gap) that passed every prior unit-test gate.
+package localrunnere2e_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+)
+
+// localRunnerFixture wires every component the local-runner loop
+// needs. Built once per test via newLocalRunnerFixture; teardown is
+// handled via t.Cleanup.
+type localRunnerFixture struct {
+	url          string // httptest server URL
+	pool         *pgxpool.Pool
+	runRepo      runpkg.Repository
+	artifactRepo artifact.Repository
+	runnerBinary string // path to built fishhawk-runner
+	fakeAgentDir string // dir containing the fake claude shim
+}
+
+// cannedPlanJSON returns a minimal schema-valid standard_v1 plan
+// fixture marshalled to JSON. Pre-written to disk before the runner
+// spawns; the runner reads and validates it after the fake agent exits.
+func cannedPlanJSON(t *testing.T) []byte {
+	t.Helper()
+	m := map[string]any{
+		"plan_version": "standard_v1",
+		"ticket_reference": map[string]any{
+			"type": "github_issue",
+			"url":  "https://github.com/x/y/issues/1",
+			"id":   "x/y#1",
+		},
+		"generated_by": map[string]any{
+			"agent":     "claude-code",
+			"model":     "claude-opus-4-7",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		},
+		"summary": "E2E integration test plan.",
+		"scope": map[string]any{
+			"files": []any{
+				map[string]any{"path": "main.go", "operation": "create"},
+			},
+		},
+		"approach": []any{
+			map[string]any{"step": 1, "description": "Write the code."},
+		},
+		"verification": map[string]any{
+			"test_strategy": "Run go test.",
+			"rollback_plan": "Revert the commit.",
+		},
+		"predicted_runtime_minutes":    5,
+		"predicted_runtime_confidence": "high",
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal canned plan: %v", err)
+	}
+	return b
+}
+
+func newLocalRunnerFixture(t *testing.T) *localRunnerFixture {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// 1. Spin up Postgres in a throwaway container.
+	c, err := tcpostgres.Run(ctx,
+		"postgres:16-alpine",
+		tcpostgres.WithDatabase("fishhawk"),
+		tcpostgres.WithUsername("fishhawk"),
+		tcpostgres.WithPassword("fishhawk"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(60*time.Second),
+		),
+	)
+	if err != nil {
+		if isDockerUnavailable(err) {
+			t.Skipf("Docker not available; skipping local-runner E2E: %v", err)
+		}
+		t.Fatalf("start postgres: %v", err)
+	}
+	t.Cleanup(func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutCancel()
+		_ = c.Terminate(shutCtx)
+	})
+	pgURL, err := c.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("postgres connection string: %v", err)
+	}
+
+	// 2. Apply migrations + open pool.
+	if err := postgres.MigrateUp(pgURL); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := pgxpool.New(ctx, pgURL)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	// 3. Wire repos + backend server with an in-memory trace store.
+	// No Orchestrator, no notifier, no GitHub integration — all nil-
+	// guarded by the server. OIDCVerifier is nil so the signing-key
+	// endpoint is open (v0 self-execution posture per server.go doc).
+	runRepo := runpkg.NewPostgresRepository(pool)
+	signingRepo := signing.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	artifactRepo := artifact.NewPostgresRepository(pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      runRepo,
+		SigningRepo:  signingRepo,
+		AuditRepo:    auditRepo,
+		ArtifactRepo: artifactRepo,
+		TraceStore:   tracestore.NewMem(),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// 4. Build the real fishhawk-runner binary. A real binary rather
+	// than `go run` keeps the runner's stdout clean for the trace
+	// stream. Cold build is a few seconds; subsequent builds in the
+	// same test process hit the build cache.
+	binary := filepath.Join(t.TempDir(), runnerBinaryName())
+	buildCtx, buildCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer buildCancel()
+	build := exec.CommandContext(buildCtx, "go", "build",
+		"-o", binary,
+		"github.com/kuhlman-labs/fishhawk/runner/cmd/fishhawk-runner",
+	)
+	var buildStderr bytes.Buffer
+	build.Stderr = &buildStderr
+	if err := build.Run(); err != nil {
+		t.Fatalf("build fishhawk-runner: %v\nstderr: %s", err, buildStderr.String())
+	}
+
+	// 5. Write the fake claude shim. The script prints one JSON line
+	// and exits 0 — it does NOT write the plan file. The test pre-
+	// writes the canned plan before spawning the runner so the runner
+	// reads the pre-existing file after the fake agent exits.
+	fakeDir := t.TempDir()
+	fakeScript := filepath.Join(fakeDir, "claude")
+	if runtime.GOOS == "windows" {
+		fakeScript = filepath.Join(fakeDir, "claude.bat")
+	}
+	scriptBody := "#!/bin/sh\nprintf '{\"type\":\"result\"}\\n'\n"
+	if err := os.WriteFile(fakeScript, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+
+	return &localRunnerFixture{
+		url:          httpSrv.URL,
+		pool:         pool,
+		runRepo:      runRepo,
+		artifactRepo: artifactRepo,
+		runnerBinary: binary,
+		fakeAgentDir: fakeDir,
+	}
+}
+
+func runnerBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "fishhawk-runner.exe"
+	}
+	return "fishhawk-runner"
+}
+
+// TestE2E_LocalRunner_PlanStage_HappyPath drives the full local-runner
+// plan-stage loop end-to-end and asserts:
+//
+//   - The runner exits 0 (agent + upload chain succeeded).
+//   - The stage transitions to awaiting_approval (pending→dispatched→
+//     running→awaiting_approval via advanceStageAfterTrace, which is the
+//     #419 state-machine fix under test).
+//   - A plan artifact exists for the stage (the --plan-out upload path
+//     fired, which was the second regression class from #419).
+func TestE2E_LocalRunner_PlanStage_HappyPath(t *testing.T) {
+	fx := newLocalRunnerFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Seed run with RunnerKind=local so advanceStageAfterTrace handles
+	// the missing workflow_dispatch step (pending→dispatched).
+	r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef-e2e",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	// Seed plan stage with RequiresApproval=true so the trace upload
+	// drives the stage to awaiting_approval rather than succeeded.
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            r.ID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "claude-code",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+
+	// Pre-write the canned plan. The runner reads this file after the
+	// fake agent exits; the fake agent script does NOT write it.
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, cannedPlanJSON(t), 0o600); err != nil {
+		t.Fatalf("write canned plan: %v", err)
+	}
+
+	// Write a dummy prompt file.
+	promptPath := filepath.Join(t.TempDir(), "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("analyse and plan the work"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+
+	// Spawn the runner. PATH is prepended with fakeAgentDir so the
+	// runner's claudecode adapter resolves 'claude' to our shim.
+	cmd := exec.CommandContext(ctx, fx.runnerBinary,
+		"--run-id", r.ID.String(),
+		"--backend-url", fx.url,
+		"--workflow", "feature_change",
+		"--stage", "plan",
+		"--stage-id", stage.ID.String(),
+		"--prompt-file", promptPath,
+		"--plan-out", planPath,
+		"--upload-trace",
+	)
+	// Replace PATH in the inherited environment so 'claude' resolves
+	// to the shim; other vars (HOME, TMPDIR, etc.) are inherited as-is.
+	runnerEnv := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "PATH=") {
+			e = "PATH=" + fx.fakeAgentDir + ":" + strings.TrimPrefix(e, "PATH=")
+		}
+		runnerEnv = append(runnerEnv, e)
+	}
+	cmd.Env = runnerEnv
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("runner exited non-zero: %v\noutput:\n%s", err, out.String())
+	}
+
+	// Assert stage reached awaiting_approval. This is the load-bearing
+	// assertion: it exercises the pending→dispatched gap fix from #419
+	// (advanceStageAfterTrace lines 311-321) that the unit-test gate
+	// could not catch.
+	got, err := fx.runRepo.GetStage(ctx, stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != runpkg.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want %q\nrunner output:\n%s",
+			got.State, runpkg.StageStateAwaitingApproval, out.String())
+	}
+
+	// Assert a plan artifact was uploaded. This exercises the
+	// --plan-out upload path (the second regression class from #419).
+	artifacts, err := fx.artifactRepo.ListForStage(ctx, stage.ID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	if len(artifacts) == 0 {
+		t.Errorf("no artifacts for stage %s; expected a plan artifact\nrunner output:\n%s",
+			stage.ID, out.String())
+	}
+}
+
+// isDockerUnavailable matches the guard pattern from
+// backend/internal/integration/mcp/e2e_test.go. FISHHAWK_SKIP_INTEGRATION
+// provides an explicit escape hatch for CI environments without Docker.
+func isDockerUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"cannot connect to the docker daemon",
+		"docker: not found",
+		"executable file not found",
+		"dial unix /var/run/docker.sock",
+	} {
+		if strings.Contains(msg, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return errors.Is(err, exec.ErrNotFound)
+}
