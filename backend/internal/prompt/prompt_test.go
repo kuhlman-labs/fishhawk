@@ -513,6 +513,31 @@ func TestBuild_Plan_CalibrationHint_Deterministic(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_ScopeFilesShapeGuidance(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"WRONG",
+		"RIGHT",
+		`"files": ["`,
+		`"operation"`,
+		"create",
+		"modify",
+		"delete",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing scope.files shape guidance %q\n---\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_Plan_ContainsIncrementalVerification(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		Source:      "github_issue",
