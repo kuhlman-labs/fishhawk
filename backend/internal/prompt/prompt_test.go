@@ -666,6 +666,96 @@ func TestBuild_Plan_PriorRejectionFeedback_Truncated(t *testing.T) {
 	}
 }
 
+func TestBuild_Implement_ScopeConstraint_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		ScopeConstraint: &ScopeConstraint{
+			ScopeHint:   "Implement the foo helper in pkg/bar.",
+			ParentRunID: "00000000-0000-0000-0000-000000000001",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"SCOPE CONSTRAINT",
+		"00000000-0000-0000-0000-000000000001",
+		"Implement the foo helper in pkg/bar.",
+		"Step zero",
+		"list the files you intend to modify",
+		"STOP and surface that the boundary is wrong",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Implement_ScopeConstraint_SiblingHints(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		ScopeConstraint: &ScopeConstraint{
+			ScopeHint:    "Implement Part A in pkg/a.",
+			ParentRunID:  "00000000-0000-0000-0000-000000000002",
+			SiblingHints: []string{"Implement Part B in pkg/b.", "Implement Part C in pkg/c."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, hint := range []string{"Implement Part B in pkg/b.", "Implement Part C in pkg/c."} {
+		if !strings.Contains(got, hint) {
+			t.Errorf("prompt missing sibling hint %q\n---\n%s", hint, got)
+		}
+	}
+	if !strings.Contains(got, "do NOT modify code in sibling scope") {
+		t.Errorf("prompt missing sibling prohibition notice\n---\n%s", got)
+	}
+}
+
+func TestBuild_Implement_ScopeConstraint_Nil_SectionAbsent(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// ScopeConstraint deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "SCOPE CONSTRAINT") {
+		t.Errorf("SCOPE CONSTRAINT section should not appear when ScopeConstraint is nil:\n%s", got)
+	}
+}
+
+func TestBuild_Implement_ScopeConstraint_AppearsBeforePlan(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		ScopeConstraint: &ScopeConstraint{
+			ScopeHint:   "Implement the foo helper in pkg/bar.",
+			ParentRunID: "00000000-0000-0000-0000-000000000003",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	constraintIdx := strings.Index(got, "SCOPE CONSTRAINT")
+	planIdx := strings.Index(got, "Approved plan (binding instruction)")
+	if constraintIdx < 0 {
+		t.Fatalf("SCOPE CONSTRAINT not found in prompt:\n%s", got)
+	}
+	if planIdx < 0 {
+		t.Fatalf("Approved plan section not found in prompt:\n%s", got)
+	}
+	if constraintIdx > planIdx {
+		t.Errorf("SCOPE CONSTRAINT should appear before the approved plan (constraintIdx=%d planIdx=%d):\n%s",
+			constraintIdx, planIdx, got)
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop

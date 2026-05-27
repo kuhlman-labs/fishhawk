@@ -168,6 +168,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 				StageBudgetMinutes:  budgetSecs / 60,
 			}
 		}
+		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -314,6 +315,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 				StageBudgetMinutes:  budgetSecs / 60,
 			}
 		}
+		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -900,6 +902,67 @@ func (s *Server) loadPriorRejectionFeedback(ctx context.Context, repo, triggerRe
 		}
 	}
 	return nil
+}
+
+// resolveDecomposedScopeConstraint builds a *prompt.ScopeConstraint for
+// child runs of a decomposed plan. Returns nil when:
+//   - the run is not decomposed (DecomposedFrom == nil)
+//   - the run has no cached IssueContext (can't match a sub-plan without it)
+//   - ArtifactRepo is unconfigured (nil-guard: avoids a panic in tryLoadPlanForRun)
+//   - the parent plan can't be loaded (degrade gracefully — agent gets an unconstrained prompt)
+//   - no sub-plan title matches the child's IssueContext.Body prefix (defensive — wrong constraint is worse than none)
+//
+// Matching uses strings.HasPrefix(body, "## "+title+"\n\n"), which is the
+// invariant enforced by childIssueContextFromSubPlan in orchestrator.go.
+func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *run.Run) *prompt.ScopeConstraint {
+	if runRow.DecomposedFrom == nil || runRow.IssueContext == nil {
+		return nil
+	}
+	if s.cfg.ArtifactRepo == nil {
+		return nil
+	}
+	parentPlan, found, err := s.tryLoadPlanForRun(ctx, *runRow.DecomposedFrom)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: resolve scope constraint: load parent plan failed",
+			slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	if !found || parentPlan == nil || parentPlan.Decomposition == nil {
+		return nil
+	}
+
+	body := runRow.IssueContext.Body
+	matchIdx := -1
+	for i, sub := range parentPlan.Decomposition.SubPlans {
+		if strings.HasPrefix(body, "## "+sub.Title+"\n\n") {
+			matchIdx = i
+			break
+		}
+	}
+	if matchIdx < 0 {
+		return nil
+	}
+
+	matched := parentPlan.Decomposition.SubPlans[matchIdx]
+	var siblingHints []string
+	for i, sub := range parentPlan.Decomposition.SubPlans {
+		if i != matchIdx {
+			siblingHints = append(siblingHints, sub.ScopeHint)
+		}
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+		"prompt: injected scope constraint for decomposed child",
+		slog.String("child_run_id", runRow.ID.String()),
+		slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+		slog.Int("sibling_count", len(siblingHints)),
+	)
+	return &prompt.ScopeConstraint{
+		ScopeHint:    matched.ScopeHint,
+		ParentRunID:  runRow.DecomposedFrom.String(),
+		SiblingHints: siblingHints,
+	}
 }
 
 // loadLastDecomposeRejectionReason scans the run's approval_submitted

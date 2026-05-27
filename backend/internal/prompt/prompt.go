@@ -78,6 +78,20 @@ type PredictionContext struct {
 	StageBudgetMinutes  int
 }
 
+// ScopeConstraint narrows a decomposed child run's implement stage to
+// a specific sub-plan scope. When non-nil, buildImplement prepends a
+// binding SCOPE CONSTRAINT block so the agent doesn't drift into
+// sibling sub-plans. Nil for standalone (non-decomposed) runs.
+type ScopeConstraint struct {
+	// ScopeHint is this child's scope_hint verbatim from the parent plan.
+	ScopeHint string
+	// ParentRunID is the UUID string of the parent decomposed run.
+	ParentRunID string
+	// SiblingHints are the scope_hints of all other sub-plans in the
+	// parent decomposition (all sub-plans except this child's).
+	SiblingHints []string
+}
+
 // Trigger captures the bits of the originating event needed to
 // construct an issue-driven prompt. Empty IssueTitle / IssueBody
 // for non-issue triggers; for v0, those triggers all come from
@@ -146,6 +160,11 @@ type Trigger struct {
 	// section surfacing predicted_runtime_minutes, predicted_runtime_confidence,
 	// and the spec-resolved stage budget. Nil → section omitted (#503).
 	PredictionContext *PredictionContext
+	// ScopeConstraint narrows the implement stage to a specific sub-plan
+	// when this run is a decomposed child. When non-nil, buildImplement
+	// prepends a binding SCOPE CONSTRAINT block before the plan and
+	// issue sections. Nil for standalone runs (#541).
+	ScopeConstraint *ScopeConstraint
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -173,6 +192,33 @@ func buildImplement(t Trigger) string {
 	b.WriteString("You are implementing a change in the repository ")
 	b.WriteString(quoteRepo(t.Repo))
 	b.WriteString(".\n\n")
+
+	// Scope constraint (#541): for decomposed child runs, inject a
+	// binding SCOPE CONSTRAINT block before the plan and issue sections.
+	// The constraint names this child's scope_hint and lists sibling
+	// hints so the agent knows where NOT to touch code.
+	if t.ScopeConstraint != nil {
+		sc := t.ScopeConstraint
+		b.WriteString("SCOPE CONSTRAINT (binding — read before writing any code)\n")
+		b.WriteString("=========================================================\n\n")
+		fmt.Fprintf(&b, "This run is a decomposed child of parent run %s.\n\n", sc.ParentRunID)
+		b.WriteString("Your scope for this child run:\n\n")
+		b.WriteString(sc.ScopeHint)
+		b.WriteString("\n\n")
+		if len(sc.SiblingHints) > 0 {
+			b.WriteString("do NOT modify code in sibling scope. Sibling scopes are owned by other child runs:\n\n")
+			for _, hint := range sc.SiblingHints {
+				b.WriteString("- ")
+				b.WriteString(hint)
+				b.WriteString("\n")
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("Step zero — before writing any code: list the files you intend to modify. " +
+			"If any file falls outside your scope above, STOP and surface that the boundary is wrong " +
+			"rather than expanding scope. If you find yourself wanting to work in a sibling's area, " +
+			"STOP and signal completion instead.\n\n")
+	}
 
 	// Plan-as-contract (#223): when the plan stage produced a
 	// standard_v1 artifact and a human approved it, that plan is
