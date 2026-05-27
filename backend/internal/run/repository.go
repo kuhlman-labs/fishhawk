@@ -200,6 +200,14 @@ type Repository interface {
 	// TransitionStage moves a stage to the target state. completion
 	// must be non-nil and populated when transitioning to
 	// StageStateFailed; nil otherwise.
+	//
+	// Same-state (idempotent) calls return the unchanged stage and a
+	// nil error — the row is not mutated and UpdatedAt is not bumped.
+	// Racing callers (e.g. maybeAdvanceDecomposedParent from
+	// concurrent child completions) rely on this: when the parent
+	// stage was already advanced by the first caller, subsequent
+	// callers silently no-op rather than returning an error. "No
+	// change" is not surfaced as a distinct outcome.
 	TransitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion) (*Stage, error)
 
 	// RetryStage is the explicit override path off a terminal state —
