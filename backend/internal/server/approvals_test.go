@@ -1274,6 +1274,62 @@ func TestSubmitApproval_BudgetCheck_WithinBudget_Proceeds(t *testing.T) {
 	}
 }
 
+func TestSubmitApproval_Reject_RejectionCommentInAuditPayload(t *testing.T) {
+	// Reject with non-empty comment → approval_submitted payload carries rejection_comment.
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject","comment":"plan needs more detail"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var foundSubmitted bool
+	for _, e := range au.appended {
+		if e.Category != "approval_submitted" {
+			continue
+		}
+		foundSubmitted = true
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal audit payload: %v", err)
+		}
+		got, ok := payload["rejection_comment"]
+		if !ok {
+			t.Errorf("rejection_comment missing from payload: %v", payload)
+		} else if got != "plan needs more detail" {
+			t.Errorf("rejection_comment = %v, want 'plan needs more detail'", got)
+		}
+	}
+	if !foundSubmitted {
+		t.Errorf("expected approval_submitted audit entry, got %+v", au.appended)
+	}
+}
+
+func TestSubmitApproval_Reject_EmptyComment_NoRejectionCommentInPayload(t *testing.T) {
+	// Reject with no comment → approval_submitted payload must not have rejection_comment.
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	for _, e := range au.appended {
+		if e.Category != "approval_submitted" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal audit payload: %v", err)
+		}
+		if _, ok := payload["rejection_comment"]; ok {
+			t.Errorf("rejection_comment must not appear when comment is empty; payload: %v", payload)
+		}
+	}
+}
+
 func TestSubmitApproval_Reject_DecomposeComment_SetsRejectReason(t *testing.T) {
 	// Reject with "--decompose" in comment → approval_submitted payload
 	// contains reject_reason=decompose_required.

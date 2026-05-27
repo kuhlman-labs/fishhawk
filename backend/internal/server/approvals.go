@@ -410,6 +410,9 @@ func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *appr
 	if app.Decision == approval.DecisionReject && strings.Contains(comment, "--decompose") {
 		auditPayload["reject_reason"] = "decompose_required"
 	}
+	if app.Decision == approval.DecisionReject && comment != "" {
+		auditPayload["rejection_comment"] = comment
+	}
 	payload, _ := json.Marshal(auditPayload)
 
 	approver := app.ApproverSubject

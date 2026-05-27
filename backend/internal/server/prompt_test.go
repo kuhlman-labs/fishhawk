@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -1142,5 +1143,156 @@ func TestGetStagePrompt_VerifyConfig_Absent(t *testing.T) {
 	}
 	if strings.Contains(body, "verify_timeout_seconds") {
 		t.Errorf("response JSON should not contain verify_timeout_seconds when spec has none:\n%s", body)
+	}
+}
+
+// --- loadPriorRejectionFeedback unit tests ---
+
+// feedbackRunRepo wraps promptRunRepo to supply canned ListRuns results.
+type feedbackRunRepo struct {
+	*promptRunRepo
+	listResult []*run.Run
+	listErr    error
+}
+
+func (r *feedbackRunRepo) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	return r.listResult, nil
+}
+
+// feedbackAuditRepo is a minimal audit.Repository for loadPriorRejectionFeedback tests.
+type feedbackAuditRepo struct {
+	byRunID map[uuid.UUID][]*audit.Entry
+	listErr error
+}
+
+func (f *feedbackAuditRepo) Append(_ context.Context, _ audit.AppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (f *feedbackAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	rid := p.RunID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
+}
+func (f *feedbackAuditRepo) AppendGlobalChained(_ context.Context, _ audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (f *feedbackAuditRepo) Get(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (f *feedbackAuditRepo) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (f *feedbackAuditRepo) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
+	return nil, nil
+}
+func (f *feedbackAuditRepo) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
+func (f *feedbackAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, _ string) ([]*audit.Entry, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.byRunID[runID], nil
+}
+func (f *feedbackAuditRepo) ListAll(_ context.Context, _ audit.ListAllParams) ([]*audit.Entry, error) {
+	return nil, nil
+}
+func (f *feedbackAuditRepo) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
+	return nil, nil
+}
+
+func newFeedbackServer(t *testing.T, runs []*run.Run, auditByRun map[uuid.UUID][]*audit.Entry) *Server {
+	t.Helper()
+	rr := &feedbackRunRepo{
+		promptRunRepo: newPromptRunRepo(),
+		listResult:    runs,
+	}
+	ar := &feedbackAuditRepo{byRunID: auditByRun}
+	return New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   rr,
+		AuditRepo: ar,
+	})
+}
+
+func makeRejectionEntry(runID uuid.UUID, comment string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"decision":          "reject",
+		"rejection_comment": comment,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+}
+
+func makeApproveEntry(runID uuid.UUID) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"decision": "approve"})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+}
+
+func TestLoadPriorRejectionFeedback_NoPriorRuns_ReturnsNil(t *testing.T) {
+	s := newFeedbackServer(t, nil, nil)
+	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", uuid.New())
+	if got != nil {
+		t.Errorf("got %q, want nil (no prior runs)", *got)
+	}
+}
+
+func TestLoadPriorRejectionFeedback_PriorRunNoRejection_ReturnsNil(t *testing.T) {
+	priorID := uuid.New()
+	currentID := uuid.New()
+	s := newFeedbackServer(t,
+		[]*run.Run{{ID: priorID}},
+		map[uuid.UUID][]*audit.Entry{priorID: {makeApproveEntry(priorID)}},
+	)
+	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
+	if got != nil {
+		t.Errorf("got %q, want nil (no rejection in prior run)", *got)
+	}
+}
+
+func TestLoadPriorRejectionFeedback_PriorRunRejectionEmptyComment_ReturnsNil(t *testing.T) {
+	priorID := uuid.New()
+	currentID := uuid.New()
+	payload, _ := json.Marshal(map[string]any{"decision": "reject", "rejection_comment": ""})
+	rid := priorID
+	s := newFeedbackServer(t,
+		[]*run.Run{{ID: priorID}},
+		map[uuid.UUID][]*audit.Entry{priorID: {{ID: uuid.New(), RunID: &rid, Payload: payload}}},
+	)
+	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
+	if got != nil {
+		t.Errorf("got %q, want nil (rejection with empty comment)", *got)
+	}
+}
+
+func TestLoadPriorRejectionFeedback_PriorRunRejectionNonEmptyComment_ReturnsComment(t *testing.T) {
+	priorID := uuid.New()
+	currentID := uuid.New()
+	s := newFeedbackServer(t,
+		[]*run.Run{{ID: priorID}},
+		map[uuid.UUID][]*audit.Entry{priorID: {makeRejectionEntry(priorID, "plan is too vague")}},
+	)
+	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
+	if got == nil {
+		t.Fatal("got nil, want comment")
+	}
+	if *got != "plan is too vague" {
+		t.Errorf("got %q, want 'plan is too vague'", *got)
+	}
+}
+
+func TestLoadPriorRejectionFeedback_CurrentRunIDExcluded(t *testing.T) {
+	currentID := uuid.New()
+	// The only run in the list is the current one — must be skipped.
+	s := newFeedbackServer(t,
+		[]*run.Run{{ID: currentID}},
+		map[uuid.UUID][]*audit.Entry{currentID: {makeRejectionEntry(currentID, "do not return this")}},
+	)
+	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
+	if got != nil {
+		t.Errorf("got %q, want nil (current run should be excluded)", *got)
 	}
 }

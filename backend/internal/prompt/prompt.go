@@ -135,6 +135,12 @@ type Trigger struct {
 	// threshold of implement-stage executions have been recorded (mirrors
 	// the DecomposeRequired pattern for plan-stage hint injection).
 	CalibrationHint *CalibrationHint
+	// PriorRejectionFeedback is the operator's rationale from the most
+	// recent rejection of a plan for the same trigger_ref. When non-nil
+	// and non-empty, buildPlan injects a binding "you MUST address this"
+	// section so the agent knows why the previous attempt was rejected.
+	// Nil when no prior rejection exists or the comment was empty.
+	PriorRejectionFeedback *string
 	// PredictionContext carries runtime prediction data for the implement-
 	// stage prompt. When non-nil, buildImplement appends a Budget context
 	// section surfacing predicted_runtime_minutes, predicted_runtime_confidence,
@@ -260,6 +266,18 @@ func buildPlan(t Trigger) string {
 		b.WriteString("IMPORTANT: Your previous plan was rejected because predicted_runtime_minutes " +
 			"exceeded the implement-stage budget without a decomposition block. " +
 			"You MUST populate decomposition.sub_plans in this plan — omitting it will block approval again.\n\n")
+	}
+
+	if t.PriorRejectionFeedback != nil && *t.PriorRejectionFeedback != "" {
+		feedback := *t.PriorRejectionFeedback
+		const maxFeedbackBytes = 4000
+		if len(feedback) > maxFeedbackBytes {
+			feedback = feedback[:maxFeedbackBytes] + "...[truncated]"
+		}
+		b.WriteString("### Prior plan-stage rejection feedback\n\n")
+		b.WriteString("The operator rejected the most recent plan for this issue with the following rationale. You MUST address this feedback in your new plan:\n\n")
+		b.WriteString(feedback)
+		b.WriteString("\n\n")
 	}
 
 	writeIssueContext(&b, t)

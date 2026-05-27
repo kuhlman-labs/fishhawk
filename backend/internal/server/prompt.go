@@ -182,6 +182,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		} else {
 			trigger.CalibrationHint = hint
 		}
+		if runRow.TriggerRef != nil {
+			trigger.PriorRejectionFeedback = s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
+		}
 	}
 
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
@@ -324,6 +327,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			slog.WarnContext(r.Context(), "calibration hint resolution failed", "error", err)
 		} else {
 			trigger.CalibrationHint = hint
+		}
+		if runRow.TriggerRef != nil {
+			trigger.PriorRejectionFeedback = s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
 		}
 	}
 
@@ -826,6 +832,74 @@ func (s *Server) resolveAgentSelfRetryForStage(ctx context.Context, runRow *run.
 		}
 	}
 	return specStage.Executor.AgentSelfRetry
+}
+
+// loadPriorRejectionFeedback searches the most-recent prior runs for
+// the same trigger_ref and returns the rejection_comment from the newest
+// approval_submitted audit entry where decision=reject and
+// rejection_comment is non-empty. Returns nil when there is no matching
+// prior rejection, when RunRepo or AuditRepo is unconfigured, or on any
+// error (best-effort, same posture as CalibrationHint). At most 3 prior
+// runs are inspected to bound audit fan-out; at most 10 runs are fetched
+// from the repo in total (Limit=10).
+func (s *Server) loadPriorRejectionFeedback(ctx context.Context, repo, triggerRef string, currentRunID uuid.UUID) *string {
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return nil
+	}
+	ref := triggerRef
+	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		Repo:       repo,
+		TriggerRef: &ref,
+		Limit:      10,
+	})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list runs for prior rejection failed",
+			slog.String("trigger_ref", triggerRef),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+
+	checked := 0
+	for _, r := range runs {
+		if r.ID == currentRunID {
+			continue
+		}
+		if checked >= 3 {
+			break
+		}
+		checked++
+
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, r.ID, "approval_submitted")
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list approval_submitted for prior run failed",
+				slog.String("run_id", r.ID.String()),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+
+		// Scan newest-first (ListForRunByCategory returns entries ordered ASC by ts).
+		for i := len(entries) - 1; i >= 0; i-- {
+			var payload struct {
+				Decision         string `json:"decision"`
+				RejectionComment string `json:"rejection_comment"`
+			}
+			if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+				continue
+			}
+			if payload.Decision == "reject" && payload.RejectionComment != "" {
+				c := payload.RejectionComment
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+					"prompt: loaded prior rejection feedback into plan prompt",
+					slog.String("prior_run_id", r.ID.String()),
+					slog.Int("comment_bytes", len(c)),
+				)
+				return &c
+			}
+		}
+	}
+	return nil
 }
 
 // loadLastDecomposeRejectionReason scans the run's approval_submitted
