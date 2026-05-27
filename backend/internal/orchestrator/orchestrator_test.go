@@ -180,8 +180,20 @@ func (s *stubRuns) TransitionStage(_ context.Context, id uuid.UUID, to run.Stage
 func (s *stubRuns) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
-func (s *stubRuns) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
-	return nil, errors.New("not used")
+
+func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f.DecomposedFrom == nil {
+		return nil, errors.New("not used")
+	}
+	var out []*run.Run
+	for _, r := range s.runs {
+		if r.DecomposedFrom != nil && *r.DecomposedFrom == *f.DecomposedFrom {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 func (s *stubRuns) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
@@ -702,5 +714,93 @@ func TestAdvance_FailedStageBeforePending_DoesNotDispatchDownstream(t *testing.T
 	}
 	if len(gh.calls) != 0 {
 		t.Errorf("orchestrator dispatched a stage past the failure: %d calls", len(gh.calls))
+	}
+}
+
+func TestCompleteRun_AllChildrenSucceed_AdvancesParent(t *testing.T) {
+	// D4 inline hook: when the last child of a decomposed parent
+	// completes successfully, completeRun should inline-advance the
+	// parent's awaiting_children stage to succeeded and dispatch the
+	// next parent stage (review). This avoids a sweeper round-trip.
+	o, rs, _ := newOrchestrator(t)
+
+	// Parent run: implement (awaiting_children) + review (pending).
+	parentRun, parentStages := rs.seed(t, "x/y", nil, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingChildren},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStatePending},
+	})
+
+	// First child: already succeeded.
+	child1, _ := rs.seed(t, "x/y", nil, nil)
+	child1.DecomposedFrom = &parentRun.ID
+	child1.State = run.StateSucceeded
+
+	// Second child: still running, implement stage succeeded.
+	// Calling Advance will complete it and trigger the inline hook.
+	child2, _ := rs.seed(t, "x/y", nil, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+	})
+	child2.DecomposedFrom = &parentRun.ID
+
+	out, err := o.Advance(context.Background(), child2.ID)
+	if err != nil {
+		t.Fatalf("Advance(child2): %v", err)
+	}
+	if out != OutcomeRunCompleted {
+		t.Errorf("Outcome = %q, want run_completed", out)
+	}
+
+	// Parent's implement stage must be succeeded (transitioned from awaiting_children).
+	if parentStages[0].State != run.StageStateSucceeded {
+		t.Errorf("parent implement stage = %q, want succeeded", parentStages[0].State)
+	}
+	// Parent's review stage must have been dispatched (human → awaiting_approval).
+	if parentStages[1].State != run.StageStateAwaitingApproval {
+		t.Errorf("parent review stage = %q, want awaiting_approval", parentStages[1].State)
+	}
+	// Parent run stays running while the review gate is open.
+	if rs.runs[parentRun.ID].State != run.StateRunning {
+		t.Errorf("parent run state = %q, want running", rs.runs[parentRun.ID].State)
+	}
+}
+
+func TestCompleteRun_OneChildFails_AdvancesParentToFailed(t *testing.T) {
+	// D4 inline hook: when any child failed, the parent's
+	// awaiting_children stage must transition to failed (category C)
+	// and the parent run must complete as failed.
+	o, rs, _ := newOrchestrator(t)
+
+	// Parent run: implement (awaiting_children) + review (pending).
+	parentRun, parentStages := rs.seed(t, "x/y", nil, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingChildren},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStatePending},
+	})
+
+	// First child: already failed.
+	child1, _ := rs.seed(t, "x/y", nil, nil)
+	child1.DecomposedFrom = &parentRun.ID
+	child1.State = run.StateFailed
+
+	// Second child: succeeds now, triggering the inline hook.
+	child2, _ := rs.seed(t, "x/y", nil, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+	})
+	child2.DecomposedFrom = &parentRun.ID
+
+	out, err := o.Advance(context.Background(), child2.ID)
+	if err != nil {
+		t.Fatalf("Advance(child2): %v", err)
+	}
+	if out != OutcomeRunCompleted {
+		t.Errorf("Outcome = %q, want run_completed", out)
+	}
+
+	// Parent's implement stage must be failed.
+	if parentStages[0].State != run.StageStateFailed {
+		t.Errorf("parent implement stage = %q, want failed", parentStages[0].State)
+	}
+	// Parent run must be failed.
+	if rs.runs[parentRun.ID].State != run.StateFailed {
+		t.Errorf("parent run state = %q, want failed", rs.runs[parentRun.ID].State)
 	}
 }

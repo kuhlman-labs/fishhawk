@@ -379,7 +379,125 @@ func (o *Orchestrator) completeRun(ctx context.Context, r *run.Run, stages []*ru
 		slog.String("run_id", r.ID.String()),
 		slog.String("state", string(target)),
 	)
+	if r.DecomposedFrom != nil {
+		o.maybeAdvanceDecomposedParent(ctx, *r.DecomposedFrom)
+	}
 	return OutcomeRunCompleted, nil
+}
+
+// maybeAdvanceDecomposedParent is called after a child run reaches a
+// terminal state. When all siblings are also terminal, it transitions
+// the parent's awaiting_children stage (to succeeded or failed-C) and
+// calls Advance so the next parent stage — typically the review gate —
+// is dispatched inline rather than waiting for the periodic sweeper.
+// Best-effort: failures are logged at WARN and never surface to callers.
+func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentRunID uuid.UUID) {
+	children, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &parentRunID,
+		Limit:          100,
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list decomposed children failed",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if len(children) == 0 {
+		return
+	}
+	anyFailed := false
+	for _, c := range children {
+		if !c.State.IsTerminal() {
+			return
+		}
+		if c.State == run.StateFailed {
+			anyFailed = true
+		}
+	}
+
+	stages, err := o.Runs.ListStagesForRun(ctx, parentRunID)
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list parent stages for children_settled failed",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	var awaitingStage *run.Stage
+	for _, s := range stages {
+		if s.State == run.StageStateAwaitingChildren {
+			awaitingStage = s
+			break
+		}
+	}
+	if awaitingStage == nil {
+		return
+	}
+
+	target := run.StageStateSucceeded
+	var completion *run.StageCompletion
+	if anyFailed {
+		target = run.StageStateFailed
+		cat := run.FailureC
+		reason := "one or more decomposed child runs failed"
+		completion = &run.StageCompletion{
+			FailureCategory: &cat,
+			FailureReason:   &reason,
+		}
+	}
+
+	if _, err := o.Runs.TransitionStage(ctx, awaitingStage.ID, target, completion); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: transition awaiting_children stage failed",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("stage_id", awaitingStage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	o.emitChildrenSettled(ctx, parentRunID, awaitingStage.ID, anyFailed)
+
+	if _, err := o.Advance(ctx, parentRunID); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: advance parent after children settled failed",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// emitChildrenSettled writes a children_settled audit entry once all
+// decomposed children have reached terminal states. Best-effort: a
+// failure here logs and returns; the stage transition has already landed.
+func (o *Orchestrator) emitChildrenSettled(ctx context.Context, parentRunID, stageID uuid.UUID, anyFailed bool) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping children_settled entry",
+			slog.String("parent_run_id", parentRunID.String()))
+		return
+	}
+	outcome := "succeeded"
+	if anyFailed {
+		outcome = "failed"
+	}
+	payload, err := json.Marshal(map[string]any{"outcome": outcome})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal children_settled payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "children_settled",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append children_settled failed",
+			slog.String("error", err.Error()))
+	}
 }
 
 // dispatchStage transitions the next stage to dispatched and (for
