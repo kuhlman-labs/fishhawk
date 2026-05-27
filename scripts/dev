@@ -81,6 +81,10 @@ cmd_up() {
   mkdir -p "${REPO_ROOT}/bin"
   (cd "${REPO_ROOT}" && go build -o bin/fishhawkd ./backend/cmd/fishhawkd/)
 
+  # Migrate
+  print "applying migrations..."
+  "$BIN" migrate up
+
   # Spawn
   mkdir -p "${REPO_ROOT}/.fishhawk"
   "${BIN}" serve >> "$LOG_FILE" 2>&1 &
