@@ -2,6 +2,7 @@ package plan_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,6 +210,39 @@ func TestTryCoerce_IntegerTicketReference(t *testing.T) {
 	}
 	if err == nil {
 		t.Error("err = nil, want non-nil: integer is not coercible and original schema error should propagate")
+	}
+}
+
+// TestTryCoerce_PartialCoercionWithRemainingViolation exercises the production
+// failure shape: agent emits a coercible field (generated_by as bare string)
+// AND a non-coercible field (approach as bare string — expects array). Coercion
+// fires on generated_by but the plan is still invalid after. The fix: TryCoerce
+// returns (coercedBytes, coercions, err) so callers report the post-coercion
+// violation (/approach) rather than the original /generated_by error.
+func TestTryCoerce_PartialCoercionWithRemainingViolation(t *testing.T) {
+	m := planfixture.Valid()
+	m["generated_by"] = "my-agent" // coercible: bare string → object
+	m["approach"] = "do the thing" // non-coercible: string where array required
+	data := marshal(t, m)
+
+	coercedBytes, coercions, err := plan.TryCoerce(data, testNow)
+
+	if err == nil {
+		t.Fatal("err = nil, want non-nil: approach is not coercible so plan remains invalid")
+	}
+	if len(coercions) != 1 {
+		t.Fatalf("coercions = %d, want 1 (generated_by coerced; approach not coercible)", len(coercions))
+	}
+	if got := coercions[0].FieldPath; got != "/generated_by" {
+		t.Errorf("coercions[0].FieldPath = %q, want /generated_by", got)
+	}
+	if coercedBytes == nil {
+		t.Fatal("coercedBytes = nil, want non-nil: partial fix bytes must be returned so caller reports post-coercion error")
+	}
+	// The returned error must name the remaining violation, not generated_by.
+	errStr := err.Error()
+	if strings.Contains(errStr, "generated_by") {
+		t.Errorf("err mentions generated_by (already coerced); want error naming remaining violation: %v", err)
 	}
 }
 

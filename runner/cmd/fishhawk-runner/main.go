@@ -181,6 +181,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	}
 
 	logStartup(logSink, cfg)
+	_, _ = fmt.Fprintf(logSink, `{"event":"coercion_registry","summary":%q}`+"\n", plan.CoercionRegistrySummary())
 
 	ctx, stop := newRunnerContext()
 	defer stop()
@@ -1075,12 +1076,28 @@ func validatePlan(path string) (agent.Event, error) {
 			}, fmt.Errorf("plan: write coerced %s: %w", path, err)
 		}
 		data = coercedBytes
+	} else if coerceErr != nil && len(coercions) > 0 {
+		// Partial coercion: some fields were fixed but the plan is still
+		// invalid. Rewrite the file with the partially-fixed bytes so the
+		// subsequent Validate reports the remaining violation rather than
+		// the original error (which may name a field already coerced).
+		if err := os.WriteFile(path, coercedBytes, 0o600); err != nil {
+			return agent.Event{
+				Kind:    "policy_event",
+				Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "coerce_write_failed", "path": path, "error": err.Error()}),
+			}, fmt.Errorf("plan: write coerced %s: %w", path, err)
+		}
+		data = coercedBytes
 	}
 
 	if vErr := plan.Validate(data); vErr != nil {
+		invalidPayload := map[string]string{"check": "plan_validation", "outcome": "invalid", "path": path, "error": vErr.Error()}
+		if len(coercions) > 0 {
+			invalidPayload["coerced"] = fmt.Sprintf("%d field(s)", len(coercions))
+		}
 		return agent.Event{
 			Kind:    "policy_event",
-			Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "invalid", "path": path, "error": vErr.Error()}),
+			Payload: agent.MakePayload(invalidPayload),
 		}, vErr
 	}
 

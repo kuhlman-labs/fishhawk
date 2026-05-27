@@ -135,6 +135,7 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// doesn't retry — the agent's output is bad and re-shipping won't help.
 	if err := plan.Validate(body); err != nil {
 		coercionOK := false
+		reportErr := err // updated to post-coercion error on partial coercion
 		var schemaErr *plan.SchemaError
 		if errors.As(err, &schemaErr) {
 			coercedBytes, coercions, coerceErr := plan.TryCoerce(body, time.Now().UTC())
@@ -162,6 +163,12 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 				}
 				body = coercedBytes
 				coercionOK = true
+			} else if coerceErr != nil && len(coercions) > 0 {
+				// Partial coercion: some fields were fixed but the plan is
+				// still invalid. Report the post-coercion error so the 400
+				// names the remaining violation rather than a field that
+				// coercion already fixed.
+				reportErr = coerceErr
 			}
 		}
 		if !coercionOK {
@@ -171,7 +178,7 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 			// `running` (#527). Best-effort: a TransitionStage error
 			// logs but doesn't change the upload response.
 			cat := run.FailureB
-			reason := "plan_invalid: " + err.Error()
+			reason := "plan_invalid: " + reportErr.Error()
 			if _, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
 				run.StageStateFailed, &run.StageCompletion{
 					FailureCategory: &cat,
@@ -185,7 +192,7 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 			}
 			s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
 				"plan does not validate against standard_v1",
-				map[string]any{"error": err.Error()})
+				map[string]any{"error": reportErr.Error()})
 			return
 		}
 	}
