@@ -14,8 +14,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -30,6 +32,10 @@ type promptRunRepo struct {
 	getRuns              map[uuid.UUID]*run.Run
 	setPRURLCalls        []promptSetPRURLCall
 	transitionStageCalls []promptTransitionStageCall
+	// stagesByRunID backs ListStagesForRun. When non-nil, the map is
+	// consulted; when nil the method returns an error so accidental
+	// calls in tests that don't seed it stay loud.
+	stagesByRunID map[uuid.UUID][]*run.Stage
 }
 
 type promptTransitionStageCall struct {
@@ -107,8 +113,11 @@ func (r *promptRunRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, ur
 func (r *promptRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
-func (r *promptRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
+func (r *promptRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	if r.stagesByRunID == nil {
+		return nil, errors.New("not used")
+	}
+	return r.stagesByRunID[runID], nil
 }
 func (r *promptRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
@@ -1294,5 +1303,110 @@ func TestLoadPriorRejectionFeedback_CurrentRunIDExcluded(t *testing.T) {
 	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
 	if got != nil {
 		t.Errorf("got %q, want nil (current run should be excluded)", *got)
+	}
+}
+
+// TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected verifies that
+// when a child run has DecomposedFrom set and a matching IssueContext, the
+// implement-stage prompt contains a SCOPE CONSTRAINT block with this child's
+// scope_hint and the sibling's scope_hint (#541).
+func TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	parentRunID := uuid.New()
+	childRunID := uuid.New()
+	parentPlanStageID := uuid.New()
+	childStageID := uuid.New()
+
+	// Build a standard_v1 plan artifact with a two-sub-plan decomposition.
+	parentPlan := &plan.Plan{
+		PlanVersion: "standard_v1",
+		Summary:     "parent plan",
+		Verification: plan.Verification{
+			TestStrategy: "ts",
+			RollbackPlan: "rb",
+		},
+		Decomposition: &plan.Decomposition{
+			Rationale: "scope split",
+			SubPlans: []plan.SubPlanSummary{
+				{Title: "Part A title", ScopeHint: "Implement Part A in pkg/a."},
+				{Title: "Part B title", ScopeHint: "Implement Part B in pkg/b."},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(parentPlan)
+	if err != nil {
+		t.Fatalf("marshal parent plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       parentPlanStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	// Seed parent run with a plan stage.
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		parentRunID: {
+			{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan},
+		},
+	}
+	rr.getRuns[parentRunID] = &run.Run{
+		ID:   parentRunID,
+		Repo: "o/r",
+	}
+
+	// Child run: DecomposedFrom=parentRunID, IssueContext.Body matches Part A.
+	childBody := "## Part A title\n\nImplement Part A in pkg/a.\n\n---\n*Decomposed sub-plan.*"
+	rr.getRuns[childRunID] = &run.Run{
+		ID:             childRunID,
+		Repo:           "o/r",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerCLI,
+		DecomposedFrom: &parentRunID,
+		IssueContext: &run.IssueContext{
+			Title: "Part A title",
+			Body:  childBody,
+		},
+	}
+	rr.getStages[childStageID] = &run.Stage{
+		ID:    childStageID,
+		RunID: childRunID,
+		Type:  run.StageTypeImplement,
+	}
+
+	priv, _ := sf.issue(t, childRunID)
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, childRunID, childStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for _, want := range []string{
+		"SCOPE CONSTRAINT",
+		"Implement Part A in pkg/a.",
+		"Implement Part B in pkg/b.",
+		"do NOT modify code in sibling scope",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
 	}
 }
