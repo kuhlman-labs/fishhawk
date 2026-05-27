@@ -781,6 +781,52 @@ func TestBuild_Plan_CompoundFieldDirective(t *testing.T) {
 	}
 }
 
+func TestBuild_Implement_ApprovalConditions_Rendered(t *testing.T) {
+	cond := "add the cross-branch rejection test"
+	got, err := Build("implement", Trigger{
+		Repo:               "o/r",
+		ApprovedPlan:       fixturePlan(),
+		ApprovalConditions: &cond,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Approval conditions",
+		"AMEND the plan",
+		"MANDATORY",
+		"win on conflict",
+		cond,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	// Conditions must appear before the approved plan so the agent
+	// sees them before reading the plan steps.
+	condIdx := strings.Index(got, "### Approval conditions")
+	planIdx := strings.Index(got, "Approved plan (binding instruction)")
+	if condIdx < 0 || planIdx < 0 || condIdx > planIdx {
+		t.Errorf("approval conditions should appear before approved plan (condIdx=%d planIdx=%d):\n%s",
+			condIdx, planIdx, got)
+	}
+}
+
+func TestBuild_Implement_ApprovalConditions_Nil_Absent(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// ApprovalConditions deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Approval conditions") {
+		t.Errorf("Approval conditions section should not appear when ApprovalConditions is nil:\n%s", got)
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop

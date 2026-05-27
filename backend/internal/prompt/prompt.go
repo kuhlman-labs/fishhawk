@@ -165,6 +165,12 @@ type Trigger struct {
 	// prepends a binding SCOPE CONSTRAINT block before the plan and
 	// issue sections. Nil for standalone runs (#541).
 	ScopeConstraint *ScopeConstraint
+	// ApprovalConditions carries the operator's approve-with-notes text for
+	// the current run's plan stage. When non-nil, buildImplement injects a
+	// binding section after the SCOPE CONSTRAINT block (if any) and before
+	// the approved-plan section. Nil means no conditions were given (section
+	// omitted).
+	ApprovalConditions *string
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -218,6 +224,21 @@ func buildImplement(t Trigger) string {
 			"If any file falls outside your scope above, STOP and surface that the boundary is wrong " +
 			"rather than expanding scope. If you find yourself wanting to work in a sibling's area, " +
 			"STOP and signal completion instead.\n\n")
+	}
+
+	// Approval conditions (#557): when the operator approved the plan with
+	// notes, inject a binding section so the agent sees them before reading
+	// the plan. Conditions AMEND the plan, are MANDATORY, and win on conflict.
+	if t.ApprovalConditions != nil {
+		ac := *t.ApprovalConditions
+		const maxConditionBytes = 4000
+		if len(ac) > maxConditionBytes {
+			ac = ac[:maxConditionBytes] + "...[truncated]"
+		}
+		b.WriteString("### Approval conditions\n\n")
+		b.WriteString("The operator approved this plan with the following conditions. These conditions AMEND the plan, are MANDATORY, and win on conflict with plan steps:\n\n")
+		b.WriteString(ac)
+		b.WriteString("\n\n")
 	}
 
 	// Plan-as-contract (#223): when the plan stage produced a

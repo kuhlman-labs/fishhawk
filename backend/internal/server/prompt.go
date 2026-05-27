@@ -169,6 +169,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow)
+		trigger.ApprovalConditions = s.loadApprovalConditions(r.Context(), runRow.ID)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -316,6 +317,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow)
+		trigger.ApprovalConditions = s.loadApprovalConditions(r.Context(), runRow.ID)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -995,4 +997,46 @@ func (s *Server) loadLastDecomposeRejectionReason(ctx context.Context, runID uui
 		}
 	}
 	return false
+}
+
+// loadApprovalConditions scans the run's approval_submitted audit entries
+// (newest-first) for the first entry where decision=="approve" and the
+// comment payload key is non-empty. Returns the comment string (capped at
+// 4000 bytes) or nil when none is found. Best-effort: WARN-logs and returns
+// nil on any error.
+func (s *Server) loadApprovalConditions(ctx context.Context, runID uuid.UUID) *string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list approval_submitted for conditions failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Decision string `json:"decision"`
+			Comment  string `json:"comment"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Decision == "approve" && payload.Comment != "" {
+			c := payload.Comment
+			const maxConditionBytes = 4000
+			if len(c) > maxConditionBytes {
+				c = c[:maxConditionBytes] + "...[truncated]"
+			}
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded approval conditions into implement prompt",
+				slog.String("run_id", runID.String()),
+				slog.Int("comment_bytes", len(payload.Comment)),
+			)
+			return &c
+		}
+	}
+	return nil
 }
