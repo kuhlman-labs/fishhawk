@@ -30,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -126,6 +127,7 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 
 	logger := newLogger(logSink)
+	logger.Info("plan coercion registry", slog.String("summary", plan.CoercionRegistrySummary()))
 
 	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL}
 

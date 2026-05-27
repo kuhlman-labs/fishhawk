@@ -3,6 +3,7 @@ package plan
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -166,6 +167,18 @@ func navigateTo(m map[string]any, parts []string) (map[string]any, string, bool)
 	return parent, parts[len(parts)-1], true
 }
 
+// CoercionRegistrySummary returns a human-readable description of the paths
+// registered for coercion. Call at startup with the binary's configured logger
+// to confirm the registry is populated without waiting for a misfire.
+func CoercionRegistrySummary() string {
+	paths := make([]string, 0, len(coercionRegistry))
+	for path := range coercionRegistry {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return fmt.Sprintf("%d paths: %s", len(paths), strings.Join(paths, ", "))
+}
+
 // TryCoerce attempts to fix the known string-elision class of plan schema
 // violations: cases where an agent emits a bare string where the schema
 // expects an object. The set of coercible paths is derived at init time from
@@ -176,9 +189,11 @@ func navigateTo(m map[string]any, parts []string) (map[string]any, string, bool)
 // Returns (coercedBytes, coercions, nil) when coercion produces a valid plan.
 // Returns (nil, nil, nil) when no string-valued nested-object fields are
 // detected AND the original data already validates — caller keeps original
-// bytes. Returns (nil, nil, err) when coercions were applied but re-validation
-// still fails, or when no coercions apply and the original data is invalid —
-// either way the caller should fall through to the 400 path.
+// bytes. Returns (coercedBytes, coercions, err) when coercions were applied
+// but re-validation still fails — callers use coercedBytes to report the
+// post-coercion violation rather than the original error (which may name a
+// field already fixed by coercion). Returns (nil, nil, err) when no coercions
+// apply and the original data is invalid — caller falls through to the 400 path.
 func TryCoerce(data []byte, now time.Time) ([]byte, []Coercion, error) {
 	var m map[string]any
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -254,7 +269,7 @@ func TryCoerce(data []byte, now time.Time) ([]byte, []Coercion, error) {
 	}
 
 	if err := Validate(coercedBytes); err != nil {
-		return nil, nil, err
+		return coercedBytes, coercions, err
 	}
 
 	return coercedBytes, coercions, nil
