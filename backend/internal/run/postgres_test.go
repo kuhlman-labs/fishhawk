@@ -708,6 +708,42 @@ func TestPostgres_StageGate_NilWhenSpecHasNoGate(t *testing.T) {
 	}
 }
 
+func TestPostgres_TransitionStage_SameState_NoOp(t *testing.T) {
+	// Pins the same-state no-op contract documented on
+	// Repository.TransitionStage: when the stage is already in the
+	// target state, the call must return the unchanged stage (nil
+	// error) without bumping updated_at.
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+
+	// Walk to succeeded via the normal lifecycle.
+	if _, err := repo.TransitionStage(context.Background(), s.ID, run.StageStateDispatched, nil); err != nil {
+		t.Fatalf("→dispatched: %v", err)
+	}
+	if _, err := repo.TransitionStage(context.Background(), s.ID, run.StageStateRunning, nil); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+	first, err := repo.TransitionStage(context.Background(), s.ID, run.StageStateSucceeded, nil)
+	if err != nil {
+		t.Fatalf("→succeeded: %v", err)
+	}
+
+	// Call again with the same target state.
+	second, err := repo.TransitionStage(context.Background(), s.ID, run.StageStateSucceeded, nil)
+	if err != nil {
+		t.Fatalf("same-state re-apply returned error: %v", err)
+	}
+	if second.State != run.StageStateSucceeded {
+		t.Errorf("state = %q, want succeeded", second.State)
+	}
+	if first.UpdatedAt.UnixNano() != second.UpdatedAt.UnixNano() {
+		t.Errorf("same-state re-apply mutated row (updated_at changed)")
+	}
+}
+
 func TestPostgres_StageGate_CheckGateHasNoApprovers(t *testing.T) {
 	// routine_change.workflows.yaml's review stage uses a check-only
 	// gate (no approvers; just blocking_checks). The persisted Gate
