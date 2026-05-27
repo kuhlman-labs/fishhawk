@@ -93,16 +93,39 @@ type ParseError struct {
 func (e *ParseError) Error() string { return "plan: " + e.Msg }
 func (e *ParseError) Unwrap() error { return e.Cause }
 
-// SchemaError is returned for schema violations. Path is a JSON
-// Pointer into the input document; Message is the leaf-level
-// failure message from the validator, the most actionable line for
-// surfacing to the user.
-type SchemaError struct {
+// SchemaViolation is a single field-level violation within a SchemaError.
+// Path is a JSON Pointer (RFC 6901) and Message is the schema's reported
+// reason for that specific location.
+type SchemaViolation struct {
 	Path    string
 	Message string
 }
 
+// SchemaError is returned for schema violations. Path and Message identify
+// the primary (first) violation; Violations enumerates all leaf-level
+// failures so callers can surface every broken field in one shot.
+type SchemaError struct {
+	Path       string
+	Message    string
+	Violations []SchemaViolation
+}
+
 func (e *SchemaError) Error() string {
+	// When the validator found more than one leaf violation, list them
+	// all so the failure reason surfaced to the operator names every
+	// broken field in a single round-trip (#555). The single-violation
+	// case keeps the original format for backward compatibility.
+	if len(e.Violations) > 1 {
+		parts := make([]string, 0, len(e.Violations))
+		for _, v := range e.Violations {
+			if v.Path == "" || v.Path == "/" {
+				parts = append(parts, v.Message)
+			} else {
+				parts = append(parts, fmt.Sprintf("%s: %s", v.Path, v.Message))
+			}
+		}
+		return fmt.Sprintf("plan: %d schema violations: %s", len(e.Violations), strings.Join(parts, "; "))
+	}
 	if e.Path == "" || e.Path == "/" {
 		return "plan: schema violation: " + e.Message
 	}
@@ -130,19 +153,30 @@ func Validate(data []byte) error {
 	return nil
 }
 
-// schemaErrorFrom collapses a jsonschema.ValidationError tree to
-// the most actionable leaf. Mirrors the helper in
+// schemaErrorFrom collects all leaf-level failures from a
+// jsonschema.ValidationError tree. Mirrors the helper in
 // backend/internal/plan; kept independent so each side stays
 // self-contained.
 func schemaErrorFrom(verr *jsonschema.ValidationError) *SchemaError {
-	leaf := deepestLeaf(verr)
-	loc := leaf.InstanceLocation
-	if len(loc) == 0 {
-		loc = []string{""}
+	leaves := allLeaves(verr)
+	if len(leaves) == 0 {
+		leaves = []*jsonschema.ValidationError{verr}
+	}
+	violations := make([]SchemaViolation, 0, len(leaves))
+	for _, leaf := range leaves {
+		loc := leaf.InstanceLocation
+		if len(loc) == 0 {
+			loc = []string{""}
+		}
+		violations = append(violations, SchemaViolation{
+			Path:    "/" + joinPointer(loc),
+			Message: kindMessage(leaf),
+		})
 	}
 	return &SchemaError{
-		Path:    "/" + joinPointer(loc),
-		Message: kindMessage(leaf),
+		Path:       violations[0].Path,
+		Message:    violations[0].Message,
+		Violations: violations,
 	}
 }
 
@@ -154,13 +188,26 @@ func kindMessage(v *jsonschema.ValidationError) string {
 	return full
 }
 
-func deepestLeaf(v *jsonschema.ValidationError) *jsonschema.ValidationError {
-	for _, c := range v.Causes {
-		if len(c.InstanceLocation) >= len(v.InstanceLocation) {
-			return deepestLeaf(c)
+// allLeaves collects every terminal node from a ValidationError tree.
+// A node is terminal when none of its children have an InstanceLocation
+// at least as long as the node's own. Mirrors backend/internal/plan.
+func allLeaves(v *jsonschema.ValidationError) []*jsonschema.ValidationError {
+	var out []*jsonschema.ValidationError
+	var walk func(node *jsonschema.ValidationError)
+	walk = func(node *jsonschema.ValidationError) {
+		hasDeeper := false
+		for _, c := range node.Causes {
+			if len(c.InstanceLocation) >= len(node.InstanceLocation) {
+				hasDeeper = true
+				walk(c)
+			}
+		}
+		if !hasDeeper {
+			out = append(out, node)
 		}
 	}
-	return v
+	walk(v)
+	return out
 }
 
 func joinPointer(parts []string) string {
