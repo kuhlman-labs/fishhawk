@@ -23,6 +23,25 @@ The canonical schema is [`plan-standard-v1.schema.json`](plan-standard-v1.schema
 
 This annotation does not affect validation (see §10.3). It is a contract signal for schema authors: the soak period during which the field is optional must be declared in the introducing PR body before the required promotion is merged.
 
+**`x-coerce-principal` / `x-coerce-defaults` annotations** — non-standard JSON Schema keywords on `$defs` entries that opt a definition into server-side coercion. When a bare string appears where the schema expects an object, `TryCoerce` uses these annotations to reconstruct the object automatically:
+
+- `x-coerce-principal` (string): the property name that receives the bare string value.
+- `x-coerce-defaults` (object): default values for all other required properties. The sentinel `"<<runtime:now>>"` on any string value is replaced with the upload timestamp at runtime.
+
+Example — adding coercion to a new `$defs` entry:
+
+```json
+"my-object": {
+  "type": "object",
+  "required": ["name", "kind"],
+  "x-coerce-principal": "name",
+  "x-coerce-defaults": {"kind": "default"},
+  "properties": { ... }
+}
+```
+
+Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs` entry is automatically registered at package init — no code change to `TryCoerce` is required. Both `x-coerce-principal` and `x-coerce-defaults` are collected as annotations per JSON Schema Draft 2020-12 §10.3 and do not affect validation.
+
 **Removals** follow a longer deprecation window — duration TBD. No fields have been removed from `standard_v1`.
 
 ## Top-level shape
@@ -228,6 +247,7 @@ The backend applies a narrow set of coercions when an agent emits a bare string 
 
 | Path | Coerced to |
 |---|---|
+| `/ticket_reference` (bare string `s`) | `{"type": "github_issue", "url": s, "id": "unknown"}` |
 | `/generated_by` (bare string `s`) | `{"agent": s, "model": "unknown", "timestamp": "<upload-time>"}` |
 | `/scope/files[i]` (bare string `s`) | `{"path": s, "operation": "modify"}` |
 | `/decomposition/sub_plans[i]` (bare string `s`) | `{"title": s, "scope_hint": "", "predicted_runtime_minutes": 1, "predicted_runtime_confidence": "low"}` |

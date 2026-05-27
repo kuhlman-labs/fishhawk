@@ -146,6 +146,71 @@ func TestTryCoerce_IntegerScopeFile(t *testing.T) {
 	}
 }
 
+// TestTryCoerce_TicketReferenceString verifies that a bare URL string at
+// /ticket_reference is wrapped into the canonical ticket_reference object shape.
+func TestTryCoerce_TicketReferenceString(t *testing.T) {
+	m := planfixture.Valid()
+	m["ticket_reference"] = "https://github.com/x/y/issues/547"
+	data := marshal(t, m)
+
+	coercedBytes, coercions, err := plan.TryCoerce(data, testNow)
+	if err != nil {
+		t.Fatalf("TryCoerce: unexpected error: %v", err)
+	}
+	if len(coercions) != 1 {
+		t.Fatalf("coercions = %d, want 1", len(coercions))
+	}
+	if got := coercions[0].FieldPath; got != "/ticket_reference" {
+		t.Errorf("FieldPath = %q, want /ticket_reference", got)
+	}
+	if got := coercions[0].OriginalType; got != "string" {
+		t.Errorf("OriginalType = %q, want string", got)
+	}
+	if got, ok := coercions[0].OriginalValue.(string); !ok || got != "https://github.com/x/y/issues/547" {
+		t.Errorf("OriginalValue = %v, want string \"https://github.com/x/y/issues/547\"", coercions[0].OriginalValue)
+	}
+	if coercedBytes == nil {
+		t.Fatal("coercedBytes is nil")
+	}
+	if err := plan.Validate(coercedBytes); err != nil {
+		t.Errorf("coerced plan does not validate: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(coercedBytes, &result); err != nil {
+		t.Fatalf("unmarshal coerced: %v", err)
+	}
+	tr, _ := result["ticket_reference"].(map[string]any)
+	if tr["url"] != "https://github.com/x/y/issues/547" {
+		t.Errorf("ticket_reference.url = %v, want https://github.com/x/y/issues/547", tr["url"])
+	}
+	if tr["type"] != "github_issue" {
+		t.Errorf("ticket_reference.type = %v, want github_issue", tr["type"])
+	}
+	if tr["id"] != "unknown" {
+		t.Errorf("ticket_reference.id = %v, want unknown", tr["id"])
+	}
+}
+
+// TestTryCoerce_IntegerTicketReference verifies that a non-string type at
+// /ticket_reference (an integer) is not coercible and propagates a non-nil
+// error — the caller falls through to the existing rejection path.
+func TestTryCoerce_IntegerTicketReference(t *testing.T) {
+	m := planfixture.Valid()
+	m["ticket_reference"] = 42
+	data := marshal(t, m)
+
+	coercedBytes, coercions, err := plan.TryCoerce(data, testNow)
+	if coercedBytes != nil {
+		t.Errorf("coercedBytes = non-nil, want nil for non-coercible type")
+	}
+	if len(coercions) != 0 {
+		t.Errorf("coercions = %d, want 0", len(coercions))
+	}
+	if err == nil {
+		t.Error("err = nil, want non-nil: integer is not coercible and original schema error should propagate")
+	}
+}
+
 // TestTryCoerce_AlreadyValid verifies a plan that already satisfies the
 // schema produces (nil, nil, nil) — caller MUST keep the original bytes
 // unchanged so the content hash signed by the runner remains stable.
