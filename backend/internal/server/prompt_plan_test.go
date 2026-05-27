@@ -146,9 +146,19 @@ func (r *planArtifactRepo) Create(_ context.Context, _ artifact.CreateParams) (*
 
 // planAuditRepo records appended entries; the implement-prompt
 // handler emits `plan_missing_for_implement` when the plan isn't
-// found, and the test asserts that.
+// found, and the test asserts that. byRunCategory supports seeding
+// canned entries for ListForRunByCategory.
 type planAuditRepo struct {
-	appended []audit.ChainAppendParams
+	appended      []audit.ChainAppendParams
+	byRunCategory map[string][]*audit.Entry
+}
+
+func (a *planAuditRepo) seedByCategory(runID uuid.UUID, category string, entries ...*audit.Entry) {
+	if a.byRunCategory == nil {
+		a.byRunCategory = map[string][]*audit.Entry{}
+	}
+	key := runID.String() + ":" + category
+	a.byRunCategory[key] = append(a.byRunCategory[key], entries...)
 }
 
 func (a *planAuditRepo) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
@@ -178,7 +188,13 @@ func (a *planAuditRepo) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 func (a *planAuditRepo) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, error) {
 	return nil, nil
 }
-func (a *planAuditRepo) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
+func (a *planAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.byRunCategory != nil {
+		key := runID.String() + ":" + category
+		if entries, ok := a.byRunCategory[key]; ok {
+			return entries, nil
+		}
+	}
 	return nil, nil
 }
 func (a *planAuditRepo) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
@@ -570,6 +586,84 @@ func TestHandleGetStagePromptRender_BudgetContext(t *testing.T) {
 	}
 	if strings.Contains(planResp.Prompt, "### Budget context") {
 		t.Errorf("plan-stage prompt should not contain Budget context section:\n%s", planResp.Prompt)
+	}
+}
+
+func TestImplementPrompt_ApprovalConditions_Rendered(t *testing.T) {
+	// Seed a run with an approval_submitted entry carrying decision=approve
+	// and a non-empty comment. The implement-stage prompt must contain the
+	// "Approval conditions" section with the comment verbatim.
+	s, rr, ar, au, sf, gh := newImplementPromptServer(t)
+	runID, planStageID, implStageID, _ := seedRunWithStages(rr)
+
+	v := "standard_v1"
+	ar.seed(planStageID, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       fixturePlanJSON(t),
+		ContentHash:   "conditions-test",
+		CreatedAt:     time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC),
+	})
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "ctx"}
+
+	approveComment := "add the cross-branch rejection test"
+	payload, _ := json.Marshal(map[string]any{
+		"decision": "approve",
+		"comment":  approveComment,
+	})
+	au.seedByCategory(runID, "approval_submitted", &audit.Entry{
+		ID:       uuid.New(),
+		Payload:  payload,
+		Category: "approval_submitted",
+	})
+
+	priv, _ := sf.issue(t, runID)
+	w := promptRequestForStage(t, s, runID, implStageID, priv)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Approval conditions", approveComment} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+}
+
+func TestImplementPrompt_ApprovalConditions_AbsentWhenNoComment(t *testing.T) {
+	// No approval_submitted entry with a comment → "Approval conditions"
+	// section must not appear.
+	s, rr, ar, _, sf, gh := newImplementPromptServer(t)
+	runID, planStageID, implStageID, _ := seedRunWithStages(rr)
+
+	v := "standard_v1"
+	ar.seed(planStageID, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       fixturePlanJSON(t),
+		ContentHash:   "no-conditions-test",
+		CreatedAt:     time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC),
+	})
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "ctx"}
+
+	priv, _ := sf.issue(t, runID)
+	w := promptRequestForStage(t, s, runID, implStageID, priv)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(resp.Prompt, "Approval conditions") {
+		t.Errorf("Approval conditions section should not appear when no approve comment exists:\n%s", resp.Prompt)
 	}
 }
 

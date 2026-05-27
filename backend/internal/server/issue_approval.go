@@ -322,6 +322,9 @@ func (s *Server) writeSlashApprovalAudit(ctx context.Context, stage *run.Stage, 
 	if app.Decision == approval.DecisionReject && comment != "" {
 		auditPayload["rejection_comment"] = comment
 	}
+	if app.Decision == approval.DecisionApprove && comment != "" {
+		auditPayload["comment"] = comment
+	}
 	payload, _ := json.Marshal(auditPayload)
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        stage.RunID,
