@@ -80,6 +80,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["type", "url", "id"],
+      "x-coerce-principal": "url",
+      "x-coerce-defaults": {"type": "github_issue", "id": "unknown"},
       "properties": {
         "type": {
           "type": "string",
@@ -103,6 +105,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["agent", "model", "timestamp"],
+      "x-coerce-principal": "agent",
+      "x-coerce-defaults": {"model": "unknown", "timestamp": "<<runtime:now>>"},
       "properties": {
         "agent": {
           "type": "string",
@@ -149,6 +153,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["path", "operation"],
+      "x-coerce-principal": "path",
+      "x-coerce-defaults": {"operation": "modify"},
       "properties": {
         "path": {
           "type": "string",
@@ -200,6 +206,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["title", "scope_hint", "predicted_runtime_minutes", "predicted_runtime_confidence"],
+      "x-coerce-principal": "title",
+      "x-coerce-defaults": {"scope_hint": "", "predicted_runtime_minutes": 1, "predicted_runtime_confidence": "low"},
       "properties": {
         "title": {
           "type": "string",
