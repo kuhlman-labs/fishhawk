@@ -175,7 +175,7 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 
-	s.writeSlashApprovalAudit(ctx, advanced, res.Approval)
+	s.writeSlashApprovalAudit(ctx, advanced, res.Approval, p.Comment)
 
 	if s.cfg.Orchestrator != nil {
 		if _, err := s.cfg.Orchestrator.Advance(ctx, advanced.RunID); err != nil {
@@ -310,15 +310,19 @@ func (s *Server) authorizeSlashApprover(ctx context.Context, stage *run.Stage, s
 // writeSlashApprovalAudit mirrors writeApprovalAudit's chain entry
 // — same category, same payload shape — so audit consumers don't
 // care which surface produced the row.
-func (s *Server) writeSlashApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval) {
+func (s *Server) writeSlashApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment string) {
 	systemKind := audit.ActorKind("user")
 	approver := app.ApproverSubject
-	payload, _ := json.Marshal(map[string]any{
+	auditPayload := map[string]any{
 		"stage_id": stage.ID.String(),
 		"decision": string(app.Decision),
 		"surface":  string(app.Surface),
 		"approver": approver,
-	})
+	}
+	if app.Decision == approval.DecisionReject && comment != "" {
+		auditPayload["rejection_comment"] = comment
+	}
+	payload, _ := json.Marshal(auditPayload)
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        stage.RunID,
 		StageID:      &stage.ID,

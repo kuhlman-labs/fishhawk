@@ -607,6 +607,65 @@ func TestBuild_Implement_BudgetContext_DefaultBudget(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_PriorRejectionFeedback_Rendered(t *testing.T) {
+	feedback := "The plan lacked sufficient test coverage for edge cases."
+	got, err := Build("plan", Trigger{
+		IssueNumber:            7,
+		Repo:                   "x/y",
+		PriorRejectionFeedback: &feedback,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Prior plan-stage rejection feedback",
+		"The operator rejected the most recent plan for this issue",
+		"You MUST address this feedback in your new plan",
+		feedback,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Plan_PriorRejectionFeedback_Nil_SectionAbsent(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		// PriorRejectionFeedback deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Prior plan-stage rejection feedback") {
+		t.Errorf("plan prompt should not contain rejection feedback section when nil:\n%s", got)
+	}
+}
+
+func TestBuild_Plan_PriorRejectionFeedback_Truncated(t *testing.T) {
+	// Input of 5000 bytes should be capped at 4000 bytes with the truncation suffix.
+	// Cap is 4000 (not 2000) because real rejection rationales run 2-4KB —
+	// substantive operator feedback shouldn't lose its actionable tail.
+	longFeedback := strings.Repeat("x", 5000)
+	got, err := Build("plan", Trigger{
+		IssueNumber:            7,
+		Repo:                   "x/y",
+		PriorRejectionFeedback: &longFeedback,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "...[truncated]") {
+		t.Errorf("plan prompt missing truncation suffix:\n%s", got)
+	}
+	// The full 5000-char string must not appear verbatim.
+	if strings.Contains(got, longFeedback) {
+		t.Errorf("untruncated long feedback appeared in prompt")
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop
