@@ -491,6 +491,43 @@ func TestWarnings_ExpensiveTestStrategy(t *testing.T) {
 	}
 }
 
+func TestSchemaError_MultiViolation(t *testing.T) {
+	// approach must be an array of step-objects; verification must be an
+	// object. Providing bare strings for both should produce violations at
+	// both /approach and /verification rather than only the first one.
+	_, err := plan.Parse([]byte(`{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://x", "id": "x"},
+  "generated_by": {"agent": "a", "model": "m", "timestamp": "2026-01-01T00:00:00Z"},
+  "summary": "x",
+  "scope": {"files": [{"path": "a.go", "operation": "create"}]},
+  "approach": "should be an array",
+  "verification": "should be an object",
+  "predicted_runtime_minutes": 10,
+  "predicted_runtime_confidence": "medium"
+}`))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	hasApproach := false
+	hasVerification := false
+	for _, v := range se.Violations {
+		if v.Path == "/approach" {
+			hasApproach = true
+		}
+		if v.Path == "/verification" {
+			hasVerification = true
+		}
+	}
+	if !hasApproach {
+		t.Errorf("Violations missing /approach entry; got %+v", se.Violations)
+	}
+	if !hasVerification {
+		t.Errorf("Violations missing /verification entry; got %+v", se.Violations)
+	}
+}
+
 func TestSemanticError_FormatsMessage(t *testing.T) {
 	err := &plan.SemanticError{Message: "duplicate title \"Foo\""}
 	want := "plan: semantic: duplicate title \"Foo\""

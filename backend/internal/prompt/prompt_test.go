@@ -756,6 +756,31 @@ func TestBuild_Implement_ScopeConstraint_AppearsBeforePlan(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_CompoundFieldDirective(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The compound-field directive must explicitly name approach and
+	// verification so agents don't produce bare-string values for
+	// these structured fields.
+	wants := []string{
+		"Compound-field shape rule",
+		"approach",
+		"verification",
+		"bare string",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing compound-field directive string %q\n---\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop

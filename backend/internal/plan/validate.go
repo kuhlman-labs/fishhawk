@@ -188,19 +188,31 @@ func Warnings(p *Plan) []string {
 	return warns
 }
 
-// schemaErrorFrom collapses a jsonschema.ValidationError tree to the
-// most actionable leaf for callers. Mirrors the helper in the spec
-// package (kept independent rather than DRY-extracted to keep the
-// schema packages self-contained).
+// schemaErrorFrom collects all leaf-level failures from a
+// jsonschema.ValidationError tree and returns a SchemaError whose
+// Violations field enumerates every broken field. The primary Path and
+// Message come from Violations[0] for backward compat with callers that
+// only read those two fields.
 func schemaErrorFrom(verr *jsonschema.ValidationError) *SchemaError {
-	leaf := deepestLeaf(verr)
-	loc := leaf.InstanceLocation
-	if len(loc) == 0 {
-		loc = []string{""}
+	leaves := allLeaves(verr)
+	if len(leaves) == 0 {
+		leaves = []*jsonschema.ValidationError{verr}
+	}
+	violations := make([]SchemaViolation, 0, len(leaves))
+	for _, leaf := range leaves {
+		loc := leaf.InstanceLocation
+		if len(loc) == 0 {
+			loc = []string{""}
+		}
+		violations = append(violations, SchemaViolation{
+			Path:    "/" + joinPointer(loc),
+			Message: kindMessage(leaf),
+		})
 	}
 	return &SchemaError{
-		Path:    "/" + joinPointer(loc),
-		Message: kindMessage(leaf),
+		Path:       violations[0].Path,
+		Message:    violations[0].Message,
+		Violations: violations,
 	}
 }
 
@@ -212,13 +224,28 @@ func kindMessage(v *jsonschema.ValidationError) string {
 	return full
 }
 
-func deepestLeaf(v *jsonschema.ValidationError) *jsonschema.ValidationError {
-	for _, c := range v.Causes {
-		if len(c.InstanceLocation) >= len(v.InstanceLocation) {
-			return deepestLeaf(c)
+// allLeaves collects every terminal node from a ValidationError tree.
+// A node is terminal when none of its children have an InstanceLocation
+// at least as long as the node's own (i.e., no children at a deeper or
+// equal schema path). This produces one entry per independently broken
+// field rather than only the first path the old deepestLeaf walked.
+func allLeaves(v *jsonschema.ValidationError) []*jsonschema.ValidationError {
+	var out []*jsonschema.ValidationError
+	var walk func(node *jsonschema.ValidationError)
+	walk = func(node *jsonschema.ValidationError) {
+		hasDeeper := false
+		for _, c := range node.Causes {
+			if len(c.InstanceLocation) >= len(node.InstanceLocation) {
+				hasDeeper = true
+				walk(c)
+			}
+		}
+		if !hasDeeper {
+			out = append(out, node)
 		}
 	}
-	return v
+	walk(v)
+	return out
 }
 
 func joinPointer(parts []string) string {

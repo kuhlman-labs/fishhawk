@@ -95,6 +95,35 @@ func TestSchemaErrorFormatting(t *testing.T) {
 	}
 }
 
+func TestSchemaError_MultiViolation(t *testing.T) {
+	// approach must be an array; verification must be an object.
+	// Both as bare strings should produce violations at both paths.
+	m := planfixture.Valid(func(m map[string]any) {
+		m["approach"] = "should be an array"
+		m["verification"] = "should be an object"
+	})
+	var serr *SchemaError
+	if err := Validate(fixtureJSON(t, m)); !errors.As(err, &serr) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	hasApproach := false
+	hasVerification := false
+	for _, v := range serr.Violations {
+		if v.Path == "/approach" {
+			hasApproach = true
+		}
+		if v.Path == "/verification" {
+			hasVerification = true
+		}
+	}
+	if !hasApproach {
+		t.Errorf("Violations missing /approach entry; got %+v", serr.Violations)
+	}
+	if !hasVerification {
+		t.Errorf("Violations missing /verification entry; got %+v", serr.Violations)
+	}
+}
+
 func TestParseErrorUnwrap(t *testing.T) {
 	cause := errors.New("underlying")
 	pe := &ParseError{Msg: "wrapped", Cause: cause}
