@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -9,14 +10,110 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
+
+// fakePlanReviewer records each Review invocation and returns a canned verdict.
+type fakePlanReviewer struct {
+	mu      sync.Mutex
+	calls   []string
+	verdict *planreview.ReviewVerdict
+	model   string
+	err     error
+}
+
+func (f *fakePlanReviewer) Review(_ context.Context, promptText string) (*planreview.ReviewVerdict, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, promptText)
+	if f.err != nil {
+		return nil, "", f.err
+	}
+	return f.verdict, f.model, nil
+}
+
+// reviewers YAML fragments for plan stage specs. These are complete
+// minimal workflow specs accepted by spec.ParseBytes.
+var (
+	specGatingReviewers = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+
+	specAdvisoryReviewers = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+
+	specNoReviewers = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+)
+
+// newPlanServerWithReviewer builds a plan server that also wires a
+// PlanReviewer, run data (for GetRun), and a workflow spec on the run.
+func newPlanServerWithReviewer(t *testing.T, runID, stageID uuid.UUID, reviewer PlanReviewer, workflowSpec []byte) (*Server, *signingFake, *fakeArtifactRepo, *auditFake, *promptRunRepo) {
+	t.Helper()
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID}
+	rr.getRuns[runID] = &run.Run{
+		ID:           runID,
+		Repo:         "kuhlman-labs/example",
+		WorkflowID:   "feature_change",
+		WorkflowSpec: workflowSpec,
+	}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		ArtifactRepo: ar,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		PlanReviewer: reviewer,
+	})
+	return s, sf, ar, au, rr
+}
 
 // validPlanBytes returns a minimal standard_v1 plan that satisfies
 // the schema. The same fixture is used across happy / idempotency
@@ -334,5 +431,255 @@ func TestShipPlan_Unconfigured_503(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+// --- Plan-review integration tests (ADR-027 Sub-plan D) ---
+
+// TestShipPlan_ReviewAgents_Gateless_NilReviewer confirms that when
+// PlanReviewer is nil, no plan_reviewed audit entries are written and
+// the upload still returns 201.
+func TestShipPlan_ReviewAgents_Gateless_NilReviewer(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	// PlanReviewer is nil → gateless regardless of spec
+	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, nil, specGatingReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// Only plan_generated entry; no plan_reviewed.
+	for _, e := range au.appended {
+		if e.Category == "plan_reviewed" {
+			t.Errorf("unexpected plan_reviewed audit entry when PlanReviewer is nil")
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_Gateless_NoReviewersInSpec confirms that
+// when the spec has no reviewers (agent==0), no plan_reviewed entries
+// are written even when PlanReviewer is configured.
+func TestShipPlan_ReviewAgents_Gateless_NoReviewersInSpec(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specNoReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// Reviewer must not have been called.
+	reviewer.mu.Lock()
+	callCount := len(reviewer.calls)
+	reviewer.mu.Unlock()
+	if callCount != 0 {
+		t.Errorf("reviewer called %d times, want 0 (no reviewers in spec)", callCount)
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_reviewed" {
+			t.Errorf("unexpected plan_reviewed audit entry when spec has agent=0")
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_Advisory_RecordsVerdictDoesNotBlock verifies
+// that in advisory mode (agent>0 && human>0) a reject verdict is recorded
+// in the audit log but does NOT transition the stage to failed-B.
+func TestShipPlan_ReviewAgents_Advisory_RecordsVerdictDoesNotBlock(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict: planreview.VerdictReject,
+			Concerns: []planreview.Concern{
+				{Severity: planreview.SeverityHigh, Category: "scope", Note: "missing files"},
+			},
+		},
+		// Different model from planfixture.Valid() "claude-opus-4-7" so
+		// self-review WARN doesn't fire in this advisory-mode test.
+		model: "claude-sonnet-4-6",
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// plan_reviewed audit entry must exist.
+	var reviewedEntries []planreview.PlanReviewedPayload
+	for _, e := range au.appended {
+		if e.Category != "plan_reviewed" {
+			continue
+		}
+		var p planreview.PlanReviewedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_reviewed payload: %v", err)
+		}
+		reviewedEntries = append(reviewedEntries, p)
+	}
+	if len(reviewedEntries) != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1", len(reviewedEntries))
+	}
+	got := reviewedEntries[0]
+	if got.Verdict != planreview.VerdictReject {
+		t.Errorf("verdict = %q, want reject", got.Verdict)
+	}
+	if got.ReviewerKind != "agent" {
+		t.Errorf("reviewer_kind = %q, want agent", got.ReviewerKind)
+	}
+	if got.Authority != planreview.AuthorityAdvisory {
+		t.Errorf("authority = %q, want advisory", got.Authority)
+	}
+
+	// Advisory mode: stage must NOT be transitioned to failed-B.
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("advisory: stage should not be transitioned to failed-B on reject")
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_GatingReject_StageFailedB verifies that in
+// gating mode (agent>0 && human==0) a reject verdict transitions the
+// stage to failed-B so trace-driven awaiting_approval is blocked.
+func TestShipPlan_ReviewAgents_GatingReject_StageFailedB(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictReject,
+			FreeForm: "plan is incomplete",
+		},
+		// Different model from planfixture.Valid() "claude-opus-4-7".
+		model: "claude-sonnet-4-6",
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	// Upload still returns 201 — the plan artifact is stored.
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// plan_reviewed audit entry with gating authority.
+	var sawReviewed bool
+	for _, e := range au.appended {
+		if e.Category != "plan_reviewed" {
+			continue
+		}
+		sawReviewed = true
+		var p planreview.PlanReviewedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_reviewed payload: %v", err)
+		}
+		if p.Authority != planreview.AuthorityGating {
+			t.Errorf("authority = %q, want gating", p.Authority)
+		}
+		if p.Verdict != planreview.VerdictReject {
+			t.Errorf("verdict = %q, want reject", p.Verdict)
+		}
+	}
+	if !sawReviewed {
+		t.Error("no plan_reviewed audit entry found")
+	}
+
+	// Gating reject: stage must be transitioned to failed-B.
+	var found bool
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID != stageID || call.To != run.StageStateFailed {
+			continue
+		}
+		found = true
+		if call.Completion == nil || call.Completion.FailureCategory == nil ||
+			*call.Completion.FailureCategory != run.FailureB {
+			t.Errorf("FailureCategory = %v, want B", call.Completion.FailureCategory)
+		}
+		if call.Completion.FailureReason == nil ||
+			!strings.Contains(*call.Completion.FailureReason, "plan_review_rejected") {
+			t.Errorf("FailureReason = %v, want plan_review_rejected prefix", call.Completion.FailureReason)
+		}
+	}
+	if !found {
+		t.Error("gating reject: stage was not transitioned to failed-B")
+	}
+}
+
+// TestShipPlan_ReviewAgents_GatingApprove_StageNotFailed verifies that
+// in gating mode an approve verdict does NOT fail the stage.
+func TestShipPlan_ReviewAgents_GatingApprove_StageNotFailed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		// Different model from planfixture.Valid() "claude-opus-4-7".
+		model: "claude-sonnet-4-6",
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// plan_reviewed audit entry exists.
+	var sawReviewed bool
+	for _, e := range au.appended {
+		if e.Category == "plan_reviewed" {
+			sawReviewed = true
+		}
+	}
+	if !sawReviewed {
+		t.Error("no plan_reviewed audit entry found on approve")
+	}
+
+	// No failed-B transition.
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("gating approve: stage should NOT be transitioned to failed-B")
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_SelfReviewLogsWarn verifies that when the
+// reviewer model matches the plan author model, the server logs a WARN
+// but still records the verdict (no block).
+func TestShipPlan_ReviewAgents_SelfReviewLogsWarn(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	// Model matches planfixture.Valid() generated_by.model ("claude-opus-4-7").
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7", // same as planfixture.Valid generated_by.model
+	}
+	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (self-review is warn-only):\n%s", w.Code, w.Body.String())
+	}
+
+	// Verdict is still recorded despite self-review.
+	var sawReviewed bool
+	for _, e := range au.appended {
+		if e.Category == "plan_reviewed" {
+			sawReviewed = true
+		}
+	}
+	if !sawReviewed {
+		t.Error("plan_reviewed entry missing — self-review guard should warn but not skip")
 	}
 }
