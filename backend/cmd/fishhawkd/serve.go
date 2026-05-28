@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -129,6 +130,15 @@ func runServe(args []string, logSink io.Writer) int {
 	planReviewModel := fs.String("plan-review-model",
 		envOr("FISHHAWKD_PLAN_REVIEW_MODEL", "claude-sonnet-4-6"),
 		"Anthropic model to use for plan-review agent invocations")
+	enableLocalClaudeReviewer := fs.Bool("enable-local-claude-reviewer",
+		envOr("FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER", "false") == "true",
+		"opt-in local-mode plan review: spawn the `claude` CLI as a subprocess instead of calling the Anthropic API. Ignored when --anthropic-api-key is set. Off by default")
+	localClaudeBinary := fs.String("local-claude-binary",
+		envOr("FISHHAWKD_LOCAL_CLAUDE_BINARY", "claude"),
+		"executable name or path for the local-mode `claude` CLI; used only when --enable-local-claude-reviewer is set")
+	localClaudeModel := fs.String("local-claude-model",
+		envOr("FISHHAWKD_LOCAL_CLAUDE_MODEL", "claude-sonnet-4-6"),
+		"model the local-mode `claude` CLI uses for plan review; used only when --enable-local-claude-reviewer is set")
 	planReviewMaxTokens := fs.Int("plan-review-max-tokens",
 		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_TOKENS", 4096),
 		"maximum tokens for plan-review agent responses")
@@ -144,11 +154,16 @@ func runServe(args []string, logSink io.Writer) int {
 
 	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL}
 
-	// Plan-review agent wiring. When an API key is present, construct the
-	// Anthropic SDK adapter and assign it to cfg.PlanReviewer. Without a key
-	// the field stays nil and review invocations are skipped regardless of the
-	// workflow spec's reviewers.agent value (gateless behaviour).
-	if *anthropicAPIKey != "" {
+	// Plan-review agent wiring. Selection precedence (each branch logs which
+	// adapter is active at startup):
+	//   1. --anthropic-api-key set → anthropic.Reviewer (production SDK adapter, #572).
+	//   2. else --enable-local-claude-reviewer → claudecode.Reviewer (local-mode
+	//      subprocess adapter, #575): reuses the operator's existing `claude`
+	//      CLI auth, no API key needed.
+	//   3. else PlanReviewer stays nil and review invocations are skipped
+	//      regardless of the spec's reviewers.agent value.
+	switch {
+	case *anthropicAPIKey != "":
 		cfg.PlanReviewer = anthropic.NewReviewer(anthropic.Config{
 			APIKey:    *anthropicAPIKey,
 			Model:     *planReviewModel,
@@ -156,16 +171,30 @@ func runServe(args []string, logSink io.Writer) int {
 			Timeout:   *planReviewTimeout,
 		})
 		logger.Info("plan review agent configured",
+			slog.String("adapter", "anthropic"),
 			slog.String("model", *planReviewModel),
 			slog.Int("max_tokens", *planReviewMaxTokens),
 			slog.Duration("timeout", *planReviewTimeout))
-	} else {
+	case *enableLocalClaudeReviewer:
+		cfg.PlanReviewer = claudecode.NewReviewer(claudecode.Config{
+			Binary:    *localClaudeBinary,
+			Model:     *localClaudeModel,
+			MaxTokens: *planReviewMaxTokens,
+			Timeout:   *planReviewTimeout,
+		})
+		logger.Info("plan review agent configured",
+			slog.String("adapter", "claudecode"),
+			slog.String("binary", *localClaudeBinary),
+			slog.String("model", *localClaudeModel),
+			slog.Int("max_tokens", *planReviewMaxTokens),
+			slog.Duration("timeout", *planReviewTimeout))
+	default:
 		// #574 / ADR-027: tightened from the plain "gateless" warning so
 		// the operator can predict what a workflow declaring
 		// reviewers.agent > 0 will do with no reviewer wired — fail
 		// dispatch up front in gating mode, skip with an audit trail in
 		// advisory mode.
-		logger.Warn("plan-review agent not configured (set FISHHAWKD_ANTHROPIC_API_KEY to enable); any workflow declaring reviewers.agent > 0 will fail dispatch in gating mode and skip with a plan_review_skipped audit entry in advisory mode")
+		logger.Warn("plan-review agent not configured (set FISHHAWKD_ANTHROPIC_API_KEY, or FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER for local mode, to enable); any workflow declaring reviewers.agent > 0 will fail dispatch in gating mode and skip with a plan_review_skipped audit entry in advisory mode")
 	}
 
 	// Wire the run repository when a DB URL is supplied. Without
