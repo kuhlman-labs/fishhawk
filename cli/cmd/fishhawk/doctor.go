@@ -55,6 +55,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 
 	checks := []checkResult{
+		checkDockerDaemon(),
+		checkPostgresContainer(),
+		checkMinioContainer(),
 		checkBackend(*cf.backendURL),
 		checkToken(*cf.backendURL, *cf.token),
 		checkSpec(*workingDir),
@@ -122,6 +125,62 @@ func isTerminal(w io.Writer) bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// checkDockerDaemon verifies the Docker daemon is reachable via `docker info`.
+func checkDockerDaemon() checkResult {
+	label := "docker daemon running"
+	_, err := doctorRunOutput("docker", "info")
+	if err != nil {
+		return checkResult{label: label, detail: "daemon not reachable", status: "fail",
+			remediate: "run: open -a Docker, wait ~20s, then retry"}
+	}
+	return checkResult{label: label, detail: "ok", status: "ok"}
+}
+
+// checkPostgresContainer verifies the fishhawk-postgres container is running
+// and accepting connections.
+func checkPostgresContainer() checkResult {
+	label := "postgres container"
+	out, err := doctorRunOutput("docker", "ps", "--filter", "name=^/fishhawk-postgres$", "--format", "{{.Names}}")
+	if err != nil || strings.TrimSpace(out) == "" {
+		return checkResult{label: label, detail: "not running", status: "fail",
+			remediate: "run: docker compose up -d"}
+	}
+	_, pgErr := doctorRunOutput("pg_isready", "-h", "localhost", "-p", "5432")
+	if pgErr != nil {
+		return checkResult{label: label, detail: "container up, postgres initialising", status: "warn",
+			remediate: "postgres container is up but not yet accepting connections; wait and retry"}
+	}
+	return checkResult{label: label, detail: "accepting connections", status: "ok"}
+}
+
+// checkMinioContainer verifies the fishhawk-minio container is running and
+// its health endpoint returns 200.
+func checkMinioContainer() checkResult {
+	label := "minio container"
+	out, err := doctorRunOutput("docker", "ps", "--filter", "name=^/fishhawk-minio$", "--format", "{{.Names}}")
+	if err != nil || strings.TrimSpace(out) == "" {
+		return checkResult{label: label, detail: "not running", status: "fail",
+			remediate: "run: docker compose up -d"}
+	}
+	// Port 9000 is hardcoded; if .env overrides MINIO_PORT this rung will not read it (v1 limitation).
+	req, reqErr := http.NewRequest(http.MethodGet, "http://localhost:9000/minio/health/live", nil)
+	if reqErr != nil {
+		return checkResult{label: label, detail: reqErr.Error(), status: "warn",
+			remediate: "minio container is up but health probe failed; check logs with docker logs fishhawk-minio"}
+	}
+	resp, doErr := doctorHTTPDo(req)
+	if doErr != nil {
+		return checkResult{label: label, detail: "container up, health probe failed", status: "warn",
+			remediate: "minio container is up but health probe failed; check logs with docker logs fishhawk-minio"}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return checkResult{label: label, detail: fmt.Sprintf("container up, health probe returned HTTP %d", resp.StatusCode), status: "warn",
+			remediate: "minio container is up but health probe failed; check logs with docker logs fishhawk-minio"}
+	}
+	return checkResult{label: label, detail: "healthy", status: "ok"}
 }
 
 // checkBackend probes GET {backendURL}/healthz and shows the version on success.

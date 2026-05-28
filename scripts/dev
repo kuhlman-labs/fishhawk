@@ -122,8 +122,10 @@ _build_binary() {
 
 cmd_up() {
   local force_all=0
+  local start_deps=0
   for arg in "$@"; do
     [[ "$arg" == "--all" ]] && force_all=1
+    [[ "$arg" == "--start-deps" ]] && start_deps=1
   done
 
   # Idempotency: bail if already running
@@ -150,17 +152,43 @@ cmd_up() {
     print "warning: .env not found — using current shell environment"
   fi
 
-  # Dependency health checks
-  if _pg_ready; then
-    print "postgres: ready"
-  else
-    print "warning: postgres not reachable — fishhawkd may fail to start"
+  # TCC preflight (macOS Full Disk Access)
+  if ! stat -- "${REPO_ROOT}/README.md" >/dev/null 2>/tmp/_dev_stat_err; then
+    if grep -q 'Operation not permitted' /tmp/_dev_stat_err 2>/dev/null; then
+      _die "no read access to the repo — grant Claude Code Full Disk Access in System Settings > Privacy & Security > Full Disk Access, then restart Claude Code"
+    fi
   fi
 
-  if _minio_ready; then
-    print "minio: ready"
+  # Docker daemon preflight
+  if ! docker info &>/dev/null 2>&1; then
+    _die 'Docker daemon not running — run "open -a Docker" and wait ~20s, then retry'
+  fi
+
+  # Containers preflight — check each independently, but run docker compose up -d at most once.
+  local pg_running=0 minio_running=0
+  [[ -n "$(docker ps --filter 'name=^/fishhawk-postgres$' --format '{{.Names}}')" ]] && pg_running=1
+  [[ -n "$(docker ps --filter 'name=^/fishhawk-minio$' --format '{{.Names}}')" ]] && minio_running=1
+
+  if (( !pg_running || !minio_running )); then
+    if (( start_deps )); then
+      print "starting containers..."
+      docker compose up -d
+      local i=0
+      while (( i < 30 )); do
+        _pg_ready && _minio_ready && break
+        sleep 2
+        (( i++ ))
+      done
+      _pg_ready || _die "postgres did not become ready within 60s — check: docker logs fishhawk-postgres"
+      _minio_ready || _die "minio did not become ready within 60s — check: docker logs fishhawk-minio"
+      print "postgres: ready"
+      print "minio: ready"
+    else
+      _die 'postgres/minio containers not up — run "docker compose up -d", then retry (or pass --start-deps)'
+    fi
   else
-    print "warning: minio not reachable — fishhawkd may fail to start"
+    print "postgres: running"
+    print "minio: running"
   fi
 
   # Build
@@ -245,5 +273,5 @@ cmd_down() {
 case "$cmd" in
   up)   cmd_up "${@:2}" ;;
   down) cmd_down ;;
-  *)    print -u2 "usage: scripts/dev <up [--all]|down>"; exit 1 ;;
+  *)    print -u2 "usage: scripts/dev <up [--all] [--start-deps]|down>"; exit 1 ;;
 esac
