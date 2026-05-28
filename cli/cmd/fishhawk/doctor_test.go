@@ -44,6 +44,133 @@ func fakeHTTPResponse(code int, body string) *http.Response {
 	}
 }
 
+// TestDoctorCheck_DockerDaemonDown verifies checkDockerDaemon returns fail
+// when docker info returns an error (daemon not running).
+func TestDoctorCheck_DockerDaemonDown(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "", errors.New("Cannot connect to the Docker daemon")
+	})
+	r := checkDockerDaemon()
+	if r.status != "fail" {
+		t.Errorf("status = %q, want fail", r.status)
+	}
+	if r.remediate == "" {
+		t.Error("remediate should be non-empty on fail")
+	}
+}
+
+// TestDoctorCheck_DockerDaemonUp verifies checkDockerDaemon returns ok
+// when docker info succeeds.
+func TestDoctorCheck_DockerDaemonUp(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "Server Version: 24.0.0", nil
+	})
+	r := checkDockerDaemon()
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok", r.status)
+	}
+}
+
+// TestDoctorCheck_PostgresContainerAbsent verifies checkPostgresContainer
+// returns fail when docker ps returns empty output (container not running).
+func TestDoctorCheck_PostgresContainerAbsent(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "", nil // docker ps returned empty — no matching container
+	})
+	r := checkPostgresContainer()
+	if r.status != "fail" {
+		t.Errorf("status = %q, want fail", r.status)
+	}
+	if r.remediate == "" {
+		t.Error("remediate should be non-empty on fail")
+	}
+}
+
+// TestDoctorCheck_PostgresContainerUpNotReady verifies checkPostgresContainer
+// returns warn when the container exists but pg_isready reports not-yet-ready.
+func TestDoctorCheck_PostgresContainerUpNotReady(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(name string, arg ...string) (string, error) {
+		if name == "docker" {
+			return "fishhawk-postgres", nil
+		}
+		// pg_isready returns non-zero — postgres initialising
+		return "", errors.New("no response")
+	})
+	r := checkPostgresContainer()
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn", r.status)
+	}
+	if r.remediate == "" {
+		t.Error("remediate should be non-empty on warn")
+	}
+}
+
+// TestDoctorCheck_PostgresContainerHealthy verifies checkPostgresContainer
+// returns ok when container is running and pg_isready succeeds.
+func TestDoctorCheck_PostgresContainerHealthy(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(name string, _ ...string) (string, error) {
+		if name == "docker" {
+			return "fishhawk-postgres", nil
+		}
+		return "localhost:5432 - accepting connections", nil
+	})
+	r := checkPostgresContainer()
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok; detail: %s", r.status, r.detail)
+	}
+}
+
+// TestDoctorCheck_MinioContainerAbsent verifies checkMinioContainer returns
+// fail when docker ps returns empty output (container not running).
+func TestDoctorCheck_MinioContainerAbsent(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "", nil // docker ps returned empty — no matching container
+	})
+	r := checkMinioContainer()
+	if r.status != "fail" {
+		t.Errorf("status = %q, want fail", r.status)
+	}
+	if r.remediate == "" {
+		t.Error("remediate should be non-empty on fail")
+	}
+}
+
+// TestDoctorCheck_MinioContainerUpHealthFailed verifies checkMinioContainer
+// returns warn when the container is up but the health HTTP probe fails.
+func TestDoctorCheck_MinioContainerUpHealthFailed(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "fishhawk-minio", nil
+	})
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "/minio/health/live") {
+			return nil, errors.New("connection refused")
+		}
+		return fakeHTTPResponse(http.StatusOK, ""), nil
+	})
+	r := checkMinioContainer()
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn", r.status)
+	}
+	if r.remediate == "" {
+		t.Error("remediate should be non-empty on warn")
+	}
+}
+
+// TestDoctorCheck_MinioContainerHealthy verifies checkMinioContainer returns
+// ok when the container is up and the health probe returns 200.
+func TestDoctorCheck_MinioContainerHealthy(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "fishhawk-minio", nil
+	})
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, ""), nil
+	})
+	r := checkMinioContainer()
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok; detail: %s", r.status, r.detail)
+	}
+}
+
 // TestDoctorCheck_BackendDown verifies checkBackend returns fail when the
 // backend is unreachable (doctorHTTPDo returns a connection error).
 func TestDoctorCheck_BackendDown(t *testing.T) {
