@@ -92,7 +92,7 @@ Cross-reference: this checklist codifies the rollout discipline introduced by #5
 
 ### Rebuild matrix
 
-`scripts/dev up` always rebuilds `fishhawkd`. A future enhancement could auto-detect which binaries need rebuilding from `git diff main...HEAD`.
+`scripts/dev up` auto-detects which binaries need rebuilding by diffing `origin/main...HEAD` (falling back to `main...HEAD` with a warning if origin is unreachable) against the table below. `fishhawkd` always rebuilds as the baseline; the others rebuild only when their source changed. `scripts/dev up --all` forces all four. Each rebuild prints a line naming the trigger (`baseline`, `--all`, or the path that matched).
 
 | If PR touches | Rebuild |
 |---|---|

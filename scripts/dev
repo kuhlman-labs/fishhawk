@@ -38,7 +38,94 @@ _minio_ready() {
   curl --silent --fail --max-time 3 "${endpoint}/minio/health/live" &>/dev/null
 }
 
+# Populates global rebuild_set: binary_name -> trigger_reason.
+# trigger_reason values: "__baseline__" (fishhawkd always-on), a changed file path
+# (matrix match), or unset (no trigger found for this binary).
+_detect_rebuild_set() {
+  # fishhawkd is always rebuilt as the baseline regardless of diff
+  rebuild_set[fishhawkd]="__baseline__"
+
+  local base_ref="origin/main"
+  if ! git rev-parse --verify "$base_ref" &>/dev/null 2>&1; then
+    print "warning: origin/main not available — falling back to main...HEAD"
+    base_ref="main"
+  fi
+
+  local changed_files
+  if ! changed_files="$(git diff --name-only "${base_ref}...HEAD" 2>/dev/null)"; then
+    print "warning: git diff failed — rebuilding all binaries"
+    rebuild_set[fishhawk-mcp]="__all__"
+    rebuild_set[fishhawk-runner]="__all__"
+    rebuild_set[fishhawk]="__all__"
+    return
+  fi
+
+  [[ -z "$changed_files" ]] && return
+
+  local f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+
+    case "$f" in
+      # Shared libs trigger all four binaries; short-circuit on first hit
+      backend/internal/plan/*|backend/internal/spec/*)
+        [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]] && rebuild_set[fishhawkd]="$f"
+        [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]]     && rebuild_set[fishhawk-mcp]="$f"
+        [[ -z "${rebuild_set[fishhawk-runner]:-}" ]]  && rebuild_set[fishhawk-runner]="$f"
+        [[ -z "${rebuild_set[fishhawk]:-}" ]]         && rebuild_set[fishhawk]="$f"
+        return
+        ;;
+      backend/cmd/fishhawkd/*|backend/internal/*)
+        [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]] && rebuild_set[fishhawkd]="$f"
+        ;;
+      backend/cmd/fishhawk-mcp/*)
+        [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]] && rebuild_set[fishhawk-mcp]="$f"
+        ;;
+      runner/cmd/fishhawk-runner/*|runner/internal/*)
+        [[ -z "${rebuild_set[fishhawk-runner]:-}" ]] && rebuild_set[fishhawk-runner]="$f"
+        ;;
+      cli/cmd/fishhawk/*|cli/internal/*)
+        [[ -z "${rebuild_set[fishhawk]:-}" ]] && rebuild_set[fishhawk]="$f"
+        ;;
+    esac
+  done <<< "$changed_files"
+}
+
+# Build one binary. Returns 1 (skipped) when source dir is absent; exits 1 on
+# build failure; returns 0 and prints a status line on success.
+_build_binary() {
+  local name="$1"
+  local trigger="$2"
+  typeset -A src_paths
+  src_paths=(
+    fishhawkd        "./backend/cmd/fishhawkd/"
+    fishhawk-mcp     "./backend/cmd/fishhawk-mcp/"
+    fishhawk-runner  "./runner/cmd/fishhawk-runner/"
+    fishhawk         "./cli/cmd/fishhawk/"
+  )
+  local src="${src_paths[$name]}"
+  local src_dir="${REPO_ROOT}/${src#./}"
+
+  if [[ ! -d "$src_dir" ]]; then
+    print "warning: ${name}: source directory ${src} not found — skipping"
+    return 1
+  fi
+
+  (cd "${REPO_ROOT}" && go build -o "bin/${name}" "${src}") || exit 1
+
+  case "$trigger" in
+    __baseline__) print "${name}: rebuilt (baseline)" ;;
+    __all__)      print "${name}: rebuilt (--all)" ;;
+    *)            print "${name}: rebuilt (triggered by ${trigger})" ;;
+  esac
+}
+
 cmd_up() {
+  local force_all=0
+  for arg in "$@"; do
+    [[ "$arg" == "--all" ]] && force_all=1
+  done
+
   # Idempotency: bail if already running
   if [[ -f "$PID_FILE" ]]; then
     local existing_pid
@@ -77,9 +164,38 @@ cmd_up() {
   fi
 
   # Build
-  print "building fishhawkd..."
+  print "building binaries..."
   mkdir -p "${REPO_ROOT}/bin"
-  (cd "${REPO_ROOT}" && go build -o bin/fishhawkd ./backend/cmd/fishhawkd/)
+
+  typeset -gA rebuild_set
+
+  if (( force_all )); then
+    rebuild_set=(
+      fishhawkd       __all__
+      fishhawk-mcp    __all__
+      fishhawk-runner __all__
+      fishhawk        __all__
+    )
+  else
+    _detect_rebuild_set
+  fi
+
+  local -a rebuilt_list=()
+  local binary
+  for binary in fishhawkd fishhawk-mcp fishhawk-runner fishhawk; do
+    if [[ -n "${rebuild_set[$binary]:-}" ]]; then
+      if _build_binary "$binary" "${rebuild_set[$binary]}"; then
+        rebuilt_list+=("$binary")
+      fi
+    fi
+  done
+
+  local count=${#rebuilt_list[@]}
+  if (( count > 0 )); then
+    print "rebuilt ${count} of 4 binaries: ${(j:, :)rebuilt_list}"
+  else
+    print "rebuilt 0 of 4 binaries (nothing changed)"
+  fi
 
   # Migrate
   print "applying migrations..."
@@ -127,7 +243,7 @@ cmd_down() {
 }
 
 case "$cmd" in
-  up)   cmd_up ;;
+  up)   cmd_up "${@:2}" ;;
   down) cmd_down ;;
-  *)    print -u2 "usage: scripts/dev <up|down>"; exit 1 ;;
+  *)    print -u2 "usage: scripts/dev <up [--all]|down>"; exit 1 ;;
 esac
