@@ -35,10 +35,14 @@ func (a *hintAuditRepo) ListAll(_ context.Context, p audit.ListAllParams) ([]*au
 }
 
 func (a *hintAuditRepo) seedRuntimeObserved(runID uuid.UUID, predicted, actual float64) {
+	a.seedRuntimeObservedConf(runID, predicted, actual, "medium")
+}
+
+func (a *hintAuditRepo) seedRuntimeObservedConf(runID uuid.UUID, predicted, actual float64, confidence string) {
 	payload, _ := json.Marshal(runtimeObservedPayload{
 		StageType:        "implement",
 		PredictedMinutes: predicted,
-		Confidence:       "medium",
+		Confidence:       confidence,
 		ActualMinutes:    actual,
 		Outcome:          "success",
 	})
@@ -96,6 +100,37 @@ func TestPlanPrompt_CalibrationHint_BelowThreshold(t *testing.T) {
 	}
 }
 
+func TestPlanPrompt_CalibrationHint_BandAdvisoryRendered(t *testing.T) {
+	s, rr, hintRepo, sf := newCalibrationHintPromptServer(t)
+	runID, planStageID, _, _ := seedRunWithStages(rr)
+
+	// Seed 9 high-confidence entries outside 1.5x (actual=20, predicted=10 → ratio=2x)
+	// and 1 high-confidence entry inside 1.5x → 1/10 = 10% ≤ 25% threshold.
+	for range 9 {
+		hintRepo.seedRuntimeObservedConf(runID, 10.0, 20.0, "high")
+	}
+	hintRepo.seedRuntimeObservedConf(runID, 10.0, 12.0, "high")
+
+	priv, _ := sf.issue(t, runID)
+	w := promptRequestForStage(t, s, runID, planStageID, priv)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Prompt, "### Calibration hint") {
+		t.Errorf("plan prompt missing calibration hint section:\n%s", resp.Prompt)
+	}
+	if !strings.Contains(resp.Prompt, "LEAST accurate band historically") {
+		t.Errorf("plan prompt missing high-band advisory:\n%s", resp.Prompt)
+	}
+	if !strings.Contains(resp.Prompt, "1/10 within 1.5x") {
+		t.Errorf("plan prompt missing advisory X/Y count (1/10):\n%s", resp.Prompt)
+	}
+}
+
 func TestPlanPrompt_CalibrationHint_AboveThreshold(t *testing.T) {
 	s, rr, hintRepo, sf := newCalibrationHintPromptServer(t)
 	runID, planStageID, _, _ := seedRunWithStages(rr)
@@ -117,7 +152,7 @@ func TestPlanPrompt_CalibrationHint_AboveThreshold(t *testing.T) {
 	if !strings.Contains(resp.Prompt, "### Calibration hint") {
 		t.Errorf("plan prompt missing calibration hint section:\n%s", resp.Prompt)
 	}
-	if !strings.Contains(resp.Prompt, "1.20x") {
-		t.Errorf("plan prompt missing calibration ratio 1.20x:\n%s", resp.Prompt)
+	if !strings.Contains(resp.Prompt, "ratio = 1.20") {
+		t.Errorf("plan prompt missing calibration ratio 1.20:\n%s", resp.Prompt)
 	}
 }
