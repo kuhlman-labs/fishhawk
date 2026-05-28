@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
@@ -122,6 +123,18 @@ func runServe(args []string, logSink io.Writer) int {
 	externalURL := fs.String("external-url",
 		envOr("FISHHAWKD_EXTERNAL_URL", ""),
 		"operator-facing root URL for the SPA, e.g. https://app.fishhawk.example.com; used to build links in surfaces that escape the backend (today: GitHub Check Runs). Empty disables the publish-to-GitHub paths cleanly.")
+	anthropicAPIKey := fs.String("anthropic-api-key",
+		envOr("FISHHAWKD_ANTHROPIC_API_KEY", ""),
+		"Anthropic API key for plan-review agent invocations; when empty, plan review is gateless regardless of spec config")
+	planReviewModel := fs.String("plan-review-model",
+		envOr("FISHHAWKD_PLAN_REVIEW_MODEL", "claude-sonnet-4-6"),
+		"Anthropic model to use for plan-review agent invocations")
+	planReviewMaxTokens := fs.Int("plan-review-max-tokens",
+		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_TOKENS", 4096),
+		"maximum tokens for plan-review agent responses")
+	planReviewTimeout := fs.Duration("plan-review-timeout",
+		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", 60*time.Second),
+		"per-invocation HTTP timeout for plan-review agent calls")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -130,6 +143,25 @@ func runServe(args []string, logSink io.Writer) int {
 	logger.Info("plan coercion registry", slog.String("summary", plan.CoercionRegistrySummary()))
 
 	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL}
+
+	// Plan-review agent wiring. When an API key is present, construct the
+	// Anthropic SDK adapter and assign it to cfg.PlanReviewer. Without a key
+	// the field stays nil and review invocations are skipped regardless of the
+	// workflow spec's reviewers.agent value (gateless behaviour).
+	if *anthropicAPIKey != "" {
+		cfg.PlanReviewer = anthropic.NewReviewer(anthropic.Config{
+			APIKey:    *anthropicAPIKey,
+			Model:     *planReviewModel,
+			MaxTokens: *planReviewMaxTokens,
+			Timeout:   *planReviewTimeout,
+		})
+		logger.Info("plan review agent configured",
+			slog.String("model", *planReviewModel),
+			slog.Int("max_tokens", *planReviewMaxTokens),
+			slog.Duration("timeout", *planReviewTimeout))
+	} else {
+		logger.Warn("FISHHAWKD_ANTHROPIC_API_KEY not set; plan review is gateless regardless of spec config")
+	}
 
 	// Wire the run repository when a DB URL is supplied. Without
 	// one the server still boots — /healthz works and any

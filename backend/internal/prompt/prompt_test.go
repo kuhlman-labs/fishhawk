@@ -1151,3 +1151,13 @@ func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 		t.Errorf("summary should still render:\n%s", got)
 	}
 }
+
+func TestBuildPlanReview_ContainsSplitMarker(t *testing.T) {
+	got := buildPlanReview(Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+	})
+	if !strings.Contains(got, PlanReviewSplitMarker) {
+		t.Errorf("buildPlanReview output missing PlanReviewSplitMarker %q", PlanReviewSplitMarker)
+	}
+}

@@ -100,6 +100,19 @@ When a stage's `reviewers.agent > 0` is configured in the workflow spec, the bac
 
 **Audit category `plan_reviewed`**: one entry per review-agent invocation, payload shape `PlanReviewedPayload{ReviewerKind, ReviewerModel, Authority, Verdict, Concerns[], FreeForm}`. Surfaced by `fishhawk_get_plan` (MCP tool) in `GetPlanOutput.Reviews[]`.
 
+**Production wiring** (`backend/internal/anthropic/`, wired in `backend/cmd/fishhawkd/serve.go`):
+
+`anthropic.NewReviewer` is constructed in `serve.go` when `FISHHAWKD_ANTHROPIC_API_KEY` is set and assigned to `cfg.PlanReviewer`. When the key is absent the field stays nil and review invocations are skipped (gateless behaviour).
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `FISHHAWKD_ANTHROPIC_API_KEY` | `` (empty) | Anthropic API key; empty disables plan-review agent |
+| `FISHHAWKD_PLAN_REVIEW_MODEL` | `claude-sonnet-4-6` | Model used for each review invocation |
+| `FISHHAWKD_PLAN_REVIEW_MAX_TOKENS` | `4096` | Maximum output tokens per review call |
+| `FISHHAWKD_PLAN_REVIEW_TIMEOUT` | `60s` | Per-invocation HTTP timeout |
+
+**Prompt-caching strategy**: the `plan_review` prompt (`buildPlanReview` in `backend/internal/prompt/prompt.go`) is split at `prompt.PlanReviewSplitMarker` (`"\n### Plan artifact\n\n"`). Everything before the marker — the role-constraint preamble — is placed in the Anthropic system block with `cache_control: {type: ephemeral}`. Everything from the marker onward (plan artifact + issue context + verdict schema) is placed in the user message. This keeps the cached prefix stable across calls for the same fishhawkd process lifetime while allowing the variable plan content to change per invocation.
+
 ## 5. Storage model
 
 ### 5.1 Postgres (`fishhawkd` schema)
