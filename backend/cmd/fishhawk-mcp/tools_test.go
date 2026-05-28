@@ -1016,6 +1016,226 @@ func TestGetPlan_WithoutDecomposition_RuntimeFieldsPresent(t *testing.T) {
 	}
 }
 
+// --- get_plan reviews field (ADR-027 / #560 sub-plan E) ---
+
+// seedPlanReviewAudit adds a plan_reviewed audit entry to the fake's
+// per-run audit map. The payload is round-tripped through JSON so the
+// handler's re-marshal + unmarshal decodes to the same value.
+func seedPlanReviewAudit(fb *fakeBackend, runID uuid.UUID, review PlanReview) {
+	payload, _ := json.Marshal(review)
+	var decoded any
+	_ = json.Unmarshal(payload, &decoded)
+	entry := AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "plan_reviewed",
+		Payload:  decoded,
+	}
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
+}
+
+func TestGetPlan_WithReviews_PopulatesField(t *testing.T) {
+	// Two plan-review agent verdicts recorded on the plan's run.
+	// Both must appear in Reviews with correct fields.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedPlanReviewAudit(fb, runID, PlanReview{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-7",
+		Authority:     "advisory",
+		Verdict:       "approve",
+	})
+	seedPlanReviewAudit(fb, runID, PlanReview{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-7",
+		Authority:     "advisory",
+		Verdict:       "approve_with_concerns",
+		Concerns: []PlanReviewConcern{
+			{Severity: "medium", Category: "scope", Note: "touching too many files"},
+		},
+		FreeForm: "Consider narrowing scope.",
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" {
+		t.Fatalf("Status = %q, want available", out.Status)
+	}
+	if got := len(out.Reviews); got != 2 {
+		t.Fatalf("len(Reviews) = %d, want 2", got)
+	}
+	if out.Reviews[0].Verdict != "approve" {
+		t.Errorf("Reviews[0].Verdict = %q, want approve", out.Reviews[0].Verdict)
+	}
+	if out.Reviews[0].Authority != "advisory" {
+		t.Errorf("Reviews[0].Authority = %q, want advisory", out.Reviews[0].Authority)
+	}
+	if out.Reviews[1].Verdict != "approve_with_concerns" {
+		t.Errorf("Reviews[1].Verdict = %q, want approve_with_concerns", out.Reviews[1].Verdict)
+	}
+	if got := len(out.Reviews[1].Concerns); got != 1 {
+		t.Fatalf("len(Reviews[1].Concerns) = %d, want 1", got)
+	}
+	if out.Reviews[1].Concerns[0].Severity != "medium" {
+		t.Errorf("Concerns[0].Severity = %q, want medium", out.Reviews[1].Concerns[0].Severity)
+	}
+	if out.Reviews[1].FreeForm != "Consider narrowing scope." {
+		t.Errorf("Reviews[1].FreeForm = %q", out.Reviews[1].FreeForm)
+	}
+}
+
+func TestGetPlan_NoReviewAuditEntries_ReviewsAbsent(t *testing.T) {
+	// No plan_reviewed audit entries — Reviews should be nil so
+	// it is omitted from the JSON response (omitempty).
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+	// perRunAuditByRun[runID] left empty.
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" {
+		t.Fatalf("Status = %q, want available", out.Status)
+	}
+	if out.Reviews != nil {
+		t.Errorf("Reviews should be nil when no plan_reviewed entries exist; got %+v", out.Reviews)
+	}
+}
+
+func TestGetPlan_ReviewAuditError_Surfaced(t *testing.T) {
+	// The per-run audit endpoint returns 500 → the error propagates
+	// through loadPlanReviews and surfaces as a getPlan error.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+	fb.perRunAuditStatus = http.StatusInternalServerError
+
+	r := newResolver(srv, nil)
+	_, _, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected error when plan_reviewed audit query fails")
+	}
+	if !strings.Contains(err.Error(), "load plan reviews") {
+		t.Errorf("error should mention 'load plan reviews': %v", err)
+	}
+}
+
+func TestGetPlan_MalformedReviewPayload_Skipped(t *testing.T) {
+	// An audit entry whose payload doesn't decode to PlanReview shape
+	// is silently skipped; a valid entry that follows still appears.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// Malformed entry: payload is a string, not an object.
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: 1,
+		RunID:    runID.String(),
+		Category: "plan_reviewed",
+		Payload:  "not-a-review-object",
+	})
+	// Valid entry follows.
+	seedPlanReviewAudit(fb, runID, PlanReview{
+		ReviewerKind: "agent",
+		Authority:    "gating",
+		Verdict:      "reject",
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" {
+		t.Fatalf("Status = %q, want available", out.Status)
+	}
+	// The malformed entry is skipped; only the valid entry appears.
+	if got := len(out.Reviews); got != 1 {
+		t.Fatalf("len(Reviews) = %d, want 1 (malformed entry skipped)", got)
+	}
+	if out.Reviews[0].Verdict != "reject" {
+		t.Errorf("Reviews[0].Verdict = %q, want reject", out.Reviews[0].Verdict)
+	}
+}
+
+func TestGetPlan_ReviewsQueryUsesResolvedRunID(t *testing.T) {
+	// CI-retry: child run has no plan stage; parent has the plan.
+	// Reviews should be queried against the PARENT run (the one
+	// where the plan artifact lives), not the child.
+	fb, srv := newFakeBackend(t)
+	parentID := uuid.New()
+	childID := uuid.New()
+	parentPlanStage := uuid.New()
+
+	parentIDStr := parentID.String()
+	fb.getRunByID[childID] = Run{
+		ID:          childID.String(),
+		ParentRunID: &parentIDStr,
+		State:       "running",
+		Repo:        "x/y",
+	}
+	fb.getRunByID[parentID] = Run{ID: parentID.String(), State: "running", Repo: "x/y"}
+	fb.stagesByRun[childID] = []Stage{
+		{ID: uuid.New().String(), RunID: childID.String(), Type: "implement", State: "running"},
+	}
+	fb.stagesByRun[parentID] = []Stage{
+		{ID: parentPlanStage.String(), RunID: parentID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, parentPlanStage, samplePlanContent(), time.Hour)
+
+	// Seed a review on the PARENT run.
+	seedPlanReviewAudit(fb, parentID, PlanReview{
+		ReviewerKind: "agent",
+		Authority:    "advisory",
+		Verdict:      "approve",
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: childID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" {
+		t.Fatalf("Status = %q, want available", out.Status)
+	}
+	if out.ResolvedVia != "parent:"+parentID.String() {
+		t.Errorf("ResolvedVia = %q", out.ResolvedVia)
+	}
+	// Reviews come from the parent (the resolved run), not the child.
+	if got := len(out.Reviews); got != 1 {
+		t.Fatalf("len(Reviews) = %d, want 1 (review seeded on parent)", got)
+	}
+	if out.Reviews[0].Verdict != "approve" {
+		t.Errorf("Reviews[0].Verdict = %q, want approve", out.Reviews[0].Verdict)
+	}
+}
+
 // --- get_run_status (E19.5 / #345) ---
 
 func auditFixture(seq int64, runID uuid.UUID, category, actor string, offset time.Duration) AuditEntry {
