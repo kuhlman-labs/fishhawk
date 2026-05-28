@@ -128,7 +128,8 @@
         "gates": {
           "type": "array",
           "items": { "$ref": "#/$defs/gate" }
-        }
+        },
+        "reviewers": { "$ref": "#/$defs/reviewers_config" }
       }
     },
 
@@ -351,6 +352,24 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+        }
+      }
+    },
+
+    "reviewers_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Plan-review reviewer counts for plan stages (ADR-027). Authority table: agent>0 && human==0 → gating (agent rejections block stage advancement); agent>0 && human>0 → advisory (agent verdicts surfaced, cannot block human approval); agent==0 → gateless. When the reviewers block is absent entirely, the backend defaults to {human:1} — preserving pre-ADR-027 behavior.",
+      "properties": {
+        "agent": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of agent reviewers to invoke after the plan artifact is validated. 0 (default) means no agent review."
+        },
+        "human": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of human approvers required. 0 means no human approval gate for this plan stage."
         }
       }
     }

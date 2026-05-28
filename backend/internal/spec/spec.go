@@ -138,17 +138,32 @@ type OnCIFailure struct {
 // here so the consumer side has a single source of truth.
 const DefaultMaxRetries = 1
 
+// ReviewersConfig holds the plan-review reviewer counts for a plan stage
+// (ADR-027). Authority is resolved by planreview.ResolveAuthority:
+//
+//   - agent>0 && human==0 → gating (agent rejections block stage advancement)
+//   - agent>0 && human>0  → advisory (agent verdicts surfaced; cannot block)
+//   - agent==0            → gateless
+//
+// A nil pointer on Stage.Reviewers means the field was absent in the spec;
+// callers should treat nil as {Human:1} to preserve pre-ADR-027 behavior.
+type ReviewersConfig struct {
+	Agent int `json:"agent,omitempty" yaml:"agent,omitempty"`
+	Human int `json:"human,omitempty" yaml:"human,omitempty"`
+}
+
 // Stage is one unit of work in a workflow. The closed set of types
 // (plan / implement / review) is enforced by the schema.
 type Stage struct {
-	ID          string       `json:"id" yaml:"id"`
-	Type        StageType    `json:"type" yaml:"type"`
-	Executor    Executor     `json:"executor" yaml:"executor"`
-	Inputs      []Input      `json:"inputs,omitempty" yaml:"inputs,omitempty"`
-	Produces    []Produces   `json:"produces,omitempty" yaml:"produces,omitempty"`
-	Constraints []Constraint `json:"constraints,omitempty" yaml:"constraints,omitempty"`
-	Budget      *Budget      `json:"budget,omitempty" yaml:"budget,omitempty"`
-	Gates       []Gate       `json:"gates,omitempty" yaml:"gates,omitempty"`
+	ID          string           `json:"id" yaml:"id"`
+	Type        StageType        `json:"type" yaml:"type"`
+	Executor    Executor         `json:"executor" yaml:"executor"`
+	Inputs      []Input          `json:"inputs,omitempty" yaml:"inputs,omitempty"`
+	Produces    []Produces       `json:"produces,omitempty" yaml:"produces,omitempty"`
+	Constraints []Constraint     `json:"constraints,omitempty" yaml:"constraints,omitempty"`
+	Budget      *Budget          `json:"budget,omitempty" yaml:"budget,omitempty"`
+	Gates       []Gate           `json:"gates,omitempty" yaml:"gates,omitempty"`
+	Reviewers   *ReviewersConfig `json:"reviewers,omitempty" yaml:"reviewers,omitempty"`
 }
 
 // StageType is the stage's kind, drawn from a closed v0 set.

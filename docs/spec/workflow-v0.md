@@ -48,6 +48,9 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
   constraints: [<constraint>...] # optional, only meaningful for implement
   budget: <budget> # optional
   gates: [<gate>...] # optional
+  reviewers: # optional; plan-review agents and human counts (ADR-027, see ### Plan reviewers)
+    agent: 1  # integer >= 0; default 0
+    human: 0  # integer >= 0; default 0
 ```
 
 Stage `id` is unique within the workflow. The `from_stage` field on inputs cross-references it; the validator (E1.3 / #18) enforces this beyond the schema.
@@ -82,6 +85,30 @@ executor:
 
 - **Only valid on agent-executed stages.** Declaring `agent_self_retry` on a `human: true` executor is a schema error — the field lives in the agent branch of the executor `oneOf`, so `unevaluatedProperties: false` rejects it on the human branch.
 - **Backend plumbing and runner detection** are handled by separate follow-up tickets. This field documents the authoring surface and is parsed by both the backend and CLI validators; runner behavior is not yet wired.
+
+### Plan reviewers
+
+An optional block on `plan` stages that controls how many agent and/or human reviewers must weigh in before the stage advances to `awaiting_approval` (ADR-027). The block may be placed on any stage type but only has runtime effect on `plan` stages.
+
+```yaml
+reviewers:
+  agent: 1  # integer >= 0; 0 means no agent review (default)
+  human: 0  # integer >= 0; 0 means no human approval gate (default)
+```
+
+**Authority modes** (resolved by `planreview.ResolveAuthority`):
+
+| `agent` | `human` | Authority mode | Effect |
+|---------|---------|----------------|--------|
+| `> 0`   | `== 0`  | **gating**     | Agent rejections block stage advancement to `awaiting_approval`. All agent reviews must approve (or approve_with_concerns) before the plan advances. |
+| `> 0`   | `> 0`   | **advisory**   | Agent verdicts are surfaced in `fishhawk_get_plan` and recorded as `plan_reviewed` audit entries, but cannot block human approval. |
+| `== 0`  | any     | **gateless**   | No agent review. Human approval (if `human > 0`) proceeds as before. |
+
+**Default behavior (absent `reviewers` block):** When the `reviewers` field is omitted, the backend treats the stage as `{human: 1}` — preserving the existing one-human-approver behavior from before ADR-027. Callers reading `Stage.Reviewers == nil` must apply this default.
+
+**Self-review guard:** If the review agent's model identifier matches the plan's `generated_by.model`, the server logs a WARN but does not block. ADR-027 treats this as an advisory signal only.
+
+**`plan_reviewed` audit category:** Each agent review invocation appends a `plan_reviewed` entry to the run's audit log with `reviewer_kind: "agent"`, the structured verdict (`approve`, `approve_with_concerns`, `reject`), and any concerns. The verdict is surfaced via `fishhawk_get_plan` in the `Reviews` field.
 
 ## Inputs
 
@@ -253,6 +280,8 @@ Per-workflow auto-retry policy (#276 / E16). When a required CI check fails on t
 | Stage `type`                | `plan` \| `implement` \| `review`                                            | closed set                                                                                          |
 | Executor                    | `agent: <string>` xor `human: true`                                          | mutually exclusive                                                                                  |
 | `executor.agent_self_retry` | `true` \| `false` (default `false`)                                          | agent branch only; schema error on human executor                                                   |
+| `reviewers.agent`           | integer `>= 0` (default `0`)                                                 | absent block → nil → backend defaults to `{human:1}`                                               |
+| `reviewers.human`           | integer `>= 0` (default `0`)                                                 | absent block → nil → backend defaults to `{human:1}`                                               |
 | Input `source`              | `github_issue` \| `pull_request`                                             | v0; v0.x adds Linear/Jira                                                                           |
 | Artifact                    | `plan` \| `pull_request`                                                     | closed set                                                                                          |
 | Persistence target          | `originating_issue` \| `fishhawk_audit_log`                                  | closed set                                                                                          |
