@@ -190,6 +190,8 @@ func Build(stageType string, t Trigger) (string, error) {
 		return buildImplement(t), nil
 	case "plan":
 		return buildPlan(t), nil
+	case "plan_review":
+		return buildPlanReview(t), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrUnsupportedStage, stageType)
 	}
@@ -436,6 +438,162 @@ func buildPlan(t Trigger) string {
 		}
 	}
 	return b.String()
+}
+
+// buildPlanReview constructs the constrained prompt for a plan-review agent.
+// The review agent's sole task is to emit a structured verdict JSON — it is
+// explicitly forbidden from re-planning, proposing edits, or producing any
+// output other than the verdict object.
+//
+// The prompt surfaces the full plan artifact and the originating issue body
+// so the reviewer has the same context as the plan author. Docs references
+// (plan schema, spec) are included so the reviewer can validate structure
+// without fetching external resources.
+func buildPlanReview(t Trigger) string {
+	var b strings.Builder
+	b.WriteString("You are a plan-review agent for the repository ")
+	b.WriteString(quoteRepo(t.Repo))
+	b.WriteString(".\n\n")
+
+	b.WriteString("ROLE CONSTRAINT (binding — read before writing any output)\n")
+	b.WriteString("===========================================================\n\n")
+	b.WriteString("Your ONLY task is to review the plan artifact below and emit a single JSON verdict object.\n")
+	b.WriteString("You MUST NOT:\n")
+	b.WriteString("- Re-plan, propose alternative plans, or suggest edits to the plan.\n")
+	b.WriteString("- Produce any prose output outside the JSON verdict object.\n")
+	b.WriteString("- Modify any source files.\n")
+	b.WriteString("- Invoke any tools beyond reading repository files for context.\n\n")
+	b.WriteString("Your entire response MUST be a single JSON object conforming to the verdict schema below. " +
+		"Do not wrap it in markdown code fences, do not add prose before or after it. " +
+		"A response that contains anything other than the JSON object will be rejected.\n\n")
+
+	// Plan artifact section — the primary input to the review.
+	if t.ApprovedPlan != nil {
+		writePlanForReview(&b, t.ApprovedPlan)
+	} else {
+		b.WriteString("### Plan artifact\n\n")
+		b.WriteString("(no plan artifact provided — emit verdict: reject with concern: missing plan artifact)\n\n")
+	}
+
+	// Issue context: give the reviewer the originating motivation so
+	// they can assess whether the plan actually addresses the issue.
+	if t.IssueNumber > 0 || t.IssueTitle != "" || t.IssueBody != "" {
+		b.WriteString("### Originating issue\n\n")
+		if t.IssueNumber > 0 {
+			fmt.Fprintf(&b, "Issue: #%d", t.IssueNumber)
+			if t.IssueTitle != "" {
+				b.WriteString(" · ")
+				b.WriteString(t.IssueTitle)
+			}
+			b.WriteString("\n")
+		} else if t.IssueTitle != "" {
+			b.WriteString("Title: ")
+			b.WriteString(t.IssueTitle)
+			b.WriteString("\n")
+		}
+		if t.IssueBody != "" {
+			b.WriteString("\n")
+			b.WriteString(t.IssueBody)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	// Verdict schema — inline so the reviewer doesn't need to fetch it.
+	b.WriteString("### Verdict schema\n\n")
+	b.WriteString("Emit exactly this JSON shape. All fields shown; omit `concerns` and `free_form` when empty:\n\n")
+	b.WriteString("{\n")
+	b.WriteString("  \"verdict\": \"approve\" | \"approve_with_concerns\" | \"reject\",\n")
+	b.WriteString("  \"concerns\": [\n")
+	b.WriteString("    {\n")
+	b.WriteString("      \"severity\": \"high\" | \"medium\" | \"low\",\n")
+	b.WriteString("      \"category\": \"<short classifier, e.g. scope | security | correctness | coverage>\",\n")
+	b.WriteString("      \"note\": \"<free-form explanation of the concern>\"\n")
+	b.WriteString("    }\n")
+	b.WriteString("  ],\n")
+	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
+	b.WriteString("}\n\n")
+
+	// Review criteria — what the agent should assess.
+	b.WriteString("### Review criteria\n\n")
+	b.WriteString("Assess the plan against the following criteria. Record a concern for each gap found:\n\n")
+	b.WriteString("1. **Scope completeness**: Does the file list cover all changes implied by the approach steps? " +
+		"Are operations (create/modify/delete) accurate?\n")
+	b.WriteString("2. **Approach feasibility**: Are the approach steps actionable and internally consistent? " +
+		"Do they address the issue as stated?\n")
+	b.WriteString("3. **Verification adequacy**: Does the test strategy catch the load-bearing behaviour? " +
+		"Is the rollback plan realistic?\n")
+	b.WriteString("4. **Risk coverage**: Are meaningful risks identified? Are assumptions cited or testable?\n")
+	b.WriteString("5. **Schema compliance**: Does the plan conform to the standard_v1 shape? " +
+		"(docs/spec/plan-standard-v1.md)\n\n")
+
+	// Verdict decision rule.
+	b.WriteString("### Verdict decision rule\n\n")
+	b.WriteString("- `approve`: plan is sound; all criteria met or concerns are cosmetic.\n")
+	b.WriteString("- `approve_with_concerns`: plan is implementable but has non-blocking gaps; " +
+		"record each gap as a concern with appropriate severity.\n")
+	b.WriteString("- `reject`: plan has one or more blocking problems that must be resolved before implementation; " +
+		"record each blocker as a `high`-severity concern.\n\n")
+
+	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
+	return b.String()
+}
+
+// writePlanForReview renders a standard_v1 plan for the review-agent prompt.
+// It mirrors writeApprovedPlan but uses a neutral "Plan artifact" header
+// (the plan is under review, not yet approved).
+func writePlanForReview(b *strings.Builder, p *plan.Plan) {
+	b.WriteString("### Plan artifact\n\n")
+
+	if p.Summary != "" {
+		b.WriteString("Summary:\n")
+		b.WriteString(p.Summary)
+		b.WriteString("\n\n")
+	}
+
+	if len(p.Scope.Files) > 0 {
+		b.WriteString("Files in scope:\n")
+		for _, f := range p.Scope.Files {
+			fmt.Fprintf(b, "- %s (%s)\n", f.Path, f.Operation)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(p.Approach) > 0 {
+		b.WriteString("Approach:\n")
+		for _, step := range p.Approach {
+			fmt.Fprintf(b, "%d. %s\n", step.Step, step.Description)
+		}
+		b.WriteString("\n")
+	}
+
+	if p.Verification.TestStrategy != "" || p.Verification.RollbackPlan != "" {
+		b.WriteString("Verification:\n")
+		if p.Verification.TestStrategy != "" {
+			b.WriteString("- Test strategy: ")
+			b.WriteString(p.Verification.TestStrategy)
+			b.WriteString("\n")
+		}
+		if p.Verification.RollbackPlan != "" {
+			b.WriteString("- Rollback plan: ")
+			b.WriteString(p.Verification.RollbackPlan)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	if len(p.RisksAndAssumptions) > 0 {
+		b.WriteString("Risks & assumptions:\n")
+		for _, r := range p.RisksAndAssumptions {
+			fmt.Fprintf(b, "- %s\n", r)
+		}
+		b.WriteString("\n")
+	}
+
+	if p.PredictedRuntimeMinutes > 0 {
+		fmt.Fprintf(b, "Runtime prediction: %d minutes (%s confidence)\n\n",
+			p.PredictedRuntimeMinutes, p.PredictedRuntimeConfidence)
+	}
 }
 
 // resolveMins converts a duration to whole minutes, returning

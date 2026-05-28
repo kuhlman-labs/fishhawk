@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,9 +15,21 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
+
+// PlanReviewer invokes a review agent synchronously with the given
+// prompt text and returns the structured verdict and the model identifier
+// used. The model is compared to plan.GeneratedBy.Model for the
+// self-review guard (ADR-027). Nil PlanReviewer disables agent-driven
+// plan review regardless of the stage's reviewers spec config.
+type PlanReviewer interface {
+	Review(ctx context.Context, promptText string) (verdict *planreview.ReviewVerdict, model string, err error)
+}
 
 // maxPlanBundleBytes caps the request body for plan upload. Plans
 // are document-shaped JSON (steps, files, scope, etc.); even verbose
@@ -266,12 +279,23 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Plan review: invoke configured review agents after the artifact
+	// is stored and audited, before advancing the stage. Returns true
+	// when authority is gating and at least one verdict is reject;
+	// in that case the stage has been transitioned to failed-B and
+	// stage advancement is blocked.
+	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body)
+
 	// Plan-ready comment-back hook (#245). Fires here so the
 	// notifier sees the just-landed artifact even when the runner's
 	// trace-then-plan upload order beats the trace-handler's
 	// notifyPlanReady to running. Best-effort + dedup'd via the
 	// audit log; safe to call alongside the trace-handler hook.
-	s.notifyPlanReadyIfReady(r, runID, stage)
+	// Suppressed on gating-reject: the stage has been failed, not
+	// awaiting approval, so a plan-ready comment would be misleading.
+	if !gatingRejected {
+		s.notifyPlanReadyIfReady(r, runID, stage)
+	}
 
 	s.writeJSON(w, r, http.StatusCreated, planResponse{
 		ID:            created.ID,
@@ -317,4 +341,188 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// runPlanReviews invokes configured review agents after a plan artifact
+// is stored and audited. For each invocation it:
+//  1. Builds the plan_review prompt from the plan artifact + run context.
+//  2. Calls PlanReviewer.Review and logs WARN on self-review (model match).
+//  3. Appends a plan_reviewed audit entry with the verdict payload.
+//
+// Returns true when authority is gating (reviewers.agent>0 && human==0)
+// and at least one verdict is reject. In that case the stage has been
+// transitioned to failed-B so trace-driven awaiting_approval advancement
+// is blocked by the terminal state machine.
+//
+// Returns false (no gating rejection) when:
+//   - PlanReviewer is nil (production default — not yet wired)
+//   - RunRepo is nil
+//   - the run's workflow spec carries no plan stage with reviewers.agent>0
+//   - all review agents approve (or approve_with_concerns)
+//
+// All per-invocation errors are WARN-logged and skipped so a transient
+// reviewer failure doesn't fail the upload response — the plan artifact
+// is already durably stored.
+func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte) bool {
+	if s.cfg.PlanReviewer == nil || s.cfg.RunRepo == nil {
+		return false
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: get run failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+
+	reviewersCfg := s.resolvePlanStageReviewers(ctx, runRow)
+	if reviewersCfg == nil || reviewersCfg.Agent == 0 {
+		return false
+	}
+
+	authority := planreview.ResolveAuthority(*reviewersCfg)
+
+	// Parse plan for the self-review guard (GeneratedBy.Model) and
+	// for the plan_review prompt builder. Validation already passed
+	// earlier in handleShipPlan; parse failure here is an internal
+	// inconsistency — log and skip reviews.
+	parsedPlan, err := plan.Parse(planBody)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: parse plan failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+
+	// Build the plan_review prompt using the same trigger-context
+	// machinery as the agent prompt handler.
+	trig := prompt.Trigger{
+		Repo:         runRow.Repo,
+		ApprovedPlan: parsedPlan,
+	}
+	if runRow.IssueContext != nil {
+		trig.IssueTitle = runRow.IssueContext.Title
+		trig.IssueBody = runRow.IssueContext.Body
+	}
+	if runRow.TriggerRef != nil {
+		if n, ok := parseIssueRef(*runRow.TriggerRef); ok {
+			trig.IssueNumber = n
+		}
+	}
+	promptText, err := prompt.Build("plan_review", trig)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: build prompt failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+
+	systemKind := audit.ActorKind("system")
+	hasRejection := false
+	for i := 0; i < reviewersCfg.Agent; i++ {
+		verdict, model, err := s.cfg.PlanReviewer.Review(ctx, promptText)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: reviewer invocation failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.Int("reviewer_index", i),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+
+		// Self-review guard (ADR-027): warn when the review agent's
+		// model matches the plan author's model. Warn-only per ADR;
+		// the verdict is still recorded.
+		if model != "" && model == parsedPlan.GeneratedBy.Model {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"plan review: self-review detected — reviewer model matches plan author model",
+				slog.String("model", model),
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+			)
+		}
+
+		// Append a plan_reviewed audit entry for each invocation.
+		payload := planreview.PlanReviewedPayload{
+			ReviewerKind:  "agent",
+			ReviewerModel: model,
+			Authority:     authority,
+			Verdict:       verdict.Verdict,
+			Concerns:      verdict.Concerns,
+			FreeForm:      verdict.FreeForm,
+		}
+		payloadBytes, _ := json.Marshal(payload)
+		if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     runID,
+			StageID:   &stageID,
+			Timestamp: time.Now().UTC(),
+			Category:  "plan_reviewed",
+			ActorKind: &systemKind,
+			Payload:   payloadBytes,
+		}); aerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: append audit entry failed",
+				slog.String("run_id", runID.String()),
+				slog.String("error", aerr.Error()),
+			)
+		}
+
+		if verdict.Verdict == planreview.VerdictReject {
+			hasRejection = true
+		}
+	}
+
+	// Authority gating: when gating mode and any verdict is reject,
+	// transition the stage to failed-B so the trace handler's
+	// dispatched→awaiting_approval path is blocked by the terminal state.
+	if authority == planreview.AuthorityGating && hasRejection {
+		cat := run.FailureB
+		reason := "plan_review_rejected: agent review verdict reject under gating authority"
+		if _, terr := s.cfg.RunRepo.TransitionStage(ctx, stageID,
+			run.StageStateFailed, &run.StageCompletion{
+				FailureCategory: &cat,
+				FailureReason:   &reason,
+			}); terr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"plan review: transition to failed-B after gating reject failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", terr.Error()),
+			)
+		}
+		return true
+	}
+	return false
+}
+
+// resolvePlanStageReviewers reads the run's workflow spec and returns
+// the ReviewersConfig for the plan-type stage in the active workflow.
+// Returns nil when the spec is absent, unparseable, or the workflow
+// has no plan stage.
+func (s *Server) resolvePlanStageReviewers(ctx context.Context, runRow *run.Run) *spec.ReviewersConfig {
+	if runRow.WorkflowSpec == nil {
+		return nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: parse workflow spec failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return nil
+	}
+	for _, st := range wf.Stages {
+		if st.Type == spec.StageTypePlan {
+			return st.Reviewers
+		}
+	}
+	return nil
 }

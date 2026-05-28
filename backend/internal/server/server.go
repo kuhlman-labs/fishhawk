@@ -191,6 +191,13 @@ type Config struct {
 	// caller can approve), which is acceptable for the v0 demo
 	// loop but NOT safe for production.
 	RoleResolver *role.Resolver
+
+	// PlanReviewer invokes review agents for plan artifacts when the
+	// stage's workflow spec declares reviewers.agent > 0. Nil disables
+	// agent-driven plan review regardless of the spec config (gateless
+	// behaviour). Production wires an Anthropic SDK client; tests
+	// inject a fake via this field.
+	PlanReviewer PlanReviewer
 }
 
 // Server wraps an http.Server with the routes and middleware stack

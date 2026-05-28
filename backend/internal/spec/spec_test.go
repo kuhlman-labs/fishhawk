@@ -665,6 +665,146 @@ workflows:
 	}
 }
 
+// --- reviewers field (ADR-027 / #560) ---
+
+func TestParse_Reviewers_Absent_NilPointer(t *testing.T) {
+	// No `reviewers` block → Stage.Reviewers is nil. The nil pointer is
+	// load-bearing: callers treat nil as {Human:1} (pre-ADR-027 behavior).
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	st := s.Workflows["trivial"].Stages[0]
+	if st.Reviewers != nil {
+		t.Errorf("Reviewers = %+v, want nil when block is absent", st.Reviewers)
+	}
+}
+
+func TestParse_Reviewers_ExplicitAgentAndHuman(t *testing.T) {
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agent: 1
+          human: 1
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	st := s.Workflows["trivial"].Stages[0]
+	if st.Reviewers == nil {
+		t.Fatal("Reviewers should be non-nil when block is present")
+	}
+	if st.Reviewers.Agent != 1 {
+		t.Errorf("Reviewers.Agent = %d, want 1", st.Reviewers.Agent)
+	}
+	if st.Reviewers.Human != 1 {
+		t.Errorf("Reviewers.Human = %d, want 1", st.Reviewers.Human)
+	}
+}
+
+func TestParse_Reviewers_AgentOnly_Gating(t *testing.T) {
+	// agent>0 && human==0 → gating authority mode.
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agent: 2
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	rv := s.Workflows["trivial"].Stages[0].Reviewers
+	if rv == nil {
+		t.Fatal("Reviewers should be non-nil")
+	}
+	if rv.Agent != 2 {
+		t.Errorf("Reviewers.Agent = %d, want 2", rv.Agent)
+	}
+	if rv.Human != 0 {
+		t.Errorf("Reviewers.Human = %d, want 0 (omitted → zero)", rv.Human)
+	}
+}
+
+func TestParse_Reviewers_NegativeAgent_Rejected(t *testing.T) {
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agent: -1
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for negative agent count", err)
+	}
+}
+
+func TestParse_Reviewers_NegativeHuman_Rejected(t *testing.T) {
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          human: -1
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for negative human count", err)
+	}
+}
+
 // --- Parse via io.Reader ---
 
 func TestParse_ReaderRoundTrip(t *testing.T) {

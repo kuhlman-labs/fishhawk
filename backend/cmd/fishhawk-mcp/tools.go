@@ -243,6 +243,28 @@ type PlanVerification struct {
 	RollbackPlan string `json:"rollback_plan"`
 }
 
+// PlanReviewConcern is one flagged issue within a review verdict,
+// decoded from a plan_reviewed audit entry (ADR-027).
+type PlanReviewConcern struct {
+	Severity string `json:"severity"`
+	Category string `json:"category"`
+	Note     string `json:"note"`
+}
+
+// PlanReview is one review-agent verdict decoded from a plan_reviewed
+// audit entry (ADR-027). Each entry represents one agent invocation.
+// ReviewerKind is always "agent" for agent reviews. Authority is one
+// of gating, advisory, or gateless per the stage's reviewers config.
+// Verdict is one of approve, approve_with_concerns, or reject.
+type PlanReview struct {
+	ReviewerKind  string              `json:"reviewer_kind"`
+	ReviewerModel string              `json:"reviewer_model,omitempty"`
+	Authority     string              `json:"authority"`
+	Verdict       string              `json:"verdict"`
+	Concerns      []PlanReviewConcern `json:"concerns,omitempty"`
+	FreeForm      string              `json:"free_form,omitempty"`
+}
+
 // GetPlanOutput is the response shape. Status is `available` or
 // `no_plan_yet`; on `no_plan_yet` Plan is nil and Message explains
 // why so an agent reading the response can branch on the state
@@ -252,6 +274,7 @@ type GetPlanOutput struct {
 	Message     string       `json:"message,omitempty" jsonschema:"human-readable explanation when status=no_plan_yet"`
 	Plan        *PlanContent `json:"plan,omitempty"`
 	ResolvedVia string       `json:"resolved_via,omitempty" jsonschema:"'self' when the plan came from the requested run; 'parent:<run_id>' when the parent-walk resolved it for a CI-retry chain"`
+	Reviews     []PlanReview `json:"reviews,omitempty" jsonschema:"plan-review agent verdicts; populated when reviewers.agent>0 is configured on the stage (ADR-027)"`
 }
 
 // registerGetPlan wires the fishhawk_get_plan tool. The handler
@@ -271,12 +294,17 @@ canonical plan. Returns the parsed standard_v1 plan shape: summary,
 scope.files, approach steps, verification (test_strategy +
 rollback_plan), risks_and_assumptions when present,
 predicted_runtime_minutes + predicted_runtime_confidence (every plan),
-and decomposition (when the agent proposed sub-plans).
+decomposition (when the agent proposed sub-plans), and reviews[]
+(when plan-review agents were configured on the stage — each entry
+has reviewer_kind, authority, verdict, concerns[], and free_form).
 
 Response status:
   - "available"     — Plan is populated; ResolvedVia tells you whether
                       it came from the requested run ("self") or a
                       parent in the retry chain ("parent:<run_id>").
+                      Reviews[] is populated from plan_reviewed audit
+                      entries on the resolved run (empty when no
+                      review agents ran).
   - "no_plan_yet"   — The run (and its parents) have no terminal plan
                       artifact yet. Message names the chain depth
                       searched.
@@ -304,10 +332,15 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if current != runID {
 				resolvedVia = "parent:" + current.String()
 			}
+			reviews, err := r.loadPlanReviews(ctx, current)
+			if err != nil {
+				return nil, GetPlanOutput{}, fmt.Errorf("load plan reviews: %w", err)
+			}
 			return nil, GetPlanOutput{
 				Status:      "available",
 				Plan:        p,
 				ResolvedVia: resolvedVia,
+				Reviews:     reviews,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -400,6 +433,37 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 		return nil, false, fmt.Errorf("decode plan artifact: %w", err)
 	}
 	return &p, true, nil
+}
+
+// loadPlanReviews queries plan_reviewed audit entries for the given
+// run and decodes each payload into a PlanReview. Entries whose
+// payload is absent or malformed are silently skipped — a review
+// with a corrupt payload is not a reason to fail the whole plan
+// fetch. Returns nil when no plan_reviewed entries exist.
+func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]PlanReview, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "plan_reviewed",
+		Limit:    50,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var reviews []PlanReview
+	for _, e := range entries {
+		if e.Payload == nil {
+			continue
+		}
+		raw, merr := json.Marshal(e.Payload)
+		if merr != nil {
+			continue
+		}
+		var review PlanReview
+		if uerr := json.Unmarshal(raw, &review); uerr != nil {
+			continue
+		}
+		reviews = append(reviews, review)
+	}
+	return reviews, nil
 }
 
 // auditLimitDefault is the default value for the get_run_status
