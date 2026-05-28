@@ -914,6 +914,211 @@ func TestBuild_Implement_ApprovalConditions_Nil_Absent(t *testing.T) {
 	}
 }
 
+func TestBuild_PlanReview_ContainsVerdictSchema(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		IssueNumber:  42,
+		IssueTitle:   "Add foo",
+		IssueBody:    "We need a foo function in pkg/bar.",
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Verdict schema must be present so the agent knows the output shape.
+	wants := []string{
+		`"verdict"`,
+		`"approve"`,
+		`"approve_with_concerns"`,
+		`"reject"`,
+		`"concerns"`,
+		`"severity"`,
+		`"category"`,
+		`"note"`,
+		`"free_form"`,
+		"Verdict schema",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing verdict schema element %q\n---\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_PlanReview_ContainsPlanArtifact(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		IssueNumber:  42,
+		IssueTitle:   "Add foo",
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The plan content must appear in the review prompt so the agent
+	// can assess it.
+	wants := []string{
+		"Plan artifact",
+		"Add a foo helper to pkg/bar.",
+		"pkg/bar/foo.go (create)",
+		"pkg/bar/bar.go (modify)",
+		"1. Define Foo on the bar.Service interface.",
+		"2. Implement Foo with a table-driven test.",
+		"Test strategy:",
+		"Rollback plan:",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing plan content %q\n---\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_PlanReview_ContainsNoPlanConstraint(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The no-re-plan constraint must be explicitly stated.
+	noPlanStrings := []string{
+		"ROLE CONSTRAINT",
+		"Re-plan",
+		"propose alternative plans",
+		"suggest edits to the plan",
+		"MUST NOT",
+		"JSON only",
+	}
+	for _, w := range noPlanStrings {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing no-re-plan constraint %q\n---\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_PlanReview_ContainsIssueBody(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		IssueNumber:  7,
+		IssueTitle:   "Some issue",
+		IssueBody:    "This is the issue body with context.",
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Issue body must be present so the reviewer can assess whether
+	// the plan actually addresses the originating issue.
+	if !strings.Contains(got, "This is the issue body with context.") {
+		t.Errorf("plan_review prompt should include the issue body for context:\n%s", got)
+	}
+	if !strings.Contains(got, "Originating issue") {
+		t.Errorf("plan_review prompt missing 'Originating issue' section:\n%s", got)
+	}
+}
+
+func TestBuild_PlanReview_NilPlan_EmitsMissingArtifactGuidance(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo: "x/y",
+		// ApprovedPlan deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "no plan artifact provided") {
+		t.Errorf("plan_review with nil plan should surface missing-artifact guidance:\n%s", got)
+	}
+	// Verdict schema must still be present even without a plan.
+	if !strings.Contains(got, "Verdict schema") {
+		t.Errorf("plan_review with nil plan must still include verdict schema:\n%s", got)
+	}
+}
+
+func TestBuild_PlanReview_IsDeterministic(t *testing.T) {
+	tr := Trigger{
+		IssueNumber:  7,
+		IssueTitle:   "T",
+		IssueBody:    "B",
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+	}
+	a, _ := Build("plan_review", tr)
+	b, _ := Build("plan_review", tr)
+	if a != b {
+		t.Errorf("Build plan_review is non-deterministic across calls:\nA: %s\nB: %s", a, b)
+	}
+}
+
+func TestBuild_PlanReview_NoIssueContext_SectionAbsent(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		// No issue fields set.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// When no issue context is available, the Originating issue section
+	// should not appear — don't render an empty section header.
+	if strings.Contains(got, "Originating issue") {
+		t.Errorf("plan_review should not render Originating issue section when no issue context provided:\n%s", got)
+	}
+}
+
+func TestBuild_PlanReview_ReviewCriteriaPresent(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Review criteria",
+		"Scope completeness",
+		"Approach feasibility",
+		"Verification adequacy",
+		"Risk coverage",
+		"Schema compliance",
+		"Verdict decision rule",
+		"approve_with_concerns",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing review criteria element %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_PlanReview_ProducesNoPRDescriptionGuidance(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The review prompt must not bleed in implement-stage instructions.
+	// The agent is a reviewer, not an implementer.
+	if strings.Contains(got, PullRequestDescriptionPath) {
+		t.Errorf("plan_review prompt must not include PR description guidance:\n%s", got)
+	}
+	if strings.Contains(got, "## Summary") {
+		t.Errorf("plan_review prompt must not include PR section headers:\n%s", got)
+	}
+}
+
+func TestBuild_PlanReview_UnsupportedStageStillErrors(t *testing.T) {
+	// Confirm that adding plan_review didn't accidentally break the
+	// ErrUnsupportedStage path for truly unknown stage types.
+	_, err := Build("deploy", Trigger{})
+	if !errors.Is(err, ErrUnsupportedStage) {
+		t.Errorf("expected ErrUnsupportedStage for 'deploy', got %v", err)
+	}
+}
+
 func TestBuild_Implement_WithSparsePlan_OmitsEmptySections(t *testing.T) {
 	// A plan that fails optional sections (no scope.files, no
 	// risks) should still render cleanly — empty sections drop
