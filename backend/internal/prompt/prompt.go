@@ -25,6 +25,13 @@ import (
 // per ADR-025 D1). If that default changes in the spec package, update here.
 const defaultStageTimeoutMinutes = 15
 
+// PlanReviewSplitMarker is the substring that separates the stable
+// role-constraint preamble (cached) from the variable plan + issue
+// content in the plan-review prompt. Adapters split here for
+// Anthropic prompt caching; tests assert the constant appears in
+// buildPlanReview's output.
+const PlanReviewSplitMarker = "\n### Plan artifact\n\n"
+
 // ErrUnsupportedStage signals the requested stage type isn't yet
 // wired for prompt construction. The handler maps this to HTTP 501.
 var ErrUnsupportedStage = errors.New("prompt: unsupported stage type")
