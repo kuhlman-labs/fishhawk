@@ -523,6 +523,8 @@ func (s *Server) resolveCalibrationHint(ctx context.Context, workflowID string) 
 	return &prompt.CalibrationHint{
 		Samples:          result.Samples,
 		CalibrationRatio: result.CalibrationRatio,
+		ActualP50Minutes: result.ActualP50Minutes,
+		ActualP95Minutes: result.ActualP95Minutes,
 		ConfidenceBands:  bands,
 	}, nil
 }

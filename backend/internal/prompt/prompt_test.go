@@ -416,6 +416,8 @@ func TestBuild_Plan_CalibrationHintRendered(t *testing.T) {
 		CalibrationHint: &CalibrationHint{
 			Samples:          10,
 			CalibrationRatio: 1.18,
+			ActualP50Minutes: 12.5,
+			ActualP95Minutes: 18.0,
 			ConfidenceBands: map[string]CalibrationBand{
 				"high":   {Samples: 4, WithinScale: 3},
 				"medium": {Samples: 6, WithinScale: 4},
@@ -428,8 +430,10 @@ func TestBuild_Plan_CalibrationHintRendered(t *testing.T) {
 	}
 	wants := []string{
 		"### Calibration hint",
-		"actual runtime was 1.18x of predicted",
 		"10 implement-stage",
+		"actual p50 = 12.5 min",
+		"p95 = 18.0 min",
+		"ratio = 1.18",
 		"high: 4 samples, 3 within 1.5x of prediction",
 		"medium: 6 samples, 4 within 1.5x of prediction",
 		"low: 2 samples, 2 within 1.5x of prediction",
@@ -510,6 +514,87 @@ func TestBuild_Plan_CalibrationHint_Deterministic(t *testing.T) {
 	b, _ := Build("plan", tr)
 	if a != b {
 		t.Errorf("Build with CalibrationHint is non-deterministic across calls:\nA: %s\nB: %s", a, b)
+	}
+}
+
+func TestBuild_Plan_CalibrationHint_HighBandAdvisory(t *testing.T) {
+	// High band at 1/10 within 1.5x (10% ≤ 25%) → advisory fires naming "high".
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          10,
+			CalibrationRatio: 2.50,
+			ActualP50Minutes: 25.0,
+			ActualP95Minutes: 45.0,
+			ConfidenceBands: map[string]CalibrationBand{
+				"high": {Samples: 10, WithinScale: 1},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"\"high\" has been the LEAST accurate band historically",
+		"1/10 within 1.5x",
+		"Reserve \"high\" for genuinely mechanical changes",
+		"Default to \"medium\"",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing advisory string %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Plan_CalibrationHint_NoAdvisoryWhenHighAccurate(t *testing.T) {
+	// Coverage: medium is the worst band (1/10) but high is accurate (8/10).
+	// The advisory is gated on high specifically, so it must NOT fire here.
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          20,
+			CalibrationRatio: 1.00,
+			ActualP50Minutes: 10.0,
+			ActualP95Minutes: 15.0,
+			ConfidenceBands: map[string]CalibrationBand{
+				"medium": {Samples: 10, WithinScale: 1},
+				"high":   {Samples: 10, WithinScale: 8},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "LEAST accurate band historically") {
+		t.Errorf("high-band advisory must not fire when high band is accurate (8/10):\n%s", got)
+	}
+}
+
+func TestBuild_Plan_CalibrationHint_NoAdvisoryAboveThreshold(t *testing.T) {
+	// All bands above 25% accuracy → no advisory.
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          30,
+			CalibrationRatio: 1.00,
+			ActualP50Minutes: 10.0,
+			ActualP95Minutes: 15.0,
+			ConfidenceBands: map[string]CalibrationBand{
+				"high":   {Samples: 10, WithinScale: 4}, // 40% > 25%
+				"medium": {Samples: 10, WithinScale: 4},
+				"low":    {Samples: 10, WithinScale: 4},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "LEAST accurate band historically") {
+		t.Errorf("advisory must not fire when all bands exceed 25%% accuracy:\n%s", got)
 	}
 }
 

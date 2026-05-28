@@ -63,6 +63,8 @@ type CalibrationBand struct {
 type CalibrationHint struct {
 	Samples          int
 	CalibrationRatio float64
+	ActualP50Minutes float64
+	ActualP95Minutes float64
 	ConfidenceBands  map[string]CalibrationBand
 }
 
@@ -411,8 +413,8 @@ func buildPlan(t Trigger) string {
 		"If your plan commits to an expensive step, allocate explicit minutes for it in predicted_runtime_minutes.\n")
 	if t.CalibrationHint != nil {
 		b.WriteString("\n### Calibration hint\n\n")
-		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow: actual runtime was %.2fx of predicted (actual / predicted).\n",
-			t.CalibrationHint.Samples, t.CalibrationHint.CalibrationRatio)
+		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow: actual p50 = %.1f min, p95 = %.1f min, ratio = %.2f.\n",
+			t.CalibrationHint.Samples, t.CalibrationHint.ActualP50Minutes, t.CalibrationHint.ActualP95Minutes, t.CalibrationHint.CalibrationRatio)
 		b.WriteString("Confidence-band accuracy:\n")
 		for _, level := range []string{"high", "medium", "low"} {
 			band, ok := t.CalibrationHint.ConfidenceBands[level]
@@ -423,6 +425,14 @@ func buildPlan(t Trigger) string {
 				level, band.Samples, band.WithinScale)
 		}
 		fmt.Fprintf(&b, "Multiply your raw estimate by %.2f to get a calibrated value.\n", t.CalibrationHint.CalibrationRatio)
+		if highBand, ok := t.CalibrationHint.ConfidenceBands["high"]; ok && highBand.Samples >= 5 {
+			if float64(highBand.WithinScale)/float64(highBand.Samples) <= 0.25 {
+				fmt.Fprintf(&b, "→ \"high\" has been the LEAST accurate band historically (%d/%d within 1.5x). "+
+					"Reserve \"high\" for genuinely mechanical changes (rename, doc edit). "+
+					"Default to \"medium\" when there's any logic, multi-file, or new-code uncertainty.\n",
+					highBand.WithinScale, highBand.Samples)
+			}
+		}
 	}
 	return b.String()
 }
