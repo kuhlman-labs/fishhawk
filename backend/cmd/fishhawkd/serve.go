@@ -160,7 +160,12 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.Int("max_tokens", *planReviewMaxTokens),
 			slog.Duration("timeout", *planReviewTimeout))
 	} else {
-		logger.Warn("FISHHAWKD_ANTHROPIC_API_KEY not set; plan review is gateless regardless of spec config")
+		// #574 / ADR-027: tightened from the plain "gateless" warning so
+		// the operator can predict what a workflow declaring
+		// reviewers.agent > 0 will do with no reviewer wired — fail
+		// dispatch up front in gating mode, skip with an audit trail in
+		// advisory mode.
+		logger.Warn("plan-review agent not configured (set FISHHAWKD_ANTHROPIC_API_KEY to enable); any workflow declaring reviewers.agent > 0 will fail dispatch in gating mode and skip with a plan_review_skipped audit entry in advisory mode")
 	}
 
 	// Wire the run repository when a DB URL is supplied. Without

@@ -263,6 +263,11 @@ type PlanReview struct {
 	Verdict       string              `json:"verdict"`
 	Concerns      []PlanReviewConcern `json:"concerns,omitempty"`
 	FreeForm      string              `json:"free_form,omitempty"`
+	// Reason is populated only on a "skipped" verdict (#574): it
+	// names why the configured agent layer was not run (e.g.
+	// "reviewer_not_configured" when reviewers.agent>0 but no
+	// PlanReviewer is wired on the backend).
+	Reason string `json:"reason,omitempty"`
 }
 
 // GetPlanOutput is the response shape. Status is `available` or
@@ -274,7 +279,7 @@ type GetPlanOutput struct {
 	Message     string       `json:"message,omitempty" jsonschema:"human-readable explanation when status=no_plan_yet"`
 	Plan        *PlanContent `json:"plan,omitempty"`
 	ResolvedVia string       `json:"resolved_via,omitempty" jsonschema:"'self' when the plan came from the requested run; 'parent:<run_id>' when the parent-walk resolved it for a CI-retry chain"`
-	Reviews     []PlanReview `json:"reviews,omitempty" jsonschema:"plan-review agent verdicts; populated when reviewers.agent>0 is configured on the stage (ADR-027)"`
+	Reviews     []PlanReview `json:"reviews,omitempty" jsonschema:"plan-review agent verdicts; populated when reviewers.agent>0 is configured on the stage (ADR-027). A verdict of 'skipped' with a reason marks an agent layer that was configured but not wired on the backend"`
 }
 
 // registerGetPlan wires the fishhawk_get_plan tool. The handler
@@ -296,7 +301,9 @@ rollback_plan), risks_and_assumptions when present,
 predicted_runtime_minutes + predicted_runtime_confidence (every plan),
 decomposition (when the agent proposed sub-plans), and reviews[]
 (when plan-review agents were configured on the stage — each entry
-has reviewer_kind, authority, verdict, concerns[], and free_form).
+has reviewer_kind, authority, verdict, concerns[], and free_form). A
+verdict of "skipped" with a reason marks an agent layer that was
+configured (reviewers.agent>0) but not wired on the backend.
 
 Response status:
   - "available"     — Plan is populated; ResolvedVia tells you whether
@@ -462,6 +469,41 @@ func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]P
 			continue
 		}
 		reviews = append(reviews, review)
+	}
+
+	// Second pass: plan_review_skipped entries (#574). These mark a
+	// configured agent layer that was not wired on the backend. Each
+	// surfaces as a synthesized PlanReview with verdict "skipped" so
+	// an agent reading the response can tell a degraded gate from a
+	// real verdict without a separate audit query.
+	skipped, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "plan_review_skipped",
+		Limit:    50,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range skipped {
+		if e.Payload == nil {
+			continue
+		}
+		raw, merr := json.Marshal(e.Payload)
+		if merr != nil {
+			continue
+		}
+		var p struct {
+			Reason    string `json:"reason"`
+			Authority string `json:"authority"`
+		}
+		if uerr := json.Unmarshal(raw, &p); uerr != nil {
+			continue
+		}
+		reviews = append(reviews, PlanReview{
+			ReviewerKind: "agent",
+			Authority:    p.Authority,
+			Verdict:      "skipped",
+			Reason:       p.Reason,
+		})
 	}
 	return reviews, nil
 }

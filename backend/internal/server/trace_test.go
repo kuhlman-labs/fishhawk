@@ -126,9 +126,10 @@ func (s *traceStoreFake) List(_ context.Context, _ uuid.UUID) ([]tracestore.Bund
 // logged. AppendChained is the only method exercised by the trace
 // handler.
 type auditFake struct {
-	mu        sync.Mutex
-	appended  []audit.ChainAppendParams
-	appendErr error
+	mu             sync.Mutex
+	appended       []audit.ChainAppendParams
+	globalAppended []audit.GlobalChainAppendParams
+	appendErr      error
 }
 
 func newAuditFake() *auditFake { return &auditFake{} }
@@ -151,8 +152,14 @@ func (a *auditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
 }
 
-func (a *auditFake) AppendGlobalChained(_ context.Context, _ audit.GlobalChainAppendParams) (*audit.Entry, error) {
-	return nil, errors.New("auditFake: AppendGlobalChained not used")
+func (a *auditFake) AppendGlobalChained(_ context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	if a.appendErr != nil {
+		return nil, a.appendErr
+	}
+	a.mu.Lock()
+	a.globalAppended = append(a.globalAppended, p)
+	a.mu.Unlock()
+	return &audit.Entry{ID: uuid.New()}, nil
 }
 
 func (a *auditFake) ListGlobal(_ context.Context) ([]*audit.Entry, error) {

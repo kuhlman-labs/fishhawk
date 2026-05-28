@@ -364,7 +364,9 @@ func deref(s *string) string {
 // reviewer failure doesn't fail the upload response — the plan artifact
 // is already durably stored.
 func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte) bool {
-	if s.cfg.PlanReviewer == nil || s.cfg.RunRepo == nil {
+	// RunRepo is required to resolve the workflow spec; without it we
+	// can't tell whether agent review was even requested.
+	if s.cfg.RunRepo == nil {
 		return false
 	}
 
@@ -383,6 +385,39 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	}
 
 	authority := planreview.ResolveAuthority(*reviewersCfg)
+
+	// PlanReviewer not wired but the spec requested agent review
+	// (#574 / ADR-027). Emit a plan_review_skipped audit entry so the
+	// degradation is auditable rather than silent, then continue: the
+	// stage advances to awaiting_approval via the trace path (in
+	// advisory mode the human gate remains authoritative). The
+	// gating-mode hard block lives at the run-create endpoint
+	// (handleCreateRun); the dispatcher-driven path is not guarded
+	// there, so the entry is emitted for both authorities here.
+	if s.cfg.PlanReviewer == nil {
+		if s.cfg.AuditRepo != nil {
+			payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
+				Reason:           "reviewer_not_configured",
+				ConfiguredAgents: reviewersCfg.Agent,
+				Authority:        authority,
+			})
+			systemKind := audit.ActorKind("system")
+			if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID:     runID,
+				StageID:   &stageID,
+				Timestamp: time.Now().UTC(),
+				Category:  "plan_review_skipped",
+				ActorKind: &systemKind,
+				Payload:   payload,
+			}); aerr != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: append plan_review_skipped audit entry failed",
+					slog.String("run_id", runID.String()),
+					slog.String("error", aerr.Error()),
+				)
+			}
+		}
+		return false
+	}
 
 	// Parse plan for the self-review guard (GeneratedBy.Model) and
 	// for the plan_review prompt builder. Validation already passed

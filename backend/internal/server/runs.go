@@ -12,6 +12,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -301,6 +302,49 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		maxRetriesSnap = webhook.WorkflowMaxRetries(wf)
 	}
 	_ = parsed // parsed is reserved for future spec-driven checks
+
+	// Plan-review wiring guard (#574 / ADR-027). When the resolved
+	// spec declares an agent-gated plan review (reviewers.agent > 0,
+	// human == 0) but no PlanReviewer is wired, agent review would be
+	// silently skipped at plan-upload time — minting a run that can
+	// never satisfy its own gate. Reject at create time with a
+	// run_rejected_misconfigured audit trail rather than letting the
+	// run proceed past a gate that does not exist. Advisory mode
+	// (agent > 0, human > 0) is allowed through: the human gate
+	// remains authoritative and runPlanReviews emits a
+	// plan_review_skipped audit entry for the missing agent layer.
+	if haveStageDefs && s.cfg.PlanReviewer == nil {
+		for _, st := range workflowDef.Stages {
+			if st.Type != spec.StageTypePlan || st.Reviewers == nil {
+				continue
+			}
+			if planreview.ResolveAuthority(*st.Reviewers) != planreview.AuthorityGating {
+				continue
+			}
+			if s.cfg.AuditRepo != nil {
+				payload, _ := json.Marshal(map[string]any{
+					"reason":            "plan_reviewer_unconfigured",
+					"stage":             st.ID,
+					"workflow_id":       req.WorkflowID,
+					"repo":              req.Repo,
+					"configured_agents": st.Reviewers.Agent,
+				})
+				systemKind := audit.ActorKind("system")
+				if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(r.Context(), audit.GlobalChainAppendParams{
+					Timestamp: time.Now().UTC(),
+					Category:  "run_rejected_misconfigured",
+					ActorKind: &systemKind,
+					Payload:   payload,
+				}); aerr != nil {
+					s.cfg.Logger.Warn("append run_rejected_misconfigured audit entry failed",
+						"repo", req.Repo, "workflow_id", req.WorkflowID, "error", aerr.Error())
+				}
+			}
+			s.writeError(w, r, http.StatusBadRequest, "plan_reviewer_unconfigured",
+				"workflow declares agent-gated plan review (reviewers.agent > 0, human == 0) but fishhawkd has no PlanReviewer wired; set FISHHAWKD_ANTHROPIC_API_KEY or remove reviewers.agent", nil)
+			return
+		}
+	}
 
 	// Idempotency-Key (E8.2 / #40). When set, a previously-created
 	// run with the same (repo, key) is returned 200 instead of
