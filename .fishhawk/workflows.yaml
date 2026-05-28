@@ -39,6 +39,13 @@ workflows:
         type: plan
         executor:
           agent: claude-code
+        # Advisory plan review (ADR-027): an agent reviewer surfaces a
+        # verdict before the human gate; agent>0 + human>0 → advisory, so
+        # the founder approval below stays authoritative. Exercised locally
+        # via the claudecode.Reviewer subprocess (#575).
+        reviewers:
+          agent: 1
+          human: 1
         inputs:
           - source: github_issue
             required: true
