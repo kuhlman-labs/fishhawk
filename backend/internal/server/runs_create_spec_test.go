@@ -273,6 +273,101 @@ func TestCreateRun_WorkflowSpec_StageCreateFails_Returns500(t *testing.T) {
 	}
 }
 
+// gatingReviewSpecYAML carries a plan stage requesting agent-gated
+// review (reviewers.agent>0, human==0) — the configuration that must
+// be rejected at create time when no PlanReviewer is wired (#574).
+const gatingReviewSpecYAML = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+
+// TestCreateRun_GatingReview_NilReviewer_Rejected verifies the #574
+// guard: a workflow declaring agent-gated plan review while the server
+// has no PlanReviewer wired is rejected with 400 +
+// plan_reviewer_unconfigured, a run_rejected_misconfigured global-chain
+// audit entry is written, and no run row is created.
+func TestCreateRun_GatingReview_NilReviewer_Rejected(t *testing.T) {
+	repo := newFakeRepo()
+	au := newAuditFake()
+	// PlanReviewer intentionally nil.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  gatingReviewSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_reviewer_unconfigured"`) {
+		t.Errorf("body missing plan_reviewer_unconfigured code: %s", w.Body.String())
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("expected zero runs created, got %d", len(repo.runs))
+	}
+	// A run_rejected_misconfigured global-chain entry must be written.
+	var found bool
+	for _, e := range au.globalAppended {
+		if e.Category == "run_rejected_misconfigured" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no run_rejected_misconfigured global-chain audit entry written: %#v", au.globalAppended)
+	}
+}
+
+// TestCreateRun_AdvisoryReview_NilReviewer_Allowed verifies the #574
+// guard does NOT block advisory-mode review (agent>0, human>0): the
+// human gate remains authoritative, so the run is created normally
+// even with no PlanReviewer wired.
+func TestCreateRun_AdvisoryReview_NilReviewer_Allowed(t *testing.T) {
+	repo := newFakeRepo()
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec": strings.Replace(gatingReviewSpecYAML,
+			"agent: 1\n          human: 0", "agent: 1\n          human: 1", 1),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (advisory mode allowed):\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.globalAppended {
+		if e.Category == "run_rejected_misconfigured" {
+			t.Errorf("advisory mode must not emit run_rejected_misconfigured")
+		}
+	}
+}
+
 // --- GitHub fetch fallback for workflow_spec (#413) ---
 
 // ghTokensStub satisfies githubapp.TokenProvider for runs_test GitHub

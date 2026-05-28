@@ -328,9 +328,23 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		fb.mu.Lock()
 		fb.perRunAuditLastQueryByID[id] = r.URL.RawQuery
-		items := fb.perRunAuditByRun[id]
+		all := fb.perRunAuditByRun[id]
 		next := fb.perRunAuditNextByRun[id]
 		fb.mu.Unlock()
+		// Mirror the backend's category filter: when a category query
+		// param is set, return only entries of that category. The
+		// production endpoint filters server-side; loadPlanReviews
+		// relies on this to query plan_reviewed and plan_review_skipped
+		// independently (#574).
+		items := all
+		if cat := r.URL.Query().Get("category"); cat != "" {
+			items = nil
+			for _, e := range all {
+				if e.Category == cat {
+					items = append(items, e)
+				}
+			}
+		}
 		w.WriteHeader(fb.perRunAuditStatus)
 		_ = json.NewEncoder(w).Encode(listAuditResult{Items: items, NextCursor: next})
 	})
@@ -1091,6 +1105,58 @@ func TestGetPlan_WithReviews_PopulatesField(t *testing.T) {
 	}
 	if out.Reviews[1].FreeForm != "Consider narrowing scope." {
 		t.Errorf("Reviews[1].FreeForm = %q", out.Reviews[1].FreeForm)
+	}
+}
+
+func TestGetPlan_WithSkippedReview_SurfacesSkippedVerdict(t *testing.T) {
+	// A plan_review_skipped audit entry (#574) surfaces as a synthesized
+	// review with verdict "skipped" and the recorded reason/authority.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	payload, _ := json.Marshal(map[string]any{
+		"reason":            "reviewer_not_configured",
+		"configured_agents": 1,
+		"authority":         "gating",
+	})
+	var decoded any
+	_ = json.Unmarshal(payload, &decoded)
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: 1,
+		RunID:    runID.String(),
+		Category: "plan_review_skipped",
+		Payload:  decoded,
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" {
+		t.Fatalf("Status = %q, want available", out.Status)
+	}
+	if len(out.Reviews) != 1 {
+		t.Fatalf("len(Reviews) = %d, want 1", len(out.Reviews))
+	}
+	got := out.Reviews[0]
+	if got.Verdict != "skipped" {
+		t.Errorf("Verdict = %q, want skipped", got.Verdict)
+	}
+	if got.Reason != "reviewer_not_configured" {
+		t.Errorf("Reason = %q, want reviewer_not_configured", got.Reason)
+	}
+	if got.Authority != "gating" {
+		t.Errorf("Authority = %q, want gating", got.Authority)
+	}
+	if got.ReviewerKind != "agent" {
+		t.Errorf("ReviewerKind = %q, want agent", got.ReviewerKind)
 	}
 }
 

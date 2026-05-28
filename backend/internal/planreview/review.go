@@ -87,6 +87,18 @@ func ResolveAuthority(r spec.ReviewersConfig) AuthorityMode {
 	}
 }
 
+// ReviewSkippedPayload is the JSON payload stored in an audit
+// entry with category "plan_review_skipped" (#574). It records that
+// the stage's reviewers config requested agent review (agent > 0) but
+// no PlanReviewer was wired, so the agent layer was skipped. Authority
+// captures whether the skip degraded a gating or advisory gate; in
+// advisory mode the human gate remains authoritative.
+type ReviewSkippedPayload struct {
+	Reason           string        `json:"reason"`
+	ConfiguredAgents int           `json:"configured_agents"`
+	Authority        AuthorityMode `json:"authority"`
+}
+
 // PlanReviewedPayload is the JSON payload stored in an audit entry
 // with category "plan_reviewed". One entry is appended per review
 // agent invocation.

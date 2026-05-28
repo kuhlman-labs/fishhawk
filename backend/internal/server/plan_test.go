@@ -436,13 +436,17 @@ func TestShipPlan_Unconfigured_503(t *testing.T) {
 
 // --- Plan-review integration tests (ADR-027 Sub-plan D) ---
 
-// TestShipPlan_ReviewAgents_Gateless_NilReviewer confirms that when
-// PlanReviewer is nil, no plan_reviewed audit entries are written and
-// the upload still returns 201.
-func TestShipPlan_ReviewAgents_Gateless_NilReviewer(t *testing.T) {
+// TestShipPlan_ReviewAgents_Gating_NilReviewer_SkippedAudit confirms
+// that when the spec requests agent-gated review (agent>0, human==0)
+// but PlanReviewer is nil, the plan-upload path writes a
+// plan_review_skipped audit entry (rather than silently skipping) and
+// the upload still returns 201. The hard create-time block for gating
+// mode lives at handleCreateRun (covered separately); the upload path
+// only audits the degradation (#574).
+func TestShipPlan_ReviewAgents_Gating_NilReviewer_SkippedAudit(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
-	// PlanReviewer is nil → gateless regardless of spec
-	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, nil, specGatingReviewers)
+	// PlanReviewer is nil but spec requests gating agent review.
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, nil, specGatingReviewers)
 	priv, _ := sf.issue(t, runID)
 	body := validPlanBytes(t)
 
@@ -451,10 +455,84 @@ func TestShipPlan_ReviewAgents_Gateless_NilReviewer(t *testing.T) {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
 
-	// Only plan_generated entry; no plan_reviewed.
+	// No plan_reviewed entry (no reviewer ran) but a plan_review_skipped
+	// entry recording the gating degradation.
+	var skipped []planreview.ReviewSkippedPayload
 	for _, e := range au.appended {
 		if e.Category == "plan_reviewed" {
 			t.Errorf("unexpected plan_reviewed audit entry when PlanReviewer is nil")
+		}
+		if e.Category != "plan_review_skipped" {
+			continue
+		}
+		var p planreview.ReviewSkippedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_review_skipped payload: %v", err)
+		}
+		skipped = append(skipped, p)
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("plan_review_skipped entries = %d, want 1", len(skipped))
+	}
+	got := skipped[0]
+	if got.Reason != "reviewer_not_configured" {
+		t.Errorf("reason = %q, want reviewer_not_configured", got.Reason)
+	}
+	if got.ConfiguredAgents != 1 {
+		t.Errorf("configured_agents = %d, want 1", got.ConfiguredAgents)
+	}
+	if got.Authority != planreview.AuthorityGating {
+		t.Errorf("authority = %q, want gating", got.Authority)
+	}
+
+	// Skip does not fail the stage — no failed-B transition.
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("nil-reviewer skip should not transition the stage to failed-B")
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_Advisory_NilReviewer_SkippedAudit confirms
+// that in advisory mode (agent>0, human>0) with PlanReviewer nil, a
+// plan_review_skipped entry is written and the stage is not failed —
+// the human gate remains authoritative (#574).
+func TestShipPlan_ReviewAgents_Advisory_NilReviewer_SkippedAudit(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, nil, specAdvisoryReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	var skipped []planreview.ReviewSkippedPayload
+	for _, e := range au.appended {
+		if e.Category != "plan_review_skipped" {
+			continue
+		}
+		var p planreview.ReviewSkippedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_review_skipped payload: %v", err)
+		}
+		skipped = append(skipped, p)
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("plan_review_skipped entries = %d, want 1", len(skipped))
+	}
+	if skipped[0].Authority != planreview.AuthorityAdvisory {
+		t.Errorf("authority = %q, want advisory", skipped[0].Authority)
+	}
+	if skipped[0].Reason != "reviewer_not_configured" {
+		t.Errorf("reason = %q, want reviewer_not_configured", skipped[0].Reason)
+	}
+
+	// Advisory skip: stage must NOT be failed; the human gate decides.
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("advisory nil-reviewer skip should not transition the stage to failed-B")
 		}
 	}
 }
