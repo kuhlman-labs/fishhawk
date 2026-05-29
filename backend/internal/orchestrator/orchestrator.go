@@ -219,6 +219,12 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 			DecomposedFrom: &parentID,
 			RunnerKind:     parent.RunnerKind,
 			IssueContext:   childCtx,
+			// Inherit the parent's cached workflow spec so the child's
+			// implement-stage prompt resolves the policy max_stage_runtime
+			// (30m for feature_change) instead of the runner's 15m default.
+			// Without this the decomposition budget is defeated: oversized
+			// plans split to fit 30m, then each child times out at 15m.
+			WorkflowSpec: parent.WorkflowSpec,
 		})
 		if err != nil {
 			return false, fmt.Errorf("create child run for sub_plan %q: %w", sub.Title, err)
