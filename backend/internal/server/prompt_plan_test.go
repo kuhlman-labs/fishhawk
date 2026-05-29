@@ -589,6 +589,44 @@ func TestHandleGetStagePromptRender_BudgetContext(t *testing.T) {
 	}
 }
 
+func TestHandleGetStagePromptRender_SpecBearingImplementResolvesPolicyTimeout(t *testing.T) {
+	// A decomposed child carries the inherited workflow spec (30m policy).
+	// Its implement-stage prompt must resolve agent_timeout_seconds to the
+	// policy max_stage_runtime (1800s), not the runner's 15m (900s) default.
+	// This is the behavioral guard for issue #593: without spec inheritance
+	// the prompt layer falls back to 900 and the decomposition budget breaks.
+	s, rr, ar, _, _, gh := newImplementPromptServer(t)
+	_, planStageID, implStageID, rn := seedRunWithStages(rr)
+	rn.WorkflowSpec = []byte(planStageSpecYAML30m)
+
+	v := "standard_v1"
+	ar.seed(planStageID, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       fixturePlanJSON(t),
+		ContentHash:   "spec-timeout-test",
+		CreatedAt:     time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC),
+	})
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Timeout test", Body: "ctx"}
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", implStageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("implement stage status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.AgentTimeoutSeconds != 1800 {
+		t.Errorf("agent_timeout_seconds = %d, want 1800 (policy max_stage_runtime, not the 900s runner default)", resp.AgentTimeoutSeconds)
+	}
+}
+
 func TestImplementPrompt_ApprovalConditions_Rendered(t *testing.T) {
 	// Seed a run with an approval_submitted entry carrying decision=approve
 	// and a non-empty comment. The implement-stage prompt must contain the

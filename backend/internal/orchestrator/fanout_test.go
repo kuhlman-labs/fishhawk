@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -50,6 +51,7 @@ func (r *fanoutRunsRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*r
 		DecomposedFrom: p.DecomposedFrom,
 		RunnerKind:     p.RunnerKind,
 		IssueContext:   p.IssueContext,
+		WorkflowSpec:   p.WorkflowSpec,
 		State:          run.StatePending,
 		CreatedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
@@ -219,6 +221,13 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 	})
 	planStage, implementStage := stages[0], stages[1]
 
+	// The parent carries a cached workflow spec; each minted child must
+	// inherit it so its implement-stage prompt resolves the policy
+	// max_stage_runtime instead of the runner's 15m default. The bytes
+	// need not parse here — only byte-equality is asserted.
+	parentSpec := []byte("workflows:\n  feature_change:\n    policy:\n      max_stage_runtime: 30m\n")
+	parent.WorkflowSpec = parentSpec
+
 	planBytes := decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"})
 	schemaV := "standard_v1"
 	arts := &fakeArtifacts{
@@ -264,6 +273,9 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 		}
 		if child.WorkflowID != parent.WorkflowID {
 			t.Errorf("child %d workflow_id = %q, want %q", i, child.WorkflowID, parent.WorkflowID)
+		}
+		if !bytes.Equal(child.WorkflowSpec, parentSpec) {
+			t.Errorf("child %d workflow_spec = %q, want inherited parent spec %q", i, child.WorkflowSpec, parentSpec)
 		}
 	}
 	if got := len(rs.createdStages); got != 3 {
