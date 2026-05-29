@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -288,6 +289,212 @@ func TestAutoOpenPR_PushFails(t *testing.T) {
 	}
 	if shipCalled {
 		t.Error("ShipLocalPullRequest should not be called when push fails")
+	}
+}
+
+// mustGitCLI runs git in dir and fails the test on a non-zero exit.
+func mustGitCLI(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	full := append([]string{"-C", dir}, args...)
+	if out, err := exec.Command("git", full...).CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// mustGitOutCLI runs git in dir, fails on error, and returns trimmed stdout.
+func mustGitOutCLI(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	full := append([]string{"-C", dir}, args...)
+	out, err := exec.Command("git", full...).Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestReadScopeFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Missing file → nil (fallback to git add -A).
+	if got := readScopeFiles(filepath.Join(dir, "absent.json")); got != nil {
+		t.Errorf("readScopeFiles(missing) = %v, want nil", got)
+	}
+
+	// Empty files list → nil.
+	emptyPath := filepath.Join(dir, "empty.json")
+	if err := os.WriteFile(emptyPath, []byte(`{"files":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readScopeFiles(emptyPath); got != nil {
+		t.Errorf("readScopeFiles(empty) = %v, want nil", got)
+	}
+
+	// Valid handoff → declared paths, dropping blank-path entries.
+	validPath := filepath.Join(dir, "scope.json")
+	body := `{"files":[{"path":"cli/cmd/fishhawk/autopr.go","operation":"modify"},` +
+		`{"path":"","operation":"modify"},{"path":".gitignore","operation":"modify"}]}`
+	if err := os.WriteFile(validPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := readScopeFiles(validPath)
+	want := []string{"cli/cmd/fishhawk/autopr.go", ".gitignore"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("readScopeFiles(valid) = %v, want %v", got, want)
+	}
+}
+
+// TestStageScopedAuto_StagesOnlyDeclared is the gating test: a working
+// tree with one declared file and one undeclared stray file must stage
+// exactly the declared path and report the stray as drift. Uses a real
+// git repo (autoGitCommand defaults to exec.Command).
+func TestStageScopedAuto_StagesOnlyDeclared(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	mustGitCLI(t, repo, "init", "--initial-branch=main")
+	mustGitCLI(t, repo, "config", "user.name", "init")
+	mustGitCLI(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCLI(t, repo, "add", "-A")
+	mustGitCLI(t, repo, "commit", "-m", "initial")
+
+	// One declared edit plus one undeclared stray file.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "stray.pid"), []byte("12345\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	drift, err := stageScopedAuto(repo, []string{"README.md"})
+	if err != nil {
+		t.Fatalf("stageScopedAuto: %v", err)
+	}
+	if len(drift) != 1 || drift[0] != "stray.pid" {
+		t.Errorf("drift = %v, want [stray.pid]", drift)
+	}
+	staged := mustGitOutCLI(t, repo, "diff", "--cached", "--name-only")
+	if staged != "README.md" {
+		t.Errorf("staged files = %q, want only README.md", staged)
+	}
+}
+
+// TestStageScopedAuto_DeclaredCleanNoStage confirms a declared path that
+// is clean (not dirty) is a no-op: nothing staged, no drift, no error
+// from `git add` matching an unchanged pathspec.
+func TestStageScopedAuto_DeclaredCleanNoStage(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	mustGitCLI(t, repo, "init", "--initial-branch=main")
+	mustGitCLI(t, repo, "config", "user.name", "init")
+	mustGitCLI(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCLI(t, repo, "add", "-A")
+	mustGitCLI(t, repo, "commit", "-m", "initial")
+
+	drift, err := stageScopedAuto(repo, []string{"README.md"})
+	if err != nil {
+		t.Fatalf("stageScopedAuto: %v", err)
+	}
+	if len(drift) != 0 {
+		t.Errorf("drift = %v, want empty", drift)
+	}
+	if staged := mustGitOutCLI(t, repo, "diff", "--cached", "--name-only"); staged != "" {
+		t.Errorf("staged files = %q, want none", staged)
+	}
+}
+
+// TestAutoOpenPR_ScopeBoundedStaging verifies autoOpenPR stages exactly
+// the declared scope path and leaves the stray file dirty, going through
+// the full PR flow with a real git working tree but stubbed gh/ship.
+func TestAutoOpenPR_ScopeBoundedStaging(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCLI(t, repo, "init", "--initial-branch=main")
+	mustGitCLI(t, repo, "config", "user.name", "init")
+	mustGitCLI(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCLI(t, repo, "add", "-A")
+	mustGitCLI(t, repo, "commit", "-m", "initial")
+	mustGitCLI(t, dir, "init", "--bare", "origin.git")
+	mustGitCLI(t, repo, "remote", "add", "origin", bare)
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "stray.pid"), []byte("999\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prFile := filepath.Join(dir, "pr.md")
+	if err := os.WriteFile(prFile, []byte("Scoped change\n\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origPath := prDescriptionPath
+	prDescriptionPath = prFile
+	t.Cleanup(func() { prDescriptionPath = origPath })
+
+	scopeFile := filepath.Join(dir, "scope.json")
+	if err := os.WriteFile(scopeFile,
+		[]byte(`{"files":[{"path":"README.md","operation":"modify"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origScope := scopeFilePath
+	scopeFilePath = scopeFile
+	t.Cleanup(func() { scopeFilePath = origScope })
+
+	origGh := autoGhCommand
+	autoGhCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", "echo https://github.com/owner/repo/pull/7")
+	}
+	t.Cleanup(func() { autoGhCommand = origGh })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(httpclient.ShipLocalPullRequestResult{
+			PRNumber: 7, PRURL: "https://github.com/owner/repo/pull/7",
+		})
+	}))
+	defer srv.Close()
+
+	_, err := autoOpenPR(context.Background(),
+		httpclient.New(srv.URL, "test-token"),
+		autoOpenPRArgs{
+			WorkingDir: repo,
+			RunID:      uuid.New(),
+			StageID:    uuid.New(),
+			GitHubRepo: "owner/repo",
+			BaseBranch: "main",
+		})
+	if err != nil {
+		t.Fatalf("autoOpenPR: %v", err)
+	}
+
+	// The commit on the pushed branch touched only README.md.
+	committed := mustGitOutCLI(t, repo, "show", "--name-only", "--format=", "HEAD")
+	if committed != "README.md" {
+		t.Errorf("committed files = %q, want only README.md", committed)
+	}
+	// stray.pid stays dirty (excluded, not committed or lost).
+	if status := mustGitOutCLI(t, repo, "status", "--porcelain"); !strings.Contains(status, "stray.pid") {
+		t.Errorf("stray.pid should remain dirty; status = %q", status)
 	}
 }
 

@@ -1306,6 +1306,105 @@ func TestLoadPriorRejectionFeedback_CurrentRunIDExcluded(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_Implement_EchoesScopeFiles verifies that the
+// implement-stage prompt response echoes the approved plan's
+// scope.files into the scope_files field, so the runner can bound the
+// commit to exactly those declared paths (#581).
+func TestGetStagePrompt_Implement_EchoesScopeFiles(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+				{Path: "docs/api/v0.md", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.ScopeFiles) != 2 {
+		t.Fatalf("scope_files len = %d, want 2: %+v", len(resp.ScopeFiles), resp.ScopeFiles)
+	}
+	if resp.ScopeFiles[0].Path != "backend/internal/server/prompt.go" || resp.ScopeFiles[0].Operation != "modify" {
+		t.Errorf("scope_files[0] = %+v", resp.ScopeFiles[0])
+	}
+	if resp.ScopeFiles[1].Path != "docs/api/v0.md" || resp.ScopeFiles[1].Operation != "modify" {
+		t.Errorf("scope_files[1] = %+v", resp.ScopeFiles[1])
+	}
+}
+
+// TestGetStagePrompt_Implement_NoScopeFilesWhenPlanMissing confirms the
+// scope_files field is omitted when no approved plan is available, so
+// the runner falls back to `git add -A`.
+func TestGetStagePrompt_Implement_NoScopeFilesWhenPlanMissing(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+	rr.runRow = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ScopeFiles != nil {
+		t.Errorf("scope_files = %+v, want nil/omitted when plan missing", resp.ScopeFiles)
+	}
+}
+
 // TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected verifies that
 // when a child run has DecomposedFrom set and a matching IssueContext, the
 // implement-stage prompt contains a SCOPE CONSTRAINT block with this child's

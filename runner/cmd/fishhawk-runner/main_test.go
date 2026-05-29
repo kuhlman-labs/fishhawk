@@ -1785,6 +1785,126 @@ func implementEnv(t *testing.T, repo, ref string) {
 	t.Setenv("GITHUB_REF_NAME", ref)
 }
 
+// TestRun_ImplementStage_ScopeFilesThreadedAndHandoffWritten verifies
+// the #581 plumbing: the prompt response's scope_files are threaded
+// into CommitAndPushArgs.ScopeFiles (as repo-relative paths) and
+// written to the /tmp/fishhawk-scope.json handoff for the CLI auto-PR
+// path.
+func TestRun_ImplementStage_ScopeFilesThreadedAndHandoffWritten(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	stageID := "22222222-3333-4444-5555-666666666666"
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    stageID,
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "a/b.go", Operation: "modify"},
+			{Path: "c/d.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	// Redirect the scope handoff to a temp path so the CLI auto-PR
+	// contract is exercised without /tmp pollution.
+	scopePath := filepath.Join(t.TempDir(), "scope.json")
+	origScope := scopeHandoffPath
+	scopeHandoffPath = scopePath
+	t.Cleanup(func() { scopeHandoffPath = origScope })
+
+	runID := "11111111-2222-3333-4444-555555555555"
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	wantPaths := []string{"a/b.go", "c/d.go"}
+	if len(fp.gotArgs.ScopeFiles) != len(wantPaths) {
+		t.Fatalf("CommitAndPush ScopeFiles = %v, want %v", fp.gotArgs.ScopeFiles, wantPaths)
+	}
+	for i, want := range wantPaths {
+		if fp.gotArgs.ScopeFiles[i] != want {
+			t.Errorf("ScopeFiles[%d] = %q, want %q", i, fp.gotArgs.ScopeFiles[i], want)
+		}
+	}
+
+	// The handoff file was written for the out-of-process CLI path.
+	data, err := os.ReadFile(scopePath)
+	if err != nil {
+		t.Fatalf("read scope handoff: %v", err)
+	}
+	var sh scopeHandoff
+	if err := json.Unmarshal(data, &sh); err != nil {
+		t.Fatalf("decode scope handoff: %v", err)
+	}
+	if len(sh.Files) != 2 || sh.Files[0].Path != "a/b.go" || sh.Files[1].Operation != "create" {
+		t.Errorf("scope handoff files = %+v", sh.Files)
+	}
+}
+
+// TestRun_ImplementStage_NoScopeFiles_FallsBack confirms that when the
+// prompt response carries no scope_files, CommitAndPush gets an empty
+// ScopeFiles (the `git add -A` fallback) and no handoff file is written.
+func TestRun_ImplementStage_NoScopeFiles_FallsBack(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	stageID := "22222222-3333-4444-5555-666666666666"
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    stageID,
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	scopePath := filepath.Join(t.TempDir(), "scope.json")
+	origScope := scopeHandoffPath
+	scopeHandoffPath = scopePath
+	t.Cleanup(func() { scopeHandoffPath = origScope })
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	if len(fp.gotArgs.ScopeFiles) != 0 {
+		t.Errorf("ScopeFiles = %v, want empty (fallback to git add -A)", fp.gotArgs.ScopeFiles)
+	}
+	if _, err := os.Stat(scopePath); !os.IsNotExist(err) {
+		t.Errorf("scope handoff should not be written when scope is empty; stat err = %v", err)
+	}
+}
+
 func TestRun_ImplementStage_HappyPath(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})

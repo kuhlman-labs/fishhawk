@@ -106,6 +106,14 @@ type CommitAndPushArgs struct {
 	// Uncommitted agent edits are stashed before the fetch+rebase
 	// and restored afterwards.
 	RebaseFromRemote bool
+
+	// ScopeFiles is the approved plan's declared paths (#581). When
+	// non-empty, CommitAndPush stages exactly these paths instead of
+	// `git add -A`, and reports any dirty-but-undeclared paths via
+	// CommitAndPushResult.ScopeDrift. When empty, staging falls back
+	// to `git add -A` (preserves the plan_missing_for_implement
+	// behavior). Paths are repo-relative, matching scope.files entries.
+	ScopeFiles []string
 }
 
 // CommitAndPushResult captures the SHAs the runner needs to populate
@@ -124,6 +132,14 @@ type CommitAndPushResult struct {
 	// policy_event in the trace and an early return — rather than
 	// a hard failure. Branch is NOT created in this case.
 	NoChanges bool
+
+	// ScopeDrift lists dirty paths the working tree carried that were
+	// NOT in the approved plan's scope.files (#581). These are
+	// excluded from the commit — never staged — and surfaced for the
+	// caller to flag (non-blocking, matching the spec's flag-only
+	// scope-drift treatment, ADR-027). Always empty when ScopeFiles
+	// was empty (the `git add -A` fallback path).
+	ScopeDrift []string
 }
 
 // CommitAndPush configures a bot author, creates Branch, stages
@@ -201,7 +217,30 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 			return nil, fmt.Errorf("gitops: checkout -b %s: %w", args.Branch, err)
 		}
 	}
-	if err := p.run(ctx, args.RepoDir, "add", "-A"); err != nil {
+	// Scope-bounded staging (#581): when the approved plan declared a
+	// scope.files set, stage exactly those paths and exclude any
+	// dirty-but-undeclared files (recorded as drift). Otherwise fall
+	// back to `git add -A` — the plan_missing_for_implement path where
+	// we have no scope to bound against.
+	var scopeDrift []string
+	if len(args.ScopeFiles) > 0 {
+		drift, err := p.StageScoped(ctx, args.RepoDir, args.ScopeFiles)
+		if err != nil {
+			return nil, err
+		}
+		scopeDrift = drift
+		// All dirty files were out of scope → nothing staged. Treat as
+		// NoChanges rather than letting `git commit` fail with "nothing
+		// to commit"; the caller logs the empty-changes signal (and the
+		// drift) instead of a hard error.
+		staged, err := p.runOut(ctx, args.RepoDir, "diff", "--cached", "--name-only")
+		if err != nil {
+			return nil, fmt.Errorf("gitops: diff --cached: %w", err)
+		}
+		if strings.TrimSpace(staged) == "" {
+			return &CommitAndPushResult{NoChanges: true, BaseSHA: baseSHA, ScopeDrift: scopeDrift}, nil
+		}
+	} else if err := p.run(ctx, args.RepoDir, "add", "-A"); err != nil {
 		return nil, fmt.Errorf("gitops: add: %w", err)
 	}
 	if err := p.run(ctx, args.RepoDir, "commit", "--signoff", "-m", args.CommitMessage); err != nil {
@@ -242,9 +281,65 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 
 	return &CommitAndPushResult{
-		HeadSHA: headSHA,
-		BaseSHA: baseSHA,
+		HeadSHA:    headSHA,
+		BaseSHA:    baseSHA,
+		ScopeDrift: scopeDrift,
 	}, nil
+}
+
+// StageScoped stages exactly the declared scope paths and returns the
+// set of dirty-but-undeclared paths (scope drift). It reads `git status
+// --porcelain` to enumerate every dirty path, stages the ones that
+// match a declared path via a single `git add -A -- <paths>` (per-path
+// -A covers create, modify, AND delete), and returns the remainder as
+// drift. Drift paths are never staged; declared paths that are clean
+// are a no-op. Staging only the paths git already reports dirty means
+// `git add` never errors on a pathspec that matches nothing.
+func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []string) (drift []string, err error) {
+	status, err := p.runOut(ctx, repoDir, "status", "--porcelain")
+	if err != nil {
+		return nil, fmt.Errorf("gitops: status: %w", err)
+	}
+	declared := make(map[string]bool, len(scopeFiles))
+	for _, f := range scopeFiles {
+		declared[f] = true
+	}
+	var toStage []string
+	for _, line := range strings.Split(status, "\n") {
+		path := porcelainPath(line)
+		if path == "" {
+			continue
+		}
+		if declared[path] {
+			toStage = append(toStage, path)
+		} else {
+			drift = append(drift, path)
+		}
+	}
+	if len(toStage) > 0 {
+		addArgs := append([]string{"add", "-A", "--"}, toStage...)
+		if err := p.run(ctx, repoDir, addArgs...); err != nil {
+			return nil, fmt.Errorf("gitops: add scoped: %w", err)
+		}
+	}
+	return drift, nil
+}
+
+// porcelainPath extracts the repo-relative path from one `git status
+// --porcelain` line. Returns "" for blank/short lines. For a rename
+// ("R  old -> new") it returns the destination path, which is what a
+// plan declares for a rename. Surrounding quotes (core.quotePath, used
+// for paths with special characters) are stripped.
+func porcelainPath(line string) string {
+	// Minimum line is "XY p": two status codes, a space, one path char.
+	if len(line) < 4 {
+		return ""
+	}
+	rest := line[3:]
+	if idx := strings.Index(rest, " -> "); idx >= 0 {
+		rest = rest[idx+len(" -> "):]
+	}
+	return strings.Trim(rest, `"`)
 }
 
 // pushHost extracts the `<scheme>://<host>/` string git config keys
