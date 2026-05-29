@@ -343,21 +343,31 @@ func deref(s *string) string {
 	return *s
 }
 
-// runPlanReviews invokes configured review agents after a plan artifact
-// is stored and audited. For each invocation it:
-//  1. Builds the plan_review prompt from the plan artifact + run context.
-//  2. Calls PlanReviewer.Review and logs WARN on self-review (model match).
-//  3. Appends a plan_reviewed audit entry with the verdict payload.
+// runPlanReviews resolves the plan stage's review config and dispatches
+// the review agents. It does the cheap request-scoped reads (GetRun,
+// resolveStageReviewers, plan.Parse, prompt.Build) on the caller's
+// context, then branches on authority:
 //
-// Returns true when authority is gating (reviewers.agent>0 && human==0)
-// and at least one verdict is reject. In that case the stage has been
-// transitioned to failed-B so trace-driven awaiting_approval advancement
-// is blocked by the terminal state machine.
+//   - gating (reviewers.agent>0 && human==0): runs the review loop
+//     SYNCHRONOUSLY. When any verdict is reject it transitions the stage
+//     to failed-B and returns true, so the trace handler's
+//     dispatched→awaiting_approval advancement is blocked by the
+//     terminal state machine. The failed-B edge must land before stage
+//     advancement, which is why gating review can't be detached.
+//
+//   - advisory (reviewers.agent>0 && human>0): dispatches the review
+//     loop on a DETACHED context (context.WithoutCancel) in a goroutine
+//     tracked by s.bgReviews, and returns false immediately so the
+//     upload handler writes its 201 without waiting on the reviewer.
+//     The detachment is the #584 fix: the review runs to its own
+//     FISHHAWKD_PLAN_REVIEW_TIMEOUT budget instead of dying when the
+//     runner's upload client disconnects and cancels r.Context().
 //
 // Returns false (no gating rejection) when:
 //   - PlanReviewer is nil (production default — not yet wired)
 //   - RunRepo is nil
 //   - the run's workflow spec carries no plan stage with reviewers.agent>0
+//   - authority is advisory (review runs detached, never blocks)
 //   - all review agents approve (or approve_with_concerns)
 //
 // All per-invocation errors are WARN-logged and skipped so a transient
@@ -456,9 +466,66 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		return false
 	}
 
+	// Detach the reviewer context from the request lifecycle (#584).
+	// context.WithoutCancel keeps the parent's values but is NOT
+	// cancelled when the parent is — so the review survives the runner's
+	// upload client disconnecting (which cancels r.Context()) and the
+	// handler returning. The reviewer adapter's own
+	// context.WithTimeout(reviewCtx, cfg.Timeout) then becomes the
+	// effective per-invocation bound (FISHHAWKD_PLAN_REVIEW_TIMEOUT).
+	authorModel := parsedPlan.GeneratedBy.Model
+	reviewCtx := context.WithoutCancel(ctx)
+
+	// Advisory: dispatch detached so the upload returns promptly. The
+	// goroutine closes over only already-resolved values (built prompt,
+	// IDs, authority, author model) — never r or request-scoped state.
+	if authority != planreview.AuthorityGating {
+		s.bgReviews.Add(1)
+		go func() {
+			defer s.bgReviews.Done()
+			s.runPlanReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+		}()
+		return false
+	}
+
+	// Gating: run synchronously so the failed-B transition lands before
+	// the trace handler advances the stage.
+	hasRejection := s.runPlanReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+	if hasRejection {
+		cat := run.FailureB
+		reason := "plan_review_rejected: agent review verdict reject under gating authority"
+		if _, terr := s.cfg.RunRepo.TransitionStage(reviewCtx, stageID,
+			run.StageStateFailed, &run.StageCompletion{
+				FailureCategory: &cat,
+				FailureReason:   &reason,
+			}); terr != nil {
+			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn,
+				"plan review: transition to failed-B after gating reject failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", terr.Error()),
+			)
+		}
+		return true
+	}
+	return false
+}
+
+// runPlanReviewLoop runs the per-reviewer plan-review loop shared by the
+// synchronous (gating) and detached (advisory) dispatch paths. For each
+// configured agent it calls PlanReviewer.Review, logs WARN on self-review
+// (reviewer model == authorModel), and appends one plan_reviewed audit
+// entry. Returns true when at least one verdict is reject. It performs no
+// stage transition — the gating caller owns the failed-B transition so
+// the advance-blocking edge stays on the synchronous path only.
+//
+// ctx is the detached review context: per-invocation errors are
+// WARN-logged and skipped so a transient reviewer failure doesn't strand
+// the loop.
+func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, agents int, authority planreview.AuthorityMode, promptText, authorModel string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
-	for i := 0; i < reviewersCfg.Agent; i++ {
+	for i := 0; i < agents; i++ {
 		verdict, model, err := s.cfg.PlanReviewer.Review(ctx, promptText)
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: reviewer invocation failed",
@@ -473,7 +540,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		// Self-review guard (ADR-027): warn when the review agent's
 		// model matches the plan author's model. Warn-only per ADR;
 		// the verdict is still recorded.
-		if model != "" && model == parsedPlan.GeneratedBy.Model {
+		if model != "" && model == authorModel {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"plan review: self-review detected — reviewer model matches plan author model",
 				slog.String("model", model),
@@ -510,28 +577,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 			hasRejection = true
 		}
 	}
-
-	// Authority gating: when gating mode and any verdict is reject,
-	// transition the stage to failed-B so the trace handler's
-	// dispatched→awaiting_approval path is blocked by the terminal state.
-	if authority == planreview.AuthorityGating && hasRejection {
-		cat := run.FailureB
-		reason := "plan_review_rejected: agent review verdict reject under gating authority"
-		if _, terr := s.cfg.RunRepo.TransitionStage(ctx, stageID,
-			run.StageStateFailed, &run.StageCompletion{
-				FailureCategory: &cat,
-				FailureReason:   &reason,
-			}); terr != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"plan review: transition to failed-B after gating reject failed",
-				slog.String("run_id", runID.String()),
-				slog.String("stage_id", stageID.String()),
-				slog.String("error", terr.Error()),
-			)
-		}
-		return true
-	}
-	return false
+	return hasRejection
 }
 
 // resolveStageReviewers reads the run's workflow spec and returns the

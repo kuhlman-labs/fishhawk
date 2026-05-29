@@ -92,7 +92,19 @@ type Client struct {
 func New(baseURL string) *Client {
 	return &Client{
 		BaseURL: baseURL,
-		HTTP:    &http.Client{Timeout: 60 * time.Second},
+		// 120s is defense-in-depth, NOT the real fix for the reviewer-
+		// killed-at-60s bug (#584). The actual fix is server-side: the
+		// backend now detaches advisory plan/implement review from the
+		// upload request context (context.WithoutCancel) and runs it
+		// asynchronously, so the review completes to its own
+		// FISHHAWKD_PLAN_REVIEW_TIMEOUT budget regardless of when this
+		// client disconnects. A gating-mode synchronous review can still
+		// exceed any fixed client timeout; if this client gives up first,
+		// the detached server-side review completes anyway and a retried
+		// upload short-circuits at GetByHash. Raising the ceiling just
+		// keeps advisory uploads well under it and reduces spurious
+		// gating retries.
+		HTTP: &http.Client{Timeout: 120 * time.Second},
 	}
 }
 

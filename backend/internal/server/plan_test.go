@@ -40,6 +40,55 @@ func (f *fakePlanReviewer) Review(_ context.Context, promptText string) (*planre
 	return f.verdict, f.model, nil
 }
 
+// blockingPlanReviewer blocks each Review call until release is closed,
+// so async-dispatch tests can assert ordering deterministically without
+// sleeps. started carries a value the first time Review is entered, so a
+// test can wait until the reviewer goroutine is actually in-flight before
+// cancelling a context or asserting on the upload response.
+//
+// Review returns ctx.Err() when the context is cancelled — modelling a
+// real reviewer adapter whose exec.CommandContext kills `claude` on
+// cancellation. That makes it a load-bearing probe for the #584
+// context-detach guarantee: if the detached goroutine were handed the
+// request context instead of context.WithoutCancel'd one, a parent cancel
+// would surface here as an error and no audit entry would land.
+type blockingPlanReviewer struct {
+	release chan struct{}
+	started chan struct{}
+	mu      sync.Mutex
+	calls   int
+	verdict *planreview.ReviewVerdict
+	model   string
+}
+
+func newBlockingPlanReviewer(v *planreview.ReviewVerdict, model string) *blockingPlanReviewer {
+	return &blockingPlanReviewer{
+		release: make(chan struct{}),
+		started: make(chan struct{}, 1),
+		verdict: v,
+		model:   model,
+	}
+}
+
+func (b *blockingPlanReviewer) Review(ctx context.Context, _ string) (*planreview.ReviewVerdict, string, error) {
+	select {
+	case b.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	b.mu.Lock()
+	b.calls++
+	b.mu.Unlock()
+	return b.verdict, b.model, nil
+}
+
 // reviewers YAML fragments for plan stage specs. These are complete
 // minimal workflow specs accepted by spec.ParseBytes.
 var (
@@ -593,6 +642,9 @@ func TestShipPlan_ReviewAgents_Advisory_RecordsVerdictDoesNotBlock(t *testing.T)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
+	// Advisory review runs detached (#584); drain it before asserting on
+	// the audit entry it writes.
+	s.waitBackgroundReviews()
 
 	// plan_reviewed audit entry must exist.
 	var reviewedEntries []planreview.PlanReviewedPayload
@@ -759,5 +811,140 @@ func TestShipPlan_ReviewAgents_SelfReviewLogsWarn(t *testing.T) {
 	}
 	if !sawReviewed {
 		t.Error("plan_reviewed entry missing — self-review guard should warn but not skip")
+	}
+}
+
+// countAuditCategory returns how many appended audit entries match cat.
+// Holds the auditFake mutex so it is safe to call while a detached
+// review goroutine may still be appending.
+func countAuditCategory(au *auditFake, cat string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, e := range au.appended {
+		if e.Category == cat {
+			n++
+		}
+	}
+	return n
+}
+
+// TestShipPlan_ReviewAgents_Advisory_RunsAsync asserts the #584 decoupling
+// for the plan path: under advisory authority the upload handler returns
+// 201 BEFORE the (blocked) reviewer finishes, then once the reviewer is
+// released and the background goroutine drained, the plan_reviewed audit
+// entry lands. The ordering is asserted deterministically via the
+// blocking-reviewer channel + waitBackgroundReviews(), with no sleeps.
+func TestShipPlan_ReviewAgents_Advisory_RunsAsync(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := newBlockingPlanReviewer(
+		&planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		"claude-sonnet-4-6",
+	)
+	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	// Handler returns while the reviewer is still blocked on release.
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// The async review cannot have completed yet: release is not closed,
+	// so no plan_reviewed entry can exist. (plan_generated is synchronous.)
+	if n := countAuditCategory(au, "plan_reviewed"); n != 0 {
+		t.Fatalf("plan_reviewed entries = %d before release, want 0 (review was not async)", n)
+	}
+
+	// Release the reviewer and drain the detached goroutine.
+	close(reviewer.release)
+	s.waitBackgroundReviews()
+
+	if n := countAuditCategory(au, "plan_reviewed"); n != 1 {
+		t.Errorf("plan_reviewed entries = %d after release, want 1", n)
+	}
+}
+
+// TestShipPlan_ReviewAgents_Advisory_ContextDetached asserts the detached
+// review survives cancellation of the context passed into runPlanReviews
+// (simulating the runner's upload client disconnecting and cancelling
+// r.Context() mid-review). context.WithoutCancel is the load-bearing
+// mechanism: the parent cancel must NOT propagate to the reviewer, so the
+// verdict still records. The blocking reviewer returns ctx.Err() on a
+// cancelled context, so this test fails if the goroutine were handed the
+// raw request context.
+func TestShipPlan_ReviewAgents_Advisory_ContextDetached(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := newBlockingPlanReviewer(
+		&planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		"claude-sonnet-4-6",
+	)
+	s, _, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
+	body := validPlanBytes(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Advisory → dispatches a detached goroutine and returns false.
+	if s.runPlanReviews(ctx, runID, stageID, body) {
+		t.Fatal("advisory runPlanReviews returned true (advisory must never gate)")
+	}
+
+	// Wait until the reviewer goroutine is in-flight, then cancel the
+	// parent context mid-review and let the reviewer proceed.
+	<-reviewer.started
+	cancel()
+	close(reviewer.release)
+
+	s.waitBackgroundReviews()
+
+	if n := countAuditCategory(au, "plan_reviewed"); n != 1 {
+		t.Errorf("plan_reviewed entries = %d, want 1 — detached review must survive parent-context cancel (context.WithoutCancel)", n)
+	}
+}
+
+// TestShipPlan_ReviewAgents_GatingReject_FromAwaitingApproval asserts the
+// state-machine edge the synchronous-gating guarantee relies on: when the
+// trace handler has already advanced the plan stage to awaiting_approval
+// (trace ships before plan), a later gating reject on the plan upload
+// still transitions the stage to failed-B. The edge legality is asserted
+// explicitly via run.ValidStageTransition rather than assumed.
+func TestShipPlan_ReviewAgents_GatingReject_FromAwaitingApproval(t *testing.T) {
+	// Explicit edge-legality guard: if awaiting_approval → failed is ever
+	// removed from the transition table, the synchronous-gating design
+	// breaks and this assertion catches it before the handler test below.
+	if !run.ValidStageTransition(run.StageStateAwaitingApproval, run.StageStateFailed) {
+		t.Fatal("awaiting_approval → failed is not a legal transition; synchronous gating reject can no longer fail the stage")
+	}
+
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, _, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	// Seed the stage already in awaiting_approval — the state the trace
+	// handler leaves it in before the plan upload arrives.
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, State: run.StageStateAwaitingApproval}
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	var found bool
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID != stageID || call.To != run.StageStateFailed {
+			continue
+		}
+		found = true
+		if call.Completion == nil || call.Completion.FailureCategory == nil ||
+			*call.Completion.FailureCategory != run.FailureB {
+			t.Errorf("FailureCategory = %v, want B", call.Completion.FailureCategory)
+		}
+	}
+	if !found {
+		t.Error("gating reject from awaiting_approval did not transition the stage to failed-B")
 	}
 }
