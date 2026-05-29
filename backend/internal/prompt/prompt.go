@@ -555,7 +555,12 @@ func buildPlanReview(t Trigger) string {
 		"Is the rollback plan realistic?\n")
 	b.WriteString("4. **Risk coverage**: Are meaningful risks identified? Are assumptions cited or testable?\n")
 	b.WriteString("5. **Schema compliance**: Does the plan conform to the standard_v1 shape? " +
-		"(docs/spec/plan-standard-v1.md)\n\n")
+		"(docs/spec/plan-standard-v1.md)\n")
+	b.WriteString("6. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project " +
+		"convention — MUST be one you can quote verbatim from the context provided in this prompt or from a " +
+		"repository file you actually read during this review. Do NOT assert rules from memory. If you cannot " +
+		"verify the rule exists, do NOT raise the concern. Ground every concern in the plan, issue, and context " +
+		"actually provided.\n\n")
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
@@ -695,7 +700,15 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("3. **Verification satisfiability**: Are the plan's verification steps (test strategy, rollback) " +
 		"satisfiable against this diff?\n")
 	b.WriteString("4. **Obvious regressions**: Does the diff introduce obvious correctness regressions, " +
-		"broken references, or removed behaviour the issue didn't ask for?\n\n")
+		"broken references, or removed behaviour the issue didn't ask for?\n")
+	b.WriteString("5. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project " +
+		"convention — MUST be one you can quote verbatim from the context provided in this prompt or from a " +
+		"repository file you actually read during this review. Do NOT assert rules from memory. If you cannot " +
+		"verify the rule exists, do NOT raise the concern. Ground every concern in the plan, issue, and diff " +
+		"actually provided.\n")
+	b.WriteString("6. **Style is out of scope**: Subjective style judgments (comment length, naming aesthetics, " +
+		"formatting) are out of scope for review — that is lint's job. Focus on plan adherence, scope " +
+		"(flag-only), verification satisfiability, and obvious regressions.\n\n")
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
