@@ -387,7 +387,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		diff = nil
 		diffErr = nil
 		if cfg.checkBaseRef != "" {
-			d, ev, err := computeAndEmitDiff(cfg)
+			d, ev, err := computeAndEmitDiff(cfg, logSink)
 			res.Events = append(res.Events, ev)
 			if err == nil {
 				diff = &d
@@ -909,7 +909,7 @@ func classifyErr(err error) string {
 // log line. The error is intentionally NOT load-bearing on the
 // run's res.OK; the in-band constraint enforcer below is the one
 // that demotes to category-B.
-func computeAndEmitDiff(cfg config) (constraint.Diff, agent.Event, error) {
+func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, agent.Event, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
@@ -930,14 +930,30 @@ func computeAndEmitDiff(cfg config) (constraint.Diff, agent.Event, error) {
 			}),
 		}, fmt.Errorf("computeAndEmitDiff: stage: %w", err)
 	}
-	d, err := (&gitdiff.Runner{}).Run(context.Background(), cfg.checkBaseRef, repoDir)
+	runner := &gitdiff.Runner{}
+	d, err := runner.Run(context.Background(), cfg.checkBaseRef, repoDir)
 	if err != nil {
 		return constraint.Diff{}, agent.Event{
 			Kind:    "policy_event",
 			Payload: agent.MakePayload(map[string]string{"check": "diff", "outcome": "diff_failed", "error": err.Error()}),
 		}, fmt.Errorf("computeAndEmitDiff: %w", err)
 	}
-	return d, makeGitDiffEvent(cfg.checkBaseRef, d), nil
+
+	// Capture the full unified-diff hunk text for content-level
+	// implement-review (#585). This is additive trace payload; a
+	// failure here degrades gracefully — we emit the git_diff event
+	// WITHOUT a patch rather than failing the whole diff, because the
+	// name-status list (d, above) is the load-bearing policy input and
+	// is already in hand. The reviewer prompt falls back to its
+	// file-list rendering when the patch is absent.
+	patch, truncated, perr := runner.RunPatch(context.Background(), cfg.checkBaseRef, repoDir)
+	if perr != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"git_diff_patch_failed","base_ref":%q,"detail":%q}`+"\n",
+			cfg.checkBaseRef, perr.Error())
+		patch, truncated = "", false
+	}
+	return d, makeGitDiffEvent(cfg.checkBaseRef, d, patch, truncated), nil
 }
 
 // enforceConstraints reads the constraints config and evaluates
@@ -1017,17 +1033,30 @@ type gitDiffFile struct {
 // the future (e.g. base-vs-head, stage-vs-stage); for v0 it's
 // always "name_status" — the parsed `git diff --name-status`
 // output.
+//
+// Patch carries the full unified-diff hunk text for content-level
+// implement-review (#585). It is additive and `omitempty`: older
+// bundles (and patch-compute failures) omit it, and the backend
+// reader decodes the absence to an empty Patch. PatchTruncated marks
+// a patch that hit the maxPatchBytes cap. The `patch` / `patch_truncated`
+// json tags MUST stay identical to backend/internal/bundle/bundle.go's
+// gitDiffPayload mirror — this is the runner↔backend wire contract,
+// not a JSON Schema, so the two sides agree field-by-field in lockstep.
 type gitDiffPayload struct {
-	Kind     string        `json:"kind"`
-	BaseRef  string        `json:"base_ref"`
-	Files    []gitDiffFile `json:"files"`
-	NumFiles int           `json:"num_files"`
+	Kind           string        `json:"kind"`
+	BaseRef        string        `json:"base_ref"`
+	Files          []gitDiffFile `json:"files"`
+	NumFiles       int           `json:"num_files"`
+	Patch          string        `json:"patch,omitempty"`
+	PatchTruncated bool          `json:"patch_truncated,omitempty"`
 }
 
 // makeGitDiffEvent converts a constraint.Diff into the bundle event
 // the backend's policy re-evaluation reads. Kind is "git_diff";
-// payload schema is gitDiffPayload (above).
-func makeGitDiffEvent(baseRef string, d constraint.Diff) agent.Event {
+// payload schema is gitDiffPayload (above). patch is the unified-diff
+// hunk text (empty when capture failed); truncated marks a capped
+// patch.
+func makeGitDiffEvent(baseRef string, d constraint.Diff, patch string, truncated bool) agent.Event {
 	files := make([]gitDiffFile, 0, len(d.ChangedFiles))
 	for _, f := range d.ChangedFiles {
 		files = append(files, gitDiffFile{Path: f.Path, Status: string(f.Status)})
@@ -1035,10 +1064,12 @@ func makeGitDiffEvent(baseRef string, d constraint.Diff) agent.Event {
 	return agent.Event{
 		Kind: "git_diff",
 		Payload: agent.MakePayload(gitDiffPayload{
-			Kind:     "name_status",
-			BaseRef:  baseRef,
-			Files:    files,
-			NumFiles: len(files),
+			Kind:           "name_status",
+			BaseRef:        baseRef,
+			Files:          files,
+			NumFiles:       len(files),
+			Patch:          patch,
+			PatchTruncated: truncated,
 		}),
 	}
 }

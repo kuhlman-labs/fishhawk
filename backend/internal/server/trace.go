@@ -894,6 +894,10 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		Repo:         runRow.Repo,
 		ApprovedPlan: approvedPlan,
 		Diff:         renderDiffForReview(diff),
+		// Full unified-diff hunks for content-level review (#585). Empty
+		// when the bundle predates the patch field or the runner couldn't
+		// compute it — buildImplementReview falls back to the file list.
+		DiffPatch: diff.Patch,
 	}
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title

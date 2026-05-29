@@ -185,6 +185,57 @@ func TestExtractDiff_HappyPath(t *testing.T) {
 	}
 }
 
+func TestExtractDiff_RoundTripsPatch(t *testing.T) {
+	// The git_diff event's unified-diff patch text round-trips through
+	// ExtractDiff into policy.Diff.Patch for the implement-review prompt
+	// (#585). ChangedFiles is unaffected.
+	patch := "diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-old\n+new\n"
+	payload, err := json.Marshal(gitDiffPayload{
+		Kind:           "name_status",
+		BaseRef:        "origin/main",
+		Files:          []gitDiffEntry{{Path: "a.go", Status: "M"}},
+		NumFiles:       1,
+		Patch:          patch,
+		PatchTruncated: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGitDiff, Data: payload},
+	}
+	got, err := ExtractDiff(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractDiff: %v", err)
+	}
+	if got.Patch != patch {
+		t.Errorf("Patch = %q, want %q", got.Patch, patch)
+	}
+	if len(got.ChangedFiles) != 1 || got.ChangedFiles[0].Path != "a.go" {
+		t.Errorf("ChangedFiles = %+v, want single a.go", got.ChangedFiles)
+	}
+}
+
+func TestExtractDiff_OlderBundleDecodesEmptyPatch(t *testing.T) {
+	// A bundle WITHOUT the patch field (older runner) decodes to an
+	// empty Patch — backward-compatible additive field (#585).
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+	}
+	got, err := ExtractDiff(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractDiff: %v", err)
+	}
+	if got.Patch != "" {
+		t.Errorf("Patch = %q, want empty for a bundle without the field", got.Patch)
+	}
+	if len(got.ChangedFiles) != 1 {
+		t.Errorf("ChangedFiles = %+v, want one file", got.ChangedFiles)
+	}
+}
+
 func TestExtractDiff_NoDiffEvent(t *testing.T) {
 	lines := []Line{
 		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{}`)},

@@ -53,6 +53,15 @@ type ChangedFile struct {
 // (e.g. plan stages that aren't supposed to change source).
 type Diff struct {
 	ChangedFiles []ChangedFile
+
+	// Patch is the full unified-diff hunk text for the stage, carried
+	// for downstream content consumers (the implement-review prompt,
+	// #585) ONLY. It is deliberately NOT read by Evaluate or any check
+	// function — constraints operate purely on ChangedFiles, so
+	// constraint evaluation is identical whether or not Patch is set.
+	// Empty for older bundles that predate the patch field and for
+	// stages whose runner could not compute the patch.
+	Patch string
 }
 
 // Constraints is the parsed shape of the workflow-spec stage's

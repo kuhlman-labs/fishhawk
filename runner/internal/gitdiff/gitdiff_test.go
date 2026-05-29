@@ -126,6 +126,20 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(128)
 	case "ok_empty":
 		// No output — clean diff.
+	case "patch_ok":
+		// A small unified diff (hunk format), as `git diff --cached
+		// <base>` (without --name-status) emits.
+		fmt.Print("diff --git a/a.go b/a.go\n" +
+			"index 111..222 100644\n" +
+			"--- a/a.go\n" +
+			"+++ b/a.go\n" +
+			"@@ -1,2 +1,2 @@\n" +
+			" package x\n" +
+			"-old line\n" +
+			"+new line\n")
+	case "patch_big":
+		// Emit more than maxPatchBytes so RunPatch truncates.
+		fmt.Print(strings.Repeat("+", maxPatchBytes+1024))
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
 		os.Exit(2)
@@ -254,6 +268,101 @@ func mustRunGit(t *testing.T, repoDir string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func TestRunPatch_OK(t *testing.T) {
+	r := &Runner{Cmd: fakeCmd("patch_ok")}
+	patch, truncated, err := r.RunPatch(context.Background(), "main", t.TempDir())
+	if err != nil {
+		t.Fatalf("RunPatch: %v", err)
+	}
+	if truncated {
+		t.Error("small patch should not be truncated")
+	}
+	for _, want := range []string{"diff --git a/a.go b/a.go", "@@ -1,2 +1,2 @@", "-old line", "+new line"} {
+		if !strings.Contains(patch, want) {
+			t.Errorf("patch missing %q; got:\n%s", want, patch)
+		}
+	}
+}
+
+func TestRunPatch_TruncatesWithMarker(t *testing.T) {
+	r := &Runner{Cmd: fakeCmd("patch_big")}
+	patch, truncated, err := r.RunPatch(context.Background(), "main", t.TempDir())
+	if err != nil {
+		t.Fatalf("RunPatch: %v", err)
+	}
+	if !truncated {
+		t.Fatal("oversized patch should be truncated")
+	}
+	if !strings.Contains(patch, "[patch truncated:") {
+		t.Errorf("expected truncation marker; got tail: %q", patch[len(patch)-80:])
+	}
+	// The captured body is capped at maxPatchBytes; total length is
+	// the cap plus the (small) marker, never the full raw output. This
+	// keeps the emitted JSONL line well under bundle.ReadEvents' 4 MiB
+	// per-line scanner buffer.
+	if len(patch) > maxPatchBytes+256 {
+		t.Errorf("patch len %d exceeds cap+marker budget", len(patch))
+	}
+}
+
+func TestRunPatch_Error_SurfacesStderr(t *testing.T) {
+	r := &Runner{Cmd: fakeCmd("error")}
+	_, _, err := r.RunPatch(context.Background(), "no-such-ref", t.TempDir())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "ambiguous argument") {
+		t.Errorf("err = %v, want stderr-derived message", err)
+	}
+}
+
+func TestRunPatch_RequiredArgs(t *testing.T) {
+	r := &Runner{}
+	if _, _, err := r.RunPatch(context.Background(), "", "/x"); err == nil {
+		t.Error("expected baseRef required")
+	}
+	if _, _, err := r.RunPatch(context.Background(), "main", ""); err == nil {
+		t.Error("expected repoDir required")
+	}
+}
+
+// TestRunPatch_RealRepo_CapturesHunks verifies RunPatch returns real
+// unified-diff hunks (including rename hunks) for the same staged index
+// Run sees. Real git required; skipped when not on PATH.
+func TestRunPatch_RealRepo_CapturesHunks(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	mustRunGit(t, repo, "init", "--initial-branch=main")
+	mustRunGit(t, repo, "config", "user.name", "init")
+	mustRunGit(t, repo, "config", "user.email", "init@example.com")
+	mustRunGit(t, repo, "config", "commit.gpgsign", "false")
+	mustRunGit(t, repo, "config", "tag.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package x\nold\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+	mustRunGit(t, repo, "commit", "-m", "initial")
+	mustRunGit(t, repo, "branch", "base")
+
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package x\nnew\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+
+	patch, truncated, err := (&Runner{}).RunPatch(context.Background(), "base", repo)
+	if err != nil {
+		t.Fatalf("RunPatch: %v", err)
+	}
+	if truncated {
+		t.Error("tiny patch should not be truncated")
+	}
+	if !strings.Contains(patch, "-old") || !strings.Contains(patch, "+new") {
+		t.Errorf("expected added/removed lines in hunks; got:\n%s", patch)
 	}
 }
 
