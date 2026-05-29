@@ -181,9 +181,22 @@ agent-driven local-runner loop:
   3. fishhawk_approve_plan ...
   4. fishhawk_run_stage --stage implement ...
 
-Runner output streams as MCP progress notifications when the
-client provides a progress token; the final tool result carries
-the full event list plus the post-run stage state.
+Runner output streams as MCP progress notifications ONLY when the
+client supplies a progressToken on the call (opt-in per the MCP
+spec); the final tool result always carries the full event list
+plus the post-run stage state.
+
+During execution the runner emits periodic stage_progress
+heartbeats (~every 15s) carrying the turn count, elapsed time,
+tokens-so-far, and last event kind, so the driver can distinguish a
+progressing stage from a stalled one (the counters keep ticking on
+elapsed even when turns/tokens stall). With a progressToken these
+arrive live as progress notifications for the operator/client
+watching the run; without one they still appear post-hoc in the
+final result's events list. This is NOT a live mid-call early-cancel
+signal for the synchronously-blocked driving agent — the agent sees
+the heartbeats only after the call returns (and as groundwork for a
+future async run_stage).
 
 Output fields (three additional best-effort fields, omitted when
 unavailable):
@@ -566,8 +579,24 @@ func runStageParseEvents(
 // for the progress notification's human-readable summary. Looks for
 // a top-level `kind` or `type` field (the runner's event shape uses
 // `kind`); falls back to the JSON-encoded payload truncated.
+//
+// A stage_progress heartbeat (#580) is special-cased: its Message
+// carries the coarse counters (turns / tokens-so-far / elapsed /
+// last event kind) so the driver can tell a progressing stage from a
+// stalled one. This Message is the only per-event field the relay
+// populates, so it is where the liveness signal must land.
 func runStageEventMessage(payload any) string {
 	if m, ok := payload.(map[string]any); ok {
+		if ev, _ := m["event"].(string); ev == "stage_progress" {
+			// JSON numbers decode as float64; format as integers.
+			num := func(k string) float64 {
+				f, _ := m[k].(float64)
+				return f
+			}
+			last, _ := m["last_event_kind"].(string)
+			return fmt.Sprintf("stage_progress turns=%.0f tokens=%.0f elapsed=%.0fs last=%s",
+				num("turns"), num("tokens_so_far"), num("elapsed_seconds"), last)
+		}
 		for _, key := range []string{"kind", "type", "event"} {
 			if v, ok := m[key].(string); ok && v != "" {
 				return v

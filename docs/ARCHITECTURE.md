@@ -212,6 +212,8 @@ Connection pool: `pgxpool.Pool` per service instance.
 | `agent_retry` | Middle | Boundary marker the runner's Claude Code driver emits between attempts when it re-spawns the agent after a transient thinking-block API 400 (payload: `attempt`, `reason`, `tokens_so_far`). See the bounded in-driver retry row in §10. |
 | `trailer` | Last line | `event_count`, content hash of preceding lines |
 
+**Not a bundle event — `stage_progress` liveness heartbeat (#580)**: during agent invocation the Claude Code driver writes a single-line `{"event":"stage_progress","elapsed_seconds":N,"turns":N,"tokens_so_far":N,"last_event_kind":"…"}` to the runner's **logSink (stderr) only**, every ~15s (`claudecode.Invoker.HeartbeatInterval`, default 15s). It carries coarse structural counters — never agent payload text — so a long stage is visibly progressing. It is **never** appended to `Result.Events`, so the signed trace bundle is unchanged (same treatment as the logSink-only `runner_cancelled` / `stage_self_retry` lines). The `fishhawk-mcp` `fishhawk_run_stage` relay forwards it as a `notifications/progress` update whose message renders the counters; because it's time-driven, a stalled stage still emits heartbeats with non-advancing `turns`/`tokens_so_far`, letting the driver tell "alive and progressing" from "stuck".
+
 ## 6. Invariants
 
 These are load-bearing. Do not break them without explicit ADR.

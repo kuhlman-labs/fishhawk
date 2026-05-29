@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"time"
 )
 
@@ -54,6 +55,20 @@ type Invocation struct {
 	// mid-execution. Empty / nil is fine — the child inherits the
 	// parent env unchanged.
 	Env map[string]string
+
+	// ProgressSink receives single-line JSON stage_progress
+	// heartbeats emitted at a fixed cadence during the invocation
+	// (#580). Each line is a complete `{"event":"stage_progress",...}`
+	// JSON object terminated by '\n' carrying coarse, structural
+	// liveness metadata (elapsed seconds, turn count, tokens-so-far,
+	// last event kind) — never agent payload text, so it has no
+	// redaction exposure. The runner wires this to its logSink (the
+	// structured stderr stream the fishhawk-mcp relay forwards as
+	// progress notifications). Heartbeats are written ONLY here, never
+	// appended to Result.Events, so the signed trace bundle is
+	// unchanged. A nil ProgressSink disables heartbeats entirely
+	// (zero writes), preserving the pre-#580 behavior and tests.
+	ProgressSink io.Writer
 }
 
 // Budget caps an agent invocation. Per MVP_SPEC §4.2 (`budget`

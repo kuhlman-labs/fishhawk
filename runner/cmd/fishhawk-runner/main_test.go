@@ -1458,6 +1458,41 @@ func TestRun_FetchPrompt_MCPTokenFetchFailure_StillProceeds(t *testing.T) {
 	}
 }
 
+// TestRun_WiresProgressSinkToLogSink confirms run() sets the
+// Invocation's ProgressSink to the same logSink it writes lifecycle
+// lines to, so the agent adapter's stage_progress heartbeats land on
+// the stream the fishhawk-mcp relay forwards (#580).
+func TestRun_WiresProgressSinkToLogSink(t *testing.T) {
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "Hello agent.",
+		PromptHash: "deadbeef",
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invoker.gotInv nil — invocation not captured")
+	}
+	if invoker.gotInv.ProgressSink != io.Writer(&stderr) {
+		t.Errorf("ProgressSink = %v, want the logSink passed to run()", invoker.gotInv.ProgressSink)
+	}
+}
+
 func TestRun_FetchPrompt_PromptFileWins(t *testing.T) {
 	dir := t.TempDir()
 	promptPath := filepath.Join(dir, "prompt.txt")
