@@ -167,6 +167,14 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	if *baseBranch != "" {
 		argv = append(argv, "--base-branch", *baseBranch)
 	}
+	// Only implement stages produce a diff to enforce. Passing
+	// --check-base-ref makes the runner emit the git_diff event the
+	// backend needs to re-evaluate policy (policy_evaluated) and run
+	// implement-review (#561/#585). Plan/review stages omit it. Mirrors
+	// backend/cmd/fishhawk-mcp/run_stage.go — keep in sync.
+	if *stage == "implement" {
+		argv = append(argv, "--check-base-ref", *baseBranch)
+	}
 	if *noPR {
 		argv = append(argv, "--no-pr")
 	}

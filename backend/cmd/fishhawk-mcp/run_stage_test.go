@@ -366,6 +366,10 @@ func TestRunStage_ArgvComposition_PlanStage(t *testing.T) {
 			t.Errorf("argv missing %q\nfull: %s", want, joined)
 		}
 	}
+	// Plan stages produce no diff, so --check-base-ref must be omitted.
+	if strings.Contains(joined, "--check-base-ref") {
+		t.Errorf("plan stage should not include --check-base-ref\nfull: %s", joined)
+	}
 }
 
 func TestRunStage_ArgvComposition_ImplementStageNoPlanOut(t *testing.T) {
@@ -398,8 +402,14 @@ func TestRunStage_ArgvComposition_ImplementStageNoPlanOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runStage: %v", err)
 	}
-	if strings.Contains(strings.Join(capturedArgs, " "), "--plan-out") {
+	joined := strings.Join(capturedArgs, " ")
+	if strings.Contains(joined, "--plan-out") {
 		t.Errorf("implement stage should not include --plan-out: %v", capturedArgs)
+	}
+	// Implement stages must carry --check-base-ref so the runner emits
+	// the git_diff event (backend policy_evaluated + implement-review).
+	if !strings.Contains(joined, "--check-base-ref main") {
+		t.Errorf("implement stage missing --check-base-ref main\nfull: %s", joined)
 	}
 }
 

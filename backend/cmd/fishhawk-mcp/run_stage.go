@@ -310,6 +310,16 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		baseBranch = "main"
 	}
 	argv = append(argv, "--base-branch", baseBranch)
+	// Only implement stages produce a diff to enforce. Passing
+	// --check-base-ref makes the runner run computeAndEmitDiff, which
+	// emits the git_diff event the backend needs to re-evaluate policy
+	// (policy_evaluated) and run implement-review (#561/#585). Plan and
+	// review stages legitimately produce no diff, so they omit it.
+	// Mirrors the runner's own gate (computeAndEmitDiff runs iff
+	// cfg.checkBaseRef != "").
+	if in.Stage == "implement" {
+		argv = append(argv, "--check-base-ref", baseBranch)
+	}
 	if !in.PushAndOpenPR {
 		argv = append(argv, "--no-pr")
 	}

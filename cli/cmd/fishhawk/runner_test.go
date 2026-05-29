@@ -138,6 +138,12 @@ func TestRunnerStart_HappyPath_BuildsExpectedArgv(t *testing.T) {
 			t.Errorf("argv missing %q: %v", want, cap.args)
 		}
 	}
+	// Implement stages carry --check-base-ref <baseBranch> so the runner
+	// emits the git_diff event (backend policy_evaluated +
+	// implement-review). Assert both the flag and its value follow.
+	if i := indexOf(cap.args, "--check-base-ref"); i < 0 || i+1 >= len(cap.args) || cap.args[i+1] != "main" {
+		t.Errorf("implement argv missing --check-base-ref main: %v", cap.args)
+	}
 	if contains(cap.args, "--no-pr") {
 		t.Errorf("argv should NOT include --no-pr when flag is not passed (default=false): %v", cap.args)
 	}
@@ -170,6 +176,10 @@ func TestRunnerStart_PlanStage_PassesPlanOut(t *testing.T) {
 	}
 	if !contains(cap.args, "/tmp/fishhawk-plan.json") {
 		t.Errorf("plan-stage argv missing /tmp/fishhawk-plan.json: %v", cap.args)
+	}
+	// Plan stages produce no diff, so --check-base-ref is omitted.
+	if contains(cap.args, "--check-base-ref") {
+		t.Errorf("plan-stage argv should NOT include --check-base-ref: %v", cap.args)
 	}
 }
 
@@ -495,10 +505,14 @@ func TestRunnerStart_StageCompleteComment(t *testing.T) {
 
 // contains reports whether s appears anywhere in xs.
 func contains(xs []string, s string) bool {
-	for _, x := range xs {
+	return indexOf(xs, s) >= 0
+}
+
+func indexOf(xs []string, s string) int {
+	for i, x := range xs {
 		if x == s {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
 }
