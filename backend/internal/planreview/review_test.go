@@ -156,3 +156,58 @@ func TestPlanReviewedPayload_JSONRoundTrip(t *testing.T) {
 		t.Errorf("Verdict = %q, want %q", got.Verdict, p.Verdict)
 	}
 }
+
+// --- ImplementReviewedPayload JSON round-trip (ADR-027 impl 2/2) ---
+
+func TestImplementReviewedPayload_JSONRoundTrip(t *testing.T) {
+	p := planreview.ImplementReviewedPayload{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-7",
+		Authority:     planreview.AuthorityAdvisory,
+		Verdict:       planreview.VerdictApproveWithConcerns,
+		Concerns: []planreview.Concern{
+			{Severity: planreview.SeverityLow, Category: "scope", Note: "touched a file outside scope.files"},
+		},
+		FreeForm: "diff implements the plan",
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.ReviewerKind != p.ReviewerKind {
+		t.Errorf("ReviewerKind = %q, want %q", got.ReviewerKind, p.ReviewerKind)
+	}
+	if got.Authority != p.Authority {
+		t.Errorf("Authority = %q, want %q", got.Authority, p.Authority)
+	}
+	if got.Verdict != p.Verdict {
+		t.Errorf("Verdict = %q, want %q", got.Verdict, p.Verdict)
+	}
+	if len(got.Concerns) != 1 || got.Concerns[0].Category != "scope" {
+		t.Errorf("Concerns = %+v, want one scope concern", got.Concerns)
+	}
+}
+
+// TestResolveAuthority_ImplementParity confirms the authority table is
+// identical for the implement stage — the same ReviewersConfig inputs
+// produce the same authority modes (ADR-027 impl 2/2 reuses the table).
+func TestResolveAuthority_ImplementParity(t *testing.T) {
+	cases := []struct {
+		agent, human int
+		want         planreview.AuthorityMode
+	}{
+		{1, 0, planreview.AuthorityGating},
+		{1, 1, planreview.AuthorityAdvisory},
+		{0, 1, planreview.AuthorityGateless},
+	}
+	for _, c := range cases {
+		got := planreview.ResolveAuthority(spec.ReviewersConfig{Agent: c.agent, Human: c.human})
+		if got != c.want {
+			t.Errorf("ResolveAuthority(agent=%d,human=%d) = %q, want %q", c.agent, c.human, got, c.want)
+		}
+	}
+}

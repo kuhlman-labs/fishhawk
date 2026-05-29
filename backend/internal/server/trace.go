@@ -11,13 +11,16 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -330,6 +333,42 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			slog.String("error", err.Error()),
 		)
 		return
+	}
+
+	// Implement-review hook (ADR-027 impl 2/2). After the diff has
+	// landed (the bundle carries it) and the stage is running, but
+	// BEFORE the terminal awaiting_approval/succeeded transition, spawn
+	// implement-review agent(s) when this is an implement stage with
+	// reviewers.agent>0. A gating reject (human==0) fails the stage as
+	// category-B and returns here, so the terminal transition below is
+	// blocked by the state machine — mirroring runPlanReviews' contract.
+	//
+	// Guarded on stage.Type so the default trace path is byte-identical
+	// for every non-implement stage; runImplementReviews itself
+	// short-circuits when reviewers.agent==0, so reviewer-less implement
+	// runs are unaffected too.
+	if stage.Type == run.StageTypeImplement {
+		// Diff source is the trace bundle, regardless of whether a PR was
+		// opened (local --no-pr runs still carry the git_diff event). An
+		// extraction error skips review and proceeds to the terminal
+		// transition rather than failing the stage.
+		if diff, derr := bundle.ExtractDiff(bundleBytes); derr == nil {
+			if s.runImplementReviews(r.Context(), runID, stageID, diff) {
+				cat := run.FailureB
+				reason := "implement_review_rejected: agent review verdict reject under gating authority"
+				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
+					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+						"trace upload: transition to failed-B after implement-review gating reject failed",
+						slog.String("run_id", runID.String()),
+						slog.String("stage_id", stageID.String()),
+						slog.String("error", ferr.Error()),
+					)
+				}
+				s.advanceAfterFailure(r, runID, stageID)
+				s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
+				return
+			}
+		}
 	}
 
 	terminal := run.StageStateAwaitingApproval
@@ -759,6 +798,190 @@ func (s *Server) emitRuntimeObserved(ctx context.Context, runID, stageID uuid.UU
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// runImplementReviews invokes configured implement-review agents after
+// the implement-stage diff has landed in the trace bundle (ADR-027 impl
+// 2/2). It mirrors runPlanReviews: for each configured agent it builds
+// the implement_review prompt from the diff + approved plan + issue,
+// calls PlanReviewer.Review, warns on self-review, and appends one
+// implement_reviewed audit entry per invocation.
+//
+// Returns true only when authority is gating (reviewers.agent>0 &&
+// human==0) and at least one verdict is reject — the caller transitions
+// the stage to failed-B so the terminal awaiting_approval advance is
+// blocked. scope.files drift is flag-only: a {category:"scope"} concern
+// never forces a reject (ADR-027 Decision Q6); only an overall verdict of
+// reject blocks.
+//
+// Returns false (no gating block) when:
+//   - RunRepo is nil
+//   - the workflow spec carries no implement stage with reviewers.agent>0
+//   - PlanReviewer is nil (emits implement_review_skipped, then proceeds)
+//   - no approved plan is available
+//   - all review agents approve (or approve_with_concerns)
+//
+// Per-invocation errors are WARN-logged and skipped so a transient
+// reviewer failure doesn't block the stage — the diff is already stored.
+// This mirrors runPlanReviews' failure/skip behavior exactly; the
+// louder-on-failure change is tracked separately in #584.
+func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff) bool {
+	if s.cfg.RunRepo == nil {
+		return false
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: get run failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+
+	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
+	if reviewersCfg == nil || reviewersCfg.Agent == 0 {
+		return false
+	}
+
+	authority := planreview.ResolveAuthority(*reviewersCfg)
+
+	// PlanReviewer not wired but the spec requested agent review.
+	// Emit implement_review_skipped so the degradation is auditable,
+	// then proceed (in advisory mode the human gate remains
+	// authoritative). Mirrors runPlanReviews.
+	if s.cfg.PlanReviewer == nil {
+		if s.cfg.AuditRepo != nil {
+			payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
+				Reason:           "reviewer_not_configured",
+				ConfiguredAgents: reviewersCfg.Agent,
+				Authority:        authority,
+			})
+			systemKind := audit.ActorKind("system")
+			if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID:     runID,
+				StageID:   &stageID,
+				Timestamp: time.Now().UTC(),
+				Category:  "implement_review_skipped",
+				ActorKind: &systemKind,
+				Payload:   payload,
+			}); aerr != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append implement_review_skipped audit entry failed",
+					slog.String("run_id", runID.String()),
+					slog.String("error", aerr.Error()),
+				)
+			}
+		}
+		return false
+	}
+
+	// Load the approved plan for the self-review guard (GeneratedBy.Model)
+	// and the implement_review prompt's scope/approach/verification. No
+	// plan → skip review (the diff has nothing to be measured against).
+	approvedPlan, err := s.loadApprovedPlanForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: load plan failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	if approvedPlan == nil {
+		return false
+	}
+
+	trig := prompt.Trigger{
+		Repo:         runRow.Repo,
+		ApprovedPlan: approvedPlan,
+		Diff:         renderDiffForReview(diff),
+	}
+	if runRow.IssueContext != nil {
+		trig.IssueTitle = runRow.IssueContext.Title
+		trig.IssueBody = runRow.IssueContext.Body
+	}
+	if runRow.TriggerRef != nil {
+		if n, ok := parseIssueRef(*runRow.TriggerRef); ok {
+			trig.IssueNumber = n
+		}
+	}
+	promptText, err := prompt.Build("implement_review", trig)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: build prompt failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+
+	systemKind := audit.ActorKind("system")
+	hasRejection := false
+	for i := 0; i < reviewersCfg.Agent; i++ {
+		verdict, model, err := s.cfg.PlanReviewer.Review(ctx, promptText)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: reviewer invocation failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.Int("reviewer_index", i),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+
+		// Self-review guard (ADR-027): warn when the reviewer's model
+		// matches the plan author's model. Warn-only; verdict still
+		// recorded. The approved plan's GeneratedBy.Model is an
+		// approximation of the implement-stage author's model — v0 does
+		// not record the implement agent's model separately.
+		if model != "" && model == approvedPlan.GeneratedBy.Model {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"implement review: self-review detected — reviewer model matches plan author model",
+				slog.String("model", model),
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+			)
+		}
+
+		payload := planreview.ImplementReviewedPayload{
+			ReviewerKind:  "agent",
+			ReviewerModel: model,
+			Authority:     authority,
+			Verdict:       verdict.Verdict,
+			Concerns:      verdict.Concerns,
+			FreeForm:      verdict.FreeForm,
+		}
+		payloadBytes, _ := json.Marshal(payload)
+		if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     runID,
+			StageID:   &stageID,
+			Timestamp: time.Now().UTC(),
+			Category:  "implement_reviewed",
+			ActorKind: &systemKind,
+			Payload:   payloadBytes,
+		}); aerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append audit entry failed",
+				slog.String("run_id", runID.String()),
+				slog.String("error", aerr.Error()),
+			)
+		}
+
+		if verdict.Verdict == planreview.VerdictReject {
+			hasRejection = true
+		}
+	}
+
+	return authority == planreview.AuthorityGating && hasRejection
+}
+
+// renderDiffForReview formats a policy.Diff (per-file path + git status)
+// into the changed-files summary the implement_review prompt embeds. The
+// reviewer compares this list against the plan's scope.files to flag
+// drift. Status letters mirror `git diff --name-status` (A/M/D/R/C).
+func renderDiffForReview(diff policy.Diff) string {
+	var b strings.Builder
+	for _, f := range diff.ChangedFiles {
+		fmt.Fprintf(&b, "- %s %s\n", f.Status, f.Path)
+	}
+	return b.String()
 }
 
 func sha256Hex(b []byte) string {

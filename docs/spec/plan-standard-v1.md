@@ -113,6 +113,8 @@ A non-empty human-readable description. The plan-review UI renders this as the l
 
 `files` lists every file the agent intends to touch with one of `create | modify | delete`. The runner's post-hoc constraint check (E5.5 / #53) compares this list against the actual diff and against the stage's `forbidden_paths` / `allowed_paths` constraints.
 
+`scope.files` is also read by the implement-review agent (ADR-027 impl 2/2) as a **flag-only drift signal**: when the implement-stage diff touches files outside `scope.files`, the review agent emits a `{category: "scope"}` concern naming the out-of-scope files — it does **not** auto-reject. Only an overall verdict of `reject` (a blocking plan/correctness problem) blocks stage advancement under gating authority; scope drift alone surfaces as a concern for the operator to weigh.
+
 `estimated_lines_changed` is a reviewer cue, not enforced.
 
 ### `approach`
