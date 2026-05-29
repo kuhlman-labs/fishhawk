@@ -1,0 +1,269 @@
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+)
+
+// Implement-stage workflow specs with reviewers config. The implement
+// stage carries no constraints so the trace handler's policy re-eval
+// passes and reaches the implement-review hook (ADR-027 impl 2/2).
+var (
+	specImplementGatingReviewers = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+`)
+
+	specImplementAdvisoryReviewers = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 1
+`)
+)
+
+// newImplementReviewServer wires an orchestratorRepo seeded with a
+// succeeded plan stage (carrying a plan artifact) and a dispatched
+// implement stage requiring approval, plus the given reviewer and spec.
+// Returns the server, signing fake, audit fake, run repo, and the
+// implement stage so callers can assert its post-trace state.
+func newImplementReviewServer(t *testing.T, reviewer PlanReviewer, workflowSpec []byte) (
+	*Server, *signingFake, *auditFake, *orchestratorRepo, *run.Run, *run.Stage,
+) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = workflowSpec
+	runRow.Repo = "kuhlman-labs/example"
+
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedBudgetPlanArtifact(t, art, planStage.ID, &plan.Plan{
+		PlanVersion:                "standard_v1",
+		Summary:                    "Add foo helper",
+		PredictedRuntimeMinutes:    10,
+		PredictedRuntimeConfidence: plan.RuntimeConfidenceMedium,
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify},
+			},
+		},
+	})
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+		PlanReviewer: reviewer,
+	})
+	return s, sf, au, rr, runRow, implStage
+}
+
+// implementDiffBundle builds a trace bundle carrying a git_diff event so
+// bundle.ExtractDiff yields the given changed files.
+func implementDiffBundle(t *testing.T, files []map[string]string) []byte {
+	t.Helper()
+	return makeTestBundle(t, files)
+}
+
+// TestShipTrace_ImplementReview_GatingReject_StageFailedB asserts that
+// under gating authority (agent>=1, human==0) a reject verdict fails the
+// implement stage as category-B rather than advancing it to
+// awaiting_approval.
+func TestShipTrace_ImplementReview_GatingReject_StageFailedB(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	if implStage.State != run.StageStateFailed {
+		t.Fatalf("implement stage state = %q, want failed", implStage.State)
+	}
+	if implStage.FailureCategory == nil || *implStage.FailureCategory != run.FailureB {
+		t.Errorf("failure category = %v, want B", implStage.FailureCategory)
+	}
+
+	// One implement_reviewed audit entry with gating authority + reject.
+	var found bool
+	au.mu.Lock()
+	for _, e := range au.appended {
+		if e.Category == "implement_reviewed" {
+			found = true
+		}
+	}
+	au.mu.Unlock()
+	if !found {
+		t.Error("no implement_reviewed audit entry emitted")
+	}
+
+	// The reviewer received a non-empty diff in its prompt.
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	if !strings.Contains(reviewer.calls[0], "backend/internal/foo/foo.go") {
+		t.Errorf("reviewer prompt missing the diff's changed file:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestShipTrace_ImplementReview_GatingApprove_Advances asserts that under
+// gating authority an approve verdict lets the stage advance to its
+// terminal state (awaiting_approval, since the stage requires approval).
+func TestShipTrace_ImplementReview_GatingApprove_Advances(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	if implStage.State != run.StageStateAwaitingApproval {
+		t.Errorf("implement stage state = %q, want awaiting_approval", implStage.State)
+	}
+}
+
+// TestShipTrace_ImplementReview_ScopeDriftOnly_Advances asserts the
+// flag-only contract (ADR-027 Decision Q6): a reviewer returning
+// approve_with_concerns with a single {category:"scope"} concern under
+// gating authority does NOT fail the stage — drift alone never blocks.
+func TestShipTrace_ImplementReview_ScopeDriftOnly_Advances(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict: planreview.VerdictApproveWithConcerns,
+			Concerns: []planreview.Concern{
+				{Severity: planreview.SeverityLow, Category: "scope", Note: "touched a file outside scope.files"},
+			},
+		},
+		model: "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+		{"path": "backend/internal/other/other.go", "status": "A"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	if implStage.State == run.StageStateFailed {
+		t.Fatalf("scope drift alone must not fail the stage; state = %q", implStage.State)
+	}
+	if implStage.State != run.StageStateAwaitingApproval {
+		t.Errorf("implement stage state = %q, want awaiting_approval", implStage.State)
+	}
+}
+
+// TestShipTrace_ImplementReview_Advisory_RecordsVerdictRequiresApproval
+// asserts that under advisory authority (agent>=1, human>=1) even a reject
+// verdict is recorded as implement_reviewed but does NOT block — the human
+// gate stays authoritative and the stage advances to awaiting_approval.
+func TestShipTrace_ImplementReview_Advisory_RecordsVerdictRequiresApproval(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	if implStage.State != run.StageStateAwaitingApproval {
+		t.Errorf("advisory: implement stage state = %q, want awaiting_approval", implStage.State)
+	}
+
+	// Verdict still recorded with advisory authority.
+	var rec *planreview.ImplementReviewedPayload
+	au.mu.Lock()
+	for i := range au.appended {
+		if au.appended[i].Category == "implement_reviewed" {
+			var p planreview.ImplementReviewedPayload
+			if err := json.Unmarshal(au.appended[i].Payload, &p); err == nil {
+				rec = &p
+			}
+		}
+	}
+	au.mu.Unlock()
+	if rec == nil {
+		t.Fatal("no implement_reviewed audit entry emitted under advisory authority")
+	}
+	if rec.Authority != planreview.AuthorityAdvisory {
+		t.Errorf("authority = %q, want advisory", rec.Authority)
+	}
+	if rec.Verdict != planreview.VerdictReject {
+		t.Errorf("verdict = %q, want reject (recorded but non-blocking)", rec.Verdict)
+	}
+}

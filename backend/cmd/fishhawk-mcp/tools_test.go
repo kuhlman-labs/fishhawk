@@ -1049,6 +1049,111 @@ func seedPlanReviewAudit(fb *fakeBackend, runID uuid.UUID, review PlanReview) {
 	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
 }
 
+// seedImplementReviewAudit adds an implement_reviewed audit entry to the
+// fake's per-run audit map (ADR-027 impl 2/2). Mirrors
+// seedPlanReviewAudit but for the implement-review category.
+func seedImplementReviewAudit(fb *fakeBackend, runID uuid.UUID, review PlanReview) {
+	payload, _ := json.Marshal(review)
+	var decoded any
+	_ = json.Unmarshal(payload, &decoded)
+	entry := AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "implement_reviewed",
+		Payload:  decoded,
+	}
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
+}
+
+func TestGetRunStatus_WithImplementReviews_PopulatesField(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+
+	seedImplementReviewAudit(fb, runID, PlanReview{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-7",
+		Authority:     "advisory",
+		Verdict:       "approve_with_concerns",
+		Concerns: []PlanReviewConcern{
+			{Severity: "low", Category: "scope", Note: "touched a file outside scope.files"},
+		},
+		FreeForm: "diff implements the plan",
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if got := len(out.ImplementReviews); got != 1 {
+		t.Fatalf("len(ImplementReviews) = %d, want 1", got)
+	}
+	rev := out.ImplementReviews[0]
+	if rev.Verdict != "approve_with_concerns" {
+		t.Errorf("Verdict = %q, want approve_with_concerns", rev.Verdict)
+	}
+	if rev.Authority != "advisory" {
+		t.Errorf("Authority = %q, want advisory", rev.Authority)
+	}
+	if len(rev.Concerns) != 1 || rev.Concerns[0].Category != "scope" {
+		t.Errorf("Concerns = %+v, want one scope concern", rev.Concerns)
+	}
+}
+
+func TestGetRunStatus_NoImplementReviews_NilField(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String()}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementReviews != nil {
+		t.Errorf("ImplementReviews should be nil with no entries; got %+v", out.ImplementReviews)
+	}
+}
+
+func TestGetRunStatus_ImplementReviewSkipped_SurfacesSkippedVerdict(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String()}
+
+	// implement_review_skipped entry (reviewer not wired).
+	payload, _ := json.Marshal(map[string]any{
+		"reason":            "reviewer_not_configured",
+		"configured_agents": 1,
+		"authority":         "gating",
+	})
+	var decoded any
+	_ = json.Unmarshal(payload, &decoded)
+	fb.perRunAuditByRun[runID] = []AuditEntry{{
+		ID:       uuid.New().String(),
+		Sequence: 1,
+		RunID:    runID.String(),
+		Category: "implement_review_skipped",
+		Payload:  decoded,
+	}}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if got := len(out.ImplementReviews); got != 1 {
+		t.Fatalf("len(ImplementReviews) = %d, want 1", got)
+	}
+	if out.ImplementReviews[0].Verdict != "skipped" {
+		t.Errorf("Verdict = %q, want skipped", out.ImplementReviews[0].Verdict)
+	}
+	if out.ImplementReviews[0].Reason != "reviewer_not_configured" {
+		t.Errorf("Reason = %q, want reviewer_not_configured", out.ImplementReviews[0].Reason)
+	}
+}
+
 func TestGetPlan_WithReviews_PopulatesField(t *testing.T) {
 	// Two plan-review agent verdicts recorded on the plan's run.
 	// Both must appear in Reviews with correct fields.

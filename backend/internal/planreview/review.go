@@ -110,3 +110,23 @@ type PlanReviewedPayload struct {
 	Concerns      []Concern     `json:"concerns,omitempty"`
 	FreeForm      string        `json:"free_form,omitempty"`
 }
+
+// ImplementReviewedPayload is the JSON payload stored in an audit entry
+// with category "implement_reviewed" (ADR-027 impl 2/2). It records one
+// implement-review agent invocation against the implement-stage diff. The
+// shape is identical to PlanReviewedPayload — the verdict, authority, and
+// concern semantics are the same; only the reviewed artifact (diff vs.
+// plan) differs. scope.files drift is surfaced as a {category:"scope"}
+// concern here rather than an auto-reject (ADR-027 Decision Q6).
+//
+// The companion "implement_review_skipped" category reuses
+// ReviewSkippedPayload — same reviewer-not-configured degradation story
+// as the plan stage.
+type ImplementReviewedPayload struct {
+	ReviewerKind  string        `json:"reviewer_kind"`
+	ReviewerModel string        `json:"reviewer_model,omitempty"`
+	Authority     AuthorityMode `json:"authority"`
+	Verdict       Verdict       `json:"verdict"`
+	Concerns      []Concern     `json:"concerns,omitempty"`
+	FreeForm      string        `json:"free_form,omitempty"`
+}

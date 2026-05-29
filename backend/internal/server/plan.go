@@ -379,7 +379,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		return false
 	}
 
-	reviewersCfg := s.resolvePlanStageReviewers(ctx, runRow)
+	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypePlan)
 	if reviewersCfg == nil || reviewersCfg.Agent == 0 {
 		return false
 	}
@@ -534,18 +534,20 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	return false
 }
 
-// resolvePlanStageReviewers reads the run's workflow spec and returns
-// the ReviewersConfig for the plan-type stage in the active workflow.
-// Returns nil when the spec is absent, unparseable, or the workflow
-// has no plan stage.
-func (s *Server) resolvePlanStageReviewers(ctx context.Context, runRow *run.Run) *spec.ReviewersConfig {
+// resolveStageReviewers reads the run's workflow spec and returns the
+// ReviewersConfig for the first stage of the given type in the active
+// workflow. Returns nil when the spec is absent, unparseable, or the
+// workflow has no stage of that type. Shared by the plan-review and
+// implement-review paths (ADR-027 impl 1/2 + 2/2).
+func (s *Server) resolveStageReviewers(ctx context.Context, runRow *run.Run, stageType spec.StageType) *spec.ReviewersConfig {
 	if runRow.WorkflowSpec == nil {
 		return nil
 	}
 	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: parse workflow spec failed",
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "stage review: parse workflow spec failed",
 			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_type", string(stageType)),
 			slog.String("error", err.Error()),
 		)
 		return nil
@@ -555,7 +557,7 @@ func (s *Server) resolvePlanStageReviewers(ctx context.Context, runRow *run.Run)
 		return nil
 	}
 	for _, st := range wf.Stages {
-		if st.Type == spec.StageTypePlan {
+		if st.Type == stageType {
 			return st.Reviewers
 		}
 	}

@@ -32,6 +32,13 @@ const defaultStageTimeoutMinutes = 15
 // buildPlanReview's output.
 const PlanReviewSplitMarker = "\n### Plan artifact\n\n"
 
+// ImplementReviewSplitMarker is the substring that separates the stable
+// role-constraint preamble (cached) from the variable diff + plan + issue
+// content in the implement-review prompt. Adapters split here for
+// Anthropic prompt caching; tests assert the constant appears in
+// buildImplementReview's output (ADR-027 impl 2/2).
+const ImplementReviewSplitMarker = "\n### Diff under review\n\n"
+
 // ErrUnsupportedStage signals the requested stage type isn't yet
 // wired for prompt construction. The handler maps this to HTTP 501.
 var ErrUnsupportedStage = errors.New("prompt: unsupported stage type")
@@ -180,6 +187,11 @@ type Trigger struct {
 	// the approved-plan section. Nil means no conditions were given (section
 	// omitted).
 	ApprovalConditions *string
+	// Diff is the rendered changed-files summary for the implement-review
+	// prompt (ADR-027 impl 2/2). Populated by the trace handler from
+	// bundle.ExtractDiff (path + git status per file). Empty for any
+	// non-implement-review build.
+	Diff string
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -199,6 +211,8 @@ func Build(stageType string, t Trigger) (string, error) {
 		return buildPlan(t), nil
 	case "plan_review":
 		return buildPlanReview(t), nil
+	case "implement_review":
+		return buildImplementReview(t), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrUnsupportedStage, stageType)
 	}
@@ -541,6 +555,121 @@ func buildPlanReview(t Trigger) string {
 		"record each gap as a concern with appropriate severity.\n")
 	b.WriteString("- `reject`: plan has one or more blocking problems that must be resolved before implementation; " +
 		"record each blocker as a `high`-severity concern.\n\n")
+
+	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
+	return b.String()
+}
+
+// buildImplementReview constructs the constrained prompt for an
+// implement-review agent (ADR-027 impl 2/2). The agent reviews the diff
+// produced by the implement stage against the approved plan and emits a
+// single structured verdict JSON — it is forbidden from re-planning,
+// proposing edits, or producing any output other than the verdict object.
+//
+// The prompt surfaces the changed-files diff summary, the approved plan's
+// scope.files / approach / verification, and the originating issue body so
+// the reviewer can assess whether the diff implements the plan. The
+// scope-drift rule is flag-only: files touched outside scope.files yield a
+// {category:"scope"} concern, never an auto-reject (ADR-027 Decision Q6).
+func buildImplementReview(t Trigger) string {
+	var b strings.Builder
+	b.WriteString("You are an implement-review agent for the repository ")
+	b.WriteString(quoteRepo(t.Repo))
+	b.WriteString(".\n\n")
+
+	b.WriteString("ROLE CONSTRAINT (binding — read before writing any output)\n")
+	b.WriteString("===========================================================\n\n")
+	b.WriteString("Your ONLY task is to review the diff below against the approved plan and emit a single JSON verdict object.\n")
+	b.WriteString("You MUST NOT:\n")
+	b.WriteString("- Re-plan, propose alternative implementations, or suggest edits to the diff.\n")
+	b.WriteString("- Produce any prose output outside the JSON verdict object.\n")
+	b.WriteString("- Modify any source files.\n")
+	b.WriteString("- Invoke any tools beyond reading repository files for context.\n\n")
+	b.WriteString("Your entire response MUST be a single JSON object conforming to the verdict schema below. " +
+		"Do not wrap it in markdown code fences, do not add prose before or after it. " +
+		"A response that contains anything other than the JSON object will be rejected.\n\n")
+
+	// Diff under review — the primary input. The split marker leads this
+	// section so caching adapters can split the stable preamble from the
+	// variable diff/plan/issue content.
+	b.WriteString("### Diff under review\n\n")
+	if t.Diff != "" {
+		b.WriteString("Files changed by the implement stage (path + git status — this is a changed-files list, NOT a line-level diff):\n\n")
+		b.WriteString(t.Diff)
+		b.WriteString("\nTo assess content (plan adherence, verification, regressions below), READ each listed file from the repository to see its current state. " +
+			"Pre-change content and deleted lines are NOT visible from this list, so base any regression concern only on what you can confirm by reading the current files — " +
+			"do not assert the absence of regressions you could not actually inspect.\n\n")
+	} else {
+		b.WriteString("(no diff present in the trace bundle — emit verdict: approve with a concern noting the empty diff)\n\n")
+	}
+
+	// Approved plan section — what the diff is being measured against.
+	if t.ApprovedPlan != nil {
+		writePlanForReview(&b, t.ApprovedPlan)
+	} else {
+		b.WriteString("### Plan artifact\n\n")
+		b.WriteString("(no approved plan available — review the diff for obvious regressions only)\n\n")
+	}
+
+	// Issue context: the originating motivation.
+	if t.IssueNumber > 0 || t.IssueTitle != "" || t.IssueBody != "" {
+		b.WriteString("### Originating issue\n\n")
+		if t.IssueNumber > 0 {
+			fmt.Fprintf(&b, "Issue: #%d", t.IssueNumber)
+			if t.IssueTitle != "" {
+				b.WriteString(" · ")
+				b.WriteString(t.IssueTitle)
+			}
+			b.WriteString("\n")
+		} else if t.IssueTitle != "" {
+			b.WriteString("Title: ")
+			b.WriteString(t.IssueTitle)
+			b.WriteString("\n")
+		}
+		if t.IssueBody != "" {
+			b.WriteString("\n")
+			b.WriteString(t.IssueBody)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	// Verdict schema — inline so the reviewer doesn't need to fetch it.
+	b.WriteString("### Verdict schema\n\n")
+	b.WriteString("Emit exactly this JSON shape. All fields shown; omit `concerns` and `free_form` when empty:\n\n")
+	b.WriteString("{\n")
+	b.WriteString("  \"verdict\": \"approve\" | \"approve_with_concerns\" | \"reject\",\n")
+	b.WriteString("  \"concerns\": [\n")
+	b.WriteString("    {\n")
+	b.WriteString("      \"severity\": \"high\" | \"medium\" | \"low\",\n")
+	b.WriteString("      \"category\": \"<short classifier, e.g. scope | correctness | regression | verification>\",\n")
+	b.WriteString("      \"note\": \"<free-form explanation of the concern>\"\n")
+	b.WriteString("    }\n")
+	b.WriteString("  ],\n")
+	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
+	b.WriteString("}\n\n")
+
+	// Review criteria — what the agent should assess.
+	b.WriteString("### Review criteria\n\n")
+	b.WriteString("Assess the diff against the following criteria. Record a concern for each gap found:\n\n")
+	b.WriteString("1. **Plan adherence**: Does the diff implement the approved plan's approach steps? " +
+		"Are the changes the plan called for actually present?\n")
+	b.WriteString("2. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
+		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
+		"Do NOT reject solely for scope drift — drift is a flag, not a blocker.\n")
+	b.WriteString("3. **Verification satisfiability**: Are the plan's verification steps (test strategy, rollback) " +
+		"satisfiable against this diff?\n")
+	b.WriteString("4. **Obvious regressions**: Does the diff introduce obvious correctness regressions, " +
+		"broken references, or removed behaviour the issue didn't ask for?\n\n")
+
+	// Verdict decision rule.
+	b.WriteString("### Verdict decision rule\n\n")
+	b.WriteString("- `approve`: diff implements the plan; all criteria met or concerns are cosmetic.\n")
+	b.WriteString("- `approve_with_concerns`: diff is acceptable but has non-blocking gaps (including any scope drift); " +
+		"record each gap as a concern with appropriate severity.\n")
+	b.WriteString("- `reject`: diff has one or more blocking problems — it does not implement the plan, or it introduces " +
+		"a correctness regression — that must be resolved; record each blocker as a `high`-severity concern. " +
+		"Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead.\n\n")
 
 	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
 	return b.String()

@@ -534,6 +534,13 @@ type GetRunStatusOutput struct {
 	Run         Run          `json:"run"`
 	Stages      []Stage      `json:"stages" jsonschema:"ordered by sequence ascending"`
 	RecentAudit []AuditEntry `json:"recent_audit" jsonschema:"time-descending; item 0 is the most recent"`
+	// ImplementReviews surfaces implement-review agent verdicts (ADR-027
+	// impl 2/2) so the human reviewer sees the diff-review outcome before
+	// approving the implement stage. Each entry has reviewer_kind,
+	// authority, verdict, concerns[] (a {category:"scope"} concern flags
+	// scope.files drift), and free_form. A verdict of "skipped" with a
+	// reason marks a configured agent layer that was not wired.
+	ImplementReviews []PlanReview `json:"implement_reviews,omitempty" jsonschema:"implement-review agent verdicts; populated when reviewers.agent>0 is configured on the implement stage (ADR-027). A {category:'scope'} concern flags scope.files drift (flag-only, never an auto-reject). A verdict of 'skipped' with a reason marks an agent layer that was configured but not wired on the backend"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -551,6 +558,14 @@ Returns the Run row (state, workflow, trigger, PR URL when stamped),
 the full ordered stage list (each stage's id / type / state /
 executor / timing / failure category if any), and the N most-recent
 audit entries time-descending (default 5; capped at 50).
+
+Also returns implement_reviews[]: implement-review agent verdicts
+(ADR-027) when reviewers.agent>0 is configured on the implement stage.
+Each entry carries reviewer_kind, authority, verdict, concerns[], and
+free_form; a {category:"scope"} concern flags scope.files drift
+(flag-only, never an auto-reject). Read these before approving the
+implement stage. A verdict of "skipped" with a reason marks an agent
+layer that was configured but not wired on the backend.
 
 Use this as the agent's "where are we" query — replaces a sequential
 chain of GetRun / ListStages / ListAudit calls with a single
@@ -589,11 +604,80 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, GetRunStatusOutput{}, fmt.Errorf("list recent audit: %w", err)
 	}
 
+	implementReviews, err := r.loadImplementReviews(ctx, runID)
+	if err != nil {
+		return nil, GetRunStatusOutput{}, fmt.Errorf("load implement reviews: %w", err)
+	}
+
 	return nil, GetRunStatusOutput{
-		Run:         *runRow,
-		Stages:      stages,
-		RecentAudit: recent,
+		Run:              *runRow,
+		Stages:           stages,
+		RecentAudit:      recent,
+		ImplementReviews: implementReviews,
 	}, nil
+}
+
+// loadImplementReviews queries implement_reviewed audit entries for the
+// given run and decodes each into a PlanReview (the verdict shape is
+// identical across plan and implement review, ADR-027). It mirrors
+// loadPlanReviews: corrupt payloads are skipped, and a second pass over
+// implement_review_skipped entries synthesizes a "skipped" verdict so a
+// degraded gate is distinguishable from a real verdict. Returns nil when
+// no implement-review entries exist.
+func (r *runResolver) loadImplementReviews(ctx context.Context, runID uuid.UUID) ([]PlanReview, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "implement_reviewed",
+		Limit:    50,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var reviews []PlanReview
+	for _, e := range entries {
+		if e.Payload == nil {
+			continue
+		}
+		raw, merr := json.Marshal(e.Payload)
+		if merr != nil {
+			continue
+		}
+		var review PlanReview
+		if uerr := json.Unmarshal(raw, &review); uerr != nil {
+			continue
+		}
+		reviews = append(reviews, review)
+	}
+
+	skipped, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "implement_review_skipped",
+		Limit:    50,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range skipped {
+		if e.Payload == nil {
+			continue
+		}
+		raw, merr := json.Marshal(e.Payload)
+		if merr != nil {
+			continue
+		}
+		var p struct {
+			Reason    string `json:"reason"`
+			Authority string `json:"authority"`
+		}
+		if uerr := json.Unmarshal(raw, &p); uerr != nil {
+			continue
+		}
+		reviews = append(reviews, PlanReview{
+			ReviewerKind: "agent",
+			Authority:    p.Authority,
+			Verdict:      "skipped",
+			Reason:       p.Reason,
+		})
+	}
+	return reviews, nil
 }
 
 // clampAuditLimit applies the default + cap. Negative or zero

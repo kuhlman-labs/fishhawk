@@ -1161,3 +1161,72 @@ func TestBuildPlanReview_ContainsSplitMarker(t *testing.T) {
 		t.Errorf("buildPlanReview output missing PlanReviewSplitMarker %q", PlanReviewSplitMarker)
 	}
 }
+
+func TestBuild_ImplementReview_FullContext(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		IssueNumber:  42,
+		IssueTitle:   "Add foo",
+		IssueBody:    "We need a foo function in pkg/bar.",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n- A pkg/bar/foo.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		// Role constraint + JSON-only contract.
+		"ROLE CONSTRAINT",
+		"single JSON object",
+		// The diff under review renders the changed files.
+		ImplementReviewSplitMarker,
+		"pkg/bar/foo.go",
+		// Honest framing: it's a changed-files list, not a line-level diff,
+		// and the reviewer must read files for content (#585).
+		"NOT a line-level diff",
+		"READ each listed file",
+		// scope.files from the approved plan (for drift comparison).
+		"pkg/bar/legacy.go (delete)",
+		// Verdict schema closed set.
+		"\"approve\" | \"approve_with_concerns\" | \"reject\"",
+		// scope-drift flag-only instruction.
+		"Scope adherence (flag-only)",
+		"Do NOT reject solely for scope drift",
+		"Scope drift ALONE is never grounds for reject",
+		// Issue context.
+		"Issue: #42 · Add foo",
+		"We need a foo function in pkg/bar.",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_EmptyDiff_NotesEmptyDiff(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "no diff present") {
+		t.Errorf("implement_review prompt should note an empty diff:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_ProducesNoPRDescriptionGuidance(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, PullRequestDescriptionPath) {
+		t.Errorf("implement_review prompt must not carry implement-stage PR guidance:\n%s", got)
+	}
+}
