@@ -1092,6 +1092,31 @@ func TestBuild_PlanReview_ReviewCriteriaPresent(t *testing.T) {
 	}
 }
 
+func TestBuild_PlanReview_GroundsRuleCitations(t *testing.T) {
+	// #595: review agents fabricated a CLAUDE.md comment-length rule that
+	// does not exist. The grounding constraint must instruct the reviewer to
+	// only cite rules it can quote verbatim from provided context, never from
+	// memory. Pin the load-bearing substrings.
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Grounded citations",
+		"quote verbatim",
+		"CLAUDE.md",
+		"Do NOT assert rules from memory",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing grounding-constraint substring %q:\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_PlanReview_ProducesNoPRDescriptionGuidance(t *testing.T) {
 	got, err := Build("plan_review", Trigger{
 		Repo:         "x/y",
@@ -1200,6 +1225,37 @@ func TestBuild_ImplementReview_FullContext(t *testing.T) {
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
 			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_GroundsRuleCitationsAndScopesStyle(t *testing.T) {
+	// #595: on run 112743b1 the implement-review raised {category:scope}
+	// concerns asserting a CLAUDE.md comment-length rule that does not exist
+	// and flagged compliant multi-line WHY comments. The grounding constraint
+	// and the style-is-lint scoping line must both be present.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		// Grounding constraint.
+		"Grounded citations",
+		"quote verbatim",
+		"CLAUDE.md",
+		"Do NOT assert rules from memory",
+		// Style-is-lint scoping.
+		"Style is out of scope",
+		"comment length, naming aesthetics, formatting",
+		"that is lint's job",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing substring %q:\n%s", w, got)
 		}
 	}
 }
