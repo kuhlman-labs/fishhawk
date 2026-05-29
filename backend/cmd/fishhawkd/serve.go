@@ -336,6 +336,13 @@ func runServe(args []string, logSink io.Writer) int {
 			Artifacts:     cfg.ArtifactRepo,
 			Logger:        logger,
 			IssueNotifier: notifier,
+			// PlanReviewerConfigured mirrors the run-create guard's
+			// `cfg.PlanReviewer == nil` check (#574) so the webhook-
+			// dispatcher path refuses an agent-gated plan stage with
+			// no reviewer wired (#577 / ADR-027). cfg.PlanReviewer is
+			// resolved earlier (~L167) from the anthropic/claudecode
+			// reviewer selection.
+			PlanReviewerConfigured: cfg.PlanReviewer != nil,
 			// ApprovalHandler is wired below after the Server
 			// is constructed — the Server implements the
 			// interface and holds all the deps the handler
