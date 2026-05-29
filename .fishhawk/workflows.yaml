@@ -71,6 +71,15 @@ workflows:
         type: implement
         executor:
           agent: claude-code
+        # Advisory implement-review (ADR-027 impl 2/2, #561): an agent
+        # reviewer reads the diff against the approved plan and surfaces a
+        # verdict (incl. scope-drift flag). agent>0 + human>0 → advisory, so
+        # it never blocks; the review stage's founder approval stays the gate.
+        # Runs async server-side post-#584; verdict lands ~60-90s after the
+        # implement trace upload (poll the audit / get_run_status).
+        reviewers:
+          agent: 1
+          human: 1
         inputs:
           - artifact: plan
             from_stage: plan
