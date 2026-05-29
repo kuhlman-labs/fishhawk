@@ -54,6 +54,37 @@ type promptResponse struct {
 	// RetryAttempt is the run's current retry_attempt counter. 0 for
 	// original runs; incremented by the backend on each auto-retry.
 	RetryAttempt int `json:"retry_attempt,omitempty"`
+	// ScopeFiles is the approved plan's scope.files list, echoed on
+	// implement stages so the runner can bound the commit to exactly
+	// those declared paths instead of `git add -A` (#581). Empty/omitted
+	// when no approved plan is available (plan_missing_for_implement) —
+	// the runner falls back to staging every change.
+	ScopeFiles []scopeFile `json:"scope_files,omitempty"`
+}
+
+// scopeFile is one entry in promptResponse.ScopeFiles: the path the
+// agent declared it would touch plus the per-file operation
+// (create/modify/delete). Mirrors plan.ScopeFile but pins the wire
+// shape to the prompt-response contract rather than re-exporting the
+// plan type.
+type scopeFile struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+}
+
+// scopeFilesFromPlan converts an approved plan's scope.files into the
+// prompt-response wire shape. Returns nil when the plan is nil or
+// declares no files, so the field is omitted and the runner falls
+// back to `git add -A`.
+func scopeFilesFromPlan(p *plan.Plan) []scopeFile {
+	if p == nil || len(p.Scope.Files) == 0 {
+		return nil
+	}
+	out := make([]scopeFile, 0, len(p.Scope.Files))
+	for _, f := range p.Scope.Files {
+		out = append(out, scopeFile{Path: f.Path, Operation: string(f.Operation)})
+	}
+	return out
 }
 
 // issueGetter is the slice of githubclient.Client the prompt
@@ -149,6 +180,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// into the prompt builder. Missing plan → fall back to the
 	// issue-only template and emit `plan_missing_for_implement` so
 	// the audit log captures the gap.
+	var scopeFiles []scopeFile
 	if stage.Type == run.StageTypeImplement {
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
@@ -168,6 +200,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 				StageBudgetMinutes:  budgetSecs / 60,
 			}
 		}
+		scopeFiles = scopeFilesFromPlan(approvedPlan)
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow)
 		trigger.ApprovalConditions = s.loadApprovalConditions(r.Context(), runRow.ID)
 	}
@@ -219,6 +252,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
+		ScopeFiles:           scopeFiles,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -297,6 +331,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	// into the prompt builder. Missing plan → fall back to the
 	// issue-only template and emit `plan_missing_for_implement` so
 	// the audit log captures the gap.
+	var scopeFiles []scopeFile
 	if stage.Type == run.StageTypeImplement {
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
@@ -316,6 +351,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 				StageBudgetMinutes:  budgetSecs / 60,
 			}
 		}
+		scopeFiles = scopeFilesFromPlan(approvedPlan)
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow)
 		trigger.ApprovalConditions = s.loadApprovalConditions(r.Context(), runRow.ID)
 	}
@@ -367,6 +403,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
+		ScopeFiles:           scopeFiles,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()

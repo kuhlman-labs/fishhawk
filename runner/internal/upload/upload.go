@@ -339,6 +339,21 @@ type FetchedPrompt struct {
 	// remaining self-retry budget without an additional API call.
 	MaxRetriesSnapshot int `json:"max_retries_snapshot,omitempty"`
 	RetryAttempt       int `json:"retry_attempt,omitempty"`
+	// ScopeFiles is the approved plan's scope.files, echoed by the
+	// backend on implement stages so the runner can bound the commit
+	// to exactly those declared paths instead of `git add -A` (#581).
+	// Empty when no approved plan was available — the runner falls
+	// back to staging every change.
+	ScopeFiles []ScopeFile `json:"scope_files,omitempty"`
+}
+
+// ScopeFile is one entry in FetchedPrompt.ScopeFiles: a declared path
+// plus its per-file operation (create/modify/delete). Mirrors the
+// backend's scope_files response shape and the standard_v1 plan
+// scope.files entries.
+type ScopeFile struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an

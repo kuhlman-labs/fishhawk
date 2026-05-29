@@ -143,6 +143,180 @@ func TestCommitAndPush_RejectsBadInputs(t *testing.T) {
 	}
 }
 
+// TestStageScoped_StagesDeclaredExcludesStray is the #581 gating test:
+// given one declared file plus one undeclared stray file, scope-bounded
+// staging stages exactly the declared path and reports the stray as
+// drift without staging it. Fails if per-path staging pulled in the
+// stray or if drift exclusion regressed.
+func TestStageScoped_StagesDeclaredExcludesStray(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	// Declared modification + an undeclared untracked stray.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "stray.pid"), []byte("12345\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	drift, err := p.StageScoped(context.Background(), repo, []string{"README.md"})
+	if err != nil {
+		t.Fatalf("StageScoped: %v", err)
+	}
+
+	staged := mustGitOut(t, repo, "diff", "--cached", "--name-only")
+	if staged != "README.md" {
+		t.Errorf("staged files = %q, want only README.md", staged)
+	}
+	if len(drift) != 1 || drift[0] != "stray.pid" {
+		t.Errorf("drift = %v, want [stray.pid]", drift)
+	}
+}
+
+// TestCommitAndPush_ScopeBounded_CommitsOnlyDeclared exercises the full
+// commit boundary: the stray file is excluded from the commit and
+// surfaced as ScopeDrift while still left dirty in the working tree.
+func TestCommitAndPush_ScopeBounded_CommitsOnlyDeclared(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "stray.pid"), []byte("12345\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/scope/branch",
+		CommitMessage: "Scoped commit",
+		RemoteURL:     bare,
+		ScopeFiles:    []string{"README.md"},
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush: %v", err)
+	}
+	if res.NoChanges {
+		t.Error("expected NoChanges=false (README.md is in scope and dirty)")
+	}
+	if len(res.ScopeDrift) != 1 || res.ScopeDrift[0] != "stray.pid" {
+		t.Errorf("ScopeDrift = %v, want [stray.pid]", res.ScopeDrift)
+	}
+	// The commit touched exactly the declared path.
+	committed := mustGitOut(t, repo, "diff", "--name-only", res.BaseSHA, res.HeadSHA)
+	if committed != "README.md" {
+		t.Errorf("committed files = %q, want only README.md", committed)
+	}
+	// The stray file stays dirty in the working tree (excluded, not lost).
+	status := mustGitOut(t, repo, "status", "--porcelain")
+	if !strings.Contains(status, "stray.pid") {
+		t.Errorf("stray.pid should still be dirty in the working tree; status = %q", status)
+	}
+}
+
+// TestCommitAndPush_ScopeBounded_AllStrayIsNoChanges covers the case
+// where every dirty file is out of scope: nothing is staged, so the
+// commit is short-circuited as NoChanges rather than failing, and the
+// strays are reported as drift.
+func TestCommitAndPush_ScopeBounded_AllStrayIsNoChanges(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "stray.pid"), []byte("12345\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/scope/none",
+		CommitMessage: "should not commit",
+		RemoteURL:     "https://example.com/x/y",
+		ScopeFiles:    []string{"README.md"},
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush: %v", err)
+	}
+	if !res.NoChanges {
+		t.Error("expected NoChanges=true when all dirty files are out of scope")
+	}
+	if len(res.ScopeDrift) != 1 || res.ScopeDrift[0] != "stray.pid" {
+		t.Errorf("ScopeDrift = %v, want [stray.pid]", res.ScopeDrift)
+	}
+}
+
+func TestPorcelainPath(t *testing.T) {
+	cases := map[string]string{
+		" M README.md":        "README.md",
+		"?? stray.pid":        "stray.pid",
+		"A  pkg/new.go":       "pkg/new.go",
+		"R  old.go -> new.go": "new.go",
+		`?? "with space"`:     "with space",
+		"":                    "",
+		"X":                   "",
+	}
+	for line, want := range cases {
+		if got := porcelainPath(line); got != want {
+			t.Errorf("porcelainPath(%q) = %q, want %q", line, got, want)
+		}
+	}
+}
+
+// initRepo creates a git repo with one committed README.md and returns
+// its path. No remote — callers that push add their own bare repo.
+func initRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	return repo
+}
+
+func mustGitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func mustGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)

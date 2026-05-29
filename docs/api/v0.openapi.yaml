@@ -1452,6 +1452,28 @@ paths:
                   min_runner_version:
                     type: string
                     description: Minimum runner version the backend requires; absent when the backend has no constraint. Runners older than this value must exit with code 3 (version_skew) rather than invoking the agent.
+                  scope_files:
+                    type: array
+                    description: |
+                      The approved plan's `scope.files`, echoed on implement
+                      stages so the runner can bound the commit to exactly
+                      these declared paths instead of `git add -A` (#581).
+                      Absent when no approved plan is available
+                      (`plan_missing_for_implement`) — the runner falls back
+                      to staging every change. Dirty-but-undeclared paths are
+                      excluded from the commit and flagged as scope drift
+                      (non-blocking).
+                    items:
+                      type: object
+                      required: [path, operation]
+                      properties:
+                        path:
+                          type: string
+                          description: Repo-relative path the agent declared it would touch.
+                        operation:
+                          type: string
+                          enum: [create, modify, delete]
+                          description: Per-file intent from the standard_v1 plan scope.files entry.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1523,6 +1545,24 @@ paths:
                   min_runner_version:
                     type: string
                     description: Minimum runner version the backend requires; absent when the backend has no constraint.
+                  scope_files:
+                    type: array
+                    description: |
+                      The approved plan's `scope.files`, echoed on implement
+                      stages so the runner can bound the commit to exactly
+                      these declared paths instead of `git add -A` (#581).
+                      Absent when no approved plan is available.
+                    items:
+                      type: object
+                      required: [path, operation]
+                      properties:
+                        path:
+                          type: string
+                          description: Repo-relative path the agent declared it would touch.
+                        operation:
+                          type: string
+                          enum: [create, modify, delete]
+                          description: Per-file intent from the standard_v1 plan scope.files entry.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

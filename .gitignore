@@ -77,5 +77,8 @@ verifier/fishhawk-verify
 /fishhawk
 /fishhawk-verify
 
-# scripts/dev runtime state (PID file).
-.fishhawk/dev.pid
+# scripts/dev runtime state (PID files). Numbered variants (dev 2.pid,
+# dev 3.pid, …) appear when multiple dev loops run; ignore them all so
+# they never leak into a scope-bounded commit as drift (#581). The
+# tracked .fishhawk/workflows.yaml is unaffected (not a .pid file).
+.fishhawk/*.pid

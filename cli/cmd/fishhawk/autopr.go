@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,27 @@ import (
 // prDescriptionPath is where the runner agent writes the PR title and
 // body. The autoOpenPR function reads this file; override in tests.
 var prDescriptionPath = "/tmp/fishhawk-pr.md"
+
+// scopeFilePath is where the runner writes the implement stage's
+// resolved plan scope.files (see writeScopeHandoff in
+// runner/cmd/fishhawk-runner/main.go). autoOpenPR reads this to bound
+// staging to the declared paths instead of `git add -A`; override in
+// tests. Missing or empty falls back to `git add -A` (#581).
+var scopeFilePath = "/tmp/fishhawk-scope.json"
+
+// scopeHandoffFile is the JSON the runner writes to scopeFilePath. It is
+// field-for-field compatible with the runner's scopeHandoff type — this
+// is the runner↔CLI wire contract for #581, not a JSON Schema.
+type scopeHandoffFile struct {
+	Files []scopeFileEntry `json:"files"`
+}
+
+// scopeFileEntry mirrors one standard_v1 plan scope.files entry: a
+// declared repo-relative path plus its per-file operation.
+type scopeFileEntry struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+}
 
 // autoGitCommand constructs git subprocesses for autoOpenPR.
 // Exposed as a var so tests can inject stubs without spawning real git.
@@ -173,7 +195,22 @@ func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRA
 		}
 	}
 
-	if out, addErr := autoGitCommand("git", "-C", args.WorkingDir, "add", "-A").CombinedOutput(); addErr != nil {
+	// Bound staging to the approved plan's scope.files when the runner
+	// handed them off; otherwise fall back to `git add -A`. Scope-bounded
+	// staging excludes dirty-but-undeclared paths (stray dev .pid files,
+	// editor scratch, unrelated local edits) from the Fishhawk-attributed
+	// commit, warning about them as scope drift rather than blocking (#581).
+	if scopeFiles := readScopeFiles(scopeFilePath); len(scopeFiles) > 0 {
+		drift, scopeErr := stageScopedAuto(args.WorkingDir, scopeFiles)
+		if scopeErr != nil {
+			return nil, fmt.Errorf("autopr: %w", scopeErr)
+		}
+		if len(drift) > 0 {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"autopr: scope_drift: %d undeclared dirty path(s) excluded from commit: %s\n",
+				len(drift), strings.Join(drift, ", "))
+		}
+	} else if out, addErr := autoGitCommand("git", "-C", args.WorkingDir, "add", "-A").CombinedOutput(); addErr != nil {
 		return nil, fmt.Errorf("autopr: git add -A: %w\n%s", addErr, out)
 	}
 
@@ -286,4 +323,82 @@ func parsePRCreateOutput(out string) (prURL string, prNumber int, err error) {
 		}
 	}
 	return "", 0, fmt.Errorf("no pull request URL found in gh output: %q", strings.TrimSpace(out))
+}
+
+// readScopeFiles reads the runner-written scope handoff at path and
+// returns the declared repo-relative paths. Returns nil — triggering
+// the `git add -A` fallback in autoOpenPR — when the file is missing,
+// empty, unparseable, or declares no paths.
+func readScopeFiles(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var h scopeHandoffFile
+	if jsonErr := json.Unmarshal(data, &h); jsonErr != nil {
+		return nil
+	}
+	var paths []string
+	for _, f := range h.Files {
+		if f.Path != "" {
+			paths = append(paths, f.Path)
+		}
+	}
+	return paths
+}
+
+// stageScopedAuto stages exactly the declared scope paths in workingDir
+// and returns the set of dirty-but-undeclared paths (scope drift). It
+// reads `git status --porcelain` to enumerate every dirty path, stages
+// the ones that match a declared path via a single `git add -A -- <paths>`
+// (per-path -A covers create, modify, AND delete), and returns the
+// remainder as drift. Drift paths are never staged. Staging only paths
+// git already reports dirty means `git add` never errors on a pathspec
+// matching nothing. Mirrors gitops.Pusher.StageScoped so the CLI auto-PR
+// path and the runner-internal push path bound the commit identically.
+func stageScopedAuto(workingDir string, scopeFiles []string) (drift []string, err error) {
+	statusOut, err := autoGitCommand("git", "-C", workingDir, "status", "--porcelain").Output()
+	if err != nil {
+		return nil, fmt.Errorf("git status --porcelain: %w", err)
+	}
+	declared := make(map[string]bool, len(scopeFiles))
+	for _, f := range scopeFiles {
+		declared[f] = true
+	}
+	var toStage []string
+	for _, line := range strings.Split(string(statusOut), "\n") {
+		path := porcelainPath(line)
+		if path == "" {
+			continue
+		}
+		if declared[path] {
+			toStage = append(toStage, path)
+		} else {
+			drift = append(drift, path)
+		}
+	}
+	if len(toStage) > 0 {
+		addArgs := append([]string{"-C", workingDir, "add", "-A", "--"}, toStage...)
+		if out, addErr := autoGitCommand("git", addArgs...).CombinedOutput(); addErr != nil {
+			return nil, fmt.Errorf("git add scoped: %w\n%s", addErr, out)
+		}
+	}
+	return drift, nil
+}
+
+// porcelainPath extracts the repo-relative path from one `git status
+// --porcelain` line. Returns "" for blank/short lines. For a rename
+// ("R  old -> new") it returns the destination path, which is what a
+// plan declares for a rename. Surrounding quotes (core.quotePath, used
+// for paths with special characters) are stripped. Mirrors the runner's
+// gitops.porcelainPath.
+func porcelainPath(line string) string {
+	if len(line) < 4 {
+		return ""
+	}
+	rest := line[3:]
+	if idx := strings.Index(rest, " -> "); idx >= 0 {
+		rest = rest[idx+len(" -> "):]
+	}
+	return strings.Trim(rest, `"`)
 }

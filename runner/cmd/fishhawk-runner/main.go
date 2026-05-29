@@ -235,7 +235,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -252,7 +252,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		cfg.promptFile = path
 		cfg.decomposedFromRunID = decomposedFromRunID
+		cfg.scopeFiles = scopeFiles
 		stageType = sType
+		// Hand the resolved scope.files to the out-of-process CLI
+		// auto-PR path (#581) the same way the PR description is
+		// handed off via /tmp/fishhawk-pr.md. Only implement stages
+		// carry a scope; a write failure is non-fatal — the CLI falls
+		// back to `git add -A` when the file is missing.
+		if sType == "implement" && len(scopeFiles) > 0 {
+			writeScopeHandoff(scopeFiles, logSink)
+		}
 		// Server-resolved timeout wins when operator didn't pass --timeout explicitly.
 		if cfg.timeout == 0 && agentTimeoutSecs > 0 {
 			cfg.timeout = time.Duration(agentTimeoutSecs) * time.Second
@@ -387,8 +396,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		diff = nil
 		diffErr = nil
 		if cfg.checkBaseRef != "" {
-			d, ev, err := computeAndEmitDiff(cfg, logSink)
-			res.Events = append(res.Events, ev)
+			d, evs, err := computeAndEmitDiff(cfg, logSink)
+			res.Events = append(res.Events, evs...)
 			if err == nil {
 				diff = &d
 			} else {
@@ -806,13 +815,13 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, fetchErr
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -820,20 +829,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", false, 0, 0, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", false, 0, 0, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -895,50 +904,89 @@ func classifyErr(err error) string {
 // SPA's policy section needs the diff to render anything other
 // than "pending."
 //
-// Stages everything with `git add -A` before running the diff so
-// fresh files the agent created (test fixtures, new packages) show
-// up. The runner's later CommitAndPush calls `git add -A` again,
-// which is a no-op on an already-staged index. Pre-#296 the diff
-// ran against `<base>...HEAD` and saw nothing because the agent's
-// edits hadn't been committed yet; every PR silently failed
+// Staging before the diff makes fresh files the agent created (test
+// fixtures, new packages) show up under `git diff --cached`. Pre-#296
+// the diff ran against `<base>...HEAD` and saw nothing because the
+// agent's edits hadn't been committed yet; every PR silently failed
 // `tests_added_or_updated` and friends at the backend's policy
 // re-evaluation step.
 //
+// Staging is scope-bounded (#581) when the approved plan declared a
+// scope.files set: exactly those paths are staged and any
+// dirty-but-undeclared files are excluded and flagged as drift, so the
+// policy_evaluated diff sees the identical scoped index the eventual
+// commit will. When no scope is available (plan_missing_for_implement)
+// it falls back to `git add -A`.
+//
 // Returns the parsed Diff (consumed by enforceConstraints when
-// constraints-file is also set), a bundle event (always — either
-// the git_diff payload on success, or a policy_event marking the
-// failure on error), and the underlying error for the caller's
-// log line. The error is intentionally NOT load-bearing on the
-// run's res.OK; the in-band constraint enforcer below is the one
-// that demotes to category-B.
-func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, agent.Event, error) {
+// constraints-file is also set), one or more bundle events (the
+// git_diff payload on success plus an optional scope_drift
+// policy_event, or a policy_event marking the failure on error), and
+// the underlying error for the caller's log line. The error is
+// intentionally NOT load-bearing on the run's res.OK; the in-band
+// constraint enforcer below is the one that demotes to category-B.
+func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent.Event, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
 	}
-	// Stage everything the agent touched so `git diff --cached` can
-	// see it. add -A respects .gitignore, idempotent on a clean
-	// repo, and doesn't fail when there's nothing to stage. A
-	// failure here means we can't reliably compute the diff — surface
-	// as a diff_failed policy_event same as a git diff failure.
-	addCmd := exec.CommandContext(context.Background(), "git", "add", "-A")
-	addCmd.Dir = repoDir
-	if out, err := addCmd.CombinedOutput(); err != nil {
-		return constraint.Diff{}, agent.Event{
-			Kind: "policy_event",
-			Payload: agent.MakePayload(map[string]string{
-				"check": "diff", "outcome": "stage_failed",
-				"error": fmt.Sprintf("git add -A: %v: %s", err, strings.TrimSpace(string(out))),
-			}),
-		}, fmt.Errorf("computeAndEmitDiff: stage: %w", err)
+
+	var events []agent.Event
+
+	if paths := scopePaths(cfg.scopeFiles); len(paths) > 0 {
+		// Scope-bounded staging: same primitive CommitAndPush uses, so
+		// the diff and the commit agree on which paths are in scope.
+		drift, err := (&gitops.Pusher{}).StageScoped(context.Background(), repoDir, paths)
+		if err != nil {
+			return constraint.Diff{}, []agent.Event{{
+				Kind: "policy_event",
+				Payload: agent.MakePayload(map[string]string{
+					"check": "diff", "outcome": "stage_failed",
+					"error": err.Error(),
+				}),
+			}}, fmt.Errorf("computeAndEmitDiff: stage scoped: %w", err)
+		}
+		if len(drift) > 0 {
+			driftJSON, _ := json.Marshal(drift)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"scope_drift","stage_id":%q,"undeclared":%s}`+"\n",
+				cfg.stageID, driftJSON)
+			events = append(events, agent.Event{
+				Kind: "policy_event",
+				Payload: agent.MakePayload(map[string]any{
+					"check":      "scope_drift",
+					"outcome":    "excluded",
+					"undeclared": drift,
+				}),
+			})
+		}
+	} else {
+		// Fallback: stage everything the agent touched. add -A respects
+		// .gitignore, idempotent on a clean repo, and doesn't fail when
+		// there's nothing to stage. A failure here means we can't
+		// reliably compute the diff — surface as a stage_failed
+		// policy_event same as a git diff failure.
+		addCmd := exec.CommandContext(context.Background(), "git", "add", "-A")
+		addCmd.Dir = repoDir
+		if out, err := addCmd.CombinedOutput(); err != nil {
+			return constraint.Diff{}, []agent.Event{{
+				Kind: "policy_event",
+				Payload: agent.MakePayload(map[string]string{
+					"check": "diff", "outcome": "stage_failed",
+					"error": fmt.Sprintf("git add -A: %v: %s", err, strings.TrimSpace(string(out))),
+				}),
+			}}, fmt.Errorf("computeAndEmitDiff: stage: %w", err)
+		}
 	}
+
 	runner := &gitdiff.Runner{}
 	d, err := runner.Run(context.Background(), cfg.checkBaseRef, repoDir)
 	if err != nil {
-		return constraint.Diff{}, agent.Event{
+		events = append(events, agent.Event{
 			Kind:    "policy_event",
 			Payload: agent.MakePayload(map[string]string{"check": "diff", "outcome": "diff_failed", "error": err.Error()}),
-		}, fmt.Errorf("computeAndEmitDiff: %w", err)
+		})
+		return constraint.Diff{}, events, fmt.Errorf("computeAndEmitDiff: %w", err)
 	}
 
 	// Capture the full unified-diff hunk text for content-level
@@ -955,7 +1003,8 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, agent.E
 			cfg.checkBaseRef, perr.Error())
 		patch, truncated = "", false
 	}
-	return d, makeGitDiffEvent(cfg.checkBaseRef, d, patch, truncated), nil
+	events = append(events, makeGitDiffEvent(cfg.checkBaseRef, d, patch, truncated))
+	return d, events, nil
 }
 
 // enforceConstraints reads the constraints config and evaluates
@@ -1370,9 +1419,19 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		PushToken:        token,
 		ForceWithLease:   isDecomposed,
 		RebaseFromRemote: isSubsequent,
+		// Scope-bounded commit (#581): stage exactly the approved
+		// plan's declared paths, excluding stray dirty files. Empty
+		// (plan_missing_for_implement) falls back to `git add -A`.
+		ScopeFiles: scopePaths(cfg.scopeFiles),
 	})
 	if err != nil {
 		return fmt.Errorf("commit+push: %w", err)
+	}
+	if len(cap.ScopeDrift) > 0 {
+		driftJSON, _ := json.Marshal(cap.ScopeDrift)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_drift","run_id":%q,"stage_id":%q,"undeclared":%s}`+"\n",
+			cfg.runID, cfg.stageID, driftJSON)
 	}
 	if cap.NoChanges {
 		_, _ = fmt.Fprintf(logSink,
@@ -1455,6 +1514,60 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:8]
+}
+
+// scopeHandoffPath mirrors the /tmp/fishhawk-pr.md handoff: the runner
+// writes the implement stage's resolved scope.files here so the
+// out-of-process CLI auto-PR path (cli/cmd/fishhawk/autopr.go, a
+// separate Go module) can bound its staging to the same declared paths
+// (#581). var (not const) so tests can redirect it to a t.TempDir path
+// and avoid /tmp pollution / parallel-test races.
+var scopeHandoffPath = "/tmp/fishhawk-scope.json"
+
+// scopeHandoff is the JSON written to scopeHandoffPath. `files` mirrors
+// the standard_v1 plan scope.files shape (path + operation) so the CLI
+// and runner agree field-for-field — this is the runner↔CLI wire
+// contract for #581, not a JSON Schema.
+type scopeHandoff struct {
+	Files []upload.ScopeFile `json:"files"`
+}
+
+// writeScopeHandoff writes the resolved scope.files to scopeHandoffPath
+// for the CLI auto-PR path. Best-effort: a marshal or write failure is
+// logged but never fails the stage — the CLI falls back to `git add -A`
+// when the file is absent or empty.
+func writeScopeHandoff(files []upload.ScopeFile, logSink io.Writer) {
+	data, err := json.Marshal(scopeHandoff{Files: files})
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_handoff_failed","reason":"marshal","detail":%q}`+"\n", err.Error())
+		return
+	}
+	if err := os.WriteFile(scopeHandoffPath, data, 0o600); err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_handoff_failed","reason":"write","detail":%q}`+"\n", err.Error())
+		return
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"scope_handoff_written","path":%q,"file_count":%d}`+"\n",
+		scopeHandoffPath, len(files))
+}
+
+// scopePaths extracts the repo-relative path list from the resolved
+// scope.files, dropping entries with an empty path. Used to bound both
+// the policy diff staging and the implement commit.
+func scopePaths(files []upload.ScopeFile) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		if f.Path == "" {
+			continue
+		}
+		paths = append(paths, f.Path)
+	}
+	return paths
 }
 
 // pullRequestDescriptionPath mirrors prompt.PullRequestDescriptionPath

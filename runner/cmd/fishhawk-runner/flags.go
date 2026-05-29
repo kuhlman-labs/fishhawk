@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/version"
 )
 
@@ -62,6 +63,12 @@ type config struct {
 	// fetched prompt reveals that this run is a decomposed child.
 	// Drives shared-branch routing in openPRAndShipArtifact.
 	decomposedFromRunID string
+
+	// scopeFiles is set at runtime (not a flag) from the fetched
+	// prompt's scope_files on implement stages (#581). When non-empty
+	// it bounds the implement commit + policy diff to exactly these
+	// declared paths; empty falls back to `git add -A`.
+	scopeFiles []upload.ScopeFile
 
 	// agentSelfRetry, maxRetriesSnapshot, and retryAttempt are set at
 	// runtime from the fetched prompt response (ADR-023). Not CLI flags.

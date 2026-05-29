@@ -455,6 +455,62 @@ func TestFetchPrompt_HappyPath(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesScopeFiles confirms the client decodes the
+// backend's scope_files response field into FetchedPrompt.ScopeFiles
+// (#581), preserving path + operation order.
+func TestFetchPrompt_DecodesScopeFiles(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"scope_files": [
+			{"path": "backend/internal/server/prompt.go", "operation": "modify"},
+			{"path": "docs/api/v0.md", "operation": "modify"}
+		]
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if len(got.ScopeFiles) != 2 {
+		t.Fatalf("ScopeFiles len = %d, want 2: %+v", len(got.ScopeFiles), got.ScopeFiles)
+	}
+	if got.ScopeFiles[0].Path != "backend/internal/server/prompt.go" || got.ScopeFiles[0].Operation != "modify" {
+		t.Errorf("ScopeFiles[0] = %+v", got.ScopeFiles[0])
+	}
+	if got.ScopeFiles[1].Path != "docs/api/v0.md" {
+		t.Errorf("ScopeFiles[1] = %+v", got.ScopeFiles[1])
+	}
+}
+
+// TestFetchPrompt_ScopeFilesOmittedWhenAbsent confirms ScopeFiles
+// decodes to nil when the backend omits the field (plan_missing or a
+// non-implement stage), so the runner falls back to `git add -A`.
+func TestFetchPrompt_ScopeFilesOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.ScopeFiles != nil {
+		t.Errorf("ScopeFiles = %+v, want nil when absent", got.ScopeFiles)
+	}
+}
+
 func TestFetchPrompt_SignatureRejected(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	priv, _ := makeKey(t, fb)
