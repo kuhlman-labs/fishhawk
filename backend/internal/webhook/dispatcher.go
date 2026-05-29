@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -721,6 +722,20 @@ type Dispatcher struct {
 	// resolver / approval repo aren't wired yet.
 	ApprovalHandler ApprovalCommandHandler
 
+	// PlanReviewerConfigured reports whether fishhawkd has a plan-
+	// review agent wired (#577 / ADR-027). It mirrors the server's
+	// `cfg.PlanReviewer != nil` posture as a plain bool because the
+	// dispatcher cannot import the server's PlanReviewer interface
+	// without an import cycle (server already depends on webhook).
+	// When false and a plan stage resolves to AuthorityGating
+	// (reviewers.agent > 0, human == 0), the run is rejected at
+	// dispatch time rather than minting a run that can never satisfy
+	// a gate that does not exist — the symmetric counterpart to the
+	// run-create guard #574 added at handleCreateRun. The zero value
+	// (false) is the conservative default matching the production
+	// nil-by-default reviewer posture.
+	PlanReviewerConfigured bool
+
 	// DefaultRef is the git ref to dispatch against when the
 	// event doesn't carry one (e.g., issues events). Defaults to
 	// "main" when empty.
@@ -821,6 +836,36 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		d.writeSpecRejectionAudit(ctx, ev, m, specFile.SHA,
 			fmt.Errorf("workflow_id %q has no stages", m.WorkflowID), now)
 		return nil
+	}
+
+	// Step 3.4: plan-review wiring guard (#577 / ADR-027). The
+	// symmetric counterpart to the run-create guard #574 added at
+	// handleCreateRun. When the resolved spec declares an agent-gated
+	// plan review (reviewers.agent > 0, human == 0) but no
+	// PlanReviewer is wired, agent review would be silently skipped at
+	// plan-upload time — minting a GitHub-triggered run that can pass
+	// a gate that does not exist. Refuse before any run row is minted.
+	// Advisory mode (agent > 0, human > 0) is allowed through: the
+	// human gate remains authoritative. Because the dispatcher returns
+	// 202 to GitHub and can't surface a 400, the audit entry + WARN
+	// log are the rejection surface.
+	if !d.PlanReviewerConfigured {
+		for _, st := range workflow.Stages {
+			if st.Type != spec.StageTypePlan || st.Reviewers == nil {
+				continue
+			}
+			if planreview.ResolveAuthority(*st.Reviewers) != planreview.AuthorityGating {
+				continue
+			}
+			d.writeReviewerMisconfiguredAudit(ctx, ev, m, st, now)
+			d.logger().LogAttrs(ctx, slog.LevelWarn, "webhook dispatch rejected: plan reviewer unconfigured",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", ev.Repo),
+				slog.String("workflow_id", m.WorkflowID),
+				slog.String("stage", st.ID),
+			)
+			return nil
+		}
 	}
 
 	// Step 3.5: snapshot required-status-check contexts from
@@ -1681,6 +1726,48 @@ func (d *Dispatcher) writeSpecRejectionAudit(ctx context.Context, ev Event, m Ma
 		slog.String("workflow_sha", specSHA),
 		slog.String("error", validationErr.Error()),
 	)
+}
+
+// writeReviewerMisconfiguredAudit records the dispatcher's refusal to
+// dispatch a run whose plan stage declares an agent-gated review but
+// no PlanReviewer is wired (#577 / ADR-027). No run row exists yet at
+// the guard point — the guard runs before Step 4 (CreateRun) — so we
+// use AppendGlobalChained rather than AppendChained, which requires a
+// RunID. Payload mirrors #574's shape (reason, stage, workflow_id,
+// repo, configured_agents) plus the dispatcher-context fields
+// (delivery_id, event) so the GitHub-trigger path is correlatable.
+// Nil-guards d.Audit; an append error logs at WARN without unwinding —
+// the refusal already happened.
+func (d *Dispatcher) writeReviewerMisconfiguredAudit(ctx context.Context, ev Event, m Match,
+	st spec.Stage, now time.Time) {
+	if d.Audit == nil {
+		return
+	}
+	systemKind := audit.ActorKind("system")
+	payload, _ := json.Marshal(map[string]any{
+		"reason":            "plan_reviewer_unconfigured",
+		"stage":             st.ID,
+		"workflow_id":       m.WorkflowID,
+		"repo":              ev.Repo,
+		"configured_agents": st.Reviewers.Agent,
+		"delivery_id":       ev.DeliveryID,
+		"event":             ev.Type,
+	})
+	if _, err := d.Audit.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+		Timestamp:    now,
+		Category:     "run_rejected_misconfigured",
+		ActorKind:    &systemKind,
+		ActorSubject: stringPtr("github-webhook"),
+		Payload:      payload,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"append run_rejected_misconfigured audit entry failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+			slog.String("workflow_id", m.WorkflowID),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // writeDispatchAudit appends a chained audit entry tying the

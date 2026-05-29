@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -1010,9 +1011,10 @@ func (s *stubArtifacts) ListForStage(_ context.Context, stageID uuid.UUID) ([]*a
 // stubAudit captures every AppendChained call so tests can assert
 // audit-entry shape and category.
 type stubAudit struct {
-	mu        sync.Mutex
-	appended  []audit.ChainAppendParams
-	appendErr error
+	mu             sync.Mutex
+	appended       []audit.ChainAppendParams
+	globalAppended []audit.GlobalChainAppendParams
+	appendErr      error
 }
 
 func (s *stubAudit) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
@@ -1033,8 +1035,14 @@ func (s *stubAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
 }
 
-func (s *stubAudit) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
-	return nil, errors.New("not used")
+func (s *stubAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.appendErr != nil {
+		return nil, s.appendErr
+	}
+	s.globalAppended = append(s.globalAppended, p)
+	return &audit.Entry{ID: uuid.New()}, nil
 }
 func (s *stubAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
@@ -1155,6 +1163,128 @@ workflows:
               any_of: [tech_lead]
             sla: 4_business_hours
 `
+
+// specWithReviewers builds a feature_change spec whose plan stage
+// carries a reviewers block with the given agent/human counts. Used
+// by the plan-review wiring guard tests (#577 / ADR-027).
+func specWithReviewers(agent, human int) string {
+	return fmt.Sprintf(`version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: %d
+          human: %d
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+            sla: 4_business_hours
+`, agent, human)
+}
+
+// TestHandle_PlanReviewerGuard exercises the dispatch-time plan-review
+// wiring guard (#577 / ADR-027): the symmetric counterpart to the
+// run-create guard #574 added at handleCreateRun. When a plan stage
+// resolves to AuthorityGating (agent>0, human==0) and no PlanReviewer
+// is wired, the dispatcher must refuse before minting a run and write
+// a run_rejected_misconfigured global-chain entry. Advisory and
+// gateless modes — and a configured reviewer — dispatch normally.
+func TestHandle_PlanReviewerGuard(t *testing.T) {
+	tests := []struct {
+		name            string
+		agent           int
+		human           int
+		reviewerWired   bool
+		wantDispatched  bool
+		wantRejectAudit bool
+	}{
+		{name: "gating unconfigured rejects", agent: 1, human: 0, reviewerWired: false, wantDispatched: false, wantRejectAudit: true},
+		{name: "gating configured dispatches", agent: 1, human: 0, reviewerWired: true, wantDispatched: true, wantRejectAudit: false},
+		{name: "advisory unconfigured dispatches", agent: 1, human: 1, reviewerWired: false, wantDispatched: true, wantRejectAudit: false},
+		{name: "gateless unconfigured dispatches", agent: 0, human: 0, reviewerWired: false, wantDispatched: true, wantRejectAudit: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d, gh, runs, au := newDispatcherWithStubs(t)
+			gh.specContent = []byte(specWithReviewers(tc.agent, tc.human))
+			d.PlanReviewerConfigured = tc.reviewerWired
+
+			if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+				t.Fatalf("Handle returned non-nil (must return nil so GitHub doesn't retry): %v", err)
+			}
+
+			if tc.wantDispatched {
+				if len(runs.created) != 1 {
+					t.Fatalf("runs.created = %d, want 1 (run should dispatch)", len(runs.created))
+				}
+				if gh.dispatchCalls != 1 {
+					t.Errorf("dispatchCalls = %d, want 1", gh.dispatchCalls)
+				}
+			} else {
+				if len(runs.created) != 0 {
+					t.Errorf("runs.created = %d, want 0 (no run row may be minted on rejection)", len(runs.created))
+				}
+				if gh.dispatchCalls != 0 {
+					t.Errorf("dispatchCalls = %d, want 0", gh.dispatchCalls)
+				}
+			}
+
+			var rejects []audit.GlobalChainAppendParams
+			for _, p := range au.globalAppended {
+				if p.Category == "run_rejected_misconfigured" {
+					rejects = append(rejects, p)
+				}
+			}
+			if tc.wantRejectAudit {
+				if len(rejects) != 1 {
+					t.Fatalf("run_rejected_misconfigured global entries = %d, want exactly 1", len(rejects))
+				}
+				var payload map[string]any
+				if err := json.Unmarshal(rejects[0].Payload, &payload); err != nil {
+					t.Fatalf("unmarshal reject payload: %v", err)
+				}
+				if payload["reason"] != "plan_reviewer_unconfigured" {
+					t.Errorf("payload reason = %v, want plan_reviewer_unconfigured", payload["reason"])
+				}
+				if payload["stage"] != "plan" {
+					t.Errorf("payload stage = %v, want plan", payload["stage"])
+				}
+				if payload["workflow_id"] != "feature_change" {
+					t.Errorf("payload workflow_id = %v, want feature_change", payload["workflow_id"])
+				}
+				if payload["repo"] != "kuhlman-labs/fishhawk" {
+					t.Errorf("payload repo = %v, want kuhlman-labs/fishhawk", payload["repo"])
+				}
+				if payload["configured_agents"] != float64(tc.agent) {
+					t.Errorf("payload configured_agents = %v, want %d", payload["configured_agents"], tc.agent)
+				}
+				if payload["delivery_id"] != "deliv-1" {
+					t.Errorf("payload delivery_id = %v, want deliv-1", payload["delivery_id"])
+				}
+				if payload["event"] != "issues" {
+					t.Errorf("payload event = %v, want issues", payload["event"])
+				}
+			} else if len(rejects) != 0 {
+				t.Errorf("run_rejected_misconfigured entries = %d, want 0", len(rejects))
+			}
+		})
+	}
+}
 
 func TestHandle_RunCreate_SnapshotsMaxRetriesFromSpec(t *testing.T) {
 	t.Run("default when on_ci_failure is absent", func(t *testing.T) {
