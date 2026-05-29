@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,30 @@ func TestHelperProcess(t *testing.T) {
 	case "timeout":
 		// Sleep longer than the test's configured timeout.
 		time.Sleep(2 * time.Second)
+	case "thinking_block":
+		// Emit a terminal result event carrying the durable
+		// interleaved-thinking 400 marker, then exit non-zero. This is
+		// the fault Invoke retries.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"result","subtype":"error","is_error":true,"api_error_status":400,"result":"messages.1.content.0.thinking: thinking or redacted_thinking blocks in the latest assistant message cannot be modified"}`)
+		fmt.Fprintln(os.Stderr, "API Error: 400 thinking blocks cannot be modified")
+		os.Exit(1)
+	case "thinking_block_then_ok":
+		// Stateful across re-execs via a marker file: the first run
+		// fails with the thinking-block 400, the second succeeds. Lets
+		// the retry-then-success path run end to end.
+		marker := os.Getenv("MARKER_FILE")
+		if _, err := os.Stat(marker); err != nil {
+			// First attempt: record that we ran, then fail.
+			_ = os.WriteFile(marker, []byte("1"), 0o600)
+			fmt.Println(`{"type":"system","subtype":"init"}`)
+			fmt.Println(`{"type":"result","subtype":"error","is_error":true,"api_error_status":400,"result":"thinking blocks in the latest assistant message cannot be modified"}`)
+			os.Exit(1)
+		}
+		// Second attempt: clean run with usage.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"assistant","content":"recovered"}`)
+		fmt.Println(`{"type":"result","usage":{"input_tokens":10,"output_tokens":20}}`)
 	case "echo_env":
 		// Echo a single env var so we can assert the harness
 		// wired API key forwarding correctly.
@@ -74,6 +99,21 @@ func helperCommand(mode string) func(ctx context.Context, name string, args ...s
 			"GO_HELPER_PROCESS=1",
 			"HELPER_MODE="+mode,
 		)
+		return c
+	}
+}
+
+// helperCommandWithEnv is like helperCommand but layers extra env
+// vars (e.g. MARKER_FILE) onto every re-exec so stateful modes can
+// coordinate across attempts.
+func helperCommandWithEnv(mode string, extra ...string) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+		c.Env = append(os.Environ(),
+			"GO_HELPER_PROCESS=1",
+			"HELPER_MODE="+mode,
+		)
+		c.Env = append(c.Env, extra...)
 		return c
 	}
 }
@@ -292,5 +332,204 @@ func TestNew_DefaultsBinary(t *testing.T) {
 	}
 	if inv.APIKey != "k" {
 		t.Errorf("APIKey = %q, want k", inv.APIKey)
+	}
+	// New defaults the thinking-block retry budget at construction so a
+	// zero value on a struct literal unambiguously disables retry.
+	if inv.MaxThinkingBlockRetries != 1 {
+		t.Errorf("MaxThinkingBlockRetries = %d, want 1", inv.MaxThinkingBlockRetries)
+	}
+}
+
+func TestIsThinkingBlock400_TruthTable(t *testing.T) {
+	// The exact result string observed in run 657ade99 (issue #574
+	// impl) — pins the detection so wording drift fails loudly.
+	const realResult = `{"type":"result","subtype":"error","is_error":true,"api_error_status":400,"result":"messages.1.content.0.thinking: thinking or redacted_thinking blocks in the latest assistant message cannot be modified"}`
+	cases := []struct {
+		name    string
+		payload string
+		stderr  string
+		want    bool
+	}{
+		{"real_trace_string", realResult, "", true},
+		{"marker_in_stderr_only", "", "API Error 400: thinking blocks cannot be modified", true},
+		{"generic_400_not_thinking", `{"type":"result","is_error":true,"api_error_status":400,"result":"context length exceeded"}`, "", false},
+		{"status_400_but_no_modify_phrase", `{"type":"result","api_error_status":400,"result":"thinking budget exhausted"}`, "", false},
+		{"marker_phrases_but_status_not_400", `{"type":"result","api_error_status":429,"result":"thinking blocks cannot be modified"}`, "", false},
+		{"unrelated_error", `{"type":"result","is_error":true,"result":"file not found"}`, "boom", false},
+		{"empty", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isThinkingBlock400([]byte(tc.payload), tc.stderr)
+			if got != tc.want {
+				t.Errorf("isThinkingBlock400(%q, %q) = %v, want %v", tc.payload, tc.stderr, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInvoke_ThinkingBlockRetrySucceeds(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "attempt.marker")
+	inv := &Invoker{
+		Cmd:                     helperCommandWithEnv("thinking_block_then_ok", "MARKER_FILE="+marker),
+		Now:                     frozenNow(),
+		MaxThinkingBlockRetries: 1,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Stage: "implement"})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; FailureReason = %q", res.FailureReason)
+	}
+	// Two attempts ran: two invocation_start events with an agent_retry
+	// marker between them.
+	var starts, retries int
+	for _, ev := range res.Events {
+		switch ev.Kind {
+		case "invocation_start":
+			starts++
+		case "agent_retry":
+			retries++
+			if !strings.Contains(string(ev.Payload), `"reason":"agent_api_thinking_block"`) {
+				t.Errorf("agent_retry payload missing reason: %s", ev.Payload)
+			}
+		}
+	}
+	if starts != 2 {
+		t.Errorf("invocation_start count = %d, want 2", starts)
+	}
+	if retries != 1 {
+		t.Errorf("agent_retry count = %d, want 1", retries)
+	}
+	// Tokens are cumulative; only the successful attempt reports usage.
+	if res.TokensUsed != 30 {
+		t.Errorf("TokensUsed = %d, want 30 (cumulative)", res.TokensUsed)
+	}
+}
+
+func TestInvoke_ThinkingBlockRetryExhausted(t *testing.T) {
+	inv := &Invoker{
+		Cmd:                     helperCommand("thinking_block"),
+		Now:                     frozenNow(),
+		MaxThinkingBlockRetries: 1,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Stage: "implement"})
+	if !errors.Is(err, agent.ErrAgentThinkingBlock) {
+		t.Fatalf("err = %v, want wrapping ErrAgentThinkingBlock", err)
+	}
+	if errors.Is(err, agent.ErrAgentFailed) {
+		t.Error("ErrAgentThinkingBlock must not wrap ErrAgentFailed")
+	}
+	if res.OK {
+		t.Error("OK = true on exhausted retry")
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A (so stage-level retry still sees category A)", res.FailureCategory)
+	}
+	// Exactly maxAttempts = MaxThinkingBlockRetries+1 = 2 attempts.
+	var starts, retries int
+	var lastEnd string
+	for _, ev := range res.Events {
+		switch ev.Kind {
+		case "invocation_start":
+			starts++
+		case "agent_retry":
+			retries++
+		case "invocation_end":
+			lastEnd = string(ev.Payload)
+		}
+	}
+	if starts != 2 {
+		t.Errorf("invocation_start count = %d, want 2", starts)
+	}
+	if retries != 1 {
+		t.Errorf("agent_retry count = %d, want 1", retries)
+	}
+	if !strings.Contains(lastEnd, `"outcome":"agent_api_thinking_block"`) {
+		t.Errorf("final invocation_end outcome not agent_api_thinking_block: %s", lastEnd)
+	}
+}
+
+func TestInvoke_ThinkingBlockNoRetryWhenDisabled(t *testing.T) {
+	// MaxThinkingBlockRetries == 0 (struct literal default) means a
+	// single attempt, no retry, even for a thinking-block fault.
+	inv := &Invoker{
+		Cmd: helperCommand("thinking_block"),
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{})
+	if !errors.Is(err, agent.ErrAgentThinkingBlock) {
+		t.Fatalf("err = %v, want ErrAgentThinkingBlock", err)
+	}
+	var starts int
+	for _, ev := range res.Events {
+		if ev.Kind == "invocation_start" {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Errorf("invocation_start count = %d, want 1 (retry disabled)", starts)
+	}
+}
+
+func TestInvoke_RespawnIsStateless(t *testing.T) {
+	// Each attempt must be a fresh, stateless exec: no --continue or
+	// --resume can leak the corrupted thinking-block history into the
+	// retry. Capture every attempt's argv and assert.
+	marker := filepath.Join(t.TempDir(), "attempt.marker")
+	var argvs [][]string
+	inv := &Invoker{
+		Now:                     frozenNow(),
+		MaxThinkingBlockRetries: 1,
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			argvs = append(argvs, append([]string(nil), args...))
+			c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+			c.Env = append(os.Environ(),
+				"GO_HELPER_PROCESS=1",
+				"HELPER_MODE=thinking_block_then_ok",
+				"MARKER_FILE="+marker,
+			)
+			return c
+		},
+	}
+	if _, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p"}); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if len(argvs) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(argvs))
+	}
+	for i, argv := range argvs {
+		for _, a := range argv {
+			if a == "--continue" || a == "--resume" {
+				t.Errorf("attempt %d argv carries stateful flag %q: %v", i, a, argv)
+			}
+		}
+	}
+}
+
+func TestInvoke_GenericExitNoRetry(t *testing.T) {
+	// A plain non-zero exit with no thinking-block marker must map to
+	// ErrAgentFailed with a single attempt — no false-positive retry.
+	inv := &Invoker{
+		Cmd:                     helperCommand("error"),
+		Now:                     frozenNow(),
+		MaxThinkingBlockRetries: 1,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{})
+	if !errors.Is(err, agent.ErrAgentFailed) {
+		t.Fatalf("err = %v, want ErrAgentFailed", err)
+	}
+	if errors.Is(err, agent.ErrAgentThinkingBlock) {
+		t.Error("generic exit must not be classified as thinking-block")
+	}
+	var starts int
+	for _, ev := range res.Events {
+		if ev.Kind == "invocation_start" {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Errorf("invocation_start count = %d, want 1 (no retry on generic failure)", starts)
 	}
 }

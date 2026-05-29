@@ -364,6 +364,8 @@ func TestClassifyErr(t *testing.T) {
 		{fmt.Errorf("wrapped: %w", agent.ErrTimeout), "timeout"},
 		{agent.ErrBudgetExceeded, "budget_exceeded"},
 		{agent.ErrBinaryNotFound, "binary_not_found"},
+		{agent.ErrAgentThinkingBlock, "agent_api_thinking_block"},
+		{fmt.Errorf("wrapped: %w", agent.ErrAgentThinkingBlock), "agent_api_thinking_block"},
 		{agent.ErrAgentFailed, "agent_failed"},
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentFailed), "agent_failed"},
 		{errors.New("anything else"), "other"},

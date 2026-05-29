@@ -41,6 +41,10 @@ func TestErrors_AreDistinct(t *testing.T) {
 		{ErrBudgetExceeded, ErrTimeout},
 		{ErrBudgetExceeded, ErrBinaryNotFound},
 		{ErrTimeout, ErrBinaryNotFound},
+		{ErrAgentThinkingBlock, ErrAgentFailed},
+		{ErrAgentThinkingBlock, ErrBudgetExceeded},
+		{ErrAgentThinkingBlock, ErrTimeout},
+		{ErrAgentThinkingBlock, ErrBinaryNotFound},
 	}
 	for _, p := range pairs {
 		if errors.Is(p.a, p.b) {

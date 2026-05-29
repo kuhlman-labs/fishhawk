@@ -113,6 +113,16 @@ var (
 	ErrBudgetExceeded = errors.New("agent: budget exceeded")
 	ErrTimeout        = errors.New("agent: timeout")
 	ErrBinaryNotFound = errors.New("agent: binary not found")
+
+	// ErrAgentThinkingBlock marks the transient interleaved-thinking
+	// API 400 ("thinking/redacted_thinking blocks in the latest
+	// assistant message cannot be modified") that kills long agent
+	// runs at high turn counts. It is a peer sentinel — it does NOT
+	// wrap ErrAgentFailed — so err_class classification stays
+	// unambiguous. Downstream category-A handling keys off
+	// Result.FailureCategory=="A" (still set on this path), not
+	// errors.Is(ErrAgentFailed).
+	ErrAgentThinkingBlock = errors.New("agent: api thinking-block 400")
 )
 
 // MakePayload marshals v to a json.RawMessage or panics. Helper for
