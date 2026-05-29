@@ -54,19 +54,92 @@ type Invoker struct {
 	// Now returns the current time. Defaults to time.Now;
 	// overridable for deterministic event timestamps in tests.
 	Now func() time.Time
+
+	// MaxThinkingBlockRetries bounds the in-driver retry for the
+	// transient interleaved-thinking API 400 (see
+	// agent.ErrAgentThinkingBlock). It counts RETRIES, not attempts:
+	// the loop runs MaxThinkingBlockRetries+1 attempts total. The
+	// default (1) is set at construction in New(); a zero value means
+	// "no retry" so tests and operators can disable it deterministically.
+	MaxThinkingBlockRetries int
 }
 
 // New returns an Invoker configured to use the system `claude`
-// binary with the given API key.
+// binary with the given API key. The thinking-block retry budget
+// defaults to 1 retry here (rather than via a zero-value sentinel) so
+// that an explicit MaxThinkingBlockRetries=0 on a struct literal
+// unambiguously disables retry.
 func New(apiKey string) *Invoker {
-	return &Invoker{APIKey: apiKey}
+	return &Invoker{APIKey: apiKey, MaxThinkingBlockRetries: 1}
 }
 
-// Invoke runs Claude Code under the given Invocation and returns
-// the captured trace. The returned error is non-nil only on agent
-// failure — Result.OK is the canonical success signal so callers
-// can treat the Result as the source of truth even on error.
+// Invoke runs Claude Code under the given Invocation and returns the
+// captured trace. The returned error is non-nil only on agent
+// failure — Result.OK is the canonical success signal so callers can
+// treat the Result as the source of truth even on error.
+//
+// Invoke wraps a bounded in-driver retry around invokeOnce for the
+// transient interleaved-thinking API 400 (agent.ErrAgentThinkingBlock):
+// a single transient harness fault re-spawns the agent fresh from the
+// same prompt rather than wasting the whole stage attempt. Every other
+// failure (timeout, budget, generic non-zero exit) is returned on the
+// first attempt with no retry. The aggregate Result carries every
+// attempt's events in order — with an agent_retry marker between them —
+// and the cumulative token total across all attempts, so cost stays
+// honest even when a retry doubles spend.
 func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Result, error) {
+	maxAttempts := i.MaxThinkingBlockRetries + 1
+
+	var agg agent.Result
+	for attempt := 1; ; attempt++ {
+		res, thinkingBlock, err := i.invokeOnce(ctx, inv)
+
+		// Aggregate this attempt's events and tokens. TokensUsed is
+		// cumulative across attempts on purpose: a retry really does
+		// spend the tokens twice and the trace must say so.
+		agg.Events = append(agg.Events, res.Events...)
+		agg.TokensUsed += res.TokensUsed
+
+		retriesLeft := attempt < maxAttempts
+		overBudget := inv.Budget.MaxTokens > 0 && agg.TokensUsed >= inv.Budget.MaxTokens
+		if !thinkingBlock || !retriesLeft || overBudget {
+			// Adopt this attempt's outcome verbatim — on the
+			// retry-exhausted thinking-block path res is already a
+			// failureResult carrying outcome=agent_api_thinking_block,
+			// FailureCategory=="A", and a wrapped ErrAgentThinkingBlock.
+			agg.OK = res.OK
+			agg.FailureCategory = res.FailureCategory
+			agg.FailureReason = res.FailureReason
+			return agg, err
+		}
+
+		// Transient thinking-block fault with retries remaining: mark
+		// the boundary and re-spawn a fresh `claude` process from the
+		// same prompt. We deliberately do NOT git-reset/clean the
+		// working tree between attempts: in local --no-pr mode the tree
+		// is the operator's own repo, so a reset would be destructive,
+		// and a fresh `claude --print` exec carries no conversation
+		// state anyway (no --continue/--resume), so the partial edits
+		// the killed attempt left are a safe, intended starting point.
+		// This mirrors fishhawk_retry_stage semantics. Do not "fix"
+		// this into a reset.
+		agg.Events = append(agg.Events, agent.Event{
+			Kind:      "agent_retry",
+			Timestamp: i.now(),
+			Payload: agent.MakePayload(map[string]any{
+				"attempt":       attempt,
+				"reason":        "agent_api_thinking_block",
+				"tokens_so_far": agg.TokensUsed,
+			}),
+		})
+	}
+}
+
+// invokeOnce runs a single `claude` invocation and returns its
+// per-attempt Result, whether the failure was a transient
+// thinking-block 400 (the retry signal), and the wrapped error. Each
+// attempt gets its own wall-clock budget derived from the parent ctx.
+func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.Result, bool, error) {
 	binary := i.Binary
 	if binary == "" {
 		binary = DefaultBinary
@@ -151,11 +224,11 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return res, fmt.Errorf("claudecode: stdout pipe: %w", err)
+		return res, false, fmt.Errorf("claudecode: stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return res, fmt.Errorf("claudecode: stderr pipe: %w", err)
+		return res, false, fmt.Errorf("claudecode: stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -165,9 +238,9 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 			return failureResult(res, now(), "A",
 				fmt.Sprintf("agent binary not found: %s", binary),
 				"binary_not_found",
-			), agent.ErrBinaryNotFound
+			), false, agent.ErrBinaryNotFound
 		}
-		return res, fmt.Errorf("claudecode: start: %w", err)
+		return res, false, fmt.Errorf("claudecode: start: %w", err)
 	}
 
 	// Drain stderr concurrently to avoid deadlock if the child
@@ -181,6 +254,10 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 
 	tokensUsed := 0
 	budgetHit := false
+	// resultPayload retains the terminal type=="result" event so a
+	// post-mortem can inspect is_error / api_error_status for
+	// thinking-block detection (see isThinkingBlock400).
+	var resultPayload []byte
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -188,6 +265,9 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		line := append([]byte(nil), scanner.Bytes()...)
 		ev, used, ok := parseLine(line, now())
 		res.Events = append(res.Events, ev)
+		if ev.Kind == "result" || strings.HasPrefix(ev.Kind, "result.") {
+			resultPayload = append([]byte(nil), ev.Payload...)
+		}
 		if ok && used > 0 {
 			tokensUsed = used
 			if inv.Budget.MaxTokens > 0 && tokensUsed > inv.Budget.MaxTokens {
@@ -216,30 +296,40 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 	waitErr := cmd.Wait()
 	res.TokensUsed = tokensUsed
 
+	// A non-zero exit whose result payload or stderr carries the
+	// durable thinking-block marker is the one fault Invoke retries.
+	thinkingBlock := waitErr != nil && isThinkingBlock400(resultPayload, stderrBuf.String())
+
 	switch {
 	case budgetHit:
 		return failureResult(res, now(), "A",
 			fmt.Sprintf("token budget exceeded: used %d, max %d", tokensUsed, inv.Budget.MaxTokens),
 			"budget_exceeded",
-		), agent.ErrBudgetExceeded
+		), false, agent.ErrBudgetExceeded
 
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return failureResult(res, now(), "A",
 			fmt.Sprintf("agent timeout after %s", inv.Budget.Timeout),
 			"timeout",
-		), agent.ErrTimeout
+		), false, agent.ErrTimeout
+
+	case thinkingBlock:
+		return failureResult(res, now(), "A",
+			fmt.Sprintf("transient thinking-block API 400: %v", waitErr),
+			"agent_api_thinking_block",
+		), true, fmt.Errorf("%w: %v", agent.ErrAgentThinkingBlock, waitErr)
 
 	case waitErr != nil:
 		return failureResult(res, now(), "A",
 			fmt.Sprintf("agent exited with error: %v", waitErr),
 			"agent_error",
-		), fmt.Errorf("%w: %v", agent.ErrAgentFailed, waitErr)
+		), false, fmt.Errorf("%w: %v", agent.ErrAgentFailed, waitErr)
 
 	case scanErr != nil:
 		return failureResult(res, now(), "A",
 			fmt.Sprintf("trace stream read error: %v", scanErr),
 			"stream_error",
-		), fmt.Errorf("%w: %v", agent.ErrAgentFailed, scanErr)
+		), false, fmt.Errorf("%w: %v", agent.ErrAgentFailed, scanErr)
 	}
 
 	res.OK = true
@@ -248,7 +338,36 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		Timestamp: now(),
 		Payload:   agent.MakePayload(map[string]any{"outcome": "ok", "tokens_used": tokensUsed}),
 	})
-	return res, nil
+	return res, false, nil
+}
+
+// isThinkingBlock400 reports whether a failed attempt was the
+// transient interleaved-thinking API 400 — the one fault Invoke
+// retries. Anthropic returns this when a prior assistant message's
+// thinking/redacted_thinking blocks were modified before being passed
+// back (extended-thinking guide: blocks must be preserved verbatim).
+// On a long agent run the Claude Code harness can trip this at high
+// turn counts; a fresh re-spawn clears the corrupted history.
+//
+// Detection matches the DURABLE fragments "thinking" + "cannot be
+// modified" (case-insensitive) in the result payload or stderr, rather
+// than the full sentence, so minor wording drift doesn't silently
+// regress to no-retry. When the result payload carries an explicit
+// api_error_status it must corroborate (== 400): a 400 whose message
+// is unrelated is NOT a thinking-block fault, and a payload without the
+// marker is never one regardless of status.
+func isThinkingBlock400(resultPayload []byte, stderr string) bool {
+	hay := strings.ToLower(string(resultPayload) + "\n" + stderr)
+	if !strings.Contains(hay, "thinking") || !strings.Contains(hay, "cannot be modified") {
+		return false
+	}
+	var meta struct {
+		APIErrorStatus *int `json:"api_error_status"`
+	}
+	if err := json.Unmarshal(resultPayload, &meta); err == nil && meta.APIErrorStatus != nil {
+		return *meta.APIErrorStatus == 400
+	}
+	return true
 }
 
 func (i *Invoker) now() time.Time {

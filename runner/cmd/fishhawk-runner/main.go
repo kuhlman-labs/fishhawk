@@ -878,6 +878,8 @@ func classifyErr(err error) string {
 		return "budget_exceeded"
 	case errors.Is(err, agent.ErrBinaryNotFound):
 		return "binary_not_found"
+	case errors.Is(err, agent.ErrAgentThinkingBlock):
+		return "agent_api_thinking_block"
 	case errors.Is(err, agent.ErrAgentFailed):
 		return "agent_failed"
 	default:
