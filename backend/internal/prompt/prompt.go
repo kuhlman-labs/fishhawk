@@ -192,6 +192,15 @@ type Trigger struct {
 	// bundle.ExtractDiff (path + git status per file). Empty for any
 	// non-implement-review build.
 	Diff string
+	// DiffPatch is the full unified-diff hunk text for the implement-review
+	// prompt (#585). Populated by the trace handler from the bundle's
+	// git_diff event patch field. When non-empty, buildImplementReview
+	// renders the real hunks under the "### Diff under review" section so
+	// the reviewer can inspect added/removed lines directly; when empty
+	// (older bundles, patch-compute failure, or size-cap) it falls back to
+	// the Diff file-list rendering with the original #561 read-the-files
+	// caveat. Empty for any non-implement-review build.
+	DiffPatch string
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -593,13 +602,39 @@ func buildImplementReview(t Trigger) string {
 	// section so caching adapters can split the stable preamble from the
 	// variable diff/plan/issue content.
 	b.WriteString("### Diff under review\n\n")
-	if t.Diff != "" {
+	switch {
+	case t.DiffPatch != "":
+		// Patch-present path (#585): the full unified-diff hunks are
+		// available, so the reviewer CAN inspect added and removed lines
+		// directly. Keep the compact changed-files list as an index, then
+		// render the real hunks. The honesty caveat is revised for this
+		// path — added/removed lines ARE visible, so the reviewer should
+		// assess them rather than deferring to a file read.
+		if t.Diff != "" {
+			b.WriteString("Files changed by the implement stage (path + git status — index for the hunks below):\n\n")
+			b.WriteString(t.Diff)
+			b.WriteString("\n")
+		}
+		b.WriteString("Unified diff (the actual hunks the implement stage produced — added lines prefixed `+`, removed lines prefixed `-`):\n\n")
+		b.WriteString("```diff\n")
+		b.WriteString(t.DiffPatch)
+		if !strings.HasSuffix(t.DiffPatch, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("```\n\n")
+		b.WriteString("Assess plan adherence, verification, and regressions against these hunks directly: both added and removed lines are visible above. " +
+			"READ the surrounding repository files when you need more context than a hunk shows.\n\n")
+	case t.Diff != "":
+		// Fallback path (older bundles, patch-compute failure, or a
+		// size-capped patch the runner dropped): only the changed-files
+		// list is available. Keep the original #561 caveat verbatim — the
+		// reviewer cannot see line-level content and must read the files.
 		b.WriteString("Files changed by the implement stage (path + git status — this is a changed-files list, NOT a line-level diff):\n\n")
 		b.WriteString(t.Diff)
 		b.WriteString("\nTo assess content (plan adherence, verification, regressions below), READ each listed file from the repository to see its current state. " +
 			"Pre-change content and deleted lines are NOT visible from this list, so base any regression concern only on what you can confirm by reading the current files — " +
 			"do not assert the absence of regressions you could not actually inspect.\n\n")
-	} else {
+	default:
 		b.WriteString("(no diff present in the trace bundle — emit verdict: approve with a concern noting the empty diff)\n\n")
 	}
 

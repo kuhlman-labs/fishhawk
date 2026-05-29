@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
@@ -970,6 +972,128 @@ func TestRun_UploadTrace_HappyPath(t *testing.T) {
 	}
 	if len(fu.gotShipCalls[1].Bundle) == 0 {
 		t.Error("redacted bundle empty")
+	}
+}
+
+func TestMakeGitDiffEvent_CarriesPatch(t *testing.T) {
+	// The git_diff payload must carry the patch + patch_truncated
+	// fields so the backend bundle reader (lockstep json tags) can
+	// surface them to the implement-review prompt (#585).
+	d := constraint.Diff{ChangedFiles: []constraint.ChangedFile{
+		{Path: "a.go", Status: constraint.StatusModified},
+	}}
+	ev := makeGitDiffEvent("main", d, "diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-x\n+y\n", true)
+
+	var payload gitDiffPayload
+	if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if !strings.Contains(payload.Patch, "@@ -1 +1 @@") {
+		t.Errorf("payload.Patch missing hunk; got %q", payload.Patch)
+	}
+	if !payload.PatchTruncated {
+		t.Error("payload.PatchTruncated = false, want true")
+	}
+	// Absent patch round-trips to the empty/false zero values.
+	ev2 := makeGitDiffEvent("main", d, "", false)
+	var payload2 gitDiffPayload
+	if err := json.Unmarshal(ev2.Payload, &payload2); err != nil {
+		t.Fatalf("unmarshal payload2: %v", err)
+	}
+	if payload2.Patch != "" || payload2.PatchTruncated {
+		t.Errorf("absent patch should be empty/false; got %+v", payload2)
+	}
+}
+
+// TestRun_GitDiffPatch_RedactedInBundle drives the full runner with a
+// real git repo whose staged change adds a line containing a secret.
+// The patch lands inside the git_diff event payload, so it must be
+// redacted in the redacted bundle variant while staying verbatim in the
+// raw variant (#585 binding condition 2).
+func TestRun_GitDiffPatch_RedactedInBundle(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	runGit("config", "tag.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "config.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "initial")
+	runGit("branch", "base")
+
+	// Agent-style edit adding a credential line. The runner stages it
+	// via `git add -A` inside computeAndEmitDiff before computing the
+	// patch, so the secret appears as an added (`+`) hunk line.
+	secret := "ghp_" + strings.Repeat("a", 36)
+	if err := os.WriteFile(filepath.Join(repo, "config.go"),
+		[]byte("package x\nconst token = \""+secret+"\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Prompt file lives outside the repo so it doesn't pollute the diff.
+	promptPath := filepath.Join(t.TempDir(), "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	withFakeUploader(t, fu)
+
+	stageID := "22222222-3333-4444-5555-666666666666"
+	runID := "11111111-2222-3333-4444-555555555555"
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID, "--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--prompt-file", promptPath,
+		"--working-dir", repo,
+		"--check-base-ref", "base",
+		"--upload-trace",
+		"--stage-id", stageID,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d:\n%s", got, stderr.String())
+	}
+	if len(fu.gotShipCalls) != 2 {
+		t.Fatalf("ShipTrace calls = %d, want 2 (raw, redacted)", len(fu.gotShipCalls))
+	}
+
+	raw, err := gunzip(fu.gotShipCalls[0].Bundle)
+	if err != nil {
+		t.Fatalf("gunzip raw: %v", err)
+	}
+	redacted, err := gunzip(fu.gotShipCalls[1].Bundle)
+	if err != nil {
+		t.Fatalf("gunzip redacted: %v", err)
+	}
+	// Raw bundle must carry the patch verbatim — proving the patch was
+	// captured into the git_diff event and the secret reached the wire.
+	if !bytes.Contains(raw, []byte(secret)) {
+		t.Fatalf("secret not in raw bundle; patch not captured? raw:\n%s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`"patch"`)) {
+		t.Errorf("raw bundle git_diff event missing patch field")
+	}
+	// Redacted bundle must NOT carry the secret.
+	if bytes.Contains(redacted, []byte(secret)) {
+		t.Errorf("secret survived redaction in redacted bundle")
+	}
+	if !bytes.Contains(redacted, []byte("[REDACTED:github-pat-classic]")) {
+		t.Errorf("redaction marker missing from redacted bundle")
 	}
 }
 

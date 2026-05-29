@@ -13,6 +13,36 @@ func diff(files ...string) Diff {
 	return d
 }
 
+// TestEvaluate_IgnoresPatch asserts the Patch field (additive content
+// for the implement-review prompt, #585) does not influence constraint
+// evaluation: the violations are byte-for-byte identical whether or not
+// Patch is set. Patch is for downstream consumers ONLY; ChangedFiles is
+// the sole constraint input.
+func TestEvaluate_IgnoresPatch(t *testing.T) {
+	c := Constraints{
+		ForbiddenPaths:   []string{"secrets/**"},
+		MaxFilesChanged:  2,
+		RequiredOutcomes: []string{"tests_added_or_updated"},
+	}
+	base := diff("a.go", "b.go", "secrets/key.pem")
+
+	withoutPatch := Evaluate(base, c)
+
+	withPatch := base
+	withPatch.Patch = "diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-x\n+y\n"
+	withPatchViolations := Evaluate(withPatch, c)
+
+	if len(withoutPatch) != len(withPatchViolations) {
+		t.Fatalf("violation count differs: without=%d with=%d", len(withoutPatch), len(withPatchViolations))
+	}
+	for i := range withoutPatch {
+		if withoutPatch[i].String() != withPatchViolations[i].String() {
+			t.Errorf("violation %d differs:\n without: %s\n with:    %s",
+				i, withoutPatch[i].String(), withPatchViolations[i].String())
+		}
+	}
+}
+
 func TestEvaluate_Empty_NoConstraintsConfigured(t *testing.T) {
 	v := Evaluate(diff("a.go"), Constraints{})
 	if len(v) != 0 {

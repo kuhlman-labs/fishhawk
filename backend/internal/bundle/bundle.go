@@ -87,12 +87,19 @@ type Line struct {
 }
 
 // gitDiffPayload mirrors the runner's payload struct exactly.
-// Adding fields requires both sides to agree.
+// Adding fields requires both sides to agree. The `patch` /
+// `patch_truncated` json tags MUST stay identical to the runner's
+// gitDiffPayload (runner/cmd/fishhawk-runner/main.go) — this is the
+// runner↔backend wire contract, not a JSON Schema, so the two sides
+// move in lockstep. Patch is additive: older bundles omit it and
+// decode to an empty string (#585).
 type gitDiffPayload struct {
-	Kind     string         `json:"kind"`
-	BaseRef  string         `json:"base_ref"`
-	Files    []gitDiffEntry `json:"files"`
-	NumFiles int            `json:"num_files"`
+	Kind           string         `json:"kind"`
+	BaseRef        string         `json:"base_ref"`
+	Files          []gitDiffEntry `json:"files"`
+	NumFiles       int            `json:"num_files"`
+	Patch          string         `json:"patch,omitempty"`
+	PatchTruncated bool           `json:"patch_truncated,omitempty"`
 }
 
 type gitDiffEntry struct {
@@ -198,6 +205,11 @@ func ExtractDiff(bundleBytes []byte) (policy.Diff, error) {
 		}
 		out := policy.Diff{
 			ChangedFiles: make([]policy.ChangedFile, 0, len(payload.Files)),
+			// Additive content for the implement-review prompt only;
+			// the policy engine never reads Patch. Empty when the
+			// bundle predates the field or the runner couldn't compute
+			// the patch (#585).
+			Patch: payload.Patch,
 		}
 		for _, f := range payload.Files {
 			out.ChangedFiles = append(out.ChangedFiles, policy.ChangedFile{

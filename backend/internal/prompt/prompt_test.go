@@ -1204,6 +1204,68 @@ func TestBuild_ImplementReview_FullContext(t *testing.T) {
 	}
 }
 
+func TestBuild_ImplementReview_WithPatch_RendersHunks(t *testing.T) {
+	patch := "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n" +
+		"@@ -1,3 +1,3 @@\n-old line\n+new line\n"
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		DiffPatch:    patch,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The split marker still leads the section.
+	if !strings.Contains(got, ImplementReviewSplitMarker) {
+		t.Errorf("split marker missing:\n%s", got)
+	}
+	// Real hunks are rendered, and the file list survives as an index.
+	for _, w := range []string{
+		"-old line",
+		"+new line",
+		"@@ -1,3 +1,3 @@",
+		"index for the hunks below",
+		"both added and removed lines are visible above",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("patch-present prompt missing %q:\n%s", w, got)
+		}
+	}
+	// The original #561 file-list caveat is REVISED out on the patch
+	// path — the reviewer can inspect lines directly, so we must not
+	// tell them deleted lines are invisible.
+	if strings.Contains(got, "do not assert the absence of regressions you could not actually inspect") {
+		t.Errorf("patch-present prompt must not keep the file-list-only caveat:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_WithoutPatch_KeepsOriginalCaveatVerbatim(t *testing.T) {
+	// Backward-compat: no DiffPatch (older bundle / patch-compute
+	// failure / size cap) falls back to the file-list rendering with the
+	// original #561 caveat verbatim.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"NOT a line-level diff",
+		"READ each listed file",
+		"do not assert the absence of regressions you could not actually inspect",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fallback prompt missing original caveat %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "```diff") {
+		t.Errorf("fallback prompt should not render a diff fence:\n%s", got)
+	}
+}
+
 func TestBuild_ImplementReview_EmptyDiff_NotesEmptyDiff(t *testing.T) {
 	got, err := Build("implement_review", Trigger{
 		Repo:         "kuhlman-labs/example",

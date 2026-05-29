@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -110,6 +112,73 @@ func newImplementReviewServer(t *testing.T, reviewer PlanReviewer, workflowSpec 
 func implementDiffBundle(t *testing.T, files []map[string]string) []byte {
 	t.Helper()
 	return makeTestBundle(t, files)
+}
+
+// implementDiffBundleWithPatch builds a trace bundle whose git_diff
+// event carries both the name-status file list AND the unified-diff
+// patch text, so the trace handler threads diff.Patch into the
+// implement-review prompt (#585).
+func implementDiffBundleWithPatch(t *testing.T, files []map[string]string, patch string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	manifest, _ := json.Marshal(map[string]any{"bundle_schema": "v1"})
+	manifestLine, _ := json.Marshal(map[string]any{"seq": 1, "kind": "manifest", "data": json.RawMessage(manifest)})
+	raw.Write(manifestLine)
+	raw.WriteByte('\n')
+
+	payload, _ := json.Marshal(map[string]any{
+		"kind":      "name_status",
+		"base_ref":  "origin/main",
+		"files":     files,
+		"num_files": len(files),
+		"patch":     patch,
+	})
+	diffLine, _ := json.Marshal(map[string]any{
+		"seq": 2, "kind": "git_diff", "data": json.RawMessage(payload),
+	})
+	raw.Write(diffLine)
+	raw.WriteByte('\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+// TestShipTrace_ImplementReview_PatchThreadedIntoPrompt asserts the
+// git_diff event's patch text reaches the reviewer prompt end-to-end:
+// the trace handler sets trig.DiffPatch from diff.Patch, and
+// buildImplementReview renders the real hunks (#585).
+func TestShipTrace_ImplementReview_PatchThreadedIntoPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	patch := "diff --git a/backend/internal/foo/foo.go b/backend/internal/foo/foo.go\n" +
+		"@@ -1,2 +1,2 @@\n-old impl\n+new impl\n"
+	bundleBytes := implementDiffBundleWithPatch(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	}, patch)
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{"-old impl", "+new impl", "@@ -1,2 +1,2 @@", "both added and removed lines are visible above"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q from threaded patch:\n%s", want, got)
+		}
+	}
 }
 
 // TestShipTrace_ImplementReview_GatingReject_StageFailedB asserts that

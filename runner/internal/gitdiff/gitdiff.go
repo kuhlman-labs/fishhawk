@@ -26,6 +26,14 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 )
 
+// maxPatchBytes caps the unified-diff hunk text captured by RunPatch
+// into the git_diff event's patch field. 256 KiB stays well under
+// bundle.ReadEvents' 4 MiB per-line scanner buffer (so a capped patch
+// can never trip the line-length limit) and the 64 MiB MaxBundleBytes.
+// The patch is content for the implement-review prompt only; it is NOT
+// read by the policy engine, so truncation never affects enforcement.
+const maxPatchBytes = 256 * 1024
+
 // Runner executes `git` to produce a Diff. Cmd defaults to
 // exec.CommandContext but is overridable for tests so we can drive
 // the parser without a real git working tree.
@@ -84,6 +92,61 @@ func (r *Runner) Run(ctx context.Context, baseRef, repoDir string) (constraint.D
 		return constraint.Diff{}, fmt.Errorf("gitdiff: parse: %w", perr)
 	}
 	return diff, nil
+}
+
+// RunPatch executes `git diff --cached <baseRef>` WITHOUT
+// --name-status to produce the full unified-diff (hunk) text, mirroring
+// Run's binary/Cmd overridability for tests. It diffs the same staged
+// index Run sees, so the returned hunks describe exactly the files the
+// name-status list enumerates (the caller stages with `git add -A`
+// before calling either — see the package doc).
+//
+// The result is the content the implement-review agent inspects for
+// content-level review (plan adherence, regressions). It is additive
+// trace payload only and is deliberately never read by the policy
+// engine — ChangedFiles remains the sole constraint input.
+//
+// The patch is capped at maxPatchBytes: when the raw output exceeds the
+// cap, RunPatch truncates at the cap, appends a clear marker line, and
+// returns truncated=true. Callers degrade gracefully on error (emit the
+// git_diff event without a patch) since name-status is the load-bearing
+// input.
+func (r *Runner) RunPatch(ctx context.Context, baseRef, repoDir string) (patch string, truncated bool, err error) {
+	if baseRef == "" {
+		return "", false, fmt.Errorf("gitdiff: baseRef required")
+	}
+	if repoDir == "" {
+		return "", false, fmt.Errorf("gitdiff: repoDir required")
+	}
+
+	binary := r.Binary
+	if binary == "" {
+		binary = "git"
+	}
+	cmdFn := r.Cmd
+	if cmdFn == nil {
+		cmdFn = exec.CommandContext
+	}
+
+	args := []string{"diff", "--cached", baseRef}
+	cmd := cmdFn(ctx, binary, args...)
+	cmd.Dir = repoDir
+
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return "", false, fmt.Errorf("gitdiff: patch: %v: %s",
+				err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return "", false, fmt.Errorf("gitdiff: patch: %w", err)
+	}
+
+	if len(out) > maxPatchBytes {
+		marker := fmt.Sprintf("\n[patch truncated: %d bytes total, capped at %d KiB]\n",
+			len(out), maxPatchBytes/1024)
+		return string(out[:maxPatchBytes]) + marker, true, nil
+	}
+	return string(out), false, nil
 }
 
 // Parse interprets the NUL-separated output of `git diff
