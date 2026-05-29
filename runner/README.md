@@ -92,6 +92,14 @@ The same binary the action runs can be invoked locally for development:
 
 When `--prompt-file` is set the runner invokes Claude Code; the structured runner log lines (`runner_started`, `runner_completed`) go to stderr. With `--bundle-out`, captured events are packed into `*.jsonl.gz` per ADR-007. Without it, events fall back to JSONL on stdout.
 
+### Progress heartbeats (#580)
+
+While the agent runs, the runner writes a `stage_progress` liveness line to stderr every ~15 seconds:
+
+    {"event":"stage_progress","elapsed_seconds":42,"turns":7,"tokens_so_far":13402,"last_event_kind":"assistant"}
+
+The counters are coarse and structural — elapsed seconds, parsed-event count, cumulative tokens, and the last event kind — never agent payload text. The cadence is time-driven, so a stalled stage keeps emitting heartbeats with non-advancing `turns`/`tokens_so_far`, distinguishing "alive and progressing" from "stuck". These lines go to stderr **only**: they never enter the signed trace bundle. The `fishhawk-mcp` `fishhawk_run_stage` tool forwards them as MCP progress notifications. There is no flag to disable them in normal operation; they are suppressed only when the runner is driven without a progress sink (not reachable from the CLI).
+
 ## Releases
 
 The release workflow at `.github/workflows/runner-release.yml` triggers on tags matching `runner/v*`. To cut a release:

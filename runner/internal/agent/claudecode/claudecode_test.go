@@ -1,7 +1,10 @@
 package claudecode
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -78,6 +81,20 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"system","subtype":"init"}`)
 		fmt.Println(`{"type":"assistant","content":"recovered"}`)
 		fmt.Println(`{"type":"result","usage":{"input_tokens":10,"output_tokens":20}}`)
+	case "spaced":
+		// Emit several events spaced apart so a shortened heartbeat
+		// interval fires multiple times across the invocation, with
+		// usage advancing so the heartbeat counters move (#580).
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		os.Stdout.Sync()
+		time.Sleep(60 * time.Millisecond)
+		fmt.Println(`{"type":"assistant","usage":{"input_tokens":10,"output_tokens":5}}`)
+		os.Stdout.Sync()
+		time.Sleep(60 * time.Millisecond)
+		fmt.Println(`{"type":"assistant","usage":{"input_tokens":30,"output_tokens":10}}`)
+		os.Stdout.Sync()
+		time.Sleep(60 * time.Millisecond)
+		fmt.Println(`{"type":"result","usage":{"input_tokens":50,"output_tokens":20}}`)
 	case "echo_env":
 		// Echo a single env var so we can assert the harness
 		// wired API key forwarding correctly.
@@ -531,5 +548,155 @@ func TestInvoke_GenericExitNoRetry(t *testing.T) {
 	}
 	if starts != 1 {
 		t.Errorf("invocation_start count = %d, want 1 (no retry on generic failure)", starts)
+	}
+}
+
+// progressHeartbeats parses every stage_progress JSONL line written to
+// a ProgressSink buffer, asserting each carries the four expected
+// fields. Returns the decoded heartbeats in arrival order.
+type heartbeat struct {
+	Event         string  `json:"event"`
+	ElapsedSecs   *int    `json:"elapsed_seconds"`
+	Turns         *int    `json:"turns"`
+	TokensSoFar   *int    `json:"tokens_so_far"`
+	LastEventKind *string `json:"last_event_kind"`
+}
+
+func parseHeartbeats(t *testing.T, raw []byte) []heartbeat {
+	t.Helper()
+	var hbs []heartbeat
+	sc := bufio.NewScanner(bytes.NewReader(raw))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var hb heartbeat
+		if err := json.Unmarshal([]byte(line), &hb); err != nil {
+			t.Fatalf("ProgressSink line is not valid JSON: %q: %v", line, err)
+		}
+		if hb.Event != "stage_progress" {
+			t.Fatalf("ProgressSink line has event=%q, want stage_progress: %q", hb.Event, line)
+		}
+		if hb.ElapsedSecs == nil || hb.Turns == nil || hb.TokensSoFar == nil || hb.LastEventKind == nil {
+			t.Fatalf("stage_progress line missing one of the four fields: %q", line)
+		}
+		hbs = append(hbs, hb)
+	}
+	return hbs
+}
+
+// TestInvokeOnce_ProgressHeartbeats drives invokeOnce against a binary
+// that emits several spaced events under a shortened heartbeat
+// interval, and asserts heartbeats were written, each is a complete
+// well-formed JSON line, and the counters advance across them (#580).
+func TestInvokeOnce_ProgressHeartbeats(t *testing.T) {
+	var sink bytes.Buffer
+	inv := &Invoker{
+		Cmd:               helperCommand("spaced"),
+		HeartbeatInterval: 20 * time.Millisecond,
+		// Note: real Now (default) — frozenNow mutates shared state
+		// unsynchronized and would race the heartbeat goroutine under -race.
+	}
+	res, _, err := inv.invokeOnce(context.Background(), agent.Invocation{
+		ProgressSink: &sink,
+	})
+	if err != nil {
+		t.Fatalf("invokeOnce: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; FailureReason = %q", res.FailureReason)
+	}
+
+	hbs := parseHeartbeats(t, sink.Bytes())
+	if len(hbs) == 0 {
+		t.Fatal("no stage_progress heartbeats written to ProgressSink")
+	}
+	// Counters must be monotonic non-decreasing and the last one must
+	// reflect progress past the first event.
+	last := hbs[len(hbs)-1]
+	if *last.Turns < 1 {
+		t.Errorf("final heartbeat turns = %d, want >= 1", *last.Turns)
+	}
+	for i := 1; i < len(hbs); i++ {
+		if *hbs[i].Turns < *hbs[i-1].Turns {
+			t.Errorf("turns went backwards: %d then %d", *hbs[i-1].Turns, *hbs[i].Turns)
+		}
+		if *hbs[i].TokensSoFar < *hbs[i-1].TokensSoFar {
+			t.Errorf("tokens_so_far went backwards: %d then %d", *hbs[i-1].TokensSoFar, *hbs[i].TokensSoFar)
+		}
+	}
+	// Heartbeats are ProgressSink-only: they must never enter res.Events.
+	for _, ev := range res.Events {
+		if ev.Kind == "stage_progress" {
+			t.Error("stage_progress leaked into res.Events; must be ProgressSink-only")
+		}
+	}
+}
+
+// TestInvokeOnce_NilProgressSinkNoHeartbeats confirms a nil
+// ProgressSink emits zero heartbeats and leaves res.Events as the
+// pre-#580 happy path produced it.
+func TestInvokeOnce_NilProgressSinkNoHeartbeats(t *testing.T) {
+	inv := &Invoker{
+		Cmd:               helperCommand("happy"),
+		Now:               frozenNow(),
+		HeartbeatInterval: time.Millisecond, // would fire constantly if a sink existed
+	}
+	res, _, err := inv.invokeOnce(context.Background(), agent.Invocation{
+		// ProgressSink nil on purpose.
+	})
+	if err != nil {
+		t.Fatalf("invokeOnce: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; FailureReason = %q", res.FailureReason)
+	}
+	// invocation_start, system.init, assistant, result, invocation_end → 5
+	if got, want := len(res.Events), 5; got != want {
+		t.Fatalf("Events = %d, want %d (nil sink must not alter event stream)", got, want)
+	}
+	for _, ev := range res.Events {
+		if ev.Kind == "stage_progress" {
+			t.Error("stage_progress event present with nil ProgressSink")
+		}
+	}
+}
+
+// TestInvokeOnce_ProgressSinkReturnsPromptly asserts invokeOnce with a
+// ProgressSink returns without hanging (no goroutine leak / ticker
+// leak) on both the normal-completion and budget-hit early-break paths
+// (#580 condition 3).
+func TestInvokeOnce_ProgressSinkReturnsPromptly(t *testing.T) {
+	cases := []struct {
+		name   string
+		mode   string
+		budget agent.Budget
+	}{
+		{"normal_completion", "happy", agent.Budget{}},
+		{"budget_hit_break", "budget", agent.Budget{MaxTokens: 100}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var sink bytes.Buffer
+			inv := &Invoker{
+				Cmd:               helperCommand(tc.mode),
+				HeartbeatInterval: 10 * time.Millisecond,
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _, _ = inv.invokeOnce(context.Background(), agent.Invocation{
+					Budget:       tc.budget,
+					ProgressSink: &sink,
+				})
+			}()
+			select {
+			case <-done:
+				// Returned — the heartbeat goroutine was joined, no hang.
+			case <-time.After(5 * time.Second):
+				t.Fatal("invokeOnce did not return within 5s — goroutine leak / hang")
+			}
+		})
 	}
 }

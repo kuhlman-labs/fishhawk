@@ -310,6 +310,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			Timeout:   cfg.timeout,
 		},
 		Env: map[string]string{},
+		// Wire mid-stage progress heartbeats to logSink (the runner's
+		// structured stderr stream, which the fishhawk-mcp run_stage
+		// relay forwards as progress notifications). The agent adapter
+		// emits a single-line stage_progress JSON heartbeat here every
+		// ~15s during the agent invocation so a long stage is visibly
+		// progressing rather than silent (#580). These never enter the
+		// signed trace bundle. Reverting this one line fully disables
+		// emission.
+		ProgressSink: logSink,
 	}
 
 	// E19.8 / #348: mint a short-lived MCP token for the agent and

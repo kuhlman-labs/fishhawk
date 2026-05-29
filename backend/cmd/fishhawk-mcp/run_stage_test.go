@@ -728,6 +728,35 @@ func TestRunStageEventMessage_FallsBackToJSON(t *testing.T) {
 	}
 }
 
+// TestRunStageEventMessage_StageProgress verifies a stage_progress
+// heartbeat (#580) renders its coarse counters into the progress
+// message (turns / tokens / elapsed / last), while a normal event
+// still falls through to its kind.
+func TestRunStageEventMessage_StageProgress(t *testing.T) {
+	// JSON numbers decode as float64, mirroring the relay's
+	// json.Unmarshal-into-any path.
+	progress := map[string]any{
+		"event":           "stage_progress",
+		"elapsed_seconds": float64(42),
+		"turns":           float64(7),
+		"tokens_so_far":   float64(13402),
+		"last_event_kind": "assistant",
+	}
+	got := runStageEventMessage(progress)
+	for _, want := range []string{"turns=7", "tokens=13402", "elapsed=42s", "last=assistant"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message = %q, want it to contain %q", got, want)
+		}
+	}
+
+	// A normal event still returns its kind, unaffected by the
+	// stage_progress special-case.
+	normal := map[string]any{"kind": "runner_started"}
+	if msg := runStageEventMessage(normal); msg != "runner_started" {
+		t.Errorf("normal event message = %q, want runner_started", msg)
+	}
+}
+
 // --- DiffSummary, AuditPointer, RunURL enrichment (#442) ---
 
 // TestRunStage_DiffSummary_NilWhenNoGitDiffEvent verifies acceptance

@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
@@ -34,6 +35,11 @@ import (
 // DefaultBinary is the executable name resolved against PATH when
 // Invoker.Binary is empty.
 const DefaultBinary = "claude"
+
+// defaultHeartbeatInterval is the cadence of stage_progress liveness
+// heartbeats written to Invocation.ProgressSink during an invocation
+// (#580). Used when Invoker.HeartbeatInterval is zero.
+const defaultHeartbeatInterval = 15 * time.Second
 
 // Invoker is the agent.Invoker implementation for Claude Code.
 type Invoker struct {
@@ -62,6 +68,13 @@ type Invoker struct {
 	// default (1) is set at construction in New(); a zero value means
 	// "no retry" so tests and operators can disable it deterministically.
 	MaxThinkingBlockRetries int
+
+	// HeartbeatInterval is the cadence of stage_progress liveness
+	// heartbeats written to Invocation.ProgressSink during an
+	// invocation (#580). Zero means defaultHeartbeatInterval (15s).
+	// A per-Invoker field rather than a package-level global so
+	// parallel tests can shorten it without racing on shared state.
+	HeartbeatInterval time.Duration
 }
 
 // New returns an Invoker configured to use the system `claude`
@@ -259,6 +272,71 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// thinking-block detection (see isThinkingBlock400).
 	var resultPayload []byte
 
+	// Progress heartbeat state (#580). The scan loop below writes
+	// turns / tokensUsed / lastKind; the heartbeat goroutine reads
+	// them on each tick. Both accesses go through progMu so the race
+	// detector stays quiet (Go memory model: concurrent access from
+	// multiple goroutines needs explicit synchronization).
+	var (
+		progMu   sync.Mutex
+		turns    int
+		lastKind string
+	)
+	start := now()
+
+	// Heartbeat goroutine. It is the SOLE writer to inv.ProgressSink
+	// during Invoke, so single whole-line Fprintf writes never
+	// interleave with another writer's partial line. Proof by
+	// inspection of every ProgressSink (== runner logSink) writer:
+	//   - This goroutine — the only writer inside invokeOnce.
+	//   - The scan loop (same invokeOnce) — touches res.Events and the
+	//     progMu-guarded counters only; never writes ProgressSink.
+	//   - main.go run() lifecycle lines (runner_started, prompt_fetched,
+	//     mcp_token_issued, etc.) — all on run()'s main goroutine, which
+	//     is blocked inside invoker.Invoke for the whole invocation, so
+	//     they are strictly before/after, never concurrent.
+	//   - main.go's deferred runner_cancelled line — runs only when
+	//     run() returns, i.e. after Invoke has already returned; a
+	//     SIGTERM/cancel during Invoke propagates via ctx (cooperative
+	//     shutdown) and the line is emitted post-Invoke, not concurrently.
+	// Hence no second goroutine ever writes ProgressSink while this one
+	// is running, and JSONL line integrity is guaranteed. A nil
+	// ProgressSink starts no goroutine and emits zero heartbeats.
+	var (
+		hbDone    chan struct{}
+		hbStopped chan struct{}
+	)
+	if inv.ProgressSink != nil {
+		interval := i.HeartbeatInterval
+		if interval <= 0 {
+			interval = defaultHeartbeatInterval
+		}
+		hbDone = make(chan struct{})
+		hbStopped = make(chan struct{})
+		go func() {
+			defer close(hbStopped)
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-hbDone:
+					return
+				case <-ticker.C:
+					// Time-driven, not event-driven: a stalled stage
+					// still emits heartbeats with non-advancing counters,
+					// which is exactly how the driver tells "alive and
+					// progressing" from "stuck".
+					progMu.Lock()
+					t, tok, lk := turns, tokensUsed, lastKind
+					progMu.Unlock()
+					_, _ = fmt.Fprintf(inv.ProgressSink,
+						`{"event":"stage_progress","elapsed_seconds":%d,"turns":%d,"tokens_so_far":%d,"last_event_kind":%q}`+"\n",
+						int(now().Sub(start).Seconds()), t, tok, lk)
+				}
+			}
+		}()
+	}
+
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -268,8 +346,14 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		if ev.Kind == "result" || strings.HasPrefix(ev.Kind, "result.") {
 			resultPayload = append([]byte(nil), ev.Payload...)
 		}
+		progMu.Lock()
+		turns++
+		lastKind = ev.Kind
 		if ok && used > 0 {
 			tokensUsed = used
+		}
+		progMu.Unlock()
+		if ok && used > 0 {
 			if inv.Budget.MaxTokens > 0 && tokensUsed > inv.Budget.MaxTokens {
 				budgetHit = true
 				_ = cmd.Process.Kill()
@@ -278,6 +362,14 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		}
 	}
 	scanErr := scanner.Err()
+
+	// Stop the heartbeat goroutine now the scan loop has finished —
+	// covers both the EOF path and the budget-hit early break, so the
+	// goroutine never outlives the invocation (no ticker/timer leak).
+	if hbDone != nil {
+		close(hbDone)
+		<-hbStopped
+	}
 
 	// Drain remaining stdout if we killed mid-stream.
 	_, _ = io.Copy(io.Discard, stdout)
