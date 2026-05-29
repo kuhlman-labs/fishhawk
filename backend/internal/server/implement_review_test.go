@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -313,6 +315,9 @@ func TestShipTrace_ImplementReview_Advisory_RecordsVerdictRequiresApproval(t *te
 	if implStage.State != run.StageStateAwaitingApproval {
 		t.Errorf("advisory: implement stage state = %q, want awaiting_approval", implStage.State)
 	}
+	// Advisory review runs detached (#584); drain it before asserting on
+	// the audit entry it writes.
+	s.waitBackgroundReviews()
 
 	// Verdict still recorded with advisory authority.
 	var rec *planreview.ImplementReviewedPayload
@@ -334,5 +339,82 @@ func TestShipTrace_ImplementReview_Advisory_RecordsVerdictRequiresApproval(t *te
 	}
 	if rec.Verdict != planreview.VerdictReject {
 		t.Errorf("verdict = %q, want reject (recorded but non-blocking)", rec.Verdict)
+	}
+}
+
+// TestShipTrace_ImplementReview_Advisory_RunsAsync asserts the #584
+// decoupling for the implement path: under advisory authority the trace
+// upload returns 202 AND the stage advances to its terminal
+// awaiting_approval state BEFORE the (blocked) reviewer finishes. Once
+// released and drained, the implement_reviewed audit entry lands. The
+// human gate stays authoritative, so the advisory verdict arriving after
+// advancement is correct.
+func TestShipTrace_ImplementReview_Advisory_RunsAsync(t *testing.T) {
+	reviewer := newBlockingPlanReviewer(
+		&planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		"claude-sonnet-4-6",
+	)
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// Terminal transition happened synchronously despite the blocked
+	// reviewer — the review is detached.
+	if implStage.State != run.StageStateAwaitingApproval {
+		t.Errorf("implement stage state = %q, want awaiting_approval (advanced before review)", implStage.State)
+	}
+
+	// The async review cannot have recorded yet (release not closed).
+	if n := countAuditCategory(au, "implement_reviewed"); n != 0 {
+		t.Fatalf("implement_reviewed entries = %d before release, want 0 (review was not async)", n)
+	}
+
+	close(reviewer.release)
+	s.waitBackgroundReviews()
+
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed entries = %d after release, want 1", n)
+	}
+}
+
+// TestShipTrace_ImplementReview_Advisory_ContextDetached asserts the
+// detached implement review survives cancellation of the context passed
+// into runImplementReviews (simulating the upload client disconnect
+// cancelling r.Context() mid-review). The verdict must still record, which
+// it only does if the goroutine runs on a context.WithoutCancel'd context.
+func TestShipTrace_ImplementReview_Advisory_ContextDetached(t *testing.T) {
+	reviewer := newBlockingPlanReviewer(
+		&planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		"claude-sonnet-4-6",
+	)
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Advisory → dispatches a detached goroutine and returns false.
+	if s.runImplementReviews(ctx, runRow.ID, implStage.ID, diff) {
+		t.Fatal("advisory runImplementReviews returned true (advisory must never gate)")
+	}
+
+	<-reviewer.started
+	cancel()
+	close(reviewer.release)
+
+	s.waitBackgroundReviews()
+
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed entries = %d, want 1 — detached review must survive parent-context cancel", n)
 	}
 }

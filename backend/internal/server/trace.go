@@ -800,31 +800,41 @@ func (s *Server) emitRuntimeObserved(ctx context.Context, runID, stageID uuid.UU
 	}
 }
 
-// runImplementReviews invokes configured implement-review agents after
-// the implement-stage diff has landed in the trace bundle (ADR-027 impl
-// 2/2). It mirrors runPlanReviews: for each configured agent it builds
-// the implement_review prompt from the diff + approved plan + issue,
-// calls PlanReviewer.Review, warns on self-review, and appends one
-// implement_reviewed audit entry per invocation.
+// runImplementReviews resolves the implement stage's review config and
+// dispatches the review agents after the diff has landed in the trace
+// bundle (ADR-027 impl 2/2). It mirrors runPlanReviews' decoupling (#584):
+// the cheap request-scoped reads (GetRun, resolveStageReviewers,
+// loadApprovedPlanForRun, prompt.Build) run on the caller's context, then
+// it branches on authority:
 //
-// Returns true only when authority is gating (reviewers.agent>0 &&
-// human==0) and at least one verdict is reject — the caller transitions
-// the stage to failed-B so the terminal awaiting_approval advance is
-// blocked. scope.files drift is flag-only: a {category:"scope"} concern
-// never forces a reject (ADR-027 Decision Q6); only an overall verdict of
-// reject blocks.
+//   - gating (reviewers.agent>0 && human==0): runs the review loop
+//     SYNCHRONOUSLY and returns true when any verdict is reject — the
+//     caller (advanceStageAfterTrace) then fails the stage as category-B
+//     so the terminal awaiting_approval advance is blocked. Gating review
+//     can't be detached: the failed-B transition has to land before the
+//     terminal transition. scope.files drift is flag-only — a
+//     {category:"scope"} concern never forces a reject (ADR-027 Decision
+//     Q6); only an overall verdict of reject blocks.
+//
+//   - advisory (reviewers.agent>0 && human>0): dispatches the review loop
+//     on a DETACHED context (context.WithoutCancel) in a goroutine tracked
+//     by s.bgReviews, and returns false immediately. The terminal
+//     awaiting_approval/succeeded transition then proceeds while the
+//     review runs to its own FISHHAWKD_PLAN_REVIEW_TIMEOUT budget,
+//     decoupled from the runner's upload client timeout — the human gate
+//     stays authoritative, so the advisory verdict landing after
+//     advancement is fine.
 //
 // Returns false (no gating block) when:
 //   - RunRepo is nil
 //   - the workflow spec carries no implement stage with reviewers.agent>0
 //   - PlanReviewer is nil (emits implement_review_skipped, then proceeds)
 //   - no approved plan is available
+//   - authority is advisory (review runs detached, never blocks)
 //   - all review agents approve (or approve_with_concerns)
 //
 // Per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't block the stage — the diff is already stored.
-// This mirrors runPlanReviews' failure/skip behavior exactly; the
-// louder-on-failure change is tracked separately in #584.
 func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff) bool {
 	if s.cfg.RunRepo == nil {
 		return false
@@ -917,9 +927,41 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		return false
 	}
 
+	// Detach the reviewer context from the request lifecycle (#584); see
+	// runPlanReviews for the rationale. The goroutine / loop closes over
+	// only already-resolved values (built prompt, IDs, authority, author
+	// model) — never r, the bundle, or request-scoped state.
+	authorModel := approvedPlan.GeneratedBy.Model
+	reviewCtx := context.WithoutCancel(ctx)
+
+	// Advisory: dispatch detached so the terminal transition can proceed
+	// without waiting on the reviewer.
+	if authority != planreview.AuthorityGating {
+		s.bgReviews.Add(1)
+		go func() {
+			defer s.bgReviews.Done()
+			s.runImplementReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+		}()
+		return false
+	}
+
+	// Gating: run synchronously so the caller can fail the stage as
+	// category-B before the terminal transition.
+	return s.runImplementReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+}
+
+// runImplementReviewLoop runs the per-reviewer implement-review loop
+// shared by the synchronous (gating) and detached (advisory) dispatch
+// paths. For each configured agent it calls PlanReviewer.Review, logs
+// WARN on self-review (reviewer model == authorModel), and appends one
+// implement_reviewed audit entry. Returns true when at least one verdict
+// is reject. It performs no stage transition — the gating caller owns the
+// failed-B transition so the advance-blocking edge stays on the
+// synchronous path only.
+func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid.UUID, agents int, authority planreview.AuthorityMode, promptText, authorModel string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
-	for i := 0; i < reviewersCfg.Agent; i++ {
+	for i := 0; i < agents; i++ {
 		verdict, model, err := s.cfg.PlanReviewer.Review(ctx, promptText)
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: reviewer invocation failed",
@@ -936,7 +978,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// recorded. The approved plan's GeneratedBy.Model is an
 		// approximation of the implement-stage author's model — v0 does
 		// not record the implement agent's model separately.
-		if model != "" && model == approvedPlan.GeneratedBy.Model {
+		if model != "" && model == authorModel {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"implement review: self-review detected — reviewer model matches plan author model",
 				slog.String("model", model),
@@ -972,8 +1014,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 			hasRejection = true
 		}
 	}
-
-	return authority == planreview.AuthorityGating && hasRejection
+	return hasRejection
 }
 
 // renderDiffForReview formats a policy.Diff (per-file path + git status)

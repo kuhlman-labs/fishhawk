@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
@@ -224,6 +225,16 @@ type Server struct {
 	// don't add up (no GitHub client, no audit repo, or no
 	// ExternalURL). Concurrent NotifyXxx calls are safe.
 	issueNotifier *issuecomment.Notifier
+
+	// bgReviews tracks detached advisory plan/implement review
+	// goroutines (#584). Advisory-mode agent review is dispatched off
+	// the upload request goroutine so the response returns before the
+	// reviewer finishes (decoupling the review from the runner's upload
+	// client timeout). Shutdown drains this group, bounded by the
+	// shutdown context, so a graceful stop doesn't strand an in-flight
+	// review. Gating-mode review stays synchronous and is never tracked
+	// here.
+	bgReviews sync.WaitGroup
 }
 
 // New builds a Server. It does not start listening; call Start.
@@ -279,12 +290,36 @@ func (s *Server) Start() error {
 }
 
 // Shutdown gracefully drains in-flight requests, capped by
-// ShutdownTimeout from the parent context.
+// ShutdownTimeout from the parent context. After the HTTP server
+// drains, it also waits for any detached advisory review goroutines
+// (#584) to finish, bounded by the same shutdown context so a hung
+// reviewer can't block shutdown past the deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout)
 	defer cancel()
-	return s.http.Shutdown(shutdownCtx)
+	err := s.http.Shutdown(shutdownCtx)
+
+	// Drain in-flight detached reviews, bounded by the shutdown
+	// context. A WaitGroup can't be select-ed on directly, so signal
+	// completion through a channel.
+	done := make(chan struct{})
+	go func() {
+		s.bgReviews.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-shutdownCtx.Done():
+	}
+	return err
 }
+
+// waitBackgroundReviews blocks until every detached advisory review
+// goroutine has finished. It is the deterministic sync point tests use
+// to assert on audit entries an async review writes — release the
+// blocking reviewer, then call this, then assert. Production code never
+// calls it (Shutdown drains the same group, bounded by its context).
+func (s *Server) waitBackgroundReviews() { s.bgReviews.Wait() }
 
 // buildHandler wires the route mux and the middleware chain.
 //
