@@ -99,6 +99,21 @@ type ReviewSkippedPayload struct {
 	Authority        AuthorityMode `json:"authority"`
 }
 
+// ReviewStartedPayload is the JSON payload stored in an audit entry with
+// category "plan_review_started" / "implement_review_started" (#600). It
+// marks that a review agent was actually dispatched — emitted once per
+// stage at dispatch, only when agent>0 AND a PlanReviewer is wired (never
+// for the agent==0 "none" or nil-reviewer "skipped" branches). It is the
+// MCP-readable proxy that distinguishes a configured-and-running review
+// ('pending') from no review configured ('none'): the started entry is
+// appended before the per-reviewer loop writes the terminal *_reviewed
+// entries, so its audit sequence always precedes them under both gating
+// (synchronous) and advisory (detached) authority.
+type ReviewStartedPayload struct {
+	ConfiguredAgents int           `json:"configured_agents"`
+	Authority        AuthorityMode `json:"authority"`
+}
+
 // PlanReviewedPayload is the JSON payload stored in an audit entry
 // with category "plan_reviewed". One entry is appended per review
 // agent invocation.

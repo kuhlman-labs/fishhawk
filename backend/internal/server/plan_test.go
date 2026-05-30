@@ -511,6 +511,9 @@ func TestShipPlan_ReviewAgents_Gating_NilReviewer_SkippedAudit(t *testing.T) {
 		if e.Category == "plan_reviewed" {
 			t.Errorf("unexpected plan_reviewed audit entry when PlanReviewer is nil")
 		}
+		if e.Category == "plan_review_started" {
+			t.Errorf("unexpected plan_review_started audit entry when PlanReviewer is nil (#600: skipped branch must not emit the started proxy)")
+		}
 		if e.Category != "plan_review_skipped" {
 			continue
 		}
@@ -614,6 +617,9 @@ func TestShipPlan_ReviewAgents_Gateless_NoReviewersInSpec(t *testing.T) {
 	for _, e := range au.appended {
 		if e.Category == "plan_reviewed" {
 			t.Errorf("unexpected plan_reviewed audit entry when spec has agent=0")
+		}
+		if e.Category == "plan_review_started" {
+			t.Errorf("unexpected plan_review_started audit entry when spec has agent=0 (#600: none branch must not emit the started proxy)")
 		}
 	}
 }
@@ -811,6 +817,75 @@ func TestShipPlan_ReviewAgents_SelfReviewLogsWarn(t *testing.T) {
 	}
 	if !sawReviewed {
 		t.Error("plan_reviewed entry missing — self-review guard should warn but not skip")
+	}
+}
+
+// TestShipPlan_ReviewStarted_PrecedesReviewed asserts the #600 ordering
+// invariant: the plan_review_started audit entry is appended BEFORE the
+// terminal plan_reviewed entry under both gating (synchronous) and advisory
+// (detached goroutine) authority. The MCP review_status proxy depends on
+// this — started is the 'pending' signal and reviewed is the terminal one;
+// a started that landed after reviewed would let a consumer read 'pending'
+// on an already-complete review. The test fails if the emit is misordered
+// or skipped on either path.
+func TestShipPlan_ReviewStarted_PrecedesReviewed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec []byte
+	}{
+		{"gating", specGatingReviewers},
+		{"advisory", specAdvisoryReviewers},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			reviewer := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+				model:   "claude-sonnet-4-6",
+			}
+			s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, tc.spec)
+			priv, _ := sf.issue(t, runID)
+			body := validPlanBytes(t)
+
+			w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			// Advisory dispatches the reviewer detached (#584); drain it so
+			// the plan_reviewed entry it writes has landed before asserting.
+			s.waitBackgroundReviews()
+
+			au.mu.Lock()
+			defer au.mu.Unlock()
+			startedIdx, reviewedIdx := -1, -1
+			for i, e := range au.appended {
+				switch e.Category {
+				case "plan_review_started":
+					if startedIdx == -1 {
+						startedIdx = i
+					}
+				case "plan_reviewed":
+					if reviewedIdx == -1 {
+						reviewedIdx = i
+					}
+				}
+			}
+			if startedIdx == -1 {
+				t.Fatal("no plan_review_started audit entry emitted")
+			}
+			if reviewedIdx == -1 {
+				t.Fatal("no plan_reviewed audit entry emitted")
+			}
+			if startedIdx >= reviewedIdx {
+				t.Errorf("plan_review_started index %d must precede plan_reviewed index %d", startedIdx, reviewedIdx)
+			}
+			var p planreview.ReviewStartedPayload
+			if err := json.Unmarshal(au.appended[startedIdx].Payload, &p); err != nil {
+				t.Fatalf("decode plan_review_started payload: %v", err)
+			}
+			if p.ConfiguredAgents != 1 {
+				t.Errorf("configured_agents = %d, want 1", p.ConfiguredAgents)
+			}
+		})
 	}
 }
 

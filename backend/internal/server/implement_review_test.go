@@ -384,6 +384,74 @@ func TestShipTrace_ImplementReview_Advisory_RunsAsync(t *testing.T) {
 	}
 }
 
+// TestShipTrace_ImplementReview_Started_PrecedesReviewed asserts the #600
+// ordering invariant for the implement path: the implement_review_started
+// audit entry is appended BEFORE the terminal implement_reviewed entry under
+// both gating (synchronous) and advisory (detached goroutine) authority. The
+// MCP review_status proxy reads started as 'pending' and reviewed as the
+// terminal state; a started landing after reviewed would misreport an
+// already-complete review as pending.
+func TestShipTrace_ImplementReview_Started_PrecedesReviewed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec []byte
+	}{
+		{"gating", specImplementGatingReviewers},
+		{"advisory", specImplementAdvisoryReviewers},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+				model:   "claude-opus-4-7",
+			}
+			s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, tc.spec)
+			priv, _ := sf.issue(t, runRow.ID)
+
+			bundleBytes := implementDiffBundle(t, []map[string]string{
+				{"path": "backend/internal/foo/foo.go", "status": "M"},
+			})
+			w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+			}
+			// Advisory dispatches detached (#584); drain before asserting.
+			s.waitBackgroundReviews()
+
+			au.mu.Lock()
+			defer au.mu.Unlock()
+			startedIdx, reviewedIdx := -1, -1
+			for i, e := range au.appended {
+				switch e.Category {
+				case "implement_review_started":
+					if startedIdx == -1 {
+						startedIdx = i
+					}
+				case "implement_reviewed":
+					if reviewedIdx == -1 {
+						reviewedIdx = i
+					}
+				}
+			}
+			if startedIdx == -1 {
+				t.Fatal("no implement_review_started audit entry emitted")
+			}
+			if reviewedIdx == -1 {
+				t.Fatal("no implement_reviewed audit entry emitted")
+			}
+			if startedIdx >= reviewedIdx {
+				t.Errorf("implement_review_started index %d must precede implement_reviewed index %d", startedIdx, reviewedIdx)
+			}
+			var p planreview.ReviewStartedPayload
+			if err := json.Unmarshal(au.appended[startedIdx].Payload, &p); err != nil {
+				t.Fatalf("decode implement_review_started payload: %v", err)
+			}
+			if p.ConfiguredAgents != 1 {
+				t.Errorf("configured_agents = %d, want 1", p.ConfiguredAgents)
+			}
+		})
+	}
+}
+
 // TestShipTrace_ImplementReview_Advisory_ContextDetached asserts the
 // detached implement review survives cancellation of the context passed
 // into runImplementReviews (simulating the upload client disconnect

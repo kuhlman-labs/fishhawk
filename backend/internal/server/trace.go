@@ -927,6 +927,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		return false
 	}
 
+	// Pending-signal (#600): emit an implement_review_started audit entry
+	// now that a reviewer will actually run. Emitted synchronously before
+	// the dispatch loop so started precedes every implement_reviewed entry
+	// under both authorities — the MCP review_status proxy reads it to tell
+	// 'configured + running' (pending) from 'none configured'. Mirrors the
+	// plan path (runPlanReviews). Best-effort: never blocks dispatch.
+	s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.Agent)
+
 	// Detach the reviewer context from the request lifecycle (#584); see
 	// runPlanReviews for the rationale. The goroutine / loop closes over
 	// only already-resolved values (built prompt, IDs, authority, author

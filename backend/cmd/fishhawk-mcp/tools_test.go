@@ -66,6 +66,13 @@ type fakeBackend struct {
 	perRunAuditStatus        int
 	perRunAuditLastQueryByID map[uuid.UUID]string
 
+	// reviewFlip, when non-nil, is invoked under fb.mu on every per-run
+	// audit request with the requested category. The fishhawk_await_review
+	// poll-resolve test uses it to flip a pending review to complete
+	// mid-poll without wall-clock sleeps — it mutates perRunAuditByRun
+	// directly (the caller already holds fb.mu, so it must not re-lock).
+	reviewFlip func(category string)
+
 	// E22.1 fixtures: POST /v0/runs.
 	// createRunBody captures the last decoded request body so tests
 	// can assert what fields were sent.
@@ -328,6 +335,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		fb.mu.Lock()
 		fb.perRunAuditLastQueryByID[id] = r.URL.RawQuery
+		if fb.reviewFlip != nil {
+			fb.reviewFlip(r.URL.Query().Get("category"))
+		}
 		all := fb.perRunAuditByRun[id]
 		next := fb.perRunAuditNextByRun[id]
 		fb.mu.Unlock()

@@ -466,6 +466,17 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		return false
 	}
 
+	// Pending-signal (#600): now that a reviewer will actually run
+	// (agent>0 AND PlanReviewer wired), emit a plan_review_started audit
+	// entry. This is the only MCP-readable proxy that distinguishes a
+	// configured-and-running review ('pending') from no review configured
+	// ('none'). It is emitted synchronously here, before the dispatch loop
+	// below appends the terminal plan_reviewed entries, so started always
+	// has a lower audit sequence than reviewed under both gating
+	// (synchronous) and advisory (detached) authority. Best-effort:
+	// WARN-log and continue on append failure so dispatch is never blocked.
+	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.Agent)
+
 	// Detach the reviewer context from the request lifecycle (#584).
 	// context.WithoutCancel keeps the parent's values but is NOT
 	// cancelled when the parent is — so the review survives the runner's
@@ -509,6 +520,38 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		return true
 	}
 	return false
+}
+
+// emitReviewStarted appends a best-effort *_review_started audit entry at
+// review dispatch (#600). Shared by the plan-review and implement-review
+// paths. It is called only on the branch where a reviewer will actually
+// run (agent>0 AND PlanReviewer wired) — never for the agent==0 ('none')
+// or nil-reviewer ('skipped') branches — so a consumer can read the entry
+// as proof that a review is pending rather than absent. Mirrors the
+// skipped-entry error handling: WARN-log and continue on append failure
+// so the dispatch path is never blocked.
+func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(planreview.ReviewStartedPayload{
+		ConfiguredAgents: configuredAgents,
+		Authority:        authority,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	}
 }
 
 // runPlanReviewLoop runs the per-reviewer plan-review loop shared by the
