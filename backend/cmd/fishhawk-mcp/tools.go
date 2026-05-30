@@ -20,6 +20,12 @@ import (
 type runResolver struct {
 	api    *apiClient
 	getenv func(string) string
+
+	// reviewPollInterval is the poll cadence fishhawk_await_review uses
+	// while a review is pending. Zero falls back to
+	// defaultReviewPollInterval; tests inject a sub-millisecond value so
+	// the poll loop runs without wall-clock sleeps.
+	reviewPollInterval time.Duration
 }
 
 // registerTools wires every MCP tool onto srv. Called once at
@@ -31,6 +37,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerGetActiveRun(srv, resolver)
 	registerGetPlan(srv, resolver)
 	registerGetRunStatus(srv, resolver)
+	registerAwaitReview(srv, resolver)
 	registerListAudit(srv, resolver)
 	registerStartRun(srv, resolver)
 	registerCancelRun(srv, resolver)
@@ -280,6 +287,12 @@ type GetPlanOutput struct {
 	Plan        *PlanContent `json:"plan,omitempty"`
 	ResolvedVia string       `json:"resolved_via,omitempty" jsonschema:"'self' when the plan came from the requested run; 'parent:<run_id>' when the parent-walk resolved it for a CI-retry chain"`
 	Reviews     []PlanReview `json:"reviews,omitempty" jsonschema:"plan-review agent verdicts; populated when reviewers.agent>0 is configured on the stage (ADR-027). A verdict of 'skipped' with a reason marks an agent layer that was configured but not wired on the backend"`
+	// PlanReviewStatus is the review lifecycle summary for the plan stage
+	// (#600): none|pending|complete|skipped derived from the audit trail.
+	// 'pending' (a review was dispatched but no verdict landed) is the
+	// state Reviews[] alone cannot express — use fishhawk_await_review to
+	// block until it resolves.
+	PlanReviewStatus *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review"`
 }
 
 // registerGetPlan wires the fishhawk_get_plan tool. The handler
@@ -343,11 +356,16 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if err != nil {
 				return nil, GetPlanOutput{}, fmt.Errorf("load plan reviews: %w", err)
 			}
+			reviewStatus, err := r.reviewStatusFor(ctx, current, "plan")
+			if err != nil {
+				return nil, GetPlanOutput{}, fmt.Errorf("plan review status: %w", err)
+			}
 			return nil, GetPlanOutput{
-				Status:      "available",
-				Plan:        p,
-				ResolvedVia: resolvedVia,
-				Reviews:     reviews,
+				Status:           "available",
+				Plan:             p,
+				ResolvedVia:      resolvedVia,
+				Reviews:          reviews,
+				PlanReviewStatus: reviewStatus,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -448,27 +466,9 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 // with a corrupt payload is not a reason to fail the whole plan
 // fetch. Returns nil when no plan_reviewed entries exist.
 func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]PlanReview, error) {
-	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
-		Category: "plan_reviewed",
-		Limit:    50,
-	})
+	reviews, err := r.decodeReviewVerdicts(ctx, runID, "plan_reviewed")
 	if err != nil {
 		return nil, err
-	}
-	var reviews []PlanReview
-	for _, e := range entries {
-		if e.Payload == nil {
-			continue
-		}
-		raw, merr := json.Marshal(e.Payload)
-		if merr != nil {
-			continue
-		}
-		var review PlanReview
-		if uerr := json.Unmarshal(raw, &review); uerr != nil {
-			continue
-		}
-		reviews = append(reviews, review)
 	}
 
 	// Second pass: plan_review_skipped entries (#574). These mark a
@@ -476,36 +476,11 @@ func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]P
 	// surfaces as a synthesized PlanReview with verdict "skipped" so
 	// an agent reading the response can tell a degraded gate from a
 	// real verdict without a separate audit query.
-	skipped, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
-		Category: "plan_review_skipped",
-		Limit:    50,
-	})
+	skipped, err := r.decodeSkippedReviews(ctx, runID, "plan_review_skipped")
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range skipped {
-		if e.Payload == nil {
-			continue
-		}
-		raw, merr := json.Marshal(e.Payload)
-		if merr != nil {
-			continue
-		}
-		var p struct {
-			Reason    string `json:"reason"`
-			Authority string `json:"authority"`
-		}
-		if uerr := json.Unmarshal(raw, &p); uerr != nil {
-			continue
-		}
-		reviews = append(reviews, PlanReview{
-			ReviewerKind: "agent",
-			Authority:    p.Authority,
-			Verdict:      "skipped",
-			Reason:       p.Reason,
-		})
-	}
-	return reviews, nil
+	return append(reviews, skipped...), nil
 }
 
 // auditLimitDefault is the default value for the get_run_status
@@ -541,6 +516,13 @@ type GetRunStatusOutput struct {
 	// scope.files drift), and free_form. A verdict of "skipped" with a
 	// reason marks a configured agent layer that was not wired.
 	ImplementReviews []PlanReview `json:"implement_reviews,omitempty" jsonschema:"implement-review agent verdicts; populated when reviewers.agent>0 is configured on the implement stage (ADR-027). A {category:'scope'} concern flags scope.files drift (flag-only, never an auto-reject). A verdict of 'skipped' with a reason marks an agent layer that was configured but not wired on the backend"`
+	// PlanReviewStatus / ImplementReviewStatus summarize each stage's review
+	// lifecycle (#600): none|pending|complete|skipped derived from the audit
+	// trail. 'pending' (a review was dispatched but no verdict landed yet) is
+	// the state the Reviews slices alone cannot express; wait on it with
+	// fishhawk_await_review.
+	PlanReviewStatus      *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped. 'pending' means a review was dispatched but no verdict has landed yet"`
+	ImplementReviewStatus *ReviewStatus `json:"implement_review_status,omitempty" jsonschema:"review lifecycle for the implement stage: status is one of none, pending, complete, skipped. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -609,11 +591,22 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, GetRunStatusOutput{}, fmt.Errorf("load implement reviews: %w", err)
 	}
 
+	planReviewStatus, err := r.reviewStatusFor(ctx, runID, "plan")
+	if err != nil {
+		return nil, GetRunStatusOutput{}, fmt.Errorf("plan review status: %w", err)
+	}
+	implementReviewStatus, err := r.reviewStatusFor(ctx, runID, "implement")
+	if err != nil {
+		return nil, GetRunStatusOutput{}, fmt.Errorf("implement review status: %w", err)
+	}
+
 	return nil, GetRunStatusOutput{
-		Run:              *runRow,
-		Stages:           stages,
-		RecentAudit:      recent,
-		ImplementReviews: implementReviews,
+		Run:                   *runRow,
+		Stages:                stages,
+		RecentAudit:           recent,
+		ImplementReviews:      implementReviews,
+		PlanReviewStatus:      planReviewStatus,
+		ImplementReviewStatus: implementReviewStatus,
 	}, nil
 }
 
@@ -625,59 +618,15 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 // degraded gate is distinguishable from a real verdict. Returns nil when
 // no implement-review entries exist.
 func (r *runResolver) loadImplementReviews(ctx context.Context, runID uuid.UUID) ([]PlanReview, error) {
-	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
-		Category: "implement_reviewed",
-		Limit:    50,
-	})
+	reviews, err := r.decodeReviewVerdicts(ctx, runID, "implement_reviewed")
 	if err != nil {
 		return nil, err
 	}
-	var reviews []PlanReview
-	for _, e := range entries {
-		if e.Payload == nil {
-			continue
-		}
-		raw, merr := json.Marshal(e.Payload)
-		if merr != nil {
-			continue
-		}
-		var review PlanReview
-		if uerr := json.Unmarshal(raw, &review); uerr != nil {
-			continue
-		}
-		reviews = append(reviews, review)
-	}
-
-	skipped, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
-		Category: "implement_review_skipped",
-		Limit:    50,
-	})
+	skipped, err := r.decodeSkippedReviews(ctx, runID, "implement_review_skipped")
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range skipped {
-		if e.Payload == nil {
-			continue
-		}
-		raw, merr := json.Marshal(e.Payload)
-		if merr != nil {
-			continue
-		}
-		var p struct {
-			Reason    string `json:"reason"`
-			Authority string `json:"authority"`
-		}
-		if uerr := json.Unmarshal(raw, &p); uerr != nil {
-			continue
-		}
-		reviews = append(reviews, PlanReview{
-			ReviewerKind: "agent",
-			Authority:    p.Authority,
-			Verdict:      "skipped",
-			Reason:       p.Reason,
-		})
-	}
-	return reviews, nil
+	return append(reviews, skipped...), nil
 }
 
 // clampAuditLimit applies the default + cap. Negative or zero
