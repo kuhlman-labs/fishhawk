@@ -102,6 +102,16 @@ Cross-reference: this checklist codifies the rollout discipline introduced by #5
 | `cli/cmd/fishhawk/` or `cli/internal/...` | `fishhawk` CLI |
 | `backend/internal/plan/` or `backend/internal/spec/` (shared libs) | all four binaries |
 
+**Rebuilt-on-disk is not the same as live.** What it takes for a rebuilt binary to actually take effect differs per binary:
+
+| Binary | Activation after a rebuild |
+|---|---|
+| `fishhawkd` | rebuilt **and restarted** by `scripts/dev up`/`reload` |
+| `fishhawk-runner` | picked up automatically — spawned fresh from `bin/` on each `fishhawk_run_stage` |
+| `fishhawk-mcp` | rebuilt on disk but **needs a manual `/mcp` reconnect** — the Claude Code harness owns the MCP server process, so `scripts/dev` cannot restart it; it only signals the operator |
+
+`scripts/dev reload` (down-then-up) is the one-step post-merge command: plain `scripts/dev up` no-ops when fishhawkd is already running and so never rebuilds. Both `up` and `reload` print, as their last line(s), whether a `/mcp` reconnect is required (and why) based on whether `bin/fishhawk-mcp` was rebuilt. This supersedes the older "MCP server stale after rebuild" gotcha by making the reconnect-vs-rebuild distinction first-class.
+
 ## Adding a Go module
 
 1. `mkdir <name> && cd <name> && go mod init github.com/kuhlman-labs/fishhawk/<name>`

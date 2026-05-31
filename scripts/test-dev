@@ -1,0 +1,69 @@
+#!/usr/bin/env zsh
+# Hermetic unit test for scripts/dev library helpers.
+# Sources scripts/dev with DEV_LIB_ONLY=1 (dispatch suppressed) and asserts the
+# MCP-activation signalling and cmd_reload wiring without starting the stack.
+# Must be zsh: scripts/dev uses zsh-only features (typeset -A, subscript flags).
+# Standalone like scripts/test-cleanup-merged — not wired into scripts/test or CI.
+set -uo pipefail
+
+REPO_ROOT="${0:A:h:h}"
+PASS=0
+FAIL=0
+
+pass() { print "PASS: $1"; PASS=$(( PASS + 1 )) }
+fail() { print "FAIL: $1"; FAIL=$(( FAIL + 1 )) }
+
+# Source the library. scripts/dev enables `set -e`; turn it back off so the
+# assertions below (which run commands expected to fail) don't abort the test.
+DEV_LIB_ONLY=1 source "${REPO_ROOT}/scripts/dev"
+set +e
+
+# 1. Rebuilt path: prominent, names the binary, and tells the operator to reconnect.
+out="$(_signal_mcp_activation 1)"
+if [[ "$out" == *fishhawk-mcp* ]]; then
+  pass "rebuilt signal mentions fishhawk-mcp"
+else
+  fail "rebuilt signal should mention fishhawk-mcp (got: $out)"
+fi
+if print -r -- "$out" | grep -qi reconnect; then
+  pass "rebuilt signal matches /reconnect/i"
+else
+  fail "rebuilt signal should match /reconnect/i (got: $out)"
+fi
+
+# 2. Unchanged path: single explicit no-op line.
+out="$(_signal_mcp_activation 0)"
+if [[ "$out" == *"no MCP reconnect needed"* ]]; then
+  pass "unchanged signal says 'no MCP reconnect needed'"
+else
+  fail "unchanged signal should say 'no MCP reconnect needed' (got: $out)"
+fi
+
+# 3. cmd_reload core behavior: invokes cmd_down then cmd_up, forwarding flags.
+reload_body="$(typeset -f cmd_reload)"
+if print -r -- "$reload_body" | grep -q cmd_down; then
+  pass "cmd_reload invokes cmd_down"
+else
+  fail "cmd_reload should invoke cmd_down"
+fi
+if print -r -- "$reload_body" | grep -q cmd_up; then
+  pass "cmd_reload invokes cmd_up"
+else
+  fail "cmd_reload should invoke cmd_up"
+fi
+if print -r -- "$reload_body" | grep -q '"\$@"'; then
+  pass "cmd_reload forwards flags (\"\$@\") to cmd_up"
+else
+  fail "cmd_reload should forward \"\$@\" to cmd_up"
+fi
+
+# 4. Parse check: scripts/dev is valid zsh.
+if zsh -n "${REPO_ROOT}/scripts/dev"; then
+  pass "scripts/dev parses clean (zsh -n)"
+else
+  fail "scripts/dev failed zsh -n parse check"
+fi
+
+print ""
+print "Results: ${PASS} passed, ${FAIL} failed"
+[[ "$FAIL" -eq 0 ]]
