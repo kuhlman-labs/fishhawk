@@ -97,7 +97,12 @@ jobs:
           # v2.8.0 binaries are built with go1.25.x, so they can typecheck
           # packages whose deps require go 1.25. Older v2 releases (v2.0.x)
           # were built with go1.24 and reject go 1.25 packages.
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+          #
+          # Pin install.sh to the v2.8.0 tag, NOT master: the master script
+          # is unpinned and an upstream change to it broke CI (exit 1 right
+          # after resolving v2.8.0) with no change on our side. The tagged
+          # script matches the version it installs and is reproducible.
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
 
       - name: Lint, build, and test each module
