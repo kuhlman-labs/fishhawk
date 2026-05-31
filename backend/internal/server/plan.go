@@ -186,23 +186,26 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		}
 		if !coercionOK {
 			// Coercion could not help (non-string type or re-validation
-			// still fails). Transition the stage to failed-B so the run
-			// reflects the bad output rather than getting stuck in
-			// `running` (#527). Best-effort: a TransitionStage error
-			// logs but doesn't change the upload response.
+			// still fails). Fail the stage as category-B and walk the run
+			// to terminal failed (#527 / #603). The trace handler now
+			// leaves a plan stage in running (it no longer advances plan
+			// stages without a plan artifact), so FailStage walks
+			// running → failed; under a future plan-first reordering it
+			// walks from whatever non-terminal state the stage is in.
+			// advanceAfterFailure then drives the orchestrator so the run
+			// doesn't strand with a failed stage but a pending/running run.
+			// Best-effort: a transition / advance error logs but doesn't
+			// change the upload response.
 			cat := run.FailureB
 			reason := "plan_invalid: " + reportErr.Error()
-			if _, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stageID,
-				run.StageStateFailed, &run.StageCompletion{
-					FailureCategory: &cat,
-					FailureReason:   &reason,
-				}); terr != nil {
+			if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 					"plan upload: transition to failed-B after validation error failed",
 					slog.String("run_id", runID.String()),
 					slog.String("stage_id", stageID.String()),
-					slog.String("error", terr.Error()))
+					slog.String("error", ferr.Error()))
 			}
+			s.advanceAfterFailure(r, runID, stageID)
 			s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
 				"plan does not validate against standard_v1",
 				map[string]any{"error": reportErr.Error()})
@@ -286,14 +289,22 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// stage advancement is blocked.
 	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body)
 
-	// Plan-ready comment-back hook (#245). Fires here so the
-	// notifier sees the just-landed artifact even when the runner's
-	// trace-then-plan upload order beats the trace-handler's
-	// notifyPlanReady to running. Best-effort + dedup'd via the
-	// audit log; safe to call alongside the trace-handler hook.
-	// Suppressed on gating-reject: the stage has been failed, not
-	// awaiting approval, so a plan-ready comment would be misleading.
+	// Plan-stage terminal advancement (#603). With a valid plan artifact
+	// now stored, this handler is the authoritative driver of the plan
+	// stage's terminal transition: the trace handler leaves plan stages in
+	// running until a plan exists. Advance running → awaiting_approval (or
+	// → succeeded + orchestrator Advance for a gateless plan stage).
+	// Suppressed on gating-reject: runPlanReviews has already failed the
+	// stage, so advancing it would be a no-op-or-fault either way.
+	//
+	// notifyPlanReadyIfReady must run AFTER the advance — its guard
+	// requires the stage to be terminal/awaiting_approval. The
+	// just-landed artifact is now visible to the notifier even when the
+	// runner's trace-then-plan order beat the trace-handler hook to
+	// running. Best-effort + dedup'd via the audit log; safe alongside
+	// the trace-handler hook.
 	if !gatingRejected {
+		stage = s.advancePlanStageTerminal(r, runID, stage)
 		s.notifyPlanReadyIfReady(r, runID, stage)
 	}
 
@@ -321,6 +332,56 @@ func (s *Server) notifyPlanReadyIfReady(r *http.Request, runID uuid.UUID, stage 
 		return
 	}
 	s.notifyPlanReady(r.Context(), runID, stage)
+}
+
+// advancePlanStageTerminal drives the plan stage's terminal transition
+// once a valid plan artifact has landed (#603). The trace handler leaves
+// plan stages in running until a plan exists, so this handler owns the
+// running → awaiting_approval (gated) or running → succeeded (gateless)
+// transition.
+//
+// Idempotent: the state machine treats same-state re-application as a
+// no-op, so a future runner reordering where the trace handler already
+// advanced the stage (plan-first ordering) does not double-fault. On the
+// gateless path it fires the orchestrator's Advance so the next stage is
+// picked up, mirroring advanceStageAfterTrace.
+//
+// Best-effort: transition / advance / notify errors are WARN-logged and
+// never unwind the upload response. Returns the post-transition stage
+// (or the pre-transition stage on error) so the caller can pass the
+// settled state to notifyPlanReadyIfReady.
+func (s *Server) advancePlanStageTerminal(r *http.Request, runID uuid.UUID, stage *run.Stage) *run.Stage {
+	terminal := run.StageStateAwaitingApproval
+	if !stage.RequiresApproval {
+		terminal = run.StageStateSucceeded
+	}
+	updated, err := s.cfg.RunRepo.TransitionStage(r.Context(), stage.ID, terminal, nil)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: transition to terminal failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("target", string(terminal)),
+			slog.String("error", err.Error()))
+		return stage
+	}
+
+	// Sticky status comment (E20.4 / #330): the plan stage just settled.
+	s.notifyStatusUpdate(r.Context(), runID, "plan_handler")
+
+	// Gateless plan stages get no approval submission to drive the next
+	// dispatch — fire the orchestrator ourselves so the next stage gets
+	// picked up. Best-effort: a failure here logs but doesn't unwind.
+	if terminal == run.StageStateSucceeded && s.cfg.Orchestrator != nil {
+		if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"plan upload: orchestrator advance after gateless plan stage failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+	return updated
 }
 
 // planResponse is the JSON returned to the runner on plan upload.

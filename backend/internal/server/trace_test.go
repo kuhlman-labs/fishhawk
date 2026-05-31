@@ -528,6 +528,71 @@ func TestShipTrace_DispatchedStage_SkipsExtraStep(t *testing.T) {
 	}
 }
 
+// TestAdvanceStageAfterTrace_PlanStage_NoArtifact_StaysRunning pins the
+// #603 gate: a gated plan stage whose ArtifactRepo holds no standard_v1
+// plan artifact is left in running by the trace handler — it must NOT
+// reach awaiting_approval on trace upload alone. The complementary
+// sub-test pre-seeds a valid plan artifact so the trace handler DOES
+// advance (the future plan-first ordering), proving the gate keys on the
+// artifact rather than the stage type.
+func TestAdvanceStageAfterTrace_PlanStage_NoArtifact_StaysRunning(t *testing.T) {
+	t.Run("no artifact stays running", func(t *testing.T) {
+		sf := newSigningFake()
+		rr := newApprovalRunRepo()
+		art := newFakeArtifactRepo()                    // empty: no plan artifact for the stage
+		stage := rr.seedStage(run.StageStateDispatched) // plan-type, gated
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			SigningRepo:  sf,
+			TraceStore:   newTraceStoreFake(),
+			AuditRepo:    newAuditFake(),
+			RunRepo:      rr,
+			ArtifactRepo: art,
+		})
+
+		priv, _ := sf.issue(t, stage.RunID)
+		w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+		if got := rr.stages[stage.ID].State; got != run.StageStateRunning {
+			t.Errorf("stage state = %q, want running (no plan artifact → gate leaves it in running)", got)
+		}
+		for _, tr := range rr.transitions {
+			if tr.To == run.StageStateAwaitingApproval {
+				t.Errorf("stage transitioned to awaiting_approval with no plan artifact:\n%+v", rr.transitions)
+			}
+		}
+	})
+
+	t.Run("pre-seeded plan artifact advances", func(t *testing.T) {
+		sf := newSigningFake()
+		rr := newApprovalRunRepo()
+		art := newFakeArtifactRepo()
+		stage := rr.seedStage(run.StageStateDispatched) // plan-type, gated
+		// Pre-seed a standard_v1 plan artifact for the stage so the gate
+		// passes — modelling the future plan-first upload ordering.
+		seedBudgetPlanArtifact(t, art, stage.ID, &plan.Plan{PlanVersion: "standard_v1"})
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			SigningRepo:  sf,
+			TraceStore:   newTraceStoreFake(),
+			AuditRepo:    newAuditFake(),
+			RunRepo:      rr,
+			ArtifactRepo: art,
+		})
+
+		priv, _ := sf.issue(t, stage.RunID)
+		w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+		if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+			t.Errorf("stage state = %q, want awaiting_approval (plan artifact present → gate passes)", got)
+		}
+	})
+}
+
 func TestShipTrace_GatelessStage_TransitionsStraightToSucceeded(t *testing.T) {
 	// Implement stages have no approval gate per workflows.yaml.
 	// The trace upload handler must walk dispatched → running →

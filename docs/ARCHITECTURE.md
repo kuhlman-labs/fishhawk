@@ -86,7 +86,9 @@ When a stage's `reviewers.agent > 0` is configured in the workflow spec, the bac
 4. Self-review guard: if the review agent's model matches `plan.GeneratedBy.Model`, log WARN (ADR-027 §5 — no hard block in v0).
 5. For each review response, decode the `ReviewVerdict` JSON, append a `plan_reviewed` audit entry (category string `"plan_reviewed"`, payload `PlanReviewedPayload` from `backend/internal/planreview/review.go`).
 6. Authority check: if `ResolveAuthority(reviewers) == AuthorityGating` (i.e. `agent>0 && human==0`) and any verdict is `reject`, the stage stays in its current state rather than advancing to `awaiting_approval`.
-7. Otherwise proceed to `awaiting_approval` (or `succeeded` for gateless stages).
+7. Otherwise `handleShipPlan` drives the plan stage's terminal advance (`advancePlanStageTerminal`): `running → awaiting_approval`, or `running → succeeded` + an orchestrator `Advance` for a gateless plan stage.
+
+**Plan-stage advancement invariant** (#603): a plan stage's terminal transition is driven by a valid `standard_v1` plan artifact landing via the plan-upload handler (`handleShipPlan`), **not** by trace upload alone. The runner ships both trace variants before the plan, so `advanceStageAfterTrace` (`backend/internal/server/trace.go`) leaves a plan stage in `running` until `planArtifactExists` confirms a plan is stored — guarding against a gated plan stage reaching `awaiting_approval` with nothing to review when the later plan-ship fails `standard_v1` validation. On an invalid plan, `handleShipPlan` fails the stage category-B (`running → failed`) and calls `advanceAfterFailure` so the run walks to terminal `failed` rather than stranding. The transition is idempotent (same-state re-application is a repo-layer no-op), so a future plan-first upload ordering — where the trace handler finds the artifact and advances first — does not double-fault. When `ArtifactRepo` is unwired (minimal config), `planArtifactExists` returns true so the gate is a no-op and the prior trace-driven advance is preserved.
 
 **Authority resolution** (`backend/internal/planreview/review.go::ResolveAuthority`):
 
