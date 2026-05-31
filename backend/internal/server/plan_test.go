@@ -15,11 +15,133 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
+
+// recordingOrchestratorRepo wraps orchestratorRepo to record every
+// successful TransitionStage target, so a sequence test can assert that a
+// plan stage never passed through awaiting_approval. The embedded repo
+// validates the stage/run transition tables and mutates state, and a real
+// orchestrator.Orchestrator can drive it, so the run advances exactly as
+// in production. (#603)
+type recordingOrchestratorRepo struct {
+	*orchestratorRepo
+	stageTransitions []run.StageState
+}
+
+func (r *recordingOrchestratorRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	st, err := r.orchestratorRepo.TransitionStage(ctx, id, to, c)
+	if err == nil {
+		r.stageTransitions = append(r.stageTransitions, to)
+	}
+	return st, err
+}
+
+func (r *recordingOrchestratorRepo) sawTransitionTo(to run.StageState) bool {
+	for _, s := range r.stageTransitions {
+		if s == to {
+			return true
+		}
+	}
+	return false
+}
+
+// newPlanSequenceServer wires the full plan-stage path — signing, trace
+// store, audit, artifacts, a transition-recording run repo, and a real
+// orchestrator — so a test can drive the runner's true trace-then-plan
+// upload order and observe the resulting stage + run states. (#603)
+func newPlanSequenceServer(t *testing.T) (*Server, *recordingOrchestratorRepo, *fakeArtifactRepo, *signingFake) {
+	t.Helper()
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   newTraceStoreFake(),
+		AuditRepo:    newAuditFake(),
+		RunRepo:      rr,
+		ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	return s, rr, art, sf
+}
+
+// TestPlanStage_TraceThenInvalidPlan_EndsFailed reproduces the #603
+// sequence: the runner ships the trace (which no longer advances a plan
+// stage past running) and then an invalid plan. The stage must end in
+// failed — never awaiting_approval — and the run must be advanced to
+// terminal failed rather than stranded.
+func TestPlanStage_TraceThenInvalidPlan_EndsFailed(t *testing.T) {
+	s, rr, _, sf := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	planStage.RequiresApproval = true // gated plan stage — the #603 shape
+	priv, _ := sf.issue(t, runRow.ID)
+
+	// 1. Trace upload (raw). With no plan artifact yet, the trace handler
+	//    must leave the plan stage in running.
+	wt := shipRequest(t, s, runRow.ID, planStage.ID, "raw", priv, []byte("b"), "")
+	if wt.Code != http.StatusAccepted {
+		t.Fatalf("trace status = %d, want 202:\n%s", wt.Code, wt.Body.String())
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateRunning {
+		t.Fatalf("after trace: stage state = %q, want running (plan stage must not advance without a plan artifact)", got)
+	}
+
+	// 2. Plan upload with an invalid body.
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv,
+		[]byte(`{"plan_version":"standard_v1"}`), "")
+	if wp.Code != http.StatusBadRequest {
+		t.Fatalf("plan status = %d, want 400:\n%s", wp.Code, wp.Body.String())
+	}
+
+	// The plan stage never reached a human gate with no plan to review.
+	if rr.sawTransitionTo(run.StageStateAwaitingApproval) {
+		t.Errorf("stage transitioned to awaiting_approval; #603 requires it stay out of the gate with no valid plan\ntransitions: %+v", rr.stageTransitions)
+	}
+	// The stage ends failed.
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateFailed {
+		t.Errorf("final stage state = %q, want failed", got)
+	}
+	// The run is advanced to terminal failed (the stranded-run half).
+	if got := rr.runs[runRow.ID].State; got != run.StateFailed {
+		t.Errorf("final run state = %q, want failed (run must not strand once the stage fails)", got)
+	}
+}
+
+// TestPlanStage_TraceThenValidPlan_AdvancesToAwaitingApproval is the happy
+// path of the #603 reordering: the trace leaves the gated plan stage in
+// running, and the plan-upload handler drives it to awaiting_approval once
+// the valid plan lands.
+func TestPlanStage_TraceThenValidPlan_AdvancesToAwaitingApproval(t *testing.T) {
+	s, rr, _, sf := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	wt := shipRequest(t, s, runRow.ID, planStage.ID, "raw", priv, []byte("b"), "")
+	if wt.Code != http.StatusAccepted {
+		t.Fatalf("trace status = %d, want 202:\n%s", wt.Code, wt.Body.String())
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateRunning {
+		t.Fatalf("after trace: stage state = %q, want running", got)
+	}
+
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, validPlanBytes(t), "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("final stage state = %q, want awaiting_approval (plan handler must drive the terminal advance)", got)
+	}
+}
 
 // fakePlanReviewer records each Review invocation and returns a canned verdict.
 type fakePlanReviewer struct {
@@ -318,9 +440,13 @@ func TestShipPlan_CoercibleSchemaError_Returns201(t *testing.T) {
 		t.Errorf("audit[1].category = %q, want plan_generated", got)
 	}
 
-	// Coerced plans must NOT transition to failed-B.
-	if len(rr.transitionStageCalls) != 0 {
-		t.Errorf("transitionStage calls = %d, want 0 (coercion succeeded)", len(rr.transitionStageCalls))
+	// Coerced plans must NOT transition to failed-B. (#603: the success
+	// path now drives the plan stage's terminal advance, so a transition
+	// to a terminal *success* state is expected — only failed is wrong.)
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("coerced plan should not transition the stage to failed; got %+v", call)
+		}
 	}
 }
 
@@ -360,6 +486,10 @@ func TestShipPlan_NonCoercibleSchemaError_400(t *testing.T) {
 func TestShipPlan_SchemaInvalid_400(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, _, rr := newPlanServer(t, runID, stageID)
+	// #603: the trace handler no longer advances a plan stage past
+	// running until a plan artifact exists, so at plan-ship time the
+	// stage is in running. FailStage walks running → failed.
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, State: run.StageStateRunning}
 	priv, _ := sf.issue(t, runID)
 	body := []byte(`{"plan_version":"standard_v1"}`) // missing required fields
 
@@ -374,12 +504,13 @@ func TestShipPlan_SchemaInvalid_400(t *testing.T) {
 		t.Errorf("artifacts = %d, want 0 on schema fail", len(ar.all))
 	}
 
-	// #527: when the plan body fails standard_v1 validation, the
-	// plan handler must transition the stage to failed-B so the run
-	// doesn't get stuck in awaiting_approval with no valid plan
-	// attached. The trace handler advances the stage to
-	// awaiting_approval first (trace arrives before plan); this
-	// handler corrects course on the failure path.
+	// #527 / #603: when the plan body fails standard_v1 validation, the
+	// plan handler fails the stage as category-B (running → failed via
+	// run.FailStage) so the run reflects the bad output rather than
+	// stranding at awaiting_approval with no valid plan. The orchestrator
+	// advance that walks the run to terminal failed is asserted in
+	// TestPlanStage_TraceThenInvalidPlan_EndsFailed (this server wires no
+	// orchestrator, so advanceAfterFailure is a no-op here).
 	if len(rr.transitionStageCalls) != 1 {
 		t.Fatalf("transitionStage calls = %d, want 1:\n%+v",
 			len(rr.transitionStageCalls), rr.transitionStageCalls)

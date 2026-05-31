@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -371,6 +372,25 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 		}
 	}
 
+	// Plan-stage advancement gate (#603). A plan stage's terminal
+	// transition (→ awaiting_approval, or → succeeded for a gateless
+	// stage) is driven by a valid standard_v1 plan artifact landing via
+	// the plan-upload handler, not by trace upload alone. The runner
+	// ships both trace variants before the plan, so at trace-upload time
+	// a plan stage has no plan artifact yet — leave it in running and let
+	// handleShipPlan drive the terminal transition once the plan
+	// validates. Without this a gated plan stage would reach
+	// awaiting_approval with nothing to review when the later plan-ship
+	// fails validation, and get_plan would return no_plan_yet.
+	//
+	// Non-plan stages (implement/review) advance unchanged. When
+	// ArtifactRepo is nil (minimal config) planArtifactExists returns
+	// true so this gate is a no-op and the prior trace-driven behavior is
+	// preserved.
+	if stage.Type == run.StageTypePlan && !s.planArtifactExists(r.Context(), stageID) {
+		return
+	}
+
 	terminal := run.StageStateAwaitingApproval
 	if !stage.RequiresApproval {
 		terminal = run.StageStateSucceeded
@@ -422,6 +442,43 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// short-circuits for non-issue triggers; for issue triggers it
 	// edits the seeded comment in place.
 	s.notifyStatusUpdate(r.Context(), runID, "trace_handler")
+}
+
+// planArtifactExists reports whether a valid standard_v1 plan artifact
+// has been stored for the stage (#603). It mirrors the Kind == plan +
+// SchemaVersion == standard_v1 filter in prompt.go::tryLoadPlanForRun so
+// the trace handler's plan-stage advancement gate and the prompt builder
+// agree on what counts as a usable plan.
+//
+// When ArtifactRepo is nil (minimal config) it returns true so the gate
+// is a no-op and the prior trace-driven advancement is preserved. On a
+// list error it returns false — leaving the plan stage in running rather
+// than advancing it past a human gate with no plan — because the
+// plan-upload handler is the authoritative driver of the terminal
+// transition and will advance the stage once a valid plan lands.
+func (s *Server) planArtifactExists(ctx context.Context, stageID uuid.UUID) bool {
+	if s.cfg.ArtifactRepo == nil {
+		return true
+	}
+	arts, err := s.cfg.ArtifactRepo.ListForStage(ctx, stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"plan-stage gate: list artifacts failed — leaving stage in running",
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	for _, a := range arts {
+		if a.Kind != artifact.KindPlan {
+			continue
+		}
+		if a.SchemaVersion == nil || *a.SchemaVersion != "standard_v1" {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // notifyPlanReady fires the plan-ready comment-back hook after a
