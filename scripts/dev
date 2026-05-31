@@ -120,6 +120,27 @@ _build_binary() {
   esac
 }
 
+# Emits the MCP reconnect signal — must be the LAST thing printed by up/reload
+# so it is unmissable. Arg 1: 1 if bin/fishhawk-mcp was rebuilt this run, else 0.
+# scripts/dev cannot restart the MCP server (the Claude Code harness owns that
+# process), so on a rebuild the only lever is to tell the operator, unmissably,
+# that a manual /mcp reconnect is required or the new binary stays inert.
+_signal_mcp_activation() {
+  local rebuilt="${1:-0}"
+  if (( rebuilt )); then
+    print ""
+    print "================================================================"
+    print "  ACTION REQUIRED: bin/fishhawk-mcp was rebuilt this run."
+    print ""
+    print "  scripts/dev cannot restart the MCP server — the Claude Code"
+    print "  harness owns that process. Run /mcp to reconnect, or the"
+    print "  rebuilt fishhawk-mcp binary stays inert in this session."
+    print "================================================================"
+  else
+    print "no MCP reconnect needed (bin/fishhawk-mcp unchanged)"
+  fi
+}
+
 cmd_up() {
   local force_all=0
   local start_deps=0
@@ -225,6 +246,14 @@ cmd_up() {
     print "rebuilt 0 of 4 binaries (nothing changed)"
   fi
 
+  # Detect whether fishhawk-mcp was rebuilt off the existing rebuilt_list — no
+  # second detection mechanism. The (Ie) subscript flags return the matching
+  # index (>0) or 0 when absent. The signal itself is emitted last (below).
+  local mcp_rebuilt=0
+  if (( ${rebuilt_list[(Ie)fishhawk-mcp]} )); then
+    mcp_rebuilt=1
+  fi
+
   # Migrate
   print "applying migrations..."
   "$BIN" migrate up
@@ -235,6 +264,9 @@ cmd_up() {
   local pid=$!
   print "$pid" > "$PID_FILE"
   print "fishhawkd started (pid ${pid}) — logs: ${LOG_FILE}"
+
+  # Last line(s): tell the operator whether a /mcp reconnect is required.
+  _signal_mcp_activation "$mcp_rebuilt"
 }
 
 cmd_down() {
@@ -270,8 +302,37 @@ cmd_down() {
   rm -f "$PID_FILE"
 }
 
-case "$cmd" in
-  up)   cmd_up "${@:2}" ;;
-  down) cmd_down ;;
-  *)    print -u2 "usage: scripts/dev <up [--all] [--start-deps]|down>"; exit 1 ;;
-esac
+# One-step post-merge command: stop fishhawkd (if running), rebuild changed
+# binaries, restart fishhawkd, and emit the MCP reconnect signal. Plain `up`
+# no-ops when fishhawkd is already running, so it never rebuilds after a merge;
+# reload (down-then-up) closes that gap. Flags (--all/--start-deps) forward to
+# cmd_up.
+cmd_reload() {
+  if [[ -f "$PID_FILE" ]]; then
+    cmd_down
+  fi
+  cmd_up "$@"
+}
+
+_usage() {
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|down>"
+  print -u2 ""
+  print -u2 "  reload is the one-step post-merge command (down-then-up); plain up no-ops"
+  print -u2 "  when fishhawkd is already running and so never rebuilds."
+  print -u2 ""
+  print -u2 "binary activation after a rebuild:"
+  print -u2 "  fishhawkd        rebuilt + restarted by up/reload"
+  print -u2 "  fishhawk-runner  picked up automatically (spawned fresh from bin/ per stage)"
+  print -u2 "  fishhawk-mcp     rebuilt on disk but requires a manual /mcp reconnect"
+}
+
+# DEV_LIB_ONLY lets scripts/test-dev source this file to unit-test the helpers
+# without triggering the dispatch (and thus the stack).
+if [[ -z "${DEV_LIB_ONLY:-}" ]]; then
+  case "$cmd" in
+    up)     cmd_up "${@:2}" ;;
+    reload) cmd_reload "${@:2}" ;;
+    down)   cmd_down ;;
+    *)      _usage; exit 1 ;;
+  esac
+fi
