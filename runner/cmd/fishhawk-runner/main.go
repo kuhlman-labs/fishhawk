@@ -361,6 +361,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		invokeErr error
 		diff      *constraint.Diff
 		diffErr   error
+		// planValidationFailed records that res.OK was demoted
+		// specifically by a LOCAL plan-validation failure — not an agent
+		// category-A failure, a constraint violation, or a verify-gate
+		// failure. It widens the plan-upload gate below so the
+		// known-invalid plan is still POSTed, letting the backend's
+		// handleShipPlan accept-and-reject path own the running->failed(B)
+		// transition (#613).
+		planValidationFailed bool
 	)
 
 	for {
@@ -384,6 +392,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				res.FailureCategory = "B"
 				res.FailureReason = demote.Error()
 				invokeErr = demote
+				planValidationFailed = true
 			} else {
 				res.Events = append(res.Events, ev)
 			}
@@ -630,7 +639,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// plan upload is category-C unless the backend rejected the
 		// body as schema-invalid (ErrPlanInvalid) — that's category-B
 		// since it's the agent's output that's bad, not the network.
-		if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
+		// planValidationFailed widens the gate so a locally-invalid plan
+		// is still shipped (#613): the backend's handleShipPlan FailStage-B
+		// path (#603) then transitions the stage to failed promptly with
+		// the validation error in the audit trail, instead of leaving it
+		// in `running` until the SLA watchdog reaps it. uploadPlan returns
+		// ErrPlanInvalid in this case, so the success path is never reached
+		// and the existing error handler maps it to category B below.
+		if (res.OK || planValidationFailed) && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
+			if planValidationFailed {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"plan_invalid_shipped","run_id":%q,"stage_id":%q}`+"\n",
+					cfg.runID, cfg.stageID)
+			}
 			if err := uploadPlan(ctx, cfg, logSink, client, issuedKey); err != nil {
 				res.OK = false
 				if errors.Is(err, upload.ErrPlanInvalid) {
