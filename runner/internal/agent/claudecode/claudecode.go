@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,31 @@ import (
 // DefaultBinary is the executable name resolved against PATH when
 // Invoker.Binary is empty.
 const DefaultBinary = "claude"
+
+// allowedExtraDirs is the single source of truth for write roots the
+// agent is permitted outside the repo working tree. It seeds BOTH the
+// `--add-dir` invocation flags AND the out-of-tree write detector's
+// allowlist, so the flag and the detector can never drift. /tmp is
+// required for the plan artifact (/tmp/fishhawk-plan.json, matched by
+// backend/internal/prompt.PlanArtifactPath). The full allowlist at
+// runtime is inv.WorkingDir plus these.
+var allowedExtraDirs = []string{"/tmp"}
+
+// fileWritingTools maps Claude Code stream-json tool_use names that
+// write to the filesystem to the `input` field carrying the target
+// path. A tool_use for any other tool (Bash, Read, Grep, …) is not a
+// direct filesystem write through the tool layer and is ignored — note
+// the residual gap this leaves: Bash-mediated writes (shell `>`
+// redirects) are NOT visible here, only Write/Edit-TOOL writes (the
+// #601 class). Full confinement of Bash-mediated writes requires an
+// OS-level sandbox; see the flag-rationale block in invokeOnce and the
+// deferred agent-filesystem-confinement ADR.
+var fileWritingTools = map[string]string{
+	"Write":        "file_path",
+	"Edit":         "file_path",
+	"MultiEdit":    "file_path",
+	"NotebookEdit": "notebook_path",
+}
 
 // defaultHeartbeatInterval is the cadence of stage_progress liveness
 // heartbeats written to Invocation.ProgressSink during an invocation
@@ -199,18 +225,47 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// additional safety boundary in that model. The trace bundle is
 	// the authoritative record.
 	//
-	// --add-dir /tmp: Claude restricts writes to the working
-	// directory tree by default. The runner needs the agent to write
-	// its plan artifact to /tmp/fishhawk-plan.json (matched by
+	// Why this flag is RETAINED rather than swapped for a confining
+	// --permission-mode (empirical matrix, claude 2.1.156, 2026-06-01):
+	//
+	//   mode                          | Bash (go test, lint, …) | out-of-tree write
+	//   ------------------------------|-------------------------|------------------
+	//   acceptEdits / dontAsk         | DENIED ("requires       | Write/Edit tool
+	//                                 |  approval") — regresses |  confined, but the
+	//                                 |  the non-interactive    |  loop can't build
+	//                                 |  implement loop         |  or test
+	//   acceptEdits + allowedTools    | allowed                 | reopened via shell
+	//     Bash  /  auto               |                         |  `>` redirect
+	//   dangerously-skip-permissions  | allowed                 | unconfined (today)
+	//
+	// No claude-native mode gives BOTH non-interactive Bash AND full
+	// out-of-tree write confinement: every mode that allows the Bash
+	// the implement stage needs (go build/test, golangci-lint,
+	// scripts/test) also leaves a shell-redirect escape hatch. True
+	// confinement therefore requires an OS-level sandbox, deferred to
+	// the agent-filesystem-confinement ADR (see ADR-024 for agent
+	// execution). This PR does NOT change the flag; instead out-of-tree
+	// writes through the Write/Edit TOOLS (the #601 class) are now
+	// SURFACED as out_of_tree_write trace events (see the scan loop
+	// below). Bash-mediated writes remain invisible to that detector —
+	// that residual gap is the ADR's domain.
+	//
+	// --add-dir: Claude restricts writes to the working directory tree
+	// by default. The runner needs the agent to write its plan artifact
+	// to /tmp/fishhawk-plan.json (matched by
 	// backend/internal/prompt.PlanArtifactPath); /tmp is outside the
 	// customer's repo checkout so we explicitly expand the allowlist.
+	// allowedExtraDirs is the single source of truth shared with the
+	// out_of_tree_write detector so the flag and the detector can't drift.
 	args := []string{
 		"--print", "--verbose",
 		"--output-format", "stream-json",
 		"--dangerously-skip-permissions",
-		"--add-dir", "/tmp",
-		"-p", inv.Prompt,
 	}
+	for _, dir := range allowedExtraDirs {
+		args = append(args, "--add-dir", dir)
+	}
+	args = append(args, "-p", inv.Prompt)
 	cmd := cmdFn(ctx, binary, args...)
 	cmd.Dir = inv.WorkingDir
 	// Compose env so a Cmd builder (e.g. tests) can pre-set
@@ -337,6 +392,11 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		}()
 	}
 
+	// allowedRoots is the working tree plus the explicitly allowlisted
+	// extra dirs (shared with --add-dir via allowedExtraDirs). The
+	// detector flags any Write/Edit-tool target outside all of these.
+	allowedRoots := append([]string{inv.WorkingDir}, allowedExtraDirs...)
+
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -345,6 +405,23 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		res.Events = append(res.Events, ev)
 		if ev.Kind == "result" || strings.HasPrefix(ev.Kind, "result.") {
 			resultPayload = append([]byte(nil), ev.Payload...)
+		}
+		// Surface (never block) any agent write targeting a path outside
+		// the working tree + allowlist. Purely additive: a detection
+		// appends a warning event and does NOT flip res.OK or fail the
+		// stage. The detector is fail-open — an unparseable / unknown
+		// shape line yields no writes, never a panic.
+		for _, w := range outOfTreeWrites(line, allowedRoots) {
+			res.Events = append(res.Events, agent.Event{
+				Kind:      "out_of_tree_write",
+				Timestamp: now(),
+				Payload: agent.MakePayload(map[string]string{
+					"path":   w.path,
+					"tool":   w.tool,
+					"run_id": inv.RunID,
+					"stage":  inv.Stage,
+				}),
+			})
 		}
 		progMu.Lock()
 		turns++
@@ -539,6 +616,132 @@ func parseLine(line []byte, ts time.Time) (agent.Event, int, bool) {
 		Timestamp: ts,
 		Payload:   json.RawMessage(trimmed),
 	}, used, hasUsage
+}
+
+// outOfTreeWrite is one detected file-writing tool_use whose target
+// escapes the allowed roots.
+type outOfTreeWrite struct {
+	tool string
+	path string
+}
+
+// outOfTreeWrites inspects one Claude Code stream-json line and returns
+// every file-writing tool_use whose target path is NOT contained within
+// an allowed root. allowedRoots is inv.WorkingDir followed by
+// allowedExtraDirs; relative target paths resolve against allowedRoots[0]
+// (the working dir).
+//
+// It is a SURFACING signal, not a gate: the caller appends a warning
+// event and never fails the stage. Accordingly the function is
+// fail-open — any parse failure, a non-assistant line, an unknown
+// payload shape, or a missing path yields no writes and never panics, so
+// a stream-json schema drift across claude versions degrades to
+// no-signal rather than a crash.
+func outOfTreeWrites(line []byte, allowedRoots []string) []outOfTreeWrite {
+	var msg struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type  string          `json:"type"`
+				Name  string          `json:"name"`
+				Input json.RawMessage `json:"input"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(line, &msg); err != nil || msg.Type != "assistant" {
+		return nil
+	}
+
+	base := ""
+	if len(allowedRoots) > 0 {
+		base = allowedRoots[0]
+	}
+
+	var out []outOfTreeWrite
+	for _, block := range msg.Message.Content {
+		if block.Type != "tool_use" {
+			continue
+		}
+		field, ok := fileWritingTools[block.Name]
+		if !ok {
+			continue
+		}
+		var input map[string]json.RawMessage
+		if err := json.Unmarshal(block.Input, &input); err != nil {
+			continue
+		}
+		raw, ok := input[field]
+		if !ok {
+			continue
+		}
+		var target string
+		if err := json.Unmarshal(raw, &target); err != nil || target == "" {
+			continue
+		}
+		if !containedInAny(target, base, allowedRoots) {
+			out = append(out, outOfTreeWrite{tool: block.Name, path: target})
+		}
+	}
+	return out
+}
+
+// containedInAny reports whether target (resolved against base if it is
+// relative) lies within any of allowedRoots. Comparison is on cleaned,
+// symlink-resolved absolute paths: a target is inside a root iff
+// filepath.Rel succeeds and the result neither escapes upward ("..",
+// "../…") nor is absolute.
+func containedInAny(target, base string, allowedRoots []string) bool {
+	abs := target
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(base, abs)
+	}
+	abs = resolveSymlinks(abs)
+	for _, root := range allowedRoots {
+		r := resolveSymlinks(root)
+		rel, err := filepath.Rel(r, abs)
+		if err != nil {
+			continue
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// resolveSymlinks canonicalises path as far as the filesystem allows.
+// filepath.EvalSymlinks fails on a path that does not exist yet — which
+// is the COMMON case here, since the agent typically writes NEW files —
+// so we resolve the deepest EXISTING ancestor and re-append the
+// not-yet-created tail. This still canonicalises e.g. macOS's
+// /tmp -> /private/tmp symlink (the agent emits the resolved
+// /private/tmp form) on the existing parent dirs, so a new in-tree file
+// is correctly judged contained while a new out-of-tree file is flagged.
+// Fail-open: if no ancestor resolves, the cleaned input is returned.
+func resolveSymlinks(path string) string {
+	path = filepath.Clean(path)
+	tail := ""
+	cur := path
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			if tail == "" {
+				return resolved
+			}
+			return filepath.Join(resolved, tail)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached the filesystem root with nothing resolvable.
+			return path
+		}
+		if tail == "" {
+			tail = filepath.Base(cur)
+		} else {
+			tail = filepath.Join(filepath.Base(cur), tail)
+		}
+		cur = parent
+	}
 }
 
 // isBinaryMissing reports whether err means the binary itself is
