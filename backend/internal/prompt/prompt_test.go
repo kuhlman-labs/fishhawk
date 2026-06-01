@@ -1093,6 +1093,34 @@ func TestBuild_PlanReview_ReviewCriteriaPresent(t *testing.T) {
 	}
 }
 
+func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
+	// #606: the verbose verdict-schema / review-criteria / decision-rule
+	// preamble was trimmed to lower the per-call token cost on the local
+	// reviewer (no prompt caching — the full prompt is one -p argument). Pin
+	// the size reduction so a future reword can't silently re-bloat the
+	// prompt. The baseline below is the byte length of the prompt (with this
+	// fixture) BEFORE the #606 trim. Load-bearing tokens are covered by the
+	// other TestBuild_PlanReview_* tests; this one guards the token budget.
+	const preTrimBaselineLen = 3333
+	got := buildPlanReview(Trigger{
+		Repo:         "kuhlman-labs/example",
+		IssueNumber:  42,
+		IssueTitle:   "Add foo",
+		IssueBody:    "We need a foo function in pkg/bar.",
+		ApprovedPlan: fixturePlan(),
+	})
+	if len(got) >= preTrimBaselineLen {
+		t.Errorf("buildPlanReview not trimmed: got %d bytes, expected materially below pre-trim baseline %d",
+			len(got), preTrimBaselineLen)
+	}
+	// Require a material reduction, not a one-byte cosmetic change.
+	const minReduction = 300
+	if preTrimBaselineLen-len(got) < minReduction {
+		t.Errorf("buildPlanReview trim immaterial: got %d bytes, only %d below baseline %d (want >= %d shorter)",
+			len(got), preTrimBaselineLen-len(got), preTrimBaselineLen, minReduction)
+	}
+}
+
 func TestBuild_PlanReview_GroundsRuleCitations(t *testing.T) {
 	// #595: review agents fabricated a CLAUDE.md comment-length rule that
 	// does not exist. The grounding constraint must instruct the reviewer to
