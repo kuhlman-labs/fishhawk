@@ -601,6 +601,100 @@ func TestBuild_Plan_CalibrationHint_NoAdvisoryAboveThreshold(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_CalibrationHint_MediumBandAdvisory(t *testing.T) {
+	// Medium band at 1/10 within 1.5x (10% ≤ 25%) → advisory fires naming
+	// "medium" and surfacing the 1/ratio sizing-down factor. ratio 0.17 → ~5.9x.
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          10,
+			CalibrationRatio: 0.17,
+			ActualP50Minutes: 60.0,
+			ActualP95Minutes: 90.0,
+			ConfidenceBands: map[string]CalibrationBand{
+				"medium": {Samples: 10, WithinScale: 1},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"\"medium\" has degraded too",
+		"1/10 within 1.5x",
+		"about 5.9x too high",
+		"Drop to \"low\"",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing medium advisory string %q:\n%s", w, got)
+		}
+	}
+	// The medium advisory must never steer toward "high".
+	if strings.Contains(got, "reaching for a higher band") == false {
+		t.Errorf("medium advisory should steer away from higher bands:\n%s", got)
+	}
+}
+
+func TestBuild_Plan_CalibrationHint_BothBandsBadFireBoth(t *testing.T) {
+	// Both high and medium at 1/10 → both advisories fire independently.
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          20,
+			CalibrationRatio: 0.50,
+			ActualP50Minutes: 30.0,
+			ActualP95Minutes: 50.0,
+			ConfidenceBands: map[string]CalibrationBand{
+				"high":   {Samples: 10, WithinScale: 1},
+				"medium": {Samples: 10, WithinScale: 1},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"LEAST accurate band historically", // high-band advisory
+		"\"medium\" has degraded too",      // medium-band advisory
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing advisory string %q (both bands should fire):\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Plan_CalibrationHint_NoMediumAdvisoryWhenAccurate(t *testing.T) {
+	// Medium at 8/10 (80% > 25%) → medium advisory must NOT fire, while the
+	// rest of the calibration hint still renders.
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		CalibrationHint: &CalibrationHint{
+			Samples:          10,
+			CalibrationRatio: 1.00,
+			ActualP50Minutes: 10.0,
+			ActualP95Minutes: 15.0,
+			ConfidenceBands: map[string]CalibrationBand{
+				"medium": {Samples: 10, WithinScale: 8},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "\"medium\" has degraded too") {
+		t.Errorf("medium-band advisory must not fire when medium band is accurate (8/10):\n%s", got)
+	}
+	// The hint body still renders.
+	if !strings.Contains(got, "Confidence-band accuracy:") {
+		t.Errorf("calibration hint body should still render:\n%s", got)
+	}
+}
+
 func TestBuild_Plan_ScopeFilesShapeGuidance(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		IssueNumber: 7,
