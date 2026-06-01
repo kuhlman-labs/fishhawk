@@ -108,6 +108,16 @@ type ScopeConstraint struct {
 	SiblingHints []string
 }
 
+// IssueComment is one issue comment in Trigger.IssueComments, a
+// snapshot taken at trigger time (#618). Author is the commenter's
+// GitHub login; CreatedAt is the RFC3339 timestamp from the GitHub
+// API. Rendered into the plan-stage prompt by writeIssueContext.
+type IssueComment struct {
+	Author    string
+	Body      string
+	CreatedAt string
+}
+
 // Trigger captures the bits of the originating event needed to
 // construct an issue-driven prompt. Empty IssueTitle / IssueBody
 // for non-issue triggers; for v0, those triggers all come from
@@ -128,6 +138,13 @@ type Trigger struct {
 	// implement stage links to the issue and lets the agent fetch
 	// (#244).
 	IssueBody string
+	// IssueComments are the issue's comments at trigger time, a
+	// snapshot captured alongside IssueBody (#618). Only the
+	// plan-stage prompt renders them — after the body — so
+	// comment-borne refinements/decisions reach the plan agent on
+	// the first attempt. Empty/nil for non-issue triggers, issues
+	// with no comments, or runs whose issue_context predates #618.
+	IssueComments []IssueComment
 	// IssueURL is the canonical github.com URL for the triggering
 	// issue. Set by the server-side prompt handler from
 	// repo + IssueNumber. Used by the implement-stage prompt's
@@ -920,7 +937,84 @@ func writeIssueContext(b *strings.Builder, t Trigger) {
 		b.WriteString(t.IssueBody)
 		b.WriteString("\n")
 	}
+	writeIssueComments(b, t.IssueComments)
 	b.WriteString("\n")
+}
+
+// writeIssueComments renders the issue's comments into the plan-stage
+// prompt after the body (#618). Comment-borne refinements/decisions
+// would otherwise never reach the plan agent, which only saw
+// title+body — the #616 case where a refinement posted as a comment
+// needed a reject->re-plan to land.
+//
+// Rules:
+//   - Drop comments whose author login ends in `[bot]` (CI bots and
+//     Fishhawk's own #377 footer) so the agent doesn't read its own
+//     output back as new guidance.
+//   - Render survivors chronologically (oldest->newest), each prefixed
+//     with the author login and timestamp.
+//   - Cap each comment body (maxCommentBytes) and the total rendered
+//     size (maxTotalCommentBytes). When over the total budget, drop the
+//     OLDEST comments first — recency is load-bearing because a later
+//     comment may supersede the body — and prepend an omission marker.
+//   - Lead with a one-line preface that later comments may supersede
+//     the body.
+//
+// Renders nothing when no comments survive the bot filter (the
+// body-only fallback is unchanged).
+func writeIssueComments(b *strings.Builder, comments []IssueComment) {
+	surviving := make([]IssueComment, 0, len(comments))
+	for _, c := range comments {
+		if strings.HasSuffix(c.Author, "[bot]") {
+			continue
+		}
+		surviving = append(surviving, c)
+	}
+	if len(surviving) == 0 {
+		return
+	}
+
+	// Per-comment cap so a single long comment can't dominate the
+	// budget. Same capped-injection style as PriorRejectionFeedback's
+	// maxFeedbackBytes.
+	const maxCommentBytes = 2000
+	rendered := make([]string, len(surviving))
+	for i, c := range surviving {
+		body := c.Body
+		if len(body) > maxCommentBytes {
+			body = body[:maxCommentBytes] + "...[truncated]"
+		}
+		author := c.Author
+		if author == "" {
+			author = "unknown"
+		}
+		rendered[i] = fmt.Sprintf("**@%s** (%s):\n%s", author, c.CreatedAt, body)
+	}
+
+	// Total budget: walk newest->oldest accumulating bytes; once over
+	// budget, drop everything older (recency is load-bearing). The
+	// newest comment always survives — the per-comment cap is below the
+	// total budget.
+	const maxTotalCommentBytes = 12000
+	start := 0
+	total := 0
+	for i := len(rendered) - 1; i >= 0; i-- {
+		total += len(rendered[i])
+		if total > maxTotalCommentBytes {
+			start = i + 1
+			break
+		}
+	}
+
+	b.WriteString("\n### Issue comments\n\n")
+	b.WriteString("The issue has the following comments (oldest first). A later comment may refine or supersede the issue body above — weigh the most recent guidance accordingly.\n\n")
+	if start > 0 {
+		fmt.Fprintf(b, "[%d older comment(s) omitted to fit budget]\n\n", start)
+	}
+	for i := start; i < len(rendered); i++ {
+		b.WriteString(rendered[i])
+		b.WriteString("\n\n")
+	}
 }
 
 // quoteRepo backticks an "owner/name" string for inline display.

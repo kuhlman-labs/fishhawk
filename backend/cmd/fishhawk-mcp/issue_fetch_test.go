@@ -116,6 +116,24 @@ func TestFetchIssueViaGh_Success(t *testing.T) {
 	}
 }
 
+func TestFetchIssueViaGh_DecodesComments(t *testing.T) {
+	withFakeGh(t, `{"title":"Add foo","body":"We need foo.","url":"https://github.com/x/y/issues/42","number":42,"comments":[{"author":{"login":"alice"},"body":"Refinement here.","createdAt":"2026-05-01T10:00:00Z"},{"author":{"login":"bob"},"body":"Second comment.","createdAt":"2026-05-02T11:00:00Z"}]}`)
+	got, err := fetchIssueViaGh("x/y", 42)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(got.Comments) != 2 {
+		t.Fatalf("want 2 comments, got %d: %+v", len(got.Comments), got.Comments)
+	}
+	if got.Comments[0].Author != "alice" || got.Comments[0].Body != "Refinement here." ||
+		got.Comments[0].CreatedAt != "2026-05-01T10:00:00Z" {
+		t.Errorf("comment[0] mismatch: %+v", got.Comments[0])
+	}
+	if got.Comments[1].Author != "bob" {
+		t.Errorf("comment[1] author = %q, want bob", got.Comments[1].Author)
+	}
+}
+
 func TestFetchIssueViaGh_NotInstalled(t *testing.T) {
 	withFakeGhMissing(t)
 	_, err := fetchIssueViaGh("x/y", 42)

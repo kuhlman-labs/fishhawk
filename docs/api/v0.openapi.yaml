@@ -242,10 +242,13 @@ components:
     IssueContext:
       type: object
       description: |
-        Cached GitHub issue payload — title, body, url, and
-        number — fetched by the operator's `gh issue view` at
+        Cached GitHub issue payload — title, body, url, number, and
+        comments — fetched by the operator's `gh issue view` at
         run-create time so the backend's prompt builder doesn't
-        need an installation_id to look up the issue (#415).
+        need an installation_id to look up the issue (#415). The
+        optional `comments` array carries the issue's comments so the
+        plan agent sees refinements/decisions posted as comments, not
+        just the title+body snapshot (#618).
       required: [title, body, url, number]
       properties:
         title:
@@ -258,6 +261,24 @@ components:
         number:
           type: integer
           minimum: 1
+        comments:
+          type: array
+          description: |
+            Issue comments captured at run-create time, oldest first.
+            Optional and additive — runs whose issue_context predates
+            #618 omit the field.
+          items:
+            type: object
+            required: [author, body, created_at]
+            properties:
+              author:
+                type: string
+                description: Commenter's GitHub login.
+              body:
+                type: string
+              created_at:
+                type: string
+                format: date-time
 
     Stage:
       type: object

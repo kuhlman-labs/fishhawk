@@ -696,6 +696,17 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 	if runRow.IssueContext != nil {
 		trigger.IssueTitle = runRow.IssueContext.Title
 		trigger.IssueBody = runRow.IssueContext.Body
+		// Comments (#618): map the cached comment snapshot into the
+		// trigger so the plan-stage prompt can render comment-borne
+		// refinements. Branch 2 (webhook fetch) does not yet fetch
+		// comments — see the follow-up issue referenced in the PR.
+		for _, c := range runRow.IssueContext.Comments {
+			trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
+				Author:    c.Author,
+				Body:      c.Body,
+				CreatedAt: c.CreatedAt,
+			})
+		}
 		return
 	}
 

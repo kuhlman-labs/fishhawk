@@ -94,10 +94,21 @@ type Run struct {
 // run-create (#415). Stored on the run row so the prompt builder
 // reads it without needing a backend-side GitHub fetch.
 type IssueContext struct {
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	URL    string `json:"url"`
-	Number int    `json:"number"`
+	Title    string         `json:"title"`
+	Body     string         `json:"body"`
+	URL      string         `json:"url"`
+	Number   int            `json:"number"`
+	Comments []IssueComment `json:"comments,omitempty"`
+}
+
+// IssueComment is one issue comment carried alongside the body in
+// IssueContext (#618). Captured at run-create from `gh issue view
+// --json comments` so the plan agent sees refinements/decisions
+// posted as comments, not just the title+body snapshot.
+type IssueComment struct {
+	Author    string `json:"author"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
 }
 
 // CreateRunInput is what StartRun marshals into the request body.
