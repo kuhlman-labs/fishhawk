@@ -199,7 +199,16 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violat
 	for _, o := range outcomes {
 		switch o {
 		case "tests_added_or_updated":
-			if !diffTouchesTests(diff) {
+			switch {
+			case diffTouchesTests(diff):
+				// A recognized test file was added or updated — satisfied.
+			case len(diff.ChangedFiles) > 0 && !diffTouchesTestableCode(diff):
+				// Non-empty diff touching only docs/scripts/config: no
+				// unit-testable source changed, so the outcome is
+				// vacuously satisfied (#610). The len()>0 guard keeps an
+				// EMPTY diff failing — that still signals "stage produced
+				// nothing."
+			default:
 				v = append(v, Violation{
 					Constraint: "required_outcomes",
 					Detail:     "no test files added or updated",
@@ -255,6 +264,7 @@ func diffTouchesTests(diff Diff) bool {
 // in one place; new frameworks add a clause here.
 func isTestPath(p string) bool {
 	low := strings.ToLower(p)
+	base := filepathBase(low)
 	switch {
 	case strings.HasSuffix(low, "_test.go"): // Go
 		return true
@@ -273,12 +283,52 @@ func isTestPath(p string) bool {
 		strings.Contains(low, "/test/"): // Python / Rust / C++ test directories
 		return true
 	case strings.HasSuffix(low, "_test.py"),
-		strings.HasPrefix(filepathBase(low), "test_"): // Python
+		strings.HasPrefix(base, "test_"): // Python
 		return true
 	case strings.Contains(low, "/spec/"): // Ruby / Elixir
 		return true
+	case base == "test" || base == "tests": // shell/script test runner (e.g. scripts/test)
+		return true
+	case strings.HasPrefix(base, "test-"): // hyphenated script test convention (e.g. scripts/test-dev)
+		return true
+	case (strings.HasPrefix(low, "scripts/") || strings.Contains(low, "/scripts/")) &&
+		strings.HasPrefix(base, "test"): // any scripts/test* helper (test, test-dev, test-coverage)
+		return true
 	}
 	return false
+}
+
+// diffTouchesTestableCode reports whether the diff changes any file
+// with a recognized source-code extension. Used to scope
+// tests_added_or_updated: a non-empty diff that touches only docs,
+// shell scripts, or config (no source extension in this set) has no
+// unit-testable code, so the outcome is vacuously satisfied rather
+// than failed. The allowlist is a heuristic, not exhaustive — an
+// unrecognized future source language reads as "no testable code"
+// and passes vacuously (fail open, never a new false-fail); extend
+// the set here, the same one-function spot as isTestPath.
+func diffTouchesTestableCode(diff Diff) bool {
+	for _, f := range diff.ChangedFiles {
+		if f.Status == StatusDeleted {
+			continue
+		}
+		low := strings.ToLower(f.Path)
+		for _, ext := range testableSourceExts {
+			if strings.HasSuffix(low, ext) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// testableSourceExts is the set of file extensions that count as
+// unit-testable source code for diffTouchesTestableCode. Docs (.md),
+// shell scripts, and YAML/JSON config are deliberately excluded.
+var testableSourceExts = []string{
+	".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".rb", ".rs",
+	".java", ".kt", ".swift", ".scala", ".c", ".cc", ".cpp",
+	".h", ".hpp", ".cs", ".php", ".ex", ".exs", ".clj",
 }
 
 // filepathBase trims directory components from p without importing
