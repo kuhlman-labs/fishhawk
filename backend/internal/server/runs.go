@@ -45,10 +45,22 @@ type runResponse struct {
 // distinct from the domain type so a future field change in the
 // store doesn't accidentally leak through the API surface.
 type issueContextPayload struct {
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	URL    string `json:"url"`
-	Number int    `json:"number"`
+	Title    string                `json:"title"`
+	Body     string                `json:"body"`
+	URL      string                `json:"url"`
+	Number   int                   `json:"number"`
+	Comments []issueCommentPayload `json:"comments,omitempty"`
+}
+
+// issueCommentPayload mirrors run.IssueComment on the wire. Field
+// names match the OpenAPI issue-comment schema (required [author,
+// body, created_at]) that #618 published; because the POST /v0/runs
+// decoder uses DisallowUnknownFields, these tags must stay exactly
+// comments/author/body/created_at or a commented issue 400s.
+type issueCommentPayload struct {
+	Author    string `json:"author"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
 }
 
 func toRunResponse(r *run.Run) runResponse {
@@ -75,6 +87,17 @@ func toRunResponse(r *run.Run) runResponse {
 			Body:   r.IssueContext.Body,
 			URL:    r.IssueContext.URL,
 			Number: r.IssueContext.Number,
+		}
+		if len(r.IssueContext.Comments) > 0 {
+			comments := make([]issueCommentPayload, len(r.IssueContext.Comments))
+			for i, c := range r.IssueContext.Comments {
+				comments[i] = issueCommentPayload{
+					Author:    c.Author,
+					Body:      c.Body,
+					CreatedAt: c.CreatedAt,
+				}
+			}
+			resp.IssueContext.Comments = comments
 		}
 	}
 	return resp
@@ -396,6 +419,17 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			Body:   req.IssueContext.Body,
 			URL:    req.IssueContext.URL,
 			Number: req.IssueContext.Number,
+		}
+		if len(req.IssueContext.Comments) > 0 {
+			comments := make([]run.IssueComment, len(req.IssueContext.Comments))
+			for i, c := range req.IssueContext.Comments {
+				comments[i] = run.IssueComment{
+					Author:    c.Author,
+					Body:      c.Body,
+					CreatedAt: c.CreatedAt,
+				}
+			}
+			createParams.IssueContext.Comments = comments
 		}
 	}
 	if idempKey != "" {
