@@ -159,6 +159,9 @@ func TestBuild_Plan(t *testing.T) {
 		"scripts/sync-schemas",
 		"docs/spec/",
 		"citation",
+		// #627: cross-boundary test directive — pin the greppable anchors.
+		"spans multiple architectural layers",
+		"integration/end-to-end test",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -1083,12 +1086,39 @@ func TestBuild_PlanReview_ReviewCriteriaPresent(t *testing.T) {
 		"Verification adequacy",
 		"Risk coverage",
 		"Schema compliance",
+		"Cross-boundary integration test",
+		"end-to-end",
 		"Verdict decision rule",
 		"approve_with_concerns",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
 			t.Errorf("plan_review prompt missing review criteria element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_CrossBoundaryTestCriterion pins the load-bearing
+// substrings of criterion #7 (#627). Mirrors
+// TestBuild_PlanReview_GroundsRuleCitations. The criterion is advisory: it
+// instructs the reviewer to record a concern (approve_with_concerns) when a
+// cross-boundary change lacks an end-to-end test, not to hard-reject.
+func TestBuild_PlanReview_CrossBoundaryTestCriterion(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"serialization boundary",
+		"absent from scope.files",
+		"unit-only",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing cross-boundary criterion substring %q:\n%s", w, got)
 		}
 	}
 }
@@ -1101,7 +1131,15 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// prompt. The baseline below is the byte length of the prompt (with this
 	// fixture) BEFORE the #606 trim. Load-bearing tokens are covered by the
 	// other TestBuild_PlanReview_* tests; this one guards the token budget.
-	const preTrimBaselineLen = 3333
+	//
+	// #627 raised this baseline to keep the trim-guard meaningful after
+	// criterion #7 (cross-boundary integration test) was added. The guard's
+	// meaning is "the #606 trim still removes >= minReduction bytes vs the
+	// untrimmed version" — so the baseline must represent the untrimmed prompt
+	// that ALSO includes criterion #7, NOT current_size + minReduction (which
+	// would make the assertion tautological). New baseline = the original
+	// pre-#606 untrimmed length (3333) PLUS the 583 bytes criterion #7 adds.
+	const preTrimBaselineLen = 3916
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,
