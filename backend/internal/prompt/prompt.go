@@ -443,6 +443,11 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- decomposition.sub_plans[i]: {\"title\": \"...\", \"scope_hint\": \"...\", \"predicted_runtime_minutes\": N, \"predicted_runtime_confidence\": \"low|medium|high\"} object — use the FULL canonical field names; \"confidence\" / \"minutes\" shorthand will be rejected\n")
 	b.WriteString("The validator rejects any plan where these fields contain bare strings instead of their required structured shapes.\n")
 	b.WriteString("\n")
+	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
+		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +
+		"integration/end-to-end test that crosses those layers, not only per-layer unit tests. Per-layer units " +
+		"pass while the seam between them breaks (cf. #618).\n")
+	b.WriteString("\n")
 	b.WriteString("If your plan scope includes any file under docs/spec/, the verification steps must include: " +
 		"run scripts/sync-schemas after editing the canonical copy; CI schema-sync gate will catch embedded copies that drift.\n")
 	b.WriteString("\n")
@@ -575,7 +580,13 @@ func buildPlanReview(t Trigger) string {
 	b.WriteString("6. **Grounded citations**: any rule you cite — from CLAUDE.md, a style guide, or a project " +
 		"convention — MUST be one you can quote verbatim from the context in this prompt or a repository file you " +
 		"actually read during this review. Do NOT assert rules from memory; if you cannot verify the rule exists, " +
-		"do NOT raise the concern.\n\n")
+		"do NOT raise the concern.\n")
+	b.WriteString("7. **Cross-boundary integration test**: when the plan adds or changes a field/value that flows " +
+		"across layers (request/response payload -> domain type -> persistence -> render/consumer), verify " +
+		"verification.test_strategy includes a test that exercises the full path end-to-end, not only per-layer " +
+		"unit tests. Flag (concern, category coverage) if any serialization boundary in that data flow is absent " +
+		"from scope.files, or if the test strategy is unit-only for a cross-boundary change. Scope this to genuinely " +
+		"cross-boundary changes; do not raise it for incidental multi-file changes.\n\n")
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
