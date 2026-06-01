@@ -1223,6 +1223,11 @@ func TestHandle_PlanReviewerGuard(t *testing.T) {
 			d, gh, runs, au := newDispatcherWithStubs(t)
 			gh.specContent = []byte(specWithReviewers(tc.agent, tc.human))
 			d.PlanReviewerConfigured = tc.reviewerWired
+			// Wire a recording notifier so the dispatcher→IssueNotifier
+			// seam (#599) is asserted: the rejection case must post a
+			// run-rejected comment, the dispatch cases must not.
+			notifier := &stubIssueNotifier{}
+			d.IssueNotifier = notifier
 
 			if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
 				t.Fatalf("Handle returned non-nil (must return nil so GitHub doesn't retry): %v", err)
@@ -1282,7 +1287,61 @@ func TestHandle_PlanReviewerGuard(t *testing.T) {
 			} else if len(rejects) != 0 {
 				t.Errorf("run_rejected_misconfigured entries = %d, want 0", len(rejects))
 			}
+
+			// #599: the dispatcher must surface the refusal to the
+			// customer via a run-rejected issue comment on the rejection
+			// case, and must NOT post on any dispatch case.
+			if tc.wantRejectAudit {
+				if len(notifier.rejectCalls) != 1 {
+					t.Fatalf("NotifyRunRejected calls = %d, want exactly 1", len(notifier.rejectCalls))
+				}
+				c := notifier.rejectCalls[0]
+				if c.repo != "kuhlman-labs/fishhawk" {
+					t.Errorf("reject comment repo = %q, want kuhlman-labs/fishhawk", c.repo)
+				}
+				if c.installationID != 42 {
+					t.Errorf("reject comment installationID = %d, want 42", c.installationID)
+				}
+				if c.issueNumber != 1247 {
+					t.Errorf("reject comment issueNumber = %d, want 1247", c.issueNumber)
+				}
+				if c.workflowID != "feature_change" {
+					t.Errorf("reject comment workflowID = %q, want feature_change", c.workflowID)
+				}
+				if c.stageID != "plan" {
+					t.Errorf("reject comment stageID = %q, want plan", c.stageID)
+				}
+			} else if len(notifier.rejectCalls) != 0 {
+				t.Errorf("NotifyRunRejected calls = %d, want 0 on a dispatch case", len(notifier.rejectCalls))
+			}
 		})
+	}
+}
+
+// TestHandle_PlanReviewerGuard_NilNotifier locks the best-effort guard
+// condition: when no IssueNotifier is wired the dispatcher still
+// refuses (no run, audit written) and does not panic dereferencing a
+// nil notifier (#599).
+func TestHandle_PlanReviewerGuard_NilNotifier(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	gh.specContent = []byte(specWithReviewers(1, 0))
+	d.PlanReviewerConfigured = false
+	d.IssueNotifier = nil
+
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle returned non-nil: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("runs.created = %d, want 0 (rejection)", len(runs.created))
+	}
+	var rejects int
+	for _, p := range au.globalAppended {
+		if p.Category == "run_rejected_misconfigured" {
+			rejects++
+		}
+	}
+	if rejects != 1 {
+		t.Errorf("run_rejected_misconfigured entries = %d, want 1", rejects)
 	}
 }
 
@@ -2160,7 +2219,29 @@ type stubIssueNotifier struct {
 	mu          sync.Mutex
 	retryCalls  []stubCIRetryCall
 	statusCalls []uuid.UUID
+	rejectCalls []stubRunRejectedCall
 	err         error
+}
+
+// stubRunRejectedCall records a NotifyRunRejected invocation for the
+// #599 plan-reviewer-guard tests.
+type stubRunRejectedCall struct {
+	repo           string
+	installationID int64
+	issueNumber    int
+	workflowID     string
+	stageID        string
+}
+
+func (s *stubIssueNotifier) NotifyRunRejected(_ context.Context, repo string,
+	installationID int64, issueNumber int, workflowID, stageID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rejectCalls = append(s.rejectCalls, stubRunRejectedCall{
+		repo: repo, installationID: installationID, issueNumber: issueNumber,
+		workflowID: workflowID, stageID: stageID,
+	})
+	return s.err
 }
 
 // stubCIRetryCall records a NotifyCIRetry invocation for the #279

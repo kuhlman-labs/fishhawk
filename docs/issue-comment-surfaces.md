@@ -14,6 +14,7 @@ it.
 | Plan-on-issue (summary) | `issue_commented` | `plan` | `Server.notifyPlanReady` | plan-stage terminal | No (legacy path; chosen when the spec opts out of full-plan rendering) |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
+| Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 
 Notes:
 - The reaction-polling worker (#360) is a *read-side* concern that reads
@@ -30,6 +31,13 @@ Notes:
   (`latestPlanApproval`); pre-approval the footer is omitted.
 - The sticky status comment is the *only* surface that follows a run
   end-to-end; everything else is event-scoped.
+- The run-rejected surface (`NotifyRunRejected`, #599) is *runless*: the
+  dispatcher's plan-review wiring guard (#577) fires before `CreateRun`, so
+  there is no run row to scope a comment to. Like the slash-command reply it
+  takes explicit issue coordinates (repo, installation, issue number) +
+  the offending workflow_id / stage rather than a run UUID, and writes no
+  notifier-level audit row — the canonical machine record is the dispatcher's
+  `run_rejected_misconfigured` global-chain entry.
 - The typed-reply approval path (`+1` / `lgtm` per E17.4) does NOT post its
   own slash reply (`silent=true`) — the user's typed reply *is* the
   acknowledgment. The plan-on-issue comment edit covers the broadcast.

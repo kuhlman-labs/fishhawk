@@ -939,6 +939,80 @@ func (n *Notifier) NotifySlashApprovalReply(ctx context.Context, p SlashApproval
 	return nil
 }
 
+// NotifyRunRejected posts a comment on the triggering issue when the
+// dispatcher refuses a GitHub-triggered run because the workflow's
+// plan stage declares an agent-gated review (reviewers.agent > 0,
+// human == 0) but the server has no plan reviewer wired (#577 / #599).
+// Without this the refusal is silent to the customer: the webhook
+// returns 202, no run appears, and the only trail is the operator-side
+// global-chain run_rejected_misconfigured audit entry + a WARN log,
+// neither of which the customer can see.
+//
+// Flat primitive params (repo, installationID, issueNumber,
+// workflowID, stageID) rather than a struct or a run UUID: the guard
+// fires before any run row is minted — there is no run UUID to pass —
+// and the signature matches the NotifyCIRetry / NotifyStatusUpdateForRun
+// convention so the webhook package's IssueNotifier interface can name
+// the method without importing this package's concrete types.
+//
+// Skips silently when the receiver is nil, issueNumber <= 0,
+// installationID == 0, or the repo is malformed (defense in depth;
+// the dispatcher guard should only call this with valid coordinates).
+//
+// Dedup posture (deliberately none at this layer, mirroring
+// NotifySlashApprovalReply): the per-run audit-log dedup the other
+// surfaces use requires a run row that does not exist here, and the
+// webhook receipt layer already dedups deliveries before
+// Dispatcher.Handle is invoked (Handle's contract: "called once dedup
+// has passed"), so same-delivery redeliveries cannot double-post.
+// Distinct relabel / re-comment events are legitimately distinct
+// refusals and should each get a reply. No notifier-level audit row is
+// written — the canonical machine record stays the dispatcher's
+// existing run_rejected_misconfigured global-chain entry.
+//
+// Best-effort: a post failure returns a wrapped error the dispatcher
+// logs at WARN; it does not change the refusal outcome.
+func (n *Notifier) NotifyRunRejected(ctx context.Context, repo string, installationID int64, issueNumber int, workflowID, stageID string) error {
+	if n == nil {
+		return nil
+	}
+	if issueNumber <= 0 || installationID == 0 {
+		return nil
+	}
+	repoRef, err := parseRepo(repo)
+	if err != nil {
+		return nil
+	}
+	body := renderRunRejectedBody(workflowID, stageID)
+	if _, err := n.github.CreateIssueComment(ctx, installationID, repoRef, issueNumber, body); err != nil {
+		return fmt.Errorf("issuecomment: create run-rejected comment: %w", err)
+	}
+	return nil
+}
+
+// renderRunRejectedBody renders the fixed explanatory comment posted
+// when the dispatcher refuses a run for a missing plan reviewer (#599).
+// Names the offending workflow_id + stage and both fixes per the
+// issue: (a) configure the server-side reviewer, or (b) change the
+// stage's `reviewers`. Fixed short template — far under GitHub's
+// MaxIssueCommentBodyBytes cap, so no truncation needed.
+func renderRunRejectedBody(workflowID, stageID string) string {
+	var b strings.Builder
+	b.WriteString("**Fishhawk did not start a run.**\n\n")
+	fmt.Fprintf(&b, "Workflow `%s`, stage `%s` declares an agent-gated plan review "+
+		"(`reviewers.agent > 0`, `human == 0`), but this Fishhawk server has no plan "+
+		"reviewer configured. An agent gate that can never be satisfied would leave the "+
+		"run stuck forever, so the run was refused before it started.\n\n",
+		workflowID, stageID)
+	b.WriteString("Fix it one of two ways:\n\n")
+	b.WriteString("- **Configure the server-side reviewer**: set `FISHHAWKD_ANTHROPIC_API_KEY` " +
+		"(or otherwise enable the local plan reviewer) so the agent gate can be satisfied.\n")
+	fmt.Fprintf(&b, "- **Change the stage's `reviewers`** for `%s`: add a human approver "+
+		"(advisory mode, `human > 0`) so the human gate stays authoritative, or remove the "+
+		"agent gate entirely.\n", stageID)
+	return b.String()
+}
+
 // commentContext bundles the per-run inputs the post-helpers need:
 // the run row (for installation_id), the parsed repo, the issue
 // number, and the pre-rendered run URL. Built once per call.
