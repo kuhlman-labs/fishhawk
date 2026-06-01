@@ -488,6 +488,17 @@ func buildPlan(t Trigger) string {
 					highBand.WithinScale, highBand.Samples)
 			}
 		}
+		if medBand, ok := t.CalibrationHint.ConfidenceBands["medium"]; ok && medBand.Samples >= 5 {
+			if float64(medBand.WithinScale)/float64(medBand.Samples) <= 0.25 {
+				fmt.Fprintf(&b, "→ \"medium\" has degraded too (%d/%d within 1.5x) — you over-predict here as well. ",
+					medBand.WithinScale, medBand.Samples)
+				if t.CalibrationHint.CalibrationRatio > 0 {
+					fmt.Fprintf(&b, "Estimates in this band run about %.1fx too high; size your raw estimate DOWN by that factor. ",
+						1.0/t.CalibrationHint.CalibrationRatio)
+				}
+				b.WriteString("Drop to \"low\" for small, well-scoped changes rather than reaching for a higher band.\n")
+			}
+		}
 	}
 	return b.String()
 }
