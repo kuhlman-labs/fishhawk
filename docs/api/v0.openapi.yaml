@@ -1459,7 +1459,7 @@ paths:
                     description: Hex-encoded sha256 of the prompt bytes.
                   agent_timeout_seconds:
                     type: integer
-                    description: Spec-resolved wall-clock cap in seconds; 0 means the runner should apply its own fallback.
+                    description: 'Wall-clock kill cap in seconds; 0 means the runner should apply its own fallback. For implement stages the value is dynamically widened above the spec budget to max(spec budget, approved-plan predicted_runtime_minutes x 2, implement-stage calibration p95 x 1.5), capped at 2x the spec budget; other stages return the spec-resolved value unchanged.'
                   decomposed_from_run_id:
                     type: string
                     format: uuid
@@ -1552,7 +1552,7 @@ paths:
                   prompt_hash: { type: string }
                   agent_timeout_seconds:
                     type: integer
-                    description: Spec-resolved wall-clock cap in seconds; 0 means the runner should apply its own fallback.
+                    description: 'Wall-clock kill cap in seconds; 0 means the runner should apply its own fallback. For implement stages the value is dynamically widened above the spec budget to max(spec budget, approved-plan predicted_runtime_minutes x 2, implement-stage calibration p95 x 1.5), capped at 2x the spec budget; other stages return the spec-resolved value unchanged.'
                   decomposed_from_run_id:
                     type: string
                     format: uuid

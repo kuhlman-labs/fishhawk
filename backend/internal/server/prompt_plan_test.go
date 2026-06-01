@@ -151,6 +151,13 @@ func (r *planArtifactRepo) Create(_ context.Context, _ artifact.CreateParams) (*
 type planAuditRepo struct {
 	appended      []audit.ChainAppendParams
 	byRunCategory map[string][]*audit.Entry
+	allEntries    []*audit.Entry
+}
+
+// seedAll seeds entries returned by ListAll, which implementCalibrationP95
+// scans for runtime_observed implement-stage samples.
+func (a *planAuditRepo) seedAll(entries ...*audit.Entry) {
+	a.allEntries = append(a.allEntries, entries...)
 }
 
 func (a *planAuditRepo) seedByCategory(runID uuid.UUID, category string, entries ...*audit.Entry) {
@@ -180,7 +187,7 @@ func (a *planAuditRepo) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
 func (a *planAuditRepo) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
-	return nil, nil
+	return a.allEntries, nil
 }
 func (a *planAuditRepo) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, audit.ErrNotFound
@@ -595,17 +602,29 @@ func TestHandleGetStagePromptRender_SpecBearingImplementResolvesPolicyTimeout(t 
 	// policy max_stage_runtime (1800s), not the runner's 15m (900s) default.
 	// This is the behavioral guard for issue #593: without spec inheritance
 	// the prompt layer falls back to 900 and the decomposition budget breaks.
+	//
+	// The plan predicts a small runtime (5m → plan term 10m) and no
+	// calibration data exists, so both dynamic implement-timeout terms
+	// (#523) land below the 30m spec floor — the spec budget governs and
+	// the assertion stays exactly 1800. (The widening path is covered by
+	// TestResolveImplementTimeout and the local-runner integration test.)
 	s, rr, ar, _, _, gh := newImplementPromptServer(t)
 	_, planStageID, implStageID, rn := seedRunWithStages(rr)
 	rn.WorkflowSpec = []byte(planStageSpecYAML30m)
 
+	smallPlanJSON, err := json.Marshal(planfixture.Valid(func(m map[string]any) {
+		m["predicted_runtime_minutes"] = 5
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
 	v := "standard_v1"
 	ar.seed(planStageID, &artifact.Artifact{
 		ID:            uuid.New(),
 		StageID:       planStageID,
 		Kind:          artifact.KindPlan,
 		SchemaVersion: &v,
-		Content:       fixturePlanJSON(t),
+		Content:       smallPlanJSON,
 		ContentHash:   "spec-timeout-test",
 		CreatedAt:     time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC),
 	})
@@ -702,6 +721,142 @@ func TestImplementPrompt_ApprovalConditions_AbsentWhenNoComment(t *testing.T) {
 	}
 	if strings.Contains(resp.Prompt, "Approval conditions") {
 		t.Errorf("Approval conditions section should not appear when no approve comment exists:\n%s", resp.Prompt)
+	}
+}
+
+// runtimeObservedImplementEntry builds a runtime_observed audit entry for
+// an implement-stage sample with the given actual runtime, attributed to
+// runID so the workflow-id filter in implementCalibrationP95 resolves it.
+func runtimeObservedImplementEntry(runID uuid.UUID, actualMinutes float64) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_type":        "implement",
+		"predicted_minutes": 10.0,
+		"confidence":        "medium",
+		"actual_minutes":    actualMinutes,
+		"outcome":           "success",
+	})
+	rid := runID
+	return &audit.Entry{
+		ID:        uuid.New(),
+		RunID:     &rid,
+		Category:  "runtime_observed",
+		Payload:   payload,
+		Timestamp: time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+// TestResolveImplementTimeout exercises the dynamic implement-stage kill
+// cap (#523): max(spec budget, predicted×2, p95×1.5) clamped to spec×2,
+// with best-effort fallbacks that never drop below the spec floor.
+func TestResolveImplementTimeout(t *testing.T) {
+	cases := []struct {
+		name        string
+		spec        time.Duration
+		predicted   int       // 0 → no plan artifact seeded
+		p95Samples  []float64 // implement actual_minutes; nil → no calibration
+		wantMinutes float64
+	}{
+		{
+			name:        "no plan, no calibration → spec floor",
+			spec:        30 * time.Minute,
+			wantMinutes: 30,
+		},
+		{
+			name:        "plan predicts 23m → 46m under ceiling",
+			spec:        30 * time.Minute,
+			predicted:   23,
+			wantMinutes: 46,
+		},
+		{
+			name:        "plan predicts 40m → clamped to 60m ceiling",
+			spec:        30 * time.Minute,
+			predicted:   40,
+			wantMinutes: 60,
+		},
+		{
+			name:        "tiny plan but p95 floors above spec",
+			spec:        15 * time.Minute,
+			predicted:   2,
+			p95Samples:  []float64{12},
+			wantMinutes: 18, // p95 12 × 1.5
+		},
+		{
+			name:        "plan and p95 both below spec → spec floor",
+			spec:        30 * time.Minute,
+			predicted:   5,
+			p95Samples:  []float64{4},
+			wantMinutes: 30,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, ar, au, _, _ := newImplementPromptServer(t)
+			runID, planStageID, _, rn := seedRunWithStages(rr)
+
+			if tc.predicted > 0 {
+				planJSON, err := json.Marshal(planfixture.Valid(func(m map[string]any) {
+					m["predicted_runtime_minutes"] = tc.predicted
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				v := "standard_v1"
+				ar.seed(planStageID, &artifact.Artifact{
+					ID:            uuid.New(),
+					StageID:       planStageID,
+					Kind:          artifact.KindPlan,
+					SchemaVersion: &v,
+					Content:       planJSON,
+					CreatedAt:     time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC),
+				})
+			}
+			for _, m := range tc.p95Samples {
+				au.seedAll(runtimeObservedImplementEntry(runID, m))
+			}
+
+			got := s.resolveImplementTimeout(context.Background(), rn, tc.spec)
+			wantSecs := int(tc.wantMinutes * 60)
+			if int(got.Seconds()) != wantSecs {
+				t.Errorf("resolveImplementTimeout = %v (%ds), want %v minutes (%ds)",
+					got, int(got.Seconds()), tc.wantMinutes, wantSecs)
+			}
+		})
+	}
+}
+
+// TestResolveAgentTimeout_PlanStageNotWidened is the regression guard for
+// approval condition (1): the dynamic implement widening must not leak into
+// the plan stage's own agent_timeout_seconds. Even with a plan artifact that
+// predicts a large runtime, resolveAgentTimeout for the plan stage type must
+// return the spec-resolved value (1800s), not an enlarged one.
+func TestResolveAgentTimeout_PlanStageNotWidened(t *testing.T) {
+	s, rr, ar, _, _, _ := newImplementPromptServer(t)
+	_, planStageID, _, rn := seedRunWithStages(rr)
+	rn.WorkflowSpec = []byte(planStageSpecYAML30m)
+
+	planJSON, err := json.Marshal(planfixture.Valid(func(m map[string]any) {
+		m["predicted_runtime_minutes"] = 40 // would widen an implement stage to the 60m ceiling
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := "standard_v1"
+	ar.seed(planStageID, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       planJSON,
+		CreatedAt:     time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC),
+	})
+
+	if got := s.resolveAgentTimeout(context.Background(), rn, run.StageTypePlan); got != 1800 {
+		t.Errorf("plan-stage agent_timeout_seconds = %d, want 1800 (spec-resolved, not widened)", got)
+	}
+	// Sanity: the same run's implement stage IS widened (40×2=80m clamped to 60m = 3600s).
+	if got := s.resolveAgentTimeout(context.Background(), rn, run.StageTypeImplement); got != 3600 {
+		t.Errorf("implement-stage agent_timeout_seconds = %d, want 3600 (40m×2 clamped to 30m×2 ceiling)", got)
 	}
 }
 

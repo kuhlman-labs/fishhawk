@@ -11,6 +11,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -27,6 +30,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -144,6 +148,11 @@ func newLocalRunnerFixture(t *testing.T) *localRunnerFixture {
 		AuditRepo:    auditRepo,
 		ArtifactRepo: artifactRepo,
 		TraceStore:   tracestore.NewMem(),
+		// A no-op client (nil TokenProvider) satisfies the prompt
+		// handler's non-nil GitHub guard. GetIssue is never reached for
+		// CLI-triggered runs with no issue ref, so the nil tokens never
+		// touch the wire.
+		GitHub: githubclient.New(nil),
 	})
 	httpSrv := httptest.NewServer(srv.Handler())
 	t.Cleanup(httpSrv.Close)
@@ -304,6 +313,177 @@ func TestE2E_LocalRunner_PlanStage_HappyPath(t *testing.T) {
 		t.Errorf("no artifacts for stage %s; expected a plan artifact\nrunner output:\n%s",
 			stage.ID, out.String())
 	}
+}
+
+// implementTimeoutSpecYAML is a feature_change workflow with a 30m policy
+// budget and no per-stage executor timeouts, so both stages resolve to the
+// 30m policy max_stage_runtime (1800s).
+const implementTimeoutSpecYAML = `version: "0.3"
+workflows:
+  feature_change:
+    policy:
+      max_stage_runtime: "30m"
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestE2E_LocalRunner_ImplementTimeout_WidenedByPlan is the cross-layer
+// guard for #523. It crosses the full seam that per-layer unit tests miss
+// (cf. #618): a standard_v1 plan persisted through real Postgres → the
+// server's dynamic implement-timeout computation → the prompt-fetch
+// response payload that the runner consumes. The plan predicts 22 minutes,
+// so the implement-stage agent_timeout_seconds must be widened to 22×2=44
+// minutes (2640s) — above the 30m (1800s) spec budget — and the prompt-text
+// "spec-resolved stage budget" hint must carry the SAME enlarged value, so
+// the hint and the actual kill cap can't silently diverge.
+func TestE2E_LocalRunner_ImplementTimeout_WidenedByPlan(t *testing.T) {
+	fx := newLocalRunnerFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const predictedMinutes = 22
+	const specBudgetSeconds = 1800
+	wantTimeoutSeconds := predictedMinutes * 2 * 60 // 2640
+
+	r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef-impl-timeout",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+		WorkflowSpec:  []byte(implementTimeoutSpecYAML),
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:        r.ID,
+		Sequence:     1,
+		Type:         runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+
+	// Persist the approved plan artifact under the plan stage. predicted
+	// lands in the 20-25m calibration-tail band the issue (run 891ef85d)
+	// motivated.
+	planJSON := implementTimeoutPlanJSON(t, predictedMinutes)
+	schema := "standard_v1"
+	if _, err := fx.artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       planJSON,
+		ContentHash:   "impl-timeout-e2e",
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:        r.ID,
+		Sequence:     2,
+		Type:         runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+
+	// Fetch the implement-stage prompt over the real HTTP handler (the
+	// SPA-readable render path needs no signature).
+	url := fmt.Sprintf("%s/v0/stages/%s/prompt-render", fx.url, implStage.ID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("prompt-render request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prompt-render status = %d:\n%s", resp.StatusCode, body)
+	}
+
+	var pr struct {
+		Prompt              string `json:"prompt"`
+		AgentTimeoutSeconds int    `json:"agent_timeout_seconds"`
+	}
+	if err := json.Unmarshal(body, &pr); err != nil {
+		t.Fatalf("decode prompt response: %v\n%s", err, body)
+	}
+
+	// Wire value: the kill cap reaching the runner is the widened value,
+	// not the spec budget.
+	if pr.AgentTimeoutSeconds != wantTimeoutSeconds {
+		t.Errorf("agent_timeout_seconds = %d, want %d (predicted %dm × 2; spec budget was %ds)",
+			pr.AgentTimeoutSeconds, wantTimeoutSeconds, predictedMinutes, specBudgetSeconds)
+	}
+	// Prompt-text hint: the "spec-resolved stage budget" the agent is told
+	// must equal the wire kill cap (agent_timeout_seconds / 60), so the two
+	// can't diverge.
+	wantBudgetText := fmt.Sprintf("The spec-resolved stage budget is **%d minutes**.", pr.AgentTimeoutSeconds/60)
+	if !strings.Contains(pr.Prompt, wantBudgetText) {
+		t.Errorf("prompt missing budget hint %q (must match wire timeout %ds)\n---\n%s",
+			wantBudgetText, pr.AgentTimeoutSeconds, pr.Prompt)
+	}
+}
+
+// implementTimeoutPlanJSON returns a schema-valid standard_v1 plan with the
+// given predicted_runtime_minutes, marshalled to JSON for artifact storage.
+func implementTimeoutPlanJSON(t *testing.T, predictedMinutes int) []byte {
+	t.Helper()
+	m := map[string]any{
+		"plan_version": "standard_v1",
+		"ticket_reference": map[string]any{
+			"type": "github_issue",
+			"url":  "https://github.com/x/y/issues/1",
+			"id":   "x/y#1",
+		},
+		"generated_by": map[string]any{
+			"agent":     "claude-code",
+			"model":     "claude-opus-4-7",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		},
+		"summary": "Implement-timeout E2E plan.",
+		"scope": map[string]any{
+			"files": []any{
+				map[string]any{"path": "main.go", "operation": "create"},
+			},
+		},
+		"approach": []any{
+			map[string]any{"step": 1, "description": "Write the code."},
+		},
+		"verification": map[string]any{
+			"test_strategy": "Run go test.",
+			"rollback_plan": "Revert the commit.",
+		},
+		"predicted_runtime_minutes":    predictedMinutes,
+		"predicted_runtime_confidence": "medium",
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
 }
 
 // isDockerUnavailable matches the guard pattern from
