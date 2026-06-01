@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -93,6 +94,20 @@ func (s *Server) handleGetCalibration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Decode payloads and apply filters.
+	samples := s.filterRuntimeObservedSamples(r.Context(), entries, stageType, workflowID, since)
+
+	result := computeCalibration(workflowID, stageType, samples)
+	s.writeJSON(w, r, http.StatusOK, result)
+}
+
+// filterRuntimeObservedSamples decodes runtime_observed audit entries and
+// keeps those whose stage_type matches stageType and — when workflowID is
+// non-empty — whose run resolves to that workflow. The since cutoff drops
+// entries older than the timestamp (zero time disables it). Best-effort:
+// entries that fail to decode, lack a run id, or whose run can't be
+// resolved are skipped. Shared by handleGetCalibration and
+// implementCalibrationP95 so the two stay in lockstep.
+func (s *Server) filterRuntimeObservedSamples(ctx context.Context, entries []*audit.Entry, stageType, workflowID string, since time.Time) []runtimeObservedPayload {
 	var samples []runtimeObservedPayload
 	for _, e := range entries {
 		if !since.IsZero() && e.Timestamp.Before(since) {
@@ -112,16 +127,37 @@ func (s *Server) handleGetCalibration(w http.ResponseWriter, r *http.Request) {
 			if s.cfg.RunRepo == nil || e.RunID == nil {
 				continue
 			}
-			runRow, err := s.cfg.RunRepo.GetRun(r.Context(), *e.RunID)
+			runRow, err := s.cfg.RunRepo.GetRun(ctx, *e.RunID)
 			if err != nil || runRow.WorkflowID != workflowID {
 				continue
 			}
 		}
 		samples = append(samples, p)
 	}
+	return samples
+}
 
-	result := computeCalibration(workflowID, stageType, samples)
-	s.writeJSON(w, r, http.StatusOK, result)
+// implementCalibrationP95 loads runtime_observed audit entries for the
+// workflow, filters them to implement-stage samples, and returns the
+// observed p95 actual-runtime in minutes. Returns ok=false when the
+// AuditRepo is unconfigured, the ListAll scan fails, or there are zero
+// samples — letting callers fall back rather than fail. Reuses the same
+// load + filter + computeCalibration path as handleGetCalibration so the
+// p95 it returns is identical to what the calibration endpoint reports.
+func (s *Server) implementCalibrationP95(ctx context.Context, workflowID string) (p95Minutes float64, ok bool) {
+	if s.cfg.AuditRepo == nil {
+		return 0, false
+	}
+	category := "runtime_observed"
+	entries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &category})
+	if err != nil {
+		return 0, false
+	}
+	samples := s.filterRuntimeObservedSamples(ctx, entries, "implement", workflowID, time.Time{})
+	if len(samples) == 0 {
+		return 0, false
+	}
+	return computeCalibration(workflowID, "implement", samples).ActualP95Minutes, true
 }
 
 // computeCalibration derives statistics from the filtered sample slice.

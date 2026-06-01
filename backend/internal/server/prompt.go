@@ -779,7 +779,78 @@ func (s *Server) resolveAgentTimeout(ctx context.Context, runRow *run.Run, stage
 		}
 	}
 	resolved := spec.ResolveStageTimeout(wf, specStage, spec.DefaultStageTimeout)
+	// Implement stages get a dynamically-widened runtime kill cap (#523):
+	// correctly-scoped work whose actual runtime lands in the deep
+	// calibration tail should be allowed to finish rather than being
+	// SIGKILLed mid-tail. Every other stage type keeps the spec-resolved
+	// value unchanged. Both call sites that pass run.StageTypeImplement
+	// (prompt.go:248/399 wire value and the :226/377 prompt-text hint)
+	// flow through here, so the hint and the kill cap can't diverge.
+	if stageType == run.StageTypeImplement {
+		return int(s.resolveImplementTimeout(ctx, runRow, resolved).Seconds())
+	}
 	return int(resolved.Seconds())
+}
+
+// Dynamic implement-stage timeout terms (#523). The timeout is
+// max(spec budget, predicted×2, p95×1.5) clamped to spec×2. The spec
+// budget stays the approval-time scope gate (checkPlanBudget); these
+// terms only widen the runtime kill cap.
+const (
+	implementPlanMultiplier       = 2   // plan.predicted_runtime_minutes × 2
+	implementP95Multiplier        = 1.5 // calibration implement p95 × 1.5
+	implementTimeoutCeilingFactor = 2   // hard ceiling = spec budget × 2
+)
+
+// resolveImplementTimeout computes the dynamic wall-clock kill cap for an
+// implement stage. It starts at the spec-resolved budget (the floor, so the
+// timeout can never be smaller than today), raises the candidate to
+// predicted_runtime_minutes×2 when an approved plan is loadable, raises it
+// to the implement-stage calibration p95×1.5 when calibration data exists,
+// then clamps the result to spec×implementTimeoutCeilingFactor.
+//
+// Best-effort throughout: a plan-load or calibration failure leaves the
+// candidate at the spec floor. Crucially, at PLAN-stage prompt build there
+// is no approved plan yet, so loadApprovedPlanForRun returns nil and the
+// plan term falls back to the floor — the implement budget shown to the
+// planner stays spec-resolved (no circularity).
+func (s *Server) resolveImplementTimeout(ctx context.Context, runRow *run.Run, specResolved time.Duration) time.Duration {
+	candidate := specResolved
+	winner := "spec"
+	var planTerm, p95Term time.Duration
+
+	// Plan term: predicted_runtime_minutes × 2. Best-effort — any load
+	// failure or absent/zero prediction leaves the candidate at the floor.
+	if p, err := s.loadApprovedPlanForRun(ctx, runRow.ID); err == nil && p != nil && p.PredictedRuntimeMinutes > 0 {
+		planTerm = time.Duration(p.PredictedRuntimeMinutes*implementPlanMultiplier) * time.Minute
+		if planTerm > candidate {
+			candidate, winner = planTerm, "plan"
+		}
+	}
+
+	// p95 term: historical implement-stage actual p95 × 1.5.
+	if p95, ok := s.implementCalibrationP95(ctx, runRow.WorkflowID); ok && p95 > 0 {
+		p95Term = time.Duration(p95 * implementP95Multiplier * float64(time.Minute))
+		if p95Term > candidate {
+			candidate, winner = p95Term, "p95"
+		}
+	}
+
+	// Hard ceiling: a pathological plan estimate or p95 cannot produce an
+	// unbounded timeout.
+	if ceiling := specResolved * implementTimeoutCeilingFactor; candidate > ceiling {
+		candidate, winner = ceiling, "ceiling"
+	}
+
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: resolved dynamic implement timeout",
+		slog.String("run_id", runRow.ID.String()),
+		slog.Int64("spec_budget_seconds", int64(specResolved.Seconds())),
+		slog.Int64("plan_term_seconds", int64(planTerm.Seconds())),
+		slog.Int64("p95_term_seconds", int64(p95Term.Seconds())),
+		slog.Int64("timeout_seconds", int64(candidate.Seconds())),
+		slog.String("winner", winner),
+	)
+	return candidate
 }
 
 // resolveVerifyConfig returns the verify command and timeout (in seconds)
