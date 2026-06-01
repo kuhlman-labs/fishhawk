@@ -119,6 +119,8 @@ func TestRequiredOutcomes_TestsAddedOrUpdated_Pass(t *testing.T) {
 		"backend/internal/server/test/fixtures.go",
 		"src/foo/spec/bar.rb",
 		"py/test_thing.py",
+		"scripts/test",     // shell test runner
+		"scripts/test-dev", // hyphenated script test convention (#601)
 	}
 	for _, p := range cases {
 		t.Run(p, func(t *testing.T) {
@@ -135,6 +137,45 @@ func TestRequiredOutcomes_TestsAddedOrUpdated_Fail(t *testing.T) {
 	v := Evaluate(d, Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}})
 	if len(v) != 1 || !strings.Contains(v[0].Detail, "no test files") {
 		t.Errorf("expected tests-not-added violation, got %+v", v)
+	}
+}
+
+// TestRequiredOutcomes_TestsAddedOrUpdated_NonCodeDiffPasses covers
+// the #610 fix: a non-empty diff that touches only docs/scripts/config
+// (no unit-testable source) is vacuously satisfied. The first case is
+// the literal run 679b042c / #601 reproduction.
+func TestRequiredOutcomes_TestsAddedOrUpdated_NonCodeDiffPasses(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Diff
+	}{
+		{"#601 repro: docs + scripts only", Diff{ChangedFiles: []ChangedFile{
+			{Path: "CLAUDE.md", Status: StatusModified},
+			{Path: "scripts/dev", Status: StatusModified},
+			{Path: "scripts/test-dev", Status: StatusAdded},
+		}}},
+		{"docs-only", Diff{ChangedFiles: []ChangedFile{
+			{Path: "docs/ARCHITECTURE.md", Status: StatusModified},
+		}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Evaluate(tc.d, Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}})
+			if len(v) != 0 {
+				t.Errorf("expected pass for non-code diff, got %+v", v)
+			}
+		})
+	}
+}
+
+// TestRequiredOutcomes_TestsAddedOrUpdated_SourceOnlyStillFails is the
+// real-case regression guard: a diff that touches unit-testable source
+// (a.go) but adds no test must still fail with the unchanged detail.
+func TestRequiredOutcomes_TestsAddedOrUpdated_SourceOnlyStillFails(t *testing.T) {
+	d := Diff{ChangedFiles: []ChangedFile{{Path: "a.go", Status: StatusAdded}}}
+	v := Evaluate(d, Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}})
+	if len(v) != 1 || !strings.Contains(v[0].Detail, "no test files") {
+		t.Errorf("expected tests-not-added violation for source-only diff, got %+v", v)
 	}
 }
 
