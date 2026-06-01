@@ -115,6 +115,57 @@ else
   fail "_decide_mcp_signal: branch-diff up rebuild should be 1"
 fi
 
+# 7. _healthz_url: derives the port from FISHHAWKD_ADDR, default 8080.
+unset FISHHAWKD_ADDR
+if [[ "$(_healthz_url)" == "http://localhost:8080/healthz" ]]; then
+  pass "_healthz_url defaults to port 8080 when FISHHAWKD_ADDR unset"
+else
+  fail "_healthz_url should default to 8080 (got: $(_healthz_url))"
+fi
+FISHHAWKD_ADDR=':9090'
+if [[ "$(_healthz_url)" == "http://localhost:9090/healthz" ]]; then
+  pass "_healthz_url respects ':9090' override"
+else
+  fail "_healthz_url should use port 9090 for ':9090' (got: $(_healthz_url))"
+fi
+FISHHAWKD_ADDR='127.0.0.1:9091'
+if [[ "$(_healthz_url)" == "http://localhost:9091/healthz" ]]; then
+  pass "_healthz_url respects '127.0.0.1:9091' override"
+else
+  fail "_healthz_url should use port 9091 for '127.0.0.1:9091' (got: $(_healthz_url))"
+fi
+unset FISHHAWKD_ADDR
+
+# 8. _await_healthz: returns non-zero quickly for an already-exited pid (the
+# spawn-then-die early-exit path) without needing a live server.
+( exit 0 ) &
+dead_pid=$!
+wait "$dead_pid" 2>/dev/null
+if _await_healthz "$dead_pid" "http://localhost:1/healthz" 10; then
+  fail "_await_healthz should return non-zero for an already-exited pid"
+else
+  pass "_await_healthz returns non-zero promptly for a dead pid"
+fi
+
+# 9. cmd_up readiness gate: body must poll _await_healthz, tail the log, and
+# exit 1 on failure — mirroring the existing cmd_reload body-grep assertions.
+up_body="$(typeset -f cmd_up)"
+if print -r -- "$up_body" | grep -q '_await_healthz'; then
+  pass "cmd_up gates the spawn on _await_healthz"
+else
+  fail "cmd_up should call _await_healthz after spawning fishhawkd"
+fi
+if print -r -- "$up_body" | grep -q 'tail -n 15'; then
+  pass "cmd_up tails the log on a failed readiness gate"
+else
+  fail "cmd_up should tail the log on readiness-gate failure"
+fi
+if print -r -- "$up_body" | grep -q 'exit 1'; then
+  pass "cmd_up exits non-zero on a failed readiness gate"
+else
+  fail "cmd_up should exit 1 on readiness-gate failure"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"
