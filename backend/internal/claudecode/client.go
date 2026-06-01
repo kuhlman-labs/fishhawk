@@ -16,6 +16,7 @@
 package claudecode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,6 +47,15 @@ type Config struct {
 	MaxTokens int
 	// Timeout bounds a single inference call via context.WithTimeout.
 	Timeout time.Duration
+	// MaxRetries bounds the in-adapter retry for a transient subprocess
+	// launch crash (an external/OOM SIGKILL surfacing as *exec.ExitError,
+	// #620). It counts RETRIES, not attempts: the loop runs MaxRetries+1
+	// attempts total. The default (1) is set at construction in NewClient;
+	// an explicit 0 disables retry deterministically so tests can pin a
+	// single attempt. A per-attempt timeout (a slow review, #606) and
+	// deterministic faults (binary-missing, envelope-decode, bad verdict)
+	// are never retried.
+	MaxRetries int
 }
 
 // Client wraps the `claude` CLI for one-shot inference calls.
@@ -61,6 +71,9 @@ type Client struct {
 func NewClient(cfg Config) *Client {
 	if cfg.Binary == "" {
 		cfg.Binary = DefaultBinary
+	}
+	if cfg.MaxRetries == 0 {
+		cfg.MaxRetries = 1
 	}
 	return &Client{cfg: cfg, Cmd: exec.CommandContext}
 }
@@ -81,6 +94,34 @@ type cliEnvelope struct {
 // The child inherits os.Environ() so the operator's existing ANTHROPIC_API_KEY
 // or subscription auth is used with zero new plumbing.
 func (c *Client) Inference(ctx context.Context, prompt string) (responseText, model string, err error) {
+	maxAttempts := c.cfg.MaxRetries + 1
+
+	for attempt := 1; ; attempt++ {
+		text, mdl, retryable, ierr := c.invokeOnce(ctx, prompt)
+		if ierr == nil {
+			return text, mdl, nil
+		}
+		// Stop on a non-retryable fault (binary-missing, a per-attempt
+		// timeout, an envelope-decode/bad-verdict fault, or any non-
+		// *exec.ExitError invocation failure), once the retry budget is
+		// spent, or when the PARENT ctx is already done — an outer
+		// cancellation or deadline (ctx.Err() != nil), distinct from the
+		// per-attempt timeout invokeOnce derives internally. The last
+		// diagnostic error is returned verbatim so the plan-review WARN
+		// keeps its cause + elapsed + stderr detail.
+		if !retryable || attempt >= maxAttempts || ctx.Err() != nil {
+			return "", "", ierr
+		}
+	}
+}
+
+// invokeOnce runs a single `claude` subprocess: it builds the command with a
+// fresh per-attempt deadline, captures stdout and stderr, decodes the CLI
+// envelope, and validates it. It returns retryable=true only for the transient
+// crash class — an *exec.ExitError that is NOT a per-attempt timeout (an
+// external/OOM SIGKILL). A timeout-kill (a slow review, #606) and every
+// deterministic fault return retryable=false so the loop fails fast.
+func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, model string, retryable bool, err error) {
 	if c.cfg.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.cfg.Timeout)
@@ -102,28 +143,55 @@ func (c *Client) Inference(ctx context.Context, prompt string) (responseText, mo
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
+	// Capture stderr into our own buffer. Because cmd.Stderr is now non-nil,
+	// cmd.Output() no longer populates exitErr.Stderr — so diagnostics must
+	// be read from this buffer, which survives even when a SIGKILLed child
+	// flushed nothing to its own ExitError capture (the empty "signal:
+	// killed:" string in #620).
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
+	start := time.Now()
 	out, err := cmd.Output()
+	elapsed := time.Since(start)
 	if err != nil {
 		if isBinaryMissing(err) {
-			return "", "", fmt.Errorf("claudecode: binary not found: %s", c.cfg.Binary)
+			return "", "", false, fmt.Errorf("claudecode: binary not found: %s", c.cfg.Binary)
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return "", "", fmt.Errorf("claudecode: claude exited non-zero: %v: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+			stderrText := strings.TrimSpace(stderr.String())
+			// A per-attempt context deadline kills the child and leaves
+			// ctx.Err()==DeadlineExceeded: a slow review, not a launch
+			// crash. Label it and do NOT retry — retrying a 300s timeout
+			// would compound into a 600s wait (#606). External/OOM kills
+			// (ctx.Err()==nil) are the transient #620 class and retry.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return "", "", false, fmt.Errorf("claudecode: claude killed after %s (timeout): %v%s", elapsed, err, stderrSuffix(stderrText))
+			}
+			return "", "", true, fmt.Errorf("claudecode: claude killed after %s (external/OOM): %v%s", elapsed, err, stderrSuffix(stderrText))
 		}
-		return "", "", fmt.Errorf("claudecode: claude invocation failed: %w", err)
+		return "", "", false, fmt.Errorf("claudecode: claude invocation failed: %w", err)
 	}
 
 	var env cliEnvelope
 	if err := json.Unmarshal(out, &env); err != nil {
-		return "", "", fmt.Errorf("claudecode: decode CLI envelope: %w", err)
+		return "", "", false, fmt.Errorf("claudecode: decode CLI envelope: %w", err)
 	}
 	if env.IsError {
-		return "", "", fmt.Errorf("claudecode: claude reported error envelope (subtype=%q)", env.Subtype)
+		return "", "", false, fmt.Errorf("claudecode: claude reported error envelope (subtype=%q)", env.Subtype)
 	}
 
-	return env.Result, c.cfg.Model, nil
+	return env.Result, c.cfg.Model, false, nil
+}
+
+// stderrSuffix formats captured child stderr as a trailing ": <text>" clause
+// for a diagnostic error, or the empty string when nothing was captured.
+func stderrSuffix(stderrText string) string {
+	if stderrText == "" {
+		return ""
+	}
+	return ": " + stderrText
 }
 
 // isBinaryMissing reports whether err means the binary itself is not on disk /
