@@ -95,6 +95,15 @@ func TestHelperProcess(t *testing.T) {
 		os.Stdout.Sync()
 		time.Sleep(60 * time.Millisecond)
 		fmt.Println(`{"type":"result","usage":{"input_tokens":50,"output_tokens":20}}`)
+	case "out_of_tree_write":
+		// Emit an assistant tool_use writing to an out-of-tree absolute
+		// path supplied via OOT_PATH, driving the full scan->detector->
+		// event path through Invoke. A clean result line follows so the
+		// stage still succeeds (surfacing must not fail the stage).
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Printf(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":%q}}]}}`+"\n",
+			os.Getenv("OOT_PATH"))
+		fmt.Println(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`)
 	case "echo_env":
 		// Echo a single env var so we can assert the harness
 		// wired API key forwarding correctly.
@@ -548,6 +557,184 @@ func TestInvoke_GenericExitNoRetry(t *testing.T) {
 	}
 	if starts != 1 {
 		t.Errorf("invocation_start count = %d, want 1 (no retry on generic failure)", starts)
+	}
+}
+
+// assistantWrite builds an assistant stream-json line carrying a single
+// file-writing tool_use targeting path.
+func assistantWrite(tool, field, path string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":%q,"input":{%q:%q}}]}}`,
+		tool, field, path))
+}
+
+func TestOutOfTreeWrites(t *testing.T) {
+	// workDir is a real, existing dir; its deepest-existing-ancestor is
+	// itself, so containment of NEW files under it must resolve cleanly.
+	// NOTE: the test sandbox often sets TMPDIR under /tmp, so t.TempDir()
+	// lands inside the /tmp allowlist — to test genuine working-dir
+	// containment independent of /tmp, the in/out-of-tree cases use
+	// roots={workDir} only and a synthetic out-of-tree absolute path.
+	workDir := t.TempDir()
+	allowed := append([]string{workDir}, allowedExtraDirs...)
+	const outside = "/opt/fishhawk-oot-test"
+
+	// Portable symlink case: linkDir is a symlink to realRoot. A write
+	// through the symlinked path must be judged inside realRoot.
+	realRoot := t.TempDir()
+	linkDir := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(realRoot, linkDir); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		line    []byte
+		roots   []string
+		wantOOT bool
+	}{
+		{
+			// Condition (1): a NEW (not-yet-created) in-tree file must
+			// NOT be flagged — containment resolves against the deepest
+			// existing ancestor (workDir), not the target itself.
+			name:    "in_tree_new_file_not_flagged",
+			line:    assistantWrite("Edit", "file_path", filepath.Join(workDir, "pkg", "new.go")),
+			roots:   []string{workDir},
+			wantOOT: false,
+		},
+		{
+			// Condition (1): a NEW out-of-tree file IS flagged.
+			name:    "out_of_tree_new_file_flagged",
+			line:    assistantWrite("Write", "file_path", filepath.Join(outside, "sub", "new.txt")),
+			roots:   []string{workDir},
+			wantOOT: true,
+		},
+		{
+			name:    "home_like_path_flagged",
+			line:    assistantWrite("Edit", "file_path", "/some/operator/.claude/memory.md"),
+			roots:   []string{workDir},
+			wantOOT: true,
+		},
+		{
+			name:    "under_allowlisted_tmp_not_flagged",
+			line:    assistantWrite("Write", "file_path", "/tmp/fishhawk-plan.json"),
+			roots:   allowed,
+			wantOOT: false,
+		},
+		{
+			// macOS: /tmp is a symlink to /private/tmp and the agent
+			// emits the resolved /private/tmp form. Build that resolved
+			// form explicitly and assert it's still inside the /tmp root.
+			name:    "tmp_resolved_symlink_form_not_flagged",
+			line:    assistantWrite("Write", "file_path", filepath.Join(resolveSymlinks("/tmp"), "fishhawk-plan.json")),
+			roots:   []string{"/tmp"},
+			wantOOT: false,
+		},
+		{
+			name:    "symlinked_root_resolved_not_flagged",
+			line:    assistantWrite("Write", "file_path", filepath.Join(linkDir, "out.txt")),
+			roots:   []string{realRoot},
+			wantOOT: false,
+		},
+		{
+			name:    "notebook_edit_out_of_tree_flagged",
+			line:    assistantWrite("NotebookEdit", "notebook_path", filepath.Join(outside, "nb.ipynb")),
+			roots:   []string{workDir},
+			wantOOT: true,
+		},
+		{
+			// Bash is the unconfinable escape hatch — its tool_use is not
+			// a direct filesystem write and must NOT be flagged here.
+			name:    "bash_tool_use_not_flagged",
+			line:    []byte(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo x > /etc/passwd"}}]}}`),
+			roots:   allowed,
+			wantOOT: false,
+		},
+		{
+			name:    "read_tool_use_not_flagged",
+			line:    assistantWrite("Read", "file_path", "/etc/hosts"),
+			roots:   allowed,
+			wantOOT: false,
+		},
+		{
+			name:    "non_assistant_line_not_flagged",
+			line:    []byte(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`),
+			roots:   allowed,
+			wantOOT: false,
+		},
+		{
+			name:    "malformed_line_not_flagged",
+			line:    []byte(`not json at all`),
+			roots:   allowed,
+			wantOOT: false,
+		},
+		{
+			name:    "empty_line_not_flagged",
+			line:    []byte(``),
+			roots:   allowed,
+			wantOOT: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := outOfTreeWrites(tc.line, tc.roots)
+			if tc.wantOOT && len(got) == 0 {
+				t.Fatalf("expected an out-of-tree write, got none")
+			}
+			if !tc.wantOOT && len(got) != 0 {
+				t.Fatalf("expected no out-of-tree write, got %+v", got)
+			}
+		})
+	}
+}
+
+// TestInvoke_OutOfTreeWriteSurfaced drives the full scan->detector->
+// event path through Invoke: a single out-of-tree Write tool_use lands
+// exactly one out_of_tree_write event in Result.Events while Result.OK
+// stays true (surfacing must never fail the stage).
+func TestInvoke_OutOfTreeWriteSurfaced(t *testing.T) {
+	workDir := t.TempDir()
+	// Synthetic path outside both workDir and the /tmp allowlist. (The
+	// test sandbox puts t.TempDir() under /tmp, so a temp path would be
+	// in-allowlist; /opt/... is genuinely out of tree. The helper only
+	// prints the path — nothing is written — so it need not exist.)
+	const ootPath = "/opt/fishhawk-oot-test/escaped.txt"
+	inv := &Invoker{
+		Cmd: helperCommandWithEnv("out_of_tree_write", "OOT_PATH="+ootPath),
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID:      "rid-oot",
+		Stage:      "implement",
+		WorkingDir: workDir,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; surfacing must not fail the stage: %q", res.FailureReason)
+	}
+	var oot []agent.Event
+	for _, ev := range res.Events {
+		if ev.Kind == "out_of_tree_write" {
+			oot = append(oot, ev)
+		}
+	}
+	if len(oot) != 1 {
+		t.Fatalf("out_of_tree_write events = %d, want 1:\n%+v", len(oot), res.Events)
+	}
+	payload := string(oot[0].Payload)
+	if !strings.Contains(payload, ootPath) {
+		t.Errorf("event missing path %q: %s", ootPath, payload)
+	}
+	if !strings.Contains(payload, `"tool":"Write"`) {
+		t.Errorf("event missing tool=Write: %s", payload)
+	}
+	if !strings.Contains(payload, `"run_id":"rid-oot"`) {
+		t.Errorf("event missing run_id: %s", payload)
+	}
+	if !strings.Contains(payload, `"stage":"implement"`) {
+		t.Errorf("event missing stage: %s", payload)
 	}
 }
 

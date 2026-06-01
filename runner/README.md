@@ -100,6 +100,20 @@ While the agent runs, the runner writes a `stage_progress` liveness line to stde
 
 The counters are coarse and structural — elapsed seconds, parsed-event count, cumulative tokens, and the last event kind — never agent payload text. The cadence is time-driven, so a stalled stage keeps emitting heartbeats with non-advancing `turns`/`tokens_so_far`, distinguishing "alive and progressing" from "stuck". These lines go to stderr **only**: they never enter the signed trace bundle. The `fishhawk-mcp` `fishhawk_run_stage` tool forwards them as MCP progress notifications. There is no flag to disable them in normal operation; they are suppressed only when the runner is driven without a progress sink (not reachable from the CLI).
 
+### Out-of-tree write detection (#611)
+
+The agent runs under `--dangerously-skip-permissions` (a `--print` non-interactive invocation has no human to answer Claude's permission prompts; the trace bundle is the authoritative after-the-fact record). Empirically, no claude-native `--permission-mode` confines filesystem writes while still allowing the arbitrary non-interactive Bash the implement stage needs (`go build/test`, `golangci-lint`, `scripts/test`): the modes that confine the Write/Edit tools also deny that Bash, and the modes that allow it leave a shell-redirect (`>`) escape hatch. True confinement therefore requires an OS-level sandbox, which is deferred to an ADR (see Notes).
+
+As a purely additive safety net, the runner inspects each `assistant` stream-json line and emits an `out_of_tree_write` trace event for any file-writing tool call (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) whose target path falls outside the working tree plus the allowlisted extra dirs (`/tmp`, shared with `--add-dir` so the flag and the detector can't drift):
+
+    {"kind":"out_of_tree_write","ts":"…","payload":{"path":"/Users/op/.claude/memory.md","tool":"Edit","run_id":"…","stage":"implement"}}
+
+This makes a previously invisible boundary crossing (the #601 class) visible in the trace bundle and audit log. Important limits:
+
+- **Surfacing only, never blocking.** The detector is additive: it appends a warning event and does **not** flip `OK` to false or fail the stage. It is also fail-open — an unparseable or unknown-shape line yields no event and never panics, so a stream-json schema drift across claude versions degrades to no-signal rather than a crash.
+- **Residual gap.** It catches writes through the Write/Edit **tools** only. **Bash-mediated writes** (shell `>` redirects) are NOT visible to it. Closing that gap, and confining writes rather than merely surfacing them, is the OS-sandbox ADR's domain.
+- Containment is resolved against the target's deepest **existing** ancestor (the common case is a brand-new file that doesn't exist yet) and canonicalises symlinks first, so e.g. macOS's `/tmp` → `/private/tmp` symlink does not cause false positives.
+
 ## Releases
 
 The release workflow at `.github/workflows/runner-release.yml` triggers on tags matching `runner/v*`. To cut a release:
