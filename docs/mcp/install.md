@@ -146,6 +146,8 @@ The composition matches the CLI's `fishhawk run start --working-dir … --issue 
 
 The `fishhawk_run_stage` tool requires the `fishhawk-runner` binary on the MCP server's host (`PATH` lookup, overridable via `FISHHAWK_RUNNER_BIN` env or the tool's `runner_binary` input). The MCP server runs locally on an operator's workstation today, so this is always satisfied; a future hosted MCP deployment will surface a clean tool error.
 
+`stage_id` is optional ([#602](https://github.com/kuhlman-labs/fishhawk/issues/602)): when omitted, the tool resolves it from `(run_id, stage)` by listing the run's stages and matching on stage type, so you no longer hand-copy a stage UUID. Pass `stage_id` explicitly only to disambiguate or for back-compat — when supplied it must match a stage of the requested type, or the call errors rather than spawning against the wrong stage. A v0 run has at most one stage per type, so the requested type normally resolves uniquely; the >1 case is reported as an ambiguous error naming the duplicate ids rather than silently picking one.
+
 Cancellation: cancelling the `fishhawk_run_stage` tool call sends `SIGTERM` to the runner, waits 30 seconds, then escalates to `SIGKILL`. The runner handles SIGTERM cooperatively (#435) — `ctx.Done()` propagates to the long-running calls (agent invocation + trace/plan/PR uploads), the deferred cancel-emit writes a `runner_cancelled` JSONL line on stdout, and the process exits with code 130 (`128 + SIGINT` convention). The bundle that was packed up to the cancellation point still ships best-effort, so the backend receives whatever events the agent produced.
 
 ## Runner integration
@@ -165,6 +167,8 @@ Cancellation: cancelling the `fishhawk_run_stage` tool call sends `SIGTERM` to t
 | `fishhawk: HTTP 404` from `fishhawk_get_plan` | Run id valid but the plan stage hasn't terminated — the tool returns a structured `no_plan_yet` response, not an error. Other 404s usually mean the run id is wrong. |
 | `no plan stage on run …` from `fishhawk_approve_plan` | The run's workflow doesn't have a plan stage (e.g. `routine_change`). Approve at the stage level directly via the CLI / SPA. |
 | `fishhawk-runner not on PATH` from `fishhawk_run_stage` | The binary could not be resolved via any rung of the resolution chain (input → env → sibling → PATH). Remediate in order of preference: (1) install `fishhawk-runner` in the same directory as `fishhawk-mcp` — the sibling-binary probe resolves it automatically; (2) set `--env FISHHAWK_RUNNER_BIN=<path>` in `claude mcp add` (see step 4); (3) pass `runner_binary` per tool call as a last resort. |
+| `stage type "…" not found in run …` from `fishhawk_run_stage` | The run has no stage of the requested `stage` type — the error lists the run's available stage types. Check that `stage` matches the run's workflow (e.g. `routine_change` has no plan stage) and that the prior stage actually created the one you're asking to run. |
+| `stage type "…" is ambiguous in run …` from `fishhawk_run_stage` | The run has more than one stage of the requested type (unusual for v0). The error names the duplicate stage ids; pass the intended one as `stage_id` explicitly to disambiguate. |
 
 ## See also
 

@@ -93,7 +93,7 @@ type AuditPointer struct {
 // MCP composes the same arguments the CLI would.
 type RunStageInput struct {
 	RunID         string `json:"run_id" jsonschema:"Fishhawk run UUID minted by fishhawk_start_run"`
-	StageID       string `json:"stage_id" jsonschema:"stage UUID inside the run"`
+	StageID       string `json:"stage_id,omitempty" jsonschema:"stage UUID inside the run; optional — when omitted it is auto-resolved from (run_id, stage type). Pass explicitly only to disambiguate, or for back-compat; when supplied it must match the resolved stage of the requested type"`
 	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review"`
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in; defaults to the MCP server's cwd"`
@@ -237,17 +237,34 @@ host; this tool is local-only by design (ADR-024 Q5).
 //  6. on context cancellation, SIGTERM + grace + SIGKILL the child.
 //  7. wait for exit; fetch the post-run stage state for the result.
 func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in RunStageInput) (*mcp.CallToolResult, RunStageOutput, error) {
-	// (1) Input validation.
-	if in.RunID == "" || in.StageID == "" || in.Workflow == "" || in.Stage == "" {
-		return nil, RunStageOutput{}, errors.New("run_id, stage_id, workflow, and stage are all required")
+	// (1) Input validation. stage_id is optional: when omitted it is
+	// resolved tool-side from (run_id, stage type) below.
+	if in.RunID == "" || in.Workflow == "" || in.Stage == "" {
+		return nil, RunStageOutput{}, errors.New("run_id, workflow, and stage are all required")
 	}
 	runUUID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, RunStageOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
 	}
-	stageUUID, err := uuid.Parse(in.StageID)
+	// Only parse stage_id when explicitly supplied — preserve the
+	// "not a valid UUID" error for a non-empty bad value.
+	if in.StageID != "" {
+		if _, perr := uuid.Parse(in.StageID); perr != nil {
+			return nil, RunStageOutput{}, fmt.Errorf("stage_id %q is not a valid UUID: %w", in.StageID, perr)
+		}
+	}
+
+	// Resolve the stage id from (run_id, stage type), honouring an
+	// explicit stage_id when supplied (back-compat) and erroring when
+	// it disagrees. This replaces the hand-copied-UUID error class
+	// (#602) and folds in #583's belongs-to-run validation.
+	resolvedStageID, err := r.resolveStageID(ctx, runUUID, in.Stage, in.StageID)
 	if err != nil {
-		return nil, RunStageOutput{}, fmt.Errorf("stage_id %q is not a valid UUID: %w", in.StageID, err)
+		return nil, RunStageOutput{}, err
+	}
+	stageUUID, err := uuid.Parse(resolvedStageID)
+	if err != nil {
+		return nil, RunStageOutput{}, fmt.Errorf("resolved stage_id %q is not a valid UUID: %w", resolvedStageID, err)
 	}
 
 	// (2) Resolve the runner binary.
@@ -307,7 +324,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		"--backend-url", r.api.baseURL,
 		"--workflow", in.Workflow,
 		"--stage", in.Stage,
-		"--stage-id", in.StageID,
+		"--stage-id", resolvedStageID,
 		"--working-dir", workingDir,
 		"--fetch-prompt",
 		"--upload-trace",
@@ -519,6 +536,62 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		AuditPointer: auditPointer,
 		RunURL:       runURL,
 	}, nil
+}
+
+// resolveStageID resolves the stage UUID to spawn the runner against
+// from (run_id, stage type). It lists the run's stages (ListRunStages)
+// and matches on Stage.Type:
+//
+//   - explicitStageID != "": back-compat path. The explicit id must be
+//     one of the run's stages of stageType; otherwise it errors. This
+//     also enforces #583's belongs-to-run invariant on the explicit
+//     path — a fat-fingered or wrong-run UUID no longer spawns.
+//   - explicitStageID == "": auto-resolve. Requires exactly one stage
+//     of stageType. Zero matches errors naming the available stage
+//     types; more than one errors (ambiguous) naming the duplicate ids
+//     rather than silently picking one.
+//
+// Uses a bounded context mirroring the post-run stage fetch.
+func (r *runResolver) resolveStageID(ctx context.Context, runUUID uuid.UUID, stageType, explicitStageID string) (string, error) {
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	stages, err := r.api.ListRunStages(fetchCtx, runUUID)
+	if err != nil {
+		return "", fmt.Errorf("resolve stage_id: list stages for run %s: %w", runUUID, err)
+	}
+
+	var matches []string
+	available := make([]string, 0, len(stages))
+	for _, s := range stages {
+		available = append(available, s.Type)
+		if s.Type == stageType {
+			matches = append(matches, s.ID)
+		}
+	}
+
+	if explicitStageID != "" {
+		for _, id := range matches {
+			if id == explicitStageID {
+				return explicitStageID, nil
+			}
+		}
+		return "", fmt.Errorf(
+			"stage_id %s does not match a %q stage in run %s; available stage types: %v",
+			explicitStageID, stageType, runUUID, available)
+	}
+
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return "", fmt.Errorf(
+			"stage type %q not found in run %s; available: %v",
+			stageType, runUUID, available)
+	default:
+		return "", fmt.Errorf(
+			"stage type %q is ambiguous in run %s (matched %d stages: %s); pass stage_id explicitly",
+			stageType, runUUID, len(matches), strings.Join(matches, ", "))
+	}
 }
 
 // runStageParseEvents reads JSONL lines from r and appends each
