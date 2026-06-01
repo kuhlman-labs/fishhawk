@@ -197,7 +197,10 @@ jobs:
           node-version: '22'
       - name: Lint OpenAPI spec
         run: |
-          npx -y @redocly/cli@latest lint \
+          # Pin to a concrete published version, NOT @latest: a floating
+          # ref lets an upstream release red-line CI with no change on our
+          # side. Bump deliberately. See #607/#608.
+          npx -y @redocly/cli@2.31.5 lint \
             --config docs/api/redocly.yaml \
             docs/api/v0.openapi.yaml
 

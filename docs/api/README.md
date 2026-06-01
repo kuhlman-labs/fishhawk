@@ -27,10 +27,10 @@ Per ADR (#46) and `MVP_SPEC.md` §5.1.1:
 
 ```sh
 # Lint
-npx -y @redocly/cli@latest lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml
+npx -y @redocly/cli@2.31.5 lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml
 
 # Preview rendered docs
-npx -y @redocly/cli@latest preview-docs docs/api/v0.openapi.yaml
+npx -y @redocly/cli@2.31.5 preview-docs docs/api/v0.openapi.yaml
 ```
 
 When adding an endpoint:
