@@ -82,17 +82,39 @@ func withShortGrace(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { runStageGracePeriod = orig })
 }
 
-// seedStage seeds a fake-backend stage so the post-run fetch
-// populates StageState in the tool output.
+// seedStage seeds a single fake-backend "plan" stage so the post-run
+// fetch populates StageState in the tool output. Thin wrapper over
+// seedStageOfType for the common plan case.
 func seedStage(fb *fakeBackend, runID, stageID uuid.UUID, state string) {
+	seedStageOfType(fb, runID, stageID, "plan", state)
+}
+
+// seedStageOfType seeds a single fake-backend stage of the given type.
+// stage_id is now resolved tool-side from (run_id, stage type), so the
+// seeded stage's Type must match the input's Stage for resolution to
+// succeed.
+func seedStageOfType(fb *fakeBackend, runID, stageID uuid.UUID, stageType, state string) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
-	fb.stagesByRun[runID] = []Stage{{ID: stageID.String(), RunID: runID.String(), State: state, Type: "plan"}}
+	fb.stagesByRun[runID] = []Stage{{ID: stageID.String(), RunID: runID.String(), State: state, Type: stageType}}
+}
+
+// seedStages seeds an arbitrary set of stages on a run. Used by the
+// resolution tests (absent / ambiguous / multi-type cases).
+func seedStages(fb *fakeBackend, runID uuid.UUID, stages ...Stage) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.stagesByRun[runID] = stages
 }
 
 // --- input validation ---
 
-func TestRunStage_RequiresAllFourIDs(t *testing.T) {
+// TestRunStage_RequiresRunWorkflowStage asserts the three remaining
+// required inputs. stage_id is now optional (resolved tool-side from
+// (run_id, stage type)), so its absence is no longer a "required"
+// error — see TestRunStage_ResolvesStageIDWhenOmitted and the
+// absent/ambiguous resolution tests for that path.
+func TestRunStage_RequiresRunWorkflowStage(t *testing.T) {
 	_, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 	withFakeRunner(t, "exit 0")
@@ -102,7 +124,6 @@ func TestRunStage_RequiresAllFourIDs(t *testing.T) {
 		in   RunStageInput
 	}{
 		{"missing run_id", RunStageInput{StageID: uuid.NewString(), Workflow: "w", Stage: "plan"}},
-		{"missing stage_id", RunStageInput{RunID: uuid.NewString(), Workflow: "w", Stage: "plan"}},
 		{"missing workflow", RunStageInput{RunID: uuid.NewString(), StageID: uuid.NewString(), Stage: "plan"}},
 		{"missing stage", RunStageInput{RunID: uuid.NewString(), StageID: uuid.NewString(), Workflow: "w"}},
 	}
@@ -135,18 +156,197 @@ func TestRunStage_InvalidRunUUIDFails(t *testing.T) {
 	}
 }
 
+// --- stage_id resolution (#602) ---
+
+// captureArgv swaps in a runStageCommand fake that records the runner
+// argv and exits 0, plus a LookPath stub. Returns a pointer to the
+// captured slice.
+func captureArgv(t *testing.T) *[]string {
+	t.Helper()
+	captured := new([]string)
+	origCmd := runStageCommand
+	origLook := runStageLookPath
+	runStageCommand = func(_ string, args ...string) *exec.Cmd {
+		*captured = args
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = origLook
+	})
+	return captured
+}
+
+// TestRunStage_ResolvesStageIDWhenOmitted verifies step 6a: when
+// stage_id is omitted, it resolves from (run_id, stage type) and the
+// composed argv carries the resolved --stage-id.
+func TestRunStage_ResolvesStageIDWhenOmitted(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+
+	runID := uuid.New()
+	planStage := uuid.New()
+	implStage := uuid.New()
+	seedStages(fb, runID,
+		Stage{ID: planStage.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "running"},
+	)
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		Workflow:   "w",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if !strings.Contains(strings.Join(*argv, " "), "--stage-id "+implStage.String()) {
+		t.Errorf("argv should carry the resolved implement stage id %s\nfull: %v", implStage, *argv)
+	}
+}
+
+// TestRunStage_AbsentStageTypeErrors verifies step 6b: a stage type
+// not present in the run errors, naming the available stage types.
+func TestRunStage_AbsentStageTypeErrors(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "exit 0")
+
+	runID := uuid.New()
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	)
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		Workflow:   "w",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected stage-not-found error")
+	}
+	if !strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), "plan") {
+		t.Errorf("err should say the type is not found and name available types (plan): %v", err)
+	}
+}
+
+// TestRunStage_AmbiguousStageTypeErrors verifies step 6c: two stages
+// of the same type with no explicit stage_id errors, naming the
+// duplicate ids rather than picking one.
+func TestRunStage_AmbiguousStageTypeErrors(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "exit 0")
+
+	runID := uuid.New()
+	dup1 := uuid.NewString()
+	dup2 := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: dup1, RunID: runID.String(), Type: "implement", State: "running"},
+		Stage{ID: dup2, RunID: runID.String(), Type: "implement", State: "running"},
+	)
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		Workflow:   "w",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected ambiguous-stage error")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("err should say ambiguous: %v", err)
+	}
+	if !strings.Contains(err.Error(), dup1) || !strings.Contains(err.Error(), dup2) {
+		t.Errorf("err should name both duplicate ids %s, %s: %v", dup1, dup2, err)
+	}
+}
+
+// TestRunStage_ExplicitStageIDDisagreesErrors verifies step 6d: an
+// explicit stage_id that is not a stage of the requested type errors.
+func TestRunStage_ExplicitStageIDDisagreesErrors(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "exit 0")
+
+	runID := uuid.New()
+	planStage := uuid.New()
+	implStage := uuid.New()
+	seedStages(fb, runID,
+		Stage{ID: planStage.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "running"},
+	)
+
+	// Pass the plan stage id but ask to run the implement stage.
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    planStage.String(),
+		Workflow:   "w",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected disagreement error")
+	}
+	if !strings.Contains(err.Error(), "does not match") || !strings.Contains(err.Error(), planStage.String()) {
+		t.Errorf("err should say the explicit id does not match the requested type: %v", err)
+	}
+}
+
+// TestRunStage_ExplicitStageIDAgreesWorks verifies step 6e
+// (back-compat): an explicit stage_id that matches the resolved type
+// still works and flows into the argv.
+func TestRunStage_ExplicitStageIDAgreesWorks(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+
+	runID := uuid.New()
+	planStage := uuid.New()
+	implStage := uuid.New()
+	seedStages(fb, runID,
+		Stage{ID: planStage.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "running"},
+	)
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    implStage.String(),
+		Workflow:   "w",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if !strings.Contains(strings.Join(*argv, " "), "--stage-id "+implStage.String()) {
+		t.Errorf("argv should carry the agreed explicit stage id %s\nfull: %v", implStage, *argv)
+	}
+}
+
 // --- binary resolution ---
 
 func TestRunStage_MissingBinaryReturnsCleanError(t *testing.T) {
-	_, srv := newFakeBackend(t)
+	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 	withFakeRunnerMissing(t)
 	// os.Executable sibling probe must also fail so we reach the error rung.
 	withFakeExecutable(t, t.TempDir(), false /* no sibling */)
 
+	// Seed a matching stage so stage resolution passes and we reach the
+	// binary-resolution error rung this test is about.
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "awaiting_approval")
+
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
-		RunID:    uuid.NewString(),
-		StageID:  uuid.NewString(),
+		RunID:    runID.String(),
+		StageID:  stageID.String(),
 		Workflow: "w",
 		Stage:    "plan",
 	})
@@ -390,7 +590,7 @@ func TestRunStage_ArgvComposition_ImplementStageNoPlanOut(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStage(fb, runID, stageID, "succeeded")
+	seedStageOfType(fb, runID, stageID, "implement", "succeeded")
 
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID:      runID.String(),
@@ -431,7 +631,7 @@ func TestRunStage_PushAndOpenPR_DropsNoPRFlag(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStage(fb, runID, stageID, "succeeded")
+	seedStageOfType(fb, runID, stageID, "implement", "succeeded")
 
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID:         runID.String(),
@@ -511,14 +711,21 @@ func TestRunStage_GitHubRepoAutoDetectFails_WarnsWithoutPush(t *testing.T) {
 }
 
 func TestRunStage_GitHubRepoAutoDetectFails_WithPushErrors(t *testing.T) {
-	_, srv := newFakeBackend(t)
+	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 	withFakeGitRemote(t, "", errors.New("nope"))
 	withFakeRunner(t, "exit 0")
 
+	// Seed a matching implement stage so stage resolution passes and the
+	// test reaches the github_repo auto-detect failure it actually
+	// exercises (resolveStageID runs before the github_repo check).
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "running")
+
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
-		RunID:         uuid.NewString(),
-		StageID:       uuid.NewString(),
+		RunID:         runID.String(),
+		StageID:       stageID.String(),
 		Workflow:      "w",
 		Stage:         "implement",
 		PushAndOpenPR: true,
@@ -806,7 +1013,7 @@ func TestRunStage_DiffSummary_PopulatedFromGitDiffEvent(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStage(fb, runID, stageID, "succeeded")
+	seedStageOfType(fb, runID, stageID, "implement", "succeeded")
 
 	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID:      runID.String(),
@@ -846,7 +1053,7 @@ func TestRunStage_AuditPointer_NilOnBackend500(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStage(fb, runID, stageID, "succeeded")
+	seedStageOfType(fb, runID, stageID, "implement", "succeeded")
 
 	warningsBefore := 0
 	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
@@ -890,7 +1097,7 @@ func TestRunStage_RunURL_ContainsRunID(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStage(fb, runID, stageID, "succeeded")
+	seedStageOfType(fb, runID, stageID, "implement", "succeeded")
 
 	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID:      runID.String(),
