@@ -12,6 +12,22 @@ cmd="${1:-}"
 
 _die() { print -u2 "error: $*"; exit 1 }
 
+# ZERR diagnostic trap. zsh auto-installs a function named TRAPZERR as the ZERR
+# (error) trap: it fires on any command returning non-zero in a NON-tested
+# context — exactly where `set -e` (ERR_EXIT) would abort. Without this, an
+# intermittent top-level abort (issue #631) exits 1 with literally zero output
+# and is undiagnosable. We print the failing command's exit code and file:line
+# to stderr so the next recurrence pins the exact trigger. Use ${funcfiletrace[1]}
+# (the call site of this trap function) — bare ${LINENO} inside a TRAPZERR
+# function reports the trap's own internal line in zsh, not the error site.
+# Stays silent in normal operation: ZERR does not fire for commands whose status
+# is tested by if/while/until/&&/||/! (e.g. _build_binary in an `if`,
+# _await_healthz in `if !`, _pg_ready in `&&`/`||`).
+TRAPZERR() {
+  local code=$?
+  print -u2 "scripts/dev: command failed (exit ${code}) at line ${funcfiletrace[1]}"
+}
+
 _pg_ready() {
   local host="${PGHOST:-localhost}"
   local port="${PGPORT:-5432}"
@@ -23,7 +39,7 @@ _pg_ready() {
     local hostport="${stripped%%/*}"                   # take host:port before /
     host="${hostport%%:*}"
     port="${hostport##*:}"
-    [[ "$host" == "$port" ]] && port=5432             # no colon — default port
+    if [[ "$host" == "$port" ]]; then port=5432; fi   # no colon — default port
   fi
 
   if command -v pg_isready &>/dev/null; then
@@ -46,7 +62,7 @@ _minio_ready() {
 _healthz_url() {
   local addr="${FISHHAWKD_ADDR:-:8080}"
   local port="${addr##*:}"
-  [[ -z "$port" || "$port" == "$addr" ]] && port=8080
+  if [[ -z "$port" || "$port" == "$addr" ]]; then port=8080; fi
   print "http://localhost:${port}/healthz"
 }
 
@@ -69,7 +85,7 @@ _await_healthz() {
       return 0
     fi
     sleep 1
-    (( i++ ))
+    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
   done
   return 1
 }
@@ -105,23 +121,23 @@ _detect_rebuild_set() {
     case "$f" in
       # Shared libs trigger all four binaries; short-circuit on first hit
       backend/internal/plan/*|backend/internal/spec/*)
-        [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]] && rebuild_set[fishhawkd]="$f"
-        [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]]     && rebuild_set[fishhawk-mcp]="$f"
-        [[ -z "${rebuild_set[fishhawk-runner]:-}" ]]  && rebuild_set[fishhawk-runner]="$f"
-        [[ -z "${rebuild_set[fishhawk]:-}" ]]         && rebuild_set[fishhawk]="$f"
+        if [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]]; then rebuild_set[fishhawkd]="$f"; fi
+        if [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]];    then rebuild_set[fishhawk-mcp]="$f"; fi
+        if [[ -z "${rebuild_set[fishhawk-runner]:-}" ]]; then rebuild_set[fishhawk-runner]="$f"; fi
+        if [[ -z "${rebuild_set[fishhawk]:-}" ]];        then rebuild_set[fishhawk]="$f"; fi
         return
         ;;
       backend/cmd/fishhawkd/*|backend/internal/*)
-        [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]] && rebuild_set[fishhawkd]="$f"
+        if [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]]; then rebuild_set[fishhawkd]="$f"; fi
         ;;
       backend/cmd/fishhawk-mcp/*)
-        [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]] && rebuild_set[fishhawk-mcp]="$f"
+        if [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]]; then rebuild_set[fishhawk-mcp]="$f"; fi
         ;;
       runner/cmd/fishhawk-runner/*|runner/internal/*)
-        [[ -z "${rebuild_set[fishhawk-runner]:-}" ]] && rebuild_set[fishhawk-runner]="$f"
+        if [[ -z "${rebuild_set[fishhawk-runner]:-}" ]]; then rebuild_set[fishhawk-runner]="$f"; fi
         ;;
       cli/cmd/fishhawk/*|cli/internal/*)
-        [[ -z "${rebuild_set[fishhawk]:-}" ]] && rebuild_set[fishhawk]="$f"
+        if [[ -z "${rebuild_set[fishhawk]:-}" ]]; then rebuild_set[fishhawk]="$f"; fi
         ;;
     esac
   done <<< "$changed_files"
@@ -234,11 +250,12 @@ _signal_mcp_activation() {
 }
 
 cmd_up() {
+  print "up: starting"
   local force_all=0
   local start_deps=0
   for arg in "$@"; do
-    [[ "$arg" == "--all" ]] && force_all=1
-    [[ "$arg" == "--start-deps" ]] && start_deps=1
+    if [[ "$arg" == "--all" ]]; then force_all=1; fi
+    if [[ "$arg" == "--start-deps" ]]; then start_deps=1; fi
   done
 
   # Idempotency: bail if already running
@@ -279,8 +296,8 @@ cmd_up() {
 
   # Containers preflight — check each independently, but run docker compose up -d at most once.
   local pg_running=0 minio_running=0
-  [[ -n "$(docker ps --filter 'name=^/fishhawk-postgres$' --format '{{.Names}}')" ]] && pg_running=1
-  [[ -n "$(docker ps --filter 'name=^/fishhawk-minio$' --format '{{.Names}}')" ]] && minio_running=1
+  if [[ -n "$(docker ps --filter 'name=^/fishhawk-postgres$' --format '{{.Names}}')" ]]; then pg_running=1; fi
+  if [[ -n "$(docker ps --filter 'name=^/fishhawk-minio$' --format '{{.Names}}')" ]]; then minio_running=1; fi
 
   if (( !pg_running || !minio_running )); then
     if (( start_deps )); then
@@ -290,7 +307,7 @@ cmd_up() {
       while (( i < 30 )); do
         _pg_ready && _minio_ready && break
         sleep 2
-        (( i++ ))
+        (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
       done
       _pg_ready || _die "postgres did not become ready within 60s — check: docker logs fishhawk-postgres"
       _minio_ready || _die "minio did not become ready within 60s — check: docker logs fishhawk-minio"
@@ -410,7 +427,7 @@ cmd_down() {
   local i=0
   while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
     sleep 1
-    (( i++ ))
+    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (the #631 trigger)
   done
 
   if kill -0 "$pid" 2>/dev/null; then
@@ -433,6 +450,7 @@ cmd_down() {
 # diff (HEAD@{1}..HEAD), so a full rebuild does not false-nag a reconnect.
 # Extra flags (--start-deps, a redundant --all) forward to cmd_up unchanged.
 cmd_reload() {
+  print "reload: starting"
   if [[ -f "$PID_FILE" ]]; then
     cmd_down
   fi
