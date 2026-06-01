@@ -1333,6 +1333,92 @@ func TestNotify_NilReceiver_NoOp(t *testing.T) {
 	}); err != nil {
 		t.Errorf("nil reply should be a no-op; got %v", err)
 	}
+	if err := n.NotifyRunRejected(context.Background(), "x/y", 1, 1, "feature_change", "plan"); err != nil {
+		t.Errorf("nil run-rejected should be a no-op; got %v", err)
+	}
+}
+
+// TestNotifyRunRejected_PostsExplanation covers the #599 surface: the
+// run-rejected comment names the offending workflow_id + stage and
+// both fixes, posts no audit row (runless; canonical record is the
+// dispatcher's global-chain entry), and is not deduped.
+func TestNotifyRunRejected_PostsExplanation(t *testing.T) {
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := n.NotifyRunRejected(context.Background(), "kuhlman-labs/fishhawk", 42, 1247,
+		"feature_change", "plan"); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 comment; got %d", len(gh.calls))
+	}
+	call := gh.calls[0]
+	if call.installationID != 42 {
+		t.Errorf("installationID = %d, want 42", call.installationID)
+	}
+	if call.issueNumber != 1247 {
+		t.Errorf("issueNumber = %d, want 1247", call.issueNumber)
+	}
+	for _, want := range []string{"feature_change", "plan", "FISHHAWKD_ANTHROPIC_API_KEY", "reviewers"} {
+		if !strings.Contains(call.body, want) {
+			t.Errorf("body missing %q:\n%s", want, call.body)
+		}
+	}
+	// Runless surface: no notifier-level audit row (mirrors
+	// NotifySlashApprovalReply).
+	if len(au.appended) != 0 {
+		t.Errorf("expected no audit rows; got %d", len(au.appended))
+	}
+
+	// Not deduped: a second refusal posts again.
+	if err := n.NotifyRunRejected(context.Background(), "kuhlman-labs/fishhawk", 42, 1247,
+		"feature_change", "plan"); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 2 {
+		t.Errorf("run-rejected comments should not be deduped; got %d calls", len(gh.calls))
+	}
+}
+
+// TestNotifyRunRejected_SkipsBadParams exercises the defensive skips:
+// zero issue, zero installation, malformed repo all no-op without
+// touching GitHub.
+func TestNotifyRunRejected_SkipsBadParams(t *testing.T) {
+	gh := &fakeGitHub{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Audit:       &fakeAudit{},
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	cases := []struct {
+		name           string
+		repo           string
+		installationID int64
+		issueNumber    int
+	}{
+		{"zero issue", "x/y", 99, 0},
+		{"zero installation", "x/y", 0, 1},
+		{"malformed repo", "no-slash", 99, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := n.NotifyRunRejected(context.Background(), tc.repo, tc.installationID,
+				tc.issueNumber, "feature_change", "plan"); err != nil {
+				t.Errorf("expected nil; got %v", err)
+			}
+		})
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("expected 0 calls; got %d", len(gh.calls))
+	}
 }
 
 // --- helpers ---

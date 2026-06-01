@@ -656,6 +656,13 @@ type IssueNotifier interface {
 	// Best-effort; failures here don't unwind the calling
 	// transition.
 	NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error
+	// NotifyRunRejected posts a comment on the triggering issue when
+	// the plan-review wiring guard refuses a GitHub-triggered run for
+	// a missing plan reviewer (#577 / #599). The guard runs before
+	// CreateRun, so there is no run UUID — the issue coordinates are
+	// passed as flat primitives (matching NotifyCIRetry's convention).
+	// Best-effort: failures log but don't change the refusal outcome.
+	NotifyRunRejected(ctx context.Context, repo string, installationID int64, issueNumber int, workflowID, stageID string) error
 }
 
 // ApprovalCommandHandler executes a slash-command approval / reject
@@ -864,6 +871,27 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 				slog.String("workflow_id", m.WorkflowID),
 				slog.String("stage", st.ID),
 			)
+			// Surface the refusal to the customer on the triggering
+			// issue (#599). The operator-side audit + WARN above are
+			// invisible to them; without this the run just silently
+			// never appears. Best-effort exactly like the status-comment
+			// seed (step 8.5): a failure logs but does not change the
+			// return nil. Both issue-trigger entry points populate
+			// m.IssueRef (matchIssue + matchIssueComment), so the
+			// labeled-issue and /fishhawk run paths are both covered.
+			if d.IssueNotifier != nil && m.TriggerSource == run.TriggerGitHubIssue &&
+				m.IssueRef != nil && m.IssueRef.Number > 0 {
+				if err := d.IssueNotifier.NotifyRunRejected(ctx, ev.Repo, ev.InstallationID,
+					m.IssueRef.Number, m.WorkflowID, st.ID); err != nil {
+					d.logger().LogAttrs(ctx, slog.LevelWarn,
+						"run-rejected comment failed",
+						slog.String("delivery_id", ev.DeliveryID),
+						slog.String("repo", ev.Repo),
+						slog.String("workflow_id", m.WorkflowID),
+						slog.String("error", err.Error()),
+					)
+				}
+			}
 			return nil
 		}
 	}
