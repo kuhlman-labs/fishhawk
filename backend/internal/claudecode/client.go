@@ -50,11 +50,13 @@ type Config struct {
 	// MaxRetries bounds the in-adapter retry for a transient subprocess
 	// launch crash (an external/OOM SIGKILL surfacing as *exec.ExitError,
 	// #620). It counts RETRIES, not attempts: the loop runs MaxRetries+1
-	// attempts total. The default (1) is set at construction in NewClient;
-	// an explicit 0 disables retry deterministically so tests can pin a
-	// single attempt. A per-attempt timeout (a slow review, #606) and
-	// deterministic faults (binary-missing, envelope-decode, bad verdict)
-	// are never retried.
+	// attempts total. NewClient normalises a zero value to 1 — Go cannot
+	// distinguish an explicit 0 from an unset field, so the constructor
+	// always defaults zero to 1. To run a single attempt (retry disabled),
+	// set cfg.MaxRetries to 0 on the Client AFTER NewClient (as the tests
+	// do) rather than passing 0 to NewClient. A per-attempt timeout (a slow
+	// review, #606) and deterministic faults (binary-missing,
+	// envelope-decode, bad verdict) are never retried.
 	MaxRetries int
 }
 
