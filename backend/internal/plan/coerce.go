@@ -33,8 +33,51 @@ type coercionAnnotation struct {
 // built once at package init by parsing the embedded schema.
 var coercionRegistry map[string]coercionEntry
 
+// optionalTopLevelFields is the schema-derived set of top-level properties that
+// are NOT in the schema's `required` array (properties \ required), built once
+// at package init. TryCoerce drops any of these whose value is JSON null,
+// treating null-as-absent. Required fields are intentionally excluded so a null
+// required field still fails Validate with a precise message.
+var optionalTopLevelFields map[string]struct{}
+
 func init() {
 	coercionRegistry = buildCoercionRegistry()
+	optionalTopLevelFields = buildOptionalTopLevelFields()
+}
+
+// buildOptionalTopLevelFields parses the embedded schema and returns the set of
+// top-level property names that are not listed in the schema's `required`
+// array. Schema-derived so it auto-adapts as the schema evolves (today:
+// decomposition, risks_and_assumptions).
+func buildOptionalTopLevelFields() map[string]struct{} {
+	const schemaPath = "schemas/plan-standard-v1.schema.json"
+	data, err := schemaFS.ReadFile(schemaPath)
+	if err != nil {
+		panic(fmt.Sprintf("plan: coerce: read schema %s: %v", schemaPath, err))
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(data, &schema); err != nil {
+		panic(fmt.Sprintf("plan: coerce: parse schema %s: %v", schemaPath, err))
+	}
+
+	required := make(map[string]struct{})
+	if reqRaw, ok := schema["required"].([]any); ok {
+		for _, r := range reqRaw {
+			if s, ok := r.(string); ok {
+				required[s] = struct{}{}
+			}
+		}
+	}
+
+	optional := make(map[string]struct{})
+	if props, ok := schema["properties"].(map[string]any); ok {
+		for name := range props {
+			if _, isRequired := required[name]; !isRequired {
+				optional[name] = struct{}{}
+			}
+		}
+	}
+	return optional
 }
 
 func buildCoercionRegistry() map[string]coercionEntry {
@@ -179,9 +222,12 @@ func CoercionRegistrySummary() string {
 	return fmt.Sprintf("%d paths: %s", len(paths), strings.Join(paths, ", "))
 }
 
-// TryCoerce attempts to fix the known string-elision class of plan schema
-// violations: cases where an agent emits a bare string where the schema
-// expects an object. The set of coercible paths is derived at init time from
+// TryCoerce attempts to fix two known classes of plan schema violations:
+// (1) the string-elision class — an agent emits a bare string where the schema
+// expects an object; and (2) the null-optional class — an agent sets an
+// optional top-level field to JSON null, which TryCoerce drops (treating
+// null-as-absent). A null in a REQUIRED field is left in place so Validate
+// still fails with a precise message. The set of coercible paths is derived at init time from
 // the x-coerce-principal / x-coerce-defaults annotations in the embedded
 // schema — no per-field code changes are required when the schema gains a new
 // annotated $defs entry.
@@ -201,6 +247,24 @@ func TryCoerce(data []byte, now time.Time) ([]byte, []Coercion, error) {
 	}
 
 	var coercions []Coercion
+
+	// Drop top-level optional fields whose value is JSON null. encoding/json
+	// stores a JSON null as a present key with a nil value, so an agent that
+	// emits e.g. "decomposition": null lands here as (present, nil) and would
+	// otherwise fail schema validation. Treat null-as-absent for optional fields
+	// only; a null in a REQUIRED field is left in place so Validate still fails
+	// with a precise message.
+	for key := range optionalTopLevelFields {
+		if v, ok := m[key]; ok && v == nil {
+			delete(m, key)
+			coercions = append(coercions, Coercion{
+				FieldPath:     "/" + key,
+				OriginalType:  "null",
+				OriginalValue: nil,
+				CoercedTo:     nil,
+			})
+		}
+	}
 
 	for path, entry := range coercionRegistry {
 		parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
