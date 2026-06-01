@@ -13,7 +13,7 @@ Pre-alpha. Most code referenced in `docs/MVP_SPEC.md` doesn't exist yet — it's
 - `docs/BRAND_FOUNDATIONS.md` — voice, naming, positioning.
 - `docs/METHODOLOGY.md` — autonomy tiers (low/medium/high).
 - `docs/spec/` — canonical JSON Schemas + reference docs for the workflow spec (`.fishhawk/workflows.yaml`) and the plan artifact (`standard_v1`). Validate with `check-jsonschema --schemafile <schema> <yaml-or-json>`.
-- `docs/api/` — REST API surface: `v0.openapi.yaml` is source of truth, `v0.md` is the human companion. Lint with `npx -y @redocly/cli@latest lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml`.
+- `docs/api/` — REST API surface: `v0.openapi.yaml` is source of truth, `v0.md` is the human companion. Lint with `npx -y @redocly/cli@2.31.5 lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml` (pinned version — see the pinning rule under "Build, test, lint").
 - `.fishhawk/workflows.yaml` — placeholder; executed by the product itself starting Day 21 (~2026-05-20).
 
 ## Documentation surfaces
@@ -40,6 +40,8 @@ golangci-lint run ./backend/...
 ```
 
 `.golangci.yml` is **v2 format** (`version: "2"` at top). Local install must be golangci-lint v2.x; v1 binaries reject this config.
+
+**Pin executable tooling fetched inside CI/release `run:` steps.** Any tool a workflow downloads and executes at run time — install scripts piped to a shell (`curl … | sh`), `npx` packages — MUST be pinned to a specific immutable tag or version, never `master`/`main`/`latest`/a floating major. A third-party repo can change its `master` install script or publish a new `@latest` and red-line the entire pipeline (including `main`) with zero change on our side — exactly what happened when golangci-lint's `master/install.sh` broke CI (#607/#608). Current pins: golangci-lint `install.sh` → the `v2.8.0` tag (all four workflows: `ci.yml` + the three `*-release.yml`); `@redocly/cli` → `2.31.5` (in `ci.yml` and the `docs/api/` lint/preview commands — keep these in sync). GitHub Action refs (`actions/checkout@vN`, etc.) are the exception: they stay on floating major tags because `.github/dependabot.yml`'s `github-actions` entry bumps them deliberately and reviewably. npx-in-run-step pins are not yet Dependabot-tracked, so bump them by hand.
 
 **Coverage gate**: aggregate ≥ 80% across **all** registered modules, excluding sqlc-generated `*/db/` packages (CI uses `--exclude '/db/'` so new sqlc packages auto-skip). Tiered targets in `docs/ARCHITECTURE.md` §9. CI fails `CI Pass` if the threshold drops. `scripts/test coverage` runs the same check. The underlying loop (CI uses the same shape):
 
