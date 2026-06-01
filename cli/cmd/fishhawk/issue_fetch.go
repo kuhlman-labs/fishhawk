@@ -54,18 +54,28 @@ func resolveIssueRef(raw string) (int, error) {
 	return n, nil
 }
 
-// ghIssue is the subset of `gh issue view --json title,body,url,number`
-// output the CLI consumes. gh emits camelCase; mirror it verbatim
-// so the JSON decoder picks the right keys.
+// ghIssue is the subset of `gh issue view --json
+// title,body,url,number,comments` output the CLI consumes. gh emits
+// camelCase; mirror it verbatim so the JSON decoder picks the right
+// keys. Each comment carries a nested `author` object (we read its
+// `login`), plus `body` and `createdAt`.
 type ghIssue struct {
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	URL    string `json:"url"`
-	Number int    `json:"number"`
+	Title    string `json:"title"`
+	Body     string `json:"body"`
+	URL      string `json:"url"`
+	Number   int    `json:"number"`
+	Comments []struct {
+		Author struct {
+			Login string `json:"login"`
+		} `json:"author"`
+		Body      string `json:"body"`
+		CreatedAt string `json:"createdAt"`
+	} `json:"comments"`
 }
 
 // fetchIssueViaGh shells to `gh issue view N --repo owner/name
-// --json title,body,url,number` and returns the parsed result.
+// --json title,body,url,number,comments` and returns the parsed
+// result.
 //
 // Best-effort by design — when `gh` is missing, unauthed, or the
 // repo blocks the operator, runStart warns to stderr and proceeds
@@ -83,7 +93,7 @@ func fetchIssueViaGh(repo string, issueNumber int) (*httpclient.IssueContext, er
 		return nil, ErrGhNotInstalled
 	}
 	cmd := ghIssueCommand("gh", "issue", "view", strconv.Itoa(issueNumber),
-		"--repo", repo, "--json", "title,body,url,number")
+		"--repo", repo, "--json", "title,body,url,number,comments")
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -97,12 +107,20 @@ func fetchIssueViaGh(repo string, issueNumber int) (*httpclient.IssueContext, er
 	if err := json.Unmarshal(out, &iss); err != nil {
 		return nil, fmt.Errorf("gh issue view: decode: %w", err)
 	}
-	return &httpclient.IssueContext{
+	ic := &httpclient.IssueContext{
 		Title:  iss.Title,
 		Body:   iss.Body,
 		URL:    iss.URL,
 		Number: iss.Number,
-	}, nil
+	}
+	for _, c := range iss.Comments {
+		ic.Comments = append(ic.Comments, httpclient.IssueComment{
+			Author:    c.Author.Login,
+			Body:      c.Body,
+			CreatedAt: c.CreatedAt,
+		})
+	}
+	return ic, nil
 }
 
 // ErrGhNotInstalled signals the `gh` binary is missing on the

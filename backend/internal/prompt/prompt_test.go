@@ -1349,3 +1349,172 @@ func TestBuild_ImplementReview_ProducesNoPRDescriptionGuidance(t *testing.T) {
 		t.Errorf("implement_review prompt must not carry implement-stage PR guidance:\n%s", got)
 	}
 }
+
+// TestBuild_Plan_IssueCommentsRendered is the headline #618 / #616
+// acceptance check: a comment that contradicts the body renders in the
+// '### Issue comments' section with its author + timestamp and the
+// supersede preface, chronologically after the body.
+func TestBuild_Plan_IssueCommentsRendered(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 616,
+		IssueTitle:  "Add a foo flag",
+		IssueBody:   "We need a --foo flag that defaults to off.",
+		Repo:        "x/y",
+		IssueComments: []IssueComment{
+			{Author: "alice", Body: "First thought: make it a bool.", CreatedAt: "2026-05-01T10:00:00Z"},
+			{Author: "bob", Body: "Correction: --foo must default to ON, not off.", CreatedAt: "2026-05-02T12:30:00Z"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Issue comments",
+		"supersede", // the preface
+		"**@alice** (2026-05-01T10:00:00Z):",
+		"First thought: make it a bool.",
+		"**@bob** (2026-05-02T12:30:00Z):",
+		"Correction: --foo must default to ON, not off.",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	// Chronological order: body, then alice, then bob.
+	bodyIdx := strings.Index(got, "We need a --foo flag")
+	aliceIdx := strings.Index(got, "**@alice**")
+	bobIdx := strings.Index(got, "**@bob**")
+	if bodyIdx >= aliceIdx || aliceIdx >= bobIdx {
+		t.Errorf("expected body < alice < bob ordering, got body=%d alice=%d bob=%d", bodyIdx, aliceIdx, bobIdx)
+	}
+}
+
+// TestBuild_Plan_BotCommentsFiltered confirms comments authored by a
+// login ending in [bot] (CI bots, Fishhawk's own #377 footer) are
+// dropped from the rendered section while human comments survive.
+func TestBuild_Plan_BotCommentsFiltered(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "T",
+		IssueBody:   "Body.",
+		Repo:        "x/y",
+		IssueComments: []IssueComment{
+			{Author: "github-actions[bot]", Body: "CI failed on main.", CreatedAt: "2026-05-01T00:00:00Z"},
+			{Author: "carol", Body: "Human refinement here.", CreatedAt: "2026-05-02T00:00:00Z"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "CI failed on main.") || strings.Contains(got, "github-actions[bot]") {
+		t.Errorf("bot-authored comment should be filtered:\n%s", got)
+	}
+	if !strings.Contains(got, "Human refinement here.") {
+		t.Errorf("human comment should survive the bot filter:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_AllBotComments_SectionAbsent guards the distinct case
+// where EVERY comment is bot-authored: the '### Issue comments' section
+// is absent entirely (not rendered empty) and the body-only fallback is
+// unchanged. Distinct from the nil-slice case below.
+func TestBuild_Plan_AllBotComments_SectionAbsent(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "T",
+		IssueBody:   "Body stays.",
+		Repo:        "x/y",
+		IssueComments: []IssueComment{
+			{Author: "github-actions[bot]", Body: "CI failed.", CreatedAt: "2026-05-01T00:00:00Z"},
+			{Author: "dependabot[bot]", Body: "Bump dep.", CreatedAt: "2026-05-02T00:00:00Z"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Issue comments") {
+		t.Errorf("section must be absent when all comments are bot-authored:\n%s", got)
+	}
+	if !strings.Contains(got, "Body stays.") {
+		t.Errorf("body-only fallback should be unchanged:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_NoIssueComments confirms the body-only fallback is
+// unchanged when IssueComments is nil (the pre-#618 shape).
+func TestBuild_Plan_NoIssueComments(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "T",
+		IssueBody:   "Just the body.",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Issue comments") {
+		t.Errorf("no comments section expected for nil IssueComments:\n%s", got)
+	}
+	if !strings.Contains(got, "Just the body.") {
+		t.Errorf("body should still render:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_PerCommentTruncation confirms an over-cap comment body
+// is truncated with the ...[truncated] marker.
+func TestBuild_Plan_PerCommentTruncation(t *testing.T) {
+	huge := strings.Repeat("x", 5000)
+	got, err := Build("plan", Trigger{
+		IssueNumber:   7,
+		IssueBody:     "Body.",
+		Repo:          "x/y",
+		IssueComments: []IssueComment{{Author: "alice", Body: huge, CreatedAt: "2026-05-01T00:00:00Z"}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "...[truncated]") {
+		t.Errorf("expected per-comment truncation marker:\n%s", got)
+	}
+	if strings.Contains(got, huge) {
+		t.Error("full over-cap comment body should not appear verbatim")
+	}
+}
+
+// TestBuild_Plan_TotalBudgetDropsOldest confirms that when the total
+// comment budget is exceeded, the OLDEST comments are dropped first
+// (recency is load-bearing) and the omission marker is prepended. The
+// newest comment always survives.
+func TestBuild_Plan_TotalBudgetDropsOldest(t *testing.T) {
+	// Each comment is ~1900 bytes (under the 2000 per-comment cap); 10
+	// of them (~19KB) blows past the 12KB total budget so the oldest
+	// get dropped.
+	var comments []IssueComment
+	for i := 0; i < 10; i++ {
+		comments = append(comments, IssueComment{
+			Author:    "u",
+			Body:      strings.Repeat("a", 1900) + "_comment" + string(rune('0'+i)),
+			CreatedAt: "2026-05-01T00:00:0" + string(rune('0'+i)) + "Z",
+		})
+	}
+	got, err := Build("plan", Trigger{
+		IssueNumber:   7,
+		IssueBody:     "Body.",
+		Repo:          "x/y",
+		IssueComments: comments,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "older comment(s) omitted to fit budget") {
+		t.Errorf("expected omission marker when over total budget:\n%s", got)
+	}
+	// Newest (index 9) survives; oldest (index 0) is dropped.
+	if !strings.Contains(got, "_comment9") {
+		t.Errorf("newest comment must survive:\n%s", got)
+	}
+	if strings.Contains(got, "_comment0") {
+		t.Errorf("oldest comment should be dropped when over budget:\n%s", got)
+	}
+}

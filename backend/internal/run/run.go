@@ -255,10 +255,22 @@ type Run struct {
 // the agent and any rendered surfaces link directly to what humans
 // see.
 type IssueContext struct {
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	URL    string `json:"url"`
-	Number int    `json:"number"`
+	Title    string         `json:"title"`
+	Body     string         `json:"body"`
+	URL      string         `json:"url"`
+	Number   int            `json:"number"`
+	Comments []IssueComment `json:"comments,omitempty"`
+}
+
+// IssueComment is one issue comment captured alongside the body at
+// run-create (#618). Persisted inside the runs.issue_context JSONB
+// payload (additive — existing rows lacking the key unmarshal to a
+// nil slice). The prompt builder renders these into the plan-stage
+// prompt so comment-borne refinements reach the plan agent.
+type IssueComment struct {
+	Author    string `json:"author"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
 }
 
 // RunnerKind enumerates the execution backends Fishhawk supports.

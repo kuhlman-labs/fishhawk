@@ -421,6 +421,94 @@ func TestGetStagePrompt_CachedIssueContext_PreferredOverGitHubFetch(t *testing.T
 	}
 }
 
+// TestGetStagePrompt_CachedIssueComments_MappedIntoTrigger is the
+// #618 check: a cached IssueContext carrying comments renders the
+// '### Issue comments' section in the plan-stage prompt with the
+// commenter's login.
+func TestGetStagePrompt_CachedIssueComments_MappedIntoTrigger(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    &triggerRef,
+		IssueContext: &run.IssueContext{
+			Number: 42,
+			Title:  "Cached title",
+			Body:   "Cached body.",
+			URL:    "https://github.com/kuhlman-labs/example/issues/42",
+			Comments: []run.IssueComment{
+				{Author: "alice", Body: "Comment-borne refinement.", CreatedAt: "2026-05-01T10:00:00Z"},
+			},
+		},
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if gh.called {
+		t.Errorf("GetIssue should NOT be called when IssueContext is cached")
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !contains(resp.Prompt, "### Issue comments") {
+		t.Errorf("prompt missing comments section:\n%s", resp.Prompt)
+	}
+	if !contains(resp.Prompt, "Comment-borne refinement.") {
+		t.Errorf("prompt missing comment body:\n%s", resp.Prompt)
+	}
+	if !contains(resp.Prompt, "@alice") {
+		t.Errorf("prompt missing comment author:\n%s", resp.Prompt)
+	}
+}
+
+// TestGetStagePrompt_CachedIssueContext_NoComments guards the
+// regression case: a cached IssueContext with no comments still
+// renders the body-only plan prompt unchanged — no comments section.
+func TestGetStagePrompt_CachedIssueContext_NoComments(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    &triggerRef,
+		IssueContext: &run.IssueContext{
+			Number: 42,
+			Title:  "Cached title",
+			Body:   "Cached body.",
+			URL:    "https://github.com/kuhlman-labs/example/issues/42",
+		},
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if contains(resp.Prompt, "### Issue comments") {
+		t.Errorf("no comments section expected when IssueContext has no comments:\n%s", resp.Prompt)
+	}
+	if !contains(resp.Prompt, "Cached body.") {
+		t.Errorf("body-only prompt should still render the body:\n%s", resp.Prompt)
+	}
+}
+
 func TestGetStagePrompt_UnsupportedStageType(t *testing.T) {
 	s, rr, sf, _ := newPromptServer(t)
 	runID := uuid.New()
