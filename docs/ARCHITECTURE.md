@@ -117,7 +117,7 @@ When a stage's `reviewers.agent > 0` is configured in the workflow spec, the bac
 | `FISHHAWKD_ANTHROPIC_API_KEY` | `` (empty) | Anthropic API key; empty disables the SDK adapter |
 | `FISHHAWKD_PLAN_REVIEW_MODEL` | `claude-sonnet-4-6` | Model used for each SDK review invocation |
 | `FISHHAWKD_PLAN_REVIEW_MAX_TOKENS` | `4096` | Maximum output tokens per review call (both adapters) |
-| `FISHHAWKD_PLAN_REVIEW_TIMEOUT` | `60s` | Per-invocation timeout (both adapters). Since #584 this is the **effective** per-invocation bound: the reviewer context is detached from the upload request via `context.WithoutCancel`, so the adapter's own `context.WithTimeout(reviewCtx, this)` is no longer clamped by the runner's upload-client disconnect. See **Review dispatch: advisory-async vs. gating-sync** below. |
+| `FISHHAWKD_PLAN_REVIEW_TIMEOUT` | `300s` | Per-invocation timeout (both adapters). Since #584 this is the **effective** per-invocation bound: the reviewer context is detached from the upload request via `context.WithoutCancel`, so the adapter's own `context.WithTimeout(reviewCtx, this)` is no longer clamped by the runner's upload-client disconnect. Raised 60s→300s in #606 to cover review of large (10+ file) `standard_v1` plans observed timing out at the old bound; small plans still finish well inside it. The env override is unchanged. Distinct from the ~1s immediate-crash mode owned by #620. See **Review dispatch: advisory-async vs. gating-sync** below. |
 | `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` | `false` | Opt-in local-mode subprocess adapter; ignored when the API key is set |
 | `FISHHAWKD_LOCAL_CLAUDE_BINARY` | `claude` | Executable name/path for the local-mode `claude` CLI |
 | `FISHHAWKD_LOCAL_CLAUDE_MODEL` | `claude-sonnet-4-6` | Model the local-mode `claude` CLI uses for review |
@@ -129,7 +129,10 @@ Recommended local config for dogfooding (copy-pasteable):
 ```sh
 export FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER=true
 export FISHHAWKD_LOCAL_CLAUDE_MODEL=claude-sonnet-4-6
+export FISHHAWKD_PLAN_REVIEW_TIMEOUT=300
 ```
+
+Large-plan expectation (#606): small plans review in ~60–90s, but large backend `standard_v1` plans (10+ files) need the wider budget — the old 60s default timed them out and the agent verdict never landed. Because advisory plan review is async/detached (#584), a longer budget blocks nothing: it only lengthens the worst-case `pending` window that `fishhawk_await_review` already returns gracefully (#600). The override above is redundant with the new 300s code default but kept in the copy-pasteable block for explicitness. This is the genuine timeout-on-large-plans mode only; the separate ~1s immediate-crash mode is owned by #620.
 
 The review model (`claude-sonnet-4-6`) deliberately differs from the plan **author's** typical default (Opus): the plan-review prompt's self-review guard keys on the model identifier, so reviewing with a different model than authored keeps the self-review WARN meaningful rather than firing on every plan. The adapter returns the configured `FISHHAWKD_LOCAL_CLAUDE_MODEL` verbatim as the verdict's model identifier (the CLI envelope does not reliably echo the model), keeping that guard deterministic.
 

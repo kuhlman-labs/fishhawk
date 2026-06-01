@@ -143,8 +143,9 @@ func runServe(args []string, logSink io.Writer) int {
 		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_TOKENS", 4096),
 		"maximum tokens for plan-review agent responses")
 	planReviewTimeout := fs.Duration("plan-review-timeout",
-		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", 60*time.Second),
-		"per-invocation HTTP timeout for plan-review agent calls")
+		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", 300*time.Second),
+		"effective per-invocation bound for plan-review agent calls (since #584); "+
+			"must cover review of large standard_v1 plans — raised from 60s to 300s (#606)")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}

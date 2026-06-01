@@ -547,8 +547,10 @@ func buildPlanReview(t Trigger) string {
 	}
 
 	// Verdict schema — inline so the reviewer doesn't need to fetch it.
+	// The JSON shape below is load-bearing and kept verbatim; surrounding
+	// prose is trimmed to keep the per-call token cost down (#606).
 	b.WriteString("### Verdict schema\n\n")
-	b.WriteString("Emit exactly this JSON shape. All fields shown; omit `concerns` and `free_form` when empty:\n\n")
+	b.WriteString("Emit exactly this JSON shape; omit `concerns` and `free_form` when empty:\n\n")
 	b.WriteString("{\n")
 	b.WriteString("  \"verdict\": \"approve\" | \"approve_with_concerns\" | \"reject\",\n")
 	b.WriteString("  \"concerns\": [\n")
@@ -561,33 +563,27 @@ func buildPlanReview(t Trigger) string {
 	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
 	b.WriteString("}\n\n")
 
-	// Review criteria — what the agent should assess.
+	// Review criteria — what the agent should assess. Record a concern per gap.
 	b.WriteString("### Review criteria\n\n")
-	b.WriteString("Assess the plan against the following criteria. Record a concern for each gap found:\n\n")
-	b.WriteString("1. **Scope completeness**: Does the file list cover all changes implied by the approach steps? " +
-		"Are operations (create/modify/delete) accurate?\n")
-	b.WriteString("2. **Approach feasibility**: Are the approach steps actionable and internally consistent? " +
-		"Do they address the issue as stated?\n")
-	b.WriteString("3. **Verification adequacy**: Does the test strategy catch the load-bearing behaviour? " +
-		"Is the rollback plan realistic?\n")
-	b.WriteString("4. **Risk coverage**: Are meaningful risks identified? Are assumptions cited or testable?\n")
-	b.WriteString("5. **Schema compliance**: Does the plan conform to the standard_v1 shape? " +
-		"(docs/spec/plan-standard-v1.md)\n")
-	b.WriteString("6. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project " +
-		"convention — MUST be one you can quote verbatim from the context provided in this prompt or from a " +
-		"repository file you actually read during this review. Do NOT assert rules from memory. If you cannot " +
-		"verify the rule exists, do NOT raise the concern. Ground every concern in the plan, issue, and context " +
-		"actually provided.\n\n")
+	b.WriteString("Record a concern for each gap found:\n\n")
+	b.WriteString("1. **Scope completeness**: file list covers all changes implied by the approach; " +
+		"create/modify/delete operations accurate.\n")
+	b.WriteString("2. **Approach feasibility**: steps actionable, internally consistent, address the issue.\n")
+	b.WriteString("3. **Verification adequacy**: test strategy catches load-bearing behaviour; rollback realistic.\n")
+	b.WriteString("4. **Risk coverage**: meaningful risks identified; assumptions cited or testable.\n")
+	b.WriteString("5. **Schema compliance**: plan conforms to standard_v1 (docs/spec/plan-standard-v1.md).\n")
+	b.WriteString("6. **Grounded citations**: any rule you cite — from CLAUDE.md, a style guide, or a project " +
+		"convention — MUST be one you can quote verbatim from the context in this prompt or a repository file you " +
+		"actually read during this review. Do NOT assert rules from memory; if you cannot verify the rule exists, " +
+		"do NOT raise the concern.\n\n")
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
-	b.WriteString("- `approve`: plan is sound; all criteria met or concerns are cosmetic.\n")
-	b.WriteString("- `approve_with_concerns`: plan is implementable but has non-blocking gaps; " +
-		"record each gap as a concern with appropriate severity.\n")
-	b.WriteString("- `reject`: plan has one or more blocking problems that must be resolved before implementation; " +
-		"record each blocker as a `high`-severity concern.\n\n")
+	b.WriteString("- `approve`: all criteria met or concerns cosmetic.\n")
+	b.WriteString("- `approve_with_concerns`: implementable with non-blocking gaps; record each as a concern.\n")
+	b.WriteString("- `reject`: one or more blocking problems; record each as a `high`-severity concern.\n\n")
 
-	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
+	b.WriteString("Emit your verdict now. JSON only, no surrounding prose.\n")
 	return b.String()
 }
 
