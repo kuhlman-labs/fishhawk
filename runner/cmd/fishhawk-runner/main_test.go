@@ -1729,6 +1729,58 @@ func TestRun_UploadPlan_PlanInvalid_CategoryB(t *testing.T) {
 	}
 }
 
+func TestRun_PlanValidationInvalid_ShipsToBackend(t *testing.T) {
+	// #613: when local plan-validation fails, the runner must STILL POST
+	// the invalid plan (with --upload-trace) so the backend's
+	// handleShipPlan accept-and-reject path owns the running->failed(B)
+	// transition rather than leaving the stage in `running` until the SLA
+	// watchdog reaps it.
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Drop required field "summary" — schema rejects (a violation class
+	// coercion cannot synthesize), mirroring
+	// TestRun_PlanValidationInvalid_DemotesToCategoryB.
+	bad := strings.Replace(validPlanJSON(), `"summary": "Add a thing.",`, "", 1)
+	if err := os.WriteFile(planPath, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	// Mirror the backend's 400 plan_invalid response on the shipped body.
+	fu.planErr = upload.ErrPlanInvalid
+	withFakeUploader(t, fu)
+
+	runID := "11111111-2222-3333-4444-555555555555"
+	stageID := "22222222-3333-4444-5555-666666666666"
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID, "--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--prompt-file", promptPath,
+		"--plan-out", planPath,
+		"--upload-trace",
+		"--stage-id", stageID,
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	// Regression guard (#613): ShipPlan WAS called with the invalid plan.
+	if fu.gotPlanArgs == nil {
+		t.Fatal("ShipPlan not called — locally-invalid plan must still be shipped")
+	}
+	if !strings.Contains(out, `"event":"plan_invalid_shipped"`) {
+		t.Errorf("missing plan_invalid_shipped log:\n%s", out)
+	}
+	if !strings.Contains(out, `"category":"B"`) {
+		t.Errorf("expected category-B propagated from backend reject:\n%s", out)
+	}
+}
+
 func TestRun_UploadPlan_NotShippedWithoutPlanOut(t *testing.T) {
 	dir := t.TempDir()
 	promptPath := filepath.Join(dir, "prompt.txt")
