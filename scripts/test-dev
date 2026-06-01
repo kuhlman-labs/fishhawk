@@ -166,6 +166,100 @@ else
   fail "cmd_up should exit 1 on readiness-gate failure"
 fi
 
+# 10. ZERR diagnostic trap (#631): installed, reports the ERROR-SITE file:line
+# (not the trap's own body line), propagates the exit code, and the hardening
+# can't silently regress.
+if (( ${+functions[TRAPZERR]} )); then
+  pass "TRAPZERR diagnostic trap is installed"
+else
+  fail "TRAPZERR should be defined/installed as the ZERR trap"
+fi
+# Sourcing scripts/dev installed TRAPZERR into THIS test process; neutralize it
+# here so its stderr doesn't pollute the test's own output (the assertions below
+# intentionally drive a fixture subprocess that exits non-zero, and the harness
+# itself exits non-zero on failure). The fixture re-sources scripts/dev, so it
+# exercises the real trap in isolation.
+unfunction TRAPZERR 2>/dev/null
+trap - ZERR
+
+# Error-site precision: a fixture that fails on a KNOWN line (line 5) must be
+# named by the diagnostic. Sources the real scripts/dev so the actual TRAPZERR
+# fires; funcfiletrace[1] must point at the fixture's failing line, not the trap
+# body's line inside scripts/dev.
+zerr_fixture="$(mktemp -t test-dev-zerr.XXXXXX)"
+cat > "$zerr_fixture" <<EOF
+#!/usr/bin/env zsh
+set -euo pipefail
+DEV_LIB_ONLY=1 source "${REPO_ROOT}/scripts/dev"
+true
+( exit 7 )
+EOF
+zerr_out="$(zsh "$zerr_fixture" 2>&1 1>/dev/null)"
+zerr_rc=$?
+rm -f "$zerr_fixture"
+if (( zerr_rc == 7 )); then
+  pass "ZERR abort propagates the failing exit code (7), never zero-output exit 0"
+else
+  fail "fixture should exit 7 under set -e (got rc=$zerr_rc)"
+fi
+if [[ "$zerr_out" == *"exit 7"* ]]; then
+  pass "TRAPZERR reports the failing command's exit code (exit 7)"
+else
+  fail "TRAPZERR should report 'exit 7' (got: $zerr_out)"
+fi
+if [[ "$zerr_out" == *line* ]]; then
+  pass "TRAPZERR diagnostic includes 'line'"
+else
+  fail "TRAPZERR diagnostic should include 'line' (got: $zerr_out)"
+fi
+if [[ "$zerr_out" == *:5* ]]; then
+  pass "TRAPZERR names the error-site line (fixture line 5)"
+else
+  fail "TRAPZERR should name the failing line :5 (got: $zerr_out)"
+fi
+if [[ "$zerr_out" == */scripts/dev:* ]]; then
+  fail "TRAPZERR named scripts/dev — should report the error site, not its own trap line (got: $zerr_out)"
+else
+  pass "TRAPZERR reports the error site, not the trap's internal scripts/dev line"
+fi
+
+# Hardening guard: no fragile `]] && <var>=` assignment-RHS pattern may remain in
+# scripts/dev — that bare-&&-in-a-non-tested-context form is the ERR_EXIT hazard
+# this change removed, and it must not silently creep back.
+if grep -nE '\]\] &&[[:space:]]+[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?=' "${REPO_ROOT}/scripts/dev"; then
+  fail "scripts/dev still has a fragile ']] && var=' assignment (ERR_EXIT hazard)"
+else
+  pass "no fragile ']] && var=' assignment remains in scripts/dev"
+fi
+
+# The confirmed #631 trigger: `(( i++ ))` returns exit 1 when i==0 (post-increment
+# yields the old value, and (( 0 )) is false), aborting the loop body under set -e.
+# Guard that no post-increment arithmetic counter survives in scripts/dev.
+if grep -nE '\(\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*\+\+[[:space:]]*\)\)' "${REPO_ROOT}/scripts/dev"; then
+  fail "scripts/dev still has a '(( var++ ))' post-increment (set -e abort at var==0, #631)"
+else
+  pass "no fragile '(( var++ ))' post-increment remains in scripts/dev"
+fi
+
+# The replacement `(( ++i ))` counter loop is ERR_EXIT-safe from i==0: the body
+# must run and the loop complete without aborting under set -e.
+if ( set -e; i=0; while (( i < 2 )); do (( ++i )); done; print "$i" ) >/dev/null 2>&1; then
+  pass "'(( ++i ))' counter loop from i==0 does not abort under set -e"
+else
+  fail "'(( ++i ))' counter loop aborted under set -e (the #631 regression)"
+fi
+
+# The rewritten `if [[ false-cond ]]; then var=1; fi` form is ERR_EXIT-safe: a
+# false condition must NOT abort under set -e (the `[[ ]]` is the if-condition, a
+# tested context). zsh's ERR_EXIT-vs-`&&` interaction is subtle and version-
+# dependent — the explicit if-form removes that ambiguity entirely, which is the
+# point of the hardening.
+if ( set -e; v=0; if [[ 1 == 2 ]]; then v=1; fi; print "$v" ) >/dev/null 2>&1; then
+  pass "rewritten 'if [[ false ]]; then var=1; fi' does not abort under set -e"
+else
+  fail "rewritten if-form aborted under set -e (a false condition should be safe)"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"
