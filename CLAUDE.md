@@ -110,7 +110,9 @@ Cross-reference: this checklist codifies the rollout discipline introduced by #5
 | `fishhawk-runner` | picked up automatically — spawned fresh from `bin/` on each `fishhawk_run_stage` |
 | `fishhawk-mcp` | rebuilt on disk but **needs a manual `/mcp` reconnect** — the Claude Code harness owns the MCP server process, so `scripts/dev` cannot restart it; it only signals the operator |
 
-`scripts/dev reload` (down-then-up) is the one-step post-merge command: plain `scripts/dev up` no-ops when fishhawkd is already running and so never rebuilds. Both `up` and `reload` print, as their last line(s), whether a `/mcp` reconnect is required (and why) based on whether `bin/fishhawk-mcp` was rebuilt. This supersedes the older "MCP server stale after rebuild" gotcha by making the reconnect-vs-rebuild distinction first-class.
+`scripts/dev reload` (down-then-up) is the one-step post-merge command: plain `scripts/dev up` no-ops when fishhawkd is already running and so never rebuilds. **`reload` always rebuilds all four binaries (it forces `--all`)** — after a merge `HEAD == origin/main`, so the `origin/main...HEAD` diff is empty and the rebuild matrix would match nothing, silently skipping runner/CLI/mcp. Forcing `--all` closes that gap.
+
+Because `--all` always rebuilds `fishhawk-mcp`, the `/mcp` reconnect banner is **decoupled from the rebuild action**: it is keyed to whether the pull's merge-aware diff (`HEAD@{1}..HEAD`) actually touched fishhawk-mcp source — `backend/cmd/fishhawk-mcp/` or the shared libs `backend/internal/plan/` + `backend/internal/spec/` (the same matrix globs that route to mcp). So `reload` no longer false-nags a reconnect when the merge never touched the MCP server. Fresh-clone / no-reflog / detached-HEAD (where `HEAD@{1}` is unresolvable) falls back to firing the banner conservatively — never a false-negative silent-stale mcp. Plain `up` (branch-diff, not `--all`) still keys the banner off whether mcp was rebuilt, since there a rebuild genuinely means mcp source differs from main. This supersedes the older "MCP server stale after rebuild" gotcha by making the reconnect-vs-rebuild distinction first-class.
 
 ## Adding a Go module
 

@@ -56,8 +56,66 @@ if print -r -- "$reload_body" | grep -q '"\$@"'; then
 else
   fail "cmd_reload should forward \"\$@\" to cmd_up"
 fi
+# reload must force a full rebuild (--all) so the empty post-merge
+# origin/main...HEAD diff doesn't silently skip runner/CLI/mcp.
+if print -r -- "$reload_body" | grep -q -- '--all'; then
+  pass "cmd_reload forces a full rebuild (--all)"
+else
+  fail "cmd_reload should force --all"
+fi
 
-# 4. Parse check: scripts/dev is valid zsh.
+# 4. _diff_touches_mcp: pure matcher mirrors the rebuild matrix's mcp routing.
+if _diff_touches_mcp "backend/cmd/fishhawk-mcp/main.go"; then
+  pass "_diff_touches_mcp matches backend/cmd/fishhawk-mcp/"
+else
+  fail "_diff_touches_mcp should match backend/cmd/fishhawk-mcp/"
+fi
+if _diff_touches_mcp "backend/internal/plan/validate.go"; then
+  pass "_diff_touches_mcp matches shared lib backend/internal/plan/"
+else
+  fail "_diff_touches_mcp should match backend/internal/plan/"
+fi
+if _diff_touches_mcp "backend/internal/spec/load.go"; then
+  pass "_diff_touches_mcp matches shared lib backend/internal/spec/"
+else
+  fail "_diff_touches_mcp should match backend/internal/spec/"
+fi
+# #612 case: --all rebuilt mcp, but the merge delta touched only runner source.
+if _diff_touches_mcp "runner/internal/plan/coerce.go"; then
+  fail "_diff_touches_mcp should NOT match runner-only delta"
+else
+  pass "_diff_touches_mcp stays quiet for runner-only delta"
+fi
+
+# 5. _decide_mcp_signal: all three branches plus the reflog-unavailable fallback.
+# Args: <mcp_rebuilt> <force_all> <reflog_ok> <merge_diff_text>
+if [[ "$(_decide_mcp_signal 0 1 1 'backend/cmd/fishhawk-mcp/main.go')" == 0 ]]; then
+  pass "_decide_mcp_signal: mcp not rebuilt -> 0"
+else
+  fail "_decide_mcp_signal: mcp not rebuilt should be 0"
+fi
+if [[ "$(_decide_mcp_signal 1 1 1 'backend/cmd/fishhawk-mcp/main.go')" == 1 ]]; then
+  pass "_decide_mcp_signal: rebuilt + --all + diff touches mcp -> 1"
+else
+  fail "_decide_mcp_signal: rebuilt + --all + mcp delta should be 1"
+fi
+if [[ "$(_decide_mcp_signal 1 1 1 'runner/internal/plan/coerce.go')" == 0 ]]; then
+  pass "_decide_mcp_signal: rebuilt + --all + diff misses mcp -> 0"
+else
+  fail "_decide_mcp_signal: rebuilt + --all + non-mcp delta should be 0"
+fi
+if [[ "$(_decide_mcp_signal 1 1 0 '')" == 1 ]]; then
+  pass "_decide_mcp_signal: rebuilt + --all + no reflog -> 1 (fallback)"
+else
+  fail "_decide_mcp_signal: reflog-unavailable fallback should be 1"
+fi
+if [[ "$(_decide_mcp_signal 1 0 1 'runner/internal/plan/coerce.go')" == 1 ]]; then
+  pass "_decide_mcp_signal: rebuilt under branch-diff up -> 1"
+else
+  fail "_decide_mcp_signal: branch-diff up rebuild should be 1"
+fi
+
+# 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"
 else
