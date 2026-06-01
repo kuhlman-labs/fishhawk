@@ -120,8 +120,64 @@ _build_binary() {
   esac
 }
 
+# Pure path matcher: returns 0 if any line of the newline-delimited changed-file
+# text in $1 matches a rebuild-matrix glob that routes to fishhawk-mcp, else 1.
+# Reuses the exact glob set _detect_rebuild_set uses for fishhawk-mcp — the
+# shared-lib case (backend/internal/plan|spec, line ~71) plus the mcp-cmd case
+# (backend/cmd/fishhawk-mcp, line ~81). If those matrix globs change, this must
+# move with them. Git-free so scripts/test-dev can drive it with crafted input.
+_diff_touches_mcp() {
+  local diff_text="$1"
+  local f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    case "$f" in
+      backend/cmd/fishhawk-mcp/*|backend/internal/plan/*|backend/internal/spec/*)
+        return 0
+        ;;
+    esac
+  done <<< "$diff_text"
+  return 1
+}
+
+# Pure decision helper for the MCP reconnect banner — extracted so the
+# three-branch logic is hermetically testable. The caller runs the git diff and
+# passes the result in. Echoes 1 (fire the banner) or 0 (stay quiet).
+# Args: <mcp_rebuilt 0|1> <force_all 0|1> <reflog_ok 0|1> <merge_diff_text>
+#   - mcp not rebuilt              -> 0
+#   - rebuilt under --all, reflog ok -> consult merge diff (touches mcp ? 1 : 0)
+#   - rebuilt under --all, no reflog -> 1 (safe fallback; never a silent stale mcp)
+#   - rebuilt under a branch-diff up -> 1 (rebuilt_list membership already means
+#                                          mcp source differs from main)
+_decide_mcp_signal() {
+  local mcp_rebuilt="$1"
+  local force_all="$2"
+  local reflog_ok="$3"
+  local merge_diff="$4"
+
+  if (( ! mcp_rebuilt )); then
+    print 0
+    return
+  fi
+
+  if (( force_all )); then
+    if (( reflog_ok )); then
+      if _diff_touches_mcp "$merge_diff"; then
+        print 1
+      else
+        print 0
+      fi
+    else
+      print 1
+    fi
+    return
+  fi
+
+  print 1
+}
+
 # Emits the MCP reconnect signal — must be the LAST thing printed by up/reload
-# so it is unmissable. Arg 1: 1 if bin/fishhawk-mcp was rebuilt this run, else 0.
+# so it is unmissable. Arg 1: 1 if a /mcp reconnect is required this run, else 0.
 # scripts/dev cannot restart the MCP server (the Claude Code harness owns that
 # process), so on a rebuild the only lever is to tell the operator, unmissably,
 # that a manual /mcp reconnect is required or the new binary stays inert.
@@ -248,11 +304,26 @@ cmd_up() {
 
   # Detect whether fishhawk-mcp was rebuilt off the existing rebuilt_list — no
   # second detection mechanism. The (Ie) subscript flags return the matching
-  # index (>0) or 0 when absent. The signal itself is emitted last (below).
+  # index (>0) or 0 when absent.
   local mcp_rebuilt=0
   if (( ${rebuilt_list[(Ie)fishhawk-mcp]} )); then
     mcp_rebuilt=1
   fi
+
+  # Decide the reconnect banner. Under --all (reload), fishhawk-mcp ALWAYS
+  # rebuilds, so rebuilt_list membership is uninformative — keying the nag off it
+  # would fire on every post-merge reload even when the merge never touched the
+  # MCP server. Consult the pull's merge-aware diff (HEAD@{1}..HEAD) and fire only
+  # when it actually touched fishhawk-mcp source. Quote 'HEAD@{1}' so zsh leaves
+  # the brace literal; run the git call as an if-condition so set -e is suppressed
+  # and an unresolvable reflog (fresh clone / detached HEAD) branches to the safe
+  # fallback (fire the banner) rather than aborting cmd_up.
+  local reflog_ok=0 merge_diff=""
+  if merge_diff="$(git diff --name-only 'HEAD@{1}' HEAD 2>/dev/null)"; then
+    reflog_ok=1
+  fi
+  local mcp_signal
+  mcp_signal="$(_decide_mcp_signal "$mcp_rebuilt" "$force_all" "$reflog_ok" "$merge_diff")"
 
   # Migrate
   print "applying migrations..."
@@ -266,7 +337,7 @@ cmd_up() {
   print "fishhawkd started (pid ${pid}) — logs: ${LOG_FILE}"
 
   # Last line(s): tell the operator whether a /mcp reconnect is required.
-  _signal_mcp_activation "$mcp_rebuilt"
+  _signal_mcp_activation "$mcp_signal"
 }
 
 cmd_down() {
@@ -302,16 +373,20 @@ cmd_down() {
   rm -f "$PID_FILE"
 }
 
-# One-step post-merge command: stop fishhawkd (if running), rebuild changed
+# One-step post-merge command: stop fishhawkd (if running), rebuild ALL four
 # binaries, restart fishhawkd, and emit the MCP reconnect signal. Plain `up`
 # no-ops when fishhawkd is already running, so it never rebuilds after a merge;
-# reload (down-then-up) closes that gap. Flags (--all/--start-deps) forward to
-# cmd_up.
+# reload (down-then-up) closes that gap. reload forces --all because the
+# post-merge `origin/main...HEAD` diff is empty (HEAD == origin/main), so the
+# rebuild matrix would match nothing and silently skip runner/CLI/mcp. The MCP
+# reconnect banner is decoupled from the rebuild: it consults the merge-aware
+# diff (HEAD@{1}..HEAD), so a full rebuild does not false-nag a reconnect.
+# Extra flags (--start-deps, a redundant --all) forward to cmd_up unchanged.
 cmd_reload() {
   if [[ -f "$PID_FILE" ]]; then
     cmd_down
   fi
-  cmd_up "$@"
+  cmd_up --all "$@"
 }
 
 _usage() {
