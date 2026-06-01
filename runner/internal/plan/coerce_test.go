@@ -262,3 +262,58 @@ func TestTryCoerce_AlreadyValid(t *testing.T) {
 		t.Errorf("err = %v, want nil", err)
 	}
 }
+
+// TestTryCoerce_NullDecompositionDropped verifies that an optional top-level
+// field set to JSON null (decomposition) is dropped and treated as absent so
+// the plan validates, rather than deterministically failing schema validation.
+func TestTryCoerce_NullDecompositionDropped(t *testing.T) {
+	m := planfixture.Valid()
+	m["decomposition"] = nil
+	data := marshal(t, m)
+
+	coercedBytes, coercions, err := plan.TryCoerce(data, testNow)
+	if err != nil {
+		t.Fatalf("TryCoerce: unexpected error: %v", err)
+	}
+	if len(coercions) != 1 {
+		t.Fatalf("coercions = %d, want 1", len(coercions))
+	}
+	if got := coercions[0].FieldPath; got != "/decomposition" {
+		t.Errorf("FieldPath = %q, want /decomposition", got)
+	}
+	if got := coercions[0].OriginalType; got != "null" {
+		t.Errorf("OriginalType = %q, want null", got)
+	}
+	if coercedBytes == nil {
+		t.Fatal("coercedBytes is nil")
+	}
+	if err := plan.Validate(coercedBytes); err != nil {
+		t.Errorf("coerced plan does not validate: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(coercedBytes, &result); err != nil {
+		t.Fatalf("unmarshal coerced: %v", err)
+	}
+	if _, present := result["decomposition"]; present {
+		t.Error("decomposition key still present after coercion; want dropped")
+	}
+}
+
+// TestTryCoerce_NullRequiredFieldNotDropped verifies that a JSON null in a
+// REQUIRED field (summary) is NOT dropped — it must still fail Validate with a
+// precise message rather than being silently removed.
+func TestTryCoerce_NullRequiredFieldNotDropped(t *testing.T) {
+	m := planfixture.Valid()
+	m["summary"] = nil
+	data := marshal(t, m)
+
+	_, coercions, err := plan.TryCoerce(data, testNow)
+	if err == nil {
+		t.Fatal("err = nil, want non-nil: null required field must fail validation")
+	}
+	for _, c := range coercions {
+		if c.FieldPath == "/summary" {
+			t.Errorf("required field /summary was coerced/dropped; want left in place")
+		}
+	}
+}

@@ -860,6 +860,7 @@ func TestBuild_Plan_CompoundFieldDirective(t *testing.T) {
 		"bare string",
 		"decomposition.sub_plans[i]",
 		"shorthand will be rejected",
+		"do NOT set it to null",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

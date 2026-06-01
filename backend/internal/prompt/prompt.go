@@ -422,7 +422,7 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- scope.files[i]: {\"path\": \"...\", \"operation\": \"...\"} object\n")
 	b.WriteString("- ticket_reference: {\"type\": \"...\", \"url\": \"...\", \"id\": \"...\"} object\n")
 	b.WriteString("- generated_by: {\"agent\": \"...\", \"model\": \"...\", \"timestamp\": \"...\"} object\n")
-	b.WriteString("- decomposition (when present): {\"rationale\": \"...\", \"sub_plans\": [...]} object\n")
+	b.WriteString("- decomposition (when present): {\"rationale\": \"...\", \"sub_plans\": [...]} object — when you are NOT decomposing, OMIT this field entirely; do NOT set it to null\n")
 	b.WriteString("- decomposition.sub_plans[i]: {\"title\": \"...\", \"scope_hint\": \"...\", \"predicted_runtime_minutes\": N, \"predicted_runtime_confidence\": \"low|medium|high\"} object — use the FULL canonical field names; \"confidence\" / \"minutes\" shorthand will be rejected\n")
 	b.WriteString("The validator rejects any plan where these fields contain bare strings instead of their required structured shapes.\n")
 	b.WriteString("\n")
