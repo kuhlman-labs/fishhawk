@@ -77,11 +77,23 @@ type scopeFile struct {
 // declares no files, so the field is omitted and the runner falls
 // back to `git add -A`.
 func scopeFilesFromPlan(p *plan.Plan) []scopeFile {
-	if p == nil || len(p.Scope.Files) == 0 {
+	if p == nil {
 		return nil
 	}
-	out := make([]scopeFile, 0, len(p.Scope.Files))
-	for _, f := range p.Scope.Files {
+	return scopeFilesFromScope(&p.Scope)
+}
+
+// scopeFilesFromScope converts a plan.Scope's files into the
+// prompt-response wire shape. Returns nil when the scope is nil or
+// declares no files. Shared by scopeFilesFromPlan (top-level scope)
+// and resolveDecomposedScopeFiles (per-sub-plan scope) so both produce
+// identical wire shapes.
+func scopeFilesFromScope(sc *plan.Scope) []scopeFile {
+	if sc == nil || len(sc.Files) == 0 {
+		return nil
+	}
+	out := make([]scopeFile, 0, len(sc.Files))
+	for _, f := range sc.Files {
 		out = append(out, scopeFile{Path: f.Path, Operation: string(f.Operation)})
 	}
 	return out
@@ -202,7 +214,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		scopeFiles = scopeFilesFromPlan(approvedPlan)
-		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow)
+		// Decomposition fan-out (#676): a child run narrows its scope to
+		// the matched sub-plan's own scope.files when present, so the
+		// runner's scope_handoff + scope-drift bound to this slice rather
+		// than the parent's full scope. Falls back to the parent scope
+		// when the sub-plan omits scope or the run isn't a decomposed child.
+		if childScope := s.resolveDecomposedScopeFiles(r.Context(), runRow, approvedPlan); len(childScope) > 0 {
+			scopeFiles = childScope
+		}
+		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.loadApprovalConditions(r.Context(), runRow.ID)
 	}
 
@@ -354,7 +374,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		scopeFiles = scopeFilesFromPlan(approvedPlan)
-		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow)
+		// Decomposition fan-out (#676): a child run narrows its scope to
+		// the matched sub-plan's own scope.files when present, so the
+		// runner's scope_handoff + scope-drift bound to this slice rather
+		// than the parent's full scope. Falls back to the parent scope
+		// when the sub-plan omits scope or the run isn't a decomposed child.
+		if childScope := s.resolveDecomposedScopeFiles(r.Context(), runRow, approvedPlan); len(childScope) > 0 {
+			scopeFiles = childScope
+		}
+		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.loadApprovalConditions(r.Context(), runRow.ID)
 	}
 
@@ -1091,48 +1119,50 @@ func (s *Server) loadPriorSchemaValidationError(ctx context.Context, runID uuid.
 	return nil
 }
 
-// resolveDecomposedScopeConstraint builds a *prompt.ScopeConstraint for
-// child runs of a decomposed plan. Returns nil when:
+// matchDecomposedSubPlan returns the sub-plan whose title prefixes the
+// child run's IssueContext.Body, plus its index within the decomposition's
+// sub_plans. Returns (nil, -1) when:
 //   - the run is not decomposed (DecomposedFrom == nil)
 //   - the run has no cached IssueContext (can't match a sub-plan without it)
-//   - ArtifactRepo is unconfigured (nil-guard: avoids a panic in tryLoadPlanForRun)
-//   - the parent plan can't be loaded (degrade gracefully — agent gets an unconstrained prompt)
-//   - no sub-plan title matches the child's IssueContext.Body prefix (defensive — wrong constraint is worse than none)
+//   - parentPlan is nil or carries no decomposition (degrade gracefully)
+//   - no sub-plan title matches the child's IssueContext.Body prefix
+//     (defensive — a wrong match is worse than none)
+//
+// parentPlan is the already-loaded approved plan for the child run; for a
+// decomposed child loadApprovedPlanForRun walks ParentRunID up to the
+// parent's decomposed plan, so the caller's single load is reused here
+// instead of re-reading the artifact.
 //
 // Matching uses strings.HasPrefix(body, "## "+title+"\n\n"), which is the
 // invariant enforced by childIssueContextFromSubPlan in orchestrator.go.
-func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *run.Run) *prompt.ScopeConstraint {
+func matchDecomposedSubPlan(runRow *run.Run, parentPlan *plan.Plan) (*plan.SubPlanSummary, int) {
 	if runRow.DecomposedFrom == nil || runRow.IssueContext == nil {
-		return nil
+		return nil, -1
 	}
-	if s.cfg.ArtifactRepo == nil {
-		return nil
+	if parentPlan == nil || parentPlan.Decomposition == nil {
+		return nil, -1
 	}
-	parentPlan, found, err := s.tryLoadPlanForRun(ctx, *runRow.DecomposedFrom)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: resolve scope constraint: load parent plan failed",
-			slog.String("parent_run_id", runRow.DecomposedFrom.String()),
-			slog.String("error", err.Error()),
-		)
-		return nil
-	}
-	if !found || parentPlan == nil || parentPlan.Decomposition == nil {
-		return nil
-	}
-
 	body := runRow.IssueContext.Body
-	matchIdx := -1
-	for i, sub := range parentPlan.Decomposition.SubPlans {
+	for i := range parentPlan.Decomposition.SubPlans {
+		sub := &parentPlan.Decomposition.SubPlans[i]
 		if strings.HasPrefix(body, "## "+sub.Title+"\n\n") {
-			matchIdx = i
-			break
+			return sub, i
 		}
 	}
-	if matchIdx < 0 {
+	return nil, -1
+}
+
+// resolveDecomposedScopeConstraint builds a *prompt.ScopeConstraint for
+// child runs of a decomposed plan. Returns nil when the child doesn't
+// match a sub-plan (see matchDecomposedSubPlan). parentPlan is the
+// caller's already-loaded approved plan — for a decomposed child this is
+// the parent's decomposed plan — so no additional artifact read happens.
+func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan) *prompt.ScopeConstraint {
+	matched, matchIdx := matchDecomposedSubPlan(runRow, parentPlan)
+	if matched == nil {
 		return nil
 	}
 
-	matched := parentPlan.Decomposition.SubPlans[matchIdx]
 	var siblingHints []string
 	for i, sub := range parentPlan.Decomposition.SubPlans {
 		if i != matchIdx {
@@ -1150,6 +1180,31 @@ func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *r
 		ParentRunID:  runRow.DecomposedFrom.String(),
 		SiblingHints: siblingHints,
 	}
+}
+
+// resolveDecomposedScopeFiles returns the matched sub-plan's own
+// scope.files for a decomposed child, converted to the prompt-response
+// wire shape. Returns nil when the child doesn't match a sub-plan or the
+// matched sub-plan omits scope — in which case the caller keeps the
+// parent plan's full scope.files (backward-compatible fallback).
+// parentPlan is the caller's already-loaded approved plan, reused here
+// rather than re-read.
+func (s *Server) resolveDecomposedScopeFiles(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan) []scopeFile {
+	matched, _ := matchDecomposedSubPlan(runRow, parentPlan)
+	if matched == nil || matched.Scope == nil {
+		return nil
+	}
+	files := scopeFilesFromScope(matched.Scope)
+	if len(files) == 0 {
+		return nil
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+		"prompt: narrowed scope_files to sub-plan slice for decomposed child",
+		slog.String("child_run_id", runRow.ID.String()),
+		slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+		slog.Int("file_count", len(files)),
+	)
+	return files
 }
 
 // loadLastDecomposeRejectionReason scans the run's approval_submitted

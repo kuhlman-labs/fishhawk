@@ -49,8 +49,14 @@ const (
 
 // SubPlanSummary describes one sub-plan within a Decomposition.
 type SubPlanSummary struct {
-	Title                      string            `json:"title"`
-	ScopeHint                  string            `json:"scope_hint"`
+	Title     string `json:"title"`
+	ScopeHint string `json:"scope_hint"`
+	// Scope is the optional per-sub-plan file list. When set, the
+	// decomposition fan-out child for this sub-plan bounds its run scope
+	// (scope_handoff + scope-drift) to these files instead of the parent
+	// plan's full scope.files. Nil means inherit the parent plan's full
+	// scope.
+	Scope                      *Scope            `json:"scope,omitempty"`
 	PredictedRuntimeMinutes    int               `json:"predicted_runtime_minutes"`
 	PredictedRuntimeConfidence RuntimeConfidence `json:"predicted_runtime_confidence"`
 }

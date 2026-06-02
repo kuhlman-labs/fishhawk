@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1737,6 +1738,7 @@ func TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected(t *testing.T) {
 		Repo:           "o/r",
 		WorkflowID:     "feature_change",
 		TriggerSource:  run.TriggerCLI,
+		ParentRunID:    &parentRunID,
 		DecomposedFrom: &parentRunID,
 		IssueContext: &run.IssueContext{
 			Title: "Part A title",
@@ -1778,4 +1780,149 @@ func TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected(t *testing.T) {
 			t.Errorf("prompt missing %q\n---\n%s", want, resp.Prompt)
 		}
 	}
+}
+
+// TestGetStagePrompt_DecomposedChild_ScopeFiles is the cross-boundary seam
+// test for #676: it threads a per-sub-plan scope.files slice through schema
+// validation -> backend plan domain type -> the prompt-response wire payload
+// (the field the runner's scope_handoff/scope_drift consumer reads), and
+// asserts the child's prompt response carries the MATCHED sub-plan's slice,
+// not the parent's full union. The fallback subtest asserts a sub-plan
+// without scope inherits the parent's full scope.files (backward compat).
+func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
+	// Parent decomposed plan: full scope is the union (a.go, b.go), but each
+	// sub-plan carries its own narrower slice. Part B intentionally omits
+	// scope to exercise the parent-scope fallback.
+	newParentPlan := func() *plan.Plan {
+		return &plan.Plan{
+			PlanVersion: "standard_v1",
+			Summary:     "parent plan",
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{
+					{Path: "pkg/a/a.go", Operation: plan.FileOpCreate},
+					{Path: "pkg/b/b.go", Operation: plan.FileOpModify},
+				},
+			},
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Decomposition: &plan.Decomposition{
+				Rationale: "scope split",
+				SubPlans: []plan.SubPlanSummary{
+					{
+						Title:     "Part A title",
+						ScopeHint: "Implement Part A in pkg/a.",
+						Scope: &plan.Scope{
+							Files: []plan.ScopeFile{
+								{Path: "pkg/a/a.go", Operation: plan.FileOpCreate},
+							},
+						},
+					},
+					{
+						Title:     "Part B title",
+						ScopeHint: "Implement Part B in pkg/b.",
+						// No Scope — must fall back to the parent's full scope.
+					},
+				},
+			},
+		}
+	}
+
+	// seedChildPrompt seeds a parent plan artifact + a decomposed child run
+	// whose IssueContext.Body matches the sub-plan named by childTitle, then
+	// fetches the child's implement-stage prompt response.
+	seedChildPrompt := func(t *testing.T, childTitle, childHint string) promptResponse {
+		t.Helper()
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		parentRunID := uuid.New()
+		childRunID := uuid.New()
+		parentPlanStageID := uuid.New()
+		childStageID := uuid.New()
+
+		planBytes, err := json.Marshal(newParentPlan())
+		if err != nil {
+			t.Fatalf("marshal parent plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       parentPlanStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			parentRunID: {
+				{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan},
+			},
+		}
+		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+
+		childBody := "## " + childTitle + "\n\n" + childHint + "\n\n---\n*Decomposed sub-plan.*"
+		rr.getRuns[childRunID] = &run.Run{
+			ID:             childRunID,
+			Repo:           "o/r",
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerCLI,
+			ParentRunID:    &parentRunID,
+			DecomposedFrom: &parentRunID,
+			IssueContext: &run.IssueContext{
+				Title: childTitle,
+				Body:  childBody,
+			},
+		}
+		rr.getStages[childStageID] = &run.Stage{
+			ID:    childStageID,
+			RunID: childRunID,
+			Type:  run.StageTypeImplement,
+		}
+
+		priv, _ := sf.issue(t, childRunID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, childRunID, childStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp
+	}
+
+	scopePaths := func(sfs []scopeFile) []string {
+		out := make([]string, 0, len(sfs))
+		for _, f := range sfs {
+			out = append(out, f.Path)
+		}
+		return out
+	}
+
+	t.Run("sub-plan with scope narrows to its own slice", func(t *testing.T) {
+		resp := seedChildPrompt(t, "Part A title", "Implement Part A in pkg/a.")
+		got := scopePaths(resp.ScopeFiles)
+		want := []string{"pkg/a/a.go"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("scope_files = %v, want the sub-plan's slice %v (NOT the parent union)", got, want)
+		}
+	})
+
+	t.Run("sub-plan without scope falls back to parent full scope", func(t *testing.T) {
+		resp := seedChildPrompt(t, "Part B title", "Implement Part B in pkg/b.")
+		got := scopePaths(resp.ScopeFiles)
+		want := []string{"pkg/a/a.go", "pkg/b/b.go"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("scope_files = %v, want the parent's full scope %v", got, want)
+		}
+	})
 }

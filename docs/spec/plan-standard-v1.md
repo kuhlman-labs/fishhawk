@@ -223,8 +223,11 @@ Required array with at least two entries. Each entry is a `SubPlanSummary`:
 |---|---|---|---|
 | `title` | string (1–200 chars) | yes | Must be unique within the array |
 | `scope_hint` | string | yes | What this sub-plan covers |
+| `scope` | `{ "files": [...] }` object | no | The files THIS slice will touch. Same shape as the top-level `scope`. |
 | `predicted_runtime_minutes` | integer ≥ 1 | yes | Estimate for this sub-plan's implement stage |
 | `predicted_runtime_confidence` | `"low"` / `"medium"` / `"high"` | yes | Confidence in the sub-plan estimate |
+
+When `scope` is present, the decomposition fan-out child minted for this sub-plan uses the sub-plan's `scope.files` — rather than the parent plan's full `scope.files` — for its implement-stage `scope_handoff` (commit bounding) and scope-drift detection. This keeps each child bounded to its own slice instead of the whole parent change. When `scope` is omitted, the child falls back to the parent plan's full `scope.files` (the pre-existing behavior).
 
 **Runtime-sum invariant**: the validator warns (but does not reject) when the sum of `sub_plans[*].predicted_runtime_minutes` is less than the parent `predicted_runtime_minutes`. The agent may legitimately compress work when breaking it into smaller pieces; the soft warning surfaces the gap for human review.
 

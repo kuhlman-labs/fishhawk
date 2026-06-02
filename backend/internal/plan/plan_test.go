@@ -352,6 +352,61 @@ func TestParse_DecompositionTwoSubPlans_Succeeds(t *testing.T) {
 	}
 }
 
+// TestParse_SubPlanScope_RoundTrips covers the additive per-sub-plan
+// scope field (#676): a decomposition whose sub_plans carry their own
+// scope.files validates against the schema and decodes into the typed
+// SubPlanSummary.Scope.
+func TestParse_SubPlanScope_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split by layer",
+			"sub_plans": []any{
+				map[string]any{
+					"title": "Part A", "scope_hint": "first slice",
+					"scope": map[string]any{
+						"files": []any{
+							map[string]any{"path": "pkg/a/a.go", "operation": "create"},
+						},
+					},
+					"predicted_runtime_minutes": 10, "predicted_runtime_confidence": "high",
+				},
+				map[string]any{
+					"title": "Part B", "scope_hint": "second slice",
+					"predicted_runtime_minutes": 15, "predicted_runtime_confidence": "medium",
+				},
+			},
+		}
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	subs := p.Decomposition.SubPlans
+	if subs[0].Scope == nil {
+		t.Fatal("sub_plans[0].Scope should be non-nil")
+	}
+	if got, want := len(subs[0].Scope.Files), 1; got != want {
+		t.Fatalf("sub_plans[0].Scope.Files len = %d, want %d", got, want)
+	}
+	if got, want := subs[0].Scope.Files[0].Path, "pkg/a/a.go"; got != want {
+		t.Errorf("sub_plans[0].Scope.Files[0].Path = %q, want %q", got, want)
+	}
+	// Sub-plan without scope decodes to a nil pointer — the field is
+	// absent (additive optional), confirming backward compatibility.
+	if subs[1].Scope != nil {
+		t.Errorf("sub_plans[1].Scope = %+v, want nil (field omitted)", subs[1].Scope)
+	}
+}
+
+// TestParse_SubPlanWithoutScope_StillValidates confirms the additive field
+// did not become required: an existing decomposition shape lacking
+// sub-plan scope continues to validate.
+func TestParse_SubPlanWithoutScope_StillValidates(t *testing.T) {
+	if _, err := plan.Parse(marshalFixture(t, planfixture.Decomposed())); err != nil {
+		t.Fatalf("Parse decomposed fixture without sub-plan scope: %v", err)
+	}
+}
+
 // --- decomposition semantic errors ---
 
 func TestParse_DecompositionDuplicateTitles_IsSemanticError(t *testing.T) {
