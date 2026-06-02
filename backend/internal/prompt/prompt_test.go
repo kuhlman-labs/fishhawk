@@ -1510,6 +1510,135 @@ func TestBuild_ImplementReview_ProducesNoPRDescriptionGuidance(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_IssueCommentsRendered is the #622 acceptance check
+// for the plan-review path: the reviewer must see the same comment-borne
+// refinements the planner saw, with the supersede preface, author +
+// timestamp prefixes, and chronological order after the body.
+func TestBuild_PlanReview_IssueCommentsRendered(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		IssueNumber:  616,
+		IssueTitle:   "Add a foo flag",
+		IssueBody:    "We need a --foo flag that defaults to off.",
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		IssueComments: []IssueComment{
+			{Author: "alice", Body: "First thought: make it a bool.", CreatedAt: "2026-05-01T10:00:00Z"},
+			{Author: "bob", Body: "Correction: --foo must default to ON, not off.", CreatedAt: "2026-05-02T12:30:00Z"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Issue comments",
+		"supersede", // the preface
+		"**@alice** (2026-05-01T10:00:00Z):",
+		"First thought: make it a bool.",
+		"**@bob** (2026-05-02T12:30:00Z):",
+		"Correction: --foo must default to ON, not off.",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	// Chronological order: body, then alice, then bob.
+	bodyIdx := strings.Index(got, "We need a --foo flag")
+	aliceIdx := strings.Index(got, "**@alice**")
+	bobIdx := strings.Index(got, "**@bob**")
+	if bodyIdx >= aliceIdx || aliceIdx >= bobIdx {
+		t.Errorf("expected body < alice < bob ordering, got body=%d alice=%d bob=%d", bodyIdx, aliceIdx, bobIdx)
+	}
+}
+
+// TestBuild_PlanReview_AllBotComments_SectionAbsent confirms the
+// plan-review prompt is byte-identical to the no-comments case when every
+// comment is bot-authored — the body-only review prompt is unchanged.
+func TestBuild_PlanReview_AllBotComments_SectionAbsent(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		IssueNumber:  7,
+		IssueTitle:   "T",
+		IssueBody:    "Body stays.",
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		IssueComments: []IssueComment{
+			{Author: "github-actions[bot]", Body: "CI failed.", CreatedAt: "2026-05-01T00:00:00Z"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Issue comments") {
+		t.Errorf("plan_review section must be absent when all comments are bot-authored:\n%s", got)
+	}
+	if !strings.Contains(got, "Body stays.") {
+		t.Errorf("plan_review body-only fallback should be unchanged:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_IssueCommentsRendered is the #622 acceptance
+// check for the implement-review path: the reviewer sees the comment-borne
+// refinements with preface, author + timestamp, and chronological order.
+func TestBuild_ImplementReview_IssueCommentsRendered(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		IssueNumber:  616,
+		IssueTitle:   "Add a foo flag",
+		IssueBody:    "We need a --foo flag that defaults to off.",
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/foo/foo.go\n",
+		IssueComments: []IssueComment{
+			{Author: "alice", Body: "First thought: make it a bool.", CreatedAt: "2026-05-01T10:00:00Z"},
+			{Author: "bob", Body: "Correction: --foo must default to ON, not off.", CreatedAt: "2026-05-02T12:30:00Z"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Issue comments",
+		"supersede",
+		"**@alice** (2026-05-01T10:00:00Z):",
+		"First thought: make it a bool.",
+		"**@bob** (2026-05-02T12:30:00Z):",
+		"Correction: --foo must default to ON, not off.",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	bodyIdx := strings.Index(got, "We need a --foo flag")
+	aliceIdx := strings.Index(got, "**@alice**")
+	bobIdx := strings.Index(got, "**@bob**")
+	if bodyIdx >= aliceIdx || aliceIdx >= bobIdx {
+		t.Errorf("expected body < alice < bob ordering, got body=%d alice=%d bob=%d", bodyIdx, aliceIdx, bobIdx)
+	}
+}
+
+// TestBuild_ImplementReview_NilComments_SectionAbsent confirms the
+// implement-review body-only fallback is unchanged when no comments are
+// present (the pre-#622 shape).
+func TestBuild_ImplementReview_NilComments_SectionAbsent(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		IssueNumber:  7,
+		IssueTitle:   "T",
+		IssueBody:    "Just the body.",
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/foo/foo.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Issue comments") {
+		t.Errorf("implement_review section expected absent for nil IssueComments:\n%s", got)
+	}
+	if !strings.Contains(got, "Just the body.") {
+		t.Errorf("implement_review body should still render:\n%s", got)
+	}
+}
+
 // TestBuild_Plan_IssueCommentsRendered is the headline #618 / #616
 // acceptance check: a comment that contradicts the body renders in the
 // '### Issue comments' section with its author + timestamp and the
