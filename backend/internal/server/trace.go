@@ -204,7 +204,18 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	// per-run total. Best-effort: the trace is already stored + audited,
 	// so a manifest-parse / audit-write / rollup failure logs at WARN
 	// and never unwinds the upload.
-	s.recordCost(r.Context(), runID, stageID, body)
+	//
+	// Gate on the raw variant so cost is recorded exactly once per stage
+	// bundle (#678). The runner POSTs both the raw and the redacted
+	// variant of the same bundle with identical signed manifest token
+	// counts; recording on every variant double-counted the cost (2x).
+	// Raw is the first/authoritative upload and is always shipped in v0
+	// (tracestore always stores raw; only its exposure is restricted —
+	// see the get-stage-trace handler), so gating on raw records the cost
+	// on the bundle's canonical upload.
+	if variant == tracestore.VariantRaw {
+		s.recordCost(r.Context(), runID, stageID, body)
+	}
 
 	// Advance the stage so the approval handler can act on it.
 	// The state machine requires dispatched → running →
@@ -884,6 +895,13 @@ type runCostRecorder interface {
 // cost_recorded audit entry tying the figure to the run, and
 // accumulates the per-run total (pinning the resolved model id) when
 // the RunRepo supports it (#649).
+//
+// This MUST be invoked once per stage bundle, not once per variant
+// upload (#678). The caller gates it on the raw variant; the runner
+// ships both the raw and redacted variant of the same bundle with
+// identical manifest token counts, so calling this on every variant
+// double-counts the cost. Do not move this call out from under the
+// raw-variant guard without re-introducing the 2x double-count.
 //
 // Every step is best-effort: the bundle is already stored + audited by
 // the time this runs, so a missing/unparsable manifest, a nil
