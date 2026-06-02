@@ -1108,6 +1108,73 @@ func TestShipTrace_RecordsCost(t *testing.T) {
 	}
 }
 
+// TestShipTrace_RecordsCostOncePerBundle is the regression test for the
+// 2x double-count (#678). The runner POSTs each stage bundle twice — once
+// as the raw variant, once as the redacted variant — with identical
+// signed manifest token counts. Before the fix, recordCost ran on every
+// variant upload, so the per-run cost and the cost_recorded ledger were
+// doubled. This double-uploads both variants of the SAME bundle and
+// asserts cost is recorded exactly once: one cost_recorded audit entry
+// and an un-doubled CostUSDTotal. It fails if recordCost is not gated on
+// the raw variant.
+func TestShipTrace_RecordsCostOncePerBundle(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID, Repo: "kuhlman-labs/fishhawk"})
+	s.cfg.RunRepo = rr
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	wantUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok {
+		t.Fatalf("pricing.Cost returned ok=false for %q — fixture model must be priced", model)
+	}
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	// Raw first (authoritative), then redacted — the runner's real
+	// two-POST sequence for a single bundle.
+	if w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("raw upload status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if w := shipRequest(t, s, stage.RunID, stage.ID, "redacted", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("redacted upload status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// Exactly one cost_recorded entry across both uploads — not two.
+	au.mu.Lock()
+	costEntries := 0
+	for i := range au.appended {
+		if au.appended[i].Category == "cost_recorded" {
+			costEntries++
+		}
+	}
+	au.mu.Unlock()
+	if costEntries != 1 {
+		t.Fatalf("cost_recorded entries = %d, want 1 (double-uploaded raw+redacted must record cost once)", costEntries)
+	}
+
+	// Per-run total is the single un-doubled pricing figure, not 2x.
+	got, err := rr.GetRun(t.Context(), stage.RunID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.CostUSDTotal != wantUSD {
+		t.Errorf("run.CostUSDTotal = %v, want %v (not doubled to %v)", got.CostUSDTotal, wantUSD, 2*wantUSD)
+	}
+}
+
 // TestShipTrace_RecordsCost_UnknownModelZero pins the unknown-model
 // arm: an unpriced model id records a cost_recorded entry at usd=0 with
 // known_model=false rather than being dropped or guessed, and the run

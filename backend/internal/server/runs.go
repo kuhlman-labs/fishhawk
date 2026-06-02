@@ -37,8 +37,15 @@ type runResponse struct {
 	MaxRetriesSnapshot int                  `json:"max_retries_snapshot"`
 	RunnerKind         string               `json:"runner_kind"`
 	IssueContext       *issueContextPayload `json:"issue_context,omitempty"`
-	CreatedAt          time.Time            `json:"created_at"`
-	UpdatedAt          time.Time            `json:"updated_at"`
+	// CostUSDTotal is the rolled estimated USD cost of the run's model
+	// usage from signed manifest token counts (#649). Always emitted (0
+	// for legacy rows that predate the rollup).
+	CostUSDTotal float64 `json:"cost_usd_total"`
+	// ResolvedModel pins the agent model id the run executed under
+	// (#649). Always emitted (empty string for legacy/unstamped runs).
+	ResolvedModel string    `json:"resolved_model"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // issueContextPayload mirrors run.IssueContext on the wire. Kept
@@ -78,6 +85,8 @@ func toRunResponse(r *run.Run) runResponse {
 		RetryAttempt:       r.RetryAttempt,
 		MaxRetriesSnapshot: r.MaxRetriesSnapshot,
 		RunnerKind:         r.RunnerKind,
+		CostUSDTotal:       r.CostUSDTotal,
+		ResolvedModel:      r.ResolvedModel,
 		CreatedAt:          r.CreatedAt,
 		UpdatedAt:          r.UpdatedAt,
 	}

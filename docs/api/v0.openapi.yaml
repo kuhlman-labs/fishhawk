@@ -138,7 +138,8 @@ components:
         table in `backend/internal/run/transition.go`.
       required:
         [id, repo, workflow_id, workflow_sha, trigger_source, state,
-         retry_attempt, max_retries_snapshot, runner_kind, created_at, updated_at]
+         retry_attempt, max_retries_snapshot, runner_kind,
+         cost_usd_total, resolved_model, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         repo:
@@ -232,6 +233,24 @@ components:
             of refetching from GitHub. Null on webhook-dispatched
             runs (which fetch fresh from GitHub at prompt-build
             time) and on non-issue triggers.
+        cost_usd_total:
+          type: number
+          format: double
+          minimum: 0
+          description: |
+            Rolled estimated US-dollar cost of the run's model usage
+            (#649), accumulated from each stage bundle's signed manifest
+            token counts via the shared pricing table. Recorded once per
+            stage bundle (the raw trace variant only — see #678). 0 for
+            legacy rows that predate the rollup.
+          example: 2.99
+        resolved_model:
+          type: string
+          description: |
+            Pinned agent model id the run executed under (#649), stamped
+            from the trace manifest at cost-rollup time. Empty string for
+            legacy/unstamped runs.
+          example: claude-opus-4-8
         created_at:
           type: string
           format: date-time
