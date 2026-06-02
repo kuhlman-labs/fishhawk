@@ -202,11 +202,31 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0027 (#534) added the
-	// mcp_tokens.scopes column and stages.self_retry_count column;
-	// the down migration drops both. Confirm: those columns are gone,
-	// but every prior migration's effect is still present
-	// (decomposed_from from 0026, issue_context from 0025, etc.).
+	// MigrateDown rolls back one step. 0028 (#649) added the
+	// runs.cost_usd_total and runs.resolved_model columns; the down
+	// migration drops both. Confirm: those columns are gone, but every
+	// prior migration's effect is still present (self_retry_count +
+	// scopes from 0027, decomposed_from from 0026, etc.).
+	var costUSDTotalCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'cost_usd_total'`,
+	).Scan(&costUSDTotalCol); err != nil {
+		t.Fatalf("query runs.cost_usd_total column: %v", err)
+	}
+	if costUSDTotalCol != 0 {
+		t.Errorf("runs.cost_usd_total count after MigrateDown = %d, want 0 (0028 down dropped it)", costUSDTotalCol)
+	}
+	var resolvedModelCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'resolved_model'`,
+	).Scan(&resolvedModelCol); err != nil {
+		t.Fatalf("query runs.resolved_model column: %v", err)
+	}
+	if resolvedModelCol != 0 {
+		t.Errorf("runs.resolved_model count after MigrateDown = %d, want 0 (0028 down dropped it)", resolvedModelCol)
+	}
 	var selfRetryCountCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -214,8 +234,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&selfRetryCountCol); err != nil {
 		t.Fatalf("query stages.self_retry_count column: %v", err)
 	}
-	if selfRetryCountCol != 0 {
-		t.Errorf("stages.self_retry_count count after MigrateDown = %d, want 0 (0027 down dropped it)", selfRetryCountCol)
+	if selfRetryCountCol != 1 {
+		t.Errorf("stages.self_retry_count count after MigrateDown = %d, want 1 (0027 still applied; only 0028 rolled back)", selfRetryCountCol)
 	}
 	var mcpScopesCol int
 	if err := pool.QueryRow(context.Background(),
@@ -224,8 +244,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&mcpScopesCol); err != nil {
 		t.Fatalf("query mcp_tokens.scopes column: %v", err)
 	}
-	if mcpScopesCol != 0 {
-		t.Errorf("mcp_tokens.scopes count after MigrateDown = %d, want 0 (0027 down dropped it)", mcpScopesCol)
+	if mcpScopesCol != 1 {
+		t.Errorf("mcp_tokens.scopes count after MigrateDown = %d, want 1 (0027 still applied; only 0028 rolled back)", mcpScopesCol)
 	}
 	var decomposedFromCol int
 	if err := pool.QueryRow(context.Background(),

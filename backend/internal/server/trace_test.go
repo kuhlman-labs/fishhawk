@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+	"github.com/kuhlman-labs/fishhawk/pricing"
 )
 
 // signingFake is a richer fake than newFakeSigningRepo so the trace
@@ -941,5 +942,191 @@ func TestShipTrace_EmitRuntimeObserved_PlanStage(t *testing.T) {
 		if e.Category == "runtime_observed" {
 			t.Errorf("unexpected runtime_observed entry emitted for plan stage")
 		}
+	}
+}
+
+// packManifestBundle builds a minimal gzipped JSONL trace bundle whose
+// only line is a manifest carrying the given model + token split — the
+// signed wire form the cost rollup reads. Used by the cost seam test.
+func packManifestBundle(t *testing.T, m bundle.Manifest) []byte {
+	t.Helper()
+	mdata, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	line := bundle.Line{
+		Seq:       0,
+		Timestamp: time.Now().UTC(),
+		Kind:      bundle.EventKindManifest,
+		Data:      mdata,
+	}
+	lb, err := json.Marshal(line)
+	if err != nil {
+		t.Fatalf("marshal line: %v", err)
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(append(lb, '\n')); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestShipTrace_RecordsCost is the cross-boundary seam test for the
+// per-run cost rollup (#649). It POSTs a trace bundle whose manifest
+// carries a model + input/output token split and asserts end-to-end
+// that the manifest → handler → cost → audit/run-record path produces:
+//
+//	(a) a cost_recorded audit entry tied to the run, carrying the
+//	    pricing-derived usd and the token split, and
+//	(b) the same usd accumulated on the run record, with the resolved
+//	    model id pinned.
+//
+// This exercises the boundaries together rather than only per-layer
+// units (cf. #618): a regression in any of the manifest decode, the
+// pricing call, the audit payload shape, or the run-record accumulator
+// trips this test even when the layer-local unit tests still pass.
+func TestShipTrace_RecordsCost(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID, Repo: "kuhlman-labs/fishhawk"})
+	s.cfg.RunRepo = rr
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	wantUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok {
+		t.Fatalf("pricing.Cost returned ok=false for %q — fixture model must be priced", model)
+	}
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) cost_recorded audit entry with the pricing-derived usd.
+	au.mu.Lock()
+	var costEntry *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "cost_recorded" {
+			costEntry = &au.appended[i]
+			break
+		}
+	}
+	au.mu.Unlock()
+	if costEntry == nil {
+		t.Fatal("no cost_recorded audit entry written")
+	}
+	if costEntry.RunID != stage.RunID {
+		t.Errorf("cost_recorded RunID = %s, want %s", costEntry.RunID, stage.RunID)
+	}
+	if costEntry.StageID == nil || *costEntry.StageID != stage.ID {
+		t.Errorf("cost_recorded StageID = %v, want %s", costEntry.StageID, stage.ID)
+	}
+	var payload struct {
+		Model        string  `json:"model"`
+		InputTokens  int     `json:"input_tokens"`
+		OutputTokens int     `json:"output_tokens"`
+		USD          float64 `json:"usd"`
+		KnownModel   bool    `json:"known_model"`
+		PricingAsOf  string  `json:"pricing_as_of"`
+	}
+	if err := json.Unmarshal(costEntry.Payload, &payload); err != nil {
+		t.Fatalf("decode cost_recorded payload: %v", err)
+	}
+	if payload.Model != model || payload.InputTokens != inTok || payload.OutputTokens != outTok {
+		t.Errorf("cost_recorded payload token/model mismatch: %+v", payload)
+	}
+	if payload.USD != wantUSD {
+		t.Errorf("cost_recorded usd = %v, want %v (pricing.Cost)", payload.USD, wantUSD)
+	}
+	if !payload.KnownModel {
+		t.Errorf("cost_recorded known_model = false, want true for a priced model")
+	}
+	if payload.PricingAsOf != pricing.AsOf {
+		t.Errorf("cost_recorded pricing_as_of = %q, want %q", payload.PricingAsOf, pricing.AsOf)
+	}
+
+	// (b) per-run total accumulated on the run record + model pinned.
+	got, err := rr.GetRun(t.Context(), stage.RunID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.CostUSDTotal != wantUSD {
+		t.Errorf("run.CostUSDTotal = %v, want %v", got.CostUSDTotal, wantUSD)
+	}
+	if got.ResolvedModel != model {
+		t.Errorf("run.ResolvedModel = %q, want %q", got.ResolvedModel, model)
+	}
+}
+
+// TestShipTrace_RecordsCost_UnknownModelZero pins the unknown-model
+// arm: an unpriced model id records a cost_recorded entry at usd=0 with
+// known_model=false rather than being dropped or guessed, and the run
+// total stays at 0.
+func TestShipTrace_RecordsCost_UnknownModelZero(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        "gpt-some-future-model",
+		InputTokens:  500,
+		OutputTokens: 500,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	var found bool
+	for i := range au.appended {
+		if au.appended[i].Category == "cost_recorded" {
+			found = true
+			var p struct {
+				USD        float64 `json:"usd"`
+				KnownModel bool    `json:"known_model"`
+			}
+			if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			if p.USD != 0 || p.KnownModel {
+				t.Errorf("unknown model: usd=%v known_model=%v, want 0/false", p.USD, p.KnownModel)
+			}
+		}
+	}
+	au.mu.Unlock()
+	if !found {
+		t.Fatal("no cost_recorded entry for unknown model — must record at 0, not drop")
+	}
+
+	got, _ := rr.GetRun(t.Context(), stage.RunID)
+	if got.CostUSDTotal != 0 {
+		t.Errorf("run.CostUSDTotal = %v, want 0 for unknown model", got.CostUSDTotal)
 	}
 }

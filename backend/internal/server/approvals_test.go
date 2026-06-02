@@ -220,6 +220,23 @@ func (r *approvalRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (
 func (r *approvalRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+
+// AddRunCost satisfies the trace handler's runCostRecorder optional
+// capability (#649) so the cost-rollup seam test can assert the per-run
+// total accumulates on the seeded run row.
+func (r *approvalRunRepo) AddRunCost(_ context.Context, id uuid.UUID, deltaUSD float64, resolvedModel string) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rn, ok := r.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	rn.CostUSDTotal += deltaUSD
+	if resolvedModel != "" {
+		rn.ResolvedModel = resolvedModel
+	}
+	return rn, nil
+}
 func (r *approvalRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }

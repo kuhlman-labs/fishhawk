@@ -61,6 +61,7 @@ type McpToken struct {
 	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
+	Scopes     []string           `json:"scopes"`
 }
 
 type Run struct {
@@ -84,6 +85,8 @@ type Run struct {
 	RunnerKind             string             `json:"runner_kind"`
 	IssueContext           []byte             `json:"issue_context"`
 	DecomposedFrom         *uuid.UUID         `json:"decomposed_from"`
+	CostUsdTotal           float64            `json:"cost_usd_total"`
+	ResolvedModel          string             `json:"resolved_model"`
 }
 
 type Session struct {

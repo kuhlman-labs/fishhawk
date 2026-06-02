@@ -12,11 +12,65 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const addRunCost = `-- name: AddRunCost :one
+UPDATE runs
+   SET cost_usd_total = cost_usd_total + $1,
+       resolved_model = CASE
+           WHEN $2::text <> '' THEN $2::text
+           ELSE resolved_model
+       END
+ WHERE id = $3
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model
+`
+
+type AddRunCostParams struct {
+	DeltaUsd      float64   `json:"delta_usd"`
+	ResolvedModel string    `json:"resolved_model"`
+	ID            uuid.UUID `json:"id"`
+}
+
+// Accumulates the estimated per-run cost rollup (#649). delta_usd is
+// the pricing-derived cost of one bundle's model usage; resolved_model
+// pins the agent model id (last-write-wins, skipped when empty so a
+// model-less bundle doesn't clobber a prior pin). Idempotency is NOT
+// claimed — each bundle receipt adds its own delta; the caller
+// (trace handler) records exactly once per bundle, keyed to the
+// cost_recorded audit entry that is the canonical per-invocation row.
+func (q *Queries) AddRunCost(ctx context.Context, arg AddRunCostParams) (Run, error) {
+	row := q.db.QueryRow(ctx, addRunCost, arg.DeltaUsd, arg.ResolvedModel, arg.ID)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.Repo,
+		&i.WorkflowID,
+		&i.WorkflowSha,
+		&i.TriggerSource,
+		&i.TriggerRef,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.InstallationID,
+		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
+		&i.RequiredChecksSnapshot,
+		&i.WorkflowSpec,
+		&i.RetryAttempt,
+		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
+		&i.IssueContext,
+		&i.DecomposedFrom,
+		&i.CostUsdTotal,
+		&i.ResolvedModel,
+	)
+	return i, err
+}
+
 const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model
 `
 
 type CreateRunParams struct {
@@ -84,6 +138,8 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.RunnerKind,
 		&i.IssueContext,
 		&i.DecomposedFrom,
+		&i.CostUsdTotal,
+		&i.ResolvedModel,
 	)
 	return i, err
 }
@@ -151,7 +207,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from FROM runs WHERE id = $1
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model FROM runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -178,12 +234,14 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.RunnerKind,
 		&i.IssueContext,
 		&i.DecomposedFrom,
+		&i.CostUsdTotal,
+		&i.ResolvedModel,
 	)
 	return i, err
 }
 
 const getRunByIdempotencyKey = `-- name: GetRunByIdempotencyKey :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model FROM runs
  WHERE repo = $1
    AND idempotency_key = $2
 `
@@ -220,6 +278,8 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 		&i.RunnerKind,
 		&i.IssueContext,
 		&i.DecomposedFrom,
+		&i.CostUsdTotal,
+		&i.ResolvedModel,
 	)
 	return i, err
 }
@@ -255,7 +315,7 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 }
 
 const listRuns = `-- name: ListRuns :many
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model FROM runs
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR workflow_id = $2)
    AND ($3::text = '' OR state = $3)
@@ -327,6 +387,8 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 			&i.RunnerKind,
 			&i.IssueContext,
 			&i.DecomposedFrom,
+			&i.CostUsdTotal,
+			&i.ResolvedModel,
 		); err != nil {
 			return nil, err
 		}
@@ -353,6 +415,54 @@ SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, sta
 // first row hasn't elapsed (when the parsed durations are uniform).
 func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
 	rows, err := q.db.Query(ctx, listStagesAwaitingApproval)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Stage
+	for rows.Next() {
+		var i Stage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Sequence,
+			&i.StageType,
+			&i.ExecutorKind,
+			&i.ExecutorRef,
+			&i.State,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.FailureCategory,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.GateSla,
+			&i.RequiresApproval,
+			&i.GateType,
+			&i.GateApprovers,
+			&i.SelfRetryCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStagesAwaitingChildren = `-- name: ListStagesAwaitingChildren :many
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
+ WHERE state = 'awaiting_children'
+ ORDER BY updated_at ASC
+`
+
+// Used by the child-completion sweeper (#455) to find parent
+// implement stages whose decomposed child runs may have reached
+// terminal states. Ordered by updated_at ASC.
+func (q *Queries) ListStagesAwaitingChildren(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listStagesAwaitingChildren)
 	if err != nil {
 		return nil, err
 	}
@@ -484,7 +594,7 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 }
 
 const lockRunForUpdate = `-- name: LockRunForUpdate :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from FROM runs WHERE id = $1 FOR UPDATE
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model FROM runs WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -511,6 +621,8 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 		&i.RunnerKind,
 		&i.IssueContext,
 		&i.DecomposedFrom,
+		&i.CostUsdTotal,
+		&i.ResolvedModel,
 	)
 	return i, err
 }
@@ -521,191 +633,6 @@ SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, sta
 
 func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, error) {
 	row := q.db.QueryRow(ctx, lockStageForUpdate, id)
-	var i Stage
-	err := row.Scan(
-		&i.ID,
-		&i.RunID,
-		&i.Sequence,
-		&i.StageType,
-		&i.ExecutorKind,
-		&i.ExecutorRef,
-		&i.State,
-		&i.StartedAt,
-		&i.EndedAt,
-		&i.FailureCategory,
-		&i.FailureReason,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.GateSla,
-		&i.RequiresApproval,
-		&i.GateType,
-		&i.GateApprovers,
-		&i.SelfRetryCount,
-	)
-	return i, err
-}
-
-const listStagesAwaitingChildren = `-- name: ListStagesAwaitingChildren :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
- WHERE state = 'awaiting_children'
- ORDER BY updated_at ASC
-`
-
-// Used by the child-completion sweeper (#455) to find parent
-// implement stages whose decomposed child runs may have reached
-// terminal states.
-func (q *Queries) ListStagesAwaitingChildren(ctx context.Context) ([]Stage, error) {
-	rows, err := q.db.Query(ctx, listStagesAwaitingChildren)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []Stage
-	for rows.Next() {
-		var i Stage
-		if err := rows.Scan(
-			&i.ID,
-			&i.RunID,
-			&i.Sequence,
-			&i.StageType,
-			&i.ExecutorKind,
-			&i.ExecutorRef,
-			&i.State,
-			&i.StartedAt,
-			&i.EndedAt,
-			&i.FailureCategory,
-			&i.FailureReason,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.GateSla,
-			&i.RequiresApproval,
-			&i.GateType,
-			&i.GateApprovers,
-			&i.SelfRetryCount,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const setRunPullRequestURL = `-- name: SetRunPullRequestURL :one
-UPDATE runs
-   SET pull_request_url = $2
- WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from
-`
-
-type SetRunPullRequestURLParams struct {
-	ID             uuid.UUID `json:"id"`
-	PullRequestUrl *string   `json:"pull_request_url"`
-}
-
-// Backfills the implement-stage PR URL onto the run row when the
-// pull_request artifact lands (#216). Idempotent: a re-upload with
-// the same URL is a no-op the trigger keeps as a no-op against
-// updated_at (assignment of identical value).
-func (q *Queries) SetRunPullRequestURL(ctx context.Context, arg SetRunPullRequestURLParams) (Run, error) {
-	row := q.db.QueryRow(ctx, setRunPullRequestURL, arg.ID, arg.PullRequestUrl)
-	var i Run
-	err := row.Scan(
-		&i.ID,
-		&i.Repo,
-		&i.WorkflowID,
-		&i.WorkflowSha,
-		&i.TriggerSource,
-		&i.TriggerRef,
-		&i.State,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.InstallationID,
-		&i.IdempotencyKey,
-		&i.ParentRunID,
-		&i.PullRequestUrl,
-		&i.RequiredChecksSnapshot,
-		&i.WorkflowSpec,
-		&i.RetryAttempt,
-		&i.MaxRetriesSnapshot,
-		&i.RunnerKind,
-		&i.IssueContext,
-		&i.DecomposedFrom,
-	)
-	return i, err
-}
-
-const updateRunState = `-- name: UpdateRunState :one
-UPDATE runs
-   SET state = $2
- WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from
-`
-
-type UpdateRunStateParams struct {
-	ID    uuid.UUID `json:"id"`
-	State string    `json:"state"`
-}
-
-func (q *Queries) UpdateRunState(ctx context.Context, arg UpdateRunStateParams) (Run, error) {
-	row := q.db.QueryRow(ctx, updateRunState, arg.ID, arg.State)
-	var i Run
-	err := row.Scan(
-		&i.ID,
-		&i.Repo,
-		&i.WorkflowID,
-		&i.WorkflowSha,
-		&i.TriggerSource,
-		&i.TriggerRef,
-		&i.State,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.InstallationID,
-		&i.IdempotencyKey,
-		&i.ParentRunID,
-		&i.PullRequestUrl,
-		&i.RequiredChecksSnapshot,
-		&i.WorkflowSpec,
-		&i.RetryAttempt,
-		&i.MaxRetriesSnapshot,
-		&i.RunnerKind,
-		&i.IssueContext,
-		&i.DecomposedFrom,
-	)
-	return i, err
-}
-
-const updateStageState = `-- name: UpdateStageState :one
-UPDATE stages
-   SET state            = $2,
-       started_at       = COALESCE(started_at, $3),
-       ended_at         = $4,
-       failure_category = $5,
-       failure_reason   = $6
- WHERE id = $1
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count
-`
-
-type UpdateStageStateParams struct {
-	ID              uuid.UUID          `json:"id"`
-	State           string             `json:"state"`
-	StartedAt       pgtype.Timestamptz `json:"started_at"`
-	EndedAt         pgtype.Timestamptz `json:"ended_at"`
-	FailureCategory *string            `json:"failure_category"`
-	FailureReason   *string            `json:"failure_reason"`
-}
-
-func (q *Queries) UpdateStageState(ctx context.Context, arg UpdateStageStateParams) (Stage, error) {
-	row := q.db.QueryRow(ctx, updateStageState,
-		arg.ID,
-		arg.State,
-		arg.StartedAt,
-		arg.EndedAt,
-		arg.FailureCategory,
-		arg.FailureReason,
-	)
 	var i Stage
 	err := row.Scan(
 		&i.ID,
@@ -751,6 +678,147 @@ type RetryStageStateParams struct {
 // transition path so retry_ordinal is always consistent.
 func (q *Queries) RetryStageState(ctx context.Context, arg RetryStageStateParams) (Stage, error) {
 	row := q.db.QueryRow(ctx, retryStageState, arg.ID, arg.State)
+	var i Stage
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Sequence,
+		&i.StageType,
+		&i.ExecutorKind,
+		&i.ExecutorRef,
+		&i.State,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.FailureCategory,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.GateSla,
+		&i.RequiresApproval,
+		&i.GateType,
+		&i.GateApprovers,
+		&i.SelfRetryCount,
+	)
+	return i, err
+}
+
+const setRunPullRequestURL = `-- name: SetRunPullRequestURL :one
+UPDATE runs
+   SET pull_request_url = $2
+ WHERE id = $1
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model
+`
+
+type SetRunPullRequestURLParams struct {
+	ID             uuid.UUID `json:"id"`
+	PullRequestUrl *string   `json:"pull_request_url"`
+}
+
+// Backfills the implement-stage PR URL onto the run row when the
+// pull_request artifact lands (#216). Idempotent: a re-upload with
+// the same URL is a no-op the trigger keeps as a no-op against
+// updated_at (assignment of identical value).
+func (q *Queries) SetRunPullRequestURL(ctx context.Context, arg SetRunPullRequestURLParams) (Run, error) {
+	row := q.db.QueryRow(ctx, setRunPullRequestURL, arg.ID, arg.PullRequestUrl)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.Repo,
+		&i.WorkflowID,
+		&i.WorkflowSha,
+		&i.TriggerSource,
+		&i.TriggerRef,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.InstallationID,
+		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
+		&i.RequiredChecksSnapshot,
+		&i.WorkflowSpec,
+		&i.RetryAttempt,
+		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
+		&i.IssueContext,
+		&i.DecomposedFrom,
+		&i.CostUsdTotal,
+		&i.ResolvedModel,
+	)
+	return i, err
+}
+
+const updateRunState = `-- name: UpdateRunState :one
+UPDATE runs
+   SET state = $2
+ WHERE id = $1
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model
+`
+
+type UpdateRunStateParams struct {
+	ID    uuid.UUID `json:"id"`
+	State string    `json:"state"`
+}
+
+func (q *Queries) UpdateRunState(ctx context.Context, arg UpdateRunStateParams) (Run, error) {
+	row := q.db.QueryRow(ctx, updateRunState, arg.ID, arg.State)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.Repo,
+		&i.WorkflowID,
+		&i.WorkflowSha,
+		&i.TriggerSource,
+		&i.TriggerRef,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.InstallationID,
+		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
+		&i.RequiredChecksSnapshot,
+		&i.WorkflowSpec,
+		&i.RetryAttempt,
+		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
+		&i.IssueContext,
+		&i.DecomposedFrom,
+		&i.CostUsdTotal,
+		&i.ResolvedModel,
+	)
+	return i, err
+}
+
+const updateStageState = `-- name: UpdateStageState :one
+UPDATE stages
+   SET state            = $2,
+       started_at       = COALESCE(started_at, $3),
+       ended_at         = $4,
+       failure_category = $5,
+       failure_reason   = $6
+ WHERE id = $1
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count
+`
+
+type UpdateStageStateParams struct {
+	ID              uuid.UUID          `json:"id"`
+	State           string             `json:"state"`
+	StartedAt       pgtype.Timestamptz `json:"started_at"`
+	EndedAt         pgtype.Timestamptz `json:"ended_at"`
+	FailureCategory *string            `json:"failure_category"`
+	FailureReason   *string            `json:"failure_reason"`
+}
+
+func (q *Queries) UpdateStageState(ctx context.Context, arg UpdateStageStateParams) (Stage, error) {
+	row := q.db.QueryRow(ctx, updateStageState,
+		arg.ID,
+		arg.State,
+		arg.StartedAt,
+		arg.EndedAt,
+		arg.FailureCategory,
+		arg.FailureReason,
+	)
 	var i Stage
 	err := row.Scan(
 		&i.ID,

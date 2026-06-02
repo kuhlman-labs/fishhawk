@@ -241,9 +241,24 @@ type Run struct {
 	// DecomposedFrom provides the direct ancestry link for the SPA's
 	// "decomposed from" breadcrumb.
 	DecomposedFrom *uuid.UUID
-	State          State
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// CostUSDTotal is the rolled estimated US-dollar cost of every
+	// model invocation in the run (#649). Accumulated control-plane-
+	// side by the trace handler from the signed bundle manifest's
+	// token counts via the shared `pricing` table — see
+	// backend/internal/cost. The figure is an ESTIMATE (point-in-time
+	// pricing; unknown models contribute 0); the per-bundle
+	// cost_recorded audit entries are the canonical per-invocation
+	// ledger. Defaults to 0 for legacy rows (migration 0028).
+	CostUSDTotal float64
+	// ResolvedModel pins the agent model id the run executed under,
+	// read from the trace-bundle manifest (#649 / G6 reproducibility).
+	// Last-write-wins across the run's bundles (every stage runs the
+	// same agent model in v0). Empty for legacy rows and runs whose
+	// runner didn't stamp a model.
+	ResolvedModel string
+	State         State
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json
