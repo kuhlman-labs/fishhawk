@@ -909,6 +909,12 @@ type runCostRecorder interface {
 // implement runCostRecorder all log at WARN (or silently no-op) and
 // never unwind the upload. An unknown model id is recorded at usd=0
 // with known_model=false rather than guessed.
+//
+// Likewise, a manifest that carries no usable token split (a backend
+// that did not report usage, leaving both token counts zero) is
+// recorded honestly at usd=0 with known_usage=false rather than a
+// silent $0 indistinguishable from a real tiny run — symmetric with
+// recordReviewerCost's known_usage contract (#682).
 func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundleBytes []byte) {
 	if s.cfg.AuditRepo == nil {
 		return
@@ -929,12 +935,23 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 
 	rec := cost.FromManifest(manifest.Model, manifest.InputTokens, manifest.OutputTokens)
 
+	// Infer whether the backend reported usage from the token split. A
+	// real invocation always has >0 tokens, so a 0/0 manifest means the
+	// backend did not report usage — record it at usd=0 rather than a
+	// guessed/priced figure (mirroring recordReviewerCost's usage.Known
+	// override and the known_model=false contract). #682.
+	knownUsage := manifest.InputTokens > 0 || manifest.OutputTokens > 0
+	if !knownUsage {
+		rec.USD = 0
+	}
+
 	payload, _ := json.Marshal(map[string]any{
 		"model":         rec.Model,
 		"input_tokens":  rec.InputTokens,
 		"output_tokens": rec.OutputTokens,
 		"usd":           rec.USD,
 		"known_model":   rec.KnownModel,
+		"known_usage":   knownUsage,
 		"pricing_as_of": rec.PricingAsOf,
 		"estimated":     true,
 	})

@@ -1077,6 +1077,7 @@ func TestShipTrace_RecordsCost(t *testing.T) {
 		OutputTokens int     `json:"output_tokens"`
 		USD          float64 `json:"usd"`
 		KnownModel   bool    `json:"known_model"`
+		KnownUsage   bool    `json:"known_usage"`
 		PricingAsOf  string  `json:"pricing_as_of"`
 	}
 	if err := json.Unmarshal(costEntry.Payload, &payload); err != nil {
@@ -1090,6 +1091,9 @@ func TestShipTrace_RecordsCost(t *testing.T) {
 	}
 	if !payload.KnownModel {
 		t.Errorf("cost_recorded known_model = false, want true for a priced model")
+	}
+	if !payload.KnownUsage {
+		t.Errorf("cost_recorded known_usage = false, want true for a non-zero token split")
 	}
 	if payload.PricingAsOf != pricing.AsOf {
 		t.Errorf("cost_recorded pricing_as_of = %q, want %q", payload.PricingAsOf, pricing.AsOf)
@@ -1227,6 +1231,73 @@ func TestShipTrace_RecordsCost_UnknownModelZero(t *testing.T) {
 	got, _ := rr.GetRun(t.Context(), stage.RunID)
 	if got.CostUSDTotal != 0 {
 		t.Errorf("run.CostUSDTotal = %v, want 0 for unknown model", got.CostUSDTotal)
+	}
+}
+
+// TestShipTrace_RecordsCost_NoUsageKnownUsageFalse pins the no-usage arm
+// (#682): a manifest carrying a KNOWN, priced model but a 0/0 token split
+// (a backend that didn't report usage) records a cost_recorded entry at
+// usd=0 with known_usage=false rather than a silent $0 indistinguishable
+// from a real tiny run, and the run total stays at 0. Using a known model
+// isolates the new known_usage signal from the existing known_model one.
+func TestShipTrace_RecordsCost_NoUsageKnownUsageFalse(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID, Repo: "kuhlman-labs/fishhawk"})
+	s.cfg.RunRepo = rr
+
+	// Same priced model the happy path uses, but with no reported usage.
+	const model = "claude-opus-4-8"
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  0,
+		OutputTokens: 0,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	var found bool
+	for i := range au.appended {
+		if au.appended[i].Category == "cost_recorded" {
+			found = true
+			var p struct {
+				USD        float64 `json:"usd"`
+				KnownModel bool    `json:"known_model"`
+				KnownUsage bool    `json:"known_usage"`
+			}
+			if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			if p.USD != 0 {
+				t.Errorf("no-usage: usd=%v, want 0", p.USD)
+			}
+			if p.KnownUsage {
+				t.Errorf("no-usage: known_usage=true, want false for a 0/0 token split")
+			}
+			if !p.KnownModel {
+				t.Errorf("no-usage: known_model=false, want true — the model is priced")
+			}
+		}
+	}
+	au.mu.Unlock()
+	if !found {
+		t.Fatal("no cost_recorded entry for no-usage bundle — must record at 0, not drop")
+	}
+
+	got, _ := rr.GetRun(t.Context(), stage.RunID)
+	if got.CostUSDTotal != 0 {
+		t.Errorf("run.CostUSDTotal = %v, want 0 for no-usage bundle", got.CostUSDTotal)
 	}
 }
 
