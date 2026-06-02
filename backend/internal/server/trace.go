@@ -285,14 +285,25 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	policyPassed := true
+	var violations []policy.Violation
 	if s.cfg.RunRepo != nil {
-		policyPassed = s.reEvaluatePolicy(r, runID, stageID, body)
+		violations = s.reEvaluatePolicy(r, runID, stageID, body)
 	}
 	if s.cfg.RunRepo != nil {
-		if policyPassed {
+		switch {
+		case len(violations) == 0:
 			s.advanceStageAfterTrace(r, runID, stageID, body)
-		} else {
+		case s.noDiffCaptured(r.Context(), stageID, body, violations):
+			// #691/#692: an implement stage whose bundle carries a
+			// present-but-empty diff is a staging/capture miss, not a
+			// genuine constraint breach. Route it to retryable
+			// category-C so the existing failed → pending retry path
+			// gives operators an escape hatch rather than dooming the
+			// stage (and any fan-out parent) on an un-redrivable B.
+			s.failStageCategoryC(r, runID, stageID,
+				"no_diff_captured: implement stage produced an empty diff; nothing was staged or captured (retryable; see #691/#692)",
+				body)
+		default:
 			s.failStageCategoryB(r, runID, stageID, "policy violations on backend re-evaluation", body)
 		}
 	}
@@ -584,8 +595,11 @@ func (s *Server) notifyStatusUpdate(ctx context.Context, runID uuid.UUID, source
 }
 
 // reEvaluatePolicy is the backend's source-of-truth re-evaluation
-// of the closed-set constraints (E3.13). Returns true (policy
-// passed) when:
+// of the closed-set constraints (E3.13). Returns the policy
+// violations found; the caller derives pass/fail from the length and
+// inspects the violation set to classify the failure (#692: an
+// empty-diff implement failure is reclassified to a retryable
+// category-C). Returns nil (treated as a pass) when:
 //
 //   - the spec lookup fails (best-effort: we don't black-hole a
 //     stage because GitHub flapped, just log and proceed)
@@ -596,15 +610,12 @@ func (s *Server) notifyStatusUpdate(ctx context.Context, runID uuid.UUID, source
 //     SPA's policy section can render the pass state instead of
 //     "pending")
 //
-// Returns false only when EmitEvaluation produces one or more
-// violations. The caller transitions the stage accordingly.
-//
 // Always tries to emit a policy_evaluated audit entry when we
 // reach a state that has either constraints or a diff — even if
 // one is empty. The SPA reads that entry to render the policy
 // section (#233); a missing entry is what makes the section
 // stuck on "pending" (#247).
-func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bundleBytes []byte) bool {
+func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bundleBytes []byte) []policy.Violation {
 	ctx := r.Context()
 	logger := s.cfg.Logger
 
@@ -613,14 +624,14 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 		logger.LogAttrs(ctx, slog.LevelWarn, "policy: get stage failed",
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
-		return true
+		return nil
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "policy: get run failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
-		return true
+		return nil
 	}
 
 	stageType := string(stage.Type)
@@ -634,7 +645,7 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 	if diffErr != nil {
 		reason := policy.SkipNoDiffInBundle
 		s.emitPolicySkipped(ctx, runID, stageID, stageType, reason, diffErr.Error())
-		return true
+		return nil
 	}
 
 	// Constraints: load from the cached spec on the run row (#283).
@@ -647,7 +658,7 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 			slog.String("skip_reason", string(skipReason)),
 			slog.String("detail", skipDetail))
 		s.emitPolicySkipped(ctx, runID, stageID, stageType, skipReason, skipDetail)
-		return true
+		return nil
 	}
 
 	// Happy path: real evaluation. EmitEvaluation handles the empty-
@@ -660,9 +671,9 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 		logger.LogAttrs(ctx, slog.LevelWarn, "policy: emit evaluation failed",
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
-		return true
+		return nil
 	}
-	return len(violations) == 0
+	return violations
 }
 
 // emitPolicySkipped is a thin wrapper around policy.EmitEvaluationSkipped
@@ -779,6 +790,70 @@ func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, r
 	// Best-effort: emit runtime calibration for implement stages that
 	// failed policy re-evaluation.
 	s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
+}
+
+// failStageCategoryC mirrors failStageCategoryB but stamps category C
+// (infrastructure/transient per MVP_SPEC §6), which — unlike B — is
+// retryable via the existing failed → pending path
+// (run.RetryStage + orchestrator re-dispatch). The trace handler uses
+// it for the #691 staging-bug signature (an implement stage's
+// present-but-empty diff), so operators get an escape hatch instead
+// of an un-redrivable B. Same best-effort posture as the B helper:
+// failures log at WARN and never unwind the already-stored upload.
+func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, reason string, bundleBytes []byte) {
+	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureC, reason); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"trace upload: transition to failed-C failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+	s.advanceAfterFailure(r, runID, stageID)
+	// Best-effort: emit runtime calibration for implement stages that
+	// failed with an empty captured diff.
+	s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
+}
+
+// noDiffCaptured reports whether a failed policy re-evaluation is the
+// #691 staging-bug signature: an implement stage whose bundle carries
+// a PRESENT-but-empty git_diff event, where that empty diff is the
+// SOLE cause of the failure. Such a failure is a capture/staging miss
+// rather than a genuine constraint breach, so the caller routes it to
+// a retryable category-C (#692) instead of an un-redrivable B.
+//
+// It returns false — preserving the genuine category-B
+// classification — when:
+//   - the stage isn't an implement stage,
+//   - the bundle has no git_diff event at all (ExtractDiff errors;
+//     that case is the no_diff_in_bundle skip→pass path and never
+//     reaches a policy failure here),
+//   - the diff is non-empty, or
+//   - any violation is something other than the empty-diff
+//     required_outcomes case. The load-bearing carve-out is the
+//     `invalid pattern` config error: a malformed
+//     forbidden_paths/allowed_paths glob emits a violation even
+//     against an empty diff (policy.matchAny validates the glob
+//     before the per-file loop), and reclassifying that would mask a
+//     real spec-config category-B.
+func (s *Server) noDiffCaptured(ctx context.Context, stageID uuid.UUID, bundleBytes []byte, violations []policy.Violation) bool {
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil || stage.Type != run.StageTypeImplement {
+		return false
+	}
+	diff, err := bundle.ExtractDiff(bundleBytes)
+	if err != nil || len(diff.ChangedFiles) != 0 {
+		return false
+	}
+	// The empty diff must be the sole cause: every violation has to be
+	// the tests_added_or_updated empty-diff signature. Any other
+	// violation (notably an `invalid pattern` config error) keeps the
+	// failure as a genuine category-B.
+	for _, v := range violations {
+		if v.Constraint != "required_outcomes" || v.Detail != "no test files added or updated" {
+			return false
+		}
+	}
+	return len(violations) > 0
 }
 
 // advanceAfterFailure invokes the orchestrator to walk the run's
