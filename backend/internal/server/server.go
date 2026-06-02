@@ -235,6 +235,27 @@ type Server struct {
 	// review. Gating-mode review stays synchronous and is never tracked
 	// here.
 	bgReviews sync.WaitGroup
+
+	// p95Cache memoizes implement-stage calibration p95 results keyed
+	// by workflow_id so resolveImplementTimeout's per-prompt-fetch call
+	// to implementCalibrationP95 doesn't run a full AuditRepo.ListAll
+	// scan (plus the per-entry RunRepo.GetRun N+1) on every implement
+	// prompt fetch. Best-effort: entries expire after
+	// implementP95CacheTTL and a miss simply re-scans the audit log.
+	// Guarded by p95CacheMu.
+	//
+	// p95CacheMu serializes the whole check-compute-store across ALL
+	// workflow_ids, not just concurrent fetches for the same workflow —
+	// a single mutex protects the one shared map. At v0 implement-fetch
+	// volumes this is acceptable: it dedupes the thundering-herd scan
+	// rather than harming throughput.
+	p95CacheMu sync.Mutex
+	p95Cache   map[string]p95CacheEntry
+
+	// nowFunc is the clock the p95 cache uses to age out entries against
+	// implementP95CacheTTL. Defaults to time.Now; tests inject a fake to
+	// drive TTL expiry without sleeping.
+	nowFunc func() time.Time
 }
 
 // New builds a Server. It does not start listening; call Start.
@@ -249,7 +270,10 @@ func New(cfg Config) *Server {
 		cfg.ShutdownTimeout = 15 * time.Second
 	}
 
-	s := &Server{cfg: cfg}
+	s := &Server{cfg: cfg, p95Cache: map[string]p95CacheEntry{}}
+	if s.nowFunc == nil {
+		s.nowFunc = time.Now
+	}
 	if cfg.GitHub != nil {
 		s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
 			GitHub:      cfg.GitHub,
