@@ -25,6 +25,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 )
 
 // DefaultBinary is the executable name resolved against PATH when
@@ -82,26 +84,37 @@ func NewClient(cfg Config) *Client {
 
 // cliEnvelope is the JSON document `claude --print --output-format json`
 // emits: a single object whose response text lives in the top-level `result`
-// field.
+// field and whose token usage lives in the top-level `usage` object (#681).
 type cliEnvelope struct {
-	Type    string `json:"type"`
-	Subtype string `json:"subtype"`
-	IsError bool   `json:"is_error"`
-	Result  string `json:"result"`
+	Type    string    `json:"type"`
+	Subtype string    `json:"subtype"`
+	IsError bool      `json:"is_error"`
+	Result  string    `json:"result"`
+	Usage   *cliUsage `json:"usage"`
+}
+
+// cliUsage is the token usage object the CLI envelope carries. It is a
+// pointer on cliEnvelope so a pre-usage / malformed envelope (no `usage`
+// key) decodes as nil and the adapter reports Known=false rather than a
+// spurious zero-token figure.
+type cliUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 // Inference runs `claude --print --output-format json --model <model> -p
 // <prompt>`, decodes the CLI envelope, and returns the envelope's `result`
-// field as responseText plus the configured model as the model identifier.
-// The child inherits os.Environ() so the operator's existing ANTHROPIC_API_KEY
-// or subscription auth is used with zero new plumbing.
-func (c *Client) Inference(ctx context.Context, prompt string) (responseText, model string, err error) {
+// field as responseText, the configured model as the model identifier, and
+// the envelope's token usage (#681). The child inherits os.Environ() so the
+// operator's existing ANTHROPIC_API_KEY or subscription auth is used with
+// zero new plumbing.
+func (c *Client) Inference(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, err error) {
 	maxAttempts := c.cfg.MaxRetries + 1
 
 	for attempt := 1; ; attempt++ {
-		text, mdl, retryable, ierr := c.invokeOnce(ctx, prompt)
+		text, mdl, u, retryable, ierr := c.invokeOnce(ctx, prompt)
 		if ierr == nil {
-			return text, mdl, nil
+			return text, mdl, u, nil
 		}
 		// Stop on a non-retryable fault (binary-missing, a per-attempt
 		// timeout, an envelope-decode/bad-verdict fault, or any non-
@@ -112,7 +125,7 @@ func (c *Client) Inference(ctx context.Context, prompt string) (responseText, mo
 		// diagnostic error is returned verbatim so the plan-review WARN
 		// keeps its cause + elapsed + stderr detail.
 		if !retryable || attempt >= maxAttempts || ctx.Err() != nil {
-			return "", "", ierr
+			return "", "", planreview.Usage{}, ierr
 		}
 	}
 }
@@ -123,7 +136,7 @@ func (c *Client) Inference(ctx context.Context, prompt string) (responseText, mo
 // crash class — an *exec.ExitError that is NOT a per-attempt timeout (an
 // external/OOM SIGKILL). A timeout-kill (a slow review, #606) and every
 // deterministic fault return retryable=false so the loop fails fast.
-func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, model string, retryable bool, err error) {
+func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, retryable bool, err error) {
 	if c.cfg.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.cfg.Timeout)
@@ -158,7 +171,7 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	elapsed := time.Since(start)
 	if err != nil {
 		if isBinaryMissing(err) {
-			return "", "", false, fmt.Errorf("claudecode: binary not found: %s", c.cfg.Binary)
+			return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: binary not found: %s", c.cfg.Binary)
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -169,22 +182,34 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 			// would compound into a 600s wait (#606). External/OOM kills
 			// (ctx.Err()==nil) are the transient #620 class and retry.
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return "", "", false, fmt.Errorf("claudecode: claude killed after %s (timeout): %v%s", elapsed, err, stderrSuffix(stderrText))
+				return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: claude killed after %s (timeout): %v%s", elapsed, err, stderrSuffix(stderrText))
 			}
-			return "", "", true, fmt.Errorf("claudecode: claude killed after %s (external/OOM): %v%s", elapsed, err, stderrSuffix(stderrText))
+			return "", "", planreview.Usage{}, true, fmt.Errorf("claudecode: claude killed after %s (external/OOM): %v%s", elapsed, err, stderrSuffix(stderrText))
 		}
-		return "", "", false, fmt.Errorf("claudecode: claude invocation failed: %w", err)
+		return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: claude invocation failed: %w", err)
 	}
 
 	var env cliEnvelope
 	if err := json.Unmarshal(out, &env); err != nil {
-		return "", "", false, fmt.Errorf("claudecode: decode CLI envelope: %w", err)
+		return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: decode CLI envelope: %w", err)
 	}
 	if env.IsError {
-		return "", "", false, fmt.Errorf("claudecode: claude reported error envelope (subtype=%q)", env.Subtype)
+		return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: claude reported error envelope (subtype=%q)", env.Subtype)
 	}
 
-	return env.Result, c.cfg.Model, false, nil
+	// Surface token usage from the envelope's `usage` object. A pre-usage or
+	// malformed envelope (no `usage` key) leaves env.Usage nil → Known=false,
+	// so the server degrades to a usd=0 record rather than guessing (#681).
+	var usageOut planreview.Usage
+	if env.Usage != nil {
+		usageOut = planreview.Usage{
+			InputTokens:  env.Usage.InputTokens,
+			OutputTokens: env.Usage.OutputTokens,
+			Known:        true,
+		}
+	}
+
+	return env.Result, c.cfg.Model, usageOut, false, nil
 }
 
 // stderrSuffix formats captured child stderr as a trailing ": <text>" clause

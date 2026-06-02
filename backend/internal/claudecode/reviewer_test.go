@@ -25,8 +25,12 @@ func TestHelperProcess(t *testing.T) {
 
 	switch os.Getenv("HELPER_MODE") {
 	case "happy":
-		// A success envelope whose result field is the verdict JSON.
+		// A success envelope whose result field is the verdict JSON. No
+		// `usage` object — models the pre-usage / degraded envelope.
 		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\"}"}`)
+	case "happy_usage":
+		// A success envelope carrying a top-level `usage` object (#681).
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\"}","usage":{"input_tokens":1234,"output_tokens":567}}`)
 	case "error":
 		// Non-zero exit stands in for a subprocess failure.
 		fmt.Fprintln(os.Stderr, "claude: model rate-limited")
@@ -311,5 +315,34 @@ func TestReviewer_StderrSurfaced(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "model rate-limited") {
 		t.Errorf("error = %q, want it to surface the child stderr", err)
+	}
+}
+
+// TestReviewer_PopulatesUsageFromEnvelope asserts a CLI envelope carrying a
+// top-level `usage` object surfaces token usage on the verdict with
+// Known=true (#681).
+func TestReviewer_PopulatesUsageFromEnvelope(t *testing.T) {
+	verdict, _, err := reviewerWithMode("happy_usage").Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if !verdict.Usage.Known {
+		t.Error("Usage.Known = false, want true for an envelope carrying a usage object")
+	}
+	if verdict.Usage.InputTokens != 1234 || verdict.Usage.OutputTokens != 567 {
+		t.Errorf("Usage = %+v, want {InputTokens:1234 OutputTokens:567 Known:true}", verdict.Usage)
+	}
+}
+
+// TestReviewer_UsageAbsentDegrades asserts a pre-usage envelope (no `usage`
+// object) decodes with Known=false rather than erroring — the graceful
+// degradation path the server records at usd=0 (#681).
+func TestReviewer_UsageAbsentDegrades(t *testing.T) {
+	verdict, _, err := reviewerWithMode("happy").Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if verdict.Usage.Known {
+		t.Errorf("Usage.Known = true, want false when the envelope carried no usage object; got %+v", verdict.Usage)
 	}
 }

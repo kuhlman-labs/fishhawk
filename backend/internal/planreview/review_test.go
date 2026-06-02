@@ -211,3 +211,35 @@ func TestResolveAuthority_ImplementParity(t *testing.T) {
 		}
 	}
 }
+
+// TestReviewVerdict_UsageIsolatedFromAgentJSON asserts the json:"-" tag on
+// ReviewVerdict.Usage keeps it out of the agent-emitted verdict decode
+// (#681): a verdict body WITHOUT a usage key decodes with a zero-value,
+// Known=false Usage, and even a body that DOES carry a "usage" key cannot
+// populate it — usage comes from the API/CLI envelope the adapter attaches,
+// never from the model's response, so a model can't spoof the cost figure.
+func TestReviewVerdict_UsageIsolatedFromAgentJSON(t *testing.T) {
+	// (a) No usage key in the agent JSON — Usage stays zero-value.
+	var v planreview.ReviewVerdict
+	if err := json.Unmarshal([]byte(`{"verdict":"approve"}`), &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v.Usage != (planreview.Usage{}) {
+		t.Errorf("Usage = %+v, want zero-value (json:\"-\" must isolate it)", v.Usage)
+	}
+	if v.Usage.Known {
+		t.Error("Usage.Known = true, want false for an agent JSON with no usage")
+	}
+
+	// (b) A spoofed usage key in the agent JSON must NOT populate Usage.
+	var spoofed planreview.ReviewVerdict
+	if err := json.Unmarshal(
+		[]byte(`{"verdict":"approve","usage":{"InputTokens":999,"OutputTokens":888,"Known":true}}`),
+		&spoofed,
+	); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if spoofed.Usage != (planreview.Usage{}) {
+		t.Errorf("spoofed Usage = %+v, want zero-value — json:\"-\" must reject a model-supplied usage key", spoofed.Usage)
+	}
+}

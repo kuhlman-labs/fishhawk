@@ -175,3 +175,28 @@ func TestReviewer_InvalidVerdictShape(t *testing.T) {
 		t.Fatal("expected error from invalid verdict value, got nil")
 	}
 }
+
+// TestReviewer_PopulatesUsage asserts the SDK response's Usage block is
+// surfaced on the returned verdict (#681): the adapter attaches token usage
+// from the API envelope (not the agent JSON), with Known=true on the happy
+// path since the SDK always returns a Usage block on a successful call.
+func TestReviewer_PopulatesUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// okResp stamps Usage{InputTokens:100, OutputTokens:20}.
+		_ = json.NewEncoder(w).Encode(okResp(`{"verdict":"approve"}`))
+	}))
+	defer srv.Close()
+
+	reviewer := NewReviewer(testConfig(), option.WithBaseURL(srv.URL))
+	verdict, _, err := reviewer.Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if !verdict.Usage.Known {
+		t.Error("Usage.Known = false, want true (SDK always returns usage)")
+	}
+	if verdict.Usage.InputTokens != 100 || verdict.Usage.OutputTokens != 20 {
+		t.Errorf("Usage = %+v, want {InputTokens:100 OutputTokens:20 Known:true}", verdict.Usage)
+	}
+}

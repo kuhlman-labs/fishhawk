@@ -52,7 +52,7 @@ func (r *Reviewer) SetMaxRetries(n int) {
 // belongs to the closed set. Subprocess failure, non-JSON output, and an
 // unknown verdict each map to a precise wrapped error.
 func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.ReviewVerdict, string, error) {
-	responseText, modelName, err := r.client.Inference(ctx, promptText)
+	responseText, modelName, usage, err := r.client.Inference(ctx, promptText)
 	if err != nil {
 		return nil, "", fmt.Errorf("claudecode: inference failed: %w", err)
 	}
@@ -65,6 +65,12 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 	if _, ok := validVerdicts[verdict.Verdict]; !ok {
 		return nil, "", fmt.Errorf("claudecode: unknown verdict %q", verdict.Verdict)
 	}
+
+	// Attach token usage from the CLI envelope (not the agent-decoded JSON)
+	// so the server can record reviewer agent cost (#681). Usage.Known is
+	// false when the envelope carried no `usage` object — the server then
+	// records the cost at usd=0 rather than guessing.
+	verdict.Usage = usage
 
 	return &verdict, modelName, nil
 }

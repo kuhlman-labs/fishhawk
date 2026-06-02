@@ -36,6 +36,10 @@ type promptRunRepo struct {
 	// consulted; when nil the method returns an error so accidental
 	// calls in tests that don't seed it stay loud.
 	stagesByRunID map[uuid.UUID][]*run.Stage
+	// addRunCostDeltas records every AddRunCost delta so the plan-review
+	// cost-rollup seam test (#681) can assert the rollup was actually
+	// driven with a non-zero delta rather than silently skipped.
+	addRunCostDeltas []float64
 }
 
 type promptTransitionStageCall struct {
@@ -80,6 +84,26 @@ func (r *promptRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error
 		return r.runRow, nil
 	}
 	return nil, run.ErrNotFound
+}
+
+// AddRunCost satisfies the trace handler's runCostRecorder optional
+// capability (#681) so the plan-review cost-rollup seam test can assert the
+// per-run total accumulates via a real AddRunCost call (not a vacuous skip).
+func (r *promptRunRepo) AddRunCost(_ context.Context, id uuid.UUID, deltaUSD float64, resolvedModel string) (*run.Run, error) {
+	r.addRunCostDeltas = append(r.addRunCostDeltas, deltaUSD)
+	rn, ok := r.getRuns[id]
+	if !ok {
+		if r.runRow != nil && r.runRow.ID == id {
+			rn = r.runRow
+		} else {
+			return nil, run.ErrNotFound
+		}
+	}
+	rn.CostUSDTotal += deltaUSD
+	if resolvedModel != "" {
+		rn.ResolvedModel = resolvedModel
+	}
+	return rn, nil
 }
 
 func (r *promptRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {

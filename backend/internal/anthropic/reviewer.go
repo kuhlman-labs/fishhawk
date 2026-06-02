@@ -39,7 +39,7 @@ func NewReviewer(cfg Config, opts ...option.RequestOption) *Reviewer {
 func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.ReviewVerdict, string, error) {
 	systemText, userText := splitPrompt(promptText)
 
-	responseText, modelName, err := r.client.Messages(ctx, systemText, userText)
+	responseText, modelName, inputTokens, outputTokens, err := r.client.Messages(ctx, systemText, userText)
 	if err != nil {
 		return nil, "", fmt.Errorf("anthropic: messages call failed: %w", err)
 	}
@@ -51,6 +51,15 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 
 	if _, ok := validVerdicts[verdict.Verdict]; !ok {
 		return nil, "", fmt.Errorf("anthropic: unknown verdict %q", verdict.Verdict)
+	}
+
+	// Attach token usage from the SDK envelope (not the agent-decoded JSON)
+	// so the server can record reviewer agent cost (#681). The SDK returns a
+	// Usage block on every successful Messages call, so Known is true here.
+	verdict.Usage = planreview.Usage{
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		Known:        true,
 	}
 
 	return &verdict, modelName, nil
