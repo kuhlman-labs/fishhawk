@@ -94,6 +94,7 @@ func scopeFilesFromPlan(p *plan.Plan) []scopeFile {
 // in production.
 type issueGetter interface {
 	GetIssue(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) (*githubclient.Issue, error)
+	ListIssueComments(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
 }
 
 // handleGetStagePrompt implements GET /v0/stages/{stage_id}/prompt.
@@ -698,8 +699,8 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 		trigger.IssueBody = runRow.IssueContext.Body
 		// Comments (#618): map the cached comment snapshot into the
 		// trigger so the plan-stage prompt can render comment-borne
-		// refinements. Branch 2 (webhook fetch) does not yet fetch
-		// comments — see the follow-up issue referenced in the PR.
+		// refinements. Branch 2 (webhook fetch) fetches comments via
+		// ListIssueComments below to populate the same shape.
 		for _, c := range runRow.IssueContext.Comments {
 			trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
 				Author:    c.Author,
@@ -726,6 +727,28 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 	}
 	trigger.IssueTitle = issue.Title
 	trigger.IssueBody = issue.Body
+
+	// Comments (#621): fetch the issue's comment thread so webhook-
+	// triggered runs render comment-borne refinements identically to
+	// branch 1. Best-effort: a fetch error degrades to title+body
+	// rather than failing the prompt build (same WARN-and-proceed
+	// posture as the GetIssue failure above).
+	comments, err := github.ListIssueComments(ctx, *runRow.InstallationID, repo, issueNumber)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list issue comments failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.Int("issue", issueNumber),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	for _, c := range comments {
+		trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
+			Author:    c.Author,
+			Body:      c.Body,
+			CreatedAt: c.CreatedAt,
+		})
+	}
 }
 
 // issueGetter returns the configured client cast to the small
