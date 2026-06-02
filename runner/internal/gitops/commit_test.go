@@ -177,6 +177,47 @@ func TestStageScoped_StagesDeclaredExcludesStray(t *testing.T) {
 	}
 }
 
+// TestStageScoped_StagesFileInBrandNewDir is the #691 gating test: when a
+// declared file lives inside an entirely-untracked new directory, plain
+// `git status --porcelain` collapses the directory to one entry that
+// matches no file-level scope path, so the declared file never stages and
+// the stage fails as a false category-B. The -uall flag enumerates the
+// untracked files individually so the declared one matches and stages
+// while its undeclared sibling is still surfaced as drift.
+func TestStageScoped_StagesFileInBrandNewDir(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	// A brand-new, entirely-untracked directory with two files: one
+	// declared in scope, one undeclared sibling.
+	newDir := filepath.Join(repo, "pkg", "budget")
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newDir, "budget.go"), []byte("package budget\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newDir, "extra.go"), []byte("package budget\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	drift, err := p.StageScoped(context.Background(), repo, []string{"pkg/budget/budget.go"})
+	if err != nil {
+		t.Fatalf("StageScoped: %v", err)
+	}
+
+	staged := mustGitOut(t, repo, "diff", "--cached", "--name-only")
+	if staged != "pkg/budget/budget.go" {
+		t.Errorf("staged files = %q, want only pkg/budget/budget.go", staged)
+	}
+	if len(drift) != 1 || drift[0] != "pkg/budget/extra.go" {
+		t.Errorf("drift = %v, want [pkg/budget/extra.go]", drift)
+	}
+}
+
 // TestCommitAndPush_ScopeBounded_CommitsOnlyDeclared exercises the full
 // commit boundary: the stray file is excluded from the commit and
 // surfaced as ScopeDrift while still left dirty in the working tree.
