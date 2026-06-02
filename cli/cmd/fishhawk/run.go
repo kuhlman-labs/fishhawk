@@ -111,6 +111,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		"explicit path to a workflow spec file; overrides auto-discovery")
 	issueArg := fs.String("issue", "",
 		"GitHub issue number, #N, or .../issues/N URL; CLI fetches via `gh` and ships inline")
+	overrideBudget := fs.Bool("override-budget", false,
+		"force the run past a blocking periodic cost budget that is over its limit for the current period (#688)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -186,12 +188,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 
 	in := httpclient.CreateRunInput{
-		Repo:          *repo,
-		WorkflowID:    *workflowID,
-		WorkflowSHA:   effectiveSHA,
-		TriggerSource: triggerSource,
-		RunnerKind:    *runnerKind,
-		WorkflowSpec:  string(specBytes),
+		Repo:           *repo,
+		WorkflowID:     *workflowID,
+		WorkflowSHA:    effectiveSHA,
+		TriggerSource:  triggerSource,
+		RunnerKind:     *runnerKind,
+		WorkflowSpec:   string(specBytes),
+		BudgetOverride: *overrideBudget,
 	}
 	if *triggerRef != "" {
 		in.TriggerRef = triggerRef

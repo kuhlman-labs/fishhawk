@@ -92,6 +92,28 @@ Notes:
   the same estimate caveat as the cost ledger: period spend undercounts
   invocations a backend reported no tokens for (`known_usage=false`, #685), so
   actual spend is a lower bound.
+- The blocking periodic-budget admission audit kinds — `run_rejected_budget`
+  and `run_admitted_budget_override` (#688 / ADR-030) — are **internal,
+  admission-time global-chain audit entries, NOT issue-comment surfaces**.
+  Nothing in `issuecomment` posts them to the issue thread; they have no
+  Notifier method. They follow the `run_rejected_misconfigured` precedent: the
+  refusal/override happens before (or in place of) `CreateRun`, so there is no
+  run row to scope the entry to — both are written via `AppendGlobalChained`
+  with a `system` actor. `run_rejected_budget` (payload `{reason:
+  budget_exhausted, workflow_id, repo, period, limit_usd, spent}`; the
+  dispatcher path adds `workflow_sha, delivery_id, event`) records a NEW run
+  refused because a workflow's current calendar-period spend crossed an
+  `enforcement: blocking` budget — written by BOTH admission seams: the HTTP
+  handler (`server/budget_admission.go::checkBlockingBudget`, alongside a `402
+  budget_exhausted` response) and the webhook dispatcher
+  (`dispatcher.go::refusedByBlockingBudget`, no response, no run row).
+  `run_admitted_budget_override` (payload `{workflow_id, repo, period,
+  limit_usd, spent}`) records an operator forcing a blocked run past via
+  `budget_override` — written ONLY on the HTTP-handler seam (the webhook path
+  carries no override). In-flight runs and CI-retry / decomposition-child
+  continuations are never gated, so neither kind is emitted for them. Listed
+  here only so a future reader grepping the audit categories doesn't mistake
+  them for comment surfaces.
 
 ## Routing
 

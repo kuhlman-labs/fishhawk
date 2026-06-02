@@ -138,6 +138,11 @@ type CreateRunInput struct {
 	// backend's prompt builder doesn't need an installation_id
 	// to look up the issue.
 	IssueContext *IssueContext `json:"issue_context,omitempty"`
+	// BudgetOverride forces the run past a blocking periodic cost
+	// budget that is over its limit for the current period (#688 /
+	// ADR-030). Ignored when no blocking budget is over. Set by the
+	// CLI's `--override-budget` flag.
+	BudgetOverride bool `json:"budget_override,omitempty"`
 }
 
 // StartRun calls POST /v0/runs.

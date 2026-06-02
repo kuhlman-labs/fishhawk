@@ -30,6 +30,7 @@ type fakeBackend struct {
 
 	gotAuthHeader string
 	gotQuery      string
+	gotStartBody  []byte
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -54,6 +55,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 
 	mux.HandleFunc("POST /v0/runs", func(w http.ResponseWriter, r *http.Request) {
 		fb.gotAuthHeader = r.Header.Get("Authorization")
+		fb.gotStartBody, _ = io.ReadAll(r.Body)
 		if fb.startStatus >= 400 {
 			writeErr(w, fb.startStatus, fb.errBody)
 			return
@@ -108,6 +110,35 @@ func TestStartRun_HappyPath(t *testing.T) {
 	}
 	if fb.gotAuthHeader != "Bearer tok-123" {
 		t.Errorf("Authorization = %q, want Bearer tok-123", fb.gotAuthHeader)
+	}
+}
+
+// TestStartRun_BudgetOverride_Serializes asserts the --override-budget
+// flag's value reaches the wire body as budget_override=true (#688),
+// and that the field is omitted when false (omitempty).
+func TestStartRun_BudgetOverride_Serializes(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startResp = Run{ID: uuid.New(), State: "pending"}
+	c := New(srv.URL, "")
+
+	if _, err := c.StartRun(context.Background(), CreateRunInput{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "abc", TriggerSource: "cli",
+		BudgetOverride: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(fb.gotStartBody), `"budget_override":true`) {
+		t.Errorf("body missing budget_override:true: %s", fb.gotStartBody)
+	}
+
+	// Default (false) → omitted from the wire body.
+	if _, err := c.StartRun(context.Background(), CreateRunInput{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "abc", TriggerSource: "cli",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(fb.gotStartBody), "budget_override") {
+		t.Errorf("budget_override present when false: %s", fb.gotStartBody)
 	}
 }
 
