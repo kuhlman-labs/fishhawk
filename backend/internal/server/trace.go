@@ -18,8 +18,10 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -989,6 +991,13 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
 	}
+
+	// Advisory periodic-budget check (#688). Placed AFTER AddRunCost so
+	// the period sum (SumWorkflowCostInRange over runs.cost_usd_total)
+	// already includes this bundle's cost — a check before the increment
+	// would miss the very crossing this bundle triggers and fire one
+	// bundle late. Warn-only and best-effort, like checkSpendAlert.
+	s.checkBudgetAlerts(ctx, runID, stageID)
 }
 
 // recordReviewerCost prices and records the cost of one advisory reviewer
@@ -1156,6 +1165,228 @@ func (s *Server) checkSpendAlert(ctx context.Context, runID, stageID uuid.UUID, 
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// runCostSummer is the optional capability checkBudgetAlerts uses to
+// total a workflow's spend over a calendar period (#688). The Postgres
+// run repository implements it; like runCostRecorder it is deliberately
+// NOT part of run.Repository so the many test fakes that don't sum cost
+// need no stub. The trace handler asserts for it at runtime and skips
+// the advisory budget check (warn-only) when the wired RunRepo doesn't
+// satisfy it — consistent with the rest of this handler's best-effort
+// posture.
+type runCostSummer interface {
+	SumWorkflowCostInRange(ctx context.Context, repo, workflowID string, from, to time.Time) (float64, error)
+}
+
+// checkBudgetAlerts evaluates the run's workflow advisory periodic
+// budgets (ADR-030 / #688) after the cost_recorded entry has been
+// accumulated into runs.cost_usd_total. For each advisory budget on the
+// run's cached workflow spec it sums the workflow's spend over the
+// current calendar period (timezone-aware in cfg.BudgetLocation),
+// evaluates it via budget.Evaluate, and on a warn_at or 100% crossing
+// emits a deduped budget_alert audit entry plus a (non-sticky) issue
+// comment.
+//
+// MUST run after AddRunCost: the period sum includes this bundle's cost
+// only once the rollup has been incremented, so a check before the
+// increment would fire the crossing one bundle late.
+//
+// Warn-only and best-effort throughout, mirroring checkSpendAlert: it
+// never gates, fails, or blocks a run. It no-ops when RunRepo/AuditRepo
+// is nil, the RunRepo doesn't implement runCostSummer, the run lookup or
+// spec parse fails, the workflow has no budgets, or every budget is
+// blocking (blocking enforcement is an admission-time gate — scope item
+// 4, a separate follow-up — never this warn path). Every failure
+// WARN-logs and returns without unwinding the already-stored cost.
+func (s *Server) checkBudgetAlerts(ctx context.Context, runID, stageID uuid.UUID) {
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return
+	}
+	summer, ok := s.cfg.RunRepo.(runCostSummer)
+	if !ok {
+		return
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"budget alert: get run failed — skipping check",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if len(runRow.WorkflowSpec) == 0 {
+		return
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"budget alert: parse cached workflow spec failed — skipping check",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok || len(wf.Budgets) == 0 {
+		return
+	}
+
+	loc := s.cfg.BudgetLocation
+	if loc == nil {
+		loc = time.UTC
+	}
+	now := time.Now()
+
+	for _, b := range wf.Budgets {
+		// Only advisory budgets surface here. An empty enforcement value
+		// defaults to advisory (the spec's documented zero-value), so the
+		// blocking admission gate is the single excluded case.
+		if b.Enforcement == spec.EnforcementBlocking {
+			continue
+		}
+		start, end := budget.PeriodRange(b.Period, now, loc)
+		if start.IsZero() {
+			// Unrecognized period — the schema enum makes this
+			// unreachable, but don't bucket into the wrong window.
+			continue
+		}
+		spent, err := summer.SumWorkflowCostInRange(ctx, runRow.Repo, runRow.WorkflowID, start, end)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"budget alert: sum period spend failed — skipping budget",
+				slog.String("run_id", runID.String()),
+				slog.String("workflow_id", runRow.WorkflowID),
+				slog.String("period", b.Period),
+				slog.String("error", err.Error()))
+			continue
+		}
+		d := budget.Evaluate(spent, b.LimitUSD, b.WarnAt, b.Period, now, loc)
+		// Decide the tier this crossing represents. Over implies
+		// WarnCrossed (warn_at <= 1), so check Over first and emit only
+		// the higher tier per bundle; the 'warn' tier still fires on the
+		// earlier bundle that first crossed warn_at but not 100%.
+		tier := ""
+		switch {
+		case d.Over:
+			tier = budgetTierOver
+		case d.WarnCrossed:
+			tier = budgetTierWarn
+		default:
+			continue
+		}
+		s.emitBudgetAlert(ctx, runID, stageID, runRow, b, d, tier)
+	}
+}
+
+// Budget alert tiers, recorded in the budget_alert payload and used as
+// the per-period de-dup discriminator.
+const (
+	budgetTierWarn = "warn"
+	budgetTierOver = "over"
+)
+
+// emitBudgetAlert appends a budget_alert audit entry and posts the
+// advisory issue comment for one crossed (budget, tier), deduped so each
+// tier fires at most once per (workflow_id, period_start, tier). Both
+// steps are best-effort: a dedup-read failure, an audit-append failure,
+// or a notifier failure all WARN-log and never unwind the upload.
+func (s *Server) emitBudgetAlert(ctx context.Context, runID, stageID uuid.UUID, runRow *run.Run, b spec.PeriodicBudget, d budget.Decision, tier string) {
+	periodStart := d.PeriodStart.Format(time.RFC3339)
+
+	already, err := s.budgetAlertAlreadyEmitted(ctx, runRow.WorkflowID, periodStart, tier)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"budget alert: dedup read failed — skipping emission",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if already {
+		return
+	}
+
+	payloadMap := map[string]any{
+		"workflow_id":  runRow.WorkflowID,
+		"repo":         runRow.Repo,
+		"period":       b.Period,
+		"period_start": periodStart,
+		"spent":        d.Spent,
+		"limit":        d.Limit,
+		"fraction":     d.Fraction,
+		"tier":         tier,
+		"enforcement":  "advisory",
+	}
+	if b.WarnAt != nil {
+		payloadMap["warn_at"] = *b.WarnAt
+	}
+	payload, _ := json.Marshal(payloadMap)
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "budget_alert",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"budget alert: append budget_alert audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		// Fall through: still try the comment so the surface fires even
+		// when the audit row didn't land.
+	}
+
+	if s.issueNotifier == nil {
+		return
+	}
+	if err := s.issueNotifier.NotifyBudgetAlert(ctx, runID, issuecomment.BudgetAlertPayload{
+		WorkflowID:  runRow.WorkflowID,
+		Period:      b.Period,
+		PeriodStart: periodStart,
+		Spent:       d.Spent,
+		Limit:       d.Limit,
+		Fraction:    d.Fraction,
+		WarnAt:      b.WarnAt,
+		Tier:        tier,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"budget alert: post issue comment failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// budgetAlertAlreadyEmitted reports whether a budget_alert audit entry
+// already carries the same (workflow_id, period_start, tier) — the
+// per-period/per-tier de-dup key. It scans ListAll(category=budget_alert)
+// in memory rather than adding a workflow filter to the audit query
+// (accepted v0 approach, #688): the budget_alert volume is tiny (at most
+// two rows per workflow per period). The key is intentionally not
+// repo-scoped, so two repos sharing a workflow_id could suppress each
+// other's alert in the same period — accepted for an advisory,
+// best-effort surface in v0.
+func (s *Server) budgetAlertAlreadyEmitted(ctx context.Context, workflowID, periodStart, tier string) (bool, error) {
+	category := "budget_alert"
+	entries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &category})
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		var p struct {
+			WorkflowID  string `json:"workflow_id"`
+			PeriodStart string `json:"period_start"`
+			Tier        string `json:"tier"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		if p.WorkflowID == workflowID && p.PeriodStart == periodStart && p.Tier == tier {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // runImplementReviews resolves the implement stage's review config and

@@ -773,3 +773,94 @@ func TestPostgres_StageGate_CheckGateHasNoApprovers(t *testing.T) {
 		t.Errorf("Approvers = %+v, want nil for check gate", s.Gate.Approvers)
 	}
 }
+
+// costRepo is the optional cost-rollup surface the trace handler
+// consumes via capability assertion (#649 / #688). AddRunCost and
+// SumWorkflowCostInRange are not part of run.Repository, so the test
+// asserts for them the same way the server does.
+type costRepo interface {
+	AddRunCost(ctx context.Context, id uuid.UUID, deltaUSD float64, resolvedModel string) (*run.Run, error)
+	SumWorkflowCostInRange(ctx context.Context, repo, workflowID string, from, to time.Time) (float64, error)
+}
+
+func TestPostgres_SumWorkflowCostInRange(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	cr, ok := repo.(costRepo)
+	if !ok {
+		t.Fatal("postgres repo does not implement AddRunCost/SumWorkflowCostInRange")
+	}
+	ctx := context.Background()
+
+	// Two feature_change runs in the same repo + one routine_change run,
+	// plus a feature_change run in a different repo. The window sum must
+	// filter on (repo, workflow_id) and the [from, to) range.
+	r1 := makeRun(t, repo) // feature_change @ kuhlman-labs/fishhawk
+	r2 := makeRun(t, repo) // feature_change @ kuhlman-labs/fishhawk
+	r3, err := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "routine_change",
+		WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create routine_change run: %v", err)
+	}
+	rOther, err := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "other/repo", WorkflowID: "feature_change",
+		WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create other-repo run: %v", err)
+	}
+
+	for _, c := range []struct {
+		id  uuid.UUID
+		usd float64
+	}{
+		{r1.ID, 10}, {r2.ID, 5}, {r3.ID, 100}, {rOther.ID, 7},
+	} {
+		if _, err := cr.AddRunCost(ctx, c.id, c.usd, "claude"); err != nil {
+			t.Fatalf("add run cost: %v", err)
+		}
+	}
+
+	now := time.Now()
+	from := now.Add(-time.Hour)
+	to := now.Add(time.Hour)
+
+	// feature_change @ fishhawk over the current window: 10 + 5.
+	got, err := cr.SumWorkflowCostInRange(ctx, "kuhlman-labs/fishhawk", "feature_change", from, to)
+	if err != nil {
+		t.Fatalf("sum feature_change: %v", err)
+	}
+	if got != 15 {
+		t.Errorf("feature_change sum = %v, want 15", got)
+	}
+
+	// routine_change is summed separately (workflow_id filter).
+	got, err = cr.SumWorkflowCostInRange(ctx, "kuhlman-labs/fishhawk", "routine_change", from, to)
+	if err != nil {
+		t.Fatalf("sum routine_change: %v", err)
+	}
+	if got != 100 {
+		t.Errorf("routine_change sum = %v, want 100", got)
+	}
+
+	// A different repo's runs never leak into the sum (repo filter).
+	got, err = cr.SumWorkflowCostInRange(ctx, "kuhlman-labs/fishhawk", "feature_change",
+		now.Add(2*time.Hour), now.Add(3*time.Hour))
+	if err != nil {
+		t.Fatalf("sum future window: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("future-window sum = %v, want 0 (range excludes all runs)", got)
+	}
+
+	// An empty match returns 0, never an error (COALESCE).
+	got, err = cr.SumWorkflowCostInRange(ctx, "kuhlman-labs/fishhawk", "no_such_workflow", from, to)
+	if err != nil {
+		t.Fatalf("sum unknown workflow: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("unknown-workflow sum = %v, want 0", got)
+	}
+}

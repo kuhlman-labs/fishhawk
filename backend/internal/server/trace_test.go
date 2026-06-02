@@ -210,8 +210,35 @@ func (a *auditFake) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit.Entry, 
 func (a *auditFake) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("auditFake: LastForRun not used")
 }
-func (a *auditFake) ListForRunByCategory(_ context.Context, _ uuid.UUID, _ string) ([]*audit.Entry, error) {
-	return nil, errors.New("auditFake: ListForRunByCategory not used")
+
+// ListForRunByCategory returns the seeded + appended entries for one
+// run filtered by category. Backs the issue-comment notifier's
+// per-surface dedup (e.g. the advisory budget_alert per-period/per-tier
+// guard, #688) when a test wires s.issueNotifier against this fake.
+func (a *auditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []*audit.Entry
+	for _, e := range a.seeded {
+		if e.RunID != nil && *e.RunID == runID && e.Category == category {
+			out = append(out, e)
+		}
+	}
+	for i := range a.appended {
+		ap := a.appended[i]
+		if ap.RunID != runID || ap.Category != category {
+			continue
+		}
+		rid := ap.RunID
+		out = append(out, &audit.Entry{
+			RunID:     &rid,
+			StageID:   ap.StageID,
+			Timestamp: ap.Timestamp,
+			Category:  ap.Category,
+			Payload:   ap.Payload,
+		})
+	}
+	return out, nil
 }
 
 // newTraceServer wires all three repos for the trace handler.

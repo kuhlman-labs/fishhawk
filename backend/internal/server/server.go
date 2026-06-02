@@ -207,6 +207,16 @@ type Config struct {
 	// values fall back to spendalert.DefaultMultiple (3x). Warn-only —
 	// it never gates a run.
 	SpendAlertMultiple float64
+
+	// BudgetLocation is the IANA timezone the periodic-budget evaluator
+	// (ADR-030 / #688) computes calendar period boundaries in: a weekly
+	// budget resets Monday 00:00 in this zone, a monthly budget on the
+	// 1st 00:00. Nil is treated as time.UTC by the trace handler's
+	// checkBudgetAlerts (and by budget.PeriodRange itself). Wired from
+	// FISHHAWKD_BUDGET_TIMEZONE in serve.go, which falls back to UTC on
+	// an unresolvable zone name so a minimal container image's missing
+	// zoneinfo never crashes startup.
+	BudgetLocation *time.Location
 }
 
 // Server wraps an http.Server with the routes and middleware stack

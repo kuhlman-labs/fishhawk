@@ -49,6 +49,23 @@ import (
 	"strconv"
 )
 
+// resolveBudgetLocation resolves an IANA timezone name to a
+// *time.Location for the advisory periodic-budget evaluator (#688). A
+// missing zoneinfo (minimal container image) or a typo'd name must never
+// crash startup, so an unresolvable name falls back to time.UTC with a
+// WARN — advisory budgets then evaluate calendar periods in UTC rather
+// than the requested zone.
+func resolveBudgetLocation(name string, logger *slog.Logger) *time.Location {
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		logger.Warn("budget timezone unresolved — falling back to UTC",
+			slog.String("requested", name),
+			slog.String("error", err.Error()))
+		return time.UTC
+	}
+	return loc
+}
+
 // runServe boots the HTTP server with graceful SIGINT/SIGTERM
 // handling. Returns the intended process exit code.
 func runServe(args []string, logSink io.Writer) int {
@@ -157,6 +174,12 @@ func runServe(args []string, logSink io.Writer) int {
 		"warn-only spend-anomaly threshold (#649): the trace handler emits a spend_alert audit "+
 			"entry when the current hour's estimated model spend exceeds this multiple of the "+
 			"rolling average of prior hours. Never gates a run")
+	budgetTimezone := fs.String("budget-timezone",
+		envOr("FISHHAWKD_BUDGET_TIMEZONE", "UTC"),
+		"IANA timezone (e.g. America/New_York) the advisory periodic-budget evaluator (#688) "+
+			"computes calendar period boundaries in — a weekly budget resets Monday 00:00 in this "+
+			"zone, a monthly budget on the 1st. An unresolvable zone name falls back to UTC with a "+
+			"WARN at startup rather than failing the boot")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -164,7 +187,9 @@ func runServe(args []string, logSink io.Writer) int {
 	logger := newLogger(logSink)
 	logger.Info("plan coercion registry", slog.String("summary", plan.CoercionRegistrySummary()))
 
-	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple}
+	budgetLocation := resolveBudgetLocation(*budgetTimezone, logger)
+
+	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation}
 
 	// Plan-review agent wiring. Selection precedence (each branch logs which
 	// adapter is active at startup):
