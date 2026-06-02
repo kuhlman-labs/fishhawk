@@ -974,6 +974,85 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 	}
 }
 
+// recordReviewerCost prices and records the cost of one advisory reviewer
+// (plan-review / implement-review) agent invocation (#681). Unlike runner
+// stage agents, reviewer agents run server-side inside fishhawkd and never
+// ship a trace bundle, so their tokens never reach recordCost — this is the
+// single seam that captures them, at the reviewer CONTRACT boundary.
+//
+// It is called from the per-reviewer review loop at the plan_reviewed /
+// implement_reviewed call site with the usage the adapter reported through
+// planreview.ReviewVerdict.Usage — never branching on which backend ran.
+// source is "plan_review" or "implement_review" so reviewer cost is
+// distinguishable from runner stage-agent cost (which carries no source).
+//
+// Graceful degradation: a backend that could not report usage leaves
+// usage.Known false (with zero-value tokens), so the record lands at usd=0
+// with known_usage=false rather than a guessed figure — mirroring the
+// unknown-model known_model=false contract in recordCost.
+//
+// Best-effort throughout, like recordCost: the advisory review verdict is
+// already recorded by the time this runs, so a nil AuditRepo, an audit-write
+// failure, or a RunRepo that doesn't implement runCostRecorder all log at
+// WARN (or silently no-op) and never unwind the review. It deliberately does
+// NOT call checkSpendAlert — reviewer cost_recorded entries are swept by the
+// next runner-triggered checkSpendAlert, which re-reads all cost_recorded
+// entries across runs.
+func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUID, model string, usage planreview.Usage, source string) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+
+	rec := cost.FromManifest(model, usage.InputTokens, usage.OutputTokens)
+	if !usage.Known {
+		// The backend could not report usage; record the cost at 0 rather
+		// than pricing zero-value tokens that might be wrong.
+		rec.USD = 0
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"model":         rec.Model,
+		"input_tokens":  rec.InputTokens,
+		"output_tokens": rec.OutputTokens,
+		"usd":           rec.USD,
+		"known_model":   rec.KnownModel,
+		"known_usage":   usage.Known,
+		"pricing_as_of": rec.PricingAsOf,
+		"source":        source,
+		"estimated":     true,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "cost_recorded",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"reviewer cost: append cost_recorded audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("source", source),
+			slog.String("error", err.Error()))
+		// Fall through: still try to accumulate the run-record total so the
+		// rollup doesn't silently drift from the (failed) audit row.
+	}
+
+	recorder, ok := s.cfg.RunRepo.(runCostRecorder)
+	if !ok {
+		return
+	}
+	if _, err := recorder.AddRunCost(ctx, runID, rec.USD, rec.Model); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"reviewer cost: accumulate per-run cost total failed",
+			slog.String("run_id", runID.String()),
+			slog.String("source", source),
+			slog.String("error", err.Error()))
+	}
+}
+
 // checkSpendAlert reads the recent cost_recorded audit history across
 // all runs, evaluates the current hour's spend against the rolling
 // average of prior hours, and emits a spend_alert audit entry when the
@@ -1281,6 +1360,11 @@ func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid
 				slog.String("error", aerr.Error()),
 			)
 		}
+
+		// Capture this reviewer invocation's agent token cost (#681). The
+		// usage rode in on the planreview.ReviewVerdict contract; we price
+		// and record it here, backend-agnostically.
+		s.recordReviewerCost(ctx, runID, stageID, model, verdict.Usage, "implement_review")
 
 		if verdict.Verdict == planreview.VerdictReject {
 			hasRejection = true

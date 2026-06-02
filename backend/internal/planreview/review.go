@@ -41,6 +41,22 @@ type Concern struct {
 	Note     string          `json:"note"`
 }
 
+// Usage is the token usage a reviewer backend reports for one review
+// invocation (#681). It is captured at the reviewer CONTRACT boundary so
+// the server can record advisory reviewer agent cost backend-agnostically
+// at the plan_reviewed / implement_reviewed call site, never branching on
+// which adapter (local subprocess, SDK, future) actually ran.
+//
+// Known is the graceful-degradation marker: a backend that cannot report
+// usage leaves Known false (with zero-value token counts), and the server
+// records the cost at usd=0 with known_usage=false rather than guessing —
+// mirroring the cost/pricing unknown-model ok=false contract.
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+	Known        bool
+}
+
 // ReviewVerdict is the structured response emitted by a review agent.
 // The review-agent prompt instructs agents to return only this shape
 // as a JSON object — no prose, no re-planning.
@@ -48,6 +64,15 @@ type ReviewVerdict struct {
 	Verdict  Verdict   `json:"verdict"`
 	Concerns []Concern `json:"concerns,omitempty"`
 	FreeForm string    `json:"free_form,omitempty"`
+
+	// Usage is the reviewer backend's token usage for this invocation,
+	// populated by the adapter AFTER it decodes the verdict JSON — usage
+	// comes from the API/CLI envelope, not the model-emitted verdict body.
+	// The `json:"-"` tag isolates it from the agent-JSON decode so a model
+	// that echoes a "usage" key in its response cannot spoof the recorded
+	// cost figure. Zero-value with Known=false when the backend cannot
+	// report usage (graceful degradation).
+	Usage Usage `json:"-"`
 }
 
 // AuthorityMode determines whether agent verdicts gate stage advancement.

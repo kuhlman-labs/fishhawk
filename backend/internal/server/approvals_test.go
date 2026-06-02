@@ -629,6 +629,11 @@ type orchestratorRepo struct {
 	runs          map[uuid.UUID]*run.Run
 	stagesByID    map[uuid.UUID]*run.Stage
 	stagesByRunID map[uuid.UUID][]*run.Stage
+	// addRunCostDeltas records every AddRunCost delta so the reviewer
+	// cost-rollup seam test (#681) can assert the rollup was actually
+	// driven with a non-zero delta — not silently skipped because the
+	// RunRepo failed to satisfy runCostRecorder (the #647-fixture trap).
+	addRunCostDeltas []float64
 }
 
 func newOrchestratorRepo() *orchestratorRepo {
@@ -671,6 +676,27 @@ func (r *orchestratorRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, er
 	rr, ok := r.runs[id]
 	if !ok {
 		return nil, run.ErrNotFound
+	}
+	return rr, nil
+}
+
+// AddRunCost satisfies the trace handler's runCostRecorder optional
+// capability (#649/#681) so the reviewer cost-rollup seam test can assert
+// the per-run total accumulates AND that AddRunCost was genuinely called
+// with a non-zero delta (the binding #647-fixture trap: a RunRepo that
+// doesn't implement this would let recordReviewerCost silently skip the
+// rollup, passing the assertion vacuously).
+func (r *orchestratorRepo) AddRunCost(_ context.Context, id uuid.UUID, deltaUSD float64, resolvedModel string) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.addRunCostDeltas = append(r.addRunCostDeltas, deltaUSD)
+	rr, ok := r.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	rr.CostUSDTotal += deltaUSD
+	if resolvedModel != "" {
+		rr.ResolvedModel = resolvedModel
 	}
 	return rr, nil
 }

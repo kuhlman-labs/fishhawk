@@ -854,6 +854,11 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			)
 		}
 
+		// Capture this reviewer invocation's agent token cost (#681). The
+		// usage rode in on the planreview.ReviewVerdict contract; we price
+		// and record it here, backend-agnostically.
+		s.recordReviewerCost(ctx, runID, stageID, model, verdict.Usage, "plan_review")
+
 		if verdict.Verdict == planreview.VerdictReject {
 			hasRejection = true
 		}

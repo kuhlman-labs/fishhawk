@@ -45,8 +45,11 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 // Messages calls the Anthropic Messages API. systemText is placed in a
 // system block with ephemeral cache_control; when empty, the system block is
 // omitted. userText becomes the single user message. Returns the first text
-// block from the response and the model name used.
-func (c *Client) Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, err error) {
+// block from the response, the model name used, and the response's token
+// usage (input/output) so the caller can attribute reviewer agent cost
+// (#681). The SDK always returns a Usage block on a successful Messages
+// call, so the token counts are authoritative on the happy path.
+func (c *Client) Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens int, err error) {
 	params := anthropicsdk.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: int64(c.maxTokens),
@@ -63,12 +66,14 @@ func (c *Client) Messages(ctx context.Context, systemText, userText string) (res
 
 	msg, err := c.inner.Messages.New(ctx, params)
 	if err != nil {
-		return "", "", err
+		return "", "", 0, 0, err
 	}
+	inTok := int(msg.Usage.InputTokens)
+	outTok := int(msg.Usage.OutputTokens)
 	for _, block := range msg.Content {
 		if block.Type == "text" {
-			return block.Text, msg.Model, nil
+			return block.Text, msg.Model, inTok, outTok, nil
 		}
 	}
-	return "", msg.Model, nil
+	return "", msg.Model, inTok, outTok, nil
 }
