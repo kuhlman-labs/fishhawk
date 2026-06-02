@@ -49,6 +49,21 @@ import (
 	"strconv"
 )
 
+// defaultPlanReviewTimeout is the #606 code default for the per-invocation
+// plan-review bound — raised from 60s to 300s to cover review of large
+// standard_v1 plans. It is the single source for BOTH the
+// FISHHAWKD_PLAN_REVIEW_TIMEOUT flag fallback and the startup warn threshold
+// so the two can never drift (#664).
+const defaultPlanReviewTimeout = 300 * time.Second
+
+// planReviewTimeoutBelowDefault reports whether the effective plan-review
+// timeout is below the #606 floor (defaultPlanReviewTimeout). Extracted as a
+// pure predicate so the below/equal/above boundary is unit-testable without
+// capturing startup logs (#664).
+func planReviewTimeoutBelowDefault(configured time.Duration) bool {
+	return configured < defaultPlanReviewTimeout
+}
+
 // resolveBudgetLocation resolves an IANA timezone name to a
 // *time.Location for the advisory periodic-budget evaluator (#688). A
 // missing zoneinfo (minimal container image) or a typo'd name must never
@@ -166,7 +181,7 @@ func runServe(args []string, logSink io.Writer) int {
 			"counts retries not attempts (N => N+1 attempts), 0 disables retry (single attempt), unset defaults to 1. "+
 			"Used only by the claudecode adapter — the anthropic SDK adapter has no retry field")
 	planReviewTimeout := fs.Duration("plan-review-timeout",
-		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", 300*time.Second),
+		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", defaultPlanReviewTimeout),
 		"effective per-invocation bound for plan-review agent calls (since #584); "+
 			"must cover review of large standard_v1 plans — raised from 60s to 300s (#606)")
 	spendAlertMultiple := fs.Float64("spend-alert-multiple",
@@ -185,6 +200,17 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 
 	logger := newLogger(logSink)
+
+	// Warn when an operator .env / flag override drops the plan-review
+	// timeout below the #606 code default (300s) — a value that risks
+	// timing out review of large standard_v1 plans, silently defeating the
+	// raise. Surfaced at startup so the drift is no longer invisible (#664).
+	if planReviewTimeoutBelowDefault(*planReviewTimeout) {
+		logger.Warn("FISHHAWKD_PLAN_REVIEW_TIMEOUT is below the recommended floor; large standard_v1 plans may time out",
+			slog.Duration("configured", *planReviewTimeout),
+			slog.Duration("recommended_floor", defaultPlanReviewTimeout),
+			slog.String("ref", "#606"))
+	}
 	logger.Info("plan coercion registry", slog.String("summary", plan.CoercionRegistrySummary()))
 
 	budgetLocation := resolveBudgetLocation(*budgetTimezone, logger)

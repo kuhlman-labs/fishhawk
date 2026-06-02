@@ -801,6 +801,39 @@ func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID
 	}
 }
 
+// emitReviewFailed appends a best-effort terminal *_review_failed audit
+// entry when a wired reviewer invocation errors or times out (#664). Shared
+// by the plan-review (plan.go) and implement-review (trace.go) error
+// branches via the passed category ("plan_review_failed" /
+// "implement_review_failed"). It mirrors emitReviewStarted's contract:
+// ActorKind=system, best-effort, WARN-log on append failure so the review
+// loop is never blocked. Observability-only — it records that a reviewer
+// failed without altering gating advance/degrade semantics (#574).
+func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model, reason string) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(planreview.ReviewFailedPayload{
+		Reason:        reason,
+		ReviewerModel: model,
+		Authority:     authority,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	}
+}
+
 // runPlanReviewLoop runs the per-reviewer plan-review loop shared by the
 // synchronous (gating) and detached (advisory) dispatch paths. For each
 // configured agent it calls PlanReviewer.Review, logs WARN on self-review
@@ -824,6 +857,12 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 				slog.Int("reviewer_index", i),
 				slog.String("error", err.Error()),
 			)
+			// Emit a terminal plan_review_failed audit entry (#664) so a
+			// timed-out / errored reviewer is observable as a definite
+			// 'failed' state rather than an ambiguous 'pending'. hasRejection
+			// is deliberately untouched — gating advance/degrade semantics
+			// are unchanged (#574); this is observability-only.
+			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, model, err.Error())
 			continue
 		}
 

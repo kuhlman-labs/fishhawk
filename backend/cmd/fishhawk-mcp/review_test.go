@@ -51,6 +51,29 @@ func seedReviewSkippedAudit(fb *fakeBackend, runID uuid.UUID, category, reason, 
 	fb.mu.Unlock()
 }
 
+// seedReviewFailedAudit appends a terminal *_review_failed audit entry
+// (#664) — the producer's ReviewFailedPayload shape — so the consumer-side
+// resolution can be pinned against the exact category + payload the server
+// writes.
+func seedReviewFailedAudit(fb *fakeBackend, runID uuid.UUID, category, reason, model, authority string) {
+	payload, _ := json.Marshal(map[string]any{
+		"reason":         reason,
+		"reviewer_model": model,
+		"authority":      authority,
+	})
+	var decoded any
+	_ = json.Unmarshal(payload, &decoded)
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: category,
+		Payload:  decoded,
+	})
+	fb.mu.Unlock()
+}
+
 // --- reviewStatusFor precedence (#600) ---
 
 func TestReviewStatusFor_None_NoEntries(t *testing.T) {
@@ -134,6 +157,77 @@ func TestReviewStatusFor_Skipped_WinsOverStarted(t *testing.T) {
 	}
 	if st.Reviews[0].Reason != "reviewer_not_configured" {
 		t.Errorf("Reason = %q, want reviewer_not_configured", st.Reviews[0].Reason)
+	}
+}
+
+// TestReviewStatusFor_Failed_WinsOverStarted is the #664 consumer-contract
+// test: a terminal plan_review_failed entry resolves the status to a definite
+// 'failed' (not the old ambiguous 'pending'), carrying the synthesized
+// failure reason. It is pinned against the same category string +
+// ReviewFailedPayload shape the server producer test writes, so a rename or
+// field drift on either side trips a test.
+func TestReviewStatusFor_Failed_WinsOverStarted(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "advisory")
+	seedReviewFailedAudit(fb, runID, "plan_review_failed",
+		"review timed out: context deadline exceeded", "claude-sonnet-4-6", "advisory")
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "failed" {
+		t.Errorf("Status = %q, want failed", st.Status)
+	}
+	if len(st.Reviews) != 1 || st.Reviews[0].Verdict != "failed" {
+		t.Fatalf("Reviews = %+v, want one failed verdict", st.Reviews)
+	}
+	if st.Reviews[0].Reason != "review timed out: context deadline exceeded" {
+		t.Errorf("Reason = %q, want the synthesized failure reason", st.Reviews[0].Reason)
+	}
+}
+
+// TestReviewStatusFor_Complete_WinsOverFailed pins the precedence ordering
+// complete > failed: when a real verdict AND a failed entry both exist (e.g.
+// a multi-agent stage where one reviewer succeeded and another timed out),
+// 'complete' wins so a landed verdict is never masked by a sibling failure.
+func TestReviewStatusFor_Complete_WinsOverFailed(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewFailedAudit(fb, runID, "plan_review_failed", "timed out", "claude-sonnet-4-6", "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Errorf("Status = %q, want complete (a landed verdict outranks a sibling failure)", st.Status)
+	}
+}
+
+// TestAwaitReview_ReturnsImmediately_Failed confirms the await tool resolves
+// a terminal failed entry on the fast path (no polling) to status 'failed'
+// with the failure reason surfaced.
+func TestAwaitReview_ReturnsImmediately_Failed(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewFailedAudit(fb, runID, "implement_review_failed",
+		"review timed out: context deadline exceeded", "claude-sonnet-4-6", "gating")
+	r := newResolver(srv, nil)
+
+	_, out, err := r.awaitReview(context.Background(), nil, AwaitReviewInput{RunID: runID.String(), Stage: "implement"})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "failed" {
+		t.Errorf("Status = %q, want failed", out.Status)
+	}
+	if len(out.Reviews) != 1 || out.Reviews[0].Reason != "review timed out: context deadline exceeded" {
+		t.Errorf("Reviews = %+v, want one failed verdict with the timeout reason", out.Reviews)
 	}
 }
 

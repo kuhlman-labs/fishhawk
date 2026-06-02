@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -231,6 +232,60 @@ func TestShipTrace_ImplementReview_GatingReject_StageFailedB(t *testing.T) {
 	}
 	if !strings.Contains(reviewer.calls[0], "backend/internal/foo/foo.go") {
 		t.Errorf("reviewer prompt missing the diff's changed file:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestShipTrace_ImplementReview_ReviewerError_EmitsImplementReviewFailed is
+// the #664 symmetric producer-contract test for the implement stage: a
+// reviewer that errors (modelling a timeout) writes exactly one terminal
+// implement_review_failed audit entry carrying the error string, and zero
+// implement_reviewed entries. It also pins that gating advance semantics are
+// untouched (#574): an erroring gating reviewer does not fail the stage.
+func TestShipTrace_ImplementReview_ReviewerError_EmitsImplementReviewFailed(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		err: fmt.Errorf("review timed out: context deadline exceeded"),
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// Exactly one implement_review_failed entry; zero implement_reviewed.
+	var failedEntries []planreview.ReviewFailedPayload
+	au.mu.Lock()
+	for _, e := range au.appended {
+		switch e.Category {
+		case "implement_review_failed":
+			var p planreview.ReviewFailedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				au.mu.Unlock()
+				t.Fatalf("decode implement_review_failed payload: %v", err)
+			}
+			failedEntries = append(failedEntries, p)
+		case "implement_reviewed":
+			t.Errorf("unexpected implement_reviewed entry on the reviewer-error path")
+		}
+	}
+	au.mu.Unlock()
+	if len(failedEntries) != 1 {
+		t.Fatalf("implement_review_failed entries = %d, want 1", len(failedEntries))
+	}
+	if failedEntries[0].Reason != "review timed out: context deadline exceeded" {
+		t.Errorf("reason = %q, want the reviewer error string", failedEntries[0].Reason)
+	}
+	if failedEntries[0].Authority != planreview.AuthorityGating {
+		t.Errorf("authority = %q, want gating", failedEntries[0].Authority)
+	}
+
+	// #574: an erroring gating reviewer must NOT fail the stage.
+	if implStage.State == run.StageStateFailed {
+		t.Errorf("reviewer error must not fail the gating implement stage; state = %q", implStage.State)
 	}
 }
 
