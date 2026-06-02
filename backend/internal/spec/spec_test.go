@@ -185,6 +185,140 @@ workflows:
 	}
 }
 
+// --- Periodic budgets (ADR-030 / #688) ---
+
+func TestParse_Budgets_RoundTrip(t *testing.T) {
+	// A workflow with a budgets entry decodes into Workflow.Budgets
+	// with every field populated. version 0.4 advertises the field.
+	yml := []byte(`
+version: "0.4"
+workflows:
+  feature_change:
+    description: "x"
+    budgets:
+      - period: weekly
+        limit_usd: 50
+        enforcement: blocking
+        warn_at: 0.8
+      - period: monthly
+        limit_usd: 200.5
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf := s.Workflows["feature_change"]
+	if got, want := len(wf.Budgets), 2; got != want {
+		t.Fatalf("budgets count = %d, want %d", got, want)
+	}
+	b0 := wf.Budgets[0]
+	if b0.Period != spec.BudgetPeriodWeekly {
+		t.Errorf("budgets[0].period = %q, want weekly", b0.Period)
+	}
+	if b0.LimitUSD != 50 {
+		t.Errorf("budgets[0].limit_usd = %v, want 50", b0.LimitUSD)
+	}
+	if b0.Enforcement != spec.EnforcementBlocking {
+		t.Errorf("budgets[0].enforcement = %q, want blocking", b0.Enforcement)
+	}
+	if b0.WarnAt == nil || *b0.WarnAt != 0.8 {
+		t.Errorf("budgets[0].warn_at = %v, want 0.8", b0.WarnAt)
+	}
+	// Second entry omits enforcement + warn_at: enforcement is the
+	// zero value (caller defaults to advisory) and WarnAt is nil.
+	b1 := wf.Budgets[1]
+	if b1.Period != spec.BudgetPeriodMonthly {
+		t.Errorf("budgets[1].period = %q, want monthly", b1.Period)
+	}
+	if b1.LimitUSD != 200.5 {
+		t.Errorf("budgets[1].limit_usd = %v, want 200.5", b1.LimitUSD)
+	}
+	if b1.WarnAt != nil {
+		t.Errorf("budgets[1].warn_at = %v, want nil for an omitted field", b1.WarnAt)
+	}
+}
+
+func TestParse_Budgets_Absent_NilSlice(t *testing.T) {
+	// No budgets block → Workflow.Budgets is nil; the admission gate
+	// and advisory wiring are no-ops for such a workflow.
+	s, err := spec.ParseBytes(readFixture(t, "valid/minimal.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if wf := s.Workflows["trivial"]; wf.Budgets != nil {
+		t.Errorf("Budgets = %v, want nil for an absent block", wf.Budgets)
+	}
+}
+
+func TestParse_Budgets_UnknownPeriod_Rejected(t *testing.T) {
+	// period is a closed enum (weekly|monthly); an unknown value is a
+	// schema error refused before the spec lands on a run row.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.4"
+workflows:
+  feature_change:
+    budgets:
+      - period: daily
+        limit_usd: 10
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+func TestParse_Budgets_MissingLimit_Rejected(t *testing.T) {
+	// limit_usd is required on a budget entry; its absence is a
+	// schema error.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.4"
+workflows:
+  feature_change:
+    budgets:
+      - period: weekly
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+func TestParse_Budgets_WarnAtOutOfRange_Rejected(t *testing.T) {
+	// warn_at must be a fraction in [0,1]; >1 is a schema error.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.4"
+workflows:
+  feature_change:
+    budgets:
+      - period: monthly
+        limit_usd: 100
+        warn_at: 1.5
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
 // --- YAML errors ---
 
 func TestParse_EmptyDocument(t *testing.T) {
