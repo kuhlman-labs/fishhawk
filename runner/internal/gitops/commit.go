@@ -289,14 +289,20 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 
 // StageScoped stages exactly the declared scope paths and returns the
 // set of dirty-but-undeclared paths (scope drift). It reads `git status
-// --porcelain` to enumerate every dirty path, stages the ones that
+// --porcelain -uall` to enumerate every dirty path, stages the ones that
 // match a declared path via a single `git add -A -- <paths>` (per-path
 // -A covers create, modify, AND delete), and returns the remainder as
 // drift. Drift paths are never staged; declared paths that are clean
 // are a no-op. Staging only the paths git already reports dirty means
 // `git add` never errors on a pathspec that matches nothing.
+//
+// -uall (--untracked-files=all) enumerates untracked files inside a
+// brand-new directory individually rather than collapsing them to a
+// single directory entry (e.g. `?? backend/internal/budget/`), which
+// matches no file-level scope.files entry and would be misclassified as
+// drift, leaving the declared file unstaged (#691).
 func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []string) (drift []string, err error) {
-	status, err := p.runOut(ctx, repoDir, "status", "--porcelain")
+	status, err := p.runOut(ctx, repoDir, "status", "--porcelain", "-uall")
 	if err != nil {
 		return nil, fmt.Errorf("gitops: status: %w", err)
 	}
