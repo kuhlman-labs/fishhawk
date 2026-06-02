@@ -964,6 +964,200 @@ func TestRunStageEventMessage_StageProgress(t *testing.T) {
 	}
 }
 
+// --- compact-by-default summary (#647) ---
+
+// compactFixtureBody is a fake-runner stderr stream mixing
+// stage_progress heartbeats with non-heartbeat events. The terminal
+// event is the REAL relayed wire shape
+// {"event":"runner_completed","outcome":"ok","tokens_used":N} — NOT a
+// synthetic invocation_end, which is appended to the signed trace
+// bundle only and never reaches the JSONL stderr the relay reads.
+const compactFixtureBody = `printf '%s\n' ` +
+	`'{"event":"stage_progress","turns":1,"tokens_so_far":100,"elapsed_seconds":15,"last_event_kind":"assistant"}' ` +
+	`'{"kind":"runner_started"}' ` +
+	`'{"event":"stage_progress","turns":3,"tokens_so_far":500,"elapsed_seconds":30,"last_event_kind":"tool_use"}' ` +
+	`'{"kind":"git_diff","changed_files":["a.go"]}' ` +
+	`'{"event":"runner_completed","outcome":"ok","tokens_used":20733}' >&2`
+
+// TestRunStage_CompactByDefault verifies the default (Verbose=false)
+// result OMITS every stage_progress heartbeat from Events while
+// RETAINING all non-heartbeat events (runner_started, git_diff, and
+// the terminal runner_completed) in arrival order, and populates the
+// scalar summary from the last heartbeat + the runner_completed event.
+func TestRunStage_CompactByDefault(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, compactFixtureBody)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+
+	// Heartbeats dropped; the three non-heartbeat events retained in order.
+	wantKinds := []string{"runner_started", "git_diff", "runner_completed"}
+	if len(out.Events) != len(wantKinds) {
+		t.Fatalf("compact Events = %d, want %d (%+v)", len(out.Events), len(wantKinds), out.Events)
+	}
+	for i, ev := range out.Events {
+		m, ok := ev.Payload.(map[string]any)
+		if !ok {
+			t.Fatalf("event[%d] payload not an object: %T", i, ev.Payload)
+		}
+		if m["event"] == "stage_progress" {
+			t.Errorf("compact Events should not contain a stage_progress heartbeat: %+v", m)
+		}
+		// runner_completed carries `event`, the rest carry `kind`.
+		got, _ := m["kind"].(string)
+		if got == "" {
+			got, _ = m["event"].(string)
+		}
+		if got != wantKinds[i] {
+			t.Errorf("event[%d] = %q, want %q", i, got, wantKinds[i])
+		}
+	}
+
+	// Summary populated: turns/elapsed/last from the last heartbeat,
+	// outcome + tokens_used from runner_completed (overriding the
+	// heartbeat's tokens_so_far=500).
+	if out.Outcome != "ok" {
+		t.Errorf("Outcome = %q, want ok", out.Outcome)
+	}
+	if out.Turns != 3 {
+		t.Errorf("Turns = %d, want 3", out.Turns)
+	}
+	if out.TokensUsed != 20733 {
+		t.Errorf("TokensUsed = %d, want 20733 (runner_completed overrides the heartbeat)", out.TokensUsed)
+	}
+	if out.ElapsedSeconds != 30 {
+		t.Errorf("ElapsedSeconds = %d, want 30", out.ElapsedSeconds)
+	}
+	if out.LastEventKind != "tool_use" {
+		t.Errorf("LastEventKind = %q, want tool_use", out.LastEventKind)
+	}
+}
+
+// TestRunStage_VerboseRetainsHeartbeats verifies Verbose=true restores
+// the full event list including every stage_progress heartbeat, while
+// the summary scalars are still populated.
+func TestRunStage_VerboseRetainsHeartbeats(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, compactFixtureBody)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+		Verbose:    true,
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+
+	// All five events retained (two heartbeats + three others).
+	if len(out.Events) != 5 {
+		t.Fatalf("verbose Events = %d, want 5 (%+v)", len(out.Events), out.Events)
+	}
+	heartbeats := 0
+	for _, ev := range out.Events {
+		if m, ok := ev.Payload.(map[string]any); ok && m["event"] == "stage_progress" {
+			heartbeats++
+		}
+	}
+	if heartbeats != 2 {
+		t.Errorf("verbose Events should retain both heartbeats; got %d", heartbeats)
+	}
+	// Summary still populated under verbose.
+	if out.Outcome != "ok" || out.TokensUsed != 20733 {
+		t.Errorf("verbose summary = (%q, %d), want (ok, 20733)", out.Outcome, out.TokensUsed)
+	}
+}
+
+// TestSummarizeRunStageEvents unit-tests the filter/summary helper in
+// isolation across the three salient cases.
+func TestSummarizeRunStageEvents(t *testing.T) {
+	hb := func(turns, tokens, elapsed float64, last string) RunnerEvent {
+		return RunnerEvent{Payload: map[string]any{
+			"event": "stage_progress", "turns": turns,
+			"tokens_so_far": tokens, "elapsed_seconds": elapsed,
+			"last_event_kind": last,
+		}}
+	}
+
+	t.Run("no heartbeats: zero summary, all retained", func(t *testing.T) {
+		in := []RunnerEvent{
+			{Payload: map[string]any{"kind": "runner_started"}},
+			{Payload: map[string]any{"kind": "trace_uploaded"}},
+		}
+		summary, filtered := summarizeRunStageEvents(in)
+		if summary != (runStageSummary{}) {
+			t.Errorf("summary = %+v, want zero", summary)
+		}
+		if len(filtered) != len(in) {
+			t.Errorf("filtered = %d, want %d (all retained)", len(filtered), len(in))
+		}
+	})
+
+	t.Run("only heartbeats: filtered empty, last heartbeat wins", func(t *testing.T) {
+		in := []RunnerEvent{
+			hb(1, 100, 15, "assistant"),
+			hb(4, 900, 45, "tool_use"),
+		}
+		summary, filtered := summarizeRunStageEvents(in)
+		if len(filtered) != 0 {
+			t.Errorf("filtered = %d, want 0 (all heartbeats dropped)", len(filtered))
+		}
+		if summary.Turns != 4 || summary.TokensUsed != 900 || summary.ElapsedSeconds != 45 || summary.LastEventKind != "tool_use" {
+			t.Errorf("summary = %+v, want last heartbeat (4/900/45/tool_use)", summary)
+		}
+		if summary.Outcome != "" {
+			t.Errorf("Outcome = %q, want empty (no runner_completed)", summary.Outcome)
+		}
+	})
+
+	t.Run("runner_completed overrides heartbeat token count", func(t *testing.T) {
+		in := []RunnerEvent{
+			hb(2, 500, 20, "assistant"),
+			{Payload: map[string]any{"event": "runner_completed", "outcome": "ok", "tokens_used": float64(20733)}},
+		}
+		summary, filtered := summarizeRunStageEvents(in)
+		// The heartbeat is dropped; runner_completed is retained.
+		if len(filtered) != 1 {
+			t.Fatalf("filtered = %d, want 1 (runner_completed retained)", len(filtered))
+		}
+		if m, _ := filtered[0].Payload.(map[string]any); m["event"] != "runner_completed" {
+			t.Errorf("filtered[0] = %+v, want runner_completed", filtered[0].Payload)
+		}
+		if summary.Outcome != "ok" {
+			t.Errorf("Outcome = %q, want ok", summary.Outcome)
+		}
+		if summary.TokensUsed != 20733 {
+			t.Errorf("TokensUsed = %d, want 20733 (override), not 500", summary.TokensUsed)
+		}
+		// Turns still come from the heartbeat.
+		if summary.Turns != 2 {
+			t.Errorf("Turns = %d, want 2 (from heartbeat)", summary.Turns)
+		}
+	})
+}
+
 // --- DiffSummary, AuditPointer, RunURL enrichment (#442) ---
 
 // TestRunStage_DiffSummary_NilWhenNoGitDiffEvent verifies acceptance

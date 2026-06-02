@@ -85,6 +85,18 @@ While the agent runs, the runner emits a `stage_progress` heartbeat (~every 15s,
 
 Because the cadence is time-driven, a stalled stage keeps producing heartbeats with non-advancing `turns`/`tokens`, so a watching operator/client can tell a progressing stage from a stuck one. Note this is a signal for the **operator/client watching the run**, not a live early-cancel channel for the synchronously-blocked driving agent — that agent sees the heartbeats only after `fishhawk_run_stage` returns (and as groundwork for a future async run_stage).
 
+### Compact-by-default result (#647)
+
+The final tool result is **compact by default**: the routine `stage_progress` heartbeats are dropped from the `events` list, while every non-heartbeat event — `runner_completed`, `git_diff`, `runner_cancelled`, etc. — is retained in arrival order alongside `stage_state` and the best-effort enrichment fields. The heartbeats' signal is preserved in five scalar summary fields distilled from the stream:
+
+| Field | Source |
+|---|---|
+| `outcome` | terminal `runner_completed` event (`ok` \| `failed`) |
+| `tokens_used` | `runner_completed` when present, else the last heartbeat's `tokens_so_far` |
+| `turns` / `elapsed_seconds` / `last_event_kind` | the last `stage_progress` heartbeat |
+
+This roughly halves the driving agent's per-stage context cost without losing any durable signal — the audit log and signed trace bundle are unchanged. Pass `verbose: true` on the input to restore the full event list including every heartbeat (e.g. a driver that wants to inspect per-heartbeat progression).
+
 ## Runner integration
 
 E19.8 / future wires `fishhawk-mcp` into the runner's container image. Until then the MCP surface is interactive-Claude-Code-only.
