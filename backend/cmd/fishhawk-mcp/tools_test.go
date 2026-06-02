@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
 // fakeBackend is a thin httptest server that records the last
@@ -1297,6 +1300,134 @@ func TestGetPlan_NoReviewAuditEntries_ReviewsAbsent(t *testing.T) {
 	}
 	if out.Reviews != nil {
 		t.Errorf("Reviews should be nil when no plan_reviewed entries exist; got %+v", out.Reviews)
+	}
+}
+
+// seedScopePrecheckAudit marshals a SERVER-side ScopePrecheckPayload and
+// feeds it back through the fake backend as a plan_scope_precheck audit
+// entry. Using the real server type is the point of the seam test: it
+// exercises the backend-write -> mcp-read JSON contract end to end, so a
+// drift in either side's struct tags fails here rather than silently in
+// production.
+func seedScopePrecheckAudit(fb *fakeBackend, runID uuid.UUID, payload server.ScopePrecheckPayload) {
+	raw, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(raw, &decoded)
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "plan_scope_precheck",
+		Payload:  decoded,
+	})
+	fb.mu.Unlock()
+}
+
+func TestGetPlan_ScopePrecheck_CrossBoundarySeam(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedScopePrecheckAudit(fb, runID, server.ScopePrecheckPayload{
+		WorkflowID:       "feature_change",
+		ImplementStageID: "implement",
+		ScannedFiles:     2,
+		Violations: []policy.Violation{
+			{
+				Constraint: "forbidden_paths",
+				Detail:     `pattern ".github/workflows/**" matched`,
+				Files:      []string{".github/workflows/ci.yml"},
+			},
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.ScopePrecheck == nil {
+		t.Fatal("ScopePrecheck is nil; want populated")
+	}
+	if out.ScopePrecheck.ScannedFiles != 2 {
+		t.Errorf("ScannedFiles = %d, want 2", out.ScopePrecheck.ScannedFiles)
+	}
+	if got := len(out.ScopePrecheck.Violations); got != 1 {
+		t.Fatalf("len(Violations) = %d, want 1", got)
+	}
+	v := out.ScopePrecheck.Violations[0]
+	if v.Constraint != "forbidden_paths" {
+		t.Errorf("Constraint = %q, want forbidden_paths", v.Constraint)
+	}
+	if len(v.Files) != 1 || v.Files[0] != ".github/workflows/ci.yml" {
+		t.Errorf("Files = %v, want [.github/workflows/ci.yml]", v.Files)
+	}
+}
+
+func TestGetPlan_ScopePrecheck_NewestEntryWins(t *testing.T) {
+	// A schema-retry run writes two plan_scope_precheck entries; the
+	// authoritative one is the newest (last, sequence-ascending). The
+	// first carries a violation; the second (the re-upload) is clean.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedScopePrecheckAudit(fb, runID, server.ScopePrecheckPayload{
+		WorkflowID:   "feature_change",
+		ScannedFiles: 1,
+		Violations: []policy.Violation{
+			{Constraint: "forbidden_paths", Detail: "stale", Files: []string{".github/workflows/ci.yml"}},
+		},
+	})
+	seedScopePrecheckAudit(fb, runID, server.ScopePrecheckPayload{
+		WorkflowID:   "feature_change",
+		ScannedFiles: 2,
+		Violations:   []policy.Violation{},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.ScopePrecheck == nil {
+		t.Fatal("ScopePrecheck is nil; want populated")
+	}
+	if out.ScopePrecheck.ScannedFiles != 2 {
+		t.Errorf("ScannedFiles = %d, want 2 (newest entry)", out.ScopePrecheck.ScannedFiles)
+	}
+	if len(out.ScopePrecheck.Violations) != 0 {
+		t.Errorf("newest entry is clean; want zero violations, got %+v", out.ScopePrecheck.Violations)
+	}
+}
+
+func TestGetPlan_ScopePrecheck_AbsentWhenNoEntry(t *testing.T) {
+	// An older run predating the pre-check has no plan_scope_precheck
+	// entry — ScopePrecheck must be nil so the field is omitted.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.ScopePrecheck != nil {
+		t.Errorf("ScopePrecheck should be nil with no entry; got %+v", out.ScopePrecheck)
 	}
 }
 

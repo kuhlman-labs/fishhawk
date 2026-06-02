@@ -54,6 +54,23 @@ Notes:
   derive the none/pending/complete/skipped lifecycle. Listed here only so a
   future reader grepping for `*_reviewed` doesn't mistake them for a comment
   surface.
+- The plan-gate scope pre-check audit kind — `plan_scope_precheck` (#658),
+  written by the plan upload handler (`server/scope_precheck.go::runScopePrecheck`)
+  immediately after `plan_generated` and before plan review — is an **internal,
+  advisory audit kind, not an issue-comment surface**. Nothing in `issuecomment`
+  posts it to the issue thread. It evaluates the uploaded plan's `scope.files`
+  against the run's implement-stage path constraints (`forbidden_paths` /
+  `allowed_paths` / `max_files_changed`; `required_outcomes` is deliberately
+  excluded — see the handler) using the same `backend/internal/policy` matcher as
+  the post-implement gate, with payload `{workflow_id, implement_stage_id,
+  violations, scanned_files}`. It is advisory + fail-open — a missing/unparseable
+  spec or a workflow with no implement stage writes no entry and never blocks the
+  upload — and is written even on a clean scope (empty `violations`) so a reader
+  can distinguish "checked and clean" from "never checked". Read back by the MCP
+  surface (`fishhawk_get_plan` `scope_precheck`, newest entry wins) so an operator
+  sees a "scope hits forbidden_paths — wrong workflow?" advisory before approving.
+  Listed here only so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
 - The cost-accounting audit kind — `cost_recorded` (#649), written by the
   trace upload handler (`trace.go::recordCost`) once per bundle receipt with
   payload `{model, input_tokens, output_tokens, usd, known_model,

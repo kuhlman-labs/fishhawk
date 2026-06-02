@@ -293,6 +293,31 @@ type GetPlanOutput struct {
 	// state Reviews[] alone cannot express — use fishhawk_await_review to
 	// block until it resolves.
 	PlanReviewStatus *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review"`
+	// ScopePrecheck surfaces the plan-gate scope/constraint pre-check
+	// (#658): scope.files evaluated against the implement stage's
+	// forbidden_paths/allowed_paths/max_files_changed before approval.
+	ScopePrecheck *ScopePrecheck `json:"scope_precheck,omitempty" jsonschema:"plan-gate scope pre-check (#658): flags scope.files that would violate the implement stage's forbidden_paths/allowed_paths/max_files_changed constraints, using the same matcher as the post-implement gate. Present (possibly with empty violations) when the plan stage ran the pre-check; absent on older runs predating it. A non-empty violations[] means this plan's scope would fail the implement stage's path constraints before any code is written — most often a sign the run is on the wrong workflow"`
+}
+
+// ScopePrecheckViolation is one path-constraint mismatch decoded from a
+// plan_scope_precheck audit entry (#658). Constraint names the
+// implement-stage path constraint the plan's scope.files would violate
+// (forbidden_paths, allowed_paths, or max_files_changed); Files lists the
+// offending scope.files paths when relevant. Mirrors the server-side
+// policy.Violation shape exactly.
+type ScopePrecheckViolation struct {
+	Constraint string   `json:"constraint"`
+	Detail     string   `json:"detail"`
+	Files      []string `json:"files,omitempty"`
+}
+
+// ScopePrecheck is the plan-gate scope pre-check result decoded from the
+// newest plan_scope_precheck audit entry (#658). Violations is empty when
+// the plan's scope satisfies every implement-stage path constraint;
+// ScannedFiles is the number of scope.files the pre-check evaluated.
+type ScopePrecheck struct {
+	Violations   []ScopePrecheckViolation `json:"violations,omitempty" jsonschema:"path-constraint mismatches; empty when the plan's scope.files satisfy the implement stage's forbidden_paths/allowed_paths/max_files_changed"`
+	ScannedFiles int                      `json:"scanned_files" jsonschema:"number of scope.files the pre-check evaluated"`
 }
 
 // registerGetPlan wires the fishhawk_get_plan tool. The handler
@@ -360,12 +385,17 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if err != nil {
 				return nil, GetPlanOutput{}, fmt.Errorf("plan review status: %w", err)
 			}
+			scopePrecheck, err := r.loadScopePrecheck(ctx, current)
+			if err != nil {
+				return nil, GetPlanOutput{}, fmt.Errorf("load scope precheck: %w", err)
+			}
 			return nil, GetPlanOutput{
 				Status:           "available",
 				Plan:             p,
 				ResolvedVia:      resolvedVia,
 				Reviews:          reviews,
 				PlanReviewStatus: reviewStatus,
+				ScopePrecheck:    scopePrecheck,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -481,6 +511,42 @@ func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]P
 		return nil, err
 	}
 	return append(reviews, skipped...), nil
+}
+
+// loadScopePrecheck fetches the NEWEST plan_scope_precheck audit entry
+// (#658) for the run and decodes its payload into a ScopePrecheck. The
+// backend's per-run audit endpoint returns entries sequence-ascending, so
+// the authoritative entry is the last one: a schema-retry run (#646)
+// re-opens the plan stage and writes a second precheck on the re-upload,
+// and the latest reflects the plan the human actually approves. Returns
+// nil when no entry exists (an older run predating the pre-check, or a
+// fail-open no-op) so the field is omitted from the response. A corrupt
+// payload is treated as "not checked" rather than failing the whole plan
+// fetch, mirroring decodeReviewVerdicts' degradation contract.
+func (r *runResolver) loadScopePrecheck(ctx context.Context, runID uuid.UUID) (*ScopePrecheck, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "plan_scope_precheck",
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return nil, nil
+	}
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return nil, nil
+	}
+	var sp ScopePrecheck
+	if uerr := json.Unmarshal(raw, &sp); uerr != nil {
+		return nil, nil
+	}
+	return &sp, nil
 }
 
 // auditLimitDefault is the default value for the get_run_status
