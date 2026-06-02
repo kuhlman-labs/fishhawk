@@ -46,11 +46,13 @@ func sampleEvents() []agent.Event {
 
 func TestPack_RoundTrip(t *testing.T) {
 	in := PackInputs{
-		RunID:   "11111111-2222-3333-4444-555555555555",
-		StageID: "22222222-3333-4444-5555-666666666666",
-		Agent:   "claude-code",
-		Model:   "claude-opus-4-7",
-		Now:     frozenNow(),
+		RunID:        "11111111-2222-3333-4444-555555555555",
+		StageID:      "22222222-3333-4444-5555-666666666666",
+		Agent:        "claude-code",
+		Model:        "claude-opus-4-7",
+		InputTokens:  200,
+		OutputTokens: 80,
+		Now:          frozenNow(),
 	}
 	events := sampleEvents()
 
@@ -83,6 +85,9 @@ func TestPack_RoundTrip(t *testing.T) {
 	}
 	if manifest.Model != "claude-opus-4-7" {
 		t.Errorf("manifest Model = %q", manifest.Model)
+	}
+	if manifest.InputTokens != 200 || manifest.OutputTokens != 80 {
+		t.Errorf("manifest token split = (%d,%d), want (200,80)", manifest.InputTokens, manifest.OutputTokens)
 	}
 	if len(gotEvents) != len(events) {
 		t.Fatalf("got %d events, want %d", len(gotEvents), len(events))

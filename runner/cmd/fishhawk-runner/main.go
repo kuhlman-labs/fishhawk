@@ -39,6 +39,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/otelemit"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
@@ -185,6 +186,26 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 
 	ctx, stop := newRunnerContext()
 	defer stop()
+
+	// GenAI observability (#649). Bootstrap is gated by
+	// OTEL_EXPORTER_OTLP_ENDPOINT: a disabled (no-op) Emitter when
+	// unset, so the local loop is unaffected. The deferred Shutdown
+	// force-flushes buffered spans before this short-lived process
+	// exits — without it the batch processor drops them. Shutdown runs
+	// on a fresh background context because ctx may already be
+	// cancelled (the SIGTERM path) by the time we exit.
+	emitter, oerr := otelemit.Bootstrap(ctx)
+	if oerr != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"otel_bootstrap_failed","detail":%q}`+"\n", oerr.Error())
+		emitter = &otelemit.Emitter{}
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = emitter.Shutdown(flushCtx)
+	}()
+
 	defer func() {
 		// Override whatever the body returned when ctx was the
 		// cause of exit. Emit a structured terminator so the MCP
@@ -371,6 +392,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		planValidationFailed bool
 	)
 
+	invokeStart := time.Now()
 	for {
 		res, invokeErr = invoker.Invoke(ctx, inv)
 
@@ -497,6 +519,22 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		break
 	}
 
+	// Emit the GenAI observability span for this stage as soon as the
+	// agent invocation (and any self-retries) settled — before bundle
+	// packing / upload, so a downstream upload failure doesn't lose
+	// the model-call span. Token counts + model come from the
+	// aggregated Result; the span carries an estimated cost via
+	// pricing.Cost. No-op when OTel emission is gated off.
+	emitter.EmitStage(ctx, otelemit.StageSpan{
+		RunID:        cfg.runID,
+		Stage:        cfg.stage,
+		Model:        res.Model,
+		InputTokens:  res.InputTokens,
+		OutputTokens: res.OutputTokens,
+		Latency:      time.Since(invokeStart),
+		OK:           res.OK,
+	})
+
 	// Bundle building is shared by --bundle-out and --upload-trace.
 	// We build raw + redacted variants once into memory, then write
 	// to disk and/or upload. When neither is configured, fall back
@@ -525,9 +563,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 
 		manifestRaw := bundle.PackInputs{
-			RunID:              cfg.runID,
-			StageID:            bundleStageID(cfg),
-			Agent:              "claude-code",
+			RunID:   cfg.runID,
+			StageID: bundleStageID(cfg),
+			Agent:   "claude-code",
+			// Carry the resolved model id + token split to the manifest
+			// so the backend prices the run from this signed record
+			// (authoritative cost), not from a runner-emitted span.
+			Model:              res.Model,
+			InputTokens:        res.InputTokens,
+			OutputTokens:       res.OutputTokens,
 			AgentFailed:        agentFailed,
 			AgentFailureReason: agentFailureReason,
 		}

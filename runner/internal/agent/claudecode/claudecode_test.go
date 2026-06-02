@@ -95,6 +95,15 @@ func TestHelperProcess(t *testing.T) {
 		os.Stdout.Sync()
 		time.Sleep(60 * time.Millisecond)
 		fmt.Println(`{"type":"result","usage":{"input_tokens":50,"output_tokens":20}}`)
+	case "model_split":
+		// A realistic transcript: the assistant event carries the
+		// model id + usage nested under `message` (the real
+		// stream-json shape), and the terminal result event reports
+		// the cumulative split. Notably, NO temperature is emitted —
+		// claude --print stream-json does not expose it (G6).
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":120,"output_tokens":30}}}`)
+		fmt.Println(`{"type":"result","model":"claude-opus-4-8","usage":{"input_tokens":200,"output_tokens":80}}`)
 	case "out_of_tree_write":
 		// Emit an assistant tool_use writing to an out-of-tree absolute
 		// path supplied via OOT_PATH, driving the full scan->detector->
@@ -185,6 +194,73 @@ func TestInvoke_HappyPath(t *testing.T) {
 	}
 	if res.Events[len(res.Events)-1].Kind != "invocation_end" {
 		t.Errorf("last event kind = %q, want invocation_end", res.Events[len(res.Events)-1].Kind)
+	}
+}
+
+// fixtureStream is a recorded claude --print stream-json transcript
+// used to pin parseLine's model-id + input/output split extraction.
+// It deliberately contains no `temperature` field, backing the G6
+// reproducibility claim that claude does not surface sampling params:
+// TestParseLine_ModelSplit asserts the substring is absent so a
+// future claude version that starts emitting it trips this test
+// rather than being silently ignored.
+const fixtureStream = `{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":120,"output_tokens":30}}}
+{"type":"result","model":"claude-opus-4-8","usage":{"input_tokens":200,"output_tokens":80}}`
+
+func TestParseLine_ModelSplit(t *testing.T) {
+	if strings.Contains(fixtureStream, "temperature") {
+		t.Fatal("fixture unexpectedly contains a temperature field; the G6 best-effort assumption no longer holds — update otelemit to capture it")
+	}
+
+	lines := strings.Split(fixtureStream, "\n")
+	ts := time.Now()
+
+	// assistant line: model + usage nested under `message`.
+	_, info, ok := parseLine([]byte(lines[1]), ts)
+	if !ok {
+		t.Fatal("assistant line: hasUsage = false")
+	}
+	if info.Model != "claude-opus-4-8" {
+		t.Errorf("assistant Model = %q, want claude-opus-4-8", info.Model)
+	}
+	if info.InputTokens != 120 || info.OutputTokens != 30 {
+		t.Errorf("assistant split = (%d,%d), want (120,30)", info.InputTokens, info.OutputTokens)
+	}
+
+	// result line: top-level model + usage.
+	_, info, ok = parseLine([]byte(lines[2]), ts)
+	if !ok {
+		t.Fatal("result line: hasUsage = false")
+	}
+	if info.Model != "claude-opus-4-8" {
+		t.Errorf("result Model = %q", info.Model)
+	}
+	if info.InputTokens != 200 || info.OutputTokens != 80 {
+		t.Errorf("result split = (%d,%d), want (200,80)", info.InputTokens, info.OutputTokens)
+	}
+}
+
+func TestInvoke_ModelAndSplitSurfaced(t *testing.T) {
+	inv := &Invoker{
+		Cmd: helperCommand("model_split"),
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "r", Stage: "implement", Prompt: "go",
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if res.Model != "claude-opus-4-8" {
+		t.Errorf("Result.Model = %q, want claude-opus-4-8", res.Model)
+	}
+	// Latest cumulative usage line wins: result reported (200,80).
+	if res.InputTokens != 200 || res.OutputTokens != 80 {
+		t.Errorf("Result split = (%d,%d), want (200,80)", res.InputTokens, res.OutputTokens)
+	}
+	if res.TokensUsed != 280 {
+		t.Errorf("Result.TokensUsed = %d, want 280", res.TokensUsed)
 	}
 }
 
