@@ -111,11 +111,43 @@ type Role struct {
 // Workflow is one named pipeline (e.g. "feature_change") with an
 // ordered list of stages.
 type Workflow struct {
-	Description string       `json:"description,omitempty" yaml:"description,omitempty"`
-	Stages      []Stage      `json:"stages" yaml:"stages"`
-	OnCIFailure *OnCIFailure `json:"on_ci_failure,omitempty" yaml:"on_ci_failure,omitempty"`
-	Policy      *Policy      `json:"policy,omitempty" yaml:"policy,omitempty"`
+	Description string           `json:"description,omitempty" yaml:"description,omitempty"`
+	Stages      []Stage          `json:"stages" yaml:"stages"`
+	OnCIFailure *OnCIFailure     `json:"on_ci_failure,omitempty" yaml:"on_ci_failure,omitempty"`
+	Policy      *Policy          `json:"policy,omitempty" yaml:"policy,omitempty"`
+	Budgets     []PeriodicBudget `json:"budgets,omitempty" yaml:"budgets,omitempty"`
 }
+
+// PeriodicBudget is a workflow-level recurring cost ceiling (ADR-030).
+// It caps total USD spend across all runs of the workflow within a
+// calendar period (weekly or monthly), resetting at the period
+// boundary. Distinct from the per-stage Budget (token/runtime caps on
+// a single stage execution): a PeriodicBudget governs aggregate spend
+// across runs, not a single stage's resource use.
+//
+// Enforcement reuses the BudgetEnforcement modes:
+//
+//   - advisory — a budget_alert audit entry + issue comment fires when
+//     period spend crosses WarnAt and again at 100%; runs never block.
+//   - blocking — a NEW run is refused at admission once the calendar
+//     period's spend exhausts LimitUSD; in-flight runs are untouched
+//     and an operator can override.
+//
+// WarnAt is an optional fraction in [0,1] (e.g. 0.8 for 80%) at which
+// the advisory warning fires ahead of the 100% crossing. A nil WarnAt
+// means only the 100% threshold is surfaced.
+type PeriodicBudget struct {
+	Period      string            `json:"period" yaml:"period"`
+	LimitUSD    float64           `json:"limit_usd" yaml:"limit_usd"`
+	Enforcement BudgetEnforcement `json:"enforcement,omitempty" yaml:"enforcement,omitempty"`
+	WarnAt      *float64          `json:"warn_at,omitempty" yaml:"warn_at,omitempty"`
+}
+
+// Budget period values for PeriodicBudget.Period.
+const (
+	BudgetPeriodWeekly  = "weekly"
+	BudgetPeriodMonthly = "monthly"
+)
 
 // OnCIFailure is the per-workflow auto-retry policy (#276 / #277).
 // When set, the dispatcher fires a fresh implement workflow_dispatch

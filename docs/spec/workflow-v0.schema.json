@@ -11,8 +11,8 @@
   "properties": {
     "version": {
       "type": "string",
-      "enum": ["0.3"],
-      "description": "Spec syntax version. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
+      "enum": ["0.3", "0.4"],
+      "description": "Spec syntax version. 0.4 adds workflow.budgets — periodic per-workflow cost ceilings (ADR-030 / #688), additive within workflow-v0.x. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
     },
     "roles": {
       "type": "object",
@@ -65,7 +65,12 @@
           "items": { "$ref": "#/$defs/stage" }
         },
         "on_ci_failure": { "$ref": "#/$defs/on_ci_failure" },
-        "policy": { "$ref": "#/$defs/policy" }
+        "policy": { "$ref": "#/$defs/policy" },
+        "budgets": {
+          "type": "array",
+          "description": "Periodic per-workflow cost ceilings (ADR-030 / #688). Each entry caps total USD spend across all runs of this workflow within a calendar period, resetting at the period boundary. Distinct from the per-stage `budget` ($defs/budget: token/runtime caps on one stage execution). Requires version 0.4+.",
+          "items": { "$ref": "#/$defs/periodic_budget" }
+        }
       }
     },
 
@@ -303,6 +308,36 @@
           "type": "string",
           "enum": ["advisory", "blocking"],
           "description": "v0 ships advisory only; blocking arrives in v0.x with the Fishhawk-issued ephemeral key path."
+        }
+      }
+    },
+
+    "periodic_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["period", "limit_usd"],
+      "description": "A workflow-level recurring cost ceiling (ADR-030 / #688). Caps aggregate USD spend across all runs of the workflow within a calendar period. Distinct from the per-stage `budget` def, which caps token/runtime on a single stage execution.",
+      "properties": {
+        "period": {
+          "type": "string",
+          "enum": ["weekly", "monthly"],
+          "description": "Calendar reset cadence. weekly resets at the start of the ISO week; monthly resets on the first of the month. Boundaries are timezone-aware."
+        },
+        "limit_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Cost ceiling in USD for the period, summed from runs.cost_usd_total across the workflow's runs created within the current period."
+        },
+        "enforcement": {
+          "type": "string",
+          "enum": ["advisory", "blocking"],
+          "description": "advisory (default): emit a budget_alert audit entry + issue comment on warn_at and 100% crossings; never blocks. blocking: refuse a NEW run at admission once the period spend exhausts limit_usd; in-flight runs are untouched and an operator can override."
+        },
+        "warn_at": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Optional fraction in [0,1] (e.g. 0.8 for 80%) at which an advisory warning fires ahead of the 100% crossing. Absent means only the 100% threshold is surfaced."
         }
       }
     },

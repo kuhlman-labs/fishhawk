@@ -15,7 +15,7 @@ Reference for `.fishhawk/workflows.yaml`. The canonical schema is [`workflow-v0.
 ## Top-level shape
 
 ```yaml
-version: "0.3" # required, exactly "0.3" in v0
+version: "0.3" # required; "0.3" or "0.4" (0.4 adds workflow.budgets)
 roles: # optional; named groups referenced by gates
   <role_id>:
     members: ["@org/team", "@user"]
@@ -24,6 +24,7 @@ workflows: # required; at least one workflow
     description: "..."
     on_ci_failure: # optional; auto-retry policy (#276)
       max_retries: 1 # default when the block is absent
+    budgets: [...] # optional; periodic per-workflow cost ceilings (ADR-030, v0.4+)
     stages: [...]
 ```
 
@@ -167,7 +168,7 @@ constraints:
 
 Constraints are evaluated **post-hoc on the runner** (E5.5 / #53) against the produced diff. Hits become **category B** failures (MVP_SPEC §6).
 
-## Budget
+## Budget (per-stage)
 
 ```yaml
 budget:
@@ -176,7 +177,33 @@ budget:
   enforcement: advisory | blocking
 ```
 
-v0 ships `advisory` enforcement only — the runner reports overruns but does not abort. `blocking` arrives in v0.x once Fishhawk issues ephemeral agent keys (so the proxy can hard-cap).
+A per-stage cap on token / runtime usage for a single stage execution. v0 ships `advisory` enforcement only — the runner reports overruns but does not abort. `blocking` arrives in v0.x once Fishhawk issues ephemeral agent keys (so the proxy can hard-cap).
+
+This is distinct from the workflow-level `budgets` below: the per-stage `budget` governs one stage's resource use; `budgets` govern aggregate USD spend across runs.
+
+## Periodic budgets (workflow-level, v0.4+)
+
+A workflow-level list of recurring cost ceilings (ADR-030 / #688). Each entry caps total USD spend across **all runs** of the workflow within a calendar period, resetting at the period boundary. Requires `version: "0.4"`.
+
+```yaml
+workflows:
+  feature_change:
+    budgets:
+      - period: weekly | monthly   # calendar reset cadence
+        limit_usd: 50              # ceiling in USD for the period (> 0)
+        enforcement: advisory | blocking  # optional; defaults to advisory
+        warn_at: 0.8               # optional fraction [0,1]; warn at 80% before 100%
+    stages: [...]
+```
+
+- **`period`** — `weekly` resets at the start of the ISO week; `monthly` resets on the first of the month. Boundaries are timezone-aware.
+- **`limit_usd`** — the ceiling, summed from `runs.cost_usd_total` (#649/#680/#684) across the workflow's runs created within the current period.
+- **`enforcement`**:
+  - `advisory` (default) — a `budget_alert` audit entry + issue comment fires when period spend crosses `warn_at` and again at 100%. Runs never block.
+  - `blocking` — a **new** run is refused at admission once the period spend exhausts `limit_usd`. In-flight runs are never touched (the gate is admission-only); an operator can override to force a run past the ceiling.
+- **`warn_at`** — optional fraction in `[0,1]` (e.g. `0.8` for 80%) at which the advisory warning fires ahead of the 100% crossing. Absent means only the 100% threshold is surfaced.
+
+> Cost honesty caveat: `known_usage=false` bundles undercount spend (#685), so a ceiling may be crossed later than true spend would imply. Admission blocking is deterministic against the recorded `runs.cost_usd_total`, not a live proxy.
 
 ## Gates
 
@@ -274,7 +301,9 @@ Per-workflow auto-retry policy (#276 / E16). When a required CI check fails on t
 
 | Field                       | Pattern / values                                                             | Notes                                                                                               |
 | --------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `version`                   | `"0.3"`                                                                      | current value; 0.2 added v0.2's `blocking_checks` drop, 0.3 adds `on_ci_failure.max_retries` (#277) |
+| `version`                   | `"0.3"` \| `"0.4"`                                                          | 0.4 adds workflow-level `budgets` (ADR-030 / #688); 0.3 adds `on_ci_failure.max_retries` (#277); 0.2 dropped `blocking_checks` |
+| `budgets[].period`          | `weekly` \| `monthly`                                                        | workflow-level periodic budget reset cadence (v0.4+)                                                |
+| `budgets[].enforcement`     | `advisory` \| `blocking`                                                     | advisory warns; blocking refuses a new run at admission                                             |
 | Role / workflow / stage IDs | `^[a-z][a-z0-9_]*$`                                                          | snake_case                                                                                          |
 | Member refs                 | `^@[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$`                                    | GitHub user or team                                                                                 |
 | Stage `type`                | `plan` \| `implement` \| `review`                                            | closed set                                                                                          |
