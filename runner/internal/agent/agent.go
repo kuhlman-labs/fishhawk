@@ -111,7 +111,12 @@ type Result struct {
 	// cost rollup, which prices input and output at different rates.
 	// Both are cumulative across in-driver retries, exactly like
 	// TokensUsed, so cost stays honest when a retry doubles spend.
-	// Zero when the agent didn't report usage.
+	// Zero when the agent didn't report usage — reporting token usage
+	// is part of the Invoker contract (see Invoker), and the backend
+	// records a 0/0 split downstream as known_usage=false rather than a
+	// silent $0 (#682). claudecode, the sole current backend, always
+	// populates these from the result event, so it records
+	// known_usage=true.
 	InputTokens  int
 	OutputTokens int
 
@@ -135,6 +140,13 @@ type Event struct {
 // Invoker runs an agent and produces a Result. Implementations are
 // agent-specific; the runner wires whichever Invoker matches the
 // workflow stage's `executor.agent` value.
+//
+// Reporting token usage is part of the contract: an implementation
+// that can surface usage MUST populate Result.InputTokens/OutputTokens
+// (and Model). A backend that cannot report usage leaves the token
+// fields zero, and the backend cost rollup records that bundle as
+// known_usage=false at usd=0 rather than a silent $0 (#682). claudecode
+// is the only current backend and always reports usage.
 type Invoker interface {
 	Invoke(ctx context.Context, inv Invocation) (Result, error)
 }
