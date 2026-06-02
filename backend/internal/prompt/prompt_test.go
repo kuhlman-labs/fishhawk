@@ -848,6 +848,63 @@ func TestBuild_Plan_PriorRejectionFeedback_Truncated(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_PriorSchemaValidationError_Rendered(t *testing.T) {
+	validationErr := "scope.files[0]: expected object, got string"
+	got, err := Build("plan", Trigger{
+		IssueNumber:                7,
+		Repo:                       "x/y",
+		PriorSchemaValidationError: &validationErr,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Prior plan-stage schema validation failure",
+		"Your previous plan failed standard_v1 validation",
+		"Fix exactly this and re-emit a valid plan",
+		validationErr,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Plan_PriorSchemaValidationError_Nil_SectionAbsent(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		// PriorSchemaValidationError deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Prior plan-stage schema validation failure") {
+		t.Errorf("plan prompt should not contain schema validation section when nil:\n%s", got)
+	}
+}
+
+func TestBuild_Plan_PriorSchemaValidationError_Truncated(t *testing.T) {
+	// Input over the 4000-byte cap must be truncated with the suffix,
+	// mirroring PriorRejectionFeedback's maxFeedbackBytes pattern.
+	longErr := strings.Repeat("x", 5000)
+	got, err := Build("plan", Trigger{
+		IssueNumber:                7,
+		Repo:                       "x/y",
+		PriorSchemaValidationError: &longErr,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "...[truncated]") {
+		t.Errorf("plan prompt missing truncation suffix:\n%s", got)
+	}
+	if strings.Contains(got, longErr) {
+		t.Errorf("untruncated long validation error appeared in prompt")
+	}
+}
+
 func TestBuild_Implement_ScopeConstraint_Rendered(t *testing.T) {
 	got, err := Build("implement", Trigger{
 		Repo:         "o/r",

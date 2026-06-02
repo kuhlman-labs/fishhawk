@@ -37,6 +37,28 @@ type PlanReviewer interface {
 // headroom and rejects pathological payloads early.
 const maxPlanBundleBytes = 256 * 1024
 
+// maxPlanSchemaRetries bounds the in-run schema-retry budget (#646).
+// On the first post-coercion validation failure the plan stage is
+// re-opened and re-dispatched with the validation error fed back; a
+// second failure exhausts the budget and fails-B as before. The budget
+// is tracked by counting plan_schema_retry audit entries for the run.
+const maxPlanSchemaRetries = 1
+
+// categoryPlanSchemaRetry is the audit-log category for the chained
+// entry trySchemaRetry writes when it re-opens a plan stage after a
+// transient schema-validation failure (#646). The entry is both the
+// budget counter (countSchemaRetries counts them) and the feedback
+// source (loadPriorSchemaValidationError reads the newest
+// validation_error back into the next plan prompt). The payload-key
+// contract (validation_error) is exercised end-to-end by the
+// cross-boundary seam test.
+const categoryPlanSchemaRetry = "plan_schema_retry"
+
+// maxSchemaValidationErrorBytes caps the validation_error stored in a
+// plan_schema_retry audit entry, mirroring buildPlan's maxFeedbackBytes
+// so the recorded error never outgrows the prompt-injection cap.
+const maxSchemaValidationErrorBytes = 4000
+
 // handleShipPlan implements POST /v0/runs/{run_id}/plan.
 //
 // Auth: same Ed25519 signing-key flow as /v0/runs/{run_id}/trace.
@@ -185,8 +207,28 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !coercionOK {
+			// Transient-retry backstop (#646): before failing-B, attempt a
+			// bounded in-run re-dispatch of the plan stage with the
+			// validation error fed back. A transient generation slip
+			// recovers on the re-attempt; a deterministic/structural
+			// violation fails the same validation twice and exhausts the
+			// budget, falling through to the unchanged fail-B path below.
+			if s.trySchemaRetry(r, runID, stageID, reportErr) {
+				// The 400 lets the now-finished runner exit cleanly (exactly
+				// as the fail-B path does). retry_scheduled signals to the
+				// local operator/driver that a re-attempt was set up rather
+				// than a terminal failure — the re-opened plan stage is
+				// re-driven automatically on the github_actions path and by a
+				// fresh fishhawk_run_stage --stage plan on the local path.
+				s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
+					"plan does not validate against standard_v1; a bounded in-run retry was scheduled",
+					map[string]any{"error": reportErr.Error(), "retry_scheduled": true})
+				return
+			}
+
 			// Coercion could not help (non-string type or re-validation
-			// still fails). Fail the stage as category-B and walk the run
+			// still fails) and the schema-retry budget is exhausted or
+			// unavailable. Fail the stage as category-B and walk the run
 			// to terminal failed (#527 / #603). The trace handler now
 			// leaves a plan stage in running (it no longer advances plan
 			// stages without a plan artifact), so FailStage walks
@@ -315,6 +357,131 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		SchemaVersion: deref(created.SchemaVersion),
 		Idempotent:    false,
 	})
+}
+
+// countSchemaRetries counts the run's plan_schema_retry audit entries
+// — the in-run schema-retry budget counter (#646). Returns 0 on any
+// error or when the AuditRepo is unconfigured (best-effort, same read
+// shape as loadLastDecomposeRejectionReason). A nil count degrades to
+// "no retries recorded", which is the conservative choice: at worst the
+// budget gate lets one extra retry through rather than wedging the run.
+func (s *Server) countSchemaRetries(ctx context.Context, runID uuid.UUID) int {
+	if s.cfg.AuditRepo == nil {
+		return 0
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryPlanSchemaRetry)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: count schema retries failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return 0
+	}
+	return len(entries)
+}
+
+// trySchemaRetry attempts a bounded in-run re-dispatch of a plan stage
+// whose uploaded plan failed standard_v1 validation after coercion
+// (#646). It returns true when the re-dispatch was set up (caller
+// responds 400 with retry_scheduled) and false when the caller should
+// fall through to the terminal fail-B path.
+//
+// Preconditions (any false → return false → fail-B):
+//   - Orchestrator and AuditRepo are wired (needed to re-dispatch and to
+//     record/count the budget).
+//   - countSchemaRetries < maxPlanSchemaRetries (budget remaining).
+//
+// On a granted retry, in order (audit-first, mirroring handleRetryStage
+// so the retry intent is durable even if a later step fails):
+//  1. Append a chained plan_schema_retry audit entry carrying the
+//     validation_error (capped), attempt, stage_id, and run_id. This
+//     entry is BOTH the budget counter and the feedback source the next
+//     plan prompt reads back via loadPriorSchemaValidationError.
+//  2. Re-open the stage: FailStage(FailureA) walks it
+//     running/dispatched → failed (transient category A, never B), then
+//     RunRepo.RetryStage(StageStatePending) walks failed → pending and
+//     clears the transient failure metadata — so the FailureA never
+//     leaks into the run's terminal state or the upload response.
+//  3. Orchestrator.Advance re-dispatches. The plan stage is sequence 0,
+//     so Advance picks it up (github_actions fires workflow_dispatch;
+//     local skips dispatch but still walks pending → dispatched, leaving
+//     the stage re-drivable by a fresh fishhawk_run_stage --stage plan,
+//     whose prompt then carries Trigger.PriorSchemaValidationError).
+func (s *Server) trySchemaRetry(r *http.Request, runID, stageID uuid.UUID, reportErr error) bool {
+	if s.cfg.Orchestrator == nil || s.cfg.AuditRepo == nil {
+		return false
+	}
+	attempt := s.countSchemaRetries(r.Context(), runID)
+	if attempt >= maxPlanSchemaRetries {
+		return false
+	}
+
+	validationErr := reportErr.Error()
+	if len(validationErr) > maxSchemaValidationErrorBytes {
+		validationErr = validationErr[:maxSchemaValidationErrorBytes] + "...[truncated]"
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"attempt":          attempt + 1,
+		"validation_error": validationErr,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  categoryPlanSchemaRetry,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		// Without the budget/feedback entry the retry is neither bounded
+		// nor steerable — fall back to fail-B rather than re-dispatching
+		// blind.
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: append plan_schema_retry audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+		return false
+	}
+
+	// Re-open: running/dispatched → failed (transient A) → pending.
+	if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureA,
+		"plan_invalid_transient_retry: "+reportErr.Error()); ferr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: transition to failed-A for schema retry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", ferr.Error()))
+		return false
+	}
+	if _, rerr := s.cfg.RunRepo.RetryStage(r.Context(), stageID, run.StageStatePending); rerr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: re-open stage to pending for schema retry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", rerr.Error()))
+		return false
+	}
+
+	// Drive the orchestrator to re-dispatch the now-pending plan stage.
+	// Best-effort: a failure here logs but still returns true — the stage
+	// is re-opened and the audit entry recorded, so an operator (or a
+	// fresh fishhawk_run_stage) can re-drive it.
+	if _, aerr := s.cfg.Orchestrator.Advance(r.Context(), runID); aerr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: orchestrator advance after schema retry re-open failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+	}
+
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+		"plan upload: scheduled in-run schema retry",
+		slog.String("run_id", runID.String()),
+		slog.String("stage_id", stageID.String()),
+		slog.Int("attempt", attempt+1))
+	return true
 }
 
 // notifyPlanReadyIfReady wraps the trace handler's notifyPlanReady

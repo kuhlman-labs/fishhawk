@@ -1508,6 +1508,50 @@ func TestLoadPriorRejectionFeedback_CurrentRunIDExcluded(t *testing.T) {
 	}
 }
 
+// --- loadPriorSchemaValidationError unit tests (#646) ---
+
+func makeSchemaRetryEntry(runID uuid.UUID, validationErr string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"validation_error": validationErr,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+}
+
+func TestLoadPriorSchemaValidationError_NewestWins(t *testing.T) {
+	runID := uuid.New()
+	// Entries are returned ASC by ts; the newest (last) must win.
+	s := newFeedbackServer(t, nil, map[uuid.UUID][]*audit.Entry{
+		runID: {
+			makeSchemaRetryEntry(runID, "first error"),
+			makeSchemaRetryEntry(runID, "second error"),
+		},
+	})
+	got := s.loadPriorSchemaValidationError(context.Background(), runID)
+	if got == nil {
+		t.Fatal("got nil, want newest validation_error")
+	}
+	if *got != "second error" {
+		t.Errorf("got %q, want %q (newest entry wins)", *got, "second error")
+	}
+}
+
+func TestLoadPriorSchemaValidationError_NoEntries_ReturnsNil(t *testing.T) {
+	s := newFeedbackServer(t, nil, nil)
+	if got := s.loadPriorSchemaValidationError(context.Background(), uuid.New()); got != nil {
+		t.Errorf("got %q, want nil (no entries)", *got)
+	}
+}
+
+func TestLoadPriorSchemaValidationError_ListError_ReturnsNil(t *testing.T) {
+	rr := &feedbackRunRepo{promptRunRepo: newPromptRunRepo()}
+	ar := &feedbackAuditRepo{listErr: errors.New("boom")}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar})
+	if got := s.loadPriorSchemaValidationError(context.Background(), uuid.New()); got != nil {
+		t.Errorf("got %q, want nil (list error degrades to nil)", *got)
+	}
+}
+
 // TestGetStagePrompt_Implement_EchoesScopeFiles verifies that the
 // implement-stage prompt response echoes the approved plan's
 // scope.files into the scope_files field, so the runner can bound the

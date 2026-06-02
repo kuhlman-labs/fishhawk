@@ -221,6 +221,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		if runRow.TriggerRef != nil {
 			trigger.PriorRejectionFeedback = s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
 		}
+		trigger.PriorSchemaValidationError = s.loadPriorSchemaValidationError(r.Context(), runRow.ID)
 	}
 
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
@@ -372,6 +373,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if runRow.TriggerRef != nil {
 			trigger.PriorRejectionFeedback = s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
 		}
+		trigger.PriorSchemaValidationError = s.loadPriorSchemaValidationError(r.Context(), runRow.ID)
 	}
 
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
@@ -1045,6 +1047,45 @@ func (s *Server) loadPriorRejectionFeedback(ctx context.Context, repo, triggerRe
 				)
 				return &c
 			}
+		}
+	}
+	return nil
+}
+
+// loadPriorSchemaValidationError scans the run's plan_schema_retry audit
+// entries (newest-first) and returns the newest entry's validation_error
+// (#646). Used by the plan-stage prompt builder to inject a binding "fix
+// exactly this" section on a re-dispatched plan attempt after a transient
+// schema-validation failure. The payload-key (validation_error) is the
+// contract this reader shares with the trySchemaRetry writer in plan.go —
+// the cross-boundary seam test guards it from drifting.
+//
+// Best-effort: returns nil when the AuditRepo is unconfigured, no
+// plan_schema_retry entry exists, or on any error (WARN-logged), so the
+// prompt fetch stays robust.
+func (s *Server) loadPriorSchemaValidationError(ctx context.Context, runID uuid.UUID) *string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "plan_schema_retry")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list plan_schema_retry audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	// Scan newest-first (ListForRunByCategory returns entries ordered ASC by ts).
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			ValidationError string `json:"validation_error"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.ValidationError != "" {
+			c := payload.ValidationError
+			return &c
 		}
 	}
 	return nil
