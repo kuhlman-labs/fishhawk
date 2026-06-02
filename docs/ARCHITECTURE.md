@@ -117,12 +117,15 @@ When a stage's `reviewers.agent > 0` is configured in the workflow spec, the bac
 | `FISHHAWKD_ANTHROPIC_API_KEY` | `` (empty) | Anthropic API key; empty disables the SDK adapter |
 | `FISHHAWKD_PLAN_REVIEW_MODEL` | `claude-sonnet-4-6` | Model used for each SDK review invocation |
 | `FISHHAWKD_PLAN_REVIEW_MAX_TOKENS` | `4096` | Maximum output tokens per review call (both adapters) |
+| `FISHHAWKD_PLAN_REVIEW_MAX_RETRIES` | `1` | Bounds the local-mode `claude` reviewer's in-adapter transient-crash retry (#620). Counts **retries, not attempts** (N retries => N+1 attempts). Unset defaults to 1 (one retry); an explicit `0` disables retry (single attempt); negatives clamp to 0. Governs only the claudecode adapter — the anthropic SDK adapter has no retry field. |
 | `FISHHAWKD_PLAN_REVIEW_TIMEOUT` | `300s` | Per-invocation timeout (both adapters). Since #584 this is the **effective** per-invocation bound: the reviewer context is detached from the upload request via `context.WithoutCancel`, so the adapter's own `context.WithTimeout(reviewCtx, this)` is no longer clamped by the runner's upload-client disconnect. Raised 60s→300s in #606 to cover review of large (10+ file) `standard_v1` plans observed timing out at the old bound; small plans still finish well inside it. The env override is unchanged. Distinct from the ~1s immediate-crash mode owned by #620. See **Review dispatch: advisory-async vs. gating-sync** below. |
 | `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` | `false` | Opt-in local-mode subprocess adapter; ignored when the API key is set |
 | `FISHHAWKD_LOCAL_CLAUDE_BINARY` | `claude` | Executable name/path for the local-mode `claude` CLI |
 | `FISHHAWKD_LOCAL_CLAUDE_MODEL` | `claude-sonnet-4-6` | Model the local-mode `claude` CLI uses for review |
 
 **Local-mode wire-up** (`backend/internal/claudecode/`, #575). The local-mode adapter is the dogfood sibling of `anthropic.Reviewer`: instead of provisioning an API key, it spawns the operator's existing `claude` CLI as a subprocess (`claude --print --output-format json --model <model> -p <prompt>`), inheriting `os.Environ()` so the operator's subscription auth or already-present `ANTHROPIC_API_KEY` is reused with zero new plumbing. It decodes the CLI's single JSON envelope, reads the `result` field, and validates the verdict against the same closed set (`approve` / `approve_with_concerns` / `reject`) as the SDK adapter.
+
+The retry budget (`FISHHAWKD_PLAN_REVIEW_MAX_RETRIES`, see the env-var table) is wired through a post-construction `(*claudecode.Reviewer).SetMaxRetries` call rather than `claudecode.Config.MaxRetries` directly: `NewClient` normalises a zero `MaxRetries` to 1, so passing the env value through the constructor could never express *disable*. `serve.go` therefore constructs the reviewer, then calls `SetMaxRetries(*planReviewMaxRetries)` to assign the env-resolved value past that normalisation. The result: unset → 1 (one retry, unchanged from #620's code default), an explicit `0` → retry disabled (single attempt), `N` → N+1 attempts, and a negative value clamps to 0.
 
 Recommended local config for dogfooding (copy-pasteable):
 
