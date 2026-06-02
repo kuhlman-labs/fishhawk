@@ -26,6 +26,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spendalert"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
 
@@ -937,6 +938,12 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 		// the rollup doesn't silently drift from the (failed) audit row.
 	}
 
+	// Spend-anomaly check (#649). The cost_recorded entry is now part of
+	// the ledger, so re-read the recent cost history (across runs) and
+	// warn if the current hour is a multiple above the rolling average.
+	// Warn-only: it never gates the upload.
+	s.checkSpendAlert(ctx, runID, stageID, rec.Model)
+
 	recorder, ok := s.cfg.RunRepo.(runCostRecorder)
 	if !ok {
 		return
@@ -945,6 +952,86 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"cost rollup: accumulate per-run cost total failed",
 			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// checkSpendAlert reads the recent cost_recorded audit history across
+// all runs, evaluates the current hour's spend against the rolling
+// average of prior hours, and emits a spend_alert audit entry when the
+// current hour exceeds the configured multiple (#649).
+//
+// It is warn-only and best-effort throughout: the trace upload is
+// already stored, audited, and cost-recorded by the time this runs, so
+// a ListAll failure, an empty/insufficient history, or an audit-write
+// failure all log at WARN (or silently no-op) and never unwind the
+// upload. The detector itself (spendalert.Evaluate) suppresses alerts
+// until a baseline exists, so a fresh deployment stays quiet.
+//
+// triggeringModel is the resolved model id of the bundle that pushed
+// the current hour over the line; it's recorded on the alert so an
+// operator can see which agent's usage drove the spike.
+func (s *Server) checkSpendAlert(ctx context.Context, runID, stageID uuid.UUID, triggeringModel string) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+
+	category := "cost_recorded"
+	entries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &category})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"spend alert: list cost_recorded entries failed — skipping check",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	samples := make([]spendalert.Sample, 0, len(entries))
+	for _, e := range entries {
+		var p struct {
+			USD float64 `json:"usd"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		samples = append(samples, spendalert.Sample{Time: e.Timestamp, USD: p.USD})
+	}
+
+	d := spendalert.Evaluate(samples, time.Now().UTC(), s.cfg.SpendAlertMultiple)
+	if !d.Tripped {
+		return
+	}
+
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"spend alert: current hour spend exceeds rolling average",
+		slog.String("run_id", runID.String()),
+		slog.Float64("latest_hour_usd", d.LatestHourUSD),
+		slog.Float64("rolling_avg_usd", d.RollingAvgUSD),
+		slog.Float64("ratio", d.Ratio),
+		slog.Float64("multiple", d.Multiple))
+
+	payload, _ := json.Marshal(map[string]any{
+		"latest_hour_usd":   d.LatestHourUSD,
+		"rolling_avg_usd":   d.RollingAvgUSD,
+		"ratio":             d.Ratio,
+		"multiple":          d.Multiple,
+		"prior_hours":       d.PriorHours,
+		"latest_hour_start": d.LatestHourStart.Format(time.RFC3339),
+		"triggering_model":  triggeringModel,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "spend_alert",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"spend alert: append spend_alert audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 	}
 }

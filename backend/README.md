@@ -71,6 +71,7 @@ Optional flags:
 - `--oauth-client-id` / `--oauth-client-secret` / `--oauth-callback-url` (or `FISHHAWKD_OAUTH_CLIENT_ID` / `_CLIENT_SECRET` / `_CALLBACK_URL`) — enable the GitHub OAuth sign-in flow at `/v0/auth/github/*`. All three must be set; mismatched configuration fails fast. The callback URL is the public URL of `/v0/auth/github/callback` (the value the OAuth App is registered with).
 - `--oauth-redirect-after-login` (default `/`) — relative path the callback handler redirects to on successful sign-in. Absolute URLs and scheme-relative paths are rejected.
 - `--external-url` (or `FISHHAWKD_EXTERNAL_URL`) — operator-facing root URL of the SPA, e.g. `https://app.fishhawk.example.com`. Used to build links in surfaces that escape the backend (today: GitHub Check Runs, #231 — `details_url` on the published `fishhawk_audit_complete` check points back here so a reviewer who clicks the check on github.com lands in Fishhawk). Empty disables the publish-to-GitHub paths cleanly; the in-Fishhawk gate enforcement still works without it.
+- `--spend-alert-multiple` (or `FISHHAWKD_SPEND_ALERT_MULTIPLE`, default `3`) — warn-only spend-anomaly threshold (#649). The trace upload handler writes a `spend_alert` audit entry when the current hour's estimated model spend exceeds this multiple of the rolling average of prior hours (24h window). It never gates or fails a run; the detector stays quiet until a baseline of prior hours with spend exists.
 
 ### Bootstrapping API tokens
 

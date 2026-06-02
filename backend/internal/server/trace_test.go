@@ -131,6 +131,11 @@ type auditFake struct {
 	appended       []audit.ChainAppendParams
 	globalAppended []audit.GlobalChainAppendParams
 	appendErr      error
+	// seeded is pre-existing history returned by ListAll alongside the
+	// entries appended during the test. The spend-alert check (#649)
+	// reads cost_recorded entries via ListAll to build its rolling
+	// baseline, so tests seed prior-hour samples here.
+	seeded []*audit.Entry
 }
 
 func newAuditFake() *auditFake { return &auditFake{} }
@@ -166,8 +171,35 @@ func (a *auditFake) AppendGlobalChained(_ context.Context, p audit.GlobalChainAp
 func (a *auditFake) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("auditFake: ListGlobal not used")
 }
-func (a *auditFake) ListAll(_ context.Context, _ audit.ListAllParams) ([]*audit.Entry, error) {
-	return nil, errors.New("auditFake: ListAll not used")
+
+// ListAll returns the seeded history plus any entries appended during
+// the test, filtered by p.Category when set. This backs the
+// spend-alert check's cost-history read (#649); the trace handler is
+// the only caller, and it filters to cost_recorded.
+func (a *auditFake) ListAll(_ context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []*audit.Entry
+	for _, e := range a.seeded {
+		if p.Category == nil || e.Category == *p.Category {
+			out = append(out, e)
+		}
+	}
+	for i := range a.appended {
+		ap := a.appended[i]
+		if p.Category != nil && ap.Category != *p.Category {
+			continue
+		}
+		rid := ap.RunID
+		out = append(out, &audit.Entry{
+			RunID:     &rid,
+			StageID:   ap.StageID,
+			Timestamp: ap.Timestamp,
+			Category:  ap.Category,
+			Payload:   ap.Payload,
+		})
+	}
+	return out, nil
 }
 func (a *auditFake) Get(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("auditFake: Get not used")
@@ -1129,4 +1161,144 @@ func TestShipTrace_RecordsCost_UnknownModelZero(t *testing.T) {
 	if got.CostUSDTotal != 0 {
 		t.Errorf("run.CostUSDTotal = %v, want 0 for unknown model", got.CostUSDTotal)
 	}
+}
+
+// seedCostEntry builds a cost_recorded audit entry at the given time
+// carrying a usd figure — the history the spend-alert check reads to
+// build its rolling baseline.
+func seedCostEntry(t *testing.T, ts time.Time, usd float64) *audit.Entry {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"usd": usd})
+	if err != nil {
+		t.Fatalf("marshal seed payload: %v", err)
+	}
+	return &audit.Entry{Timestamp: ts, Category: "cost_recorded", Payload: payload}
+}
+
+// TestShipTrace_SpendAlertTrips is the wiring test for the spend-anomaly
+// detector (#649). It seeds three prior hours of low spend, then POSTs a
+// bundle whose priced cost far exceeds 3x that baseline, and asserts a
+// spend_alert audit entry is written tying the spike to the run. Warn-
+// only: the upload still returns 202.
+func TestShipTrace_SpendAlertTrips(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 100000, 200000
+	wantUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok || wantUSD <= 0 {
+		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, wantUSD)
+	}
+
+	now := time.Now().UTC()
+	au.seeded = []*audit.Entry{
+		seedCostEntry(t, now.Add(-3*time.Hour), 0.01),
+		seedCostEntry(t, now.Add(-2*time.Hour), 0.01),
+		seedCostEntry(t, now.Add(-1*time.Hour), 0.01),
+	}
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (warn-only must not gate):\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	var alert *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "spend_alert" {
+			alert = &au.appended[i]
+			break
+		}
+	}
+	au.mu.Unlock()
+	if alert == nil {
+		t.Fatal("no spend_alert audit entry written for an anomalous hour")
+	}
+	if alert.RunID != stage.RunID {
+		t.Errorf("spend_alert RunID = %s, want %s", alert.RunID, stage.RunID)
+	}
+	var ap struct {
+		LatestHourUSD float64 `json:"latest_hour_usd"`
+		RollingAvgUSD float64 `json:"rolling_avg_usd"`
+		PriorHours    int     `json:"prior_hours"`
+		Multiple      float64 `json:"multiple"`
+		Model         string  `json:"triggering_model"`
+	}
+	if err := json.Unmarshal(alert.Payload, &ap); err != nil {
+		t.Fatalf("decode spend_alert payload: %v", err)
+	}
+	if ap.PriorHours != 3 {
+		t.Errorf("spend_alert prior_hours = %d, want 3", ap.PriorHours)
+	}
+	if ap.LatestHourUSD < wantUSD {
+		t.Errorf("spend_alert latest_hour_usd = %v, want >= %v", ap.LatestHourUSD, wantUSD)
+	}
+	if ap.Model != model {
+		t.Errorf("spend_alert triggering_model = %q, want %q", ap.Model, model)
+	}
+}
+
+// TestShipTrace_NoSpendAlertUnderSteadySpend confirms the detector stays
+// quiet when the current hour matches the recent baseline: seeding prior
+// hours at the same magnitude as the incoming bundle's cost yields no
+// spend_alert entry.
+func TestShipTrace_NoSpendAlertUnderSteadySpend(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	wantUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok {
+		t.Fatalf("pricing.Cost(%q) ok=false — fixture model must be priced", model)
+	}
+
+	now := time.Now().UTC()
+	au.seeded = []*audit.Entry{
+		seedCostEntry(t, now.Add(-3*time.Hour), wantUSD),
+		seedCostEntry(t, now.Add(-2*time.Hour), wantUSD),
+		seedCostEntry(t, now.Add(-1*time.Hour), wantUSD),
+	}
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	for i := range au.appended {
+		if au.appended[i].Category == "spend_alert" {
+			t.Errorf("unexpected spend_alert under steady spend: %s", au.appended[i].Payload)
+		}
+	}
+	au.mu.Unlock()
 }

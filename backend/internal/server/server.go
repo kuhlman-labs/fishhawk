@@ -199,6 +199,14 @@ type Config struct {
 	// behaviour). Production wires an Anthropic SDK client; tests
 	// inject a fake via this field.
 	PlanReviewer PlanReviewer
+
+	// SpendAlertMultiple is the trip threshold for the spend-anomaly
+	// check (#649): the trace handler warns (spend_alert audit entry)
+	// when the current hour's estimated model spend exceeds this
+	// multiple of the rolling average of prior hours. Non-positive
+	// values fall back to spendalert.DefaultMultiple (3x). Warn-only —
+	// it never gates a run.
+	SpendAlertMultiple float64
 }
 
 // Server wraps an http.Server with the routes and middleware stack
