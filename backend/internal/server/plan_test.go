@@ -817,6 +817,54 @@ func TestShipPlan_ReviewAgents_Advisory_RecordsVerdictDoesNotBlock(t *testing.T)
 	}
 }
 
+// TestShipPlan_ReviewAgents_IssueCommentsReachReviewPrompt is the #622
+// cross-boundary check: a comment cached on the run's IssueContext must
+// flow through the server's plan-review trigger mapping into the rendered
+// plan-review prompt. This crosses the persistence(IssueContext) -> server
+// trigger mapping -> prompt render seam that the per-layer prompt-package
+// tests cannot exercise (the bug fixed here was precisely a missing mapping
+// at that seam, cf. #618).
+func TestShipPlan_ReviewAgents_IssueCommentsReachReviewPrompt(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, _, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
+	// Seed the cached issue context with a comment that refines the body.
+	rr.getRuns[runID].IssueContext = &run.IssueContext{
+		Title:  "Add a foo flag",
+		Body:   "We need a --foo flag that defaults to off.",
+		Number: 622,
+		Comments: []run.IssueComment{
+			{Author: "carol", Body: "Correction: --foo must default to ON.", CreatedAt: "2026-05-02T00:00:00Z"},
+		},
+	}
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// Advisory review runs detached (#584); drain it before inspecting the
+	// captured prompt.
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	if !strings.Contains(got, "Correction: --foo must default to ON.") {
+		t.Errorf("plan-review prompt missing the cached issue comment body — mapping seam broken:\n%s", got)
+	}
+	if !strings.Contains(got, "### Issue comments") {
+		t.Errorf("plan-review prompt missing the issue-comments section:\n%s", got)
+	}
+}
+
 // TestShipPlan_ReviewAgents_GatingReject_StageFailedB verifies that in
 // gating mode (agent>0 && human==0) a reject verdict transitions the
 // stage to failed-B so trace-driven awaiting_approval is blocked.

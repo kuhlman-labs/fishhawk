@@ -139,11 +139,12 @@ type Trigger struct {
 	// (#244).
 	IssueBody string
 	// IssueComments are the issue's comments at trigger time, a
-	// snapshot captured alongside IssueBody (#618). Only the
-	// plan-stage prompt renders them — after the body — so
-	// comment-borne refinements/decisions reach the plan agent on
-	// the first attempt. Empty/nil for non-issue triggers, issues
-	// with no comments, or runs whose issue_context predates #618.
+	// snapshot captured alongside IssueBody (#618). The plan-stage,
+	// plan-review, and implement-review prompts render them — after
+	// the body — so comment-borne refinements/decisions reach the
+	// plan agent and both reviewers on the first attempt (#622).
+	// Empty/nil for non-issue triggers, issues with no comments, or
+	// runs whose issue_context predates #618.
 	IssueComments []IssueComment
 	// IssueURL is the canonical github.com URL for the triggering
 	// issue. Set by the server-side prompt handler from
@@ -540,27 +541,7 @@ func buildPlanReview(t Trigger) string {
 
 	// Issue context: give the reviewer the originating motivation so
 	// they can assess whether the plan actually addresses the issue.
-	if t.IssueNumber > 0 || t.IssueTitle != "" || t.IssueBody != "" {
-		b.WriteString("### Originating issue\n\n")
-		if t.IssueNumber > 0 {
-			fmt.Fprintf(&b, "Issue: #%d", t.IssueNumber)
-			if t.IssueTitle != "" {
-				b.WriteString(" · ")
-				b.WriteString(t.IssueTitle)
-			}
-			b.WriteString("\n")
-		} else if t.IssueTitle != "" {
-			b.WriteString("Title: ")
-			b.WriteString(t.IssueTitle)
-			b.WriteString("\n")
-		}
-		if t.IssueBody != "" {
-			b.WriteString("\n")
-			b.WriteString(t.IssueBody)
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
-	}
+	writeReviewIssueContext(&b, t)
 
 	// Verdict schema — inline so the reviewer doesn't need to fetch it.
 	// The JSON shape below is load-bearing and kept verbatim; surrounding
@@ -687,27 +668,7 @@ func buildImplementReview(t Trigger) string {
 	}
 
 	// Issue context: the originating motivation.
-	if t.IssueNumber > 0 || t.IssueTitle != "" || t.IssueBody != "" {
-		b.WriteString("### Originating issue\n\n")
-		if t.IssueNumber > 0 {
-			fmt.Fprintf(&b, "Issue: #%d", t.IssueNumber)
-			if t.IssueTitle != "" {
-				b.WriteString(" · ")
-				b.WriteString(t.IssueTitle)
-			}
-			b.WriteString("\n")
-		} else if t.IssueTitle != "" {
-			b.WriteString("Title: ")
-			b.WriteString(t.IssueTitle)
-			b.WriteString("\n")
-		}
-		if t.IssueBody != "" {
-			b.WriteString("\n")
-			b.WriteString(t.IssueBody)
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
-	}
+	writeReviewIssueContext(&b, t)
 
 	// Verdict schema — inline so the reviewer doesn't need to fetch it.
 	b.WriteString("### Verdict schema\n\n")
@@ -946,6 +907,38 @@ func writeIssueContext(b *strings.Builder, t Trigger) {
 		fmt.Fprintf(b, "Triggering issue: #%d\n", t.IssueNumber)
 	}
 	if t.IssueTitle != "" {
+		b.WriteString("Title: ")
+		b.WriteString(t.IssueTitle)
+		b.WriteString("\n")
+	}
+	if t.IssueBody != "" {
+		b.WriteString("\n")
+		b.WriteString(t.IssueBody)
+		b.WriteString("\n")
+	}
+	writeIssueComments(b, t.IssueComments)
+	b.WriteString("\n")
+}
+
+// writeReviewIssueContext renders the "### Originating issue" block shared by
+// the plan-review and implement-review prompts (#622). It mirrors
+// writeIssueContext's ordering — title/body then the bot-filtered,
+// budget-capped issue comments via writeIssueComments — so the reviewers judge
+// the plan/diff against the same comment-borne refinements the planner saw
+// (#618). Renders nothing when no issue context is present.
+func writeReviewIssueContext(b *strings.Builder, t Trigger) {
+	if t.IssueNumber == 0 && t.IssueTitle == "" && t.IssueBody == "" {
+		return
+	}
+	b.WriteString("### Originating issue\n\n")
+	if t.IssueNumber > 0 {
+		fmt.Fprintf(b, "Issue: #%d", t.IssueNumber)
+		if t.IssueTitle != "" {
+			b.WriteString(" · ")
+			b.WriteString(t.IssueTitle)
+		}
+		b.WriteString("\n")
+	} else if t.IssueTitle != "" {
 		b.WriteString("Title: ")
 		b.WriteString(t.IssueTitle)
 		b.WriteString("\n")

@@ -969,6 +969,16 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title
 		trig.IssueBody = runRow.IssueContext.Body
+		// Map the cached comments so the implement-review prompt renders the
+		// same comment-borne refinements the planner saw (#622) — identical
+		// shape to fillIssueContext branch 1.
+		for _, c := range runRow.IssueContext.Comments {
+			trig.IssueComments = append(trig.IssueComments, prompt.IssueComment{
+				Author:    c.Author,
+				Body:      c.Body,
+				CreatedAt: c.CreatedAt,
+			})
+		}
 	}
 	if runRow.TriggerRef != nil {
 		if n, ok := parseIssueRef(*runRow.TriggerRef); ok {
