@@ -135,9 +135,17 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 
 		// Aggregate this attempt's events and tokens. TokensUsed is
 		// cumulative across attempts on purpose: a retry really does
-		// spend the tokens twice and the trace must say so.
+		// spend the tokens twice and the trace must say so. The
+		// input/output split accumulates the same way so the cost
+		// rollup matches TokensUsed. Model is the latest non-empty id
+		// reported across attempts.
 		agg.Events = append(agg.Events, res.Events...)
 		agg.TokensUsed += res.TokensUsed
+		agg.InputTokens += res.InputTokens
+		agg.OutputTokens += res.OutputTokens
+		if res.Model != "" {
+			agg.Model = res.Model
+		}
 
 		retriesLeft := attempt < maxAttempts
 		overBudget := inv.Budget.MaxTokens > 0 && agg.TokensUsed >= inv.Budget.MaxTokens
@@ -321,6 +329,9 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	}()
 
 	tokensUsed := 0
+	inputTokens := 0
+	outputTokens := 0
+	model := ""
 	budgetHit := false
 	// resultPayload retains the terminal type=="result" event so a
 	// post-mortem can inspect is_error / api_error_status for
@@ -401,7 +412,13 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := append([]byte(nil), scanner.Bytes()...)
-		ev, used, ok := parseLine(line, now())
+		ev, info, ok := parseLine(line, now())
+		used := info.InputTokens + info.OutputTokens
+		// Model id is pinned from the latest line that surfaced one
+		// (assistant/result events carry it; system.init does not).
+		if info.Model != "" {
+			model = info.Model
+		}
 		res.Events = append(res.Events, ev)
 		if ev.Kind == "result" || strings.HasPrefix(ev.Kind, "result.") {
 			resultPayload = append([]byte(nil), ev.Payload...)
@@ -427,7 +444,11 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		turns++
 		lastKind = ev.Kind
 		if ok && used > 0 {
+			// Usage lines report cumulative counts, so the latest
+			// non-zero line wins (not a running sum within an attempt).
 			tokensUsed = used
+			inputTokens = info.InputTokens
+			outputTokens = info.OutputTokens
 		}
 		progMu.Unlock()
 		if ok && used > 0 {
@@ -464,6 +485,9 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 
 	waitErr := cmd.Wait()
 	res.TokensUsed = tokensUsed
+	res.InputTokens = inputTokens
+	res.OutputTokens = outputTokens
+	res.Model = model
 
 	// A non-zero exit whose result payload or stderr carries the
 	// durable thinking-block marker is the one fault Invoke retries.
@@ -564,28 +588,55 @@ func failureResult(res agent.Result, ts time.Time, category, reason, outcome str
 	return res
 }
 
+// lineInfo carries the structured usage + model metadata parseLine
+// extracted from one stream-json line, beyond the kind already on
+// the event. InputTokens/OutputTokens are the split counts (their
+// sum is the legacy total); Model is the resolved model id when the
+// line surfaced one.
+type lineInfo struct {
+	InputTokens  int
+	OutputTokens int
+	Model        string
+}
+
+// usageBlock is the shape of Claude Code's `usage` object, present
+// either at the top level (the convention in the recorded test
+// fixtures) or nested under `message` on a real assistant event.
+type usageBlock struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
 // parseLine turns one JSON line from Claude Code's stream-json
 // output into an agent.Event. The kind is taken from the line's
 // `type` field when present; unknown / non-JSON lines become
 // kind=raw so we never silently drop trace bytes.
 //
-// Returns (event, tokensUsed, hasUsage). hasUsage is true when the
-// line carried a `usage.input_tokens` + `usage.output_tokens`
-// block we could parse; tokensUsed is the SUM of those two.
-func parseLine(line []byte, ts time.Time) (agent.Event, int, bool) {
+// Returns (event, info, hasUsage). hasUsage is true when the line
+// carried a usage block (top-level or message-nested) whose token
+// sum is > 0. info.Model is the resolved model id (top-level `model`
+// or `message.model`) when present, "" otherwise — surfaced even on
+// lines without usage so the assistant/result event's model pins
+// cost + reproducibility (G6).
+func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo, bool) {
 	trimmed := bytes.TrimSpace(line)
 	if len(trimmed) == 0 {
-		return agent.Event{Kind: "raw", Timestamp: ts}, 0, false
+		return agent.Event{Kind: "raw", Timestamp: ts}, lineInfo{}, false
 	}
 
-	// Probe the kind without unmarshaling the whole payload.
+	// Probe the kind without unmarshaling the whole payload. usage +
+	// model appear top-level on the synthesized fixtures and the
+	// result event, but nested under `message` on a real assistant
+	// event — accept both shapes, top-level winning.
 	var meta struct {
-		Type    string `json:"type"`
-		Subtype string `json:"subtype"`
-		Usage   *struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
+		Type    string      `json:"type"`
+		Subtype string      `json:"subtype"`
+		Model   string      `json:"model"`
+		Usage   *usageBlock `json:"usage"`
+		Message *struct {
+			Model string      `json:"model"`
+			Usage *usageBlock `json:"usage"`
+		} `json:"message"`
 	}
 	if err := json.Unmarshal(trimmed, &meta); err != nil {
 		// Non-JSON line — capture verbatim so the trace is still
@@ -594,7 +645,7 @@ func parseLine(line []byte, ts time.Time) (agent.Event, int, bool) {
 			Kind:      "raw",
 			Timestamp: ts,
 			Payload:   agent.MakePayload(map[string]string{"text": string(trimmed)}),
-		}, 0, false
+		}, lineInfo{}, false
 	}
 
 	kind := meta.Type
@@ -604,18 +655,29 @@ func parseLine(line []byte, ts time.Time) (agent.Event, int, bool) {
 		kind = kind + "." + meta.Subtype
 	}
 
-	used := 0
+	usage := meta.Usage
+	if usage == nil && meta.Message != nil {
+		usage = meta.Message.Usage
+	}
+	model := meta.Model
+	if model == "" && meta.Message != nil {
+		model = meta.Message.Model
+	}
+
+	var info lineInfo
+	info.Model = model
 	hasUsage := false
-	if meta.Usage != nil {
-		used = meta.Usage.InputTokens + meta.Usage.OutputTokens
-		hasUsage = used > 0
+	if usage != nil {
+		info.InputTokens = usage.InputTokens
+		info.OutputTokens = usage.OutputTokens
+		hasUsage = info.InputTokens+info.OutputTokens > 0
 	}
 
 	return agent.Event{
 		Kind:      kind,
 		Timestamp: ts,
 		Payload:   json.RawMessage(trimmed),
-	}, used, hasUsage
+	}, info, hasUsage
 }
 
 // outOfTreeWrite is one detected file-writing tool_use whose target

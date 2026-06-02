@@ -58,14 +58,24 @@ const MaxBundleBytes = 64 * 1024 * 1024 // 64 MiB
 // bundles (without the field) parsing as AgentFailed=false.
 // (E8.5 #163)
 type ManifestData struct {
-	BundleSchema       string    `json:"bundle_schema"`
-	RunID              string    `json:"run_id"`
-	StageID            string    `json:"stage_id"`
-	Agent              string    `json:"agent"`
-	Model              string    `json:"model,omitempty"`
-	GeneratedAt        time.Time `json:"generated_at"`
-	AgentFailed        bool      `json:"agent_failed,omitempty"`
-	AgentFailureReason string    `json:"agent_failure_reason,omitempty"`
+	BundleSchema string    `json:"bundle_schema"`
+	RunID        string    `json:"run_id"`
+	StageID      string    `json:"stage_id"`
+	Agent        string    `json:"agent"`
+	Model        string    `json:"model,omitempty"`
+	GeneratedAt  time.Time `json:"generated_at"`
+
+	// InputTokens and OutputTokens are the agent-reported token split
+	// for this stage. They are the authoritative cost input: the
+	// backend prices them via pricing.Cost from the SIGNED bundle
+	// rather than trusting a runner-emitted span, so a tampered or
+	// dropped span cannot corrupt the cost ledger. omitempty keeps
+	// older bundles (without the fields) parsing as 0/0.
+	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens int `json:"output_tokens,omitempty"`
+
+	AgentFailed        bool   `json:"agent_failed,omitempty"`
+	AgentFailureReason string `json:"agent_failure_reason,omitempty"`
 }
 
 // TrailerData is the payload of the last line of every bundle. The
@@ -93,6 +103,12 @@ type PackInputs struct {
 	StageID string
 	Agent   string // e.g. "claude-code"
 	Model   string // optional; "" omits the field
+
+	// InputTokens / OutputTokens are the agent-reported token split
+	// carried through to the manifest for backend-side cost pricing.
+	// Zero omits the field (older / token-less bundles).
+	InputTokens  int
+	OutputTokens int
 
 	// AgentFailed flags a category-A failure originating in the
 	// agent invocation. The runner sets this when agent.Result.OK
@@ -151,6 +167,8 @@ func Pack(w io.Writer, in PackInputs, events []agent.Event) (int, error) {
 		StageID:            in.StageID,
 		Agent:              in.Agent,
 		Model:              in.Model,
+		InputTokens:        in.InputTokens,
+		OutputTokens:       in.OutputTokens,
 		GeneratedAt:        now(),
 		AgentFailed:        in.AgentFailed,
 		AgentFailureReason: in.AgentFailureReason,

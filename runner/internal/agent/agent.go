@@ -103,6 +103,24 @@ type Result struct {
 	// (Claude Code emits a final result event with usage). Zero
 	// when the agent didn't report or didn't get that far.
 	TokensUsed int
+
+	// InputTokens and OutputTokens split TokensUsed into the
+	// prompt-side and completion-side counts the agent reported.
+	// They feed the GenAI-semconv observability spans
+	// (gen_ai.usage.input_tokens / output_tokens) and the backend
+	// cost rollup, which prices input and output at different rates.
+	// Both are cumulative across in-driver retries, exactly like
+	// TokensUsed, so cost stays honest when a retry doubles spend.
+	// Zero when the agent didn't report usage.
+	InputTokens  int
+	OutputTokens int
+
+	// Model is the resolved model id the agent reported (the `model`
+	// field on Claude Code's assistant/result events), e.g.
+	// "claude-opus-4-8". Pinned for cost pricing and reproducibility
+	// (G6): the same model id keys pricing.Cost and is recorded on
+	// the run/audit trail. Empty when the agent didn't surface it.
+	Model string
 }
 
 // Event is one entry in the captured trace. Kind is the discriminant
