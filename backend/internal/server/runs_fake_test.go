@@ -49,6 +49,11 @@ type fakeRepo struct {
 	// (WorkflowSpec bytes, MaxRetriesSnapshot) can inspect the
 	// params the handler built.
 	lastCreateRunParams run.CreateRunParams
+
+	// getRunCalls counts GetRun invocations so the calibration cache
+	// tests can assert a cache hit skips the filterRuntimeObservedSamples
+	// per-entry run-resolve N+1.
+	getRunCalls int
 }
 
 func newFakeRepo() *fakeRepo {
@@ -95,6 +100,7 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 func (f *fakeRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.getRunCalls++
 	if f.getErr != nil {
 		return nil, f.getErr
 	}

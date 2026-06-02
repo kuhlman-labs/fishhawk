@@ -137,6 +137,19 @@ func (s *Server) filterRuntimeObservedSamples(ctx context.Context, entries []*au
 	return samples
 }
 
+// implementP95CacheTTL bounds how long a memoized implement-stage p95
+// is reused before implementCalibrationP95 re-scans the audit log.
+const implementP95CacheTTL = 60 * time.Second
+
+// p95CacheEntry memoizes the result of one implement-stage p95 scan.
+// computedAt records when the AuditRepo.ListAll scan that produced
+// (value, ok) ran, so the TTL can be checked against the server clock.
+type p95CacheEntry struct {
+	value      float64
+	ok         bool
+	computedAt time.Time
+}
+
 // implementCalibrationP95 loads runtime_observed audit entries for the
 // workflow, filters them to implement-stage samples, and returns the
 // observed p95 actual-runtime in minutes. Returns ok=false when the
@@ -144,7 +157,24 @@ func (s *Server) filterRuntimeObservedSamples(ctx context.Context, entries []*au
 // samples — letting callers fall back rather than fail. Reuses the same
 // load + filter + computeCalibration path as handleGetCalibration so the
 // p95 it returns is identical to what the calibration endpoint reports.
+//
+// Results are memoized per workflow_id for implementP95CacheTTL so the
+// per-implement-prompt-fetch caller doesn't run a full ListAll scan
+// (plus the filterRuntimeObservedSamples GetRun N+1) every time. Both a
+// positive (ok=true) and a zero-sample (ok=false) outcome are cached
+// since both are real scan results; an unconfigured AuditRepo or a
+// failed scan returns 0,false uncached so a transient failure is
+// retried on the next fetch. The whole check-compute-store runs under
+// p95CacheMu so concurrent fetches for the same workflow dedupe to a
+// single scan.
 func (s *Server) implementCalibrationP95(ctx context.Context, workflowID string) (p95Minutes float64, ok bool) {
+	s.p95CacheMu.Lock()
+	defer s.p95CacheMu.Unlock()
+
+	if entry, found := s.p95Cache[workflowID]; found && s.nowFunc().Sub(entry.computedAt) < implementP95CacheTTL {
+		return entry.value, entry.ok
+	}
+
 	if s.cfg.AuditRepo == nil {
 		return 0, false
 	}
@@ -154,10 +184,13 @@ func (s *Server) implementCalibrationP95(ctx context.Context, workflowID string)
 		return 0, false
 	}
 	samples := s.filterRuntimeObservedSamples(ctx, entries, "implement", workflowID, time.Time{})
-	if len(samples) == 0 {
-		return 0, false
+
+	value, ok := 0.0, false
+	if len(samples) > 0 {
+		value, ok = computeCalibration(workflowID, "implement", samples).ActualP95Minutes, true
 	}
-	return computeCalibration(workflowID, "implement", samples).ActualP95Minutes, true
+	s.p95Cache[workflowID] = p95CacheEntry{value: value, ok: ok, computedAt: s.nowFunc()}
+	return value, ok
 }
 
 // computeCalibration derives statistics from the filtered sample slice.
