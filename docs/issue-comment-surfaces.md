@@ -62,6 +62,18 @@ Notes:
   on `runs.cost_usd_total` is a denormalized read of it); listed here only so
   a future reader grepping the audit categories doesn't mistake it for a
   comment surface.
+- The spend-anomaly audit kind — `spend_alert` (#649), written by the trace
+  upload handler (`trace.go::checkSpendAlert`) when the current hour's
+  estimated model spend exceeds `FISHHAWKD_SPEND_ALERT_MULTIPLE` (default 3x)
+  of the rolling average of prior hours, with payload `{latest_hour_usd,
+  rolling_avg_usd, ratio, multiple, prior_hours, latest_hour_start,
+  triggering_model}` — is an **internal, warn-only audit kind, not an
+  issue-comment surface**. It never gates or fails a run; nothing in
+  `issuecomment` posts it to the issue thread. The detector
+  (`backend/internal/spendalert`) suppresses alerts until a baseline of prior
+  hours with spend exists, so a fresh deployment stays quiet. Listed here only
+  so a future reader grepping the audit categories doesn't mistake it for a
+  comment surface.
 
 ## Routing
 

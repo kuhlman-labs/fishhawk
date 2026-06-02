@@ -105,3 +105,12 @@ func envOrDuration(key string, def time.Duration) time.Duration {
 	}
 	return def
 }
+
+func envOrFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}

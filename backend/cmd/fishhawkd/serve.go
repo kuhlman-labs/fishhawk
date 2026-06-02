@@ -39,6 +39,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	slapkg "github.com/kuhlman-labs/fishhawk/backend/internal/sla"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spendalert"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
@@ -151,6 +152,11 @@ func runServe(args []string, logSink io.Writer) int {
 		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", 300*time.Second),
 		"effective per-invocation bound for plan-review agent calls (since #584); "+
 			"must cover review of large standard_v1 plans — raised from 60s to 300s (#606)")
+	spendAlertMultiple := fs.Float64("spend-alert-multiple",
+		envOrFloat("FISHHAWKD_SPEND_ALERT_MULTIPLE", spendalert.DefaultMultiple),
+		"warn-only spend-anomaly threshold (#649): the trace handler emits a spend_alert audit "+
+			"entry when the current hour's estimated model spend exceeds this multiple of the "+
+			"rolling average of prior hours. Never gates a run")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -158,7 +164,7 @@ func runServe(args []string, logSink io.Writer) int {
 	logger := newLogger(logSink)
 	logger.Info("plan coercion registry", slog.String("summary", plan.CoercionRegistrySummary()))
 
-	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL}
+	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple}
 
 	// Plan-review agent wiring. Selection precedence (each branch logs which
 	// adapter is active at startup):
