@@ -64,6 +64,31 @@ else
   fail "cmd_reload should force --all"
 fi
 
+# 3b. cmd_post_merge wiring: ff-only pull, cleanup-merged, optional issue check,
+# then reload LAST. Body-grep only (mirrors section 3) — a live post-merge mutates
+# git state and the running stack and is not hermetic.
+post_body="$(typeset -f cmd_post_merge)"
+if print -r -- "$post_body" | grep -q -- '--ff-only'; then
+  pass "cmd_post_merge pulls main with --ff-only"
+else
+  fail "cmd_post_merge should pull --ff-only"
+fi
+if print -r -- "$post_body" | grep -q 'cleanup-merged'; then
+  pass "cmd_post_merge invokes scripts/cleanup-merged"
+else
+  fail "cmd_post_merge should invoke cleanup-merged"
+fi
+if print -r -- "$post_body" | grep -q 'gh issue view'; then
+  pass "cmd_post_merge confirms the optional issue via gh issue view"
+else
+  fail "cmd_post_merge should reference gh issue view"
+fi
+if print -r -- "$post_body" | grep -q 'cmd_reload'; then
+  pass "cmd_post_merge composes cmd_reload"
+else
+  fail "cmd_post_merge should invoke cmd_reload"
+fi
+
 # 4. _diff_touches_mcp: pure matcher mirrors the rebuild matrix's mcp routing.
 if _diff_touches_mcp "backend/cmd/fishhawk-mcp/main.go"; then
   pass "_diff_touches_mcp matches backend/cmd/fishhawk-mcp/"
