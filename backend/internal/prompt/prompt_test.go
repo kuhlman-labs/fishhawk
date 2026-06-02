@@ -1015,6 +1015,8 @@ func TestBuild_Plan_CompoundFieldDirective(t *testing.T) {
 		"decomposition.sub_plans[i]",
 		"shorthand will be rejected",
 		"do NOT set it to null",
+		"the files THAT slice will touch",
+		"narrows the fan-out child run's scope",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
