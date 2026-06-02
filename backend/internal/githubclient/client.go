@@ -795,6 +795,98 @@ func nextPageURL(link string) string {
 	return ""
 }
 
+// FetchedIssueComment is the subset of a GitHub issue-comment Fishhawk
+// reads when fetching an issue's comment thread (#621). It is distinct
+// from IssueComment, which models the create/update *response* shape
+// (id/body/html_url) those helpers decode. The fetch side surfaces the
+// author login, body, and creation timestamp the plan-stage prompt
+// renders.
+type FetchedIssueComment struct {
+	Author    string
+	Body      string
+	CreatedAt string
+}
+
+// ListIssueComments fetches the comment thread on an issue (or PR —
+// GitHub treats PR conversations as issue threads).
+//
+//	GET /repos/{owner}/{repo}/issues/{number}/comments?per_page=100
+//
+// Used by the webhook/installation-token prompt path (branch 2 of
+// fillIssueContext) to populate the plan-stage prompt with
+// comment-borne refinements, matching the operator gh-fetch path
+// (#618). Pages until exhaustion via the rel="next" Link header —
+// the same mechanism ListTeamMembers relies on.
+//
+// Returns ErrNotFound when the issue or repo isn't visible to the
+// installation, ErrForbidden on auth issues.
+func (c *Client) ListIssueComments(ctx context.Context, installationID int64, repo RepoRef, number int) ([]FetchedIssueComment, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: issue number must be > 0")
+	}
+
+	pagePath := "/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/issues/" + url.PathEscape(fmt.Sprintf("%d", number)) +
+		"/comments?per_page=100"
+	endpoint := c.endpoint(pagePath)
+
+	var out []FetchedIssueComment
+	for endpoint != "" {
+		req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("githubclient: list issue comments: %w", err)
+		}
+		comments, next, err := decodeIssueCommentsPage(resp)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, comments...)
+		endpoint = next
+	}
+	return out, nil
+}
+
+// decodeIssueCommentsPage handles one page of issue comments and
+// returns the next-page URL if Link advertises one. Mirrors
+// decodeTeamMembersPage so the pagination loop above stays readable.
+func decodeIssueCommentsPage(resp *http.Response) ([]FetchedIssueComment, string, error) {
+	if err := classifyStatus("list issue comments", resp); err != nil {
+		return nil, "", err
+	}
+	var body []struct {
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Body      string `json:"body"`
+		CreatedAt string `json:"created_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, "", fmt.Errorf("githubclient: decode issue comments: %w", err)
+	}
+	out := make([]FetchedIssueComment, 0, len(body))
+	for _, c := range body {
+		out = append(out, FetchedIssueComment{
+			Author:    c.User.Login,
+			Body:      c.Body,
+			CreatedAt: c.CreatedAt,
+		})
+	}
+	return out, nextPageURL(resp.Header.Get("Link")), nil
+}
+
 // DispatchInputs is the JSON body of a workflow_dispatch event.
 // Per GitHub's contract, inputs is a flat map[string]string —
 // non-string values must be JSON-encoded by the caller.

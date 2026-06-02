@@ -155,6 +155,16 @@ type stubIssueGetter struct {
 	gotInst int64
 	gotRepo githubclient.RepoRef
 	gotNum  int
+
+	// Comment-fetch seam (#621): canned thread + optional error, plus
+	// a recorded-call flag and args so branch-2 tests can assert the
+	// fetch happened with the right installation/repo/number.
+	comments        []githubclient.FetchedIssueComment
+	commentsErr     error
+	commentsCalled  bool
+	commentsGotInst int64
+	commentsGotRepo githubclient.RepoRef
+	commentsGotNum  int
 }
 
 func (s *stubIssueGetter) GetIssue(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
@@ -166,6 +176,17 @@ func (s *stubIssueGetter) GetIssue(_ context.Context, installationID int64, repo
 		return nil, s.getErr
 	}
 	return s.issue, nil
+}
+
+func (s *stubIssueGetter) ListIssueComments(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
+	s.commentsCalled = true
+	s.commentsGotInst = installationID
+	s.commentsGotRepo = repo
+	s.commentsGotNum = number
+	if s.commentsErr != nil {
+		return nil, s.commentsErr
+	}
+	return s.comments, nil
 }
 
 func newPromptServer(t *testing.T) (*Server, *promptRunRepo, *signingFake, *stubIssueGetter) {
@@ -506,6 +527,99 @@ func TestGetStagePrompt_CachedIssueContext_NoComments(t *testing.T) {
 	}
 	if !contains(resp.Prompt, "Cached body.") {
 		t.Errorf("body-only prompt should still render the body:\n%s", resp.Prompt)
+	}
+}
+
+// TestGetStagePrompt_WebhookFetchedComments_MappedIntoTrigger is the
+// #621 headline check: a webhook-triggered run (InstallationID set, no
+// cached IssueContext) fetches the issue comment thread via branch 2
+// and renders it in the plan-stage prompt. It also proves the shared
+// writeIssueComments bot-filter applies on this path — a [bot]-authored
+// comment is dropped — exercising fetch -> server mapping -> render end
+// to end.
+func TestGetStagePrompt_WebhookFetchedComments_MappedIntoTrigger(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	var installation int64 = 555
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+		// No IssueContext — forces branch 2 (webhook fetch).
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "Body text", State: "open"}
+	gh.comments = []githubclient.FetchedIssueComment{
+		{Author: "alice", Body: "Comment-borne refinement.", CreatedAt: "2026-05-01T10:00:00Z"},
+		{Author: "github-actions[bot]", Body: "CI failed on main.", CreatedAt: "2026-05-01T11:00:00Z"},
+	}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if !gh.commentsCalled {
+		t.Fatalf("ListIssueComments should be called on the webhook branch")
+	}
+	if gh.commentsGotInst != installation || gh.commentsGotNum != 42 ||
+		gh.commentsGotRepo != (githubclient.RepoRef{Owner: "kuhlman-labs", Name: "example"}) {
+		t.Errorf("ListIssueComments args = inst %d repo %+v num %d",
+			gh.commentsGotInst, gh.commentsGotRepo, gh.commentsGotNum)
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !contains(resp.Prompt, "### Issue comments") {
+		t.Errorf("prompt missing comments section:\n%s", resp.Prompt)
+	}
+	if !contains(resp.Prompt, "Comment-borne refinement.") || !contains(resp.Prompt, "@alice") {
+		t.Errorf("prompt missing human comment:\n%s", resp.Prompt)
+	}
+	if contains(resp.Prompt, "CI failed on main.") || contains(resp.Prompt, "github-actions[bot]") {
+		t.Errorf("bot-authored comment should be filtered on the webhook path:\n%s", resp.Prompt)
+	}
+}
+
+// TestGetStagePrompt_WebhookCommentsFetchError_DegradesToBody confirms a
+// ListIssueComments failure on the webhook path is best-effort: the
+// prompt still returns 200 with title+body and no comments section.
+func TestGetStagePrompt_WebhookCommentsFetchError_DegradesToBody(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	var installation int64 = 555
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "Body text", State: "open"}
+	gh.commentsErr = errors.New("boom")
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !contains(resp.Prompt, "Body text") {
+		t.Errorf("title+body should still render on comment-fetch failure:\n%s", resp.Prompt)
+	}
+	if contains(resp.Prompt, "### Issue comments") {
+		t.Errorf("no comments section expected when the fetch failed:\n%s", resp.Prompt)
 	}
 }
 

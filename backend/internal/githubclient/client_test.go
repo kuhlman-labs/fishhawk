@@ -48,6 +48,14 @@ type fakeGitHub struct {
 	getIssueStatus int
 	getIssueBody   string
 
+	listIssueCommentsStatus int
+	// listIssueCommentsPages holds one JSON body per page; the handler
+	// serves them in order and advertises a rel="next" Link to itself
+	// until the last page, so a multi-page case proves pagination
+	// accumulates. listIssueCommentsHits counts requests served.
+	listIssueCommentsPages []string
+	listIssueCommentsHits  int
+
 	createCheckRunStatus int
 	createCheckRunBody   string
 
@@ -97,6 +105,7 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		getFileStatus:             http.StatusOK,
 		dispatchStatus:            http.StatusNoContent,
 		getIssueStatus:            http.StatusOK,
+		listIssueCommentsStatus:   http.StatusOK,
 		createCheckRunStatus:      http.StatusCreated,
 		createCheckRunBody:        `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
 		createIssueCommentStatus:  http.StatusCreated,
@@ -160,6 +169,32 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			if fg.getIssueBody != "" {
 				_, _ = io.WriteString(w, fg.getIssueBody)
 			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}/comments",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			if fg.listIssueCommentsStatus != http.StatusOK {
+				w.WriteHeader(fg.listIssueCommentsStatus)
+				if len(fg.listIssueCommentsPages) > 0 {
+					_, _ = io.WriteString(w, fg.listIssueCommentsPages[0])
+				}
+				return
+			}
+			idx := fg.listIssueCommentsHits
+			fg.listIssueCommentsHits++
+			if idx >= len(fg.listIssueCommentsPages) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "[]")
+				return
+			}
+			if idx+1 < len(fg.listIssueCommentsPages) {
+				next := "http://" + r.Host + r.URL.Path + "?page=" + strconv.Itoa(idx+2)
+				w.Header().Set("Link", "<"+next+`>; rel="next"`)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, fg.listIssueCommentsPages[idx])
 		})
 
 	mux.HandleFunc("POST /repos/{owner}/{repo}/check-runs",
@@ -692,6 +727,97 @@ func TestGetIssue_DecodeError(t *testing.T) {
 	_, err := c.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
 	if err == nil {
 		t.Fatalf("expected decode error")
+	}
+}
+
+// --- ListIssueComments ---
+
+func TestListIssueComments_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listIssueCommentsPages = []string{
+		`[{"user":{"login":"alice"},"body":"First.","created_at":"2026-05-01T10:00:00Z"},` +
+			`{"user":{"login":"bob"},"body":"Second.","created_at":"2026-05-01T11:00:00Z"}]`,
+	}
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListIssueComments(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err != nil {
+		t.Fatalf("ListIssueComments: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d comments, want 2: %+v", len(got), got)
+	}
+	if got[0] != (FetchedIssueComment{Author: "alice", Body: "First.", CreatedAt: "2026-05-01T10:00:00Z"}) {
+		t.Errorf("comment[0] = %+v", got[0])
+	}
+	if got[1].Author != "bob" || got[1].Body != "Second." {
+		t.Errorf("comment[1] = %+v", got[1])
+	}
+	if fg.gotMethod != "GET" {
+		t.Errorf("method = %q", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/issues/42/comments" {
+		t.Errorf("path = %q", fg.gotPath)
+	}
+}
+
+func TestListIssueComments_Paginates(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listIssueCommentsPages = []string{
+		`[{"user":{"login":"alice"},"body":"p1.","created_at":"2026-05-01T10:00:00Z"}]`,
+		`[{"user":{"login":"bob"},"body":"p2.","created_at":"2026-05-01T11:00:00Z"}]`,
+	}
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListIssueComments(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err != nil {
+		t.Fatalf("ListIssueComments: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d comments, want 2 across pages: %+v", len(got), got)
+	}
+	if got[0].Author != "alice" || got[1].Author != "bob" {
+		t.Errorf("pagination did not accumulate in order: %+v", got)
+	}
+	if fg.listIssueCommentsHits != 2 {
+		t.Errorf("server served %d pages, want 2", fg.listIssueCommentsHits)
+	}
+}
+
+func TestListIssueComments_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listIssueCommentsStatus = http.StatusNotFound
+	fg.listIssueCommentsPages = []string{`{"message":"Not Found"}`}
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.ListIssueComments(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestListIssueComments_DecodeError(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listIssueCommentsPages = []string{`not json`}
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.ListIssueComments(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
+	if err == nil {
+		t.Fatalf("expected decode error")
+	}
+}
+
+func TestListIssueComments_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	if _, err := c.ListIssueComments(context.Background(), 1, RepoRef{}, 1); err == nil {
+		t.Errorf("expected error for empty repo")
+	}
+	if _, err := c.ListIssueComments(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 0); err == nil {
+		t.Errorf("expected error for zero issue number")
+	}
+	c2 := &Client{}
+	if _, err := c2.ListIssueComments(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1); err == nil {
+		t.Errorf("expected error for missing TokenProvider")
 	}
 }
 
