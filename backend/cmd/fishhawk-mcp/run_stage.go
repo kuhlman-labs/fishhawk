@@ -101,6 +101,7 @@ type RunStageInput struct {
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
 	PushAndOpenPR bool   `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR; default false (the operator commits the changes themselves)"`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: FISHHAWK_RUNNER_BIN env, then fishhawk-runner sibling to this binary (os.Executable dir), then PATH"`
+	Verbose       bool   `json:"verbose,omitempty" jsonschema:"when true, return the full runner event list including every stage_progress heartbeat; default false returns a compact result that omits routine heartbeats"`
 }
 
 // RunStageOutput is the structured result of one stage run. The
@@ -117,14 +118,31 @@ type RunStageInput struct {
 // DiffSummary, AuditPointer, and RunURL are best-effort enrichment
 // fields; they are omitted (nil / empty) when unavailable and never
 // fail the tool.
+//
+// Outcome, Turns, TokensUsed, ElapsedSeconds, and LastEventKind are
+// the compact-summary scalars distilled from the runner's event
+// stream (#647): Outcome and TokensUsed come from the terminal
+// `runner_completed` event, the remaining counters from the last
+// stage_progress heartbeat. They let the driving agent read the
+// stage's headline result without re-deriving it from Events. All are
+// omitempty so they reflect as plain JSON scalars (avoiding the
+// array-reflection trap, #371). By default the routine stage_progress
+// heartbeats are dropped from Events (their signal survives in these
+// scalars); pass verbose:true on the input to restore the full list.
 type RunStageOutput struct {
 	ExitCode     int           `json:"exit_code"`
 	StageState   string        `json:"stage_state,omitempty" jsonschema:"final stage state fetched after the runner exits; empty when the fetch failed"`
-	Events       []RunnerEvent `json:"events" jsonschema:"runner-emitted JSONL events in arrival order"`
+	Events       []RunnerEvent `json:"events" jsonschema:"runner-emitted JSONL events in arrival order; compact by default (routine stage_progress heartbeats omitted), full list when verbose:true was set on the input"`
 	Warnings     []string      `json:"warnings,omitempty"`
 	DiffSummary  *DiffSummary  `json:"diff_summary,omitempty" jsonschema:"present when the runner emitted a git_diff event and git show --numstat HEAD succeeded; nil for plan stages"`
 	AuditPointer *AuditPointer `json:"audit_pointer,omitempty" jsonschema:"most-recent audit entry for this run with its entry hash; nil on any fetch failure"`
 	RunURL       string        `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
+
+	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed) from the runner_completed event; empty when the runner never reported one"`
+	Turns          int    `json:"turns,omitempty" jsonschema:"agent turn count from the last stage_progress heartbeat"`
+	TokensUsed     int    `json:"tokens_used,omitempty" jsonschema:"tokens consumed; from runner_completed when present, else the last heartbeat's running total"`
+	ElapsedSeconds int    `json:"elapsed_seconds,omitempty" jsonschema:"wall-clock seconds from the last stage_progress heartbeat"`
+	LastEventKind  string `json:"last_event_kind,omitempty" jsonschema:"the agent's last event kind from the last stage_progress heartbeat"`
 }
 
 // RunnerEvent wraps an unstructured runner event. Each event is the
@@ -183,8 +201,18 @@ agent-driven local-runner loop:
 
 Runner output streams as MCP progress notifications ONLY when the
 client supplies a progressToken on the call (opt-in per the MCP
-spec); the final tool result always carries the full event list
-plus the post-run stage state.
+spec).
+
+The final tool result is COMPACT by default: the routine
+stage_progress heartbeats are dropped from the events list (their
+signal is preserved in the scalar summary fields below), while
+stage_state, the outcome/timing/token summary, the terminal
+runner_completed event, git_diff, runner_cancelled, and every other
+non-heartbeat event are retained in arrival order. Set verbose:true
+to restore the full event list including every heartbeat. This
+roughly halves the driver's per-stage context cost without losing
+any durable signal — the audit log and signed trace bundle are
+unchanged.
 
 During execution the runner emits periodic stage_progress
 heartbeats (~every 15s) carrying the turn count, elapsed time,
@@ -192,11 +220,22 @@ tokens-so-far, and last event kind, so the driver can distinguish a
 progressing stage from a stalled one (the counters keep ticking on
 elapsed even when turns/tokens stall). With a progressToken these
 arrive live as progress notifications for the operator/client
-watching the run; without one they still appear post-hoc in the
-final result's events list. This is NOT a live mid-call early-cancel
-signal for the synchronously-blocked driving agent — the agent sees
-the heartbeats only after the call returns (and as groundwork for a
+watching the run. This is NOT a live mid-call early-cancel signal
+for the synchronously-blocked driving agent — the agent sees the
+heartbeats only after the call returns (and as groundwork for a
 future async run_stage).
+
+Summary fields (scalars distilled from the event stream, omitted
+when zero/empty):
+
+  - outcome         — terminal runner outcome (ok | failed) from the
+                      runner_completed event.
+  - turns           — agent turn count from the last heartbeat.
+  - tokens_used     — tokens consumed; from runner_completed when
+                      present, else the last heartbeat's running total.
+  - elapsed_seconds — wall-clock seconds from the last heartbeat.
+  - last_event_kind — the agent's last event kind from the last
+                      heartbeat.
 
 Output fields (three additional best-effort fields, omitted when
 unavailable):
@@ -511,31 +550,37 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// no failure mode.
 	runURL := r.api.baseURL + "/runs/" + runUUID.String()
 
+	// Distill the scalar summary and the compact (heartbeat-free) event
+	// list. Default to compact; verbose:true restores the full list.
+	summary, filtered := summarizeRunStageEvents(events)
+	resultEvents := events
+	if !in.Verbose {
+		resultEvents = filtered
+	}
+
+	out := RunStageOutput{
+		ExitCode:       exitCode,
+		StageState:     stageState,
+		Events:         resultEvents,
+		Warnings:       warnings,
+		DiffSummary:    diffSummary,
+		AuditPointer:   auditPointer,
+		RunURL:         runURL,
+		Outcome:        summary.Outcome,
+		Turns:          summary.Turns,
+		TokensUsed:     summary.TokensUsed,
+		ElapsedSeconds: summary.ElapsedSeconds,
+		LastEventKind:  summary.LastEventKind,
+	}
+
 	// Return-cancellation signal: if the parent ctx was the reason
 	// for exit, surface a clear tool error rather than a 0 / silent
 	// success.
 	if ctx.Err() != nil {
-		return nil, RunStageOutput{
-				ExitCode:     exitCode,
-				StageState:   stageState,
-				Events:       events,
-				Warnings:     warnings,
-				DiffSummary:  diffSummary,
-				AuditPointer: auditPointer,
-				RunURL:       runURL,
-			},
-			fmt.Errorf("fishhawk_run_stage cancelled: %w", ctx.Err())
+		return nil, out, fmt.Errorf("fishhawk_run_stage cancelled: %w", ctx.Err())
 	}
 
-	return nil, RunStageOutput{
-		ExitCode:     exitCode,
-		StageState:   stageState,
-		Events:       events,
-		Warnings:     warnings,
-		DiffSummary:  diffSummary,
-		AuditPointer: auditPointer,
-		RunURL:       runURL,
-	}, nil
+	return nil, out, nil
 }
 
 // resolveStageID resolves the stage UUID to spawn the runner against
@@ -700,6 +745,72 @@ func runStageDetectGitHubRepo(workingDir string) (string, error) {
 		return "", err
 	}
 	return owner + "/" + name, nil
+}
+
+// runStageSummary holds the scalar progress/outcome fields distilled
+// from the runner's event stream so the compact tool result carries
+// the durable signal without the per-heartbeat noise (#647).
+type runStageSummary struct {
+	Outcome        string
+	Turns          int
+	TokensUsed     int
+	ElapsedSeconds int
+	LastEventKind  string
+}
+
+// summarizeRunStageEvents walks the runner's events once and returns
+// (a) a scalar summary distilled from the stage_progress heartbeats
+// and the terminal runner_completed event, and (b) a filtered event
+// slice with the routine stage_progress heartbeats removed. Every
+// other event — including runner_completed, git_diff, and
+// runner_cancelled — is retained in arrival order.
+//
+// Heartbeats are discriminated by a top-level `event=="stage_progress"`
+// field; the last heartbeat's counters win. The terminal
+// `event=="runner_completed"` event carries the authoritative
+// outcome/tokens_used and overrides the heartbeat-derived TokensUsed
+// when present. Reading outcome/tokens from runner_completed — not the
+// bundle-only `kind=="invocation_end"` event — is load-bearing: only
+// runner_completed is relayed on the JSONL stderr stream this tool
+// reads (invocation_end is appended to the signed trace bundle only),
+// so keying on invocation_end would leave Outcome permanently empty in
+// production.
+func summarizeRunStageEvents(events []RunnerEvent) (runStageSummary, []RunnerEvent) {
+	var summary runStageSummary
+	filtered := make([]RunnerEvent, 0, len(events))
+	numInt := func(m map[string]any, k string) int {
+		f, _ := m[k].(float64)
+		return int(f)
+	}
+	for _, ev := range events {
+		m, ok := ev.Payload.(map[string]any)
+		if !ok {
+			filtered = append(filtered, ev)
+			continue
+		}
+		evType, _ := m["event"].(string)
+		switch evType {
+		case "stage_progress":
+			// Routine heartbeat: capture counters (last wins) and drop
+			// it from the filtered slice.
+			summary.Turns = numInt(m, "turns")
+			summary.TokensUsed = numInt(m, "tokens_so_far")
+			summary.ElapsedSeconds = numInt(m, "elapsed_seconds")
+			if last, _ := m["last_event_kind"].(string); last != "" {
+				summary.LastEventKind = last
+			}
+			continue
+		case "runner_completed":
+			// Terminal runner-level event: authoritative outcome and
+			// token total. Overrides the heartbeat-derived TokensUsed.
+			if oc, _ := m["outcome"].(string); oc != "" {
+				summary.Outcome = oc
+			}
+			summary.TokensUsed = numInt(m, "tokens_used")
+		}
+		filtered = append(filtered, ev)
+	}
+	return summary, filtered
 }
 
 // findGitDiffPayload scans events for a runner event with
