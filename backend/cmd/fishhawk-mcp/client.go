@@ -145,14 +145,15 @@ func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 // `cli → backend`, not the other way around, and the same applies
 // to this binary.
 type createRunRequest struct {
-	Repo          string        `json:"repo"`
-	WorkflowID    string        `json:"workflow_id"`
-	WorkflowSHA   string        `json:"workflow_sha"`
-	TriggerSource string        `json:"trigger_source"`
-	TriggerRef    *string       `json:"trigger_ref,omitempty"`
-	RunnerKind    string        `json:"runner_kind,omitempty"`
-	WorkflowSpec  string        `json:"workflow_spec,omitempty"`
-	IssueContext  *IssueContext `json:"issue_context,omitempty"`
+	Repo           string        `json:"repo"`
+	WorkflowID     string        `json:"workflow_id"`
+	WorkflowSHA    string        `json:"workflow_sha"`
+	TriggerSource  string        `json:"trigger_source"`
+	TriggerRef     *string       `json:"trigger_ref,omitempty"`
+	RunnerKind     string        `json:"runner_kind,omitempty"`
+	WorkflowSpec   string        `json:"workflow_spec,omitempty"`
+	IssueContext   *IssueContext `json:"issue_context,omitempty"`
+	BudgetOverride bool          `json:"budget_override,omitempty"`
 }
 
 // StartRunParams is the typed input the apiClient takes for run
@@ -175,6 +176,7 @@ type StartRunParams struct {
 	RunnerKind     string
 	WorkflowSpec   string
 	IssueContext   *IssueContext
+	BudgetOverride bool
 }
 
 // approvalRequest mirrors the backend's
@@ -244,13 +246,14 @@ func (c *apiClient) CancelRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 // translate validation errors into clean tool errors.
 func (c *apiClient) StartRun(ctx context.Context, p StartRunParams) (*Run, bool, error) {
 	req := createRunRequest{
-		Repo:          p.Repo,
-		WorkflowID:    p.WorkflowID,
-		WorkflowSHA:   p.WorkflowSHA,
-		TriggerSource: p.TriggerSource,
-		RunnerKind:    p.RunnerKind,
-		WorkflowSpec:  p.WorkflowSpec,
-		IssueContext:  p.IssueContext,
+		Repo:           p.Repo,
+		WorkflowID:     p.WorkflowID,
+		WorkflowSHA:    p.WorkflowSHA,
+		TriggerSource:  p.TriggerSource,
+		RunnerKind:     p.RunnerKind,
+		WorkflowSpec:   p.WorkflowSpec,
+		IssueContext:   p.IssueContext,
+		BudgetOverride: p.BudgetOverride,
 	}
 	if p.TriggerRef != "" {
 		ref := p.TriggerRef

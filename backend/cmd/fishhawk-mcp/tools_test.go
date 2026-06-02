@@ -2159,6 +2159,28 @@ func TestStartRun_RunnerKindLocal_ForwardedToBackend(t *testing.T) {
 	}
 }
 
+// TestStartRun_BudgetOverride_ForwardedToBackend covers the #688
+// admission-override dimension: an agent forcing a run past a blocking
+// periodic budget passes budget_override=true, the MCP forwards it
+// verbatim into the createRun request body.
+func TestStartRun_BudgetOverride_ForwardedToBackend(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:           "x/y",
+		WorkflowID:     "trivial",
+		WorkflowSpec:   validTrivialSpec,
+		BudgetOverride: true,
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if !fb.createRunBody.BudgetOverride {
+		t.Errorf("BudgetOverride = false, want true")
+	}
+}
+
 // TestStartRun_IssueFetch_AutoFlipsTriggerSource exercises the
 // gh-fetch convenience: when the agent passes issue, the MCP
 // server fetches via gh and ships the payload inline, AND flips

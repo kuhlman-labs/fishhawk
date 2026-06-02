@@ -1127,6 +1127,22 @@ paths:
                     Webhook-dispatched runs leave this empty and
                     the backend falls back to the existing
                     GitHub-fetch path.
+                budget_override:
+                  type: boolean
+                  description: |
+                    Optional. Operator force-past for a blocking
+                    periodic cost budget (#688 / ADR-030). When the
+                    resolved workflow declares an
+                    `enforcement: blocking` budget whose current
+                    calendar-period spend has reached `limit_usd`, a
+                    new run is normally refused with `402
+                    budget_exhausted`. Setting this `true` admits the
+                    run anyway and records a
+                    `run_admitted_budget_override` audit entry.
+                    Ignored when no blocking budget is over — it only
+                    matters at the moment a budget would block. There
+                    is no override on the webhook-dispatch path
+                    (webhook triggers can't carry one).
       responses:
         '200':
           description: Idempotent replay — existing run returned unchanged.
@@ -1140,6 +1156,19 @@ paths:
               schema: { $ref: '#/components/schemas/Run' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            `budget_exhausted` — the resolved workflow declares an
+            `enforcement: blocking` periodic cost budget whose
+            current calendar-period spend has reached `limit_usd`
+            (#688 / ADR-030). No run row is created. Clear it by
+            raising `limit_usd`, switching the budget to
+            `enforcement: advisory`, or retrying with
+            `budget_override: true`. In-flight runs and CI-retry /
+            decomposition-child continuations are never gated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '422':
           description: |

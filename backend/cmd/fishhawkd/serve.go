@@ -386,6 +386,11 @@ func runServe(args []string, logSink io.Writer) int {
 			// resolved earlier (~L167) from the anthropic/claudecode
 			// reviewer selection.
 			PlanReviewerConfigured: cfg.PlanReviewer != nil,
+			// BudgetLocation feeds the blocking periodic-budget
+			// admission gate (#688 / ADR-030), shared with the
+			// server's cfg.BudgetLocation so both admission seams
+			// bucket spend into the same calendar window.
+			BudgetLocation: budgetLocation,
 			// ApprovalHandler is wired below after the Server
 			// is constructed — the Server implements the
 			// interface and holds all the deps the handler

@@ -755,6 +755,13 @@ type Dispatcher struct {
 	// Now is the clock used for audit timestamps; defaults to
 	// time.Now. Overridable for deterministic tests.
 	Now func() time.Time
+
+	// BudgetLocation is the IANA timezone the blocking-budget
+	// admission gate (#688 / ADR-030) computes calendar period
+	// boundaries in. Mirrors the server's cfg.BudgetLocation so both
+	// admission seams bucket spend into the same window. Nil is
+	// treated as UTC by CheckBlockingBudget.
+	BudgetLocation *time.Location
 }
 
 // Handle takes a webhook event after receipt + dedup and runs the
@@ -907,6 +914,20 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	snapshot, snapshotErr := d.resolveRequiredChecks(ctx, ev.InstallationID, repo, ref)
 	if snapshotErr != nil {
 		d.writeProtectionRefusalAudit(ctx, ev, m, specFile.SHA, snapshotErr, now)
+		return nil
+	}
+
+	// Step 3.6: blocking periodic-budget admission gate (#688 /
+	// ADR-030). The dispatcher creates runs directly (Step 4
+	// below), bypassing handleCreateRun's gate — so a NEW run
+	// triggered by a webhook must be refused here once the
+	// workflow's calendar-period spend exhausts a blocking budget.
+	// Webhook triggers carry no operator override, so the gate has
+	// no force-past on this path. In-flight runs and CI-retry /
+	// decomposition-child continuations are never gated (those
+	// continue an already-admitted parent and take their own create
+	// paths, which skip this check). Fail-open on a sum error.
+	if d.refusedByBlockingBudget(ctx, ev, m, workflow, specFile.SHA, now) {
 		return nil
 	}
 
@@ -1796,6 +1817,89 @@ func (d *Dispatcher) writeReviewerMisconfiguredAudit(ctx context.Context, ev Eve
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// refusedByBlockingBudget reports whether a NEW webhook-triggered run
+// must be refused because the workflow's calendar-period spend has
+// exhausted a blocking periodic budget (#688 / ADR-030). It is the
+// dispatcher-side admission gate, the counterpart to the server's
+// handleCreateRun gate — the dispatcher creates runs directly and
+// bypasses the handler, so a gate only at the handler would leak every
+// webhook-dispatched run.
+//
+// It type-asserts d.Runs to webhook.CostSummer; a repository that
+// doesn't sum cost admits the run (capability-absent skip, mirroring
+// the server seam). A sum error is fail-open: WARN-log and proceed.
+// When a blocking budget is over, it writes a run_rejected_budget
+// audit entry (system actor, AppendGlobalChained — no run row exists
+// yet), WARN-logs, and returns true so the caller skips CreateRun. No
+// HTTP response and no operator override are possible on this path.
+func (d *Dispatcher) refusedByBlockingBudget(ctx context.Context, ev Event, m Match, workflow spec.Workflow, specSHA string, now time.Time) bool {
+	if len(workflow.Budgets) == 0 {
+		return false
+	}
+	summer, ok := d.Runs.(CostSummer)
+	if !ok {
+		// Capability-absent (e.g. a test fake without the method):
+		// admit, consistent with the server seam.
+		return false
+	}
+	blocked, b, dec, err := CheckBlockingBudget(ctx, summer, ev.Repo, m.WorkflowID, workflow.Budgets, now, d.BudgetLocation)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"blocking budget: sum period spend failed — admitting run (fail-open)",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+			slog.String("workflow_id", m.WorkflowID),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	if !blocked {
+		return false
+	}
+
+	d.logger().LogAttrs(ctx, slog.LevelWarn,
+		"webhook dispatch refused: blocking budget exhausted",
+		slog.String("delivery_id", ev.DeliveryID),
+		slog.String("repo", ev.Repo),
+		slog.String("workflow_id", m.WorkflowID),
+		slog.String("workflow_sha", specSHA),
+		slog.String("period", b.Period),
+		slog.Float64("limit_usd", b.LimitUSD),
+		slog.Float64("spent", dec.Spent),
+	)
+
+	if d.Audit != nil {
+		systemKind := audit.ActorKind("system")
+		payload, _ := json.Marshal(map[string]any{
+			"reason":       "budget_exhausted",
+			"workflow_id":  m.WorkflowID,
+			"repo":         ev.Repo,
+			"workflow_sha": specSHA,
+			"period":       b.Period,
+			"limit_usd":    b.LimitUSD,
+			"spent":        dec.Spent,
+			"delivery_id":  ev.DeliveryID,
+			"event":        ev.Type,
+		})
+		if _, err := d.Audit.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+			Timestamp:    now,
+			Category:     "run_rejected_budget",
+			ActorKind:    &systemKind,
+			ActorSubject: stringPtr("github-webhook"),
+			Payload:      payload,
+		}); err != nil {
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"append run_rejected_budget audit entry failed",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", ev.Repo),
+				slog.String("workflow_id", m.WorkflowID),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+	return true
 }
 
 // writeDispatchAudit appends a chained audit entry tying the

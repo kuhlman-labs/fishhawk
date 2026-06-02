@@ -150,6 +150,14 @@ type createRunRequest struct {
 	// trigger_source=github_issue; ignored otherwise so the
 	// shape can't be abused to attach prose to non-issue runs.
 	IssueContext *issueContextPayload `json:"issue_context,omitempty"`
+	// BudgetOverride lets an operator force a run past a blocking
+	// periodic budget that is over its limit for the current period
+	// (#688 / ADR-030). When true and a blocking budget would
+	// otherwise refuse the run with 402 budget_exhausted, the run is
+	// admitted and a run_admitted_budget_override audit entry is
+	// recorded. Ignored when no blocking budget is over — the field
+	// only matters at the moment a budget would block.
+	BudgetOverride bool `json:"budget_override,omitempty"`
 }
 
 // validTriggerSources is the closed set per the workflow-spec and
@@ -376,6 +384,17 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				"workflow declares agent-gated plan review (reviewers.agent > 0, human == 0) but fishhawkd has no PlanReviewer wired; set FISHHAWKD_ANTHROPIC_API_KEY or remove reviewers.agent", nil)
 			return
 		}
+	}
+
+	// Blocking periodic-budget admission gate (#688 / ADR-030). When
+	// the resolved workflow declares an enforcement:blocking budget
+	// whose current-period spend has reached limit_usd, refuse a NEW
+	// run with 402 budget_exhausted unless the operator passed
+	// budget_override. No-stage / no-spec requests have empty Budgets
+	// and pass through. checkBlockingBudget writes the error response
+	// (and the audit) on refusal.
+	if haveStageDefs && !s.checkBlockingBudget(w, r, req.Repo, req.WorkflowID, workflowDef.Budgets, req.BudgetOverride) {
+		return
 	}
 
 	// Idempotency-Key (E8.2 / #40). When set, a previously-created

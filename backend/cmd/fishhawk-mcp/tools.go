@@ -831,6 +831,12 @@ type StartRunInput struct {
 	// IssueContext from the result. Accepts the same forms as
 	// the CLI's --issue (a bare number, #N, or full URL).
 	Issue string `json:"issue,omitempty" jsonschema:"GitHub issue number, #N, or .../issues/N URL; the MCP server fetches via gh and ships inline"`
+
+	// BudgetOverride forces the run past a blocking periodic cost
+	// budget that is over its limit for the current period (#688 /
+	// ADR-030). Ignored unless a blocking budget would otherwise
+	// refuse the run with 402 budget_exhausted.
+	BudgetOverride bool `json:"budget_override,omitempty" jsonschema:"force the run past a blocking periodic cost budget that is over its limit for the current period; ignored when no blocking budget is over"`
 }
 
 // StartRunOutput is the response shape. Run is the canonical Run
@@ -1033,6 +1039,7 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		RunnerKind:     in.RunnerKind,
 		WorkflowSpec:   string(specBytes),
 		IssueContext:   issueContext,
+		BudgetOverride: in.BudgetOverride,
 	})
 	if err != nil {
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)
