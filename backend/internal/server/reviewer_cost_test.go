@@ -77,11 +77,16 @@ func findReviewerCostEntry(t *testing.T, au *auditFake, source string, stageID u
 // per-run cost rollup folded in via a real AddRunCost call (non-zero delta).
 func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
-	const model = "claude-opus-4-8"
+	// The stage agent (which ships the trace before the advisory review runs)
+	// has already pinned runs.resolved_model to its own model — the G6
+	// reproducibility pin. The advisory reviewer runs under a DIFFERENT model
+	// and must NOT clobber that pin (#684).
+	const stageAgentModel = "claude-opus-4-8"
+	const reviewerModel = "claude-sonnet-4-6"
 	const inTok, outTok = 1000, 2000
-	wantUSD, ok := pricing.Cost(model, inTok, outTok)
+	wantUSD, ok := pricing.Cost(reviewerModel, inTok, outTok)
 	if !ok {
-		t.Fatalf("pricing.Cost ok=false for %q — fixture model must be priced", model)
+		t.Fatalf("pricing.Cost ok=false for %q — fixture model must be priced", reviewerModel)
 	}
 
 	reviewer := &usageReviewer{
@@ -89,9 +94,12 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 			Verdict: planreview.VerdictApprove,
 			Usage:   planreview.Usage{InputTokens: inTok, OutputTokens: outTok, Known: true},
 		},
-		model: model,
+		model: reviewerModel,
 	}
 	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	// Seed the stage-agent pin that the trace-ship path would have set before
+	// the advisory review runs, so we can prove the reviewer leaves it intact.
+	rr.getRuns[runID].ResolvedModel = stageAgentModel
 	priv, _ := sf.issue(t, runID)
 
 	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
@@ -99,12 +107,13 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
 
-	// (i) cost_recorded audit entry sourced plan_review against the stage.
+	// (i) cost_recorded audit entry sourced plan_review against the stage,
+	// priced from the REVIEWER model (not the stage-agent model).
 	got := findReviewerCostEntry(t, au, "plan_review", stageID)
 	if got == nil {
 		t.Fatal("no cost_recorded entry sourced plan_review")
 	}
-	if got.Model != model || got.InputTokens != inTok || got.OutputTokens != outTok {
+	if got.Model != reviewerModel || got.InputTokens != inTok || got.OutputTokens != outTok {
 		t.Errorf("plan_review cost payload mismatch: %+v", got)
 	}
 	if got.USD != wantUSD {
@@ -131,8 +140,11 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 	if gotRun.CostUSDTotal != wantUSD {
 		t.Errorf("run.CostUSDTotal = %v, want %v", gotRun.CostUSDTotal, wantUSD)
 	}
-	if gotRun.ResolvedModel != model {
-		t.Errorf("run.ResolvedModel = %q, want %q", gotRun.ResolvedModel, model)
+	// (iii) the G6 pin survives: reviewer cost folded into the total but
+	// resolved_model is STILL the stage-agent model, not the reviewer model
+	// (#684). This assertion fails on the pre-fix code that passed rec.Model.
+	if gotRun.ResolvedModel != stageAgentModel {
+		t.Errorf("run.ResolvedModel = %q, want %q (stage-agent pin must survive the reviewer)", gotRun.ResolvedModel, stageAgentModel)
 	}
 }
 
@@ -144,11 +156,15 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 // via a real AddRunCost call on the orchestratorRepo (extended to satisfy
 // runCostRecorder — the binding #647-fixture trap).
 func TestImplementReview_RecordsReviewerCost(t *testing.T) {
-	const model = "claude-opus-4-8"
+	// As in the plan-review arm: the implement stage agent has already pinned
+	// runs.resolved_model to its own model before the advisory reviewer (a
+	// DIFFERENT model) runs. The reviewer must not clobber that pin (#684).
+	const stageAgentModel = "claude-opus-4-8"
+	const reviewerModel = "claude-sonnet-4-6"
 	const inTok, outTok = 1500, 3000
-	wantUSD, ok := pricing.Cost(model, inTok, outTok)
+	wantUSD, ok := pricing.Cost(reviewerModel, inTok, outTok)
 	if !ok {
-		t.Fatalf("pricing.Cost ok=false for %q — fixture model must be priced", model)
+		t.Fatalf("pricing.Cost ok=false for %q — fixture model must be priced", reviewerModel)
 	}
 
 	reviewer := &usageReviewer{
@@ -156,9 +172,13 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 			Verdict: planreview.VerdictApprove,
 			Usage:   planreview.Usage{InputTokens: inTok, OutputTokens: outTok, Known: true},
 		},
-		model: model,
+		model: reviewerModel,
 	}
 	s, sf, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	// Seed the stage-agent pin the trace-ship path would have set. The implement
+	// trace bundle carries no manifest model, so recordCost leaves resolved_model
+	// untouched — this seed is the only stage-agent pin in play.
+	runRow.ResolvedModel = stageAgentModel
 	priv, _ := sf.issue(t, runRow.ID)
 
 	bundleBytes := implementDiffBundle(t, []map[string]string{
@@ -174,7 +194,7 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	if got == nil {
 		t.Fatal("no cost_recorded entry sourced implement_review")
 	}
-	if got.Model != model || got.InputTokens != inTok || got.OutputTokens != outTok {
+	if got.Model != reviewerModel || got.InputTokens != inTok || got.OutputTokens != outTok {
 		t.Errorf("implement_review cost payload mismatch: %+v", got)
 	}
 	if got.USD != wantUSD {
@@ -204,8 +224,11 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	if gotRun.CostUSDTotal < wantUSD {
 		t.Errorf("run.CostUSDTotal = %v, want >= %v", gotRun.CostUSDTotal, wantUSD)
 	}
-	if gotRun.ResolvedModel != model {
-		t.Errorf("run.ResolvedModel = %q, want %q", gotRun.ResolvedModel, model)
+	// The G6 pin survives: reviewer cost folded into the total but
+	// resolved_model is STILL the stage-agent model, not the reviewer model
+	// (#684). This assertion fails on the pre-fix code that passed rec.Model.
+	if gotRun.ResolvedModel != stageAgentModel {
+		t.Errorf("run.ResolvedModel = %q, want %q (stage-agent pin must survive the reviewer)", gotRun.ResolvedModel, stageAgentModel)
 	}
 }
 

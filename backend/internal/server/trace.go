@@ -1015,6 +1015,14 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 // NOT call checkSpendAlert — reviewer cost_recorded entries are swept by the
 // next runner-triggered checkSpendAlert, which re-reads all cost_recorded
 // entries across runs.
+//
+// It deliberately passes "" as resolvedModel to AddRunCost (#684): the
+// reviewer is an auxiliary agent that runs AFTER the stage trace ships, so a
+// non-empty model here would make the reviewer the last writer of the G6
+// reproducibility pin (runs.resolved_model) and clobber the stage-agent pin.
+// The empty string hits the CASE-WHEN-empty ELSE branch in AddRunCost
+// (run/queries.sql), folding reviewer cost into cost_usd_total while leaving
+// resolved_model untouched. Only recordCost (the stage agent) pins it.
 func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUID, model string, usage planreview.Usage, source string) {
 	if s.cfg.AuditRepo == nil {
 		return
@@ -1061,7 +1069,7 @@ func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUI
 	if !ok {
 		return
 	}
-	if _, err := recorder.AddRunCost(ctx, runID, rec.USD, rec.Model); err != nil {
+	if _, err := recorder.AddRunCost(ctx, runID, rec.USD, ""); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"reviewer cost: accumulate per-run cost total failed",
 			slog.String("run_id", runID.String()),
