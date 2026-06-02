@@ -57,6 +57,23 @@ UPDATE runs
  WHERE id = $1
 RETURNING *;
 
+-- name: AddRunCost :one
+-- Accumulates the estimated per-run cost rollup (#649). delta_usd is
+-- the pricing-derived cost of one bundle's model usage; resolved_model
+-- pins the agent model id (last-write-wins, skipped when empty so a
+-- model-less bundle doesn't clobber a prior pin). Idempotency is NOT
+-- claimed — each bundle receipt adds its own delta; the caller
+-- (trace handler) records exactly once per bundle, keyed to the
+-- cost_recorded audit entry that is the canonical per-invocation row.
+UPDATE runs
+   SET cost_usd_total = cost_usd_total + sqlc.arg('delta_usd'),
+       resolved_model = CASE
+           WHEN sqlc.arg('resolved_model')::text <> '' THEN sqlc.arg('resolved_model')::text
+           ELSE resolved_model
+       END
+ WHERE id = sqlc.arg('id')
+RETURNING *;
+
 -- name: CreateStage :one
 INSERT INTO stages (
     id, run_id, sequence, stage_type, executor_kind, executor_ref, state,

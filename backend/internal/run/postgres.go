@@ -213,6 +213,32 @@ func (r *postgresRepo) SetRunPullRequestURL(ctx context.Context, id uuid.UUID, u
 	return rowToRun(row), nil
 }
 
+// AddRunCost accumulates the estimated per-run cost rollup (#649) and
+// pins the resolved model id. deltaUSD is added to the running total;
+// resolvedModel is last-write-wins, skipped when empty so a model-less
+// bundle doesn't clobber a prior pin. Returns ErrNotFound when the run
+// doesn't exist.
+//
+// Not part of the run.Repository interface: the trace handler consumes
+// it through an optional capability assertion (best-effort, like the
+// rest of that handler), so test fakes that don't roll cost need no
+// stub.
+func (r *postgresRepo) AddRunCost(ctx context.Context, id uuid.UUID, deltaUSD float64, resolvedModel string) (*Run, error) {
+	q := rundb.New(r.pool)
+	row, err := q.AddRunCost(ctx, rundb.AddRunCostParams{
+		ID:            id,
+		DeltaUsd:      deltaUSD,
+		ResolvedModel: resolvedModel,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("add run cost: %w", err)
+	}
+	return rowToRun(row), nil
+}
+
 func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*Stage, error) {
 	q := rundb.New(r.pool)
 
@@ -460,6 +486,8 @@ func rowToRun(r rundb.Run) *Run {
 		}
 	}
 	out.DecomposedFrom = r.DecomposedFrom
+	out.CostUSDTotal = r.CostUsdTotal
+	out.ResolvedModel = r.ResolvedModel
 	return out
 }
 

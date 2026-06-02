@@ -45,11 +45,20 @@ const EventKindManifest = "manifest"
 // both sides in lockstep. (E8.5 #163 added AgentFailed +
 // AgentFailureReason.)
 type Manifest struct {
-	BundleSchema       string `json:"bundle_schema"`
-	RunID              string `json:"run_id"`
-	StageID            string `json:"stage_id"`
-	Agent              string `json:"agent"`
-	Model              string `json:"model,omitempty"`
+	BundleSchema string `json:"bundle_schema"`
+	RunID        string `json:"run_id"`
+	StageID      string `json:"stage_id"`
+	Agent        string `json:"agent"`
+	Model        string `json:"model,omitempty"`
+	// InputTokens / OutputTokens are the agent-reported token split,
+	// added on the runner side alongside Model (#649). The backend's
+	// cost rollup (backend/internal/cost) reads them from the signed
+	// manifest to compute the authoritative per-run cost — control-
+	// plane-side, not trusted from a runner span. Older bundles omit
+	// the fields and decode to 0 (recorded as zero-cost). Keep in
+	// lockstep with runner/internal/bundle.ManifestData.
+	InputTokens        int    `json:"input_tokens,omitempty"`
+	OutputTokens       int    `json:"output_tokens,omitempty"`
 	GeneratedAt        string `json:"generated_at"`
 	AgentFailed        bool   `json:"agent_failed,omitempty"`
 	AgentFailureReason string `json:"agent_failure_reason,omitempty"`

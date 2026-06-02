@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -194,6 +195,15 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 			"append audit entry failed", map[string]any{"error": err.Error()})
 		return
 	}
+
+	// Cost rollup (#649). Compute the estimated cost of this bundle's
+	// model usage from the SIGNED manifest's token counts (not from a
+	// runner-emitted span — a tampered/dropped span can't corrupt the
+	// ledger), write a cost_recorded audit entry, and accumulate the
+	// per-run total. Best-effort: the trace is already stored + audited,
+	// so a manifest-parse / audit-write / rollup failure logs at WARN
+	// and never unwinds the upload.
+	s.recordCost(r.Context(), runID, stageID, body)
 
 	// Advance the stage so the approval handler can act on it.
 	// The state machine requires dispatched → running →
@@ -853,6 +863,88 @@ func (s *Server) emitRuntimeObserved(ctx context.Context, runID, stageID uuid.UU
 			"runtime calibration: append audit entry failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// runCostRecorder is the optional capability the trace handler uses to
+// accumulate the per-run cost rollup + pin the resolved model id
+// (#649). The Postgres run repository implements it; it is deliberately
+// NOT part of run.Repository so the many test fakes that don't roll
+// cost need no stub. The trace handler asserts for it at runtime and
+// skips the rollup (warn-only) when the wired RunRepo doesn't satisfy
+// it — consistent with the rest of this handler's best-effort posture.
+type runCostRecorder interface {
+	AddRunCost(ctx context.Context, runID uuid.UUID, deltaUSD float64, resolvedModel string) (*run.Run, error)
+}
+
+// recordCost reads the trace bundle's manifest, computes the estimated
+// cost of its model usage via the shared pricing table, writes a
+// cost_recorded audit entry tying the figure to the run, and
+// accumulates the per-run total (pinning the resolved model id) when
+// the RunRepo supports it (#649).
+//
+// Every step is best-effort: the bundle is already stored + audited by
+// the time this runs, so a missing/unparsable manifest, a nil
+// AuditRepo, an audit-write failure, or a RunRepo that doesn't
+// implement runCostRecorder all log at WARN (or silently no-op) and
+// never unwind the upload. An unknown model id is recorded at usd=0
+// with known_model=false rather than guessed.
+func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundleBytes []byte) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	manifest, err := bundle.ExtractManifest(bundleBytes)
+	if err != nil {
+		// Malformed / non-manifest bundle (e.g. legacy fixtures). The
+		// agent_failed path logs its own parse miss; here we stay quiet
+		// at debug since a bundle with no manifest carries no token
+		// counts to price.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
+			"cost rollup: manifest unavailable — skipping cost record",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	rec := cost.FromManifest(manifest.Model, manifest.InputTokens, manifest.OutputTokens)
+
+	payload, _ := json.Marshal(map[string]any{
+		"model":         rec.Model,
+		"input_tokens":  rec.InputTokens,
+		"output_tokens": rec.OutputTokens,
+		"usd":           rec.USD,
+		"known_model":   rec.KnownModel,
+		"pricing_as_of": rec.PricingAsOf,
+		"estimated":     true,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "cost_recorded",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"cost rollup: append cost_recorded audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		// Fall through: still try to accumulate the run-record total so
+		// the rollup doesn't silently drift from the (failed) audit row.
+	}
+
+	recorder, ok := s.cfg.RunRepo.(runCostRecorder)
+	if !ok {
+		return
+	}
+	if _, err := recorder.AddRunCost(ctx, runID, rec.USD, rec.Model); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"cost rollup: accumulate per-run cost total failed",
+			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
 	}
 }

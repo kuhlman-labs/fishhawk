@@ -53,6 +53,15 @@ Notes:
   derive the none/pending/complete/skipped lifecycle. Listed here only so a
   future reader grepping for `*_reviewed` doesn't mistake them for a comment
   surface.
+- The cost-accounting audit kind — `cost_recorded` (#649), written by the
+  trace upload handler (`trace.go::recordCost`) once per bundle receipt with
+  payload `{model, input_tokens, output_tokens, usd, known_model,
+  pricing_as_of, estimated}` — is an **internal audit kind, not an
+  issue-comment surface**. Nothing in `issuecomment` posts it to the issue
+  thread. It is the canonical per-invocation cost ledger (the per-run rollup
+  on `runs.cost_usd_total` is a denormalized read of it); listed here only so
+  a future reader grepping the audit categories doesn't mistake it for a
+  comment surface.
 
 ## Routing
 
