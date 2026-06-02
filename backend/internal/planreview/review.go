@@ -139,6 +139,25 @@ type ReviewStartedPayload struct {
 	Authority        AuthorityMode `json:"authority"`
 }
 
+// ReviewFailedPayload is the JSON payload stored in an audit entry with
+// category "plan_review_failed" / "implement_review_failed" (#664). It is
+// the terminal entry written when a wired reviewer invocation errors or
+// times out (a reviewer killed at FISHHAWKD_PLAN_REVIEW_TIMEOUT surfaces as
+// a Review error). One entry is appended per failed reviewer invocation.
+//
+// It is kept deliberately distinct from plan_reviewed / implement_reviewed
+// (which carry only the closed approve / approve_with_concerns / reject
+// verdict set) so a timeout or transport failure is never decoded as a real
+// verdict. Authority records whether the failure degraded a gating or
+// advisory gate; this entry is observability-only and does NOT change
+// gating advance/degrade semantics (#574). ReviewerModel is best-effort —
+// it is empty when the adapter failed before reporting which model ran.
+type ReviewFailedPayload struct {
+	Reason        string        `json:"reason"`
+	ReviewerModel string        `json:"reviewer_model,omitempty"`
+	Authority     AuthorityMode `json:"authority"`
+}
+
 // PlanReviewedPayload is the JSON payload stored in an audit entry
 // with category "plan_reviewed". One entry is appended per review
 // agent invocation.

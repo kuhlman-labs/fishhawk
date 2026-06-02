@@ -12,27 +12,30 @@ import (
 )
 
 // ReviewStatus is the lifecycle summary the MCP surface derives from the
-// review audit trail for one stage (#600). Status is one of:
+// review audit trail for one stage (#600, #664). Status is one of:
 //
 //   - "none"     — no review was configured (no *_review_started entry).
 //   - "pending"  — a review was dispatched (a *_review_started entry exists)
-//     but no terminal entry has landed yet. This state
-//     intentionally subsumes BOTH a still-running review AND a
-//     silently-failed/timed-out one — a reviewer killed at its
-//     FISHHAWKD_PLAN_REVIEW_TIMEOUT writes no terminal entry, so
-//     "pending" is the most we can assert from the audit trail.
+//     but no terminal entry has landed yet. The review is still running.
+//     A reviewer that errors or times out now writes a terminal
+//     *_review_failed entry (#664), so "pending" no longer subsumes a
+//     silent failure — it means genuinely still-in-flight.
 //   - "complete" — at least one *_reviewed verdict landed; Reviews carries
 //     the decoded verdicts.
 //   - "skipped"  — a *_review_skipped entry exists (configured agent layer
 //     not wired); Reviews carries the synthesized skipped
 //     verdict(s).
+//   - "failed"   — a terminal *_review_failed entry exists (#664): the
+//     reviewer errored or hit FISHHAWKD_PLAN_REVIEW_TIMEOUT; Reviews
+//     carries the synthesized failure reason. A definite terminal state,
+//     not a bare 'pending'.
 //
-// Reviews is populated for the complete + skipped states and empty for
-// none + pending.
+// Reviews is populated for the complete + skipped + failed states and empty
+// for none + pending.
 type ReviewStatus struct {
 	Stage   string       `json:"stage" jsonschema:"the reviewed stage type: 'plan' or 'implement'"`
-	Status  string       `json:"status" jsonschema:"one of none, pending, complete, skipped"`
-	Reviews []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; empty for none/pending"`
+	Status  string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed"`
+	Reviews []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed; empty for none/pending"`
 }
 
 // reviewCategories names the three audit categories that describe a stage's
@@ -43,6 +46,7 @@ type reviewCategories struct {
 	reviewed string
 	skipped  string
 	started  string
+	failed   string
 }
 
 // categoriesForStage maps a stage label to its review audit categories.
@@ -55,12 +59,14 @@ func categoriesForStage(stage string) (reviewCategories, error) {
 			reviewed: "plan_reviewed",
 			skipped:  "plan_review_skipped",
 			started:  "plan_review_started",
+			failed:   "plan_review_failed",
 		}, nil
 	case "implement":
 		return reviewCategories{
 			reviewed: "implement_reviewed",
 			skipped:  "implement_review_skipped",
 			started:  "implement_review_started",
+			failed:   "implement_review_failed",
 		}, nil
 	default:
 		return reviewCategories{}, fmt.Errorf("stage %q is not one of plan, implement", stage)
@@ -143,6 +149,48 @@ func (r *runResolver) decodeSkippedReviews(ctx context.Context, runID uuid.UUID,
 	return reviews, nil
 }
 
+// decodeFailedReviews queries the given *_review_failed category and
+// synthesizes a PlanReview with verdict "failed" for each entry (#664). A
+// failed entry is the terminal record of a reviewer that errored or timed
+// out; surfacing it as a definite verdict lets an agent distinguish a real
+// failure from a still-running review (which stays 'pending'). Mirrors
+// decodeSkippedReviews — same reason/authority projection.
+func (r *runResolver) decodeFailedReviews(ctx context.Context, runID uuid.UUID, category string) ([]PlanReview, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: category,
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var reviews []PlanReview
+	for _, e := range entries {
+		if e.Payload == nil {
+			continue
+		}
+		raw, merr := json.Marshal(e.Payload)
+		if merr != nil {
+			continue
+		}
+		var p struct {
+			Reason        string `json:"reason"`
+			ReviewerModel string `json:"reviewer_model"`
+			Authority     string `json:"authority"`
+		}
+		if uerr := json.Unmarshal(raw, &p); uerr != nil {
+			continue
+		}
+		reviews = append(reviews, PlanReview{
+			ReviewerKind:  "agent",
+			ReviewerModel: p.ReviewerModel,
+			Authority:     p.Authority,
+			Verdict:       "failed",
+			Reason:        p.Reason,
+		})
+	}
+	return reviews, nil
+}
+
 // hasAuditCategory returns whether at least one audit entry of the given
 // category exists for the run. Used to detect the *_review_started proxy
 // without decoding its payload — a single entry is enough to flip a
@@ -159,11 +207,14 @@ func (r *runResolver) hasAuditCategory(ctx context.Context, runID uuid.UUID, cat
 }
 
 // reviewStatusFor derives the ReviewStatus for one stage from the audit
-// trail (#600). Precedence: a terminal *_reviewed entry wins (=> complete,
-// with decoded verdicts); else a *_review_skipped entry (=> skipped); else
-// a *_review_started entry (=> pending); else none. The 'pending' branch
-// intentionally subsumes a still-running review AND a silently-failed one
-// (a reviewer killed at its timeout writes no terminal entry).
+// trail (#600, #664). Precedence: a terminal *_reviewed entry wins
+// (=> complete, with decoded verdicts); else a *_review_skipped entry
+// (=> skipped); else a terminal *_review_failed entry (=> failed, with the
+// synthesized failure reason); else a *_review_started entry (=> pending);
+// else none. The *_review_failed branch (#664) resolves what used to fall
+// through to an ambiguous 'pending' — a reviewer that errored or timed out
+// now writes a terminal entry, so the await/status surface reports a
+// definite 'failed' instead of a still-waiting 'pending'.
 func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stage string) (*ReviewStatus, error) {
 	cats, err := categoriesForStage(stage)
 	if err != nil {
@@ -184,6 +235,14 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 	}
 	if len(skipped) > 0 {
 		return &ReviewStatus{Stage: stage, Status: "skipped", Reviews: skipped}, nil
+	}
+
+	failed, err := r.decodeFailedReviews(ctx, runID, cats.failed)
+	if err != nil {
+		return nil, err
+	}
+	if len(failed) > 0 {
+		return &ReviewStatus{Stage: stage, Status: "failed", Reviews: failed}, nil
 	}
 
 	started, err := r.hasAuditCategory(ctx, runID, cats.started)
@@ -225,8 +284,8 @@ type AwaitReviewInput struct {
 // actionable next step.
 type AwaitReviewOutput struct {
 	Stage         string       `json:"stage"`
-	Status        string       `json:"status" jsonschema:"one of none, pending, complete, skipped"`
-	Reviews       []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped"`
+	Status        string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed"`
+	Reviews       []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed"`
 	WaitedSeconds float64      `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
 	Message       string       `json:"message,omitempty" jsonschema:"actionable explanation when status=pending after the timeout"`
 }
@@ -260,7 +319,7 @@ plan_reviewed / implement_reviewed entry. Resolves the review_status from
 the audit trail and:
 
   - Returns immediately when the review is already "complete", "skipped",
-    or "none" (no review configured).
+    "failed", or "none" (no review configured).
   - On "pending" (a review was dispatched but no terminal entry has landed)
     polls the audit endpoint until a terminal entry lands or the timeout
     elapses.
@@ -270,12 +329,12 @@ Inputs:
   - stage           (required) — "plan" or "implement".
   - timeout_seconds — default 120, capped at 600.
 
-Response: {stage, status, reviews[], waited_seconds, message}. A "pending"
-status after the timeout means the review is STILL RUNNING **or** it
-failed/timed-out silently (no terminal audit entry was written — e.g. the
-reviewer hit FISHHAWKD_PLAN_REVIEW_TIMEOUT). It is not a bare "still
-waiting": check the fishhawkd logs and FISHHAWKD_PLAN_REVIEW_TIMEOUT before
-re-waiting.
+Response: {stage, status, reviews[], waited_seconds, message}. A "failed"
+status is a definite terminal state: the reviewer errored or timed out (e.g.
+it hit FISHHAWKD_PLAN_REVIEW_TIMEOUT) and a terminal *_review_failed audit
+entry was written — reviews[] carries the failure reason. A "pending" status
+after the timeout means the review is genuinely STILL RUNNING (no terminal
+entry yet); re-wait or check the fishhawkd logs.
 `),
 	}, resolver.awaitReview)
 }
@@ -345,16 +404,19 @@ func (*runResolver) awaitTerminalOutput(stage string, st *ReviewStatus, start ti
 }
 
 // awaitPendingTimeoutOutput builds the actionable pending-after-timeout
-// response. The message distinguishes a still-running review from one that
-// failed/timed-out silently so the caller has a concrete next step rather
-// than a bare 'pending'.
+// response. Since #664 a reviewer that errors or times out writes a terminal
+// *_review_failed entry that resolves to a definite 'failed' status, so a
+// lingering 'pending' now means the review is genuinely still in flight —
+// the message points the operator at that distinction rather than framing
+// the timeout as an ambiguous silent failure.
 func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time) AwaitReviewOutput {
 	return AwaitReviewOutput{
 		Stage:         stage,
 		Status:        "pending",
 		WaitedSeconds: time.Since(start).Seconds(),
-		Message: fmt.Sprintf("%s review still pending after %ds: the review is still running OR it failed/timed-out silently "+
-			"(no terminal audit entry landed — e.g. the reviewer hit FISHHAWKD_PLAN_REVIEW_TIMEOUT). "+
-			"Check the fishhawkd logs and FISHHAWKD_PLAN_REVIEW_TIMEOUT before re-waiting.", stage, timeout),
+		Message: fmt.Sprintf("%s review still pending after %ds: the review is genuinely still running — no terminal "+
+			"audit entry has landed yet. A reviewer that errored or timed out (e.g. hit FISHHAWKD_PLAN_REVIEW_TIMEOUT) "+
+			"would have resolved to a definite 'failed' status instead. Re-wait, or check the fishhawkd logs if this "+
+			"persists.", stage, timeout),
 	}
 }

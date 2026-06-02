@@ -1243,6 +1243,67 @@ func TestShipPlan_ReviewAgents_GatingApprove_StageNotFailed(t *testing.T) {
 	}
 }
 
+// TestShipPlan_ReviewAgents_ReviewerError_EmitsPlanReviewFailed is the #664
+// producer-contract test: a reviewer that errors (modelling a timeout — the
+// adapter's context.WithTimeout cancellation surfaces as a Review error)
+// must write exactly one terminal plan_review_failed audit entry carrying
+// the error string as its reason, and zero plan_reviewed entries. It also
+// pins that gating advance semantics are untouched (#574): an erroring
+// gating reviewer does NOT transition the stage to failed-B (hasRejection
+// stays false). The MCP review_test.go consumer test asserts the matching
+// 'failed' status against this same category + payload.
+func TestShipPlan_ReviewAgents_ReviewerError_EmitsPlanReviewFailed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		// Model is irrelevant on the error path; the reviewer fails before
+		// reporting a verdict. err models a timeout.
+		err: fmt.Errorf("review timed out: context deadline exceeded"),
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	// Upload still returns 201 — the plan artifact is stored regardless of
+	// reviewer health.
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// Exactly one plan_review_failed entry, carrying the error string.
+	var failedEntries []planreview.ReviewFailedPayload
+	for _, e := range au.appended {
+		switch e.Category {
+		case "plan_review_failed":
+			var p planreview.ReviewFailedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode plan_review_failed payload: %v", err)
+			}
+			failedEntries = append(failedEntries, p)
+		case "plan_reviewed":
+			t.Errorf("unexpected plan_reviewed entry on the reviewer-error path")
+		}
+	}
+	if len(failedEntries) != 1 {
+		t.Fatalf("plan_review_failed entries = %d, want 1", len(failedEntries))
+	}
+	got := failedEntries[0]
+	if got.Reason != "review timed out: context deadline exceeded" {
+		t.Errorf("reason = %q, want the reviewer error string", got.Reason)
+	}
+	if got.Authority != planreview.AuthorityGating {
+		t.Errorf("authority = %q, want gating", got.Authority)
+	}
+
+	// #574: an erroring gating reviewer must NOT fail the stage — gating
+	// advance/degrade semantics are unchanged by this observability-only PR.
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("reviewer error must not transition the gating stage to failed-B")
+		}
+	}
+}
+
 // TestShipPlan_ReviewAgents_SelfReviewLogsWarn verifies that when the
 // reviewer model matches the plan author model, the server logs a WARN
 // but still records the verdict (no block).

@@ -44,14 +44,18 @@ Notes:
   acknowledgment. The plan-on-issue comment edit covers the broadcast.
 - The review-lifecycle audit categories — `plan_reviewed` /
   `implement_reviewed` (terminal verdicts), `plan_review_skipped` /
-  `implement_review_skipped` (degraded gate), and `plan_review_started` /
+  `implement_review_skipped` (degraded gate), `plan_review_started` /
   `implement_review_started` (the #600 dispatch proxy emitted only when
-  `reviewers.agent>0` AND a `PlanReviewer` is wired) — are **internal audit
+  `reviewers.agent>0` AND a `PlanReviewer` is wired), and `plan_review_failed` /
+  `implement_review_failed` (the #664 terminal entry written when a wired
+  reviewer errors or times out) — are **internal audit
   kinds, not issue-comment surfaces**. Nothing in `issuecomment` posts them
   to the issue thread. They are written by the plan/trace upload handlers
   and read back by the MCP surface (`fishhawk_get_run_status` /
   `fishhawk_get_plan` `review_status`, and `fishhawk_await_review`) to
-  derive the none/pending/complete/skipped lifecycle. Listed here only so a
+  derive the none/pending/complete/skipped/**failed** lifecycle (the
+  `*_review_failed` categories feed `fishhawk_await_review`'s terminal
+  `failed` resolution). Listed here only so a
   future reader grepping for `*_reviewed` doesn't mistake them for a comment
   surface.
 - The plan-gate scope pre-check audit kind — `plan_scope_precheck` (#658),

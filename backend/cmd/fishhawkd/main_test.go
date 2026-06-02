@@ -167,3 +167,27 @@ func TestResolveBudgetLocation(t *testing.T) {
 		}
 	})
 }
+
+// TestPlanReviewTimeoutBelowDefault pins the #664 warn-threshold predicate:
+// strictly-below the 300s #606 floor warns; at-or-above does not. Driving the
+// boundary through the pure helper keeps the assertion off startup-log
+// capture and guarantees the warn threshold tracks defaultPlanReviewTimeout.
+func TestPlanReviewTimeoutBelowDefault(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured time.Duration
+		want       bool
+	}{
+		{"below", 180 * time.Second, true},
+		{"just_below", defaultPlanReviewTimeout - time.Second, true},
+		{"equal", defaultPlanReviewTimeout, false},
+		{"above", 600 * time.Second, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planReviewTimeoutBelowDefault(tc.configured); got != tc.want {
+				t.Errorf("planReviewTimeoutBelowDefault(%v) = %v, want %v", tc.configured, got, tc.want)
+			}
+		})
+	}
+}

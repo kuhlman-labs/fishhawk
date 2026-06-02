@@ -1652,6 +1652,10 @@ func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid
 				slog.Int("reviewer_index", i),
 				slog.String("error", err.Error()),
 			)
+			// Terminal implement_review_failed audit entry (#664), mirroring
+			// the plan path: surfaces a timed-out / errored reviewer as a
+			// definite 'failed' state. hasRejection untouched (#574).
+			s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, err.Error())
 			continue
 		}
 

@@ -292,7 +292,7 @@ type GetPlanOutput struct {
 	// 'pending' (a review was dispatched but no verdict landed) is the
 	// state Reviews[] alone cannot express — use fishhawk_await_review to
 	// block until it resolves.
-	PlanReviewStatus *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review"`
+	PlanReviewStatus *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped, failed. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review; 'failed' means the reviewer errored or timed out (terminal)"`
 	// ScopePrecheck surfaces the plan-gate scope/constraint pre-check
 	// (#658): scope.files evaluated against the implement stage's
 	// forbidden_paths/allowed_paths/max_files_changed before approval.
@@ -587,8 +587,8 @@ type GetRunStatusOutput struct {
 	// trail. 'pending' (a review was dispatched but no verdict landed yet) is
 	// the state the Reviews slices alone cannot express; wait on it with
 	// fishhawk_await_review.
-	PlanReviewStatus      *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped. 'pending' means a review was dispatched but no verdict has landed yet"`
-	ImplementReviewStatus *ReviewStatus `json:"implement_review_status,omitempty" jsonschema:"review lifecycle for the implement stage: status is one of none, pending, complete, skipped. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review"`
+	PlanReviewStatus      *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped, failed. 'pending' means a review was dispatched but no verdict has landed yet; 'failed' means the reviewer errored or timed out (terminal)"`
+	ImplementReviewStatus *ReviewStatus `json:"implement_review_status,omitempty" jsonschema:"review lifecycle for the implement stage: status is one of none, pending, complete, skipped, failed. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review; 'failed' means the reviewer errored or timed out (terminal)"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
