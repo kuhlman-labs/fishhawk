@@ -13,6 +13,7 @@ it.
 | Plan-on-issue (full) | `issue_commented` | `plan_full` first, `plan_updated` on edits | `Server.notifyPlanReady` from trace + plan handlers; re-fired from approval handlers (#377) | plan-stage terminal | Yes — when the spec's `produces.persistence` has `update_on_change: true` |
 | Plan-on-issue (summary) | `issue_commented` | `plan` | `Server.notifyPlanReady` | plan-stage terminal | No (legacy path; chosen when the spec opts out of full-plan rendering) |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
+| Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688) | warn_at / 100% crossing of an advisory periodic budget | No (per-`(period_start, tier)` dedup; the warn comment and the 100% comment each post once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 
@@ -74,6 +75,23 @@ Notes:
   hours with spend exists, so a fresh deployment stays quiet. Listed here only
   so a future reader grepping the audit categories doesn't mistake it for a
   comment surface.
+- The advisory periodic-budget surface — `budget_alert` (#688 / ADR-030),
+  written by the trace upload handler (`trace.go::checkBudgetAlerts` →
+  `emitBudgetAlert`) after a `cost_recorded` entry accumulates into
+  `runs.cost_usd_total` — IS a comment surface (the table row above), unlike
+  the warn-only audit-only `spend_alert`. For each workflow budget with
+  `enforcement: advisory`, the handler sums the workflow's spend over the
+  current calendar period (timezone-aware in `FISHHAWKD_BUDGET_TIMEZONE`) and,
+  on a `warn_at` or 100% crossing, both appends a `budget_alert` audit entry
+  (category `budget_alert`, payload `{workflow_id, repo, period, period_start,
+  spent, limit, fraction, warn_at, tier, enforcement}`) AND posts the issue
+  comment via `NotifyBudgetAlert`. Both are deduped on `(workflow_id,
+  period_start, tier)` so each tier fires once per period. It is warn-only and
+  best-effort — it never gates, fails, or blocks a run; blocking enforcement
+  (admission-time refusal) is a separate scope item. The comment body carries
+  the same estimate caveat as the cost ledger: period spend undercounts
+  invocations a backend reported no tokens for (`known_usage=false`, #685), so
+  actual spend is a lower bound.
 
 ## Routing
 

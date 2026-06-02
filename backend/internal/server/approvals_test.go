@@ -237,6 +237,27 @@ func (r *approvalRunRepo) AddRunCost(_ context.Context, id uuid.UUID, deltaUSD f
 	}
 	return rn, nil
 }
+
+// SumWorkflowCostInRange satisfies the trace handler's runCostSummer
+// optional capability (#688): it sums CostUSDTotal across seeded runs
+// matching (repo, workflowID) whose CreatedAt falls in [from, to). Lets
+// the advisory-budget seam test seed runs straddling a period boundary
+// and assert only the in-period spend is summed.
+func (r *approvalRunRepo) SumWorkflowCostInRange(_ context.Context, repo, workflowID string, from, to time.Time) (float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var total float64
+	for _, rn := range r.runs {
+		if rn.Repo != repo || rn.WorkflowID != workflowID {
+			continue
+		}
+		if rn.CreatedAt.Before(from) || !rn.CreatedAt.Before(to) {
+			continue
+		}
+		total += rn.CostUSDTotal
+	}
+	return total, nil
+}
 func (r *approvalRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }

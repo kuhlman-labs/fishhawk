@@ -2,8 +2,10 @@ package main
 
 import (
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRun_NoArgs falls through to serve — but we don't actually want
@@ -135,6 +137,33 @@ func TestEnvOrInt_PlanReviewMaxRetries(t *testing.T) {
 		t.Setenv(key, "notanint")
 		if got := envOrInt(key, 1); got != 1 {
 			t.Errorf("got %d, want 1 (garbage falls back to default)", got)
+		}
+	})
+}
+
+// TestResolveBudgetLocation covers the FISHHAWKD_BUDGET_TIMEZONE
+// resolution (#688): a valid IANA name resolves to that zone, while a
+// bogus name (missing zoneinfo / typo) falls back to time.UTC rather
+// than crashing startup.
+func TestResolveBudgetLocation(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("valid zone resolves", func(t *testing.T) {
+		loc := resolveBudgetLocation("America/New_York", logger)
+		if loc == nil || loc.String() != "America/New_York" {
+			t.Errorf("got %v, want America/New_York", loc)
+		}
+	})
+	t.Run("UTC resolves", func(t *testing.T) {
+		loc := resolveBudgetLocation("UTC", logger)
+		if loc == nil || loc.String() != "UTC" {
+			t.Errorf("got %v, want UTC", loc)
+		}
+	})
+	t.Run("bogus zone falls back to UTC", func(t *testing.T) {
+		loc := resolveBudgetLocation("Not/AZone", logger)
+		if loc != time.UTC {
+			t.Errorf("got %v, want time.UTC fallback", loc)
 		}
 	})
 }

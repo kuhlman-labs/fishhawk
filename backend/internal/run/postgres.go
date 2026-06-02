@@ -239,6 +239,30 @@ func (r *postgresRepo) AddRunCost(ctx context.Context, id uuid.UUID, deltaUSD fl
 	return rowToRun(row), nil
 }
 
+// SumWorkflowCostInRange sums runs.cost_usd_total across every run of
+// one workflow in a repo whose created_at falls in the half-open
+// calendar period [from, to) (ADR-030 advisory budgets, #688). The
+// trace handler calls this to total a workflow's period spend before
+// evaluating it against an advisory budget ceiling. Returns 0 (not an
+// error) when no runs match the window.
+//
+// Like AddRunCost, NOT part of the run.Repository interface: the trace
+// handler consumes it through an optional capability assertion
+// (best-effort), so test fakes that don't sum cost need no stub.
+func (r *postgresRepo) SumWorkflowCostInRange(ctx context.Context, repo, workflowID string, from, to time.Time) (float64, error) {
+	q := rundb.New(r.pool)
+	total, err := q.SumWorkflowCostInRange(ctx, rundb.SumWorkflowCostInRangeParams{
+		Repo:        repo,
+		WorkflowID:  workflowID,
+		CreatedAt:   pgtype.Timestamptz{Time: from, Valid: true},
+		CreatedAt_2: pgtype.Timestamptz{Time: to, Valid: true},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("sum workflow cost in range: %w", err)
+	}
+	return total, nil
+}
+
 func (r *postgresRepo) CreateStage(ctx context.Context, p CreateStageParams) (*Stage, error) {
 	q := rundb.New(r.pool)
 

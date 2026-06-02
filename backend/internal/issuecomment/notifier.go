@@ -104,6 +104,13 @@ const (
 	// appends one row carrying the (unchanged) github_comment_id so
 	// the audit chain records every revision.
 	KindPlanUpdated Kind = "plan_updated"
+	// KindBudgetAlert tags an advisory periodic-budget warning comment
+	// (ADR-030 / #688). Non-sticky and append-only like KindCIRetry; the
+	// payload also carries `period_start` + `budget_tier` so the dedup
+	// query fires the warn-tier comment and the 100% comment at most once
+	// each per calendar period while a re-evaluation in the same period
+	// (or a redelivered upload) is absorbed.
+	KindBudgetAlert Kind = "budget_alert"
 )
 
 // IssueCommenter is the slice of githubclient.Client this package
@@ -665,6 +672,138 @@ func (n *Notifier) postCIRetry(ctx context.Context, ctxv commentContext, attempt
 	return nil
 }
 
+// BudgetAlertPayload is the rendered-comment input the trace handler
+// hands NotifyBudgetAlert for one crossed (advisory budget, tier). The
+// figures are echoed from budget.Decision; the caller has already
+// evaluated the threshold and decided the comment should fire.
+//
+// PeriodStart is the RFC3339-formatted calendar period start (in the
+// backend's budget timezone) — the same string the budget_alert audit
+// payload carries — so the per-period/per-tier dedup keys identically on
+// both surfaces. Tier is "warn" or "over".
+type BudgetAlertPayload struct {
+	WorkflowID  string
+	Period      string
+	PeriodStart string
+	Spent       float64
+	Limit       float64
+	Fraction    float64
+	WarnAt      *float64
+	Tier        string
+}
+
+// NotifyBudgetAlert posts the advisory periodic-budget warning comment
+// for an issue-triggered run (ADR-030 / #688). Best-effort: returns
+// errors so callers can log them, but a comment failure does NOT unwind
+// the cost recording — the budget_alert audit entry is the canonical
+// signal and the SPA renders period spend without the comment.
+//
+// Skips silently when:
+//   - The receiver is nil.
+//   - The run isn't issue-triggered (CLI / PR / local runner with no
+//     installation_id) — contextForBudgetAlert validates this.
+//   - A budget_alert comment with the SAME (period_start, tier) already
+//     landed on this run (per-period/per-tier dedup; a re-evaluation in
+//     the same period or a redelivered upload is absorbed, but the warn
+//     tier and the later 100% tier each post once).
+func (n *Notifier) NotifyBudgetAlert(ctx context.Context, runID uuid.UUID, p BudgetAlertPayload) error {
+	if n == nil {
+		return nil
+	}
+	if p.Tier == "" {
+		return nil
+	}
+	ctxv, ok, err := n.contextForBudgetAlert(ctx, runID, p.PeriodStart, p.Tier)
+	if err != nil || !ok {
+		return err
+	}
+	body := renderBudgetAlertBody(ctxv, p)
+	return n.postBudgetAlert(ctx, ctxv, p, body)
+}
+
+// contextForBudgetAlert mirrors contextFor but uses the per-period/
+// per-tier dedup query — alreadyPosted(KindBudgetAlert) would falsely
+// suppress the 100% comment after the warn comment posted, and would
+// suppress next period's warn after this period's.
+func (n *Notifier) contextForBudgetAlert(ctx context.Context, runID uuid.UUID, periodStart, tier string) (commentContext, bool, error) {
+	runRow, err := n.runs.GetRun(ctx, runID)
+	if err != nil {
+		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
+	}
+	if runRow.TriggerSource != run.TriggerGitHubIssue {
+		return commentContext{}, false, nil
+	}
+	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
+		return commentContext{}, false, nil
+	}
+	number, ok := parseIssueRef(*runRow.TriggerRef)
+	if !ok {
+		return commentContext{}, false, nil
+	}
+	repo, err := parseRepo(runRow.Repo)
+	if err != nil {
+		return commentContext{}, false, nil
+	}
+	already, err := n.alreadyPostedBudgetTier(ctx, runID, periodStart, tier)
+	if err != nil {
+		return commentContext{}, false, fmt.Errorf("issuecomment: dedup check: %w", err)
+	}
+	if already {
+		return commentContext{}, false, nil
+	}
+	return commentContext{
+		run:         runRow,
+		repo:        repo,
+		issueNumber: number,
+		runURL:      n.externalURL + "/runs/" + runID.String(),
+	}, true, nil
+}
+
+// alreadyPostedBudgetTier returns true when a budget_alert comment on
+// this run already records the same (period_start, tier).
+func (n *Notifier) alreadyPostedBudgetTier(ctx context.Context, runID uuid.UUID, periodStart, tier string) (bool, error) {
+	entries, err := n.audit.ListForRunByCategory(ctx, runID, CategoryIssueCommented)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if extractKind(e.Payload) != KindBudgetAlert {
+			continue
+		}
+		ps, t := extractBudgetPeriodTier(e.Payload)
+		if ps == periodStart && t == tier {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// postBudgetAlert fires the comment and writes the audit row, stamping
+// period_start + budget_tier so the dedup can scope per-period/per-tier.
+func (n *Notifier) postBudgetAlert(ctx context.Context, ctxv commentContext, p BudgetAlertPayload, body string) error {
+	if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
+		return fmt.Errorf("issuecomment: create comment: %w", err)
+	}
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"kind":         string(KindBudgetAlert),
+		"issue_number": ctxv.issueNumber,
+		"repo":         ctxv.repo.String(),
+		"period_start": p.PeriodStart,
+		"budget_tier":  p.Tier,
+	})
+	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     ctxv.run.ID,
+		Timestamp: n.now().UTC(),
+		Category:  CategoryIssueCommented,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("issuecomment: audit append: %w", err)
+	}
+	return nil
+}
+
 // NotifyStatusUpdate creates or edits the run's sticky status
 // comment per E20 / #326. The status comment is a single comment
 // per run that reflects the run's current stage + state; rather
@@ -895,6 +1034,51 @@ func extractRetryAttempt(payload []byte) int {
 		return 0
 	}
 	return p.RetryAttempt
+}
+
+// extractBudgetPeriodTier reads `period_start` + `budget_tier` out of a
+// budget_alert issue_commented payload for the per-period/per-tier dedup.
+// Returns empty strings on any decode failure or absent fields.
+func extractBudgetPeriodTier(payload []byte) (periodStart, tier string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var p struct {
+		PeriodStart string `json:"period_start"`
+		BudgetTier  string `json:"budget_tier"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", ""
+	}
+	return p.PeriodStart, p.BudgetTier
+}
+
+// renderBudgetAlertBody renders the advisory periodic-budget warning
+// comment. Names the workflow, the calendar period, the spend-vs-limit
+// figures, and whether the warn threshold or the full ceiling was
+// crossed. Closes with the estimate caveat: period spend is summed from
+// the per-run cost rollup, which undercounts invocations a backend
+// reported no tokens for (known_usage=false, #685), so the real spend is
+// at least the figure shown.
+func renderBudgetAlertBody(c commentContext, p BudgetAlertPayload) string {
+	var b strings.Builder
+	headline := "approaching its"
+	if p.Tier == "over" {
+		headline = "has exhausted its"
+	}
+	fmt.Fprintf(&b, "Workflow `%s` %s %s cost budget on Run [`%s`](%s).\n\n",
+		p.WorkflowID, headline, p.Period, shortID(c.run.ID), c.runURL)
+	fmt.Fprintf(&b, "- **Period spend**: $%.2f of $%.2f (%.0f%%)\n",
+		p.Spent, p.Limit, p.Fraction*100)
+	if p.Tier == "warn" && p.WarnAt != nil {
+		fmt.Fprintf(&b, "- **Warn threshold**: %.0f%%\n", *p.WarnAt*100)
+	}
+	b.WriteString("\n")
+	b.WriteString("This is an advisory budget — runs are not blocked. ")
+	b.WriteString("Period spend is an estimate summed from per-run cost rollups; ")
+	b.WriteString("invocations whose backend reported no token usage are undercounted, ")
+	b.WriteString("so actual spend is at least this figure.\n")
+	return b.String()
 }
 
 // SlashApprovalReply is the params for NotifySlashApprovalReply

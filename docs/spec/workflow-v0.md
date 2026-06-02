@@ -203,7 +203,9 @@ workflows:
   - `blocking` — a **new** run is refused at admission once the period spend exhausts `limit_usd`. In-flight runs are never touched (the gate is admission-only); an operator can override to force a run past the ceiling.
 - **`warn_at`** — optional fraction in `[0,1]` (e.g. `0.8` for 80%) at which the advisory warning fires ahead of the 100% crossing. Absent means only the 100% threshold is surfaced.
 
-> Cost honesty caveat: `known_usage=false` bundles undercount spend (#685), so a ceiling may be crossed later than true spend would imply. Admission blocking is deterministic against the recorded `runs.cost_usd_total`, not a live proxy.
+**Advisory surfacing (#688).** For an `advisory` budget the backend re-evaluates the workflow's period spend after every cost-bearing trace upload (in `trace.go::checkBudgetAlerts`, after the per-run cost rollup increments). On a `warn_at` crossing and again on a 100% crossing it appends a `budget_alert` audit entry and posts an advisory comment on the triggering issue, each deduped so the warn tier and the 100% tier fire at most once per calendar period. Period boundaries are computed in the backend's `FISHHAWKD_BUDGET_TIMEZONE` (default UTC). The surface is warn-only and best-effort: it never gates, fails, or blocks a run. `blocking` enforcement (admission-time refusal) is not yet implemented and is tracked as a follow-up; until then a `blocking` budget records spend but produces no automatic refusal.
+
+> Cost honesty caveat: `known_usage=false` bundles undercount spend (#685), so a ceiling may be crossed later than true spend would imply. Period spend is summed from the recorded `runs.cost_usd_total`, a lower bound on actual spend — the advisory comment repeats this caveat so a reader doesn't treat the figure as exact.
 
 ## Gates
 

@@ -74,6 +74,20 @@ UPDATE runs
  WHERE id = sqlc.arg('id')
 RETURNING *;
 
+-- name: SumWorkflowCostInRange :one
+-- Sums the per-run estimated cost rollup across every run of one
+-- workflow in a repo whose created_at falls in the half-open calendar
+-- period [from, to) (ADR-030 advisory budgets, #688). COALESCE returns
+-- 0 when no runs match so the caller never special-cases an empty
+-- period. created_at (not updated_at) buckets a run into the period it
+-- was admitted under, matching budget.PeriodRange's period semantics.
+SELECT COALESCE(SUM(cost_usd_total), 0)::float8 AS total_usd
+  FROM runs
+ WHERE repo = $1
+   AND workflow_id = $2
+   AND created_at >= $3
+   AND created_at < $4;
+
 -- name: CreateStage :one
 INSERT INTO stages (
     id, run_id, sequence, stage_type, executor_kind, executor_ref, state,

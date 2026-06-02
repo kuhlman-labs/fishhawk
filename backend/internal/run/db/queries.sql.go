@@ -748,6 +748,40 @@ func (q *Queries) SetRunPullRequestURL(ctx context.Context, arg SetRunPullReques
 	return i, err
 }
 
+const sumWorkflowCostInRange = `-- name: SumWorkflowCostInRange :one
+SELECT COALESCE(SUM(cost_usd_total), 0)::float8 AS total_usd
+  FROM runs
+ WHERE repo = $1
+   AND workflow_id = $2
+   AND created_at >= $3
+   AND created_at < $4
+`
+
+type SumWorkflowCostInRangeParams struct {
+	Repo        string             `json:"repo"`
+	WorkflowID  string             `json:"workflow_id"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	CreatedAt_2 pgtype.Timestamptz `json:"created_at_2"`
+}
+
+// Sums the per-run estimated cost rollup across every run of one
+// workflow in a repo whose created_at falls in the half-open calendar
+// period [from, to) (ADR-030 advisory budgets, #688). COALESCE returns
+// 0 when no runs match so the caller never special-cases an empty
+// period. created_at (not updated_at) buckets a run into the period it
+// was admitted under, matching budget.PeriodRange's period semantics.
+func (q *Queries) SumWorkflowCostInRange(ctx context.Context, arg SumWorkflowCostInRangeParams) (float64, error) {
+	row := q.db.QueryRow(ctx, sumWorkflowCostInRange,
+		arg.Repo,
+		arg.WorkflowID,
+		arg.CreatedAt,
+		arg.CreatedAt_2,
+	)
+	var total_usd float64
+	err := row.Scan(&total_usd)
+	return total_usd, err
+}
+
 const updateRunState = `-- name: UpdateRunState :one
 UPDATE runs
    SET state = $2
