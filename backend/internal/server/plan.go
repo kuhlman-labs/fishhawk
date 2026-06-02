@@ -324,6 +324,15 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Plan-gate scope pre-check (#658): evaluate the plan's scope.files
+	// against the implement stage's path constraints (forbidden_paths /
+	// allowed_paths / max_files_changed) and record an advisory
+	// plan_scope_precheck audit entry. Run it before runPlanReviews so the
+	// precheck entry precedes any plan_reviewed entries in the audit
+	// sequence, and on the request context (cheap, synchronous, no external
+	// calls). Advisory + fail-open: never blocks or unwinds the upload.
+	s.runScopePrecheck(r.Context(), runID, stageID, body)
+
 	// Plan review: invoke configured review agents after the artifact
 	// is stored and audited, before advancing the stage. Returns true
 	// when authority is gating and at least one verdict is reject;
