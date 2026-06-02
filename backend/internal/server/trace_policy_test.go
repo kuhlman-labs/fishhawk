@@ -124,8 +124,16 @@ func (r *policyRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, err
 	return nil, nil
 }
 
-func (r *policyRunRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (*run.Stage, error) {
-	return nil, errors.New("not used")
+func (r *policyRunRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stage != nil && r.stage.ID == id {
+		r.stage.State = to
+		r.stage.FailureCategory = nil
+		r.stage.FailureReason = nil
+		return r.stage, nil
+	}
+	return nil, run.ErrNotFound
 }
 
 // makeTestBundle builds a *.jsonl.gz with a manifest, an optional
@@ -177,6 +185,62 @@ workflows:
           - forbidden_paths:
               - "infra/**"
           - max_files_changed: 10
+        gates:
+          - type: approval
+            approvers:
+              any_of: [eng_team]
+            sla: 4_hours
+`
+
+// testWorkflowSpecRequireTests adds a tests_added_or_updated
+// required-outcome so an empty (present-but-zero-file) diff fails the
+// outcome — the only policy path an empty implement diff can fail
+// (#692). Used by the empty-diff → category-C reclassification test.
+const testWorkflowSpecRequireTests = `
+version: "0.3"
+roles:
+  eng_team:
+    members: ["@org/eng"]
+workflows:
+  feature_change:
+    description: Test workflow
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - required_outcomes:
+              - tests_added_or_updated
+        gates:
+          - type: approval
+            approvers:
+              any_of: [eng_team]
+            sla: 4_hours
+`
+
+// testWorkflowSpecInvalidGlob carries a malformed forbidden_paths
+// pattern (`[bad` — an unterminated character class). policy.matchAny
+// validates the glob against an empty path before the per-file loop,
+// so this emits an `invalid pattern` violation even on an empty diff.
+// Used to prove the noDiffCaptured carve-out keeps a genuine
+// spec-config category-B from being reclassified to retryable C.
+const testWorkflowSpecInvalidGlob = `
+version: "0.3"
+roles:
+  eng_team:
+    members: ["@org/eng"]
+workflows:
+  feature_change:
+    description: Test workflow
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - forbidden_paths:
+              - "[bad"
         gates:
           - type: approval
             approvers:
@@ -303,6 +367,74 @@ func TestShipTrace_PolicyReEval_ForbiddenPath_FailedB(t *testing.T) {
 	}
 	if !hasViolations {
 		t.Errorf("expected forbidden_paths in payload, got %+v", au.appended)
+	}
+}
+
+func TestShipTrace_PolicyReEval_EmptyDiff_FailedC_Retryable(t *testing.T) {
+	// #691/#692: an implement stage whose bundle carries a
+	// PRESENT-but-empty git_diff event (num_files:0) is the staging-bug
+	// signature. With a tests_added_or_updated required-outcome the
+	// empty diff fails policy, but the failure is a capture miss, not a
+	// constraint breach — so the trace handler stamps a retryable
+	// category-C with a no_diff_captured reason rather than an
+	// un-redrivable category-B. The seam check below then drives
+	// run.RetryStage across the trace-handler → run-repo boundary and
+	// asserts failed → pending, proving the recovery path the issue
+	// says is missing works end to end.
+	s, sf, repo, _ := newPolicyTraceServer(t, nil)
+	repo.runRow.WorkflowSpec = []byte(testWorkflowSpecRequireTests)
+	// An empty non-nil slice emits a git_diff event with num_files:0,
+	// distinct from the nil/no-event case (no_diff_in_bundle skip→pass).
+	bundle := makeTestBundle(t, []map[string]string{})
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, bundle, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	if repo.stage.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed", repo.stage.State)
+	}
+	if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureC {
+		t.Fatalf("FailureCategory = %v, want C", repo.stage.FailureCategory)
+	}
+	if repo.stage.FailureReason == nil || !strings.HasPrefix(*repo.stage.FailureReason, "no_diff_captured:") {
+		t.Errorf("FailureReason = %v, want a no_diff_captured reason", repo.stage.FailureReason)
+	}
+
+	// Seam: the resulting category-C failed stage must be retryable —
+	// failed → pending, NOT ErrRetryNotApplicable (which is what a
+	// category-B would yield).
+	dec, err := run.RetryStage(context.Background(), repo, repo.stage.ID)
+	if err != nil {
+		t.Fatalf("RetryStage on category-C failed stage = %v, want nil", err)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-retry state = %q, want pending", dec.Stage.State)
+	}
+}
+
+func TestShipTrace_PolicyReEval_EmptyDiff_InvalidPattern_StaysFailedB(t *testing.T) {
+	// Carve-out (correctness): an empty diff combined with a malformed
+	// forbidden_paths glob emits an `invalid pattern` violation. That's
+	// a genuine spec-config category-B, so noDiffCaptured must NOT
+	// reclassify it to retryable C even though the diff is empty.
+	s, sf, repo, _ := newPolicyTraceServer(t, nil)
+	repo.runRow.WorkflowSpec = []byte(testWorkflowSpecInvalidGlob)
+	bundle := makeTestBundle(t, []map[string]string{})
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, bundle, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	if repo.stage.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed", repo.stage.State)
+	}
+	if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureB {
+		t.Errorf("FailureCategory = %v, want B (invalid-pattern config error must not be reclassified)", repo.stage.FailureCategory)
 	}
 }
 
