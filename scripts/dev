@@ -457,11 +457,66 @@ cmd_reload() {
   cmd_up --all "$@"
 }
 
+# One-step post-merge walk: collapse the per-PR post-merge ritual into a single
+# invocation. Fast-forward-pull main, prune the merged local branch via the
+# existing scripts/cleanup-merged, optionally confirm a given issue is closed,
+# then run reload LAST so its built-in /healthz readiness gate (#628 — non-zero
+# exit + log tail on failure) and MCP-reconnect verdict (#612) are inherited and
+# the verdict is the command's final printed line. reload is the down-then-up
+# stack primitive this composes. An optional leading numeric arg is the issue
+# number to confirm closed (warn-only, non-fatal); remaining flags (--start-deps,
+# a redundant --all) forward to cmd_reload unchanged.
+cmd_post_merge() {
+  print "post-merge: starting"
+
+  local issue=''
+  if [[ "${1:-}" == <-> ]]; then
+    issue="$1"
+    shift
+  fi
+
+  # Sync main. --ff-only refuses a non-fast-forward merge, so a diverged local
+  # main exits non-zero (ZERR trap reports the site) rather than silently landing
+  # a merge commit or proceeding onto a stale tree. git pull updates the reflog,
+  # so cmd_up's merge-aware HEAD@{1}..HEAD diff reflects exactly what was pulled.
+  git checkout main
+  git pull --ff-only origin main
+
+  # Prune the merged branch. cleanup-merged self-fetches origin/main and deletes
+  # only branches that are ancestors of origin/main, so it is safe to call
+  # unconditionally and never deletes main. Reuse, do not reimplement.
+  "${REPO_ROOT}/scripts/cleanup-merged"
+
+  # Optional issue-closed confirmation. Warn-only: a not-yet-closed issue must
+  # not block the local stack reload, and an absent/unauthenticated gh degrades
+  # gracefully. Placed BEFORE reload so the reconnect verdict stays the last line.
+  if [[ -n "$issue" ]]; then
+    local state=''
+    if state="$(gh issue view "$issue" --json state --jq '.state' 2>/dev/null)"; then
+      if [[ "$state" != "CLOSED" ]]; then
+        print -u2 "warning: issue #${issue} is ${state}, not CLOSED"
+      else
+        print "issue #${issue}: closed"
+      fi
+    else
+      print -u2 "warning: could not confirm issue #${issue} state (gh unavailable or unauthenticated)"
+    fi
+  fi
+
+  # reload LAST: forces --all, gates the spawn on _await_healthz (log tail +
+  # exit 1 on failure), and prints the MCP reconnect verdict as its final line.
+  cmd_reload "$@"
+}
+
 _usage() {
-  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|down>"
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|down>"
   print -u2 ""
-  print -u2 "  reload is the one-step post-merge command (down-then-up); plain up no-ops"
-  print -u2 "  when fishhawkd is already running and so never rebuilds."
+  print -u2 "  post-merge runs the full per-PR post-merge walk: git pull --ff-only,"
+  print -u2 "  scripts/cleanup-merged, an optional issue-closed check (<issue>), then"
+  print -u2 "  reload (whose /healthz gate + MCP reconnect verdict are inherited)."
+  print -u2 ""
+  print -u2 "  reload is the down-then-up stack primitive post-merge composes; plain up"
+  print -u2 "  no-ops when fishhawkd is already running and so never rebuilds."
   print -u2 ""
   print -u2 "binary activation after a rebuild:"
   print -u2 "  fishhawkd        rebuilt + restarted by up/reload"
@@ -473,9 +528,10 @@ _usage() {
 # without triggering the dispatch (and thus the stack).
 if [[ -z "${DEV_LIB_ONLY:-}" ]]; then
   case "$cmd" in
-    up)     cmd_up "${@:2}" ;;
-    reload) cmd_reload "${@:2}" ;;
-    down)   cmd_down ;;
-    *)      _usage; exit 1 ;;
+    up)         cmd_up "${@:2}" ;;
+    reload)     cmd_reload "${@:2}" ;;
+    post-merge) cmd_post_merge "${@:2}" ;;
+    down)       cmd_down ;;
+    *)          _usage; exit 1 ;;
   esac
 fi
