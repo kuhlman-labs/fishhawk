@@ -31,6 +31,22 @@ func NewReviewer(cfg Config) *Reviewer {
 	return &Reviewer{client: NewClient(cfg)}
 }
 
+// SetMaxRetries overrides the retry budget on the underlying Client AFTER
+// construction, assigning n directly and bypassing NewClient's zero->1
+// normalisation. This is the explicit-override path the env wiring uses: Go
+// cannot distinguish an unset field from an explicit 0, so NewClient always
+// defaults a zero MaxRetries to 1 (production retries a transient crash once),
+// and an operator who passes 0 to disable retry must route through this setter.
+// A negative n is clamped to 0 (a single attempt, retry disabled). The caller
+// owns the default — this mirrors the documented "set MaxRetries after
+// NewClient" idiom on Config.MaxRetries.
+func (r *Reviewer) SetMaxRetries(n int) {
+	if n < 0 {
+		n = 0
+	}
+	r.client.cfg.MaxRetries = n
+}
+
 // Review invokes the `claude` CLI with the full promptText, JSON-decodes the
 // envelope's result text into a ReviewVerdict, and validates the verdict
 // belongs to the closed set. Subprocess failure, non-JSON output, and an

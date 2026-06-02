@@ -142,6 +142,11 @@ func runServe(args []string, logSink io.Writer) int {
 	planReviewMaxTokens := fs.Int("plan-review-max-tokens",
 		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_TOKENS", 4096),
 		"maximum tokens for plan-review agent responses")
+	planReviewMaxRetries := fs.Int("plan-review-max-retries",
+		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_RETRIES", 1),
+		"in-adapter retry budget for the local-mode `claude` reviewer's transient-crash class (#620); "+
+			"counts retries not attempts (N => N+1 attempts), 0 disables retry (single attempt), unset defaults to 1. "+
+			"Used only by the claudecode adapter — the anthropic SDK adapter has no retry field")
 	planReviewTimeout := fs.Duration("plan-review-timeout",
 		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", 300*time.Second),
 		"effective per-invocation bound for plan-review agent calls (since #584); "+
@@ -177,17 +182,23 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.Int("max_tokens", *planReviewMaxTokens),
 			slog.Duration("timeout", *planReviewTimeout))
 	case *enableLocalClaudeReviewer:
-		cfg.PlanReviewer = claudecode.NewReviewer(claudecode.Config{
+		reviewer := claudecode.NewReviewer(claudecode.Config{
 			Binary:    *localClaudeBinary,
 			Model:     *localClaudeModel,
 			MaxTokens: *planReviewMaxTokens,
 			Timeout:   *planReviewTimeout,
 		})
+		// Apply the env-resolved retry budget past NewClient's zero->1
+		// normalisation: an explicit 0 means retry disabled (single
+		// attempt), which the constructor alone cannot express.
+		reviewer.SetMaxRetries(*planReviewMaxRetries)
+		cfg.PlanReviewer = reviewer
 		logger.Info("plan review agent configured",
 			slog.String("adapter", "claudecode"),
 			slog.String("binary", *localClaudeBinary),
 			slog.String("model", *localClaudeModel),
 			slog.Int("max_tokens", *planReviewMaxTokens),
+			slog.Int("max_retries", *planReviewMaxRetries),
 			slog.Duration("timeout", *planReviewTimeout))
 	default:
 		// #574 / ADR-027: tightened from the plain "gateless" warning so

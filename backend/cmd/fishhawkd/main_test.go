@@ -106,3 +106,35 @@ func TestEnvOr(t *testing.T) {
 		}
 	})
 }
+
+// TestEnvOrInt_PlanReviewMaxRetries covers the FISHHAWKD_PLAN_REVIEW_MAX_RETRIES
+// resolution through envOrInt: unset->default, explicit "0"->0 (the retry-
+// disable path, NOT treated as empty), a positive value, and a non-integer
+// falling back to the default.
+func TestEnvOrInt_PlanReviewMaxRetries(t *testing.T) {
+	const key = "FISHHAWKD_PLAN_REVIEW_MAX_RETRIES"
+	t.Run("unset returns default 1", func(t *testing.T) {
+		t.Setenv(key, "")
+		if got := envOrInt(key, 1); got != 1 {
+			t.Errorf("got %d, want 1", got)
+		}
+	})
+	t.Run("explicit 0 resolves to 0", func(t *testing.T) {
+		t.Setenv(key, "0")
+		if got := envOrInt(key, 1); got != 0 {
+			t.Errorf("got %d, want 0 (explicit 0 must reach the setter as disable)", got)
+		}
+	})
+	t.Run("positive value resolves verbatim", func(t *testing.T) {
+		t.Setenv(key, "3")
+		if got := envOrInt(key, 1); got != 3 {
+			t.Errorf("got %d, want 3", got)
+		}
+	})
+	t.Run("non-integer falls back to default", func(t *testing.T) {
+		t.Setenv(key, "notanint")
+		if got := envOrInt(key, 1); got != 1 {
+			t.Errorf("got %d, want 1 (garbage falls back to default)", got)
+		}
+	})
+}

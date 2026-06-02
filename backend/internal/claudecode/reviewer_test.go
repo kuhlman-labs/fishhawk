@@ -42,6 +42,11 @@ func TestHelperProcess(t *testing.T) {
 		// itself, surfacing as an *exec.ExitError ("signal: killed") with
 		// ctx.Err()==nil (an external/OOM kill, the retryable class).
 		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		// SIGKILL delivery is asynchronous; block so the deferred
+		// os.Exit(0) cannot win the race and exit 0 with empty output
+		// before the signal lands (which would surface as a non-retryable
+		// decode error and flake the retry-class tests).
+		select {}
 	case "slow":
 		// Sleep past a short Timeout so the per-attempt deadline fires and
 		// the child is killed with ctx.Err()==DeadlineExceeded (the
@@ -236,6 +241,58 @@ func TestReviewer_RetryDisabled(t *testing.T) {
 	}
 	if attempts != 1 {
 		t.Errorf("attempts = %d, want 1 (MaxRetries=0 disables retry)", attempts)
+	}
+}
+
+// TestReviewer_SetMaxRetriesDisablesRetry asserts SetMaxRetries(0) yields a
+// single attempt even on the retryable crash class — proving the explicit-0
+// override bypasses NewClient's zero->1 normalisation (the env disable path).
+func TestReviewer_SetMaxRetriesDisablesRetry(t *testing.T) {
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.SetMaxRetries(0)
+	r.client.Cmd = countingHelperCommand("killed", &attempts)
+
+	_, _, err := r.Review(context.Background(), "review this plan")
+	if err == nil {
+		t.Fatal("expected error from crashing subprocess, got nil")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (SetMaxRetries(0) disables retry)", attempts)
+	}
+}
+
+// TestReviewer_SetMaxRetriesBudget asserts SetMaxRetries(3) yields 4 attempts
+// (N retries => N+1 attempts) on a persistently retryable crash.
+func TestReviewer_SetMaxRetriesBudget(t *testing.T) {
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.SetMaxRetries(3)
+	r.client.Cmd = countingHelperCommand("killed", &attempts)
+
+	_, _, err := r.Review(context.Background(), "review this plan")
+	if err == nil {
+		t.Fatal("expected error from exhausted retries, got nil")
+	}
+	if attempts != 4 {
+		t.Errorf("attempts = %d, want 4 (SetMaxRetries(3) => 3+1 attempts)", attempts)
+	}
+}
+
+// TestReviewer_SetMaxRetriesClampsNegative asserts a negative budget is clamped
+// to 0, yielding a single attempt rather than panicking or looping unbounded.
+func TestReviewer_SetMaxRetriesClampsNegative(t *testing.T) {
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.SetMaxRetries(-1)
+	r.client.Cmd = countingHelperCommand("killed", &attempts)
+
+	_, _, err := r.Review(context.Background(), "review this plan")
+	if err == nil {
+		t.Fatal("expected error from crashing subprocess, got nil")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (negative budget clamps to 0)", attempts)
 	}
 }
 
