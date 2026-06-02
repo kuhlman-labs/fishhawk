@@ -189,6 +189,14 @@ type Trigger struct {
 	// section so the agent knows why the previous attempt was rejected.
 	// Nil when no prior rejection exists or the comment was empty.
 	PriorRejectionFeedback *string
+	// PriorSchemaValidationError is the standard_v1 validation error from
+	// the most recent in-run plan attempt that failed schema validation
+	// after coercion (#646). When non-nil and non-empty, buildPlan injects
+	// a binding "fix exactly this" section so the re-dispatched plan agent
+	// knows precisely which violation to correct. Mirrors
+	// PriorRejectionFeedback's capped-injection pattern. Nil when no prior
+	// schema-retry was recorded for this run.
+	PriorSchemaValidationError *string
 	// PredictionContext carries runtime prediction data for the implement-
 	// stage prompt. When non-nil, buildImplement appends a Budget context
 	// section surfacing predicted_runtime_minutes, predicted_runtime_confidence,
@@ -396,6 +404,18 @@ func buildPlan(t Trigger) string {
 		b.WriteString("### Prior plan-stage rejection feedback\n\n")
 		b.WriteString("The operator rejected the most recent plan for this issue with the following rationale. You MUST address this feedback in your new plan:\n\n")
 		b.WriteString(feedback)
+		b.WriteString("\n\n")
+	}
+
+	if t.PriorSchemaValidationError != nil && *t.PriorSchemaValidationError != "" {
+		validationErr := *t.PriorSchemaValidationError
+		const maxFeedbackBytes = 4000
+		if len(validationErr) > maxFeedbackBytes {
+			validationErr = validationErr[:maxFeedbackBytes] + "...[truncated]"
+		}
+		b.WriteString("### Prior plan-stage schema validation failure\n\n")
+		b.WriteString("Your previous plan failed standard_v1 validation with the following error. Fix exactly this and re-emit a valid plan:\n\n")
+		b.WriteString(validationErr)
 		b.WriteString("\n\n")
 	}
 

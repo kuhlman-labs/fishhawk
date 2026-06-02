@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -50,25 +51,88 @@ func (r *recordingOrchestratorRepo) sawTransitionTo(to run.StageState) bool {
 	return false
 }
 
+// storingAuditFake extends auditFake so ListForRunByCategory reads back
+// the entries AppendChained stored. The plain auditFake errors on
+// ListForRunByCategory; the #646 schema-retry budget counter
+// (countSchemaRetries) and the cross-boundary seam test
+// (writer→audit→reader→render) both need a fake that actually persists
+// and returns entries by category.
+type storingAuditFake struct {
+	*auditFake
+}
+
+func newStoringAuditFake() *storingAuditFake {
+	return &storingAuditFake{auditFake: newAuditFake()}
+}
+
+// ListForRunByCategory returns the stored AppendChained entries for the
+// run+category in insertion order (≈ ts ASC), matching the production
+// ordering loadPriorSchemaValidationError's newest-first scan assumes.
+func (a *storingAuditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []*audit.Entry
+	for _, p := range a.appended {
+		if p.RunID == runID && p.Category == category {
+			rid := p.RunID
+			out = append(out, &audit.Entry{
+				RunID:    &rid,
+				StageID:  p.StageID,
+				Category: p.Category,
+				Payload:  p.Payload,
+			})
+		}
+	}
+	return out, nil
+}
+
 // newPlanSequenceServer wires the full plan-stage path — signing, trace
 // store, audit, artifacts, a transition-recording run repo, and a real
 // orchestrator — so a test can drive the runner's true trace-then-plan
 // upload order and observe the resulting stage + run states. (#603)
-func newPlanSequenceServer(t *testing.T) (*Server, *recordingOrchestratorRepo, *fakeArtifactRepo, *signingFake) {
+//
+// The audit fake is the storing variant so the #646 schema-retry budget
+// counter (which reads plan_schema_retry entries back) behaves as in
+// production rather than always seeing a zero count.
+func newPlanSequenceServer(t *testing.T) (*Server, *recordingOrchestratorRepo, *fakeArtifactRepo, *signingFake, *storingAuditFake) {
 	t.Helper()
 	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
 	art := newFakeArtifactRepo()
 	sf := newSigningFake()
+	au := newStoringAuditFake()
 	s := New(Config{
 		Addr:         "127.0.0.1:0",
 		SigningRepo:  sf,
 		TraceStore:   newTraceStoreFake(),
-		AuditRepo:    newAuditFake(),
+		AuditRepo:    au,
 		RunRepo:      rr,
 		ArtifactRepo: art,
 		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
 	})
-	return s, rr, art, sf
+	return s, rr, art, sf, au
+}
+
+// seedSchemaRetryEntry appends a plan_schema_retry audit entry directly,
+// pre-loading the #646 budget so a test can exercise the
+// budget-exhausted (fail-B) branch deterministically.
+func seedSchemaRetryEntry(t *testing.T, au *storingAuditFake, runID, stageID uuid.UUID, validationErr string) {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"attempt":          1,
+		"validation_error": validationErr,
+	})
+	kind := audit.ActorKind("system")
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Category:  "plan_schema_retry",
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("seed plan_schema_retry: %v", err)
+	}
 }
 
 // TestPlanStage_TraceThenInvalidPlan_EndsFailed reproduces the #603
@@ -77,11 +141,18 @@ func newPlanSequenceServer(t *testing.T) (*Server, *recordingOrchestratorRepo, *
 // failed — never awaiting_approval — and the run must be advanced to
 // terminal failed rather than stranded.
 func TestPlanStage_TraceThenInvalidPlan_EndsFailed(t *testing.T) {
-	s, rr, _, sf := newPlanSequenceServer(t)
+	s, rr, _, sf, au := newPlanSequenceServer(t)
 	runRow := rr.seedRun()
 	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
 	planStage.RequiresApproval = true // gated plan stage — the #603 shape
 	priv, _ := sf.issue(t, runRow.ID)
+
+	// Exhaust the #646 in-run schema-retry budget up front so this upload
+	// takes the terminal fail-B path the #603 invariant guards (an invalid
+	// plan never reaches the gate and never strands the run). The
+	// first-failure re-dispatch behavior is covered by
+	// TestShipPlan_SchemaRetry_FirstFailure_ReopensStage.
+	seedSchemaRetryEntry(t, au, runRow.ID, planStage.ID, "prior validation error")
 
 	// 1. Trace upload (raw). With no plan artifact yet, the trace handler
 	//    must leave the plan stage in running.
@@ -119,7 +190,7 @@ func TestPlanStage_TraceThenInvalidPlan_EndsFailed(t *testing.T) {
 // running, and the plan-upload handler drives it to awaiting_approval once
 // the valid plan lands.
 func TestPlanStage_TraceThenValidPlan_AdvancesToAwaitingApproval(t *testing.T) {
-	s, rr, _, sf := newPlanSequenceServer(t)
+	s, rr, _, sf, _ := newPlanSequenceServer(t)
 	runRow := rr.seedRun()
 	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
 	planStage.RequiresApproval = true
@@ -140,6 +211,210 @@ func TestPlanStage_TraceThenValidPlan_AdvancesToAwaitingApproval(t *testing.T) {
 
 	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
 		t.Errorf("final stage state = %q, want awaiting_approval (plan handler must drive the terminal advance)", got)
+	}
+}
+
+// invalidPlanBytes is a standard_v1 plan that fails validation and is
+// NOT coercible (missing required fields, not a string-elision slip), so
+// it reaches the #646 schema-retry backstop rather than being auto-fixed
+// by plan.TryCoerce.
+func invalidPlanBytes() []byte { return []byte(`{"plan_version":"standard_v1"}`) }
+
+// TestShipPlan_SchemaRetry_FirstFailure_ReopensStage covers the #646
+// happy path: with the orchestrator + audit wired and budget available,
+// the first post-coercion invalid plan re-opens the plan stage (does NOT
+// fail-B), records a plan_schema_retry audit entry, and signals
+// retry_scheduled in the 400 response. The transient FailureA must not
+// leak — the stage lands re-driveable (pending/dispatched, no failure
+// metadata) and the run stays non-terminal.
+func TestShipPlan_SchemaRetry_FirstFailure_ReopensStage(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, invalidPlanBytes(), "")
+	if wp.Code != http.StatusBadRequest {
+		t.Fatalf("plan status = %d, want 400:\n%s", wp.Code, wp.Body.String())
+	}
+
+	// retry_scheduled must be set so the local operator/driver knows a
+	// re-attempt was set up rather than a terminal fail.
+	var resp struct {
+		Error struct {
+			Details struct {
+				RetryScheduled bool `json:"retry_scheduled"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(wp.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v\n%s", err, wp.Body.String())
+	}
+	if !resp.Error.Details.RetryScheduled {
+		t.Errorf("response missing retry_scheduled=true:\n%s", wp.Body.String())
+	}
+
+	// The stage must NOT be terminally failed — it was re-opened and the
+	// orchestrator (local path, no GitHub) walked it pending → dispatched.
+	got := rr.stagesByID[planStage.ID]
+	if got.State == run.StageStateFailed {
+		t.Errorf("stage state = failed; #646 requires re-open on first failure")
+	}
+	if got.State != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched (orchestrator re-dispatch on local path)", got.State)
+	}
+	// The transient FailureA must have been cleared by RetryStage.
+	if got.FailureCategory != nil {
+		t.Errorf("stage still carries failure category %q; RetryStage must clear it", *got.FailureCategory)
+	}
+	// Never reached the gate; run not stranded/terminal.
+	if rr.sawTransitionTo(run.StageStateAwaitingApproval) {
+		t.Errorf("stage transitioned to awaiting_approval on an invalid plan")
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Errorf("run state = failed; a scheduled retry must not fail the run")
+	}
+
+	// Exactly one plan_schema_retry audit entry was chained.
+	entries, _ := au.ListForRunByCategory(context.Background(), runRow.ID, "plan_schema_retry")
+	if len(entries) != 1 {
+		t.Fatalf("plan_schema_retry entries = %d, want 1", len(entries))
+	}
+}
+
+// TestShipPlan_SchemaRetry_BudgetExhausted_FailsB confirms that a second
+// invalid upload (one plan_schema_retry already recorded) exhausts the
+// budget and falls through to the unchanged fail-B + advance path (#646).
+func TestShipPlan_SchemaRetry_BudgetExhausted_FailsB(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	// Budget already spent by a prior attempt.
+	seedSchemaRetryEntry(t, au, runRow.ID, planStage.ID, "prior validation error")
+
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, invalidPlanBytes(), "")
+	if wp.Code != http.StatusBadRequest {
+		t.Fatalf("plan status = %d, want 400:\n%s", wp.Code, wp.Body.String())
+	}
+
+	// No new retry scheduled — fail-B path.
+	var resp struct {
+		Error struct {
+			Details struct {
+				RetryScheduled bool `json:"retry_scheduled"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(wp.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Error.Details.RetryScheduled {
+		t.Errorf("retry_scheduled set on a budget-exhausted upload; want fail-B")
+	}
+
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed (budget exhausted → fail-B)", got)
+	}
+	if got := rr.runs[runRow.ID].State; got != run.StateFailed {
+		t.Errorf("run state = %q, want failed (fail-B advances the run)", got)
+	}
+	// No second plan_schema_retry entry was written.
+	entries, _ := au.ListForRunByCategory(context.Background(), runRow.ID, "plan_schema_retry")
+	if len(entries) != 1 {
+		t.Errorf("plan_schema_retry entries = %d, want 1 (no new entry on exhausted budget)", len(entries))
+	}
+}
+
+// TestShipPlan_SchemaRetry_NilOrchestrator_FailsB confirms the
+// no-regression fallback: without an orchestrator to re-dispatch, an
+// invalid plan fails-B exactly as before #646.
+func TestShipPlan_SchemaRetry_NilOrchestrator_FailsB(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	// newPlanServer wires signing+artifact+audit+run but NO orchestrator.
+	s, sf, _, _, rr := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	wp := shipPlanRequest(t, s, runID, stageID, priv, invalidPlanBytes(), "")
+	if wp.Code != http.StatusBadRequest {
+		t.Fatalf("plan status = %d, want 400:\n%s", wp.Code, wp.Body.String())
+	}
+	var resp struct {
+		Error struct {
+			Details struct {
+				RetryScheduled bool `json:"retry_scheduled"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(wp.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Error.Details.RetryScheduled {
+		t.Errorf("retry_scheduled set with nil orchestrator; want fail-B fallback")
+	}
+	if got := rr.getStages[stageID].State; got != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed (nil orchestrator → fail-B)", got)
+	}
+}
+
+// TestShipPlan_SchemaRetry_SeamToPromptRender is the cross-boundary seam
+// test (#646, cf. #618): it drives handleShipPlan with an invalid plan
+// (the writer records validation_error to a plan_schema_retry entry),
+// then calls handleGetStagePromptRender on the re-opened plan stage (the
+// reader pulls it back) and asserts the rendered prompt carries the
+// recorded validation error. This guards the validation_error payload-key
+// contract between plan.go and prompt.go end-to-end — per-layer units pass
+// while the seam could silently break.
+func TestShipPlan_SchemaRetry_SeamToPromptRender(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	// Writer: invalid plan → schedules a retry, recording validation_error.
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, invalidPlanBytes(), "")
+	if wp.Code != http.StatusBadRequest {
+		t.Fatalf("plan status = %d, want 400:\n%s", wp.Code, wp.Body.String())
+	}
+
+	// Pull the exact validation_error that was persisted, so the assertion
+	// pins the writer↔reader payload-key contract rather than a fixed string.
+	entries, _ := au.ListForRunByCategory(context.Background(), runRow.ID, "plan_schema_retry")
+	if len(entries) != 1 {
+		t.Fatalf("plan_schema_retry entries = %d, want 1", len(entries))
+	}
+	var stored struct {
+		ValidationError string `json:"validation_error"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &stored); err != nil {
+		t.Fatalf("unmarshal stored payload: %v", err)
+	}
+	if stored.ValidationError == "" {
+		t.Fatal("stored validation_error is empty")
+	}
+
+	// Reader + render: fetch the re-opened plan stage's prompt.
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", planStage.ID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt-render status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var pr promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &pr); err != nil {
+		t.Fatalf("decode prompt response: %v", err)
+	}
+	if !strings.Contains(pr.Prompt, "### Prior plan-stage schema validation failure") {
+		t.Errorf("rendered prompt missing schema-validation section:\n%s", pr.Prompt)
+	}
+	if !strings.Contains(pr.Prompt, stored.ValidationError) {
+		t.Errorf("rendered prompt missing the recorded validation_error %q:\n%s", stored.ValidationError, pr.Prompt)
 	}
 }
 
