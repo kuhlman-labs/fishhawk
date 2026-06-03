@@ -113,6 +113,29 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Printf(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":%q}}]}}`+"\n",
 			os.Getenv("OOT_PATH"))
 		fmt.Println(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`)
+	case "loop":
+		// Emit many identical Bash tool_use lines so the loop detector
+		// trips on an unbroken run of the same signature. A trailing sleep
+		// lets the harness kill us after it trips; if we somehow exit
+		// cleanly first the test still asserts the trip on the events read.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		for n := 0; n < 30; n++ {
+			fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"go test ./..."}}]}}`)
+			os.Stdout.Sync()
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(500 * time.Millisecond)
+	case "varied_tools":
+		// Distinct tool calls (different files / commands) interleaved with
+		// a couple of legitimate repeats — must NOT trip the detector. Ends
+		// with a clean result so the stage succeeds.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.go"}}]}}`)
+		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.go"}}]}}`)
+		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"a.go"}}]}}`)
+		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"go test"}}]}}`)
+		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"b.go"}}]}}`)
+		fmt.Println(`{"type":"result","usage":{"input_tokens":5,"output_tokens":5}}`)
 	case "echo_env":
 		// Echo a single env var so we can assert the harness
 		// wired API key forwarding correctly.
@@ -811,6 +834,133 @@ func TestInvoke_OutOfTreeWriteSurfaced(t *testing.T) {
 	}
 	if !strings.Contains(payload, `"stage":"implement"`) {
 		t.Errorf("event missing stage: %s", payload)
+	}
+}
+
+func TestToolCallSignatures(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want []string
+	}{
+		{
+			name: "single_tool_use",
+			line: `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.go"}}]}}`,
+			want: []string{`Read {"file_path":"a.go"}`},
+		},
+		{
+			name: "multiple_tool_uses_one_line",
+			line: `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.go"}},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`,
+			want: []string{`Read {"file_path":"a.go"}`, `Bash {"command":"ls"}`},
+		},
+		{
+			// Key order in the input must not change the signature — the
+			// canonicaliser sorts object keys.
+			name: "key_order_canonicalised",
+			line: `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"new":"y","file_path":"a.go"}}]}}`,
+			want: []string{`Edit {"file_path":"a.go","new":"y"}`},
+		},
+		{
+			name: "non_assistant_line",
+			line: `{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`,
+			want: nil,
+		},
+		{
+			name: "text_block_no_tool",
+			line: `{"type":"assistant","message":{"content":[{"type":"text","text":"thinking"}]}}`,
+			want: nil,
+		},
+		{
+			name: "malformed_line",
+			line: `not json`,
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := toolCallSignatures([]byte(tc.line))
+			if len(got) != len(tc.want) {
+				t.Fatalf("signatures = %#v, want %#v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("signature[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestInvoke_LoopDetected drives the full scan->detector->abort path: a
+// helper that emits a run of identical tool_use lines trips the detector
+// (LoopThreshold lowered for determinism) and the stage fails with
+// agent.ErrLoopDetected, category A, a loop_detected event, and a reason
+// naming the count.
+func TestInvoke_LoopDetected(t *testing.T) {
+	inv := &Invoker{
+		Cmd:           helperCommand("loop"),
+		Now:           frozenNow(),
+		LoopThreshold: 4,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "rid-loop", Stage: "implement", Prompt: "go",
+	})
+	if !errors.Is(err, agent.ErrLoopDetected) {
+		t.Fatalf("err = %v, want wrapping ErrLoopDetected", err)
+	}
+	if errors.Is(err, agent.ErrAgentFailed) {
+		t.Error("ErrLoopDetected must not wrap ErrAgentFailed")
+	}
+	if res.OK {
+		t.Error("OK = true on loop detected")
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A", res.FailureCategory)
+	}
+	if !strings.Contains(res.FailureReason, "loop detected") {
+		t.Errorf("FailureReason = %q, want it to mention 'loop detected'", res.FailureReason)
+	}
+	if !strings.Contains(res.FailureReason, "4 identical") {
+		t.Errorf("FailureReason = %q, want it to name the count (4)", res.FailureReason)
+	}
+	var loopEvents int
+	for _, ev := range res.Events {
+		if ev.Kind == "loop_detected" {
+			loopEvents++
+			if !strings.Contains(string(ev.Payload), `"count":4`) {
+				t.Errorf("loop_detected payload missing count: %s", ev.Payload)
+			}
+			if !strings.Contains(string(ev.Payload), `"run_id":"rid-loop"`) {
+				t.Errorf("loop_detected payload missing run_id: %s", ev.Payload)
+			}
+		}
+	}
+	if loopEvents != 1 {
+		t.Errorf("loop_detected event count = %d, want 1", loopEvents)
+	}
+}
+
+// TestInvoke_NoLoopOnVariedTools confirms the detector does not false-abort
+// a legitimate trace of varied tool calls with a couple of benign repeats.
+func TestInvoke_NoLoopOnVariedTools(t *testing.T) {
+	inv := &Invoker{
+		Cmd:           helperCommand("varied_tools"),
+		Now:           frozenNow(),
+		LoopThreshold: 3,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "rid-varied", Stage: "implement", Prompt: "go",
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; varied tools must not trip the loop detector: %q", res.FailureReason)
+	}
+	for _, ev := range res.Events {
+		if ev.Kind == "loop_detected" {
+			t.Errorf("loop_detected event emitted on a varied-tool trace: %s", ev.Payload)
+		}
 	}
 }
 

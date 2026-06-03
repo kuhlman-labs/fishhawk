@@ -101,6 +101,15 @@ type Invoker struct {
 	// A per-Invoker field rather than a package-level global so
 	// parallel tests can shorten it without racing on shared state.
 	HeartbeatInterval time.Duration
+
+	// LoopThreshold is the number of identical CONSECUTIVE tool-call
+	// signatures that trips the no-progress / duplicate-action loop
+	// detector and aborts the stage with agent.ErrLoopDetected. Zero
+	// means agent.DefaultLoopThreshold — a deliberately conservative
+	// value so legitimate repeated calls (re-reading a file, retrying a
+	// flaky command a couple of times) never false-abort real work. A
+	// per-Invoker field so tests can lower it deterministically.
+	LoopThreshold int
 }
 
 // New returns an Invoker configured to use the system `claude`
@@ -333,6 +342,17 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	outputTokens := 0
 	model := ""
 	budgetHit := false
+	// Loop / duplicate-action detection (#653). The detector watches the
+	// tool-call signature stream and trips on an unbroken run of identical
+	// signatures; on trip we kill the agent and fail the stage with
+	// agent.ErrLoopDetected. loopSig/loopCount carry the figures into the
+	// audit reason. The detector is per-invokeOnce (not shared across
+	// thinking-block retries) because a fresh re-spawn starts a fresh
+	// action stream.
+	loopDetector := agent.NewLoopDetector(i.LoopThreshold)
+	loopHit := false
+	loopSig := ""
+	loopCount := 0
 	// resultPayload retains the terminal type=="result" event so a
 	// post-mortem can inspect is_error / api_error_status for
 	// thinking-block detection (see isThinkingBlock400).
@@ -440,6 +460,33 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 				}),
 			})
 		}
+		// Feed each tool-call signature on this line to the loop detector.
+		// On trip, mark a loop_detected trace event, kill the agent, and
+		// break out of the scan loop — the terminal switch maps loopHit to
+		// agent.ErrLoopDetected. Signatures are extracted fail-open, so an
+		// unparseable line contributes none.
+		for _, sig := range toolCallSignatures(line) {
+			if loopDetector.Observe(sig) {
+				loopHit = true
+				loopSig = sig
+				loopCount = loopDetector.Streak()
+				res.Events = append(res.Events, agent.Event{
+					Kind:      "loop_detected",
+					Timestamp: now(),
+					Payload: agent.MakePayload(map[string]any{
+						"signature": loopSig,
+						"count":     loopCount,
+						"run_id":    inv.RunID,
+						"stage":     inv.Stage,
+					}),
+				})
+				_ = cmd.Process.Kill()
+				break
+			}
+		}
+		if loopHit {
+			break
+		}
 		progMu.Lock()
 		turns++
 		lastKind = ev.Kind
@@ -499,6 +546,17 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			fmt.Sprintf("token budget exceeded: used %d, max %d", tokensUsed, inv.Budget.MaxTokens),
 			"budget_exceeded",
 		), false, agent.ErrBudgetExceeded
+
+	case loopHit:
+		// A loop is terminal and NOT retried (false): re-running the same
+		// prompt would just loop again. Classified category-A so stage-level
+		// handling treats it like any other agent failure, but the sentinel
+		// is ErrLoopDetected so callers can switch on it.
+		return failureResult(res, now(), "A",
+			fmt.Sprintf("loop detected: %d identical consecutive tool calls: %s",
+				loopCount, truncateSignature(loopSig)),
+			"loop_detected",
+		), false, agent.ErrLoopDetected
 
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return failureResult(res, now(), "A",
@@ -678,6 +736,72 @@ func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo, bool) {
 		Timestamp: ts,
 		Payload:   json.RawMessage(trimmed),
 	}, info, hasUsage
+}
+
+// toolCallSignatures extracts a stable signature for every tool_use block
+// in one Claude Code assistant stream-json line, for the loop detector
+// (#653). A signature is the tool name plus its canonicalised input
+// arguments, so two identical "Read file X" calls collide while "Read
+// file X" and "Read file Y" stay distinct — only a genuinely repeated
+// ACTION accumulates toward a loop, not merely a repeated tool.
+//
+// Like outOfTreeWrites it is fail-open: a non-assistant line, a non-tool
+// block, an unparseable line, or unparseable input all yield no signatures
+// rather than a panic, so stream-json schema drift degrades to no-signal.
+func toolCallSignatures(line []byte) []string {
+	var msg struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type  string          `json:"type"`
+				Name  string          `json:"name"`
+				Input json.RawMessage `json:"input"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(line, &msg); err != nil || msg.Type != "assistant" {
+		return nil
+	}
+	var sigs []string
+	for _, block := range msg.Message.Content {
+		if block.Type != "tool_use" {
+			continue
+		}
+		sigs = append(sigs, block.Name+" "+canonicalInput(block.Input))
+	}
+	return sigs
+}
+
+// canonicalInput renders a tool_use input to a stable string so equal
+// arguments compare equal regardless of key order. json.Marshal sorts map
+// keys, so round-tripping through an interface{} canonicalises object key
+// ordering. Fail-open: on any parse/marshal failure the raw bytes are used
+// verbatim (still deterministic for byte-identical inputs).
+func canonicalInput(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return string(raw)
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return string(raw)
+	}
+	return string(b)
+}
+
+// truncateSignature bounds a signature embedded in an audit/failure reason
+// so a large tool input (e.g. a full file body in a Write call) cannot
+// bloat the reason string. The detection figures (count) are the
+// load-bearing part; the signature is a hint.
+func truncateSignature(sig string) string {
+	const max = 160
+	if len(sig) <= max {
+		return sig
+	}
+	return sig[:max] + "…"
 }
 
 // outOfTreeWrite is one detected file-writing tool_use whose target

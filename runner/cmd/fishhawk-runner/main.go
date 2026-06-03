@@ -963,6 +963,8 @@ func classifyErr(err error) string {
 		return "binary_not_found"
 	case errors.Is(err, agent.ErrAgentThinkingBlock):
 		return "agent_api_thinking_block"
+	case errors.Is(err, agent.ErrLoopDetected):
+		return "loop_detected"
 	case errors.Is(err, agent.ErrAgentFailed):
 		return "agent_failed"
 	default:

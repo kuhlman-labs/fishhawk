@@ -168,6 +168,17 @@ var (
 	// Result.FailureCategory=="A" (still set on this path), not
 	// errors.Is(ErrAgentFailed).
 	ErrAgentThinkingBlock = errors.New("agent: api thinking-block 400")
+
+	// ErrLoopDetected marks a no-progress / duplicate-action loop the
+	// runner aborted: the agent emitted the same tool-call signature N
+	// times in an unbroken consecutive run (see LoopDetector). Like
+	// ErrAgentThinkingBlock it is a peer sentinel and does NOT wrap
+	// ErrAgentFailed, so err_class classification stays unambiguous;
+	// downstream category-A handling keys off Result.FailureCategory=="A"
+	// (still set on this path). Unlike a thinking-block fault a loop is
+	// NOT retried — re-running the same prompt would just loop again — so
+	// it is returned on the first attempt with no in-driver retry.
+	ErrLoopDetected = errors.New("agent: loop detected")
 )
 
 // MakePayload marshals v to a json.RawMessage or panics. Helper for

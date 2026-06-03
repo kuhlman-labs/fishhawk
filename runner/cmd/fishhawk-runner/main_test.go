@@ -366,6 +366,8 @@ func TestClassifyErr(t *testing.T) {
 		{agent.ErrBinaryNotFound, "binary_not_found"},
 		{agent.ErrAgentThinkingBlock, "agent_api_thinking_block"},
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentThinkingBlock), "agent_api_thinking_block"},
+		{agent.ErrLoopDetected, "loop_detected"},
+		{fmt.Errorf("wrapped: %w", agent.ErrLoopDetected), "loop_detected"},
 		{agent.ErrAgentFailed, "agent_failed"},
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentFailed), "agent_failed"},
 		{errors.New("anything else"), "other"},
