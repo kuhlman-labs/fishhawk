@@ -83,6 +83,12 @@ type fakeGitHub struct {
 	getPullRequestStatus int
 	getPullRequestBody   string
 
+	createPullRequestStatus int
+	createPullRequestBody   string
+
+	listPullsStatus int
+	listPullsBody   string
+
 	graphqlStatus int
 	graphqlBody   string
 
@@ -124,6 +130,10 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		getRulesetBody:            map[int64]string{},
 		getPullRequestStatus:      http.StatusOK,
 		getPullRequestBody:        `{"number":42,"node_id":"PR_kwDOABcDEf","state":"open","merged":false,"head":{"sha":"abc123"}}`,
+		createPullRequestStatus:   http.StatusCreated,
+		createPullRequestBody:     `{"number":99,"node_id":"PR_kwDOABcZ99","state":"open","html_url":"https://github.com/x/y/pull/99","head":{"sha":"def456"}}`,
+		listPullsStatus:           http.StatusOK,
+		listPullsBody:             `[]`,
 		graphqlStatus:             http.StatusOK,
 		graphqlBody:               `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
 		getInstallationStatus:     http.StatusOK,
@@ -278,6 +288,26 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.getPullRequestStatus)
 			if fg.getPullRequestBody != "" {
 				_, _ = io.WriteString(w, fg.getPullRequestBody)
+			}
+		})
+
+	mux.HandleFunc("POST /repos/{owner}/{repo}/pulls",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.createPullRequestStatus)
+			if fg.createPullRequestBody != "" {
+				_, _ = io.WriteString(w, fg.createPullRequestBody)
+			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.listPullsStatus)
+			if fg.listPullsBody != "" {
+				_, _ = io.WriteString(w, fg.listPullsBody)
 			}
 		})
 
@@ -1612,6 +1642,146 @@ func TestGetPullRequest_ValidationErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := c.GetPullRequest(context.Background(), 1, tc.repo, tc.prNumber)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+// --- CreatePullRequest (#714 / ADR-032 consolidated decomposition PR) ---
+
+func TestCreatePullRequest_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	pr, err := c.CreatePullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+		"fishhawk/run-aaaaaaaa", "main", "Consolidated PR", "body text")
+	if err != nil {
+		t.Fatalf("CreatePullRequest: %v", err)
+	}
+	if fg.gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/pulls" {
+		t.Errorf("path = %q", fg.gotPath)
+	}
+	if fg.gotContentType != "application/json" {
+		t.Errorf("content-type = %q", fg.gotContentType)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["head"] != "fishhawk/run-aaaaaaaa" || body["base"] != "main" ||
+		body["title"] != "Consolidated PR" || body["body"] != "body text" {
+		t.Errorf("request body = %+v", body)
+	}
+	if pr.Number != 99 {
+		t.Errorf("Number = %d, want 99", pr.Number)
+	}
+	if pr.HTMLURL != "https://github.com/x/y/pull/99" {
+		t.Errorf("HTMLURL = %q", pr.HTMLURL)
+	}
+}
+
+func TestCreatePullRequest_AlreadyExists(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.createPullRequestStatus = http.StatusUnprocessableEntity
+	fg.createPullRequestBody = `{"message":"Validation Failed","errors":[{"message":"A pull request already exists for x:fishhawk/run-aaaaaaaa."}]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.CreatePullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+		"fishhawk/run-aaaaaaaa", "main", "Consolidated PR", "body")
+	if err == nil || !errors.Is(err, ErrPullRequestExists) {
+		t.Errorf("err = %v, want ErrPullRequestExists", err)
+	}
+	// A duplicate 422 must NOT be mapped to ErrValidation — the caller
+	// switches on ErrPullRequestExists to recover the existing URL.
+	if errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, should not also be ErrValidation", err)
+	}
+}
+
+func TestCreatePullRequest_OtherValidation(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.createPullRequestStatus = http.StatusUnprocessableEntity
+	fg.createPullRequestBody = `{"message":"Validation Failed","errors":[{"message":"head branch not found"}]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.CreatePullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+		"fishhawk/run-aaaaaaaa", "main", "Consolidated PR", "body")
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+	if errors.Is(err, ErrPullRequestExists) {
+		t.Errorf("err = %v, should not be ErrPullRequestExists for a non-duplicate 422", err)
+	}
+}
+
+func TestCreatePullRequest_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name       string
+		repo       RepoRef
+		head, base string
+		title      string
+		wantSubst  string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, "h", "main", "t", "owner and name"},
+		{"missing head", RepoRef{Owner: "x", Name: "y"}, "", "main", "t", "head and base"},
+		{"missing base", RepoRef{Owner: "x", Name: "y"}, "h", "", "t", "head and base"},
+		{"missing title", RepoRef{Owner: "x", Name: "y"}, "h", "main", "", "title required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.CreatePullRequest(context.Background(), 1, tc.repo, tc.head, tc.base, tc.title, "b")
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestListOpenPullRequestsByHead_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listPullsBody = `[{"number":99,"node_id":"PR_kw99","state":"open","html_url":"https://github.com/x/y/pull/99","head":{"sha":"def456"}}]`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListOpenPullRequestsByHead(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+		"fishhawk/run-aaaaaaaa", "main")
+	if err != nil {
+		t.Fatalf("ListOpenPullRequestsByHead: %v", err)
+	}
+	if fg.gotPath != "/repos/x/y/pulls" {
+		t.Errorf("path = %q", fg.gotPath)
+	}
+	// head filter must carry the "owner:branch" form and base + state.
+	if !strings.Contains(fg.gotQuery, "head=x%3Afishhawk%2Frun-aaaaaaaa") {
+		t.Errorf("query = %q, want owner:branch head filter", fg.gotQuery)
+	}
+	if !strings.Contains(fg.gotQuery, "base=main") || !strings.Contains(fg.gotQuery, "state=open") {
+		t.Errorf("query = %q, want base=main & state=open", fg.gotQuery)
+	}
+	if len(got) != 1 || got[0].Number != 99 || got[0].HTMLURL != "https://github.com/x/y/pull/99" {
+		t.Errorf("got = %+v", got)
+	}
+}
+
+func TestListOpenPullRequestsByHead_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		head      string
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, "h", "owner and name"},
+		{"missing head", RepoRef{Owner: "x", Name: "y"}, "", "head branch required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.ListOpenPullRequestsByHead(context.Background(), 1, tc.repo, tc.head, "main")
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}

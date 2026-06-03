@@ -170,6 +170,17 @@ Notes:
   parked parent does not spam the chain — discoverability rests on this single
   orchestrator-path entry. Listed here only so a future reader grepping the
   audit categories doesn't mistake it for a comment surface.
+- The consolidated-PR audit kind — `consolidated_pr_opened` (#714 / ADR-032) —
+  is an **internal, system-actor audit kind, not an issue-comment surface**.
+  Nothing in `issuecomment` posts it to the issue thread; it has no Notifier
+  method. The orchestrator's consolidated-PR path
+  (`orchestrator.go::maybeOpenConsolidatedPR`) writes it once, with a `system`
+  actor and payload `{pull_request_url}`, when a decomposed parent reaching its
+  review gate opens the single consolidated PR for the whole decomposition. It
+  is the audit trail for "the parent — not a child — owns the decomposition's
+  one PR." Best-effort: a nil `Audit` or an append failure logs at WARN and never
+  unwinds the settle. Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
 - The fan-out re-drive action audit kind — `child_redriven` (#698) — is an
   **internal, user-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it to the issue thread; it has no Notifier method. The

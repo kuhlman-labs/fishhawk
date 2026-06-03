@@ -2824,7 +2824,8 @@ func withFakeRemoteBranchExists(t *testing.T, exists bool) {
 // TestRun_ImplementStage_DecomposedFirstChild verifies that when
 // DecomposedFromRunID is set and the shared branch does not yet exist on the
 // remote, the runner uses the shared branch name, pushes with --force-with-lease
-// (ForceWithLease=true), does NOT rebase (RebaseFromRemote=false), and opens a PR.
+// (ForceWithLease=true), does NOT rebase (RebaseFromRemote=false), and — per
+// ADR-032 (#714) — does NOT open a PR (the parent run opens the consolidated PR).
 func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
@@ -2871,12 +2872,13 @@ func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 	if fp.gotArgs.RebaseFromRemote {
 		t.Error("RebaseFromRemote = true, want false for first child (branch not yet on remote)")
 	}
-	// First child: PR must be opened.
-	if fpr.gotArgs == nil {
-		t.Fatal("OpenPR not called for first decomposed child")
+	// First child: per ADR-032 the child no longer opens a PR — the parent
+	// run opens the single consolidated PR once all children settle.
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR called for first decomposed child — should be suppressed (parent opens the PR)")
 	}
-	if fu.gotPRArgs == nil {
-		t.Fatal("ShipPullRequest not called for first decomposed child")
+	if fu.gotPRArgs != nil {
+		t.Error("ShipPullRequest called for first decomposed child — should be suppressed")
 	}
 }
 
