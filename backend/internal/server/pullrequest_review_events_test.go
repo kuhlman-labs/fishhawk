@@ -28,6 +28,7 @@ type prEventsRunRepo struct {
 	stagesErr   error
 	transitions []prEventsTransition
 	transErr    error
+	curState    map[uuid.UUID]run.StageState // models the same-state no-op
 }
 
 type prEventsTransition struct {
@@ -43,17 +44,64 @@ func (r *prEventsRunRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*
 	}
 	return r.listResult, r.listErr
 }
+
+// GetRun searches the seeded runs by ID. Used by
+// ResolveReviewFromPollState (the merge-reconciler poll entrypoint).
+func (r *prEventsRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rn := range r.listResult {
+		if rn.ID == id {
+			return rn, nil
+		}
+	}
+	return nil, run.ErrNotFound
+}
+
 func (r *prEventsRunRepo) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*run.Stage, error) {
 	return r.stages[id], r.stagesErr
 }
+
+// TransitionStage models the real repo's same-state allowance: a
+// transition to the state the stage is already in is a no-op and is NOT
+// recorded. This is the basis for webhook+poll idempotency — the second
+// resolver firing on an already-terminal stage produces no duplicate
+// effective transition. Current state is seeded from the stage fixtures
+// on first touch.
 func (r *prEventsRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.transErr != nil {
 		return nil, r.transErr
 	}
+	if r.curState == nil {
+		r.curState = map[uuid.UUID]run.StageState{}
+	}
+	cur, ok := r.curState[id]
+	if !ok {
+		cur = r.seedStateLocked(id)
+		r.curState[id] = cur
+	}
+	if cur == to {
+		// Same-state no-op: not recorded as an effective transition.
+		return &run.Stage{ID: id, State: to}, nil
+	}
+	r.curState[id] = to
 	r.transitions = append(r.transitions, prEventsTransition{StageID: id, To: to})
 	return &run.Stage{ID: id, State: to}, nil
+}
+
+// seedStateLocked finds the seeded state of stage id from the fixtures.
+// Caller holds r.mu.
+func (r *prEventsRunRepo) seedStateLocked(id uuid.UUID) run.StageState {
+	for _, sts := range r.stages {
+		for _, st := range sts {
+			if st.ID == id {
+				return st.State
+			}
+		}
+	}
+	return ""
 }
 
 // prEventsAuditRepo captures AppendChained calls so tests can assert
@@ -524,6 +572,151 @@ func TestPullRequestReviewSubmitted_LongBodyTruncated(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "...") {
 		t.Errorf("truncated body should end with ellipsis; got %q", got[len(got)-10:])
+	}
+}
+
+// --- ResolveReviewFromPollState (merge-reconciler poll path) ---
+
+func TestResolveReviewFromPollState_Merged_TransitionsSucceeded(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID, true, prURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions = %+v, want one to succeeded", rr.transitions)
+	}
+	// The poll records the system marker, not a user login, but the
+	// category is unchanged so consumers render identically.
+	row := findCategory(ar.appended, CategoryPRMerged)
+	if row == nil {
+		t.Fatalf("missing pr_merged row; got %v", auditCategories(ar.appended))
+	}
+	if row.ActorSubject == nil || *row.ActorSubject != mergeReconcilerActor {
+		t.Errorf("audit ActorSubject = %v, want %q", row.ActorSubject, mergeReconcilerActor)
+	}
+}
+
+func TestResolveReviewFromPollState_ClosedUnmerged_TransitionsCancelled(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID, false, prURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateCancelled {
+		t.Fatalf("transitions = %+v, want one to cancelled", rr.transitions)
+	}
+	if findCategory(ar.appended, CategoryPRClosedWithoutMerge) == nil {
+		t.Errorf("missing pr_closed_without_merge row; got %v", auditCategories(ar.appended))
+	}
+}
+
+func TestResolveReviewFromPollState_RunNotFound_Errors(t *testing.T) {
+	rr := &prEventsRunRepo{} // no seeded runs → GetRun returns ErrNotFound
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	if err := s.ResolveReviewFromPollState(context.Background(), uuid.New(), true, "https://github.com/x/y/pull/1"); err == nil {
+		t.Fatal("expected an error when the run does not exist")
+	}
+}
+
+// --- cross-path idempotency (webhook + poll on the SAME review stage) ---
+
+func TestResolveReview_WebhookThenPoll_Merged_SingleEffectiveTransition(t *testing.T) {
+	// Cross-boundary integration (#618 discipline): the pull_request.closed
+	// webhook and the merge-reconciler poll share resolveReviewStageOnMerge,
+	// so resolving the same review stage twice must yield exactly one
+	// effective transition to succeeded.
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url":  prURL,
+			"merged":    true,
+			"merged_by": map[string]any{"login": "alice"},
+			"head":      map[string]any{"sha": "h"},
+			"base":      map[string]any{"sha": "b"},
+		},
+		"sender": map[string]any{"login": "alice"},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+	if err := s.ResolveReviewFromPollState(context.Background(), runID, true, prURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if len(rr.transitions) != 1 {
+		t.Fatalf("transitions = %d, want 1 (webhook+poll idempotent)", len(rr.transitions))
+	}
+	if rr.transitions[0].To != run.StageStateSucceeded {
+		t.Errorf("transition.To = %q, want succeeded", rr.transitions[0].To)
+	}
+}
+
+func TestResolveReview_PollThenWebhook_ClosedUnmerged_SingleCancelled(t *testing.T) {
+	// Reverse order + closed-unmerged: poll first, webhook second; both
+	// must resolve to cancelled and only one effective transition lands.
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID, false, prURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url": prURL,
+			"merged":   false,
+			"head":     map[string]any{"sha": "h"},
+			"base":     map[string]any{"sha": "b"},
+		},
+		"sender": map[string]any{"login": "alice"},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+
+	if len(rr.transitions) != 1 {
+		t.Fatalf("transitions = %d, want 1 (poll+webhook idempotent)", len(rr.transitions))
+	}
+	if rr.transitions[0].To != run.StageStateCancelled {
+		t.Errorf("transition.To = %q, want cancelled", rr.transitions[0].To)
 	}
 }
 

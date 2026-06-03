@@ -31,6 +31,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
@@ -130,6 +131,12 @@ func runServe(args []string, logSink io.Writer) int {
 	reactionPollerAgeThreshold := fs.Duration("reaction-poller-age-threshold",
 		reactionpoller.DefaultAgeThreshold,
 		"plan-comment age at which the reaction poller switches from fast to slow cadence")
+	enableMergeReconciler := fs.Bool("enable-merge-reconciler",
+		envOr("FISHHAWKD_ENABLE_MERGE_RECONCILER", "false") == "true",
+		"start the merge-status reconciler (ADR-031 Phase 1); resolves a run's review gate on a verified PR merge state when the pull_request.closed webhook was missed. Off by default — only useful with a GitHub App wired. See --merge-reconciler-interval for the rate-limit caveat at scale.")
+	mergeReconcilerInterval := fs.Duration("merge-reconciler-interval",
+		mergereconciler.DefaultInterval,
+		"merge-status reconciler scan interval. Each tick makes one GitHub GetPullRequest call per parked review stage with no per-stage cooldown; tune this upward at scale to stay within GitHub REST rate limits (5,000/hour per installation).")
 	enableChildCompletionSweeper := fs.Bool("enable-child-completion-sweeper",
 		envOr("FISHHAWKD_ENABLE_CHILD_COMPLETION_SWEEPER", "false") == "true",
 		"start the child-completion sweeper (#455 / ADR-025 D4); transitions parent stages parked in awaiting_children once their decomposed children all reach terminal states. Off by default to match the other tickers' dev-loop posture.")
@@ -606,6 +613,36 @@ func runServe(args []string, logSink io.Writer) int {
 				slog.Duration("fast_interval", *reactionPollerFastInterval),
 				slog.Duration("slow_interval", *reactionPollerSlowInterval),
 				slog.Duration("age_threshold", *reactionPollerAgeThreshold))
+		}
+	}
+
+	// Merge-status reconciler (ADR-031 Phase 1). Catch-net for a
+	// missed pull_request.closed webhook: resolves a review gate on a
+	// verified PR merge state through the SAME path the webhook uses.
+	// Off by default; on requires RunRepo + AuditRepo + a GitHub client
+	// + the server (Resolver). Same fall-through posture as the other
+	// tickers.
+	if *enableMergeReconciler {
+		switch {
+		case cfg.RunRepo == nil || cfg.AuditRepo == nil:
+			logger.Warn("--enable-merge-reconciler set but RunRepo or AuditRepo unconfigured; ticker not started")
+		case cfg.GitHub == nil:
+			logger.Warn("--enable-merge-reconciler set but GitHub client unconfigured (no app id?); ticker not started")
+		default:
+			ticker := &mergereconciler.Ticker{
+				Runs:     cfg.RunRepo,
+				PRGetter: cfg.GitHub,
+				Resolver: srv,
+				Logger:   logger,
+				Interval: *mergeReconcilerInterval,
+			}
+			go func() {
+				if err := ticker.Run(ctx); err != nil {
+					logger.Error("merge reconciler exited with error", slog.String("error", err.Error()))
+				}
+			}()
+			logger.Info("merge-status reconciler started",
+				slog.Duration("interval", *mergeReconcilerInterval))
 		}
 	}
 

@@ -543,6 +543,10 @@ func TestRunStage_ArgvComposition_PlanStage(t *testing.T) {
 		Stage:      "plan",
 		WorkingDir: "/tmp/checkout",
 		GitHubRepo: "x/y",
+		// Explicit false: this test asserts --no-pr composes. The
+		// MCP default flipped to true (ADR-031), so omitting the field
+		// would now drop --no-pr.
+		PushAndOpenPR: boolPtr(false),
 	})
 	if err != nil {
 		t.Fatalf("runStage: %v", err)
@@ -639,13 +643,95 @@ func TestRunStage_PushAndOpenPR_DropsNoPRFlag(t *testing.T) {
 		Workflow:      "feature_change",
 		Stage:         "implement",
 		GitHubRepo:    "x/y",
-		PushAndOpenPR: true,
+		PushAndOpenPR: boolPtr(true),
 	})
 	if err != nil {
 		t.Fatalf("runStage: %v", err)
 	}
 	if strings.Contains(strings.Join(capturedArgs, " "), "--no-pr") {
 		t.Errorf("--no-pr should be absent when push_and_open_pr=true: %v", capturedArgs)
+	}
+}
+
+// boolPtr returns a pointer to b. The fishhawk_run_stage input's
+// push_and_open_pr is *bool (ADR-031) so a test can express omitted
+// (nil), explicit true, and explicit false distinctly.
+func boolPtr(b bool) *bool { return &b }
+
+func TestRunStage_PushAndOpenPR_OmittedDefaultsTrue(t *testing.T) {
+	// ADR-031 Phase 1: the MCP-driven local loop defaults
+	// push_and_open_pr to true so every run carries a pull_request_url.
+	// An omitted field (nil) must drop --no-pr.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	var capturedArgs []string
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, args ...string) *exec.Cmd {
+		capturedArgs = args
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = exec.LookPath
+	})
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "succeeded")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+		// PushAndOpenPR omitted (nil) -> resolves to true.
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if strings.Contains(strings.Join(capturedArgs, " "), "--no-pr") {
+		t.Errorf("--no-pr should be absent when push_and_open_pr is omitted (defaults true): %v", capturedArgs)
+	}
+}
+
+func TestRunStage_PushAndOpenPR_ExplicitFalseKeepsNoPR(t *testing.T) {
+	// An explicit false is honored (commit-yourself flow): --no-pr
+	// must compose even though the default is now true.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	var capturedArgs []string
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, args ...string) *exec.Cmd {
+		capturedArgs = args
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = exec.LookPath
+	})
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "succeeded")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:         runID.String(),
+		StageID:       stageID.String(),
+		Workflow:      "feature_change",
+		Stage:         "implement",
+		GitHubRepo:    "x/y",
+		PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if !strings.Contains(strings.Join(capturedArgs, " "), "--no-pr") {
+		t.Errorf("--no-pr should be present when push_and_open_pr is explicitly false: %v", capturedArgs)
 	}
 }
 
@@ -701,6 +787,10 @@ func TestRunStage_GitHubRepoAutoDetectFails_WarnsWithoutPush(t *testing.T) {
 		StageID:  stageID.String(),
 		Workflow: "w",
 		Stage:    "plan",
+		// Explicit false: a missing repo is only a soft warning when
+		// the run won't push. The MCP default flipped to true
+		// (ADR-031), under which a repo-detect failure is a hard error.
+		PushAndOpenPR: boolPtr(false),
 	})
 	if err != nil {
 		t.Fatalf("runStage: %v", err)
@@ -728,7 +818,7 @@ func TestRunStage_GitHubRepoAutoDetectFails_WithPushErrors(t *testing.T) {
 		StageID:       stageID.String(),
 		Workflow:      "w",
 		Stage:         "implement",
-		PushAndOpenPR: true,
+		PushAndOpenPR: boolPtr(true),
 	})
 	if err == nil || !strings.Contains(err.Error(), "github_repo") {
 		t.Fatalf("expected github_repo error, got %v", err)
