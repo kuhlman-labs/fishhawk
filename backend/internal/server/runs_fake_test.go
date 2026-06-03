@@ -84,6 +84,7 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		WorkflowSHA:        p.WorkflowSHA,
 		TriggerSource:      p.TriggerSource,
 		TriggerRef:         p.TriggerRef,
+		InstallationID:     p.InstallationID,
 		IdempotencyKey:     p.IdempotencyKey,
 		RunnerKind:         runnerKind,
 		WorkflowSpec:       p.WorkflowSpec,
@@ -266,8 +267,17 @@ func (f *fakeRepo) stagesFor(runID uuid.UUID) []*run.Stage {
 	return out
 }
 
-func (f *fakeRepo) GetStage(_ context.Context, _ uuid.UUID) (*run.Stage, error) {
-	return nil, errors.New("fakeRepo: GetStage not implemented")
+func (f *fakeRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, stages := range f.stagesByRun {
+		for _, st := range stages {
+			if st.ID == id {
+				return st, nil
+			}
+		}
+	}
+	return nil, run.ErrNotFound
 }
 func (f *fakeRepo) ListStagesForRun(_ context.Context, _ uuid.UUID) ([]*run.Stage, error) {
 	return nil, errors.New("fakeRepo: ListStagesForRun not implemented")

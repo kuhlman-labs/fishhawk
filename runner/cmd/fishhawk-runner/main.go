@@ -1371,6 +1371,20 @@ var (
 		cmd.Dir = repoDir
 		return cmd.Run() == nil
 	}
+
+	// ghAuthToken sources a GitHub token from the operator's local `gh`
+	// CLI, used as the push + PR fallback when the run has no attributed
+	// App installation (#713). `gh auth token` prints the authenticated
+	// user's token to stdout and exits 0 when logged in, non-zero when
+	// gh is absent or not authenticated. Test seam: production shells
+	// out; tests swap in a function that returns a canned token or error.
+	ghAuthToken = func(ctx context.Context) (string, error) {
+		out, err := exec.CommandContext(ctx, "gh", "auth", "token").Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
 )
 
 // openPRAndShipArtifact is the implement-stage post-processing
@@ -1420,19 +1434,46 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// actions/checkout) and the Ed25519 one here (used by push +
 	// PR). Both attribute to the App; auth_method on each entry
 	// identifies which path served. (#201.)
+	var token string
 	tokenRes, err := client.FetchInstallationToken(ctx, upload.FetchInstallationTokenArgs{
 		RunID:      cfg.runID,
 		StageID:    cfg.stageID,
 		PrivateKey: issued.PrivateKey,
 	})
-	if err != nil {
+	switch {
+	case err == nil:
+		token = tokenRes.Token
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"backend"}`+"\n",
+			cfg.runID, cfg.stageID,
+		)
+	case errors.Is(err, upload.ErrNoInstallation):
+		// No App installation attributed to this run (a local / MCP run
+		// on a repo with no App). Fall back to the operator's local `gh`
+		// CLI token so the push + PR still work without an operator hand-
+		// push (#713). A user OAuth token authenticates both `git push`
+		// over HTTPS and the REST PR-create call.
+		ghTok, ghErr := ghAuthToken(ctx)
+		if ghErr != nil {
+			repoHint := cfg.githubRepo
+			if repoHint == "" {
+				repoHint = os.Getenv("GITHUB_REPOSITORY")
+			}
+			if repoHint == "" {
+				repoHint = "the target repo"
+			}
+			return fmt.Errorf("this run has no GitHub App installation and no `gh` CLI token is available for the push + PR fallback; "+
+				"either install the Fishhawk GitHub App on %s, or run `gh auth login` so the runner can use your local token: %w",
+				repoHint, ghErr)
+		}
+		token = ghTok
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"gh_cli"}`+"\n",
+			cfg.runID, cfg.stageID,
+		)
+	default:
 		return fmt.Errorf("fetch installation token: %w", err)
 	}
-	token := tokenRes.Token
-	_, _ = fmt.Fprintf(logSink,
-		`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"backend"}`+"\n",
-		cfg.runID, cfg.stageID,
-	)
 
 	// Repo: --github-repo flag > GITHUB_REPOSITORY env. The flag
 	// path is used by local-runner (Phase C of E22 / #389); the env

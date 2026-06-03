@@ -70,6 +70,12 @@ var (
 	// does not permit a retry (e.g., category-B). Non-retryable; the
 	// runner should exit with the original failure.
 	ErrRetryNotApplicable = errors.New("upload: retry not applicable for this stage")
+	// ErrNoInstallation is returned by FetchInstallationToken when the
+	// backend responds 400 (no_installation_for_run): the run has no
+	// GitHub App installation attributed to it (a local / MCP-created
+	// run on a repo with no App). Callers switch on this sentinel to
+	// fall back to the operator's `gh` CLI token for push + PR (#713).
+	ErrNoInstallation = errors.New("upload: run has no GitHub App installation")
 )
 
 // Client wraps a net/http.Client with a base URL. Construct via
@@ -870,6 +876,17 @@ func (c *Client) FetchInstallationToken(ctx context.Context, args FetchInstallat
 			return nil, errors.New("upload: installation-token response missing token")
 		}
 		return &out, nil
+	case http.StatusBadRequest:
+		// The backend returns 400 no_installation_for_run when the run
+		// row has no attributed App installation (a local / MCP run on a
+		// repo with no App). Map it to ErrNoInstallation so the caller
+		// can fall back to the operator's `gh` CLI token (#713). Any
+		// other 400 stays opaque.
+		detail := readBriefBody(resp)
+		if strings.Contains(detail, "no_installation_for_run") {
+			return nil, fmt.Errorf("%w: %s", ErrNoInstallation, detail)
+		}
+		return nil, fmt.Errorf("upload: fetch installation token: 400: %s", detail)
 	case http.StatusUnauthorized:
 		detail := readBriefBody(resp)
 		return nil, fmt.Errorf("%w: %s", ErrSignatureRejected, detail)
