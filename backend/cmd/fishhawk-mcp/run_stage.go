@@ -99,7 +99,7 @@ type RunStageInput struct {
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in; defaults to the MCP server's cwd"`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
-	PushAndOpenPR bool   `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR; default false (the operator commits the changes themselves)"`
+	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1) so every run carries a pull_request_url for the review gate + merge reconciler. Pass false explicitly to keep the commit-yourself flow (the operator commits + pushes). A bare omitted value resolves to true."`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: FISHHAWK_RUNNER_BIN env, then fishhawk-runner sibling to this binary (os.Executable dir), then PATH"`
 	Verbose       bool   `json:"verbose,omitempty" jsonschema:"when true, return the full runner event list including every stage_progress heartbeat; default false returns a compact result that omits routine heartbeats"`
 }
@@ -285,6 +285,13 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, RunStageOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
 	}
+
+	// Resolve the push_and_open_pr default. A bare bool can't tell an
+	// omitted JSON key from an explicit false, so the field is *bool:
+	// nil (omitted) -> true for the MCP-driven local loop (ADR-031
+	// Phase 1) so every run carries a pull_request_url; an explicit
+	// false is honored (the commit-yourself flow).
+	pushAndOpenPR := in.PushAndOpenPR == nil || *in.PushAndOpenPR
 	// Only parse stage_id when explicitly supplied — preserve the
 	// "not a valid UUID" error for a non-empty bad value.
 	if in.StageID != "" {
@@ -347,7 +354,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		switch {
 		case derr == nil:
 			repo = detected
-		case in.PushAndOpenPR:
+		case pushAndOpenPR:
 			return nil, RunStageOutput{}, fmt.Errorf(
 				"github_repo not set and could not detect from origin (push_and_open_pr requires a repo): %w", derr)
 		default:
@@ -389,7 +396,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	if in.Stage == "implement" {
 		argv = append(argv, "--check-base-ref", baseBranch)
 	}
-	if !in.PushAndOpenPR {
+	if !pushAndOpenPR {
 		argv = append(argv, "--no-pr")
 	}
 
