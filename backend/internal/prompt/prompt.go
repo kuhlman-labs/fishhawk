@@ -705,34 +705,54 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
 	b.WriteString("}\n\n")
 
-	// Review criteria — what the agent should assess.
+	// Review criteria — what the agent should assess. The lens is aimed at
+	// what the deterministic gates CANNOT see (#703); see the non-goals below.
 	b.WriteString("### Review criteria\n\n")
-	b.WriteString("Assess the diff against the following criteria. Record a concern for each gap found:\n\n")
-	b.WriteString("1. **Plan adherence**: Does the diff implement the approved plan's approach steps? " +
-		"Are the changes the plan called for actually present?\n")
-	b.WriteString("2. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
+	b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is already gated " +
+		"upstream: the policy gate, the test suite the implement agent ran, build/lint, and CI all check that " +
+		"the change is present and well-formed. Therefore:\n")
+	b.WriteString("- Do NOT re-verify plan adherence. Whether the diff mechanically implements the plan's approach " +
+		"steps is covered by the policy gate, the tests, and CI — re-stating it here adds no signal.\n")
+	b.WriteString("- Do NOT generic-bug-hunt. Hunting for arbitrary bugs overlaps the test suite and CI and is the " +
+		"lowest-orthogonality lens; spend the review on the three lenses below instead.\n\n")
+	b.WriteString("Apply these three orthogonal lenses — the gaps the deterministic gates are blind to. " +
+		"Record a concern for each gap found:\n\n")
+	b.WriteString("1. **Security / authz**: Does the diff widen the attack surface, mishandle a token or secret, " +
+		"skip an authz / scope / audience check, or trust untrusted input? Anchor this to Fishhawk's " +
+		"code-execution threat model — an agent that runs arbitrary commands against a repo, where the live risk " +
+		"is the lethal trifecta (untrusted input + sensitive data + exfiltration egress) and uncontrolled " +
+		"network egress (ADR-029 / #650). " +
+		"**Self-gate (risk-gate):** if the diff touches NO sensitive surface — no auth, policy, crypto, network, " +
+		"untrusted-input, token, or secret handling — state that briefly in `free_form` and stop; do NOT " +
+		"manufacture a security concern for a low-risk diff (e.g. a one-line config or doc change).\n")
+	b.WriteString("2. **Test vacuity**: For each added or changed test, does it actually ASSERT the behavior it " +
+		"claims to cover, or is it a tautology that passes regardless of what the code does? CI passes a vacuous " +
+		"test; only a reviewer reading the test body catches it. Flag tests that assert nothing load-bearing.\n")
+	b.WriteString("3. **Untested error / edge / concurrency paths**: Does the change add happy-path code plus a " +
+		"happy-path test that silently skips the error branch, a boundary condition, or a race / concurrency " +
+		"path the change introduces? Flag the specific untested path.\n\n")
+	b.WriteString("Three standing criteria orthogonal to the lenses above also apply:\n\n")
+	b.WriteString("4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
 		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
 		"Do NOT reject solely for scope drift — drift is a flag, not a blocker.\n")
-	b.WriteString("3. **Verification satisfiability**: Are the plan's verification steps (test strategy, rollback) " +
-		"satisfiable against this diff?\n")
-	b.WriteString("4. **Obvious regressions**: Does the diff introduce obvious correctness regressions, " +
-		"broken references, or removed behaviour the issue didn't ask for?\n")
 	b.WriteString("5. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project " +
 		"convention — MUST be one you can quote verbatim from the context provided in this prompt or from a " +
 		"repository file you actually read during this review. Do NOT assert rules from memory. If you cannot " +
 		"verify the rule exists, do NOT raise the concern. Ground every concern in the plan, issue, and diff " +
 		"actually provided.\n")
 	b.WriteString("6. **Style is out of scope**: Subjective style judgments (comment length, naming aesthetics, " +
-		"formatting) are out of scope for review — that is lint's job. Focus on plan adherence, scope " +
-		"(flag-only), verification satisfiability, and obvious regressions.\n\n")
+		"formatting) are out of scope for review — that is lint's job. Focus on the security / authz, " +
+		"test-vacuity, and untested-path lenses, plus scope drift (flag-only).\n\n")
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
-	b.WriteString("- `approve`: diff implements the plan; all criteria met or concerns are cosmetic.\n")
+	b.WriteString("- `approve`: low-risk diff; the lenses are clear (or the security lens self-gated as no " +
+		"sensitive surface) and any concerns are cosmetic.\n")
 	b.WriteString("- `approve_with_concerns`: diff is acceptable but has non-blocking gaps (including any scope drift); " +
 		"record each gap as a concern with appropriate severity.\n")
-	b.WriteString("- `reject`: diff has one or more blocking problems — it does not implement the plan, or it introduces " +
-		"a correctness regression — that must be resolved; record each blocker as a `high`-severity concern. " +
+	b.WriteString("- `reject`: diff has one or more blocking problems — a security / authz regression, a vacuous test " +
+		"that does not assert the behavior it claims, or an unhandled error / edge path the change introduces — " +
+		"that must be resolved; record each blocker as a `high`-severity concern. " +
 		"Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead.\n\n")
 
 	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
