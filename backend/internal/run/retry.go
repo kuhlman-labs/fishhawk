@@ -40,6 +40,66 @@ type RetryDecision struct {
 	Stage *Stage
 }
 
+// RetryableFailure reports whether a stage failure in the given
+// category (with the given failure_reason) can be re-opened by a
+// straightforward retry, as opposed to needing a fresh run or a
+// spec/workflow change. It is the single source of truth shared by
+// RetryStage and by the decomposition parent-resolution paths
+// (childcompletion.resolveParent, orchestrator.maybeAdvanceDecomposedParent),
+// which use it to decide whether to park a parent awaiting re-drive
+// rather than resolve it to failed. Per MVP_SPEC §6:
+//
+//	A (agent failure)            → retryable.
+//	B (constraint/policy)        → NOT retryable (spec/workflow change).
+//	C (infrastructure)           → retryable.
+//	D, sla_timeout sub-reason    → retryable (re-open the gate).
+//	D, gate-rejected sub-reason  → NOT retryable (approver said no).
+//
+// The reason argument only matters for category D, where it
+// distinguishes the SLA-timeout sub-reason (retryable) from
+// approver rejection and other D variants (not retryable). The
+// "sla_timeout" prefix is emitted by sla.handleStage; everything
+// else under D is the rejection path or future variants.
+func RetryableFailure(cat FailureCategory, reason string) bool {
+	switch cat {
+	case FailureA, FailureC:
+		return true
+	case FailureB:
+		return false
+	case FailureD:
+		return strings.HasPrefix(reason, "sla_timeout")
+	default:
+		return false
+	}
+}
+
+// ImplementFailureRetryable reports whether the implement stage among
+// the given run stages failed in a retryable category. The
+// decomposition parent-resolution paths
+// (childcompletion.resolveParent, orchestrator.maybeAdvanceDecomposedParent)
+// call this per failed child to decide whether to park the parent
+// awaiting re-drive (every failed child retryable) or resolve it to
+// failed (at least one non-retryable). Returns false when there is no
+// failed implement stage or it carries no failure category — parking
+// is only safe when every failed child's failure is positively
+// confirmed recoverable, so an unclassifiable failure resolves the
+// parent rather than parking it indefinitely.
+func ImplementFailureRetryable(stages []*Stage) bool {
+	for _, s := range stages {
+		if s.Type == StageTypeImplement && s.State == StageStateFailed {
+			if s.FailureCategory == nil {
+				return false
+			}
+			reason := ""
+			if s.FailureReason != nil {
+				reason = *s.FailureReason
+			}
+			return RetryableFailure(*s.FailureCategory, reason)
+		}
+	}
+	return false
+}
+
 // RetryStage re-opens a failed stage when the current failure
 // category supports it. Per MVP_SPEC §6:
 //
@@ -90,48 +150,46 @@ func RetryStage(ctx context.Context, repo Repository, stageID uuid.UUID) (*Retry
 		priorReason = *stage.FailureReason
 	}
 
-	switch priorCat {
-	case FailureA, FailureC:
-		// Re-dispatch path: state-machine moves stage back to
-		// pending, then the handler invokes the orchestrator,
-		// which transitions pending → dispatched and fires
-		// workflow_dispatch. Same flow whether the prior failure
-		// was an agent crash (A) or an infra timeout (C); both
-		// produce a fresh runner with a fresh signing key.
-		updated, err := repo.RetryStage(ctx, stageID, StageStatePending)
-		if err != nil {
-			return nil, fmt.Errorf("RetryStage: failed → pending: %w", err)
-		}
-		return &RetryDecision{
-			PriorCategory: priorCat,
-			PriorReason:   priorReason,
-			Stage:         updated,
-		}, nil
-	case FailureB:
-		return nil, fmt.Errorf("%w: category B failures (constraint/policy) require a spec or workflow change, not a retry",
-			ErrRetryNotApplicable)
-	case FailureD:
-		// Distinguish SLA timeout (retriable — re-open the gate)
-		// from approver rejection (not retriable — they said no).
-		// The reason prefix is set in two places:
-		//   - sla.handleStage emits "sla_timeout: <elapsed> elapsed (deadline <d>)"
-		//   - approvals.advanceStage emits "gate rejected by approver"
-		// Match the timeout prefix; everything else under D is the
-		// rejection path or future variants we haven't seen.
-		if !strings.HasPrefix(priorReason, "sla_timeout") {
+	if !RetryableFailure(priorCat, priorReason) {
+		// Not retryable: return a category-specific explanation so
+		// the handler's 422 tells the caller *why* a fresh run (or a
+		// spec change) is the right next step instead of a retry.
+		switch priorCat {
+		case FailureB:
+			return nil, fmt.Errorf("%w: category B failures (constraint/policy) require a spec or workflow change, not a retry",
+				ErrRetryNotApplicable)
+		case FailureD:
+			// The reason prefix is set in two places:
+			//   - sla.handleStage emits "sla_timeout: <elapsed> elapsed (deadline <d>)"
+			//   - approvals.advanceStage emits "gate rejected by approver"
+			// RetryableFailure matched neither the timeout prefix, so
+			// this is the rejection path or a future D variant.
 			return nil, fmt.Errorf("%w: category D failures other than SLA timeout require a fresh run",
 				ErrRetryNotApplicable)
+		default:
+			return nil, fmt.Errorf("%w: unknown failure category %q", ErrRetryNotApplicable, priorCat)
 		}
-		updated, err := repo.RetryStage(ctx, stageID, StageStateAwaitingApproval)
-		if err != nil {
-			return nil, fmt.Errorf("RetryStage: re-open gate: %w", err)
-		}
-		return &RetryDecision{
-			PriorCategory: priorCat,
-			PriorReason:   priorReason,
-			Stage:         updated,
-		}, nil
 	}
 
-	return nil, fmt.Errorf("%w: unknown failure category %q", ErrRetryNotApplicable, priorCat)
+	// Retryable. Category D (SLA timeout) re-opens the gate
+	// directly into awaiting_approval — updated_at restarts via the
+	// trigger and the SLA ticker measures from the new value, no
+	// orchestrator handoff. A/C re-dispatch through pending: the
+	// handler invokes the orchestrator, which walks pending →
+	// dispatched and fires workflow_dispatch with a fresh runner and
+	// signing key (same flow whether the prior failure was an agent
+	// crash (A) or an infra timeout (C)).
+	target := StageStatePending
+	if priorCat == FailureD {
+		target = StageStateAwaitingApproval
+	}
+	updated, err := repo.RetryStage(ctx, stageID, target)
+	if err != nil {
+		return nil, fmt.Errorf("RetryStage: failed → %s: %w", target, err)
+	}
+	return &RetryDecision{
+		PriorCategory: priorCat,
+		PriorReason:   priorReason,
+		Stage:         updated,
+	}, nil
 }

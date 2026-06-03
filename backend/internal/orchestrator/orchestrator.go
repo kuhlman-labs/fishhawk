@@ -412,13 +412,13 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 	if len(children) == 0 {
 		return
 	}
-	anyFailed := false
+	var failedChildren []*run.Run
 	for _, c := range children {
 		if !c.State.IsTerminal() {
 			return
 		}
 		if c.State == run.StateFailed {
-			anyFailed = true
+			failedChildren = append(failedChildren, c)
 		}
 	}
 
@@ -442,6 +442,26 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 		return
 	}
 
+	// #698: when children failed but EVERY failed child's implement
+	// failure is retryable (A/C/D-timeout), park the parent in
+	// awaiting_children rather than resolving it to failed-C. This
+	// closes the race where a near-instant event-driven resolution
+	// would terminate the parent before an operator can re-drive the
+	// recoverable child. The parent stays parked until a re-drive
+	// re-runs the child and this path fires again on its next
+	// terminal transition. Only a non-retryable failed child (genuine
+	// category B) resolves the parent to failed-C.
+	if len(failedChildren) > 0 && o.failedChildrenAllRetryable(ctx, failedChildren) {
+		o.emitParentAwaitingRedrive(ctx, parentRunID, awaitingStage.ID, failedChildren)
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parked parent awaiting re-drive",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("parent_stage_id", awaitingStage.ID.String()),
+			slog.Int("failed_child_count", len(failedChildren)),
+		)
+		return
+	}
+
+	anyFailed := len(failedChildren) > 0
 	target := run.StageStateSucceeded
 	var completion *run.StageCompletion
 	if anyFailed {
@@ -470,6 +490,69 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 			slog.String("parent_run_id", parentRunID.String()),
 			slog.String("error", err.Error()),
 		)
+	}
+}
+
+// failedChildrenAllRetryable reports whether every failed child run's
+// implement-stage failure is in a retryable category (A/C/D-timeout).
+// Used by maybeAdvanceDecomposedParent to decide whether to park the
+// parent awaiting re-drive. A failed child whose stages can't be
+// listed, or whose implement stage carries no failure category, is
+// treated as NOT retryable — parking is only safe when every failure
+// is positively confirmed recoverable, so an unclassifiable child
+// resolves the parent rather than parking it indefinitely.
+func (o *Orchestrator) failedChildrenAllRetryable(ctx context.Context, failed []*run.Run) bool {
+	for _, c := range failed {
+		stages, err := o.Runs.ListStagesForRun(ctx, c.ID)
+		if err != nil {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list child stages for retryability check failed",
+				slog.String("child_run_id", c.ID.String()),
+				slog.String("error", err.Error()),
+			)
+			return false
+		}
+		if !run.ImplementFailureRetryable(stages) {
+			return false
+		}
+	}
+	return true
+}
+
+// emitParentAwaitingRedrive writes a parent_awaiting_redrive audit
+// entry (system actor) when a parent is parked because every failed
+// child is retryable. It is the one-time, operator-discoverable
+// signal that the parent needs a re-drive; the parked state is
+// otherwise silent. Best-effort: a failure here logs and returns.
+func (o *Orchestrator) emitParentAwaitingRedrive(ctx context.Context, parentRunID, stageID uuid.UUID, failed []*run.Run) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping parent_awaiting_redrive entry",
+			slog.String("parent_run_id", parentRunID.String()))
+		return
+	}
+	ids := make([]string, 0, len(failed))
+	for _, c := range failed {
+		ids = append(ids, c.ID.String())
+	}
+	payload, err := json.Marshal(map[string]any{
+		"parent_stage_id":         stageID.String(),
+		"retryable_child_run_ids": ids,
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal parent_awaiting_redrive payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "parent_awaiting_redrive",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append parent_awaiting_redrive failed",
+			slog.String("error", err.Error()))
 	}
 }
 

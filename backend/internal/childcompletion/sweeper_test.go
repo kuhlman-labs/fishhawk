@@ -22,6 +22,7 @@ type fakeRunRepo struct {
 
 	awaitingChildren []*run.Stage
 	childrenByParent map[uuid.UUID][]*run.Run
+	stagesByRun      map[uuid.UUID][]*run.Stage
 	transitions      []transitionCall
 	transitionErr    error
 }
@@ -85,8 +86,13 @@ func (f *fakeRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.
 func (f *fakeRunRepo) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
-func (f *fakeRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
+func (f *fakeRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stagesByRun == nil {
+		return nil, nil
+	}
+	return f.stagesByRun[runID], nil
 }
 func (f *fakeRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
@@ -151,6 +157,21 @@ func (a *recordingAdvancer) Advance(_ context.Context, runID uuid.UUID) error {
 
 func mkChild(id uuid.UUID, state run.State) *run.Run {
 	return &run.Run{ID: id, State: state, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+}
+
+// mkFailedImplement builds a failed implement stage carrying the given
+// failure category + reason, for driving the #698 retryability check.
+func mkFailedImplement(runID uuid.UUID, cat run.FailureCategory, reason string) *run.Stage {
+	c := cat
+	r := reason
+	return &run.Stage{
+		ID:              uuid.New(),
+		RunID:           runID,
+		Type:            run.StageTypeImplement,
+		State:           run.StageStateFailed,
+		FailureCategory: &c,
+		FailureReason:   &r,
+	}
 }
 
 func TestTick_AllChildrenSucceed_TransitionsParentToSucceeded(t *testing.T) {
@@ -220,6 +241,84 @@ func TestTick_OneChildFails_TransitionsParentToFailedC(t *testing.T) {
 	defer rs.mu.Unlock()
 	if len(rs.transitions) != 1 {
 		t.Fatalf("transitions = %d, want 1", len(rs.transitions))
+	}
+	tr := rs.transitions[0]
+	if tr.To != run.StageStateFailed {
+		t.Errorf("target = %q, want failed", tr.To)
+	}
+	if tr.Failure == nil || *tr.Failure != run.FailureC {
+		t.Errorf("FailureCategory = %v, want C", tr.Failure)
+	}
+}
+
+func TestTick_AllFailedChildrenRetryable_ParksParent(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	failedChild := uuid.New()
+
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {
+				mkChild(uuid.New(), run.StateSucceeded),
+				mkChild(failedChild, run.StateFailed),
+			},
+		},
+		stagesByRun: map[uuid.UUID][]*run.Stage{
+			// Category C (infrastructure) is retryable: the parent
+			// should park awaiting re-drive, not resolve to failed-C.
+			failedChild: {mkFailedImplement(failedChild, run.FailureC, "runner OOM")},
+		},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 (parent should park awaiting re-drive)", len(rs.transitions))
+	}
+	if len(ad.advanced) != 0 {
+		t.Errorf("Advance calls = %v, want none (parent parked)", ad.advanced)
+	}
+	// The sweeper does not audit on park — discoverability comes from
+	// the orchestrator path's one-time parent_awaiting_redrive entry.
+	if len(au.appended) != 0 {
+		t.Errorf("audit appended = %v, want none (sweeper park is silent)", au.appended)
+	}
+}
+
+func TestTick_FailedChildCategoryB_ResolvesFailedC(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	failedChild := uuid.New()
+
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {
+				mkChild(failedChild, run.StateFailed),
+			},
+		},
+		stagesByRun: map[uuid.UUID][]*run.Stage{
+			// Category B (constraint/policy) is NOT retryable: the
+			// parent must resolve to failed-C.
+			failedChild: {mkFailedImplement(failedChild, run.FailureB, "scope violation")},
+		},
+	}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 1 {
+		t.Fatalf("transitions = %d, want 1 (non-retryable B resolves failed-C)", len(rs.transitions))
 	}
 	tr := rs.transitions[0]
 	if tr.To != run.StageStateFailed {
