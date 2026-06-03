@@ -11,7 +11,7 @@
 # When the product can execute this spec, the syntax may be revised to
 # match the frozen v0 schema. The intent expressed here will not change.
 
-version: "0.3"
+version: "0.4"
 
 roles:
   founder:
@@ -28,6 +28,18 @@ workflows:
       Human approves plan and PR; agent does the implementation.
     policy:
       max_stage_runtime: "30m"
+    # Periodic cost ceiling (ADR-030 / #688). Advisory — emits a
+    # budget_alert audit entry + originating-issue comment at warn_at
+    # (80%) and the 100% crossing; never blocks a run. Calibrated from
+    # recorded feature_change run costs (avg ~$3.4, max ~$8.4 over the
+    # first 29 costed runs). Weekly reset so the alert re-exercises
+    # during active dogfooding. Flip enforcement to `blocking` to also
+    # dogfood admission-time refusal once the period limit is exhausted.
+    budgets:
+      - period: weekly
+        limit_usd: 50
+        warn_at: 0.8
+        enforcement: advisory
     # Auto-retry once on CI failure (#276). The human approves the
     # plan; the agent should self-heal on a routine test or lint
     # regression without forcing the reviewer back into the loop.
