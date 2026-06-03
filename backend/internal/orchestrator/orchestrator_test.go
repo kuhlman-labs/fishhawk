@@ -1104,6 +1104,31 @@ func TestAdvance_DecomposedParent_LostRace_RecoversURL(t *testing.T) {
 	}
 }
 
+func TestAdvance_DecomposedParent_LostRace_EmptyList_RetryableError(t *testing.T) {
+	// A lost double-open race surfaces as ErrPullRequestExists, but
+	// GitHub's read-after-write consistency can lag so the recovery
+	// ListOpenPullRequestsByHead returns nothing yet. The settle must
+	// fail with a (retryable) error rather than stamp an empty/nil URL —
+	// the next Advance re-enters and recovers once the list catches up.
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	gh.createPRErr = githubclient.ErrPullRequestExists
+	gh.listByHeadResult = nil // consistency gap: 422 says exists, list empty
+
+	parent, _ := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+
+	_, err := o.Advance(context.Background(), parent.ID)
+	if err == nil {
+		t.Fatal("Advance: want a retryable error when ErrPullRequestExists but the list returns empty, got nil")
+	}
+	if gh.listByHeadCalls != 1 {
+		t.Errorf("ListOpenPullRequestsByHead calls = %d, want 1", gh.listByHeadCalls)
+	}
+	if got := rs.runs[parent.ID].PullRequestURL; got != nil {
+		t.Errorf("pull_request_url = %v, want nil (no URL stamped on the failed recovery)", *got)
+	}
+}
+
 func TestAdvance_NonDecomposedParent_NoConsolidatedPR(t *testing.T) {
 	// A plain run (no decomposed children) reaching its review gate must
 	// NOT open a PR — only decomposed parents do.
