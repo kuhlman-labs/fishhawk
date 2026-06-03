@@ -135,6 +135,22 @@ Notes:
   continuations are never gated, so neither kind is emitted for them. Listed
   here only so a future reader grepping the audit categories doesn't mistake
   them for comment surfaces.
+- The fan-out re-drive parking audit kind — `parent_awaiting_redrive` (#698) —
+  is an **internal, system-actor audit kind, not an issue-comment surface**.
+  Nothing in `issuecomment` posts it to the issue thread; it has no Notifier
+  method. The event-driven parent-resolution path
+  (`orchestrator.go::maybeAdvanceDecomposedParent`) writes it once, with a
+  `system` actor and payload `{parent_stage_id, retryable_child_run_ids}`, when
+  a decomposition parent is left parked in `awaiting_children` because EVERY
+  failed child's implement failure is retryable (category A/C or a D SLA
+  timeout — see `run.RetryableFailure`). It is the one-time, operator-
+  discoverable signal that the parent needs an operator re-drive rather than
+  having been resolved to failed-C; the parked state is otherwise silent. The
+  interval sweeper (`childcompletion.resolveParent`) parks identically but does
+  NOT emit this entry (nor any per-tick log above debug), so an indefinitely-
+  parked parent does not spam the chain — discoverability rests on this single
+  orchestrator-path entry. Listed here only so a future reader grepping the
+  audit categories doesn't mistake it for a comment surface.
 
 ## Routing
 
