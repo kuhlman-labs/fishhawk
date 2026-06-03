@@ -2016,3 +2016,28 @@ func TestNewWithSigner_WiresAppJWT(t *testing.T) {
 		t.Errorf("err = %v, want ErrNotInstalled", err)
 	}
 }
+
+// TestNewWithSigner_SignError_Propagates covers the path where the App
+// signer fails to mint a JWT: GetRepoInstallation must surface that error
+// (wrapped) instead of reaching the wire. Exercises the fakeSigner.err
+// injection the wiring test leaves unused.
+func TestNewWithSigner_SignError_Propagates(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	signErr := errors.New("sign boom")
+	signer := &fakeSigner{err: signErr}
+
+	c := NewWithSigner(&stubTokens{token: "ghs_canned_token"}, signer)
+	c.BaseURL = srv.URL
+
+	_, err := c.GetRepoInstallation(context.Background(), RepoRef{Owner: "x", Name: "y"})
+	if err == nil {
+		t.Fatal("GetRepoInstallation: want error when signer.Sign fails, got nil")
+	}
+	if !errors.Is(err, signErr) {
+		t.Errorf("err = %v, want it to wrap the signer error", err)
+	}
+	// The App-JWT mint failed, so no request should have reached the wire.
+	if fg.gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty (request must not be sent when Sign fails)", fg.gotAuth)
+	}
+}
