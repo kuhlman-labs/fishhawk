@@ -2240,6 +2240,102 @@ func TestRun_ImplementStage_InstallationTokenFetchFails_CategoryC(t *testing.T) 
 	}
 }
 
+// withFakeGHAuthToken swaps the ghAuthToken seam for the duration of a
+// test, restoring it on cleanup.
+func withFakeGHAuthToken(t *testing.T, fn func(context.Context) (string, error)) {
+	t.Helper()
+	orig := ghAuthToken
+	ghAuthToken = fn
+	t.Cleanup(func() { ghAuthToken = orig })
+}
+
+func TestRun_ImplementStage_NoInstallation_FallsBackToGHToken(t *testing.T) {
+	// A local / MCP run on a repo with no App installation: the backend
+	// returns ErrNoInstallation, and the runner sources a token from the
+	// operator's `gh` CLI and threads it through push + PR (#713).
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	fu.instTokenErr = fmt.Errorf("%w: no_installation_for_run", upload.ErrNoInstallation)
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	withFakeGHAuthToken(t, func(context.Context) (string, error) { return "gho_local_token", nil })
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	if fp.gotArgs.PushToken != "gho_local_token" {
+		t.Errorf("PushToken = %q, want gho_local_token (the gh CLI fallback token)", fp.gotArgs.PushToken)
+	}
+	if fpr.gotToken != "gho_local_token" {
+		t.Errorf("OpenPR token = %q, want gho_local_token", fpr.gotToken)
+	}
+	if !strings.Contains(stderr.String(), `"source":"gh_cli"`) {
+		t.Errorf("expected installation_token_received with source gh_cli, got:\n%s", stderr.String())
+	}
+}
+
+func TestRun_ImplementStage_NoInstallation_NoGHToken_Actionable(t *testing.T) {
+	// No App installation AND no usable `gh` CLI token: the runner must
+	// fail with a clear, actionable error naming the two fixes — never
+	// the opaque "fetch installation token" wrap — and must not open a PR.
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	fu.instTokenErr = fmt.Errorf("%w: no_installation_for_run", upload.ErrNoInstallation)
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	withFakeGHAuthToken(t, func(context.Context) (string, error) {
+		return "", errors.New("gh: not logged in")
+	})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "gh auth login") || !strings.Contains(out, "GitHub App") {
+		t.Errorf("expected actionable error naming the App install + `gh auth login`, got:\n%s", out)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR should not be called when no fallback token is available")
+	}
+}
+
 func TestRun_ImplementStage_AlwaysFetchesFreshTokenBeforePush(t *testing.T) {
 	// Even with FISHHAWK_GITHUB_TOKEN set in env (the auth pre-
 	// step's pass-through), the runner always mints a fresh token

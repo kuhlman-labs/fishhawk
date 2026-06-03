@@ -562,8 +562,11 @@ func TestCreateRun_GitHubFetch_SpecNotFound(t *testing.T) {
 }
 
 // TestCreateRun_InlineSpec_BypassesFetch verifies that when workflow_spec
-// is provided inline, the GitHub client is never called — even when a
-// GitHub client is configured.
+// is provided inline, the heavy GitHub spec-contents fetch is never
+// called. The installation endpoint IS called now (#713) — the run-
+// create path resolves the App installation best-effort even on the
+// inline path so the run row carries it for push_and_open_pr + the merge
+// reconciler — but the spec fetch must still be bypassed.
 func TestCreateRun_InlineSpec_BypassesFetch(t *testing.T) {
 	fake := newFakeGitHubForRuns(gatedSpecYAML)
 	ghSrv := fake.server(t)
@@ -585,17 +588,140 @@ func TestCreateRun_InlineSpec_BypassesFetch(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
-	if fake.installationCalls != 0 {
-		t.Errorf("installation endpoint called %d times; inline spec must bypass GitHub fetch",
+	// The installation endpoint is hit once for best-effort stamping
+	// (#713); the heavy spec-contents fetch must still be bypassed.
+	if fake.installationCalls != 1 {
+		t.Errorf("installation endpoint called %d times; want 1 (best-effort stamp on inline path)",
 			fake.installationCalls)
 	}
 	if fake.specCalls != 0 {
-		t.Errorf("spec endpoint called %d times; inline spec must bypass GitHub fetch", fake.specCalls)
+		t.Errorf("spec endpoint called %d times; inline spec must bypass GitHub spec fetch", fake.specCalls)
+	}
+	// The resolved installation is stamped onto the run row even on the
+	// inline-spec path — this is the seam #713 fixes.
+	if repo.lastCreateRunParams.InstallationID == nil || *repo.lastCreateRunParams.InstallationID != 12345 {
+		t.Errorf("InstallationID = %v, want stamped 12345 on inline path", repo.lastCreateRunParams.InstallationID)
 	}
 	// Stages are still created from the inline spec.
 	var got runResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
 	if len(repo.stagesFor(got.ID)) != 2 {
 		t.Errorf("expected 2 stages from inline spec, got %d", len(repo.stagesFor(got.ID)))
+	}
+}
+
+// TestCreateRun_InlineSpec_NotInstalled_Lenient verifies that on the
+// inline-spec path a 404 from the installation endpoint does NOT fail
+// the create (unlike the GitHub-fetch path's 422). The run is created
+// with a nil InstallationID; the runner's `gh` CLI fallback covers the
+// push + PR (#713).
+func TestCreateRun_InlineSpec_NotInstalled_Lenient(t *testing.T) {
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	fake.installationStatus = http.StatusNotFound
+	fake.installationBody = `{"message":"Not Found"}`
+	ghSrv := fake.server(t)
+	repo := newFakeRepo()
+	s := newServerWithGitHub(t, repo, ghSrv)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  gatedSpecYAML, // inline — stamping is best-effort
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (inline path must be lenient on ErrNotInstalled):\n%s", w.Code, w.Body.String())
+	}
+	if repo.lastCreateRunParams.InstallationID != nil {
+		t.Errorf("InstallationID = %v, want nil when App not installed", *repo.lastCreateRunParams.InstallationID)
+	}
+}
+
+// TestCreateRun_InlineSpec_StampThreadsToTokenEndpoint is the
+// cross-boundary seam #713 actually broke: an inline-spec create (the
+// path fishhawk_start_run drives) must stamp the resolved installation
+// onto the run row so the runner's installation-token call returns 201
+// rather than 400 no_installation_for_run. This exercises create →
+// persisted run row → token endpoint with a single RunRepo, proving the
+// stamped id threads end-to-end (not just that the field is set).
+func TestCreateRun_InlineSpec_StampThreadsToTokenEndpoint(t *testing.T) {
+	repo := newFakeRepo()
+	fake := newFakeGitHubForRuns(gatedSpecYAML) // resolves installation id 12345
+	ghSrv := fake.server(t)
+	gh := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt_test", nil },
+	}
+	sf := newSigningFake()
+	au := newAuditFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		GitHub:       gh,
+		SigningRepo:  sf,
+		AuditRepo:    au,
+		GitHubTokens: &fakeTokenProvider{tok: "ghs_xyz"},
+	})
+
+	// Create the run via the inline-spec path.
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  gatedSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create body: %v", err)
+	}
+
+	// Resolve the implement stage created from the spec.
+	stages := repo.stagesFor(created.ID)
+	if len(stages) != 2 {
+		t.Fatalf("len(stages) = %d, want 2", len(stages))
+	}
+	stageID := stages[1].ID // implement stage
+
+	// Sanity: the run row actually carries a non-nil stamped id — without
+	// this the token endpoint below would 400 regardless of routing.
+	gotRun, err := repo.GetRun(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.InstallationID == nil || *gotRun.InstallationID != 12345 {
+		t.Fatalf("run row InstallationID = %v, want stamped 12345", gotRun.InstallationID)
+	}
+
+	// Issue a signing key for the run, then call the installation-token
+	// endpoint exactly as the runner does. It must return 201, not the
+	// 400 no_installation_for_run that an unstamped run produces.
+	priv, _ := sf.issue(t, created.ID)
+	w2 := issueTokenRequest(t, s, created.ID, stageID, priv, []byte(`{}`), "")
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("installation-token status = %d, want 201 (stamped id must thread through):\n%s", w2.Code, w2.Body.String())
+	}
+	var tokResp installationTokenResponse
+	if err := json.NewDecoder(w2.Body).Decode(&tokResp); err != nil {
+		t.Fatalf("decode token body: %v", err)
+	}
+	if tokResp.Token != "ghs_xyz" {
+		t.Errorf("token = %q, want ghs_xyz", tokResp.Token)
 	}
 }

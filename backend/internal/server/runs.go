@@ -250,6 +250,40 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		maxRetriesSnap int
 		specBytes      []byte
 	)
+
+	// Resolve the repo's GitHub App installation best-effort (#713).
+	// This runs for BOTH the inline-spec path (the one MCP/local runs
+	// take — they ship the spec inline, so they'd otherwise skip the
+	// GitHub-fetch branch below and never resolve an installation) and
+	// the GitHub-fetch path. The resolved id is stamped onto the run row
+	// so the runner's push_and_open_pr can mint an installation token and
+	// the merge reconciler can poll the PR. When no installation is
+	// attributable (non-App / local setup), the id stays nil and the
+	// runner falls back to the operator's `gh` CLI token — so we do NOT
+	// hard-fail here. The GitHub-fetch branch below DOES hard-fail on
+	// ErrNotInstalled (it cannot read the spec without an installation);
+	// it reuses installResolveErr instead of calling GetRepoInstallation
+	// a second time.
+	var (
+		installationID    *int64
+		installResolveErr error
+	)
+	if s.cfg.GitHub != nil {
+		if owner, name, ok := strings.Cut(req.Repo, "/"); ok && owner != "" && name != "" {
+			id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), githubclient.RepoRef{Owner: owner, Name: name})
+			switch {
+			case err == nil:
+				installationID = &id
+			case errors.Is(err, githubclient.ErrNotInstalled):
+				installResolveErr = err
+			default:
+				installResolveErr = err
+				s.cfg.Logger.Warn("resolve repo installation failed; run created without an attributed installation",
+					"repo", req.Repo, "error", err.Error())
+			}
+		}
+	}
+
 	if req.WorkflowSpec != "" {
 		specBytes = []byte(req.WorkflowSpec)
 		p, err := spec.ParseBytes(specBytes)
@@ -288,10 +322,12 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"field": "repo", "got": req.Repo})
 			return
 		}
-		repoRef := githubclient.RepoRef{Owner: owner, Name: name}
-		installationID, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), repoRef)
-		if err != nil {
-			if errors.Is(err, githubclient.ErrNotInstalled) {
+		// Reuse the installation resolved above. Unlike the inline path,
+		// the fetch path genuinely needs the installation to read the
+		// spec, so it hard-fails: ErrNotInstalled → 422, any other
+		// resolve error → 500.
+		if installResolveErr != nil {
+			if errors.Is(installResolveErr, githubclient.ErrNotInstalled) {
 				s.writeError(w, r, http.StatusUnprocessableEntity, "repo_not_installed",
 					"GitHub App is not installed on the target repository",
 					map[string]any{"repo": req.Repo})
@@ -299,10 +335,11 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			}
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"could not resolve installation for repo",
-				map[string]any{"error": err.Error()})
+				map[string]any{"error": installResolveErr.Error()})
 			return
 		}
-		fc, err := s.cfg.GitHub.GetWorkflowSpec(r.Context(), installationID, repoRef, req.WorkflowSHA)
+		repoRef := githubclient.RepoRef{Owner: owner, Name: name}
+		fc, err := s.cfg.GitHub.GetWorkflowSpec(r.Context(), *installationID, repoRef, req.WorkflowSHA)
 		if err != nil {
 			if errors.Is(err, githubclient.ErrNotFound) {
 				s.writeError(w, r, http.StatusUnprocessableEntity, "spec_not_found",
@@ -431,6 +468,10 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		// (RunnerKindGitHubActions). Explicit values are validated
 		// above; only known-good kinds reach the repo.
 		RunnerKind: req.RunnerKind,
+		// Best-effort App installation resolved above (#713). Nil when
+		// no App is installed on the repo (local / non-App setup); the
+		// runner then falls back to the operator's `gh` CLI token.
+		InstallationID: installationID,
 	}
 	if haveStageDefs {
 		// Cache the validated spec bytes on the row so the trace

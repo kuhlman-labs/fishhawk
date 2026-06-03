@@ -143,6 +143,41 @@ func TestFetchInstallationToken_BadGateway_502(t *testing.T) {
 	}
 }
 
+func TestFetchInstallationToken_NoInstallation_400(t *testing.T) {
+	b, srv := newInstTokenBackend(t)
+	b.status = http.StatusBadRequest
+	b.body = `{"code":"no_installation_for_run","message":"run has no GitHub App installation"}`
+	c := quickInstClient(srv)
+	priv := makeInstKey(t)
+
+	_, err := c.FetchInstallationToken(context.Background(), FetchInstallationTokenArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrNoInstallation) {
+		t.Errorf("err = %v, want ErrNoInstallation", err)
+	}
+}
+
+func TestFetchInstallationToken_OtherBadRequest_Opaque(t *testing.T) {
+	// A 400 that is NOT no_installation_for_run must not be mistaken for
+	// the fallback sentinel — it stays an opaque error.
+	b, srv := newInstTokenBackend(t)
+	b.status = http.StatusBadRequest
+	b.body = `{"code":"validation_failed","message":"stage_id required"}`
+	c := quickInstClient(srv)
+	priv := makeInstKey(t)
+
+	_, err := c.FetchInstallationToken(context.Background(), FetchInstallationTokenArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, ErrNoInstallation) {
+		t.Errorf("err = %v, must not map to ErrNoInstallation", err)
+	}
+}
+
 func TestFetchInstallationToken_RejectsBadInputs(t *testing.T) {
 	c := New("http://example.com")
 	priv := makeInstKey(t)
