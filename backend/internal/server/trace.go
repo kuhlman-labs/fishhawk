@@ -389,7 +389,23 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 		// extraction error skips review and proceeds to the terminal
 		// transition rather than failing the stage.
 		if diff, derr := bundle.ExtractDiff(bundleBytes); derr == nil {
-			if s.runImplementReviews(r.Context(), runID, stageID, diff) {
+			// Surface runner-reported scope_drift to the reviewer so an
+			// operator-staged required file in a drifted path is not
+			// false-rejected as missing (#695). Best-effort: an extraction
+			// error logs at WARN and falls back to nil drift — never blocks
+			// the review (the standing anti-false-reject rule in the prompt
+			// degrades gracefully when the list is empty).
+			scopeDrift, sderr := bundle.ExtractScopeDrift(bundleBytes)
+			if sderr != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"trace upload: extract scope drift failed — proceeding with no drift list",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", sderr.Error()),
+				)
+				scopeDrift = nil
+			}
+			if s.runImplementReviews(r.Context(), runID, stageID, diff, scopeDrift) {
 				cat := run.FailureB
 				reason := "implement_review_rejected: agent review verdict reject under gating authority"
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
@@ -1499,7 +1515,7 @@ func (s *Server) budgetAlertAlreadyEmitted(ctx context.Context, workflowID, peri
 //
 // Per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't block the stage — the diff is already stored.
-func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff) bool {
+func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string) bool {
 	if s.cfg.RunRepo == nil {
 		return false
 	}
@@ -1572,6 +1588,11 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// when the bundle predates the patch field or the runner couldn't
 		// compute it — buildImplementReview falls back to the file list.
 		DiffPatch: diff.Patch,
+		// Runner-reported paths excluded from the scope-bounded diff that
+		// the operator may stage into the final commit (#695). Lets the
+		// reviewer distinguish an operator-stageable drift path from a
+		// genuinely missing file. Empty/nil when there was no drift.
+		ScopeDrift: scopeDrift,
 	}
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title

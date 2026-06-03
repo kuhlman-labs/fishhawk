@@ -309,6 +309,73 @@ func TestExtractDiff_BadDiffPayload(t *testing.T) {
 	}
 }
 
+func TestExtractScopeDrift_HappyPath(t *testing.T) {
+	// The runner's scope_drift policy_event carries the undeclared paths
+	// the operator may stage; ExtractScopeDrift round-trips them (#695).
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+		{Seq: 3, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_drift","outcome":"excluded","undeclared":["a_test.go","docs/x.md"]}`)},
+		{Seq: 4, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractScopeDrift(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractScopeDrift: %v", err)
+	}
+	want := []string{"a_test.go", "docs/x.md"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d paths, want %d (%v)", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("path %d = %q, want %q", i, got[i], w)
+		}
+	}
+}
+
+func TestExtractScopeDrift_NoEvent(t *testing.T) {
+	// No scope_drift event is the ordinary no-drift case — (nil, nil),
+	// not an error. A non-drift policy_event is skipped, not mistaken.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+		{Seq: 3, Kind: EventKindPolicyEvent, Data: json.RawMessage(`{"check":"constraints","outcome":"valid"}`)},
+		{Seq: 4, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractScopeDrift(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractScopeDrift: %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %v, want nil for a bundle with no scope_drift event", got)
+	}
+}
+
+func TestExtractScopeDrift_BadGzip(t *testing.T) {
+	_, err := ExtractScopeDrift([]byte("not gzipped"))
+	if !errors.Is(err, ErrBadGzip) {
+		t.Errorf("err = %v, want ErrBadGzip", err)
+	}
+}
+
+func TestExtractScopeDrift_BadPayload(t *testing.T) {
+	// A scope_drift policy_event whose `undeclared` is a string, not an
+	// array → json.Unmarshal into scopeDriftPayload fails. The trace
+	// handler WARN-degrades to nil drift, but this branch must still
+	// surface the error rather than silently returning empty (#695
+	// implement-review finding — distinct from the bad-gzip ReadEvents path).
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_drift","outcome":"excluded","undeclared":"not-an-array"}`)},
+	}
+	_, err := ExtractScopeDrift(packLines(t, lines))
+	if err == nil || !strings.Contains(err.Error(), "parse policy_event payload") {
+		t.Errorf("err = %v, want a parse-payload error", err)
+	}
+}
+
 func TestReadEvents_AllLinesReturned(t *testing.T) {
 	lines := []Line{
 		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{}`)},

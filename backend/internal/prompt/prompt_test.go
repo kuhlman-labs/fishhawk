@@ -1528,6 +1528,59 @@ func TestBuild_ImplementReview_OrthogonalLenses(t *testing.T) {
 	}
 }
 
+func TestBuild_ImplementReview_ScopeDrift_RendersSection(t *testing.T) {
+	// #695: when the trace handler threads runner-reported scope_drift paths
+	// onto the Trigger, the implement-review prompt names them flagged
+	// "operator may stage" so the reviewer does not false-reject a required
+	// file that landed via a drifted path.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		ScopeDrift:   []string{"pkg/bar/bar_test.go", "docs/notes.md"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"Scope drift (excluded from the diff above — operator may stage)",
+		"pkg/bar/bar_test.go",
+		"docs/notes.md",
+		"Do NOT treat any of these paths as missing",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("scope-drift prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_StandingAntiFalseRejectRule_AlwaysPresent(t *testing.T) {
+	// #695: the standing anti-false-reject rule applies whether or not a
+	// drift list is present, so it must render even with ScopeDrift empty —
+	// the path list is an enhancement, the rule is the correctness backstop.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The drift section itself is guarded by len>0, so it must be absent.
+	if strings.Contains(got, "Scope drift (excluded from the diff above") {
+		t.Errorf("drift section should be absent when ScopeDrift is empty:\n%s", got)
+	}
+	for _, w := range []string{
+		"Do NOT reject on an unconfirmable absence (standing rule)",
+		"Treat an absence you cannot positively confirm as unverifiable",
+		"do not assert the absence of a file you could not actually inspect",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("standing anti-false-reject rule missing %q:\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_ImplementReview_WithPatch_RendersHunks(t *testing.T) {
 	patch := "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n" +
 		"@@ -1,3 +1,3 @@\n-old line\n+new line\n"
