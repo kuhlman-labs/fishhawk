@@ -217,6 +217,21 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	// on the bundle's canonical upload.
 	if variant == tracestore.VariantRaw {
 		s.recordCost(r.Context(), runID, stageID, body)
+
+		// Per-run budget tripwire (ADR-030 / #653). After the bundle's cost
+		// is rolled into the run total, check it against the operator's
+		// per-run ceilings. On breach the run is HALTED (cancelled) and we
+		// short-circuit here so the stage-advancement block below never runs
+		// — no further stage is dispatched for a run the system has stopped.
+		if s.checkRunBudget(r.Context(), runID, stageID) {
+			s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
+				RunID:       runID,
+				StageID:     stageID,
+				Variant:     string(variant),
+				ContentHash: contentHash,
+			})
+			return
+		}
 	}
 
 	// Advance the stage so the approval handler can act on it.
@@ -1478,6 +1493,131 @@ func (s *Server) budgetAlertAlreadyEmitted(ctx context.Context, workflowID, peri
 		}
 	}
 	return false, nil
+}
+
+// checkRunBudget enforces the per-run budget tripwire (ADR-030 / #653): the
+// whole-run safety rail that lets "the system stop itself" before a runaway
+// run overruns silently. After the bundle's cost has been rolled into
+// runs.cost_usd_total (#649), it compares the run's cumulative spend — US$
+// (the rolled total) and tokens (summed from the cost_recorded ledger) —
+// against the operator-configured per-run ceilings. On breach it HALTS the
+// run via the cancel transition (SYSTEM actor) and appends a
+// run_budget_exceeded audit entry naming the breached dimension and the
+// figures, then returns true so the caller short-circuits stage advancement.
+//
+// Terminal state is `cancelled` by operator decision: a budget tripwire is a
+// protective system HALT, not a work failure, and cancelled is non-retryable
+// — a runaway run is deliberately NOT auto-redriven (unlike a failed-A/C).
+// The audit kind carries the honest reason. There is no Notifier surface;
+// this is an internal audit-only signal (see docs/issue-comment-surfaces.md).
+//
+// Returns false (the run proceeds) when the tripwire is disabled (both
+// ceilings <= 0, the default), the deps aren't wired, the run lookup fails,
+// or neither dimension is over. Best-effort throughout, consistent with the
+// rest of this handler: the bundle is already stored + audited, so a
+// transition or audit-write failure WARN-logs and never unwinds the upload.
+// On a transition failure (e.g. the run is already terminal) it still returns
+// true — a detected breach must never dispatch further work.
+func (s *Server) checkRunBudget(ctx context.Context, runID, stageID uuid.UUID) bool {
+	// Fast path: tripwire disabled (operator opt-in; default 0 = off). Skip
+	// every read so the default deployment pays nothing for the rail.
+	if s.cfg.MaxRunUSD <= 0 && s.cfg.MaxRunTokens <= 0 {
+		return false
+	}
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return false
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"run budget: get run failed — skipping tripwire",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+
+	tokens := s.sumRunTokens(ctx, runID)
+
+	d := budget.EvaluateRun(runRow.CostUSDTotal, tokens, s.cfg.MaxRunUSD, s.cfg.MaxRunTokens)
+	if !d.Over {
+		return false
+	}
+
+	// Halt: cancel transition (SYSTEM actor) + run_budget_exceeded audit.
+	if _, err := s.cfg.RunRepo.TransitionRun(ctx, runID, run.StateCancelled); err != nil {
+		// Already terminal or a repo error. The breach is real, so we still
+		// short-circuit (return true) — but skip the audit append to avoid a
+		// spurious run_budget_exceeded entry on a run we couldn't halt.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"run budget: cancel transition failed — run already terminal or repo error",
+			slog.String("run_id", runID.String()),
+			slog.String("dimension", d.Dimension),
+			slog.String("error", err.Error()))
+		return true
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"dimension":      d.Dimension,
+		"cost_usd_total": d.CostUSD,
+		"max_run_usd":    d.MaxUSD,
+		"tokens_total":   d.Tokens,
+		"max_run_tokens": d.MaxTokens,
+		"terminal_state": string(run.StateCancelled),
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "run_budget_exceeded",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"run budget: append run_budget_exceeded audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"run budget: per-run ceiling breached — run halted (cancelled)",
+		slog.String("run_id", runID.String()),
+		slog.String("dimension", d.Dimension),
+		slog.Float64("cost_usd_total", d.CostUSD),
+		slog.Float64("max_run_usd", d.MaxUSD),
+		slog.Int64("tokens_total", d.Tokens),
+		slog.Int64("max_run_tokens", d.MaxTokens))
+	return true
+}
+
+// sumRunTokens totals the input+output tokens across the run's cost_recorded
+// audit entries — the per-invocation cost ledger (#649) — to give the per-run
+// budget tripwire a cumulative token figure without a dedicated runs column.
+// Best-effort: a list failure or an unparsable payload contributes 0 rather
+// than unwinding the upload, so the token tripwire degrades to "low" rather
+// than false-halting on a read error.
+func (s *Server) sumRunTokens(ctx context.Context, runID uuid.UUID) int64 {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "cost_recorded")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"run budget: list cost_recorded entries failed — token total may be low",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		var p struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		total += p.InputTokens + p.OutputTokens
+	}
+	return total
 }
 
 // runImplementReviews resolves the implement stage's review config and

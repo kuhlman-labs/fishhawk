@@ -217,6 +217,24 @@ type Config struct {
 	// an unresolvable zone name so a minimal container image's missing
 	// zoneinfo never crashes startup.
 	BudgetLocation *time.Location
+
+	// MaxRunUSD is the per-run US-dollar spend ceiling — a global operator
+	// safety rail (ADR-030 / #653) that HALTS a single run once its rolled
+	// cost_usd_total (#649) reaches this figure, independent of the
+	// per-workflow periodic budgets (#688). On breach the trace handler
+	// cancels the run (SYSTEM actor, non-retryable) and writes a
+	// run_budget_exceeded audit entry. This is a backstop distinct from a
+	// per-workflow spec policy: it is operator config, not a workflow-v0
+	// schema field. Non-positive (the default 0) disables the US$ tripwire.
+	MaxRunUSD float64
+
+	// MaxRunTokens is the per-run token ceiling, the token-dimension twin of
+	// MaxRunUSD (ADR-030 / #653). Compared against the run's cumulative
+	// input+output tokens summed from its cost_recorded audit ledger (there
+	// is no dedicated runs column for it). Non-positive (the default 0)
+	// disables the token tripwire. When both ceilings are set and both are
+	// breached, US$ is reported as the breached dimension.
+	MaxRunTokens int64
 }
 
 // Server wraps an http.Server with the routes and middleware stack

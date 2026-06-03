@@ -1467,3 +1467,214 @@ func TestShipTrace_NoSpendAlertUnderSteadySpend(t *testing.T) {
 	}
 	au.mu.Unlock()
 }
+
+// TestShipTrace_RunBudgetTripwire_HaltsRun is the cross-boundary integration
+// test for the per-run budget tripwire (ADR-030 / #653). Per the
+// cross-boundary rule (#618/#624) it exercises config → trace handler →
+// run-repo persistence → audit consumer together: it seeds a run whose
+// accumulated cost sits just below a low configured per-run US$ ceiling,
+// uploads a raw trace bundle whose manifest cost pushes the rolled total over
+// the ceiling, and asserts:
+//
+//	(a) the run transitions to the cancelled terminal state (operator
+//	    decision: a budget halt is a protective system stop, not a work
+//	    failure — cancelled is non-retryable),
+//	(b) a run_budget_exceeded audit entry is appended (system actor) naming
+//	    the breached dimension (usd) and the figures, and
+//	(c) NO further stage is dispatched — the stage stays in its pre-upload
+//	    dispatched state because the handler short-circuits before
+//	    advanceStageAfterTrace (the orchestrator-advance no-dispatch).
+func TestShipTrace_RunBudgetTripwire_HaltsRun(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+	rr := newOrchestratorRepo()
+
+	runRow := rr.seedRun() // StateRunning
+	// Stage in dispatched — advanceStageAfterTrace would otherwise walk it to
+	// running/awaiting_approval; the halt must prevent that.
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	// A second pending stage so "no further stage dispatched" is observable:
+	// it must still be pending after the halt.
+	nextStage := rr.seedStage(runRow.ID, 1, run.StageStatePending)
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	bundleUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok || bundleUSD <= 0 {
+		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, bundleUSD)
+	}
+	// Seed cost just below the ceiling; the bundle's rolled cost pushes the
+	// total to 1.5*bundleUSD, over the ceiling.
+	runRow.CostUSDTotal = bundleUSD * 0.5
+	ceiling := bundleUSD
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        runRow.ID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+		MaxRunUSD:    ceiling,
+	})
+
+	priv, _ := sf.issue(t, runRow.ID)
+	w := shipRequest(t, s, runRow.ID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) run halted via the cancelled terminal state.
+	got, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.State != run.StateCancelled {
+		t.Errorf("run.State = %q, want %q (budget halt is a cancel, not a fail)", got.State, run.StateCancelled)
+	}
+
+	// (b) run_budget_exceeded audit entry with the breached dimension + figures.
+	au.mu.Lock()
+	var be *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "run_budget_exceeded" {
+			be = &au.appended[i]
+			break
+		}
+	}
+	au.mu.Unlock()
+	if be == nil {
+		t.Fatal("no run_budget_exceeded audit entry written")
+	}
+	if be.RunID != runRow.ID {
+		t.Errorf("run_budget_exceeded RunID = %s, want %s", be.RunID, runRow.ID)
+	}
+	if be.ActorKind == nil || *be.ActorKind != audit.ActorKind("system") {
+		t.Errorf("run_budget_exceeded ActorKind = %v, want system", be.ActorKind)
+	}
+	var bp struct {
+		Dimension     string  `json:"dimension"`
+		CostUSDTotal  float64 `json:"cost_usd_total"`
+		MaxRunUSD     float64 `json:"max_run_usd"`
+		TerminalState string  `json:"terminal_state"`
+	}
+	if err := json.Unmarshal(be.Payload, &bp); err != nil {
+		t.Fatalf("decode run_budget_exceeded payload: %v", err)
+	}
+	if bp.Dimension != "usd" {
+		t.Errorf("dimension = %q, want usd", bp.Dimension)
+	}
+	if bp.MaxRunUSD != ceiling {
+		t.Errorf("max_run_usd = %v, want %v", bp.MaxRunUSD, ceiling)
+	}
+	if bp.CostUSDTotal < ceiling {
+		t.Errorf("cost_usd_total = %v, want >= ceiling %v", bp.CostUSDTotal, ceiling)
+	}
+	if bp.TerminalState != string(run.StateCancelled) {
+		t.Errorf("terminal_state = %q, want cancelled", bp.TerminalState)
+	}
+
+	// (c) no further stage dispatched. The trace's stage stays dispatched
+	// (handler short-circuited before advanceStageAfterTrace), and the next
+	// stage stays pending (the orchestrator's Advance was never invoked).
+	gotStage, err := rr.GetStage(t.Context(), stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage(trace stage): %v", err)
+	}
+	if gotStage.State != run.StageStateDispatched {
+		t.Errorf("trace stage.State = %q, want %q (no advance after halt)", gotStage.State, run.StageStateDispatched)
+	}
+	gotNext, err := rr.GetStage(t.Context(), nextStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage(next stage): %v", err)
+	}
+	if gotNext.State != run.StageStatePending {
+		t.Errorf("next stage.State = %q, want %q (no dispatch after halt)", gotNext.State, run.StageStatePending)
+	}
+}
+
+// TestShipTrace_RunBudgetTripwire_UnderCeilingProceeds confirms the tripwire
+// does NOT halt a run whose rolled cost stays under the ceiling: the stage
+// advances normally and no run_budget_exceeded entry is written. This guards
+// against a false-halt regression in the evaluator wiring.
+func TestShipTrace_RunBudgetTripwire_UnderCeilingProceeds(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+	rr := newOrchestratorRepo()
+
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	stage.RequiresApproval = true // plan-type gated; advances to awaiting_approval
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	bundleUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok || bundleUSD <= 0 {
+		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v", model, ok, bundleUSD)
+	}
+	// Ceiling comfortably above the bundle's cost — no breach.
+	ceiling := bundleUSD * 100
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        runRow.ID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+		MaxRunUSD:    ceiling,
+	})
+
+	priv, _ := sf.issue(t, runRow.ID)
+	w := shipRequest(t, s, runRow.ID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	for i := range au.appended {
+		if au.appended[i].Category == "run_budget_exceeded" {
+			t.Errorf("unexpected run_budget_exceeded under ceiling: %s", au.appended[i].Payload)
+		}
+	}
+	au.mu.Unlock()
+
+	got, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.State == run.StateCancelled {
+		t.Errorf("run cancelled under ceiling — tripwire false-halted")
+	}
+	gotStage, err := rr.GetStage(t.Context(), stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if gotStage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want %q (normal advance under ceiling)", gotStage.State, run.StageStateAwaitingApproval)
+	}
+}
