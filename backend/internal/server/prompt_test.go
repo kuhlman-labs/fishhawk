@@ -1926,3 +1926,213 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 		}
 	})
 }
+
+// makeApproveWithCommentEntry builds an approval_submitted audit entry with
+// decision=approve and a non-empty operator comment (the approve-with-
+// conditions text loadApprovalConditions reads).
+func makeApproveWithCommentEntry(runID uuid.UUID, comment string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"decision": "approve",
+		"comment":  comment,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+}
+
+// TestGetStagePrompt_ApprovalConditions_DecompositionFallback is the
+// integration test for #677: it crosses the audit-load -> handler ->
+// rendered-prompt-text path and asserts the parent plan-gate's binding
+// approve-with-conditions text propagates into a decomposed child's
+// implement prompt (the #558 approval-note delivery, which a child with no
+// plan stage of its own would otherwise silently drop). The standalone and
+// no-conditions subtests guard the backward-compatible boundaries.
+func TestGetStagePrompt_ApprovalConditions_DecompositionFallback(t *testing.T) {
+	const parentCondition = "Use the orthogonal-lens reviewer; do NOT touch the legacy adapter."
+
+	// parentPlan carries a two-sub-plan decomposition so the child can match
+	// a sub-plan via its IssueContext.Body prefix (matchDecomposedSubPlan).
+	newParentPlan := func() *plan.Plan {
+		return &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "parent plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Decomposition: &plan.Decomposition{
+				Rationale: "scope split",
+				SubPlans: []plan.SubPlanSummary{
+					{Title: "Part A title", ScopeHint: "Implement Part A in pkg/a."},
+					{Title: "Part B title", ScopeHint: "Implement Part B in pkg/b."},
+				},
+			},
+		}
+	}
+
+	// seedDecomposedChild wires a parent plan artifact + a decomposed child run
+	// whose IssueContext.Body matches Part A, with the supplied audit entries
+	// keyed by run ID, and returns the child's implement-stage prompt response.
+	seedDecomposedChild := func(t *testing.T, auditByRun map[uuid.UUID][]*audit.Entry, parentRunID uuid.UUID) promptResponse {
+		t.Helper()
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		childRunID := uuid.New()
+		parentPlanStageID := uuid.New()
+		childStageID := uuid.New()
+
+		planBytes, err := json.Marshal(newParentPlan())
+		if err != nil {
+			t.Fatalf("marshal parent plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       parentPlanStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			parentRunID: {
+				{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan},
+			},
+		}
+		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+
+		childBody := "## Part A title\n\nImplement Part A in pkg/a.\n\n---\n*Decomposed sub-plan.*"
+		rr.getRuns[childRunID] = &run.Run{
+			ID:             childRunID,
+			Repo:           "o/r",
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerCLI,
+			ParentRunID:    &parentRunID,
+			DecomposedFrom: &parentRunID,
+			IssueContext: &run.IssueContext{
+				Title: "Part A title",
+				Body:  childBody,
+			},
+		}
+		rr.getStages[childStageID] = &run.Stage{
+			ID:    childStageID,
+			RunID: childRunID,
+			Type:  run.StageTypeImplement,
+		}
+
+		priv, _ := sf.issue(t, childRunID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, childRunID, childStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp
+	}
+
+	t.Run("child inherits parent approval conditions", func(t *testing.T) {
+		parentRunID := uuid.New()
+		resp := seedDecomposedChild(t, map[uuid.UUID][]*audit.Entry{
+			parentRunID: {makeApproveWithCommentEntry(parentRunID, parentCondition)},
+		}, parentRunID)
+		for _, want := range []string{"### Approval conditions", parentCondition} {
+			if !strings.Contains(resp.Prompt, want) {
+				t.Errorf("child prompt missing %q\n---\n%s", want, resp.Prompt)
+			}
+		}
+	})
+
+	t.Run("child with no parent conditions renders no block", func(t *testing.T) {
+		parentRunID := uuid.New()
+		// Parent approved with an empty comment → no conditions.
+		resp := seedDecomposedChild(t, map[uuid.UUID][]*audit.Entry{
+			parentRunID: {makeApproveEntry(parentRunID)},
+		}, parentRunID)
+		if strings.Contains(resp.Prompt, "### Approval conditions") {
+			t.Errorf("child prompt should carry no approval-conditions block:\n%s", resp.Prompt)
+		}
+	})
+
+	t.Run("standalone run still renders its own conditions", func(t *testing.T) {
+		const standaloneCondition = "Cap the retry budget at 2 and keep the timeout drift fix."
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		planStageID := uuid.New()
+		implStageID := uuid.New()
+
+		standalonePlan := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "standalone plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		}
+		planBytes, err := json.Marshal(standalonePlan)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       planStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+		}
+		// DecomposedFrom nil → standalone; the helper reads the run's OWN
+		// approval_submitted entries with no parent fallback in play.
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{
+			ID:    implStageID,
+			RunID: runID,
+			Type:  run.StageTypeImplement,
+		}
+
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {makeApproveWithCommentEntry(runID, standaloneCondition)},
+			}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, want := range []string{"### Approval conditions", standaloneCondition} {
+			if !strings.Contains(resp.Prompt, want) {
+				t.Errorf("standalone prompt missing %q\n---\n%s", want, resp.Prompt)
+			}
+		}
+	})
+}
