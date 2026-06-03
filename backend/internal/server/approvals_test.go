@@ -217,6 +217,9 @@ func (r *approvalRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.
 func (r *approvalRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *approvalRunRepo) RetryRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *approvalRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
@@ -789,6 +792,24 @@ func (r *orchestratorRepo) TransitionRun(_ context.Context, id uuid.UUID, to run
 	return rr, nil
 }
 
+// RetryRun mirrors postgresRepo's run-level reopen override (#698):
+// only failed → running is permitted. The redrive integration test
+// drives the full handler → RedriveChild → RetryRun → orchestrator
+// seam through this fake.
+func (r *orchestratorRepo) RetryRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rr := r.runs[id]
+	if rr == nil {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidRunRetryTransition(rr.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "run", From: string(rr.State), To: string(to)}
+	}
+	rr.State = to
+	return rr, nil
+}
+
 func (r *orchestratorRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, url string) (*run.Run, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -835,6 +856,9 @@ func (r *orchestratorRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]
 			continue
 		}
 		if f.State != "" && string(rr.State) != f.State {
+			continue
+		}
+		if f.DecomposedFrom != nil && (rr.DecomposedFrom == nil || *rr.DecomposedFrom != *f.DecomposedFrom) {
 			continue
 		}
 		out = append(out, rr)

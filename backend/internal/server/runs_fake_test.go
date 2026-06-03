@@ -152,6 +152,24 @@ func (f *fakeRepo) TransitionRun(_ context.Context, id uuid.UUID, to run.State) 
 	return r, nil
 }
 
+// RetryRun mirrors postgresRepo's run-level reopen override: only the
+// failed → running transition in the runRetryTransitions table is
+// permitted (#698).
+func (f *fakeRepo) RetryRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidRunRetryTransition(r.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "run", From: string(r.State), To: string(to)}
+	}
+	r.State = to
+	r.UpdatedAt = time.Now().UTC()
+	return r, nil
+}
+
 func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.Run, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

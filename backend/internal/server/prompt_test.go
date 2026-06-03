@@ -119,6 +119,9 @@ func (r *promptRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Ru
 func (r *promptRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *promptRunRepo) RetryRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *promptRunRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, url string) (*run.Run, error) {
 	r.setPRURLCalls = append(r.setPRURLCalls, promptSetPRURLCall{RunID: id, URL: url})
 	if rn, ok := r.getRuns[id]; ok {

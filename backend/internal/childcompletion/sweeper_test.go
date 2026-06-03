@@ -77,6 +77,9 @@ func (f *fakeRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*
 func (f *fakeRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (f *fakeRunRepo) RetryRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (f *fakeRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
 }

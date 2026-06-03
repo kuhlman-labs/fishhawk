@@ -45,6 +45,11 @@ func (BaseFake) TransitionRun(_ context.Context, _ uuid.UUID, _ State) (*Run, er
 	return nil, ErrNotFound
 }
 
+// RetryRun returns nil, ErrNotFound.
+func (BaseFake) RetryRun(_ context.Context, _ uuid.UUID, _ State) (*Run, error) {
+	return nil, ErrNotFound
+}
+
 // SetRunPullRequestURL returns nil, ErrNotFound.
 func (BaseFake) SetRunPullRequestURL(_ context.Context, _ uuid.UUID, _ string) (*Run, error) {
 	return nil, ErrNotFound

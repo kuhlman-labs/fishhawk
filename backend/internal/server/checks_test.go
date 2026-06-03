@@ -105,6 +105,9 @@ func (r *stageGetterRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.
 func (r *stageGetterRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *stageGetterRepo) RetryRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *stageGetterRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
