@@ -64,6 +64,9 @@ func (r *approvalGateRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*
 func (r *approvalGateRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *approvalGateRunRepo) RetryRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *approvalGateRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
 }

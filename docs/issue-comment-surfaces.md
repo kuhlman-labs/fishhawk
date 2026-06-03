@@ -151,6 +151,19 @@ Notes:
   parked parent does not spam the chain — discoverability rests on this single
   orchestrator-path entry. Listed here only so a future reader grepping the
   audit categories doesn't mistake it for a comment surface.
+- The fan-out re-drive action audit kind — `child_redriven` (#698) — is an
+  **internal, user-actor audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread; it has no Notifier method. The
+  re-drive handler (`server/redrive.go::handleRedriveChild`,
+  `POST /v0/runs/{run_id}/redrive`) writes it once on a successful re-drive,
+  with the operator's `user` actor + subject and payload
+  `{run_id, stage_id, prior_category, prior_reason, prior_failure_class, via}`,
+  recording who re-opened the failed child and which implement-stage failure was
+  re-driven. The action re-opens the failed child run (`failed` → `running`) and
+  its failed implement stage (`failed` → `pending`) so the orchestrator can
+  re-dispatch; it is the operator counterpart to the system-emitted
+  `parent_awaiting_redrive` park signal above. Listed here only so a future
+  reader grepping the audit categories doesn't mistake it for a comment surface.
 
 ## Routing
 

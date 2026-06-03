@@ -94,6 +94,9 @@ func (r *reevalRunRepo) GetRunByIdempotencyKey(context.Context, string, string) 
 func (r *reevalRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
 }
+func (r *reevalRunRepo) RetryRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
+	return nil, errors.New("not used")
+}
 func (r *reevalRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
 	return nil, errors.New("not used")
 }

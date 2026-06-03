@@ -32,6 +32,34 @@ func ValidRunTransition(from, to State) bool {
 	return ok
 }
 
+// runRetryTransitions enumerates the explicit run-level reopen
+// overrides off a terminal state — moves out of a terminal run
+// state that the regular ValidRunTransition refuses.
+//
+// failed → running is the re-drive override (#698): a decomposition
+// child run resolved to failed, but its implement-stage failure was
+// in a retryable category (A/C, or D-timeout). An operator re-drives
+// the child via POST /v0/runs/{run_id}/redrive, which un-terminals
+// the run so orchestrator.Advance (a no-op on terminal runs) can
+// re-dispatch the reset implement stage. This mirrors the
+// stageRetryTransitions pattern exactly: a separate table consulted
+// only by RetryRun, so it does not loosen ValidRunTransition for
+// ordinary callers.
+var runRetryTransitions = map[State]map[State]struct{}{
+	StateFailed: {
+		StateRunning: {},
+	},
+}
+
+// ValidRunRetryTransition reports whether `from` is allowed to retry
+// (reopen) into `to`. The retry path is intentionally narrow —
+// callers that want a regular transition should keep using
+// ValidRunTransition + TransitionRun.
+func ValidRunRetryTransition(from, to State) bool {
+	_, ok := runRetryTransitions[from][to]
+	return ok
+}
+
 // stageTransitions enumerates allowed Stage state transitions.
 //
 // Pending → Dispatched: backend has emitted workflow_dispatch.

@@ -166,6 +166,17 @@ type Repository interface {
 	// return the unchanged run.
 	TransitionRun(ctx context.Context, id uuid.UUID, to State) (*Run, error)
 
+	// RetryRun is the explicit run-level reopen override off a
+	// terminal state — today only failed → running per the
+	// runRetryTransitions table in transition.go (#698). Reuses the
+	// plain UpdateRunState query: runs carry no failure metadata to
+	// clear (only stages do), so no dedicated clearing query is
+	// needed. Returns InvalidTransitionError when the run is not in a
+	// state from which the retry target is reachable. The high-level
+	// run.RedriveChild helper calls this after validating the run is a
+	// failed decomposition child.
+	RetryRun(ctx context.Context, id uuid.UUID, to State) (*Run, error)
+
 	// SetRunPullRequestURL backfills the implement-stage PR URL
 	// onto the run row when the pull_request artifact lands
 	// (#216). Idempotent: setting the same URL twice is a no-op.

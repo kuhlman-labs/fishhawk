@@ -40,6 +40,35 @@ func TestRunTransitions_AllowedAndForbidden(t *testing.T) {
 	}
 }
 
+// TestRunRetryTransitions table-tests the narrow run-level reopen
+// override (#698). Only failed → running is permitted; the table must
+// not leak into ordinary transitions.
+func TestRunRetryTransitions(t *testing.T) {
+	cases := []struct {
+		from, to State
+		want     bool
+	}{
+		{StateFailed, StateRunning, true}, // the re-drive reopen
+		// Everything else is refused — including the same pairs the
+		// normal table allows, since RetryRun is a separate path.
+		{StateFailed, StatePending, false},
+		{StateFailed, StateSucceeded, false},
+		{StateFailed, StateFailed, false}, // not in the retry table
+		{StateRunning, StateRunning, false},
+		{StateRunning, StateFailed, false},
+		{StatePending, StateRunning, false},
+		{StateCancelled, StateRunning, false},
+		{StateSucceeded, StateRunning, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.from)+"→"+string(tc.to), func(t *testing.T) {
+			if got := ValidRunRetryTransition(tc.from, tc.to); got != tc.want {
+				t.Errorf("ValidRunRetryTransition(%q, %q) = %v, want %v", tc.from, tc.to, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 	cases := []struct {
 		from, to StageState

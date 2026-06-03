@@ -379,6 +379,57 @@ func TestPostgres_TransitionRun_HappyPath(t *testing.T) {
 	}
 }
 
+// TestPostgres_RetryRun_ReopensFailed exercises the run-level reopen
+// override (#698): a failed run goes back to running, and every other
+// column is left intact (RetryRun reuses UpdateRunState; runs carry no
+// failure metadata to clear).
+func TestPostgres_RetryRun_ReopensFailed(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+
+	r := makeRun(t, repo)
+	if _, err := repo.TransitionRun(context.Background(), r.ID, run.StateRunning); err != nil {
+		t.Fatalf("pending → running: %v", err)
+	}
+	failed, err := repo.TransitionRun(context.Background(), r.ID, run.StateFailed)
+	if err != nil {
+		t.Fatalf("running → failed: %v", err)
+	}
+	if failed.State != run.StateFailed {
+		t.Fatalf("state = %q, want failed", failed.State)
+	}
+
+	reopened, err := repo.RetryRun(context.Background(), r.ID, run.StateRunning)
+	if err != nil {
+		t.Fatalf("RetryRun failed → running: %v", err)
+	}
+	if reopened.State != run.StateRunning {
+		t.Errorf("state = %q, want running", reopened.State)
+	}
+	// Non-state columns untouched by the reopen.
+	if reopened.Repo != r.Repo || reopened.WorkflowID != r.WorkflowID || reopened.WorkflowSHA != r.WorkflowSHA {
+		t.Errorf("RetryRun clobbered a non-state column: %+v", reopened)
+	}
+	if reopened.MaxRetriesSnapshot != failed.MaxRetriesSnapshot {
+		t.Errorf("max_retries_snapshot = %d, want %d", reopened.MaxRetriesSnapshot, failed.MaxRetriesSnapshot)
+	}
+}
+
+// TestPostgres_RetryRun_RejectsNonFailed asserts the narrow retry
+// table: only failed → running is permitted. A running run cannot be
+// "reopened".
+func TestPostgres_RetryRun_RejectsNonFailed(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+
+	r := makeRun(t, repo) // pending
+	_, err := repo.RetryRun(context.Background(), r.ID, run.StateRunning)
+	var inv run.InvalidTransitionError
+	if !errors.As(err, &inv) {
+		t.Fatalf("err = %v, want InvalidTransitionError", err)
+	}
+}
+
 func TestPostgres_TransitionRun_Idempotent(t *testing.T) {
 	pool := startPostgres(t)
 	repo := run.NewPostgresRepository(pool)

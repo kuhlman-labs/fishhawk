@@ -1218,6 +1218,63 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /v0/runs/{run_id}/redrive:
+    post:
+      operationId: redriveChild
+      summary: Re-drive a failed decomposition child run
+      description: |
+        Operator recovery action for a decomposition parent parked in
+        `awaiting_children` because every failed child was in a retryable
+        failure category (A/C, or D-timeout) — see #698. Re-opens the
+        failed child run (`failed` → `running`) and its failed implement
+        stage (`failed` → `pending`), then hands off to the orchestrator
+        to walk `pending` → `dispatched` and fire `workflow_dispatch`.
+        Un-terminal-ing the run is what lets the orchestrator act —
+        `Advance` no-ops on a terminal run. On the child's next terminal
+        transition the parked parent reconciles through the normal
+        parent-resolution path. Writes a `child_redriven` audit entry on
+        success with the prior implement-stage failure category and
+        reason in the payload.
+
+        **Authorization.** Re-drive is an operator action. It requires
+        the operator retry scope (`write:stages` or `write:retries`, the
+        same shape as `POST /v0/stages/{stage_id}/retry`) AND rejects any
+        MCP subject-bound (agent) token outright — an agent may not
+        re-drive any run (not its own, not a sibling/child/parent),
+        because re-opening a terminal run is not an agent-permitted
+        action. Cookie-session operators are accepted unconditionally.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Child re-driven; refreshed Run row (state `running`) in body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) the caller presented an MCP/agent
+            subject-bound token (subject `mcp:run:<uuid>`) — body `error`
+            is `agent_token_forbidden`; agent tokens may never re-drive a
+            run. (2) a bearer token lacks both `write:stages` and
+            `write:retries` scope — body `error` is `insufficient_scope`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: |
+            Re-drive not applicable: the run is not a decomposition child
+            (`DecomposedFrom` is null), is not in the `failed` state, or
+            has no failed implement stage to re-open. Body's `error` is
+            `redrive_not_applicable` and `message` explains the reason.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/stages:
     get:
       operationId: listRunStages

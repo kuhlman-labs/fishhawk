@@ -193,6 +193,44 @@ func (r *postgresRepo) TransitionRun(ctx context.Context, id uuid.UUID, to State
 	return result, nil
 }
 
+// RetryRun is the explicit run-level reopen out of a terminal state
+// (#698). Gated by ValidRunRetryTransition (today only failed →
+// running), it reuses the plain UpdateRunState query: a run row
+// carries no failure metadata to clear (FailureCategory/FailureReason
+// live only on stages), so no dedicated clearing query — and thus no
+// sqlc regeneration — is required. Same FOR UPDATE locking as
+// TransitionRun so a concurrent transition can't race the reopen.
+func (r *postgresRepo) RetryRun(ctx context.Context, id uuid.UUID, to State) (*Run, error) {
+	var result *Run
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		current, err := q.LockRunForUpdate(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock run: %w", err)
+		}
+		from := State(current.State)
+		if !ValidRunRetryTransition(from, to) {
+			return InvalidTransitionError{Kind: "run", From: string(from), To: string(to)}
+		}
+		updated, err := q.UpdateRunState(ctx, rundb.UpdateRunStateParams{
+			ID:    id,
+			State: string(to),
+		})
+		if err != nil {
+			return fmt.Errorf("update run state: %w", err)
+		}
+		result = rowToRun(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // --- Stage methods ---
 
 func (r *postgresRepo) SetRunPullRequestURL(ctx context.Context, id uuid.UUID, url string) (*Run, error) {

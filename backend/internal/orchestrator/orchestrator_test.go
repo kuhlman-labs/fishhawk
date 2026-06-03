@@ -153,6 +153,21 @@ func (s *stubRuns) TransitionRun(_ context.Context, id uuid.UUID, to run.State) 
 	return r, nil
 }
 
+func (s *stubRuns) RetryRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.runs[id]
+	if r == nil {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidRunRetryTransition(r.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "run", From: string(r.State), To: string(to)}
+	}
+	r.State = to
+	s.runTransitions = append(s.runTransitions, runTransition{RunID: id, To: to})
+	return r, nil
+}
+
 func (s *stubRuns) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
