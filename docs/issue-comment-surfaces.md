@@ -113,6 +113,25 @@ Notes:
   the same estimate caveat as the cost ledger: period spend undercounts
   invocations a backend reported no tokens for (`known_usage=false`, #685), so
   actual spend is a lower bound.
+- The per-run budget tripwire audit kind — `run_budget_exceeded` (#653 /
+  ADR-030) — is an **internal, system-actor audit kind, not an issue-comment
+  surface**. Nothing in `issuecomment` posts it to the issue thread; it has no
+  Notifier method. The trace upload handler (`trace.go::checkRunBudget`, after
+  `recordCost` rolls the bundle's cost into `runs.cost_usd_total`) writes it
+  once, with a `system` actor and payload `{dimension (usd|tokens),
+  cost_usd_total, max_run_usd, tokens_total, max_run_tokens, terminal_state}`,
+  when a run's cumulative spend reaches an operator-configured per-run ceiling
+  (`Config.MaxRunUSD` / `Config.MaxRunTokens`, default 0 = disabled). It is the
+  third axis of ADR-030's budget story — a global per-run safety rail distinct
+  from the per-workflow periodic budgets (`budget_alert` / `run_rejected_budget`)
+  and the rate-anomaly `spend_alert`. On breach the handler HALTS the run via
+  the cancel transition (terminal state `cancelled`, non-retryable: a budget
+  tripwire is a protective system stop, not a work failure, so a runaway run is
+  deliberately not auto-redriven) and short-circuits before stage advancement,
+  so no further stage is dispatched. The US$ ceiling is enforced against the
+  rolled `cost_usd_total`; the token ceiling against the input+output tokens
+  summed from the run's `cost_recorded` ledger. Listed here only so a future
+  reader grepping the audit categories doesn't mistake it for a comment surface.
 - The blocking periodic-budget admission audit kinds — `run_rejected_budget`
   and `run_admitted_budget_override` (#688 / ADR-030) — are **internal,
   admission-time global-chain audit entries, NOT issue-comment surfaces**.
