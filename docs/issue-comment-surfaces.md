@@ -164,6 +164,22 @@ Notes:
   re-dispatch; it is the operator counterpart to the system-emitted
   `parent_awaiting_redrive` park signal above. Listed here only so a future
   reader grepping the audit categories doesn't mistake it for a comment surface.
+- The audited category-B override audit kind — `stage_override_retried` (#698) —
+  is an **internal, user-actor audit kind, not an issue-comment surface**.
+  Nothing in `issuecomment` posts it to the issue thread; it has no Notifier
+  method. The retry handler (`server/retry.go::handleRetryStage`,
+  `POST /v0/stages/{stage_id}/retry` with `{override: true, reason: "..."}`)
+  writes it once on a successful override, with the operator's `user` actor +
+  subject and payload `{stage_id, prior_category (always B), prior_reason,
+  prior_failure_class, override_reason, retry_ordinal, override_effect,
+  admissibility_reason}`. It is kept DISTINCT from the ordinary `stage_retried`
+  receipt so the explicit operator escape hatch (who/why) stays separable in
+  audit analysis from both a normal retry and #692's automatic empty-diff → C
+  reclassification. The override re-opens the category-B stage to `pending`: the
+  stage re-runs and the policy gate re-evaluates the new diff — it does NOT
+  accept the B-violating diff or bypass the gate (the `override_effect` field
+  records this framing). Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
 
 ## Routing
 

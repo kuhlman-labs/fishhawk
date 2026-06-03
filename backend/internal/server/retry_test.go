@@ -366,6 +366,124 @@ func TestRetryStage_AuditReceiptShape(t *testing.T) {
 	}
 }
 
+// postRetryBody posts to the retry endpoint with a raw JSON body —
+// used to exercise the {override, reason} escape hatch (#698).
+func postRetryBody(t *testing.T, s *Server, stageID uuid.UUID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	url := "/v0/stages/" + stageID.String() + "/retry"
+	req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	req.SetPathValue("stage_id", stageID.String())
+	w := httptest.NewRecorder()
+	s.handleRetryStage(w, withAuth(req))
+	return w
+}
+
+// #698: a category-B failure with {override:true, reason:...} re-opens
+// the stage to pending and writes the DISTINCT stage_override_retried
+// audit entry (not a plain stage_retried). The override re-runs the
+// stage so the gate re-evaluates the new diff — it does not bypass the
+// gate.
+func TestRetryStage_BOverrideHappyPath(t *testing.T) {
+	s, repo, au := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureB, "forbidden_paths violated")
+
+	w := postRetryBody(t, s, stage.ID, `{"override":true,"reason":"forbidden path was a generated file; regenerating"}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != string(run.StageStatePending) {
+		t.Errorf("body.State = %q, want pending", body.State)
+	}
+
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	got := au.appended[0]
+	if got.Category != CategoryStageOverrideRetried {
+		t.Errorf("audit category = %q, want stage_override_retried", got.Category)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(got.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["prior_category"] != "B" {
+		t.Errorf("payload.prior_category = %v, want B", payload["prior_category"])
+	}
+	if !strings.Contains(payload["override_reason"].(string), "generated file") {
+		t.Errorf("payload.override_reason = %v, want the operator reason", payload["override_reason"])
+	}
+	if _, ok := payload["override_effect"]; !ok {
+		t.Error("payload missing override_effect framing (gate not bypassed)")
+	}
+}
+
+// The category-B override is an OPERATOR-only escape hatch: an agent
+// (MCP subject-bound) token is rejected outright even for its OWN run, so
+// an agent cannot self-override a genuine policy-gate failure and the
+// stage_override_retried audit's operator attribution holds (#698). A
+// normal (non-override) retry from the same token stays allowed — that
+// path is covered by TestRetryStage_MCPTokenMatchingRunAllowed.
+func TestRetryStage_BOverrideAgentTokenForbidden(t *testing.T) {
+	s, repo, au := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureB, "forbidden_paths violated")
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/"+stage.ID.String()+"/retry",
+		strings.NewReader(`{"override":true,"reason":"agent attempting self-override"}`))
+	req.SetPathValue("stage_id", stage.ID.String())
+	w := httptest.NewRecorder()
+	// Agent token bound to the stage's OWN run — still rejected for override.
+	s.handleRetryStage(w, withMCPRetryAuth(req, stage.RunID))
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "agent_token_forbidden") {
+		t.Errorf("body missing agent_token_forbidden code: %s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no entry on a rejected agent override", au.appended)
+	}
+}
+
+// The reason is mandatory when override is set: a bare {override:true}
+// is a 400 validation_failed, not a silent override.
+func TestRetryStage_BOverrideWithoutReasonReturns400(t *testing.T) {
+	s, repo, au := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureB, "forbidden_paths violated")
+
+	w := postRetryBody(t, s, stage.ID, `{"override":true}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "validation_failed") {
+		t.Errorf("body missing validation_failed code: %s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no entry on a rejected override", au.appended)
+	}
+}
+
+// Without the override flag a category-B retry is still refused with a
+// 422 — the default behavior is unchanged (cf. TestRetryStage_BReturns422,
+// which exercises the no-body path; this one sends an explicit
+// {override:false}).
+func TestRetryStage_BOverrideFalseStill422(t *testing.T) {
+	s, repo, _ := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureB, "forbidden_paths violated")
+
+	w := postRetryBody(t, s, stage.ID, `{"override":false}`)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", w.Code)
+	}
+}
+
 func payloadKeys(m map[string]any) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {

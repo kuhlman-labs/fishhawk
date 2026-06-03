@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -21,6 +22,26 @@ import (
 // audit trail records what was retried (without forcing a reader
 // to walk back to the prior `stage_failed`-shaped entries).
 const CategoryStageRetried = "stage_retried"
+
+// CategoryStageOverrideRetried is the audit-log category for the
+// chained entry the retry handler writes when an operator re-opens a
+// genuine category-B stage via the {override:true} escape hatch
+// (#698). It is kept DISTINCT from stage_retried so the explicit
+// override (who/why) stays separable in audit analysis from both an
+// ordinary retry and #692's automatic empty-diff → C reclassification.
+// The override re-opens the B stage to pending: the stage re-runs and
+// the policy gate re-evaluates the new diff — it does not accept the
+// B-violating diff or bypass the gate.
+const CategoryStageOverrideRetried = "stage_override_retried"
+
+// retryRequest is the optional JSON body of POST
+// /v0/stages/{stage_id}/retry. An empty body retries with default
+// per-category semantics. {override:true} admits a category-B
+// failure onto the A/C re-open path and REQUIRES a non-empty reason.
+type retryRequest struct {
+	Override bool   `json:"override"`
+	Reason   string `json:"reason"`
+}
 
 // handleRetryStage implements POST /v0/stages/{stage_id}/retry.
 //
@@ -79,6 +100,25 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional request body. Absent body → default per-category retry.
+	// {override:true} admits a category-B failure onto the re-open path
+	// and requires a recorded reason (the audited escape hatch, #698).
+	var reqBody retryRequest
+	if r.Body != nil {
+		if decErr := json.NewDecoder(r.Body).Decode(&reqBody); decErr != nil && !errors.Is(decErr, io.EOF) {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"request body must be valid JSON {override, reason}",
+				map[string]any{"error": decErr.Error()})
+			return
+		}
+	}
+	if reqBody.Override && strings.TrimSpace(reqBody.Reason) == "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"reason is required when override is set",
+			map[string]any{"field": "reason"})
+		return
+	}
+
 	// Pre-fetch the stage to get the RunID for subject-binding guard.
 	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
 	if err != nil {
@@ -96,6 +136,21 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	// their own run. Subject format is "mcp:run:<uuid>" (set by
 	// bearerAuth middleware at middleware.go).
 	if strings.HasPrefix(id.Subject, "mcp:run:") {
+		// The category-B override is an OPERATOR-only escape hatch (#698):
+		// re-opening a genuine policy-gate failure is a human decision, not
+		// an agent's. Reject any agent (MCP subject-bound) token outright
+		// when override is set — even for the agent's own run — mirroring
+		// the /redrive guard, so the stage_override_retried audit's operator
+		// attribution holds (writeOverrideRetryAudit's ActorUser is then
+		// correct by construction). Normal (non-override) retry stays
+		// subject-bound below so agents can still retry their own A/C
+		// failures.
+		if reqBody.Override {
+			s.writeError(w, r, http.StatusForbidden, "agent_token_forbidden",
+				"the category-B override is an operator-only action; agent tokens may not invoke it",
+				nil)
+			return
+		}
 		runIDStr := strings.TrimPrefix(id.Subject, "mcp:run:")
 		subjectRunID, parseErr := uuid.Parse(runIDStr)
 		if parseErr != nil {
@@ -114,7 +169,7 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	dec, err := run.RetryStage(r.Context(), s.cfg.RunRepo, stageID)
+	dec, err := run.RetryStage(r.Context(), s.cfg.RunRepo, stageID, run.RetryOptions{OverrideB: reqBody.Override})
 	if err != nil {
 		switch {
 		case errors.Is(err, run.ErrNotFound):
@@ -152,8 +207,14 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 
 	// Audit first so the retry intent is recorded even if the
 	// orchestrator handoff below fails. Same posture as the
-	// approvals handler (E7.4 / approvals.go).
-	s.writeRetryAudit(r, dec, runRow)
+	// approvals handler (E7.4 / approvals.go). A category-B override
+	// gets the distinct stage_override_retried entry (who/why) instead
+	// of the ordinary stage_retried receipt.
+	if dec.Overridden {
+		s.writeOverrideRetryAudit(r, dec, reqBody.Reason)
+	} else {
+		s.writeRetryAudit(r, dec, runRow)
+	}
 
 	// A/C retries land the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire
@@ -234,6 +295,59 @@ func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow
 		Payload:      payload,
 	}); err != nil {
 		s.cfg.Logger.Error("audit append failed for retry",
+			"run_id", dec.Stage.RunID,
+			"stage_id", dec.Stage.ID,
+			"error", err.Error(),
+		)
+	}
+}
+
+// writeOverrideRetryAudit appends the distinct stage_override_retried
+// entry for an audited category-B override (#698). It records the
+// actor, the prior category/reason (always B here), and the operator's
+// required justification. The framing is explicit per the approval
+// condition: the override re-opens the stage to pending so the agent
+// re-runs and the policy gate re-evaluates the new diff — it does NOT
+// accept the B-violating diff or bypass the gate. Best-effort: the
+// transition is already committed, so a failure here logs but doesn't
+// unwind.
+func (s *Server) writeOverrideRetryAudit(r *http.Request, dec *run.RetryDecision, reason string) {
+	id := IdentityFrom(r.Context())
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	actorKind := audit.ActorUser
+
+	fields := map[string]any{
+		"stage_id":            dec.Stage.ID.String(),
+		"prior_category":      string(dec.PriorCategory),
+		"prior_reason":        dec.PriorReason,
+		"prior_failure_class": dec.PriorCategory.Description(),
+		"override_reason":     reason,
+		"retry_ordinal":       dec.Stage.SelfRetryCount,
+		// Framing (approval condition): the override does not bypass the
+		// gate — it re-opens the B stage to pending for a fresh run, and
+		// the policy gate re-evaluates the new diff.
+		"override_effect": "re-opened to pending for re-run; the policy gate re-evaluates the new diff and is not bypassed",
+		"admissibility_reason": fmt.Sprintf("category %s (%s) override; re-run + gate re-eval; via %s",
+			string(dec.PriorCategory),
+			dec.PriorCategory.Description(),
+			scopeUsed(id)),
+	}
+
+	payload, _ := json.Marshal(fields)
+
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        dec.Stage.RunID,
+		StageID:      &dec.Stage.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryStageOverrideRetried,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.Error("audit append failed for override retry",
 			"run_id", dec.Stage.RunID,
 			"stage_id", dec.Stage.ID,
 			"error", err.Error(),

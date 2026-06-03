@@ -409,7 +409,7 @@ func TestShipTrace_PolicyReEval_EmptyDiff_FailedC_Retryable(t *testing.T) {
 	// Seam: the resulting category-C failed stage must be retryable —
 	// failed → pending, NOT ErrRetryNotApplicable (which is what a
 	// category-B would yield).
-	dec, err := run.RetryStage(context.Background(), repo, repo.stage.ID)
+	dec, err := run.RetryStage(context.Background(), repo, repo.stage.ID, run.RetryOptions{})
 	if err != nil {
 		t.Fatalf("RetryStage on category-C failed stage = %v, want nil", err)
 	}
