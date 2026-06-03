@@ -1480,6 +1480,54 @@ func TestBuild_ImplementReview_GroundsRuleCitationsAndScopesStyle(t *testing.T) 
 	}
 }
 
+func TestBuild_ImplementReview_OrthogonalLenses(t *testing.T) {
+	// #703: the implement-review prompt is re-aimed at the lenses the
+	// deterministic gates (policy gate, test suite, build/lint, CI) cannot
+	// see — security/authz, test vacuity, and untested error/edge/concurrency
+	// paths — and explicitly stops re-verifying plan adherence or
+	// generic-bug-hunting. The security lens is self-gating on low-risk diffs.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		// Explicit non-goals.
+		"Do NOT re-verify plan adherence",
+		"Do NOT generic-bug-hunt",
+		// The three orthogonal lenses.
+		"Security / authz",
+		"lethal trifecta",
+		"Test vacuity",
+		"vacuous",
+		"Untested error / edge / concurrency paths",
+		// Self-gating escape on a low-risk diff.
+		"if the diff touches NO sensitive surface",
+		"manufacture a security concern for a low-risk diff",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+	// Decision rule is re-anchored on the new lenses, not plan adherence.
+	if !strings.Contains(got, "a security / authz regression, a vacuous test") {
+		t.Errorf("verdict decision rule not re-aimed at the new lenses:\n%s", got)
+	}
+	// Determinism still holds across replays.
+	again, _ := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if got != again {
+		t.Errorf("implement_review prompt is non-deterministic across calls")
+	}
+}
+
 func TestBuild_ImplementReview_WithPatch_RendersHunks(t *testing.T) {
 	patch := "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n" +
 		"@@ -1,3 +1,3 @@\n-old line\n+new line\n"
