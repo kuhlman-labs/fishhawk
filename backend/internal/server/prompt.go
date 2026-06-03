@@ -223,7 +223,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			scopeFiles = childScope
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
-		trigger.ApprovalConditions = s.loadApprovalConditions(r.Context(), runRow.ID)
+		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -383,7 +383,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			scopeFiles = childScope
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
-		trigger.ApprovalConditions = s.loadApprovalConditions(r.Context(), runRow.ID)
+		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -1279,4 +1279,35 @@ func (s *Server) loadApprovalConditions(ctx context.Context, runID uuid.UUID) *s
 		}
 	}
 	return nil
+}
+
+// resolveApprovalConditions returns the binding approve-with-conditions text
+// for an implement-stage prompt, resolving across the decomposition fan-out
+// boundary (#677). It first reads the run's own approval_submitted entries
+// via loadApprovalConditions; for a decomposed child (DecomposedFrom != nil)
+// that has no plan stage and no human approval gate of its own, this is
+// always nil, so it falls back to the PARENT run's conditions — mirroring
+// loadApprovedPlanForRun's parent walk (#558 approval-note delivery now
+// reaches implement-only children).
+//
+// The child-first lookup keeps standalone runs unchanged (DecomposedFrom nil
+// → exactly loadApprovalConditions(runRow.ID)) and future-proofs the case
+// where a child ever gains its own gate: its own conditions win over the
+// parent's.
+func (s *Server) resolveApprovalConditions(ctx context.Context, runRow *run.Run) *string {
+	if cond := s.loadApprovalConditions(ctx, runRow.ID); cond != nil {
+		return cond
+	}
+	if runRow.DecomposedFrom == nil {
+		return nil
+	}
+	cond := s.loadApprovalConditions(ctx, *runRow.DecomposedFrom)
+	if cond != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: inherited approval conditions from decomposition parent",
+			slog.String("child_run_id", runRow.ID.String()),
+			slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+		)
+	}
+	return cond
 }
