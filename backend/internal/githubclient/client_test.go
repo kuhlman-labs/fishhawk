@@ -1953,3 +1953,66 @@ func TestGetRepoInstallation_NoAppJWT(t *testing.T) {
 		t.Errorf("err = %v, want AppJWT-not-configured error", err)
 	}
 }
+
+// fakeSigner is a minimal AppJWTSigner for wiring tests: returns a
+// canned JWT (or an error) and records the TTL it was called with.
+type fakeSigner struct {
+	jwt    string
+	err    error
+	gotTTL time.Duration
+	calls  int
+}
+
+func (s *fakeSigner) Sign(ttl time.Duration) (string, error) {
+	s.calls++
+	s.gotTTL = ttl
+	if s.err != nil {
+		return "", s.err
+	}
+	return s.jwt, nil
+}
+
+// TestNewWithSigner_WiresAppJWT is the regression test for #721: it
+// drives GetRepoInstallation through the PRODUCTION constructor
+// (NewWithSigner) rather than a hand-wired Client, so it would have
+// caught the missing AppJWT wiring that left serve.go's GetRepoInstallation
+// hitting the nil guard and stamping installation_id=NULL. The earlier
+// hand-built test set AppJWT directly and so masked the omission.
+func TestNewWithSigner_WiresAppJWT(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	signer := &fakeSigner{jwt: "fake.app.jwt"}
+
+	// Construct exactly as production does, then point at the fake.
+	c := NewWithSigner(&stubTokens{token: "ghs_canned_token"}, signer)
+	c.BaseURL = srv.URL
+	if c.AppJWT == nil {
+		t.Fatal("NewWithSigner left AppJWT nil; App-level endpoints would hit the nil guard")
+	}
+
+	// 200 → installation id, via the App-JWT path (not the nil guard).
+	id, err := c.GetRepoInstallation(context.Background(), RepoRef{Owner: "x", Name: "y"})
+	if err != nil {
+		t.Fatalf("GetRepoInstallation through NewWithSigner: %v", err)
+	}
+	if id != 12345 {
+		t.Errorf("installation id = %d, want 12345", id)
+	}
+	// The outbound request must carry the App JWT minted by the signer.
+	if fg.gotAuth != "Bearer fake.app.jwt" {
+		t.Errorf("Authorization = %q, want %q (App JWT from signer)", fg.gotAuth, "Bearer fake.app.jwt")
+	}
+	if signer.calls == 0 {
+		t.Error("signer.Sign was never called; AppJWT did not reach the wire")
+	}
+	// signer.Sign(0) → DefaultJWTTTL (9m), under GitHub's 10m cap.
+	if signer.gotTTL != 0 {
+		t.Errorf("signer called with ttl = %v, want 0 (clamps to DefaultJWTTTL)", signer.gotTTL)
+	}
+
+	// 404 → ErrNotInstalled, still through the production-wired client.
+	fg.getInstallationStatus = http.StatusNotFound
+	fg.getInstallationBody = `{"message":"Not Found"}`
+	if _, err := c.GetRepoInstallation(context.Background(), RepoRef{Owner: "x", Name: "y"}); !errors.Is(err, ErrNotInstalled) {
+		t.Errorf("err = %v, want ErrNotInstalled", err)
+	}
+}
