@@ -23,6 +23,25 @@ var ErrRetryNotApplicable = errors.New("retry not applicable")
 // 501) but no path in this package returns it as of E8.6.
 var ErrRetryNotImplemented = errors.New("retry not implemented")
 
+// RetryOptions modulates RetryStage's per-category decision. The
+// zero value preserves the default semantics documented on
+// RetryStage.
+type RetryOptions struct {
+	// OverrideB, when true, re-opens a genuine category-B
+	// (constraint/policy) failed stage via the same failed → pending
+	// path as A/C, instead of refusing it with ErrRetryNotApplicable.
+	//
+	// This is the audited operator escape hatch for #698. It does NOT
+	// accept the failing diff or bypass the policy gate: re-opening to
+	// pending re-runs the stage and the policy gate re-evaluates the
+	// new diff exactly as it would for an A/C retry. The override only
+	// changes whether the stage is allowed to re-run at all — not what
+	// the gate decides about the re-run. The handler requires a
+	// recorded reason and writes a distinct stage_override_retried
+	// audit entry; the default (false) leaves B non-retryable.
+	OverrideB bool
+}
+
 // RetryDecision summarizes what RetryStage did, for the audit
 // trail and the handler's response.
 type RetryDecision struct {
@@ -38,6 +57,13 @@ type RetryDecision struct {
 	// Stage is the post-retry stage row. Its FailureCategory and
 	// FailureReason are nil; State is the retry target.
 	Stage *Stage
+
+	// Overridden reports that the retry was admitted only because the
+	// caller passed RetryOptions.OverrideB on a category-B failure.
+	// The handler keys the distinct stage_override_retried audit entry
+	// off this so the explicit operator override stays separable from
+	// an ordinary retry in any later audit analysis.
+	Overridden bool
 }
 
 // RetryableFailure reports whether a stage failure in the given
@@ -130,7 +156,13 @@ func ImplementFailureRetryable(stages []*Stage) bool {
 // The orchestrator handoff for A/C lives in the handler, not here:
 // run depends on nothing external; orchestrator depends on run.
 // Inverting that would create a cycle.
-func RetryStage(ctx context.Context, repo Repository, stageID uuid.UUID) (*RetryDecision, error) {
+//
+// opts.OverrideB is the audited operator escape hatch (#698): set it
+// to admit a genuine category-B failure onto the A/C failed → pending
+// path, which re-runs the stage so the policy gate re-evaluates the
+// new diff. It never bypasses the gate or accepts the B-violating
+// diff. The default (zero value) leaves B non-retryable.
+func RetryStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts RetryOptions) (*RetryDecision, error) {
 	stage, err := repo.GetStage(ctx, stageID)
 	if err != nil {
 		return nil, fmt.Errorf("RetryStage: get stage: %w", err)
@@ -150,7 +182,20 @@ func RetryStage(ctx context.Context, repo Repository, stageID uuid.UUID) (*Retry
 		priorReason = *stage.FailureReason
 	}
 
-	if !RetryableFailure(priorCat, priorReason) {
+	retryable := RetryableFailure(priorCat, priorReason)
+	overridden := false
+	if !retryable && priorCat == FailureB && opts.OverrideB {
+		// Audited operator override (#698): admit a genuine category-B
+		// failure onto the A/C failed → pending path. This does NOT
+		// accept the B-violating diff or skip the gate — re-opening to
+		// pending re-runs the stage and the policy gate re-evaluates
+		// the fresh diff. The handler enforces a recorded reason and
+		// writes the distinct stage_override_retried audit entry.
+		retryable = true
+		overridden = true
+	}
+
+	if !retryable {
 		// Not retryable: return a category-specific explanation so
 		// the handler's 422 tells the caller *why* a fresh run (or a
 		// spec change) is the right next step instead of a retry.
@@ -191,5 +236,6 @@ func RetryStage(ctx context.Context, repo Repository, stageID uuid.UUID) (*Retry
 		PriorCategory: priorCat,
 		PriorReason:   priorReason,
 		Stage:         updated,
+		Overridden:    overridden,
 	}, nil
 }

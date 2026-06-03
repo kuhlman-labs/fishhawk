@@ -25,7 +25,7 @@ func failedStage(t *testing.T, cat run.FailureCategory, reason string) (*memRepo
 func TestRetryStage_DTimeoutReopensTheGate(t *testing.T) {
 	repo, stage := failedStage(t, run.FailureD, "sla_timeout: 5h elapsed (deadline 4h)")
 
-	dec, err := run.RetryStage(context.Background(), repo, stage.ID)
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
 	if err != nil {
 		t.Fatalf("RetryStage: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestRetryStage_DTimeoutReopensTheGate(t *testing.T) {
 func TestRetryStage_DRejectedRefused(t *testing.T) {
 	repo, stage := failedStage(t, run.FailureD, "gate rejected by approver")
 
-	_, err := run.RetryStage(context.Background(), repo, stage.ID)
+	_, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
 	if !errors.Is(err, run.ErrRetryNotApplicable) {
 		t.Fatalf("err = %v, want ErrRetryNotApplicable", err)
 	}
@@ -56,9 +56,47 @@ func TestRetryStage_DRejectedRefused(t *testing.T) {
 func TestRetryStage_BNotApplicable(t *testing.T) {
 	repo, stage := failedStage(t, run.FailureB, "forbidden_paths violated: backend/internal/policy/secret.go")
 
-	_, err := run.RetryStage(context.Background(), repo, stage.ID)
+	_, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
 	if !errors.Is(err, run.ErrRetryNotApplicable) {
 		t.Errorf("err = %v, want ErrRetryNotApplicable", err)
+	}
+}
+
+// #698: OverrideB admits a genuine category-B failure onto the A/C
+// failed → pending path. The stage re-opens to pending (it re-runs and
+// the policy gate re-evaluates the new diff — the override does not
+// bypass the gate) and the decision is flagged Overridden so the
+// handler can write the distinct stage_override_retried audit.
+func TestRetryStage_BOverrideReopensToPending(t *testing.T) {
+	repo, stage := failedStage(t, run.FailureB, "forbidden_paths violated: backend/internal/policy/secret.go")
+
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{OverrideB: true})
+	if err != nil {
+		t.Fatalf("RetryStage with OverrideB: %v", err)
+	}
+	if dec.PriorCategory != run.FailureB {
+		t.Errorf("PriorCategory = %q, want B", dec.PriorCategory)
+	}
+	if !dec.Overridden {
+		t.Error("dec.Overridden = false, want true for a B override")
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-override state = %q, want pending", dec.Stage.State)
+	}
+	if dec.Stage.FailureCategory != nil || dec.Stage.FailureReason != nil {
+		t.Errorf("post-override stage still carries failure metadata: %+v", dec.Stage)
+	}
+}
+
+// OverrideB only relaxes category B. A category-D rejection (the other
+// non-retryable case) stays refused even with the override set — the
+// escape hatch is scoped to constraint/policy failures.
+func TestRetryStage_OverrideDoesNotApplyToDRejection(t *testing.T) {
+	repo, stage := failedStage(t, run.FailureD, "gate rejected by approver")
+
+	_, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{OverrideB: true})
+	if !errors.Is(err, run.ErrRetryNotApplicable) {
+		t.Errorf("err = %v, want ErrRetryNotApplicable (override is B-only)", err)
 	}
 }
 
@@ -70,7 +108,7 @@ func TestRetryStage_BNotApplicable(t *testing.T) {
 func TestRetryStage_ATransitionsToPending(t *testing.T) {
 	repo, stage := failedStage(t, run.FailureA, "agent crashed: SIGSEGV")
 
-	dec, err := run.RetryStage(context.Background(), repo, stage.ID)
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
 	if err != nil {
 		t.Fatalf("RetryStage: %v", err)
 	}
@@ -88,7 +126,7 @@ func TestRetryStage_ATransitionsToPending(t *testing.T) {
 func TestRetryStage_CTransitionsToPending(t *testing.T) {
 	repo, stage := failedStage(t, run.FailureC, "dispatch_watchdog: 70m elapsed (deadline 60m)")
 
-	dec, err := run.RetryStage(context.Background(), repo, stage.ID)
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
 	if err != nil {
 		t.Fatalf("RetryStage: %v", err)
 	}
@@ -104,7 +142,7 @@ func TestRetryStage_NonFailedStageRefused(t *testing.T) {
 	stage := newStage(run.StageStateAwaitingApproval)
 	repo := newMemRepo(stage)
 
-	_, err := run.RetryStage(context.Background(), repo, stage.ID)
+	_, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
 	if !errors.Is(err, run.ErrRetryNotApplicable) {
 		t.Errorf("err = %v, want ErrRetryNotApplicable", err)
 	}
@@ -118,7 +156,7 @@ func TestRetryStage_FailedWithoutCategoryRefused(t *testing.T) {
 	stage.FailureCategory = nil
 	repo := newMemRepo(stage)
 
-	_, err := run.RetryStage(context.Background(), repo, stage.ID)
+	_, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
 	if !errors.Is(err, run.ErrRetryNotApplicable) {
 		t.Errorf("err = %v, want ErrRetryNotApplicable", err)
 	}

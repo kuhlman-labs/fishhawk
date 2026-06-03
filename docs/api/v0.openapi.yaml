@@ -1986,19 +1986,63 @@ paths:
         - **D, gate-rejected**: 422 (`retry_not_applicable`) — the
           approver said no; create a fresh run instead.
         - **B**: 422 (`retry_not_applicable`) — the workflow or spec
-          needs to change before a retry would behave differently.
+          needs to change before a retry would behave differently,
+          UNLESS the request carries `{override: true, reason: "..."}`
+          (see request body below).
 
-        Writes a `stage_retried` audit entry on success with the prior
-        category and reason in the payload.
+        The optional request body enables an **audited category-B
+        override** (#698). With `{override: true}` and a non-empty
+        `reason`, a genuine category-B failure is admitted onto the same
+        failed → pending re-open path as A/C: the stage RE-RUNS and the
+        policy gate RE-EVALUATES the new diff. The override does NOT
+        accept the B-violating diff or bypass the gate — it only lets the
+        stage run again. `reason` is mandatory when `override` is true
+        (400 `validation_failed` otherwise). A successful override writes
+        a distinct `stage_override_retried` audit entry (actor + reason +
+        prior category B), kept separate from the ordinary `stage_retried`
+        receipt. Without an override the body may be omitted entirely and
+        default per-category semantics apply, writing `stage_retried`.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: false
+        description: |
+          Optional. Omit for a default per-category retry. Supply
+          `{override: true, reason: "..."}` to invoke the audited
+          category-B override.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                override:
+                  type: boolean
+                  default: false
+                  description: |
+                    Admit a category-B failure onto the failed → pending
+                    re-open path. The stage re-runs and the policy gate
+                    re-evaluates; the gate is not bypassed.
+                reason:
+                  type: string
+                  description: |
+                    Operator justification, recorded in the
+                    `stage_override_retried` audit entry. Required when
+                    `override` is true.
       responses:
         '200':
           description: Stage re-opened; refreshed Stage row in body.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Stage' }
+        '400':
+          description: |
+            Malformed request body, or `override: true` without a
+            non-empty `reason`. Body's `error` is `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
