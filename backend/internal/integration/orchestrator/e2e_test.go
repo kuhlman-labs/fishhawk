@@ -35,6 +35,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -185,15 +186,19 @@ type parentRunFixture struct {
 // seedParentRun creates a run with three stages (plan, implement,
 // review), drives the plan stage to succeeded, and inserts a
 // decomposed plan artifact so the orchestrator's fanout path fires.
-// No InstallationID is set so fireDispatch skips GitHub silently.
-func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte) parentRunFixture {
+// installationID and reviewKind let callers exercise the GitHub-wired
+// consolidated-PR path (#714): a nil installationID makes fireDispatch /
+// the consolidated-PR path skip GitHub silently, and a human reviewKind
+// parks the review at awaiting_approval without a workflow_dispatch.
+func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte, installationID *int64, reviewKind runpkg.ExecutorKind) parentRunFixture {
 	t.Helper()
 
 	r, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
-		Repo:          "kuhlman-labs/fishhawk",
-		WorkflowID:    "feature_change",
-		WorkflowSHA:   "deadbeef",
-		TriggerSource: runpkg.TriggerCLI,
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef",
+		TriggerSource:  runpkg.TriggerCLI,
+		InstallationID: installationID,
 	})
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
@@ -220,12 +225,16 @@ func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository,
 		t.Fatalf("CreateStage implement: %v", err)
 	}
 
+	reviewRef := "claude-code"
+	if reviewKind == runpkg.ExecutorHuman {
+		reviewRef = "human"
+	}
 	if _, err = runRepo.CreateStage(ctx, runpkg.CreateStageParams{
 		RunID:        r.ID,
 		Sequence:     2,
 		Type:         runpkg.StageTypeReview,
-		ExecutorKind: runpkg.ExecutorAgent,
-		ExecutorRef:  "claude-code",
+		ExecutorKind: reviewKind,
+		ExecutorRef:  reviewRef,
 	}); err != nil {
 		t.Fatalf("CreateStage review: %v", err)
 	}
@@ -283,7 +292,7 @@ func TestDecomposition_E2E_HappyPath(t *testing.T) {
 	}
 
 	planBytes := decomposedPlanContent(t)
-	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, nil, runpkg.ExecutorAgent)
 	parentID := fx.runID
 
 	// (e) First Advance: orchestrator detects decomposition and fans out.
@@ -420,7 +429,7 @@ func TestDecomposition_E2E_OneChildFails(t *testing.T) {
 	}
 
 	planBytes := decomposedPlanContent(t)
-	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, nil, runpkg.ExecutorAgent)
 	parentID := fx.runID
 
 	// Steps a–e: same setup as happy path through fanout assertion.
@@ -545,5 +554,166 @@ func TestDecomposition_E2E_OneChildFails(t *testing.T) {
 	}
 	if outcome != orchestrator.OutcomeNoOp {
 		t.Errorf("Advance on terminal run = %q, want %q", outcome, orchestrator.OutcomeNoOp)
+	}
+}
+
+// recordingGitHub stands in for the orchestrator's GitHubAPI in the
+// consolidated-PR e2e test. It records every CreatePullRequest call and
+// hands back a canned PR so the test can assert the head/base/URL seam
+// without a live GitHub.
+type recordingGitHub struct {
+	createCalls []struct {
+		Head string
+		Base string
+	}
+	prURL string
+}
+
+func (g *recordingGitHub) DispatchWorkflow(context.Context, int64,
+	githubclient.RepoRef, string, string, githubclient.DispatchInputs) error {
+	return nil
+}
+
+func (g *recordingGitHub) EnableAutoMerge(context.Context, int64,
+	githubclient.RepoRef, int, githubclient.MergeMethod) error {
+	return nil
+}
+
+func (g *recordingGitHub) CreatePullRequest(_ context.Context, _ int64,
+	repo githubclient.RepoRef, head, base, _, _ string) (*githubclient.PullRequest, error) {
+	g.createCalls = append(g.createCalls, struct {
+		Head string
+		Base string
+	}{Head: head, Base: base})
+	url := g.prURL
+	if url == "" {
+		url = "https://github.com/" + repo.Owner + "/" + repo.Name + "/pull/123"
+	}
+	return &githubclient.PullRequest{Number: 123, HTMLURL: url, State: "open"}, nil
+}
+
+func (g *recordingGitHub) ListOpenPullRequestsByHead(context.Context, int64,
+	githubclient.RepoRef, string, string) ([]githubclient.PullRequest, error) {
+	return nil, nil
+}
+
+// TestDecomposition_E2E_ConsolidatedPR exercises the #714 / ADR-032 seam
+// end-to-end: a decomposed parent fans out, both children settle
+// succeeded, and the orchestrator (driven by the sweeper's Advance) opens
+// exactly ONE consolidated PR against main, stamps pull_request_url on the
+// parent run, and dispatches the review stage to awaiting_approval — NOT
+// auto-succeeded. This is the cross-boundary coverage the per-layer units
+// can't give (settle → orchestrator → githubclient → run-repo → review
+// dispatch in a single test; cf. #618).
+func TestDecomposition_E2E_ConsolidatedPR(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	runRepo := runpkg.NewPostgresRepository(pool)
+	artifactRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	gh := &recordingGitHub{}
+
+	o := &orchestrator.Orchestrator{
+		Runs:       runRepo,
+		Artifacts:  artifactRepo,
+		Audit:      auditRepo,
+		GitHub:     gh,
+		DefaultRef: "main",
+		Logger:     slog.Default(),
+	}
+	sw := &childcompletion.Sweeper{
+		Runs:    runRepo,
+		Audit:   auditRepo,
+		Advance: advancerAdapter{o: o},
+		Logger:  slog.Default(),
+	}
+
+	planBytes := decomposedPlanContent(t)
+	// Wire an installation so the consolidated-PR path runs, and a human
+	// review so it parks at awaiting_approval (not auto-merged).
+	installID := int64(4242)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, &installID, runpkg.ExecutorHuman)
+	parentID := fx.runID
+
+	// Fan out.
+	if _, err := o.Advance(ctx, parentID); err != nil {
+		t.Fatalf("Advance (fanout): %v", err)
+	}
+	children, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRuns children: %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("children = %d, want 2", len(children))
+	}
+
+	// Drive both children to succeeded.
+	for _, child := range children {
+		if _, err := runRepo.TransitionRun(ctx, child.ID, runpkg.StateRunning); err != nil {
+			t.Fatalf("TransitionRun child running: %v", err)
+		}
+		if _, err := runRepo.TransitionRun(ctx, child.ID, runpkg.StateSucceeded); err != nil {
+			t.Fatalf("TransitionRun child succeeded: %v", err)
+		}
+	}
+
+	// Sweeper tick: resolves the parent implement stage and inline-Advances
+	// into the review gate, which opens the consolidated PR.
+	if err := sw.Tick(ctx); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// Exactly one consolidated PR, head = shared branch, base = main.
+	if len(gh.createCalls) != 1 {
+		t.Fatalf("CreatePullRequest calls = %d, want 1", len(gh.createCalls))
+	}
+	wantHead := "fishhawk/run-" + parentID.String()[:8]
+	if gh.createCalls[0].Head != wantHead {
+		t.Errorf("PR head = %q, want %q", gh.createCalls[0].Head, wantHead)
+	}
+	if gh.createCalls[0].Base != "main" {
+		t.Errorf("PR base = %q, want main", gh.createCalls[0].Base)
+	}
+
+	// Parent carries the consolidated PR URL.
+	parent, err := runRepo.GetRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if parent.PullRequestURL == nil || *parent.PullRequestURL == "" {
+		t.Fatal("parent run pull_request_url not stamped")
+	}
+
+	// Review dispatched to awaiting_approval — NOT auto-succeeded, and the
+	// run is still running (reconciles on the PR's merge).
+	stages, err := runRepo.ListStagesForRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	var reviewStage *runpkg.Stage
+	for _, s := range stages {
+		if s.Type == runpkg.StageTypeReview {
+			reviewStage = s
+			break
+		}
+	}
+	if reviewStage == nil {
+		t.Fatal("review stage not found")
+	}
+	if reviewStage.State != runpkg.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want awaiting_approval (not auto-succeeded)", reviewStage.State)
+	}
+	if parent.State != runpkg.StateRunning {
+		t.Errorf("parent run state = %q, want running", parent.State)
+	}
+
+	// consolidated_pr_opened audit entry recorded once.
+	opened, err := auditRepo.ListForRunByCategory(ctx, parentID, "consolidated_pr_opened")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory consolidated_pr_opened: %v", err)
+	}
+	if len(opened) != 1 {
+		t.Errorf("consolidated_pr_opened entries = %d, want 1", len(opened))
 	}
 }

@@ -210,8 +210,16 @@ func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run
 	}
 	return out, nil
 }
-func (s *stubRuns) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run.Run, error) {
-	return nil, errors.New("not used")
+func (s *stubRuns) SetRunPullRequestURL(_ context.Context, id uuid.UUID, url string) (*run.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.runs[id]
+	if r == nil {
+		return nil, run.ErrNotFound
+	}
+	u := url
+	r.PullRequestURL = &u
+	return r, nil
 }
 func (s *stubRuns) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
@@ -220,14 +228,37 @@ func (s *stubRuns) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
 
-// stubGitHub records DispatchWorkflow + EnableAutoMerge calls
-// without making network requests.
+// stubGitHub records DispatchWorkflow + EnableAutoMerge +
+// CreatePullRequest calls without making network requests.
 type stubGitHub struct {
 	mu             sync.Mutex
 	calls          []dispatchCall
 	dispatchErr    error
 	autoMergeCalls []autoMergeCall
 	autoMergeErr   error
+
+	createPRCalls []createPRCall
+	// createPRErr, when set, is returned from CreatePullRequest. Set
+	// to githubclient.ErrPullRequestExists to exercise the lost-race
+	// recovery path.
+	createPRErr error
+	// createPRURL is the html_url CreatePullRequest returns on success
+	// (defaults to a canned URL when empty).
+	createPRURL string
+	// listByHeadResult is what ListOpenPullRequestsByHead returns (the
+	// recovery lookup). listByHeadErr forces an error from it.
+	listByHeadResult []githubclient.PullRequest
+	listByHeadErr    error
+	listByHeadCalls  int
+}
+
+type createPRCall struct {
+	InstallationID int64
+	Repo           githubclient.RepoRef
+	Head           string
+	Base           string
+	Title          string
+	Body           string
 }
 
 type dispatchCall struct {
@@ -271,6 +302,35 @@ func (g *stubGitHub) EnableAutoMerge(_ context.Context, installationID int64,
 		PRNumber: prNumber, Method: method,
 	})
 	return nil
+}
+
+func (g *stubGitHub) CreatePullRequest(_ context.Context, installationID int64,
+	repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.createPRCalls = append(g.createPRCalls, createPRCall{
+		InstallationID: installationID, Repo: repo,
+		Head: head, Base: base, Title: title, Body: body,
+	})
+	if g.createPRErr != nil {
+		return nil, g.createPRErr
+	}
+	url := g.createPRURL
+	if url == "" {
+		url = "https://github.com/" + repo.Owner + "/" + repo.Name + "/pull/777"
+	}
+	return &githubclient.PullRequest{Number: 777, HTMLURL: url, State: "open"}, nil
+}
+
+func (g *stubGitHub) ListOpenPullRequestsByHead(_ context.Context, _ int64,
+	_ githubclient.RepoRef, _, _ string) ([]githubclient.PullRequest, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.listByHeadCalls++
+	if g.listByHeadErr != nil {
+		return nil, g.listByHeadErr
+	}
+	return g.listByHeadResult, nil
 }
 
 func newOrchestrator(t *testing.T) (*Orchestrator, *stubRuns, *stubGitHub) {
@@ -910,5 +970,207 @@ func TestCompleteRun_OneChildFails_AdvancesParentToFailed(t *testing.T) {
 	// Parent run must be failed.
 	if rs.runs[parentRun.ID].State != run.StateFailed {
 		t.Errorf("parent run state = %q, want failed", rs.runs[parentRun.ID].State)
+	}
+}
+
+// --- Consolidated decomposition PR (#714 / ADR-032) ---
+
+// seedDecomposedParent seeds a decomposed parent (implement succeeded,
+// review pending) plus one already-succeeded child, returning both so
+// the test can drive Advance(parent) straight into the review gate.
+func seedDecomposedParent(t *testing.T, rs *stubRuns, installationID *int64, reviewKind run.ExecutorKind) (*run.Run, []*run.Stage) {
+	t.Helper()
+	parent, stages := rs.seed(t, "kuhlman-labs/fishhawk", installationID, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: reviewKind, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	child, _ := rs.seed(t, "kuhlman-labs/fishhawk", installationID, nil)
+	child.DecomposedFrom = &parent.ID
+	child.State = run.StateSucceeded
+	return parent, stages
+}
+
+func TestConsolidatedBranch_MatchesRunner(t *testing.T) {
+	// Contract assertion: the orchestrator's branch helper MUST yield
+	// exactly fishhawk/run-<first8(parentID)> — the same string the
+	// runner's shortID convention produces for the shared branch the
+	// children push to. A divergence orphans the children's commits
+	// from the consolidated PR; this catches it in the unit suite, not
+	// only the Docker e2e.
+	id := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	if got := consolidatedBranch(id); got != "fishhawk/run-aaaaaaaa" {
+		t.Errorf("consolidatedBranch = %q, want fishhawk/run-aaaaaaaa", got)
+	}
+}
+
+func TestAdvance_DecomposedParent_OpensConsolidatedPR(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parent, stages := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+	parent.IssueContext = &run.IssueContext{Title: "Add widget", Number: 714}
+
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched", out)
+	}
+
+	// Exactly one consolidated PR opened, with the right head/base.
+	if len(gh.createPRCalls) != 1 {
+		t.Fatalf("CreatePullRequest calls = %d, want 1", len(gh.createPRCalls))
+	}
+	call := gh.createPRCalls[0]
+	wantHead := "fishhawk/run-" + parent.ID.String()[:8]
+	if call.Head != wantHead {
+		t.Errorf("head = %q, want %q", call.Head, wantHead)
+	}
+	if call.Base != "main" {
+		t.Errorf("base = %q, want main (DefaultRef, not TriggerRef)", call.Base)
+	}
+	if call.InstallationID != 55 {
+		t.Errorf("installation_id = %d, want 55", call.InstallationID)
+	}
+	if call.Title != "Add widget" {
+		t.Errorf("title = %q, want issue title", call.Title)
+	}
+
+	// pull_request_url stamped on the parent.
+	if rs.runs[parent.ID].PullRequestURL == nil || *rs.runs[parent.ID].PullRequestURL == "" {
+		t.Error("parent run pull_request_url not stamped")
+	}
+	// Review dispatched (human → awaiting_approval), NOT auto-succeeded.
+	if stages[1].State != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want awaiting_approval", stages[1].State)
+	}
+	if !auditHasCategory(au, "consolidated_pr_opened") {
+		t.Errorf("audit categories = %v, want consolidated_pr_opened", au.appended)
+	}
+}
+
+func TestAdvance_DecomposedParent_Idempotent(t *testing.T) {
+	// The double-open race (sweeper + event-driven) must net exactly one
+	// CreatePullRequest. After the URL is stamped, a second Advance over
+	// the same review gate opens no second PR.
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+
+	parent, stages := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+
+	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
+		t.Fatalf("Advance #1: %v", err)
+	}
+	if len(gh.createPRCalls) != 1 {
+		t.Fatalf("after Advance #1: CreatePullRequest calls = %d, want 1", len(gh.createPRCalls))
+	}
+
+	// Simulate a redelivered settle hitting the still-pending review
+	// gate again (the URL is now set on the run row).
+	stages[1].State = run.StageStatePending
+	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
+		t.Fatalf("Advance #2: %v", err)
+	}
+	if len(gh.createPRCalls) != 1 {
+		t.Errorf("after Advance #2: CreatePullRequest calls = %d, want still 1 (idempotent)", len(gh.createPRCalls))
+	}
+}
+
+func TestAdvance_DecomposedParent_LostRace_RecoversURL(t *testing.T) {
+	// A lost double-open race surfaces as ErrPullRequestExists; the
+	// orchestrator recovers the already-open PR's URL via
+	// ListOpenPullRequestsByHead rather than failing the settle.
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	gh.createPRErr = githubclient.ErrPullRequestExists
+	gh.listByHeadResult = []githubclient.PullRequest{
+		{Number: 42, HTMLURL: "https://github.com/kuhlman-labs/fishhawk/pull/42", State: "open"},
+	}
+
+	parent, _ := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+
+	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if gh.listByHeadCalls != 1 {
+		t.Errorf("ListOpenPullRequestsByHead calls = %d, want 1", gh.listByHeadCalls)
+	}
+	got := rs.runs[parent.ID].PullRequestURL
+	if got == nil || *got != "https://github.com/kuhlman-labs/fishhawk/pull/42" {
+		t.Errorf("pull_request_url = %v, want recovered URL", got)
+	}
+}
+
+func TestAdvance_DecomposedParent_LostRace_EmptyList_RetryableError(t *testing.T) {
+	// A lost double-open race surfaces as ErrPullRequestExists, but
+	// GitHub's read-after-write consistency can lag so the recovery
+	// ListOpenPullRequestsByHead returns nothing yet. The settle must
+	// fail with a (retryable) error rather than stamp an empty/nil URL —
+	// the next Advance re-enters and recovers once the list catches up.
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	gh.createPRErr = githubclient.ErrPullRequestExists
+	gh.listByHeadResult = nil // consistency gap: 422 says exists, list empty
+
+	parent, _ := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+
+	_, err := o.Advance(context.Background(), parent.ID)
+	if err == nil {
+		t.Fatal("Advance: want a retryable error when ErrPullRequestExists but the list returns empty, got nil")
+	}
+	if gh.listByHeadCalls != 1 {
+		t.Errorf("ListOpenPullRequestsByHead calls = %d, want 1", gh.listByHeadCalls)
+	}
+	if got := rs.runs[parent.ID].PullRequestURL; got != nil {
+		t.Errorf("pull_request_url = %v, want nil (no URL stamped on the failed recovery)", *got)
+	}
+}
+
+func TestAdvance_NonDecomposedParent_NoConsolidatedPR(t *testing.T) {
+	// A plain run (no decomposed children) reaching its review gate must
+	// NOT open a PR — only decomposed parents do.
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+
+	r, stages := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+
+	if _, err := o.Advance(context.Background(), r.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if len(gh.createPRCalls) != 0 {
+		t.Errorf("CreatePullRequest calls = %d, want 0 for non-decomposed run", len(gh.createPRCalls))
+	}
+	if stages[1].State != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want awaiting_approval", stages[1].State)
+	}
+}
+
+func TestAdvance_DecomposedParent_NoGitHub_GracefulSkip(t *testing.T) {
+	// Without a GitHub client (CLI/dev posture) the orchestrator can't
+	// open the PR — it WARN-logs, opens no PR, and still dispatches the
+	// review (the parent stays PR-less, same posture as fireDispatch).
+	rs := newStubRuns()
+	o := &Orchestrator{Runs: rs, DefaultRef: "main"} // GitHub nil
+
+	parent, stages := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched", out)
+	}
+	if rs.runs[parent.ID].PullRequestURL != nil {
+		t.Errorf("pull_request_url = %v, want nil (no GitHub)", rs.runs[parent.ID].PullRequestURL)
+	}
+	if stages[1].State != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want awaiting_approval", stages[1].State)
 	}
 }

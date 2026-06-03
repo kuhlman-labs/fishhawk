@@ -55,6 +55,14 @@ var (
 	// 404). Distinct from ErrNotFound so callers can surface a
 	// precise user-facing error instead of a generic "not found".
 	ErrNotInstalled = errors.New("githubclient: app not installed on repo")
+	// ErrPullRequestExists means CreatePullRequest hit a 422 whose
+	// body indicates a PR already exists for the requested head/base
+	// pair. The orchestrator's consolidated-PR path treats this as a
+	// benign lost race (ADR-032 / #714) and recovers the existing PR
+	// URL via ListOpenPullRequestsByHead rather than failing the
+	// settle. Distinct from ErrValidation so the caller can switch on
+	// it without re-parsing the 422 body.
+	ErrPullRequestExists = errors.New("githubclient: pull request already exists for head/base")
 )
 
 // RepoRef identifies a GitHub repository by owner + name.
@@ -634,6 +642,12 @@ type PullRequest struct {
 	HeadSHA string
 	State   string // "open" | "closed"
 	Merged  bool   // true when state=closed and the PR was merged
+	// Number and HTMLURL are populated by CreatePullRequest and
+	// ListOpenPullRequestsByHead (the consolidated-PR path, #714).
+	// GetPullRequest leaves them zero/empty — its callers only need
+	// NodeID/HeadSHA/State/Merged.
+	Number  int
+	HTMLURL string
 }
 
 // GetPullRequest fetches a single PR by number.
@@ -694,6 +708,176 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
 		State:   body.State,
 		Merged:  body.Merged,
 	}, nil
+}
+
+// CreatePullRequest opens a pull request from head into base (#714 /
+// ADR-032). It is the single GitHub write surface for the consolidated
+// decomposition PR: after all decomposed children push their commits
+// onto the shared branch, the orchestrator opens ONE PR for the parent
+// run via this method.
+//
+//	POST /repos/{owner}/{repo}/pulls
+//
+// head is a branch name in the same repo (no "owner:" prefix — same-repo
+// PRs only for v0). base is the target branch (typically the repo's
+// default ref). Returns the created PR's number + html_url decoded from
+// the 201.
+//
+// GitHub returns 422 when a PR already exists for the same head/base
+// pair. This method body-sniffs that 422 for the duplicate marker and
+// returns ErrPullRequestExists BEFORE the body is consumed by the shared
+// classifyStatus path (which would map every 422 to ErrValidation and
+// exhaust the 256-byte brief body). Callers recover the existing PR via
+// ListOpenPullRequestsByHead. ErrNotFound when the repo isn't visible to
+// the installation, ErrForbidden when the App lacks `pull_requests:write`.
+func (c *Client) CreatePullRequest(ctx context.Context, installationID int64,
+	repo RepoRef, head, base, title, body string) (*PullRequest, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if head == "" || base == "" {
+		return nil, errors.New("githubclient: head and base branches required")
+	}
+	if title == "" {
+		return nil, errors.New("githubclient: pull request title required")
+	}
+
+	raw, err := json.Marshal(map[string]string{
+		"title": title,
+		"head":  head,
+		"base":  base,
+		"body":  body,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: marshal create pr: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) + "/pulls")
+
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: create pr: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Body-sniff the 422-duplicate case BEFORE classifyStatus consumes
+	// the body. GitHub signals "PR already exists for this head/base"
+	// with a 422 whose errors[].message reads "A pull request already
+	// exists for ..." and/or a code of "custom"/"already_exists"; we
+	// match on the human marker to avoid a guaranteed-shape assumption.
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		brief := readBriefBody(resp.Body)
+		low := strings.ToLower(brief)
+		if strings.Contains(low, "already exists") || strings.Contains(low, "already_exists") {
+			return nil, fmt.Errorf("%w: %s", ErrPullRequestExists, brief)
+		}
+		return nil, fmt.Errorf("%w: create pr: %s", ErrValidation, brief)
+	}
+	if err := classifyStatus("create pr", resp); err != nil {
+		return nil, err
+	}
+
+	var out struct {
+		NodeID  string `json:"node_id"`
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+		State   string `json:"state"`
+		Head    struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("githubclient: decode create pr: %w", err)
+	}
+	return &PullRequest{
+		NodeID:  out.NodeID,
+		HeadSHA: out.Head.SHA,
+		State:   out.State,
+		Number:  out.Number,
+		HTMLURL: out.HTMLURL,
+	}, nil
+}
+
+// ListOpenPullRequestsByHead returns the open PRs whose head matches the
+// given branch and whose base matches the given base ref (#714). Used by
+// the orchestrator's consolidated-PR path to recover the existing PR's
+// URL when CreatePullRequest lost a double-open race and returned
+// ErrPullRequestExists — the create-PR 422 body does not carry the
+// existing PR's number/url in a guaranteed shape, so we look it up.
+//
+//	GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&base={base}&state=open
+//
+// head is a bare branch name; this method builds the "owner:branch" head
+// filter GitHub's list endpoint expects. Returns ErrNotFound when the
+// repo isn't visible to the installation, ErrForbidden on auth issues.
+func (c *Client) ListOpenPullRequestsByHead(ctx context.Context, installationID int64,
+	repo RepoRef, headBranch, base string) ([]PullRequest, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if headBranch == "" {
+		return nil, errors.New("githubclient: head branch required")
+	}
+
+	q := url.Values{}
+	q.Set("head", repo.Owner+":"+headBranch)
+	if base != "" {
+		q.Set("base", base)
+	}
+	q.Set("state", "open")
+	endpoint := c.endpoint("/repos/"+url.PathEscape(repo.Owner)+
+		"/"+url.PathEscape(repo.Name)+"/pulls") + "?" + q.Encode()
+
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: list pulls by head: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("list pulls by head", resp); err != nil {
+		return nil, err
+	}
+
+	var body []struct {
+		NodeID  string `json:"node_id"`
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+		State   string `json:"state"`
+		Head    struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode pulls by head: %w", err)
+	}
+	out := make([]PullRequest, 0, len(body))
+	for _, p := range body {
+		out = append(out, PullRequest{
+			NodeID:  p.NodeID,
+			HeadSHA: p.Head.SHA,
+			State:   p.State,
+			Number:  p.Number,
+			HTMLURL: p.HTMLURL,
+		})
+	}
+	return out, nil
 }
 
 // TeamMember is the slice of a team-membership API response we

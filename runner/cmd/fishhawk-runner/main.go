@@ -1561,14 +1561,18 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		return nil
 	}
 
-	// Subsequent decomposed children pushed onto the shared branch but
-	// the PR was already created by the first child — skip OpenPR and
-	// ShipPullRequest. The first child's artifact already names the
-	// branch, so no update is needed.
-	if isSubsequent {
+	// Decomposed children only push their commit onto the shared parent
+	// branch (one commit per sub-plan, in dependency order); they never
+	// open a PR or ship a pull_request artifact. Per ADR-032 (#719) the
+	// parent run opens ONE consolidated PR for the whole decomposition
+	// after all children settle — so suppress OpenPR + ShipPullRequest
+	// for every decomposed child, first and subsequent alike. (Before
+	// #714 only the subsequent children skipped, and the first child
+	// opened a child-owned PR the parent never tracked.)
+	if isDecomposed {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"implement_subsequent_child","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q}`+"\n",
-			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
+			`{"event":"implement_child_pushed","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q,"is_subsequent":%t}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA, isSubsequent,
 		)
 		return nil
 	}

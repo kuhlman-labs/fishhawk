@@ -47,6 +47,17 @@ type GitHubAPI interface {
 	EnableAutoMerge(ctx context.Context, installationID int64,
 		repo githubclient.RepoRef, prNumber int,
 		method githubclient.MergeMethod) error
+	// CreatePullRequest opens the single consolidated PR for a
+	// decomposed parent run (#714 / ADR-032) once all children have
+	// pushed to the shared branch. Returns ErrPullRequestExists when a
+	// PR already exists for head/base (lost double-open race).
+	CreatePullRequest(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error)
+	// ListOpenPullRequestsByHead recovers the existing open PR for a
+	// head branch — used to resolve the URL after CreatePullRequest
+	// returns ErrPullRequestExists (#714).
+	ListOpenPullRequestsByHead(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, headBranch, base string) ([]githubclient.PullRequest, error)
 }
 
 // Orchestrator wires the run repository to a GitHub client to
@@ -177,7 +188,202 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		}
 	}
 
+	// ADR-032 (#714): a decomposed parent reaching its review gate opens
+	// ONE consolidated PR for the whole decomposition. The children
+	// pushed their commits onto the shared branch and opened no PR of
+	// their own, so the parent run carries no pull_request_url and the
+	// merge reconciler would never resolve its review. Stamp the URL here
+	// — BEFORE dispatchStage — so the review dispatches with the PR
+	// present and reconciles on the consolidated PR's merge. This gate
+	// covers BOTH settle paths because the sweeper's resolveParent and
+	// maybeAdvanceDecomposedParent both finish by calling Advance.
+	if next.Type == run.StageTypeReview && r.DecomposedFrom == nil &&
+		(r.PullRequestURL == nil || *r.PullRequestURL == "") {
+		updated, err := o.maybeOpenConsolidatedPR(ctx, r, next)
+		if err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: open consolidated pr: %w", err)
+		}
+		r = updated
+	}
+
 	return o.dispatchStage(ctx, r, next)
+}
+
+// maybeOpenConsolidatedPR opens the single consolidated PR for a
+// decomposed parent run reaching its review gate (#714 / ADR-032) and
+// stamps pull_request_url on the run, returning the (reloaded) run so
+// the in-flight Advance dispatches the review with the URL present.
+//
+// Idempotency is load-bearing: the periodic child-completion sweeper and
+// the event-driven maybeAdvanceDecomposedParent can both call Advance on
+// the parent near-simultaneously, and create-PR is not idempotent. The
+// empty-URL re-read (b) shrinks the window; the ErrPullRequestExists
+// recovery (e) makes a lost race benign by resolving the already-open PR.
+//
+// Graceful-skip (returns the run unchanged, nil error) when: the run has
+// no decomposed children (an ordinary PR-less run, never a parent), the
+// URL is already set, or GitHub/installation isn't wired (CLI/dev
+// posture — same as fireDispatch/enableAutoMerge; the parent stays
+// PR-less, narrowing rather than regressing prior behavior). A genuine
+// GitHub error surfaces so the next Advance retries (the awaiting_children
+// stage is already succeeded, so the retry re-enters this gate).
+func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, reviewStage *run.Stage) (*run.Run, error) {
+	// (a) Only decomposed parents. A run with zero children is an
+	// ordinary PR-less / commit-yourself run — never open a PR for it.
+	children, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &r.ID,
+		Limit:          1,
+	})
+	if err != nil {
+		return r, fmt.Errorf("list decomposed children: %w", err)
+	}
+	if len(children) == 0 {
+		return r, nil
+	}
+
+	// (b) Re-read immediately before the create to shrink the double-
+	// open window between the two settle paths.
+	fresh, err := o.Runs.GetRun(ctx, r.ID)
+	if err != nil {
+		return r, fmt.Errorf("reload run: %w", err)
+	}
+	if fresh.PullRequestURL != nil && *fresh.PullRequestURL != "" {
+		return fresh, nil
+	}
+	r = fresh
+
+	// (d) Graceful-skip when GitHub can't be reached (no client / no
+	// installation). The parent stays PR-less — same posture as
+	// fireDispatch.
+	if o.GitHub == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping consolidated PR",
+			slog.String("run_id", r.ID.String()))
+		return r, nil
+	}
+	if r.InstallationID == nil || *r.InstallationID == 0 {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run has no installation_id; skipping consolidated PR",
+			slog.String("run_id", r.ID.String()))
+		return r, nil
+	}
+
+	repo, err := parseRepo(r.Repo)
+	if err != nil {
+		return r, fmt.Errorf("parse repo %q: %w", r.Repo, err)
+	}
+
+	head := consolidatedBranch(r.ID)
+	base := o.DefaultRef
+	if base == "" {
+		base = "main"
+	}
+	title, body := consolidatedPRTitleBody(r)
+
+	// (e) Open the PR; recover the existing one on a lost race.
+	var prURL string
+	pr, err := o.GitHub.CreatePullRequest(ctx, *r.InstallationID, repo, head, base, title, body)
+	switch {
+	case err == nil:
+		prURL = pr.HTMLURL
+	case errors.Is(err, githubclient.ErrPullRequestExists):
+		existing, lerr := o.GitHub.ListOpenPullRequestsByHead(ctx, *r.InstallationID, repo, head, base)
+		if lerr != nil {
+			return r, fmt.Errorf("recover existing pr for head %q: %w", head, lerr)
+		}
+		if len(existing) == 0 {
+			return r, fmt.Errorf("pr already exists for head %q but none returned by list", head)
+		}
+		prURL = existing[0].HTMLURL
+	default:
+		return r, fmt.Errorf("create consolidated pr: %w", err)
+	}
+	if prURL == "" {
+		return r, fmt.Errorf("consolidated pr opened but URL is empty")
+	}
+
+	// (f) Stamp the URL, reload so the in-flight Advance dispatches the
+	// review with it present, and emit a best-effort audit entry.
+	updated, err := o.Runs.SetRunPullRequestURL(ctx, r.ID, prURL)
+	if err != nil {
+		return r, fmt.Errorf("set pull_request_url: %w", err)
+	}
+	o.emitConsolidatedPROpened(ctx, r.ID, reviewStage.ID, prURL)
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator opened consolidated PR",
+		slog.String("run_id", r.ID.String()),
+		slog.String("head", head),
+		slog.String("base", base),
+		slog.String("pull_request_url", prURL),
+	)
+	return updated, nil
+}
+
+// shortRunID returns the first 8 characters of a run UUID's string
+// form. It MUST stay in sync with the runner's shortID helper
+// (runner/cmd/fishhawk-runner/main.go): the runner names the shared
+// branch the decomposed children push to as
+// "fishhawk/run-<shortID(parentRunID)>", and the orchestrator names that
+// same ref as the consolidated PR's head. A divergence would orphan the
+// children's commits from the PR. TestConsolidatedBranch_MatchesRunner
+// asserts the exact string for a known UUID so a drift fails the unit
+// suite, not only the Docker e2e.
+func shortRunID(id uuid.UUID) string {
+	s := id.String()
+	if len(s) < 8 {
+		return s
+	}
+	return s[:8]
+}
+
+// consolidatedBranch is the shared-branch name the decomposed children
+// pushed to and the consolidated PR's head. See shortRunID for the
+// runner-side cross-reference.
+func consolidatedBranch(parentID uuid.UUID) string {
+	return "fishhawk/run-" + shortRunID(parentID)
+}
+
+// consolidatedPRTitleBody derives the PR title + body from the parent
+// run's cached issue context. Falls back to a run-id-stamped title when
+// no issue context is present (webhook runs that left it nil are fetched
+// by the runner; this is the defensive default).
+func consolidatedPRTitleBody(r *run.Run) (string, string) {
+	if r.IssueContext != nil && r.IssueContext.Title != "" {
+		body := fmt.Sprintf("Consolidated changes for decomposed run %s.", r.ID)
+		if r.IssueContext.Number > 0 {
+			body += fmt.Sprintf("\n\nCloses #%d", r.IssueContext.Number)
+		}
+		return r.IssueContext.Title, body
+	}
+	return fmt.Sprintf("Fishhawk decomposition %s", shortRunID(r.ID)),
+		fmt.Sprintf("Consolidated changes for decomposed run %s.", r.ID)
+}
+
+// emitConsolidatedPROpened writes a consolidated_pr_opened audit entry
+// (system actor) when the orchestrator opens the parent's PR (#714).
+// Best-effort, mirroring emitChildrenSettled: nil-Audit guard,
+// WARN-on-error, never unwinds the settle.
+func (o *Orchestrator) emitConsolidatedPROpened(ctx context.Context, runID, stageID uuid.UUID, prURL string) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping consolidated_pr_opened entry",
+			slog.String("run_id", runID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{"pull_request_url": prURL})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal consolidated_pr_opened payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "consolidated_pr_opened",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append consolidated_pr_opened failed",
+			slog.String("error", err.Error()))
+	}
 }
 
 // fanoutIfDecomposed inspects the run's approved plan for a
