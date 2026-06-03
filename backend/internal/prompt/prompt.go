@@ -227,6 +227,16 @@ type Trigger struct {
 	// the Diff file-list rendering with the original #561 read-the-files
 	// caveat. Empty for any non-implement-review build.
 	DiffPatch string
+	// ScopeDrift is the runner-reported list of paths that the implement
+	// stage created/modified but that were EXCLUDED from the scope-bounded
+	// diff above — paths the operator may stage into the final commit
+	// (#695). Populated by the trace handler from bundle.ExtractScopeDrift
+	// (the runner's scope_drift policy_event). When non-empty,
+	// buildImplementReview renders a "Scope drift" section so the reviewer
+	// knows a required test/doc landing in one of these paths IS expected to
+	// ship even though it is absent from the diff. Empty/nil when there was
+	// no drift, the event was stripped, or for any non-implement-review build.
+	ScopeDrift []string
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -679,6 +689,24 @@ func buildImplementReview(t Trigger) string {
 		b.WriteString("(no diff present in the trace bundle — emit verdict: approve with a concern noting the empty diff)\n\n")
 	}
 
+	// Scope-drift section (#695). The runner reports paths the implement
+	// stage created/modified but that the scope-bounded diff above
+	// EXCLUDES — paths the operator may stage into the final commit. A
+	// required test/doc landing in one of these is expected to ship even
+	// though it is absent from the diff, so naming them here is what stops
+	// the reviewer false-rejecting a "missing" file that actually drifted.
+	if len(t.ScopeDrift) > 0 {
+		b.WriteString("### Scope drift (excluded from the diff above — operator may stage)\n\n")
+		b.WriteString("The implement stage created or modified the paths below, but they were EXCLUDED from the " +
+			"scope-bounded diff above. The operator may stage them into the final commit, so a required test, doc, " +
+			"or other artifact landing in one of these paths IS expected to ship even though it does not appear in " +
+			"the diff. Do NOT treat any of these paths as missing:\n\n")
+		for _, p := range t.ScopeDrift {
+			fmt.Fprintf(&b, "- %s\n", p)
+		}
+		b.WriteString("\n")
+	}
+
 	// Approved plan section — what the diff is being measured against.
 	if t.ApprovedPlan != nil {
 		writePlanForReview(&b, t.ApprovedPlan)
@@ -742,7 +770,16 @@ func buildImplementReview(t Trigger) string {
 		"actually provided.\n")
 	b.WriteString("6. **Style is out of scope**: Subjective style judgments (comment length, naming aesthetics, " +
 		"formatting) are out of scope for review — that is lint's job. Focus on the security / authz, " +
-		"test-vacuity, and untested-path lenses, plus scope drift (flag-only).\n\n")
+		"test-vacuity, and untested-path lenses, plus scope drift (flag-only).\n")
+	b.WriteString("7. **Do NOT reject on an unconfirmable absence (standing rule)**: The diff shown above is " +
+		"scope-bounded — it excludes any scope-drift paths the operator may stage into the final commit (see the " +
+		"Scope drift section when present). So a required test, doc, or other file appearing absent from the diff " +
+		"is NOT proof it is missing: it may be a drift path or otherwise outside this scoped view. Do NOT reject on " +
+		"the grounds that such a file is 'missing from the committed diff/artifact' unless you positively confirmed " +
+		"its absence by reading the repository. Treat an absence you cannot positively confirm as unverifiable and " +
+		"downgrade to approve_with_concerns — do not assert the absence of a file you could not actually inspect. " +
+		"(This is distinct from lens 2: a test that is PRESENT but vacuous is still a valid reject; this rule only " +
+		"forbids rejecting on a test that merely APPEARS absent.)\n\n")
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
@@ -753,7 +790,10 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("- `reject`: diff has one or more blocking problems — a security / authz regression, a vacuous test " +
 		"that does not assert the behavior it claims, or an unhandled error / edge path the change introduces — " +
 		"that must be resolved; record each blocker as a `high`-severity concern. " +
-		"Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead.\n\n")
+		"Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead. " +
+		"A required file merely APPEARING absent from the scope-bounded diff is ALSO never grounds for reject (it " +
+		"may be a drift path the operator stages); per standing rule 7, treat an absence you cannot positively " +
+		"confirm as unverifiable and emit approve_with_concerns, not a confirmed-missing reject.\n\n")
 
 	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
 	return b.String()

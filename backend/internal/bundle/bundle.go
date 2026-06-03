@@ -38,6 +38,11 @@ const EventKindGitDiff = "git_diff"
 // signal and the bundle schema version.
 const EventKindManifest = "manifest"
 
+// EventKindPolicyEvent is the kind the runner stamps on side-channel
+// policy observations that aren't the git_diff itself — notably the
+// scope_drift event read by ExtractScopeDrift.
+const EventKindPolicyEvent = "policy_event"
+
 // Manifest mirrors runner/internal/bundle.ManifestData. Backend
 // owns the read side; agreeing field-by-field with the runner is
 // the contract — there's no schema-sync CI for this format
@@ -114,6 +119,20 @@ type gitDiffPayload struct {
 type gitDiffEntry struct {
 	Path   string `json:"path"`
 	Status string `json:"status"`
+}
+
+// scopeDriftPayload mirrors the runner's scope_drift policy_event
+// payload exactly. The emitter is computeAndEmitDiff
+// (runner/cmd/fishhawk-runner/main.go), which builds it via
+// agent.MakePayload(map[string]any{"check":"scope_drift",
+// "outcome":"excluded","undeclared":[...]}). Like gitDiffPayload this
+// is a lockstep runner↔backend wire contract, not a JSON Schema — the
+// `check` / `undeclared` json tags MUST stay identical to the emitter
+// or ExtractScopeDrift silently reads nothing.
+type scopeDriftPayload struct {
+	Check      string   `json:"check"`
+	Outcome    string   `json:"outcome"`
+	Undeclared []string `json:"undeclared"`
 }
 
 // ReadEvents decompresses bundleBytes and returns every JSONL line
@@ -229,6 +248,43 @@ func ExtractDiff(bundleBytes []byte) (policy.Diff, error) {
 		return out, nil
 	}
 	return policy.Diff{}, ErrNoDiffEvent
+}
+
+// ExtractScopeDrift returns the `undeclared` path list carried in the
+// bundle's scope_drift policy_event, or (nil, nil) when no such event
+// is present. Drift is the exception, not the norm — the runner's
+// computeAndEmitDiff (runner/cmd/fishhawk-runner/main.go) emits the
+// event only when StageScoped finds dirty-but-undeclared paths
+// (len(drift) > 0), so an absent event is the ordinary no-drift case
+// and is NOT an error. Only a corrupt gzip frame / malformed line
+// propagates as an error.
+//
+// These paths were created or modified by the implement stage but
+// excluded from the scope-bounded git_diff event, so the
+// implement-review path threads them into the reviewer prompt flagged
+// "operator may stage" — a required test/doc landing here is expected
+// to ship even though it is absent from the scoped diff (#695). Like
+// ExtractDiff this is a lockstep runner↔backend wire contract; the
+// scopeDriftPayload tags move with the emitter.
+func ExtractScopeDrift(bundleBytes []byte) ([]string, error) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range lines {
+		if line.Kind != EventKindPolicyEvent {
+			continue
+		}
+		var payload scopeDriftPayload
+		if err := json.Unmarshal(line.Data, &payload); err != nil {
+			return nil, fmt.Errorf("bundle: parse policy_event payload: %w", err)
+		}
+		if payload.Check != "scope_drift" {
+			continue
+		}
+		return payload.Undeclared, nil
+	}
+	return nil, nil
 }
 
 // byteReader is the smallest io.Reader over a []byte that

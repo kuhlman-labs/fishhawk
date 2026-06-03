@@ -149,6 +149,88 @@ func implementDiffBundleWithPatch(t *testing.T, files []map[string]string, patch
 	return gz.Bytes()
 }
 
+// implementDiffBundleWithScopeDrift builds a trace bundle carrying BOTH a
+// git_diff event and a scope_drift policy_event, so bundle.ExtractScopeDrift
+// yields the given undeclared paths alongside the scoped diff. Used by the
+// cross-boundary test that proves the drift list reaches the reviewer prompt
+// end-to-end (#695).
+func implementDiffBundleWithScopeDrift(t *testing.T, files []map[string]string, drift []string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	manifest, _ := json.Marshal(map[string]any{"bundle_schema": "v1"})
+	manifestLine, _ := json.Marshal(map[string]any{"seq": 1, "kind": "manifest", "data": json.RawMessage(manifest)})
+	raw.Write(manifestLine)
+	raw.WriteByte('\n')
+
+	diffPayload, _ := json.Marshal(map[string]any{
+		"kind":      "name_status",
+		"base_ref":  "origin/main",
+		"files":     files,
+		"num_files": len(files),
+	})
+	diffLine, _ := json.Marshal(map[string]any{
+		"seq": 2, "kind": "git_diff", "data": json.RawMessage(diffPayload),
+	})
+	raw.Write(diffLine)
+	raw.WriteByte('\n')
+
+	driftPayload, _ := json.Marshal(map[string]any{
+		"check":      "scope_drift",
+		"outcome":    "excluded",
+		"undeclared": drift,
+	})
+	driftLine, _ := json.Marshal(map[string]any{
+		"seq": 3, "kind": "policy_event", "data": json.RawMessage(driftPayload),
+	})
+	raw.Write(driftLine)
+	raw.WriteByte('\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+// TestShipTrace_ImplementReview_ScopeDriftThreadedIntoPrompt is the
+// cross-boundary integration test for #695: a real trace bundle carrying
+// BOTH a git_diff event and a scope_drift policy_event ships through
+// handleShipTrace, and the captured reviewer prompt names the drifted path
+// with the operator-may-stage framing — proving the bundle-reader →
+// trace-handler → prompt-render seam end-to-end, not just per-layer.
+func TestShipTrace_ImplementReview_ScopeDriftThreadedIntoPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundleWithScopeDrift(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}},
+		[]string{"backend/internal/foo/foo_test.go"})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"Scope drift (excluded from the diff above — operator may stage)",
+		"backend/internal/foo/foo_test.go",
+		"operator may stage",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q from threaded scope drift:\n%s", want, got)
+		}
+	}
+}
+
 // TestShipTrace_ImplementReview_PatchThreadedIntoPrompt asserts the
 // git_diff event's patch text reaches the reviewer prompt end-to-end:
 // the trace handler sets trig.DiffPatch from diff.Patch, and
@@ -527,7 +609,7 @@ func TestShipTrace_ImplementReview_Advisory_ContextDetached(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Advisory → dispatches a detached goroutine and returns false.
-	if s.runImplementReviews(ctx, runRow.ID, implStage.ID, diff) {
+	if s.runImplementReviews(ctx, runRow.ID, implStage.ID, diff, nil) {
 		t.Fatal("advisory runImplementReviews returned true (advisory must never gate)")
 	}
 
