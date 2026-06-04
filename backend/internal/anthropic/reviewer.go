@@ -2,7 +2,6 @@ package anthropic
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -44,8 +43,8 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 		return nil, "", fmt.Errorf("anthropic: messages call failed: %w", err)
 	}
 
-	var verdict planreview.ReviewVerdict
-	if err := json.Unmarshal([]byte(responseText), &verdict); err != nil {
+	verdict, err := planreview.DecodeVerdict([]byte(responseText))
+	if err != nil {
 		return nil, "", fmt.Errorf("anthropic: decode verdict JSON: %w", err)
 	}
 
