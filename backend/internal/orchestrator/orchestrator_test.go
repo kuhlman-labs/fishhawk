@@ -25,6 +25,7 @@ type stubRuns struct {
 
 	getRunErr        error
 	listStagesErr    error
+	listStagesErrIDs map[uuid.UUID]error // per-run ListStagesForRun failure (reconcile skip path)
 	transitionRunErr error
 	transitionErr    error
 
@@ -113,6 +114,9 @@ func (s *stubRuns) GetRunByIdempotencyKey(context.Context, string, string) (*run
 func (s *stubRuns) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err, ok := s.listStagesErrIDs[runID]; ok {
+		return nil, err
+	}
 	if s.listStagesErr != nil {
 		return nil, s.listStagesErr
 	}
@@ -1223,5 +1227,45 @@ func TestReconcileStuckRuns_AdvancesAllTerminalRunOnly(t *testing.T) {
 	}
 	if got := rr.runs[inflight.ID].State; got != run.StateRunning {
 		t.Errorf("in-flight run state = %q, want running (untouched)", got)
+	}
+}
+
+// TestReconcileStuckRuns_PerRunErrorDoesNotBlockOthers guards the
+// best-effort-per-run posture (#727 review concern): a run that errors
+// during the sweep (here, a stage-scan failure — modelling a partially
+// cleaned-up record) is logged and skipped, and a sibling stuck run is
+// still rescued in the SAME pass. The pre-fix code aborted the whole
+// sweep on the first per-run error, so every subsequent run went
+// unrecovered until the next restart.
+func TestReconcileStuckRuns_PerRunErrorDoesNotBlockOthers(t *testing.T) {
+	rr := newStubRuns()
+	o := &Orchestrator{Runs: rr}
+
+	// A stuck run whose stage scan fails (record partially cleaned up).
+	broken, _ := rr.seed(t, "owner/broken", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateSucceeded},
+	})
+	rr.listStagesErrIDs = map[uuid.UUID]error{broken.ID: errors.New("record gone")}
+
+	// A healthy stuck run that must still be rescued despite the broken one.
+	good, _ := rr.seed(t, "owner/good", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateSucceeded},
+	})
+
+	n, err := o.ReconcileStuckRuns(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileStuckRuns returned error, want nil (per-run errors are skipped): %v", err)
+	}
+	if n != 1 {
+		t.Errorf("advanced = %d, want 1 (only the healthy run)", n)
+	}
+	if got := rr.runs[good.ID].State; got != run.StateSucceeded {
+		t.Errorf("good run state = %q, want succeeded (sibling error must not block it)", got)
+	}
+	if got := rr.runs[broken.ID].State; got != run.StateRunning {
+		t.Errorf("broken run state = %q, want running (left for next boot)", got)
 	}
 }

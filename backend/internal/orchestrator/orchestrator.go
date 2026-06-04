@@ -227,12 +227,18 @@ const reconcileStuckRunsPageSize = 100
 // never force-completed. Idempotent: an already-terminal run is a
 // completeRun no-op, and a second pass finds nothing to advance. Returns
 // the count advanced. Reuses existing repo methods only (no new query).
+//
+// Best-effort PER RUN: a failure on one run (stage-scan or Advance error)
+// is logged and skipped so it cannot block recovery of the others — a
+// single unresolvable run never wedges the whole boot sweep. Only a
+// systemic ListRuns paging failure aborts (and is returned).
 func (o *Orchestrator) ReconcileStuckRuns(ctx context.Context) (int, error) {
 	if o.Runs == nil {
 		return 0, errors.New("orchestrator: Runs is nil")
 	}
 
 	advanced := 0
+	failed := 0
 	offset := 0
 	for {
 		runs, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
@@ -241,21 +247,38 @@ func (o *Orchestrator) ReconcileStuckRuns(ctx context.Context) (int, error) {
 			Offset: offset,
 		})
 		if err != nil {
+			// A paging failure is systemic (not specific to one run), so
+			// abort the sweep — best-effort applies per-run, not to the
+			// listing itself.
 			return advanced, fmt.Errorf("orchestrator: reconcile list runs: %w", err)
 		}
 		if len(runs) == 0 {
 			break
 		}
 		for _, r := range runs {
+			// Best-effort PER RUN: a failure on one run (e.g. its record
+			// was partially cleaned up and Advance hits ErrNotFound) must
+			// not block recovery of the others. Log and continue rather
+			// than aborting the whole boot sweep (#727).
 			stuck, err := o.runStagesAllTerminal(ctx, r.ID)
 			if err != nil {
-				return advanced, err
+				failed++
+				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator reconcile: skipped run on stage-scan error",
+					slog.String("run_id", r.ID.String()),
+					slog.String("error", err.Error()),
+				)
+				continue
 			}
 			if !stuck {
 				continue
 			}
 			if _, err := o.Advance(ctx, r.ID); err != nil {
-				return advanced, fmt.Errorf("orchestrator: reconcile advance run %s: %w", r.ID, err)
+				failed++
+				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator reconcile: skipped run on advance error",
+					slog.String("run_id", r.ID.String()),
+					slog.String("error", err.Error()),
+				)
+				continue
 			}
 			advanced++
 			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator reconciled stuck run",
@@ -270,6 +293,7 @@ func (o *Orchestrator) ReconcileStuckRuns(ctx context.Context) (int, error) {
 
 	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator stuck-run reconciliation complete",
 		slog.Int("advanced", advanced),
+		slog.Int("failed", failed),
 	)
 	return advanced, nil
 }
