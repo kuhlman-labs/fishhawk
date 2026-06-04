@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -723,7 +724,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if res.OK && stageType == "implement" {
 			if err := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey); err != nil {
 				res.OK = false
-				if errors.Is(err, upload.ErrPullRequestInvalid) {
+				// Wrong-shaped output → category-B (parks the run for
+				// re-scope/re-plan). ErrPullRequestInvalid is the backend
+				// rejecting the artifact shape; ErrCommitWouldNotCompile is
+				// the pre-push compile gate (#728) catching a scope-only
+				// commit that dropped build-required drift. Everything else
+				// (network, git, GitHub API) is category-C infra.
+				if errors.Is(err, upload.ErrPullRequestInvalid) || errors.Is(err, gitops.ErrCommitWouldNotCompile) {
 					res.FailureCategory = "B"
 				} else {
 					res.FailureCategory = "C"
@@ -1392,6 +1399,152 @@ var (
 	}
 )
 
+// compileDiagnosticMarkers are substrings that positively identify a
+// Go compile / typecheck diagnostic in `go vet` output, as opposed to a
+// dependency-resolution failure (cold cache / no network) or a pure vet
+// analyzer finding. The gate blocks ONLY when one of these appears — a
+// positive allowlist, not a blanket "vet exited non-zero → block" — so a
+// dep-fetch failure or an unrelated vet warning degrades to a
+// non-blocking skip rather than killing every implement stage (#728,
+// reviewer concern 2). The first three are the markers the reviewer
+// named explicitly; the rest cover the same typecheck-error class.
+var compileDiagnosticMarkers = []string{
+	"does not implement",
+	"cannot use",
+	"undefined:",
+	"missing method",
+	"undeclared name",
+	"redeclared",
+	"not enough arguments",
+	"too many arguments",
+}
+
+// looksLikeCompileError reports whether `go vet` output contains a
+// genuine compile / typecheck diagnostic. Used to separate a real
+// build failure (block, category-B) from a dependency-resolution
+// failure or vet-analyzer finding (skip, non-blocking).
+func looksLikeCompileError(output string) bool {
+	for _, m := range compileDiagnosticMarkers {
+		if strings.Contains(output, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyCommittedTreeCompiles compile-gates the scope-only committed
+// tree before the runner pushes it (#728). When a scope-bounded commit
+// drops build-required drift (e.g. an interface-conformance stub left in
+// a test file the plan didn't declare), the committed tree fails to
+// build even though each per-layer change looked complete — and the
+// runner would otherwise open a non-compiling PR. This checks out the
+// committed HEAD SHA in an isolated git worktree (NOT the operator's
+// working tree, which still carries the drift on disk) and runs
+// `go vet ./...` per go.work module. `go vet` typechecks test files,
+// which `go build` skips, so it catches `does not implement <iface>
+// (missing method ...)` that `go build ./...` would miss.
+//
+// It returns ErrCommitWouldNotCompile (wrapped, naming the drift files)
+// ONLY on a genuine compile failure. Every infrastructure problem — no
+// drift to drop, no go.work (non-Go repo), no Go toolchain, a worktree
+// or `go work edit` failure, or a dependency-resolution failure — is a
+// NON-blocking skip (logged as compile_gate_skipped, returns nil), so
+// the gate never becomes a new failure source in non-Go or misconfigured
+// environments. It degrades to today's "open the PR" behavior instead.
+func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, drift []string, logSink io.Writer) error {
+	// Fast paths (zero runtime on the common case): no excluded files
+	// means nothing build-required could have been dropped; no go.work at
+	// the repo root means this isn't a Go workspace to vet.
+	if len(drift) == 0 {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "go.work")); err != nil {
+		return nil
+	}
+
+	skip := func(reason, detail string) {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"compile_gate_skipped","head_sha":%q,"reason":%q,"detail":%q}`+"\n",
+			headSHA, reason, detail)
+	}
+
+	// Isolated worktree at the committed SHA. os.MkdirTemp makes the
+	// parent; the worktree target is a not-yet-existing child because
+	// `git worktree add` refuses a populated path. Both are torn down on
+	// return (worktree remove unregisters it from the source repo; the
+	// RemoveAll is belt-and-suspenders for the parent).
+	parent, err := os.MkdirTemp("", "fishhawk-compilegate-*")
+	if err != nil {
+		skip("worktree_tmp", err.Error())
+		return nil
+	}
+	wt := filepath.Join(parent, "tree")
+	defer func() {
+		_ = exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "remove", "--force", wt).Run()
+		_ = os.RemoveAll(parent)
+	}()
+
+	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"worktree", "add", "--detach", wt, headSHA).CombinedOutput(); err != nil {
+		// A worktree-add failure is itself an *exec.ExitError but is NOT a
+		// compile failure (reviewer concern 1) — treat as infra-skip.
+		skip("worktree_add", strings.TrimSpace(string(out)))
+		return nil
+	}
+
+	// Enumerate the workspace modules from the committed go.work.
+	workCmd := exec.CommandContext(ctx, "go", "work", "edit", "-json")
+	workCmd.Dir = wt
+	workOut, err := workCmd.Output()
+	if err != nil {
+		// `go` missing (exec start error) or `go work edit` failure — infra,
+		// not a compile failure (reviewer concern 1). Skip.
+		skip("go_work_edit", err.Error())
+		return nil
+	}
+	var workspace struct {
+		Use []struct {
+			DiskPath string `json:"DiskPath"`
+		} `json:"Use"`
+	}
+	if err := json.Unmarshal(workOut, &workspace); err != nil {
+		skip("go_work_parse", err.Error())
+		return nil
+	}
+
+	// Per-module `go vet ./...`. Running from the repo root fails (no root
+	// go.mod in this multi-module workspace), so iterate the modules the
+	// same way the CLAUDE.md coverage loop does.
+	for _, m := range workspace.Use {
+		vetCmd := exec.CommandContext(ctx, "go", "vet", "./...")
+		vetCmd.Dir = filepath.Join(wt, m.DiskPath)
+		out, verr := vetCmd.CombinedOutput()
+		if verr == nil {
+			continue
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(verr, &exitErr) {
+			// vet never ran (go missing / exec start failure) — infra-skip.
+			skip("vet_exec", verr.Error())
+			return nil
+		}
+		// vet ran and exited non-zero. Block ONLY on a genuine compile /
+		// typecheck diagnostic; a dependency-resolution failure (cold cache
+		// / no network) or vet-analyzer finding is a non-blocking skip
+		// (reviewer concern 2). `continue` (not return) so a non-compile
+		// failure in ONE module doesn't abandon the gate — a later module
+		// may still carry the real build-required-drift compile error.
+		vetOut := strings.TrimSpace(string(out))
+		if !looksLikeCompileError(vetOut) {
+			skip("vet_nonzero_non_compile", vetOut)
+			continue
+		}
+		return fmt.Errorf("%w: PR would not compile; %d file(s) outside scope are build-required: %s\n%s",
+			gitops.ErrCommitWouldNotCompile, len(drift), strings.Join(drift, ", "), vetOut)
+	}
+	return nil
+}
+
 // openPRAndShipArtifact is the implement-stage post-processing
 // chain. It commits the agent's edits, pushes a fresh branch via
 // HTTPS, opens a PR via the GitHub REST API, and ships a
@@ -1528,6 +1681,28 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	title, body := prTitleAndBody(cfg, branch, logSink)
 	commitMessage := title + "\n\n" + body
 
+	// Compile-gate the scope-only committed tree before push (#728), but
+	// only on the standalone PR-opening path. Decomposed children push
+	// intermediate commits to a shared branch and may legitimately not
+	// compile in isolation before later children land, so gating them
+	// would false-positive — leave them ungated (the parent run's
+	// consolidated tip is a separate follow-up). The hook runs inside
+	// CommitAndPush after the commit and before the push, so a failure
+	// leaves origin untouched.
+	var verifyCommit func(ctx context.Context, headSHA string, drift []string) error
+	if !isDecomposed {
+		verifyCommit = func(ctx context.Context, headSHA string, drift []string) error {
+			if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, logSink); err != nil {
+				driftJSON, _ := json.Marshal(drift)
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"compile_gate_failed","run_id":%q,"stage_id":%q,"head_sha":%q,"drift":%s}`+"\n",
+					cfg.runID, cfg.stageID, headSHA, driftJSON)
+				return err
+			}
+			return nil
+		}
+	}
+
 	cap, err := newPusher().CommitAndPush(ctx, gitops.CommitAndPushArgs{
 		RepoDir:       repoDir,
 		Branch:        branch,
@@ -1552,6 +1727,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// plan's declared paths, excluding stray dirty files. Empty
 		// (plan_missing_for_implement) falls back to `git add -A`.
 		ScopeFiles: scopePaths(cfg.scopeFiles),
+		// Compile-gate the committed tree before push (#728). nil on the
+		// decomposed-child path (see above), which leaves the gate off.
+		VerifyCommit: verifyCommit,
 	})
 	if err != nil {
 		return fmt.Errorf("commit+push: %w", err)
