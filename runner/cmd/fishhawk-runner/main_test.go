@@ -3833,12 +3833,24 @@ func TestRun_ImplementStage_CompileGateFailure_CategoryB(t *testing.T) {
 	if fp.gotArgs == nil || fp.gotArgs.VerifyCommit == nil {
 		t.Error("VerifyCommit hook should be set on the standalone implement path")
 	}
-	// Aborted pre-PR: no non-compiling PR is opened, no artifact shipped.
+	// Aborted pre-PR: no non-compiling PR is opened.
 	if fpr.gotArgs != nil {
 		t.Error("OpenPR must not be called after a compile-gate failure")
 	}
-	if fu.gotPRArgs != nil {
-		t.Error("ShipPullRequest must not be called after a compile-gate failure")
+	// #742: the category-B compile-gate failure is reported to the backend
+	// via the /pull-request FAILURE path so the gated implement stage lands
+	// `failed` instead of hanging in running. It must be the failure report
+	// (outcome=failed / category=B), NOT a success PR artifact — no PR was
+	// opened, so the report carries no artifact body.
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after a compile-gate failure (#742)")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Errorf("ShipPullRequest failure report = {outcome:%q, category:%q}, want {failed, B}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
+	}
+	if len(fu.gotPRArgs.Body) != 0 {
+		t.Errorf("failure report must not carry a success PR artifact body, got %d bytes", len(fu.gotPRArgs.Body))
 	}
 }
 

@@ -557,6 +557,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// the backend's authoritative re-evaluation; C originates inside
 	// the upload itself (no bundle to stamp); D never reaches the
 	// runner.
+	// willOpenPR is true when this stage will commit + push + open a PR
+	// after the trace upload — a standalone implement stage that isn't a
+	// --no-pr local run or a decomposed child. It stamps push_and_open_pr
+	// in the bundle manifest so the backend forward-gates the implement
+	// stage's terminal transition onto the /pull-request upload (#742), and
+	// it gates the failure-report POST below so only a gated stage reports
+	// a commit/push/PR-open failure back to the backend.
+	willOpenPR := stageType == "implement" && !cfg.noPR && cfg.decomposedFromRunID == ""
+
 	var rawBundle, redactedBundle []byte
 	if cfg.bundleOut != "" || cfg.uploadTrace {
 		agentFailed := res.FailureCategory == "A"
@@ -577,6 +586,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			OutputTokens:       res.OutputTokens,
 			AgentFailed:        agentFailed,
 			AgentFailureReason: agentFailureReason,
+			PushAndOpenPR:      willOpenPR,
 		}
 		bytesData, _, err := bundle.PackBytes(manifestRaw, res.Events)
 		if err != nil {
@@ -739,6 +749,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				invokeErr = err
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"pull_request_upload","detail":%q}`+"\n", err.Error())
+				// Report the failure to /pull-request so the backend fails the
+				// implement stage that its trace gate left in `running` (#742).
+				// Without this the gated stage would hang until the SLA watchdog
+				// reaps it. Gated on willOpenPR: only a push_and_open_pr stage
+				// was left in running; a decomposed-child / --no-pr failure was
+				// never gated, so reporting one would wrongly fail an
+				// already-advanced stage. Best-effort — the failure exit stands
+				// regardless of whether the report lands.
+				if willOpenPR {
+					reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, err.Error())
+				}
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
 			}
@@ -1815,6 +1836,39 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		cfg.runID, cfg.stageID, shipRes.ID, shipRes.ContentHash, shipRes.Idempotent,
 	)
 	return nil
+}
+
+// reportPullRequestFailure POSTs a failure-outcome body to
+// /v0/runs/{run_id}/pull-request so the backend fails the implement stage
+// its trace gate left in `running` (#742). In push_and_open_pr mode the
+// /pull-request upload is the authoritative driver of the implement
+// stage's terminal transition, so a commit/push/PR-open failure must be
+// reported here — otherwise the gated stage hangs in `running` until the
+// SLA watchdog reaps it, instead of landing `failed` (retryable for C).
+//
+// category is "B" (ErrPullRequestInvalid / ErrCommitWouldNotCompile) or
+// "C" (network, git, GitHub API). Best-effort: a report failure is logged
+// but never changes the runner's exit — the failed exit already stands.
+func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, category, reason string) {
+	if issued == nil || client == nil {
+		return
+	}
+	if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+		RunID:      cfg.runID,
+		StageID:    cfg.stageID,
+		PrivateKey: issued.PrivateKey,
+		Outcome:    "failed",
+		Category:   category,
+		Reason:     reason,
+	}); err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pull_request_failure_report_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, err.Error())
+		return
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pull_request_failure_reported","run_id":%q,"stage_id":%q,"category":%q}`+"\n",
+		cfg.runID, cfg.stageID, category)
 }
 
 // shortID returns the first 8 characters of a UUID-shaped string,

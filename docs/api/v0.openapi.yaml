@@ -399,6 +399,22 @@ components:
         Wire shape the runner POSTs to /v0/runs/{run_id}/pull-request.
         Stored verbatim as the artifact's content; v0 doesn't carry a
         schema_version because the field shape isn't yet schema-stable.
+
+        Has two variants (#742):
+
+        - **Success** (default): `outcome` is absent. The PR fields
+          (`pr_number`, `pr_url`, `branch`, `head_sha`, `base_sha`,
+          `title`, `files_changed_count`) are required. The handler
+          stores the PR artifact, backfills `run.pull_request_url`, and —
+          when the implement stage was left in `running` by the trace
+          handler's push-and-open-pr gate — drives its terminal
+          transition (→ awaiting_approval / succeeded).
+        - **Failure** (`outcome: failed`): the runner's commit/push/PR-open
+          step failed, so no PR was opened. `category` (`B` re-scope, `C`
+          retryable infra) and `reason` are required; the PR fields are
+          absent. The handler fails the implement stage instead of
+          creating an artifact, so the run never strands at
+          review:awaiting_approval with a null PR.
       required: [pr_number, pr_url, branch, head_sha, base_sha, title, files_changed_count]
       properties:
         pr_number:
@@ -428,6 +444,23 @@ components:
           type: integer
           minimum: 0
           example: 3
+        outcome:
+          type: string
+          enum: [failed]
+          description: |
+            Present only on the failure variant (#742). When set to
+            `failed`, the body reports a commit/push/PR-open failure and
+            the PR fields above are absent.
+        category:
+          type: string
+          enum: [B, C]
+          description: |
+            Failure category for the failure variant (#742). `B` parks the
+            run for re-scope/re-plan (invalid PR shape / compile gate);
+            `C` is retryable infra (network, git, GitHub API).
+        reason:
+          type: string
+          description: Human-readable failure reason (failure variant only).
 
     PullRequestUploadResponse:
       type: object
@@ -445,6 +478,19 @@ components:
         pr_url: { type: string, format: uri }
         head_sha: { type: string }
         idempotent: { type: boolean }
+
+    PullRequestFailureResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/pull-request` for the failure
+        variant (`outcome: failed`, #742): the runner-reported
+        commit/push/PR-open failure was recorded and the implement stage
+        transitioned to `failed`.
+      required: [stage_id, outcome, category]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        outcome: { type: string, enum: [failed] }
+        category: { type: string, enum: [B, C] }
 
     PlanUploadResponse:
       type: object
@@ -2318,10 +2364,21 @@ paths:
       operationId: shipPullRequest
       summary: Upload a pull-request artifact for an implement stage
       description: |
-        Called after a successful implement-stage run that produced a
-        real GitHub pull request. The body carries `{ pr_number,
-        pr_url, branch, head_sha, base_sha, title, body?,
-        files_changed_count }`.
+        Called after an implement-stage run to report its commit/push/
+        PR-open outcome. The body has two variants (#742):
+
+        - **Success**: a real GitHub PR was opened. The body carries
+          `{ pr_number, pr_url, branch, head_sha, base_sha, title,
+          body?, files_changed_count }`. The handler stores the artifact,
+          backfills `run.pull_request_url`, and drives the implement
+          stage's terminal transition when the trace handler's
+          push-and-open-pr gate left it in `running`.
+        - **Failure** (`{ outcome: "failed", category, reason }`): the
+          commit/push/PR-open step failed, so no PR was opened. The
+          handler fails the implement stage (category `C` is retryable,
+          `B` parks for re-scope) instead of creating an artifact —
+          closing the zombie-run hole where a commit/push failure
+          stranded the run at review with a null PR.
 
         Two auth paths are accepted:
 
@@ -2376,16 +2433,23 @@ paths:
               schema: { $ref: '#/components/schemas/PullRequestUploadResponse' }
         '200':
           description: |
-            A pull-request artifact with this content_hash already
-            exists for the stage. Idempotent re-upload returns the
-            existing artifact unchanged.
+            Either:
+            - A pull-request artifact with this content_hash already
+              exists for the stage (idempotent re-upload returns the
+              existing artifact unchanged), or
+            - the failure variant (`outcome: failed`) was accepted and
+              the implement stage was transitioned to `failed` (#742).
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/PullRequestUploadResponse' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/PullRequestUploadResponse'
+                  - $ref: '#/components/schemas/PullRequestFailureResponse'
         '400':
           description: |
             Body missing required fields (`code: pull_request_invalid`)
-            or path/query parameters were malformed.
+            — for the failure variant, an unknown `category` or missing
+            `reason` — or path/query parameters were malformed.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

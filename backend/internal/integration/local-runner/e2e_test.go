@@ -573,6 +573,207 @@ func TestE2E_LocalRunner_AppBotIdentity_ResolvedAndCarriedOnPrompt(t *testing.T)
 	}
 }
 
+// TestE2E_LocalRunner_ImplementPRFailure_NoZombie reproduces the exact
+// b6811dc9 zombie shape (#742) end-to-end through the real runner against
+// the real backend: an implement stage whose commit/push/PR-open step
+// FAILS after policy passes must land the stage `failed` (category C,
+// retryable) — it must NEVER be observed at review:awaiting_approval with
+// pull_request_url=null.
+//
+// The forced failure is hermetic: the run has no GitHub App installation
+// and the gh-CLI push fallback (#713) is denied an auth token (empty
+// GH_CONFIG_DIR + empty token env), so the PR-open step cannot
+// authenticate. Because the trace bundle carries a non-empty scope-bounded
+// diff, the push-and-open-pr gate leaves the implement stage in `running`
+// until the runner reports the failure to /pull-request — without the #742
+// fix the trace upload would have advanced the stage to awaiting_approval
+// before the PR-open step ran, stranding the run with a null PR.
+func TestE2E_LocalRunner_ImplementPRFailure_NoZombie(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available; skipping PR-failure E2E")
+	}
+	fx := newLocalRunnerFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef-prfail",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := fx.artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       scopedPlanJSON(t, "added.txt"),
+		ContentHash:   "prfail-e2e",
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 2, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code", RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+
+	// Working tree: a git repo on `main` with one base commit, so the
+	// implement stage's scope-bounded diff (added.txt) is non-empty — the
+	// signal that fires the push-and-open-pr gate.
+	workDir := t.TempDir()
+	gitRepoInit(t, workDir)
+
+	// Fake agent: writes the scoped file (added.txt) into the working tree.
+	fakeDir := t.TempDir()
+	fakeScript := filepath.Join(fakeDir, "claude")
+	if runtime.GOOS == "windows" {
+		fakeScript = filepath.Join(fakeDir, "claude.bat")
+	}
+	scriptBody := "#!/bin/sh\nprintf '{\"type\":\"result\"}\\n'\necho 'package main' > added.txt\n"
+	if err := os.WriteFile(fakeScript, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+
+	// Empty gh config dir + empty token env so the gh-CLI push fallback
+	// (#713) deterministically fails — the PR-open step cannot authenticate.
+	ghConfigDir := t.TempDir()
+
+	cmd := exec.CommandContext(ctx, fx.runnerBinary,
+		"--run-id", r.ID.String(),
+		"--backend-url", fx.url,
+		"--workflow", "feature_change",
+		"--stage", "implement",
+		"--stage-id", implStage.ID.String(),
+		"--fetch-prompt",
+		"--upload-trace",
+		"--working-dir", workDir,
+		"--check-base-ref", "main",
+		"--github-repo", "kuhlman-labs/fishhawk",
+		"--base-branch", "main",
+	)
+	runnerEnv := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		switch {
+		case strings.HasPrefix(e, "PATH="):
+			e = "PATH=" + fakeDir + ":" + strings.TrimPrefix(e, "PATH=")
+		case strings.HasPrefix(e, "GH_TOKEN="), strings.HasPrefix(e, "GITHUB_TOKEN="), strings.HasPrefix(e, "GH_CONFIG_DIR="):
+			continue
+		}
+		runnerEnv = append(runnerEnv, e)
+	}
+	runnerEnv = append(runnerEnv, "GH_TOKEN=", "GITHUB_TOKEN=", "GH_CONFIG_DIR="+ghConfigDir)
+	cmd.Env = runnerEnv
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	// The runner is EXPECTED to exit non-zero: the PR-open step fails.
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("runner exited 0; expected failure on the PR-open step\noutput:\n%s", out.String())
+	}
+
+	// The implement stage must land FAILED with category C — never
+	// awaiting_approval (the zombie shape from run b6811dc9).
+	got, err := fx.runRepo.GetStage(ctx, implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != runpkg.StageStateFailed {
+		t.Fatalf("implement stage State = %q, want failed\nrunner output:\n%s", got.State, out.String())
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != runpkg.FailureC {
+		t.Errorf("FailureCategory = %v, want C (retryable)\nrunner output:\n%s", got.FailureCategory, out.String())
+	}
+	// Category C is retryable: the failed → pending redrive must be allowed.
+	if !runpkg.ValidStageRetryTransition(got.State, runpkg.StageStatePending) {
+		t.Errorf("category-C failed stage should permit retry (failed → pending)")
+	}
+	// The zombie shape is impossible: no PR was opened, so the run carries
+	// no pull_request_url.
+	gotRun, err := fx.runRepo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.PullRequestURL != nil {
+		t.Errorf("run.PullRequestURL = %q, want nil after a PR-open failure", *gotRun.PullRequestURL)
+	}
+}
+
+// gitRepoInit makes dir a git repo on branch `main` with a single base
+// commit, so an implement stage run against it produces a non-empty diff.
+func gitRepoInit(t *testing.T, dir string) {
+	t.Helper()
+	env := append(os.Environ(),
+		"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com",
+	)
+	runGit := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		c.Env = env
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-m", "base")
+	// Rename whatever the default initial branch is to `main` so
+	// --base-branch main resolves regardless of the host git's init.defaultBranch.
+	runGit("branch", "-M", "main")
+}
+
+// scopedPlanJSON returns a schema-valid standard_v1 plan whose scope.files
+// declares exactly scopePath, so the implement stage's scope-bounded diff
+// stages the file the fake agent writes.
+func scopedPlanJSON(t *testing.T, scopePath string) []byte {
+	t.Helper()
+	m := map[string]any{
+		"plan_version": "standard_v1",
+		"ticket_reference": map[string]any{
+			"type": "github_issue", "url": "https://github.com/x/y/issues/1", "id": "x/y#1",
+		},
+		"generated_by": map[string]any{
+			"agent": "claude-code", "model": "claude-opus-4-7",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		},
+		"summary": "PR-open failure E2E plan.",
+		"scope": map[string]any{
+			"files": []any{map[string]any{"path": scopePath, "operation": "create"}},
+		},
+		"approach": []any{map[string]any{"step": 1, "description": "Write the file."}},
+		"verification": map[string]any{
+			"test_strategy": "Run go test.", "rollback_plan": "Revert the commit.",
+		},
+		"predicted_runtime_minutes":    5,
+		"predicted_runtime_confidence": "high",
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal scoped plan: %v", err)
+	}
+	return b
+}
+
 // implementTimeoutPlanJSON returns a schema-valid standard_v1 plan with the
 // given predicted_runtime_minutes, marshalled to JSON for artifact storage.
 func implementTimeoutPlanJSON(t *testing.T, predictedMinutes int) []byte {

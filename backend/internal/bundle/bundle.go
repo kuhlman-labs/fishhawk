@@ -67,6 +67,15 @@ type Manifest struct {
 	GeneratedAt        string `json:"generated_at"`
 	AgentFailed        bool   `json:"agent_failed,omitempty"`
 	AgentFailureReason string `json:"agent_failure_reason,omitempty"`
+	// PushAndOpenPR signals an implement stage that will commit + push +
+	// open a PR after the trace upload. The trace handler reads it to
+	// forward-gate the implement stage's terminal transition onto the
+	// /pull-request upload (#742), closing the zombie-run hole where a
+	// commit/push failure stranded the run at review with a null PR. Older
+	// bundles (and every non-PR-opening stage) omit it and decode to false,
+	// preserving the prior trace-driven transition. Keep in lockstep with
+	// runner/internal/bundle.ManifestData.
+	PushAndOpenPR bool `json:"push_and_open_pr,omitempty"`
 }
 
 // Errors callers may want to switch on.
