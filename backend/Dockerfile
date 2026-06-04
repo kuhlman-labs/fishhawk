@@ -28,6 +28,8 @@ COPY backend/go.mod backend/go.sum ./backend/
 COPY runner/go.mod runner/go.sum ./runner/
 COPY cli/go.mod cli/go.sum ./cli/
 COPY verifier/go.mod verifier/go.sum ./verifier/
+# pricing has no external imports, so no go.sum exists to copy.
+COPY pricing/go.mod ./pricing/
 
 # Pre-download deps. With a populated cache, source-only changes
 # avoid re-resolving the module graph.
@@ -41,6 +43,7 @@ COPY backend ./backend
 COPY runner ./runner
 COPY cli ./cli
 COPY verifier ./verifier
+COPY pricing ./pricing
 
 ARG VERSION=dev
 
