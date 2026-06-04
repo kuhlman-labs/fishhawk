@@ -3841,3 +3841,49 @@ func TestRun_ImplementStage_CompileGateFailure_CategoryB(t *testing.T) {
 		t.Error("ShipPullRequest must not be called after a compile-gate failure")
 	}
 }
+
+// TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater
+// guards the per-module loop continuation: a non-compile `go vet` failure
+// in an EARLIER module (here a Printf analyzer finding) must not abandon
+// the gate — a genuine build-required-drift compile error in a LATER
+// module must still be caught. (Regression: an earlier `return nil` on
+// the non-compile skip would have returned before reaching modb.)
+func TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	// moda is iterated first (go work edit -json preserves use order).
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./moda\nuse ./modb\n")
+	for _, m := range []string{"moda", "modb"} {
+		if err := os.MkdirAll(filepath.Join(repo, m), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, filepath.Join(repo, m, "go.mod"), "module example.com/"+m+"\n\ngo 1.21\n")
+	}
+	// moda: compiles, but `go vet` flags a Printf format mismatch (non-zero
+	// exit, NOT a compile/typecheck diagnostic → non-blocking skip).
+	mustWrite(t, filepath.Join(repo, "moda", "a.go"),
+		"package moda\n\nimport \"fmt\"\n\nfunc Bad() { fmt.Printf(\"%d\\n\", \"x\") }\n")
+	// modb: the interface-ripple compile error in a _test.go file.
+	mustWrite(t, filepath.Join(repo, "modb", "doer.go"),
+		"package modb\n\ntype Doer interface{ Do() }\n\ntype impl struct{}\n")
+	mustWrite(t, filepath.Join(repo, "modb", "doer_test.go"),
+		"package modb\n\nvar _ Doer = impl{}\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "moda vet-warns; modb missing Do()")
+	head := gitHead(t, repo)
+
+	var log bytes.Buffer
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"modb/doer.go"}, &log)
+	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) {
+		t.Fatalf("err = %v, want ErrCommitWouldNotCompile (modb compile error must be caught despite moda vet warning)\nlog: %s", err, log.String())
+	}
+	// moda's non-compile failure should have been logged as a skip.
+	if !strings.Contains(log.String(), "vet_nonzero_non_compile") {
+		t.Errorf("expected moda's non-compile vet failure to log a skip; log: %s", log.String())
+	}
+}

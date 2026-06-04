@@ -1531,11 +1531,13 @@ func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, d
 		// vet ran and exited non-zero. Block ONLY on a genuine compile /
 		// typecheck diagnostic; a dependency-resolution failure (cold cache
 		// / no network) or vet-analyzer finding is a non-blocking skip
-		// (reviewer concern 2).
+		// (reviewer concern 2). `continue` (not return) so a non-compile
+		// failure in ONE module doesn't abandon the gate — a later module
+		// may still carry the real build-required-drift compile error.
 		vetOut := strings.TrimSpace(string(out))
 		if !looksLikeCompileError(vetOut) {
 			skip("vet_nonzero_non_compile", vetOut)
-			return nil
+			continue
 		}
 		return fmt.Errorf("%w: PR would not compile; %d file(s) outside scope are build-required: %s\n%s",
 			gitops.ErrCommitWouldNotCompile, len(drift), strings.Join(drift, ", "), vetOut)
