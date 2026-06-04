@@ -145,7 +145,9 @@ func renderActivityLine(e *audit.Entry) string {
 	case "plan_generated":
 		return "Plan posted"
 	case "approval_submitted":
-		return fmt.Sprintf("%s %s the plan", actor, approvalDecisionVerb(e.Payload))
+		// Prefer the resolved GitHub login (#751); never @-mention the raw
+		// token subject (#755) — approverMention falls back to "an approver".
+		return fmt.Sprintf("%s %s the plan", approverMention(e), approvalDecisionVerb(e.Payload))
 	case "plan_approved_via_reaction":
 		return fmt.Sprintf("%s approved on GitHub (reaction)", actor)
 	case "ci_failure_retry_dispatched":
@@ -170,11 +172,49 @@ func renderActivityLine(e *audit.Entry) string {
 	}
 }
 
+// actorMention renders an audit actor as a GitHub `@`-mention ONLY when
+// the subject is a syntactically valid GitHub login (validApproverLogin,
+// notifier.go — same package). A non-login subject (e.g. the MCP token
+// subject "brett@local-mcp", or the "anonymous"/"system"/"github-webhook"
+// sentinels) returns "" so it never produces a bogus mention that pings an
+// unrelated GitHub user (#755). Webhook-sourced rows carry real logins and
+// are unaffected.
 func actorMention(actor *string) string {
-	if actor == nil || *actor == "" || *actor == "anonymous" || *actor == "system" || *actor == "github-webhook" {
+	if actor == nil || !validApproverLogin(*actor) {
 		return ""
 	}
 	return "@" + *actor
+}
+
+// approverMention renders the approver for an approval_submitted activity
+// row, preferring the resolved GitHub login the MCP loop threads through
+// (#751, approver_github_login) and falling back to the acting subject
+// only when it is itself a valid login; otherwise "an approver" — so a
+// non-login token subject is never `@`-mentioned (#755). Mirrors the
+// plan-status footer's renderApproverHandle preference order.
+func approverMention(e *audit.Entry) string {
+	if login := approverGithubLogin(e.Payload); validApproverLogin(login) {
+		return "@" + login
+	}
+	if e.ActorSubject != nil && validApproverLogin(*e.ActorSubject) {
+		return "@" + *e.ActorSubject
+	}
+	return "an approver"
+}
+
+// approverGithubLogin extracts the resolved GitHub login (#751) from an
+// approval_submitted payload; "" when absent or unparseable.
+func approverGithubLogin(payload json.RawMessage) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var p struct {
+		ApproverGithubLogin string `json:"approver_github_login"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	return p.ApproverGithubLogin
 }
 
 func approvalDecisionVerb(payload json.RawMessage) string {
