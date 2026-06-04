@@ -21,6 +21,7 @@ jobs:
       go: ${{ steps.filter.outputs.go }}
       ts: ${{ steps.filter.outputs.ts }}
       openapi: ${{ steps.filter.outputs.openapi }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
@@ -47,6 +48,23 @@ jobs:
               - '.github/workflows/ci.yml'
             openapi:
               - 'docs/api/**'
+              - '.github/workflows/ci.yml'
+            # The fishhawkd image build (backend/Dockerfile) resolves the
+            # whole go.work workspace inside the container. A module added
+            # to go.work without being wired into the Dockerfile's COPY
+            # steps breaks `go mod download` — invisible to the `go` job
+            # (which builds against the on-disk workspace) and previously
+            # only caught post-merge by backend-build.yml (#733). Trigger
+            # the build-only docker job on anything that changes the module
+            # graph or the build context: go.mod/go.sum (any module),
+            # go.work, the Dockerfile, and the ignore file.
+            docker:
+              - '**/go.mod'
+              - '**/go.sum'
+              - 'go.work'
+              - 'go.work.sum'
+              - 'backend/Dockerfile'
+              - '.dockerignore'
               - '.github/workflows/ci.yml'
 
   go:
@@ -204,13 +222,45 @@ jobs:
             --config docs/api/redocly.yaml \
             docs/api/v0.openapi.yaml
 
+  docker-build:
+    name: Docker build (fishhawkd image, no push)
+    needs: detect
+    if: ${{ needs.detect.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Build-only validation of the release build context. This mirrors
+      # backend-build.yml's build step but with push/sign/sbom stripped:
+      # no registry login, no credentials, no publish — the point is to
+      # fail a PR when the go.work workspace no longer resolves inside the
+      # container (the #733 class), not to produce an artifact. Reads the
+      # release job's warm cache (scope=backend-build) for speed but writes
+      # its own scope so a PR can never poison the published image's cache.
+      - name: Build fishhawkd image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: false
+          load: false
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+          cache-from: type=gha,scope=backend-build
+          cache-to: type=gha,mode=max,scope=ci-docker-build
+          provenance: false
+          sbom: false
+
   # Rollup gate. The repo ruleset requires only this job; it inherits
   # the result of every job listed in `needs`. Add new jobs to that
   # list and they automatically become part of the gate without
   # touching the ruleset.
   ci-pass:
     name: CI Pass
-    needs: [detect, go, ts, openapi]
+    needs: [detect, go, ts, openapi, docker-build]
     if: always()
     runs-on: ubuntu-latest
     steps:
