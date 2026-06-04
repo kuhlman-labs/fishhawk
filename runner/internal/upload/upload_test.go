@@ -491,6 +491,58 @@ func TestFetchPrompt_DecodesScopeFiles(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesCommitAuthor confirms the client decodes the
+// backend's commit_author_name/commit_author_email response fields into
+// FetchedPrompt so App-backed commits attribute to the App's bot (#722).
+func TestFetchPrompt_DecodesCommitAuthor(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"commit_author_name": "fishhawk[bot]",
+		"commit_author_email": "41898282+fishhawk[bot]@users.noreply.github.com"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.CommitAuthorName != "fishhawk[bot]" {
+		t.Errorf("CommitAuthorName = %q, want fishhawk[bot]", got.CommitAuthorName)
+	}
+	if got.CommitAuthorEmail != "41898282+fishhawk[bot]@users.noreply.github.com" {
+		t.Errorf("CommitAuthorEmail = %q", got.CommitAuthorEmail)
+	}
+}
+
+// TestFetchPrompt_CommitAuthorOmittedWhenAbsent confirms the commit
+// author fields decode to empty when the backend omits them (no
+// resolvable App), so the runner falls back to its default bot identity.
+func TestFetchPrompt_CommitAuthorOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.CommitAuthorName != "" || got.CommitAuthorEmail != "" {
+		t.Errorf("commit author = (%q,%q), want empty when absent",
+			got.CommitAuthorName, got.CommitAuthorEmail)
+	}
+}
+
 // TestFetchPrompt_ScopeFilesOmittedWhenAbsent confirms ScopeFiles
 // decodes to nil when the backend omits the field (plan_missing or a
 // non-implement stage), so the runner falls back to `git add -A`.

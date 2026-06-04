@@ -95,6 +95,12 @@ type fakeGitHub struct {
 	getInstallationStatus int
 	getInstallationBody   string
 
+	getAppStatus int
+	getAppBody   string
+
+	getUserStatus int
+	getUserBody   string
+
 	gotAuth        string
 	gotPath        string
 	gotQuery       string
@@ -138,6 +144,10 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		graphqlBody:               `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
 		getInstallationStatus:     http.StatusOK,
 		getInstallationBody:       `{"id":12345,"app_id":1}`,
+		getAppStatus:              http.StatusOK,
+		getAppBody:                `{"slug":"fishhawk","name":"Fishhawk"}`,
+		getUserStatus:             http.StatusOK,
+		getUserBody:               `{"id":41898282,"login":"fishhawk[bot]"}`,
 	}
 	mux := http.NewServeMux()
 
@@ -328,6 +338,26 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.graphqlStatus)
 			if fg.graphqlBody != "" {
 				_, _ = io.WriteString(w, fg.graphqlBody)
+			}
+		})
+
+	mux.HandleFunc("GET /app",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.getAppStatus)
+			if fg.getAppBody != "" {
+				_, _ = io.WriteString(w, fg.getAppBody)
+			}
+		})
+
+	mux.HandleFunc("GET /users/{login}",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.getUserStatus)
+			if fg.getUserBody != "" {
+				_, _ = io.WriteString(w, fg.getUserBody)
 			}
 		})
 
@@ -1951,6 +1981,116 @@ func TestGetRepoInstallation_NoAppJWT(t *testing.T) {
 	_, err := c.GetRepoInstallation(context.Background(), RepoRef{Owner: "x", Name: "y"})
 	if err == nil || !strings.Contains(err.Error(), "AppJWT") {
 		t.Errorf("err = %v, want AppJWT-not-configured error", err)
+	}
+}
+
+func TestGetApp_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, stub := newTestClient(t, srv, nil)
+
+	app, err := c.GetApp(context.Background())
+	if err != nil {
+		t.Fatalf("GetApp: %v", err)
+	}
+	if app.Slug != "fishhawk" {
+		t.Errorf("slug = %q, want fishhawk", app.Slug)
+	}
+	// Must authenticate as the App (JWT), not an installation token.
+	if stub.installationCalled != 0 {
+		t.Errorf("Token() called with installationID %d; App-JWT path must not use installation tokens",
+			stub.installationCalled)
+	}
+	if fg.gotAuth != "Bearer ghs_app_jwt" {
+		t.Errorf("Authorization = %q, want App JWT", fg.gotAuth)
+	}
+	if fg.gotPath != "/app" {
+		t.Errorf("path = %q, want /app", fg.gotPath)
+	}
+	if fg.gotAPIVersion != "2022-11-28" {
+		t.Errorf("X-GitHub-Api-Version = %q", fg.gotAPIVersion)
+	}
+}
+
+func TestGetApp_NoAppJWT(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+	c.AppJWT = nil // remove the AppJWT configured by newTestClient
+
+	_, err := c.GetApp(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "AppJWT") {
+		t.Errorf("err = %v, want AppJWT-not-configured error", err)
+	}
+}
+
+func TestGetApp_Forbidden(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getAppStatus = http.StatusForbidden
+	fg.getAppBody = `{"message":"Bad credentials"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetApp(context.Background())
+	if !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestGetUser_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, stub := newTestClient(t, srv, nil)
+
+	user, err := c.GetUser(context.Background(), "fishhawk[bot]")
+	if err != nil {
+		t.Fatalf("GetUser: %v", err)
+	}
+	if user.ID != 41898282 {
+		t.Errorf("id = %d, want 41898282", user.ID)
+	}
+	if user.Login != "fishhawk[bot]" {
+		t.Errorf("login = %q", user.Login)
+	}
+	if stub.installationCalled != 0 {
+		t.Errorf("Token() called with installationID %d; App-JWT path must not use installation tokens",
+			stub.installationCalled)
+	}
+	// Pins the auth shape: GET /users/{login} carries the App JWT as Bearer.
+	if fg.gotAuth != "Bearer ghs_app_jwt" {
+		t.Errorf("Authorization = %q, want App JWT", fg.gotAuth)
+	}
+	if fg.gotPath != "/users/fishhawk[bot]" {
+		t.Errorf("path = %q, want /users/fishhawk[bot]", fg.gotPath)
+	}
+}
+
+func TestGetUser_NoLogin(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetUser(context.Background(), "")
+	if err == nil || !strings.Contains(err.Error(), "login required") {
+		t.Errorf("err = %v, want login-required error", err)
+	}
+}
+
+func TestGetUser_NoAppJWT(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+	c.AppJWT = nil
+
+	_, err := c.GetUser(context.Background(), "fishhawk[bot]")
+	if err == nil || !strings.Contains(err.Error(), "AppJWT") {
+		t.Errorf("err = %v, want AppJWT-not-configured error", err)
+	}
+}
+
+func TestGetUser_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getUserStatus = http.StatusNotFound
+	fg.getUserBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.GetUser(context.Background(), "ghost[bot]")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
 

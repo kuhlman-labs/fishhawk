@@ -1659,6 +1659,100 @@ func (c *Client) GetRepoInstallation(ctx context.Context, repo RepoRef) (int64, 
 	return body.ID, nil
 }
 
+// App is the slice of the GitHub App's own metadata Fishhawk needs:
+// the App's slug, which composes the bot account's git commit identity
+// (`<slug>[bot]`). Other fields land here as features need them.
+type App struct {
+	Slug string
+}
+
+// GetApp returns the authenticated GitHub App's metadata. Requires the
+// App JWT (not an installation token) because the endpoint authenticates
+// as the App itself.
+//
+//	GET /app
+//
+// Used to resolve the App's slug for the bot commit identity (#722). A
+// client built via New (no signer / dev) hits the AppJWT nil guard in
+// buildAppJWTRequest and returns the configured error rather than a
+// wrong identity. Returns ErrForbidden / ErrNotFound via classifyStatus
+// for non-2xx responses.
+func (c *Client) GetApp(ctx context.Context) (*App, error) {
+	endpoint := c.endpoint("/app")
+
+	req, err := c.buildAppJWTRequest(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: get app: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("get app", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		Slug string `json:"slug"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode app: %w", err)
+	}
+	return &App{Slug: body.Slug}, nil
+}
+
+// User is the slice of a GitHub user/account payload Fishhawk needs:
+// the numeric account id, which composes the bot's no-reply commit
+// email (`<id>+<login>@users.noreply.github.com`).
+type User struct {
+	ID    int64
+	Login string
+}
+
+// GetUser fetches a single account by login. Authenticates with the
+// App JWT (the bot user-id read here belongs to the App's own bot
+// account, resolved alongside GetApp in the commit-identity flow, #722).
+//
+//	GET /users/{login}
+//
+// Returns ErrNotFound when the login doesn't exist or isn't visible,
+// ErrForbidden on auth issues. A client without a wired signer hits the
+// AppJWT nil guard.
+func (c *Client) GetUser(ctx context.Context, login string) (*User, error) {
+	if login == "" {
+		return nil, errors.New("githubclient: login required")
+	}
+
+	endpoint := c.endpoint("/users/" + url.PathEscape(login))
+
+	req, err := c.buildAppJWTRequest(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: get user: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("get user", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		ID    int64  `json:"id"`
+		Login string `json:"login"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode user: %w", err)
+	}
+	return &User{ID: body.ID, Login: body.Login}, nil
+}
+
 // buildAppJWTRequest constructs an http.Request authenticated as the
 // GitHub App itself (App JWT). Used for endpoints that require App-level
 // auth rather than installation-level auth (e.g. GetRepoInstallation).

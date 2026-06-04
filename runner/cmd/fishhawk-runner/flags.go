@@ -77,6 +77,14 @@ type config struct {
 	agentSelfRetry     bool
 	maxRetriesSnapshot int
 	retryAttempt       int
+
+	// commitAuthorName / commitAuthorEmail are set at runtime (not flags)
+	// from the fetched prompt's commit_author_name/commit_author_email
+	// (#722). When non-empty they override the gitops bot identity so
+	// App-backed commits attribute to the App's bot account; empty falls
+	// back to gitops.DefaultAuthorName/DefaultAuthorEmail.
+	commitAuthorName  string
+	commitAuthorEmail string
 }
 
 // parseFlags reads args and populates a config. Returns a usage

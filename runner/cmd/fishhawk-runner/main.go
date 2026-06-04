@@ -256,7 +256,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -274,6 +274,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.promptFile = path
 		cfg.decomposedFromRunID = decomposedFromRunID
 		cfg.scopeFiles = scopeFiles
+		cfg.commitAuthorName = commitAuthorName
+		cfg.commitAuthorEmail = commitAuthorEmail
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
@@ -885,17 +887,20 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // decomposed child. minRunnerVersion is non-empty when the backend
 // requires a minimum runner version; the caller checks it against
 // runnerVersion() before proceeding. agentSelfRetry, maxRetriesSnapshot,
-// and retryAttempt drive the ADR-023 self-retry loop.
+// and retryAttempt drive the ADR-023 self-retry loop. commitAuthorName and
+// commitAuthorEmail are the backend-resolved App bot commit identity (#722);
+// both empty when the backend couldn't resolve it and the caller keeps the
+// gitops default bot identity.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fetchErr
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -903,20 +908,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -1528,6 +1533,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		Branch:        branch,
 		CommitMessage: commitMessage,
 		RemoteURL:     fmt.Sprintf("https://github.com/%s/%s", owner, repoName),
+		// App bot commit identity (#722): the backend resolves the App's
+		// `<slug>[bot]` name + `<id>+<slug>[bot]@users.noreply.github.com`
+		// email and echoes them on the prompt response. Empty values flow
+		// through to the gitops orDefault fallback (DefaultAuthorName/Email)
+		// unchanged — e.g. local/dev runs with no resolvable App.
+		AuthorName:  cfg.commitAuthorName,
+		AuthorEmail: cfg.commitAuthorEmail,
 		// Refresh the local extraheader with the freshly-minted
 		// token before push. Handles the long-running-stage case
 		// where the auth pre-step's token (set by actions/checkout)

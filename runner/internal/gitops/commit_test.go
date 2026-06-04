@@ -78,6 +78,64 @@ func TestCommitAndPush_RealRepo_HappyPath(t *testing.T) {
 	}
 }
 
+// TestCommitAndPush_AppBotAuthorIdentity is the consumer→git boundary of
+// the #722 seam: when the backend-resolved App bot identity is threaded
+// through AuthorName/AuthorEmail, the produced commit must carry exactly
+// that author name and the `<id>+<slug>[bot]@users.noreply.github.com`
+// email, so App-backed commits attribute to the App's bot account.
+func TestCommitAndPush_AppBotAuthorIdentity(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		wantName  = "fishhawk[bot]"
+		wantEmail = "41898282+fishhawk[bot]@users.noreply.github.com"
+	)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/test/identity",
+		CommitMessage: "Identity commit",
+		RemoteURL:     bare,
+		AuthorName:    wantName,
+		AuthorEmail:   wantEmail,
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush: %v", err)
+	}
+
+	gotName := mustGitOut(t, repo, "log", "-1", "--format=%an")
+	gotEmail := mustGitOut(t, repo, "log", "-1", "--format=%ae")
+	if gotName != wantName {
+		t.Errorf("commit author name = %q, want %q", gotName, wantName)
+	}
+	if gotEmail != wantEmail {
+		t.Errorf("commit author email = %q, want %q", gotEmail, wantEmail)
+	}
+	_ = res
+}
+
 func TestCommitAndPush_NoChangesShortCircuits(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")

@@ -1600,6 +1600,22 @@ paths:
                           type: string
                           enum: [create, modify, delete]
                           description: Per-file intent from the standard_v1 plan scope.files entry.
+                  commit_author_name:
+                    type: string
+                    description: |
+                      The GitHub App bot account's git author name
+                      (`<app-slug>[bot]`), resolved backend-side from the App
+                      so App-backed commits attribute to the App's bot account
+                      (#722). Absent when the backend can't resolve it (no App
+                      JWT, dev/CLI) — the runner falls back to its default bot
+                      identity.
+                  commit_author_email:
+                    type: string
+                    description: |
+                      The GitHub App bot account's git author email
+                      (`<bot-user-id>+<app-slug>[bot]@users.noreply.github.com`),
+                      paired with `commit_author_name` (#722). Absent under the
+                      same conditions; the runner falls back to its default.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1689,6 +1705,12 @@ paths:
                           type: string
                           enum: [create, modify, delete]
                           description: Per-file intent from the standard_v1 plan scope.files entry.
+                  commit_author_name:
+                    type: string
+                    description: GitHub App bot account's git author name (`<app-slug>[bot]`), resolved backend-side (#722). Absent when unresolvable; the runner falls back to its default.
+                  commit_author_email:
+                    type: string
+                    description: GitHub App bot account's git author email (`<bot-user-id>+<app-slug>[bot]@users.noreply.github.com`), paired with commit_author_name (#722).
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
