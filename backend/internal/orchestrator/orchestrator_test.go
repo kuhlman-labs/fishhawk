@@ -202,6 +202,18 @@ func (s *stubRuns) CreateRun(context.Context, run.CreateRunParams) (*run.Run, er
 func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// State filter (ReconcileStuckRuns). Returns every matching run in
+	// one page; the seeded fixtures stay well under the sweep page size
+	// so the caller breaks after the first page (Offset never advances).
+	if f.State != "" {
+		var out []*run.Run
+		for _, r := range s.runs {
+			if string(r.State) == f.State {
+				out = append(out, r)
+			}
+		}
+		return out, nil
+	}
 	if f.DecomposedFrom == nil {
 		return nil, errors.New("not used")
 	}
@@ -1175,5 +1187,41 @@ func TestAdvance_DecomposedParent_NoGitHub_GracefulSkip(t *testing.T) {
 	}
 	if stages[1].State != run.StageStateAwaitingApproval {
 		t.Errorf("review stage = %q, want awaiting_approval", stages[1].State)
+	}
+}
+
+// TestReconcileStuckRuns_AdvancesAllTerminalRunOnly is the unit guard
+// for the startup recovery (#727): a run whose every stage is terminal
+// but is still {run running} gets completed, while a genuinely in-flight
+// run (a non-terminal stage) is left untouched.
+func TestReconcileStuckRuns_AdvancesAllTerminalRunOnly(t *testing.T) {
+	rr := newStubRuns()
+	o := &Orchestrator{Runs: rr}
+
+	// Stuck run: every stage terminal (succeeded), run still running.
+	stuck, _ := rr.seed(t, "owner/stuck", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateSucceeded},
+	})
+	// Control run: a non-terminal stage (awaiting_approval) → in-flight.
+	inflight, _ := rr.seed(t, "owner/inflight", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateAwaitingApproval},
+	})
+
+	n, err := o.ReconcileStuckRuns(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileStuckRuns: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("advanced = %d, want 1", n)
+	}
+	if got := rr.runs[stuck.ID].State; got != run.StateSucceeded {
+		t.Errorf("stuck run state = %q, want succeeded", got)
+	}
+	if got := rr.runs[inflight.ID].State; got != run.StateRunning {
+		t.Errorf("in-flight run state = %q, want running (untouched)", got)
 	}
 }

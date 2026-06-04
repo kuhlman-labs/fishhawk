@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -29,6 +30,7 @@ type prEventsRunRepo struct {
 	transitions []prEventsTransition
 	transErr    error
 	curState    map[uuid.UUID]run.StageState // models the same-state no-op
+	runStates   map[uuid.UUID]run.State      // terminal run state recorded by TransitionRun
 }
 
 type prEventsTransition struct {
@@ -58,8 +60,48 @@ func (r *prEventsRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, err
 	return nil, run.ErrNotFound
 }
 
+// ListStagesForRun overlays any state recorded by TransitionStage onto
+// the seeded stage fixtures so a caller reading stages AFTER a review
+// transition (the orchestrator's completeRun stage scan) observes the
+// resolved state — without this overlay the static slice would still
+// show the review stage as awaiting_approval and completeRun would
+// mis-compute the run's terminal state.
 func (r *prEventsRunRepo) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*run.Stage, error) {
-	return r.stages[id], r.stagesErr
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stagesErr != nil {
+		return nil, r.stagesErr
+	}
+	src := r.stages[id]
+	out := make([]*run.Stage, len(src))
+	for i, st := range src {
+		cp := *st
+		if cur, ok := r.curState[st.ID]; ok {
+			cp.State = cur
+		}
+		out[i] = &cp
+	}
+	return out, nil
+}
+
+// TransitionRun records the run's target State (and updates the seeded
+// run in place so a subsequent GetRun is consistent), modelling the
+// idempotent same-state allowance. Used by the orchestrator's
+// completeRun when the regression tests wire a real Orchestrator.
+func (r *prEventsRunRepo) TransitionRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.runStates == nil {
+		r.runStates = map[uuid.UUID]run.State{}
+	}
+	r.runStates[id] = to
+	for _, rn := range r.listResult {
+		if rn.ID == id {
+			rn.State = to
+			return rn, nil
+		}
+	}
+	return &run.Run{ID: id, State: to}, nil
 }
 
 // TransitionStage models the real repo's same-state allowance: a
@@ -628,6 +670,87 @@ func TestResolveReviewFromPollState_ClosedUnmerged_TransitionsCancelled(t *testi
 	}
 	if findCategory(ar.appended, CategoryPRClosedWithoutMerge) == nil {
 		t.Errorf("missing pr_closed_without_merge row; got %v", auditCategories(ar.appended))
+	}
+}
+
+// TestResolveReviewFromPollState_Merged_DrivesRunToSucceeded is the
+// seam regression for #727: resolveReviewStageOnMerge transitioned the
+// review stage but never completed the RUN, leaving it {review
+// succeeded, run running} forever. The guard wires ONE repo instance
+// into BOTH Config.RunRepo and the Orchestrator and asserts the RUN
+// reaches terminal succeeded — a per-layer unit on the stage transition
+// alone passes while the bug is live.
+func TestResolveReviewFromPollState_Merged_DrivesRunToSucceeded(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, State: run.StateRunning, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {
+				{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+				{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+				{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+			},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	// Same rr instance into both surfaces — the seam under test.
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    ar,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID, true, prURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	// Review stage transitioned to succeeded.
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions = %+v, want one to succeeded", rr.transitions)
+	}
+	// AND the RUN reached terminal succeeded (the bug: it stayed running).
+	if got := rr.runStates[runID]; got != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded (run must complete, not just the stage)", got)
+	}
+}
+
+// TestResolveReviewFromPollState_ClosedUnmerged_DrivesRunToCancelled is
+// the symmetric seam guard: a closed-unmerged PR cancels the review
+// stage AND must drive the run to terminal cancelled.
+func TestResolveReviewFromPollState_ClosedUnmerged_DrivesRunToCancelled(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, State: run.StateRunning, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {
+				{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+				{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+				{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+			},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    ar,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID, false, prURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateCancelled {
+		t.Fatalf("transitions = %+v, want one to cancelled", rr.transitions)
+	}
+	if got := rr.runStates[runID]; got != run.StateCancelled {
+		t.Errorf("run state = %q, want cancelled", got)
 	}
 }
 

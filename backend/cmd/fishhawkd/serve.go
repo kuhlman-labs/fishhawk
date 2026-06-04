@@ -646,6 +646,22 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 	}
 
+	// One-shot startup run-completion recovery (ADR-031 chain, #727).
+	// The merge-resolution path used to transition the review stage
+	// without completing the run, leaving runs stuck {all stages
+	// terminal, run non-terminal} forever. ReconcileStuckRuns advances
+	// only runs whose stages are already all-terminal, so it is a cheap
+	// idempotent self-heal on every boot. Run unconditionally (gated only
+	// on the wiring); best-effort — a recovery failure logs at warn and
+	// never blocks server start.
+	if cfg.Orchestrator != nil && cfg.RunRepo != nil {
+		if n, err := cfg.Orchestrator.ReconcileStuckRuns(ctx); err != nil {
+			logger.Warn("startup stuck-run reconciliation failed", slog.String("error", err.Error()))
+		} else if n > 0 {
+			logger.Info("startup stuck-run reconciliation completed", slog.Int("rescued", n))
+		}
+	}
+
 	// Child-completion sweeper (#455 / ADR-025 D4). Resolves parent
 	// stages parked in awaiting_children when every decomposed
 	// child run reaches a terminal state. Off by default for the
