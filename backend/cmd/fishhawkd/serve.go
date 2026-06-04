@@ -380,7 +380,7 @@ func runServe(args []string, logSink io.Writer) int {
 			return exitFailure
 		}
 		cfg.GitHubTokens = githubapp.NewCachedProvider(githubapp.NewClient(signer))
-		cfg.GitHub = githubclient.New(cfg.GitHubTokens)
+		cfg.GitHub = githubclient.NewWithSigner(cfg.GitHubTokens, signer)
 		logger.Info("github app + REST client configured",
 			slog.Int64("app_id", appID))
 	} else {

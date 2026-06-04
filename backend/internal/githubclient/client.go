@@ -106,11 +106,38 @@ type Client struct {
 
 // New returns a Client with sensible defaults. tokens is required;
 // without it every call returns an error before touching the wire.
+//
+// New leaves AppJWT nil, so App-level endpoints (GetRepoInstallation)
+// fail the nil guard in buildAppJWTRequest. Production must construct
+// via NewWithSigner so those endpoints authenticate; New is for
+// installation-only callers and tests that wire AppJWT by hand.
 func New(tokens githubapp.TokenProvider) *Client {
 	return &Client{
 		Tokens: tokens,
 		HTTP:   &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// AppJWTSigner mints an App-level JWT. Satisfied by *githubapp.Signer
+// (its Sign(ttl time.Duration) (string, error) method). Declared here
+// so NewWithSigner depends on the minting capability, not the concrete
+// signer type.
+type AppJWTSigner interface {
+	Sign(ttl time.Duration) (string, error)
+}
+
+// NewWithSigner is the production constructor: it builds a Client via
+// New(tokens) and wires AppJWT from the App signer, so App-level
+// endpoints (GetRepoInstallation) authenticate with a fresh App JWT
+// instead of hitting the nil guard. This is the single wiring path
+// production must use; serve.go constructs cfg.GitHub through it.
+//
+// signer.Sign(0) clamps to githubapp.DefaultJWTTTL (9m), safely under
+// GitHub's 10-minute App-JWT cap.
+func NewWithSigner(tokens githubapp.TokenProvider, signer AppJWTSigner) *Client {
+	c := New(tokens)
+	c.AppJWT = func() (string, error) { return signer.Sign(0) }
+	return c
 }
 
 // GetFile fetches a single file from a repo at the given ref.
