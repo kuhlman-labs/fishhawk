@@ -225,6 +225,12 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			slog.String("stage_id", reviewStage.ID.String()),
 			slog.String("merger", meta.actorLogin),
 		)
+		// The review stage is now terminal but the RUN is still
+		// running — Advance walks the now-all-terminal stages to
+		// completeRun, which yields succeeded on merge. Mirror the
+		// approval handler (approvals.go): best-effort, log an Advance
+		// error but never roll back the stage transition or audit row.
+		s.advanceRunAfterReviewResolve(ctx, target.ID)
 		// Sticky status comment (E20.4 / #330). The PR merging is the
 		// terminal state for review-gated workflows; this is one of the
 		// most operator-visible moments of the run lifecycle.
@@ -262,10 +268,36 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		slog.String("stage_id", reviewStage.ID.String()),
 		slog.String("closer", meta.actorLogin),
 	)
+	// The review stage is terminal (cancelled) but the RUN is still
+	// running — Advance walks the now-all-terminal stages to
+	// completeRun, which yields cancelled on a closed-unmerged PR.
+	s.advanceRunAfterReviewResolve(ctx, target.ID)
 	// Sticky status comment (E20.4 / #330). Review stage cancelled
 	// is a terminal-ish surface state — the user should see the
 	// run's review row flip to cancelled in the comment.
 	s.notifyStatusUpdate(ctx, target.ID, "pr_closed_without_merge")
+}
+
+// advanceRunAfterReviewResolve drives the run to its terminal state
+// after resolveReviewStageOnMerge transitions the review stage to a
+// terminal state. Without this the run is left {review terminal, run
+// running} forever (#727) — the stage transition alone never completes
+// the run; the orchestrator's Advance does (it routes the now-all-
+// terminal stages through completeRun → succeeded/cancelled). Mirrors
+// the approval handler (approvals.go): best-effort, nil-guarded, logs an
+// Advance error at error level but never rolls back the stage transition
+// or audit row (the gate has already resolved).
+func (s *Server) advanceRunAfterReviewResolve(ctx context.Context, runID uuid.UUID) {
+	if s.cfg.Orchestrator == nil {
+		return
+	}
+	if _, err := s.cfg.Orchestrator.Advance(ctx, runID); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+			"resolve review on merge: orchestrator advance failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // ResolveReviewFromPollState resolves a run's review stage from the

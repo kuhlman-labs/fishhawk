@@ -209,6 +209,115 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	return o.dispatchStage(ctx, r, next)
 }
 
+// reconcileStuckRunsPageSize bounds each ListRuns page the startup
+// recovery sweep walks. Small constant — at v0 scale the running-run
+// count is tiny; this only bounds memory if it ever grows.
+const reconcileStuckRunsPageSize = 100
+
+// ReconcileStuckRuns is the one-time startup recovery for runs stuck in
+// the {all stages terminal, run non-terminal} class (#727): the
+// merge-resolution path used to transition the review stage without
+// completing the run, leaving runs like 0c50834a / e3316c14 in
+// {review succeeded, run running} forever. It pages every running run,
+// and for any whose stages are ALL terminal calls Advance — which routes
+// through completeRun and resolves the run to succeeded/failed/cancelled
+// per the existing stage scan.
+//
+// Skips any run with a non-terminal stage so a genuinely in-flight run is
+// never force-completed. Idempotent: an already-terminal run is a
+// completeRun no-op, and a second pass finds nothing to advance. Returns
+// the count advanced. Reuses existing repo methods only (no new query).
+//
+// Best-effort PER RUN: a failure on one run (stage-scan or Advance error)
+// is logged and skipped so it cannot block recovery of the others — a
+// single unresolvable run never wedges the whole boot sweep. Only a
+// systemic ListRuns paging failure aborts (and is returned).
+func (o *Orchestrator) ReconcileStuckRuns(ctx context.Context) (int, error) {
+	if o.Runs == nil {
+		return 0, errors.New("orchestrator: Runs is nil")
+	}
+
+	advanced := 0
+	failed := 0
+	offset := 0
+	for {
+		runs, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
+			State:  string(run.StateRunning),
+			Limit:  reconcileStuckRunsPageSize,
+			Offset: offset,
+		})
+		if err != nil {
+			// A paging failure is systemic (not specific to one run), so
+			// abort the sweep — best-effort applies per-run, not to the
+			// listing itself.
+			return advanced, fmt.Errorf("orchestrator: reconcile list runs: %w", err)
+		}
+		if len(runs) == 0 {
+			break
+		}
+		for _, r := range runs {
+			// Best-effort PER RUN: a failure on one run (e.g. its record
+			// was partially cleaned up and Advance hits ErrNotFound) must
+			// not block recovery of the others. Log and continue rather
+			// than aborting the whole boot sweep (#727).
+			stuck, err := o.runStagesAllTerminal(ctx, r.ID)
+			if err != nil {
+				failed++
+				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator reconcile: skipped run on stage-scan error",
+					slog.String("run_id", r.ID.String()),
+					slog.String("error", err.Error()),
+				)
+				continue
+			}
+			if !stuck {
+				continue
+			}
+			if _, err := o.Advance(ctx, r.ID); err != nil {
+				failed++
+				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator reconcile: skipped run on advance error",
+					slog.String("run_id", r.ID.String()),
+					slog.String("error", err.Error()),
+				)
+				continue
+			}
+			advanced++
+			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator reconciled stuck run",
+				slog.String("run_id", r.ID.String()),
+			)
+		}
+		if len(runs) < reconcileStuckRunsPageSize {
+			break
+		}
+		offset += len(runs)
+	}
+
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator stuck-run reconciliation complete",
+		slog.Int("advanced", advanced),
+		slog.Int("failed", failed),
+	)
+	return advanced, nil
+}
+
+// runStagesAllTerminal reports whether a run has at least one stage and
+// EVERY stage is terminal. A run with no stages, or any non-terminal
+// stage, returns false — the gate ReconcileStuckRuns uses to avoid
+// force-completing a genuinely in-flight run.
+func (o *Orchestrator) runStagesAllTerminal(ctx context.Context, runID uuid.UUID) (bool, error) {
+	stages, err := o.Runs.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("orchestrator: reconcile list stages for run %s: %w", runID, err)
+	}
+	if len(stages) == 0 {
+		return false, nil
+	}
+	for _, s := range stages {
+		if !s.State.IsTerminal() {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // maybeOpenConsolidatedPR opens the single consolidated PR for a
 // decomposed parent run reaching its review gate (#714 / ADR-032) and
 // stamps pull_request_url on the run, returning the (reloaded) run so
