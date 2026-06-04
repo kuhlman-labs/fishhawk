@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -105,6 +106,93 @@ func scopeFilesFromScope(sc *plan.Scope) []scopeFile {
 		out = append(out, scopeFile{Path: f.Path, Operation: string(f.Operation)})
 	}
 	return out
+}
+
+// conditionPathPattern matches repo-relative path-like tokens in free-text
+// approval conditions: a run of path characters that contains at least one
+// '/' and ends in a '.<ext>' suffix. Requiring BOTH a slash and an extension
+// keeps prose tokens like "and/or" (no extension) and bare words like
+// "README" (no slash) out of the extraction.
+var conditionPathPattern = regexp.MustCompile(`[A-Za-z0-9_./-]+\.[A-Za-z0-9]+`)
+
+// extractScopePathsFromConditions pulls repo-relative path tokens out of the
+// free-text approve-with-conditions comment. Surrounding backticks, quotes,
+// parentheses, and trailing punctuation are trimmed off each match. Returns
+// de-duplicated paths in first-seen order; nil for empty input.
+func extractScopePathsFromConditions(text string) []string {
+	if text == "" {
+		return nil
+	}
+	matches := conditionPathPattern.FindAllString(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(matches))
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		p := strings.Trim(m, "`'\"()[]{}<>,.;:!?")
+		if p == "" {
+			continue
+		}
+		// A token must still contain a slash and an extension after trimming
+		// (trailing-dot stripping can erase the extension, e.g. "foo.").
+		if !strings.Contains(p, "/") || !strings.Contains(p, ".") {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// mergeConditionScopeFiles folds files named by an approval condition into the
+// implement stage's effective scope set, so a condition-authorized edit ships
+// as a declared path rather than surfacing as benign undeclared scope_drift
+// (#730).
+//
+// It augments ONLY when a scope.files contract already exists (scopeFiles
+// non-empty) AND conditions is non-nil. An empty scope must stay empty: the
+// runner falls back to `git add -A` when no scope is declared, and folding
+// condition files into an otherwise-empty set would silently narrow the run to
+// just those files, dropping every other legitimately-changed file as drift.
+//
+// Paths already present (compared by .Path) are not duplicated. Operation is
+// cosmetic for drift purposes — StageScoped keys off path only.
+func (s *Server) mergeConditionScopeFiles(ctx context.Context, scopeFiles []scopeFile, conditions *string) []scopeFile {
+	if len(scopeFiles) == 0 || conditions == nil {
+		return scopeFiles
+	}
+	paths := extractScopePathsFromConditions(*conditions)
+	if len(paths) == 0 {
+		return scopeFiles
+	}
+	existing := make(map[string]struct{}, len(scopeFiles))
+	for _, f := range scopeFiles {
+		existing[f.Path] = struct{}{}
+	}
+	added := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, ok := existing[p]; ok {
+			continue
+		}
+		existing[p] = struct{}{}
+		scopeFiles = append(scopeFiles, scopeFile{Path: p, Operation: "modify"})
+		added = append(added, p)
+	}
+	if len(added) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: folded approval-condition files into implement scope",
+			slog.Int("count", len(added)),
+			slog.String("paths", strings.Join(added, ",")),
+		)
+	}
+	return scopeFiles
 }
 
 // issueGetter is the slice of githubclient.Client the prompt
@@ -232,6 +320,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		// Fold files named by the approval conditions into the effective
+		// scope set so a condition-authorized edit ships as a declared
+		// path rather than benign scope_drift (#730). No-op when scope is
+		// empty (keeps the runner's git add -A fallback).
+		scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, trigger.ApprovalConditions)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -395,6 +488,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		// Fold files named by the approval conditions into the effective
+		// scope set so a condition-authorized edit ships as a declared
+		// path rather than benign scope_drift (#730). No-op when scope is
+		// empty (keeps the runner's git add -A fallback).
+		scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, trigger.ApprovalConditions)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
