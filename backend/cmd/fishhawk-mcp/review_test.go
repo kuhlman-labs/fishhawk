@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -416,8 +417,8 @@ func TestAwaitReview_PollsThenResolves(t *testing.T) {
 }
 
 func TestAwaitReview_PendingOnTimeout(t *testing.T) {
-	// Review stays pending forever; a sub-millisecond timeout must return
-	// 'pending' with the actionable message rather than hanging.
+	// Review stays pending forever; the await loop must return 'pending'
+	// with the actionable message rather than hanging.
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "gating")
@@ -425,12 +426,29 @@ func TestAwaitReview_PendingOnTimeout(t *testing.T) {
 	r := newResolver(srv, nil)
 	r.reviewPollInterval = 100 * time.Microsecond
 
-	// timeout_seconds is whole seconds (min 1 after clamp), too coarse for a
-	// sleep-free test. Drive the deadline via a short parent context
-	// instead: pollCtx inherits the parent's cancellation, so the loop's
-	// timeout branch fires within microseconds and returns 'pending'.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	// Drive the deadline deterministically instead of racing a tiny
+	// wall-clock parent deadline (#729). A 5ms context.WithTimeout could
+	// elapse before the handler's goroutine was scheduled under CI -race, so
+	// the fast-path reviewStatusFor (review.go:355) returned context.Canceled
+	// and the loop was never entered. Use a cancellable context and cancel it
+	// from the audit hook only AFTER the fast path has resolved to 'pending'
+	// and the poll loop has begun. reviewStatusFor queries the started
+	// category exactly once per pass, as its final lookup (review.go:248): the
+	// fast path is pass #1 (count == 1), the first poll iteration is pass #2
+	// (count == 2). Cancelling on the 2nd started query guarantees the fast
+	// path completes (returns 'pending', review.go:359-361) and the loop is
+	// entered (review.go:373) before the cancellation is observed — the next
+	// reviewStatusFor(pollCtx) / pollCtx.Done() then yields the pending-timeout
+	// output deterministically.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == "plan_review_started" && startedQueries.Add(1) == 2 {
+			cancel()
+		}
+	}
 
 	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
 		RunID:          runID.String(),
@@ -453,18 +471,31 @@ func TestAwaitReview_PendingOnTimeout(t *testing.T) {
 
 func TestAwaitReview_BoundedPolls_DoesNotHammerBackend(t *testing.T) {
 	// A bounded poll loop must terminate within a small number of audit
-	// requests, not spin unbounded. Drive a short context deadline and
-	// assert the per-run audit endpoint was called a bounded number of
-	// times.
+	// requests, not spin unbounded. Drive a deterministic number of poll
+	// iterations via the started-query counter rather than a wall-clock
+	// context window that races the fast path (#729), then assert the
+	// per-run audit endpoint was polled a bounded, small number of times.
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "gating")
 
 	r := newResolver(srv, nil)
-	r.reviewPollInterval = 2 * time.Millisecond
+	r.reviewPollInterval = 100 * time.Microsecond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Millisecond)
+	// Started-category queries count reviewStatusFor passes: pass #1 is the
+	// fast path, each subsequent pass is one poll iteration (review.go:248).
+	// Cancel after a small number so the loop exits promptly with 'pending'.
+	const cancelAfterStartedQueries = 3
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == "plan_review_started" && startedQueries.Add(1) == cancelAfterStartedQueries {
+			cancel()
+		}
+	}
+
 	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
 		RunID:          runID.String(),
 		Stage:          "plan",
@@ -476,13 +507,16 @@ func TestAwaitReview_BoundedPolls_DoesNotHammerBackend(t *testing.T) {
 	if out.Status != "pending" {
 		t.Errorf("Status = %q, want pending", out.Status)
 	}
-	// With a ~12ms window and a 2ms interval the loop should poll on the
-	// order of single digits, never hundreds.
-	fb.mu.Lock()
-	q := fb.perRunAuditLastQueryByID[runID]
-	fb.mu.Unlock()
-	if q == "" {
-		t.Error("expected at least one per-run audit poll")
+	// reviewStatusFor issues exactly one started-category query per pass,
+	// and the loop must exit on the first pass that observes cancellation —
+	// so the observed count equals the cancel threshold EXACTLY. This pins a
+	// real property of the loop (one query per poll iteration, prompt exit
+	// on cancel); a regression that issued multiple queries per iteration,
+	// or kept polling after cancellation, would push the count past the
+	// threshold (or hang) and fail here — unlike a `got < N` upper bound,
+	// which the deterministic cancel makes vacuously true by construction.
+	if got := startedQueries.Load(); got != cancelAfterStartedQueries {
+		t.Errorf("started-category audit queries = %d, want exactly %d (one query per pass, prompt exit on cancel)", got, cancelAfterStartedQueries)
 	}
 }
 
