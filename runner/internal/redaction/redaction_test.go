@@ -70,6 +70,7 @@ func TestDefaultPatterns_NegativeCases(t *testing.T) {
 		"github_pat_" + strings.Repeat("a", 80), // fine-grained PAT requires 82, not 80
 		"akia0123456789abcdef",                  // lowercase doesn't match aws-access-key-id
 		"npm_short",                             // too few trailing chars for npm-publish-token
+		"ghs_short",                             // fewer than 36 trailing chars: below github-app-token floor
 	}
 	for _, sample := range cases {
 		t.Run(sample[:min(30, len(sample))], func(t *testing.T) {
@@ -81,6 +82,48 @@ func TestDefaultPatterns_NegativeCases(t *testing.T) {
 				t.Errorf("expected output unchanged on %q; got %s", sample, out)
 			}
 		})
+	}
+}
+
+// newFormatAppToken builds a synthetic GitHub App installation token in
+// the new `ghs_<APPID>_<JWT>` format (~520 chars): a base64url JWT body
+// with `.` separators, exercising the `_`, `.`, and `-` characters the
+// expanded charset must cover. The bytes are not a real token.
+func newFormatAppToken() string {
+	header := strings.Repeat("A", 36)
+	payload := strings.Repeat("b", 420) + "-_" // base64url alphabet incl. - and _
+	sig := strings.Repeat("c", 43)
+	return "ghs_123456_" + header + "." + payload + "." + sig
+}
+
+// TestDefaultPatterns_GitHubAppTokenNewFormat covers the migration to the
+// variable-length `ghs_<APPID>_<JWT>` installation-token format (#737).
+// The old fixed 40-char form is exercised at the line-33 positive case.
+func TestDefaultPatterns_GitHubAppTokenNewFormat(t *testing.T) {
+	token := newFormatAppToken()
+
+	// (a) New-format token redacted standalone.
+	out, hits := redaction.RedactDefault([]byte(token))
+	if findHit(hits, "github-app-token") != 1 {
+		t.Fatalf("expected github-app-token to fire on new-format token; hits = %+v", hits)
+	}
+	if bytes.Contains(out, []byte(token)) {
+		t.Errorf("new-format token leaked through: %s", out)
+	}
+
+	// (b) Token embedded in a git remote push URL — the actual leak
+	// vector. The token must be gone, and the `@github.com/...` tail
+	// must survive (boundary stop on `@`, no over-consumption).
+	url := "https://x-access-token:" + token + "@github.com/owner/repo.git"
+	out, hits = redaction.RedactDefault([]byte(url))
+	if findHit(hits, "github-app-token") != 1 {
+		t.Fatalf("expected github-app-token to fire in git URL; hits = %+v", hits)
+	}
+	if bytes.Contains(out, []byte(token)) {
+		t.Errorf("token leaked from git URL: %s", out)
+	}
+	if !bytes.Contains(out, []byte("@github.com/owner/repo.git")) {
+		t.Errorf("URL tail after @ was over-consumed: %s", out)
 	}
 }
 

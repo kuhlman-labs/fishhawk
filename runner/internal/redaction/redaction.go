@@ -63,8 +63,22 @@ var DefaultPatterns = []Pattern{
 		Regex: regexp.MustCompile(`github_pat_[A-Za-z0-9_]{82}`),
 	},
 	{
-		Name:  "github-app-token",
-		Regex: regexp.MustCompile(`ghs_[A-Za-z0-9]{36}`),
+		Name: "github-app-token",
+		// GitHub App installation tokens are migrating from the fixed
+		// 40-char `ghs_<36 chars>` form to a variable-length
+		// `ghs_<APPID>_<JWT>` form (~520 chars, base64url JWT body with
+		// `.` separators, plus `_`/`-`). Staged rollout Apr–late-June
+		// 2026; see
+		// https://github.blog/changelog/2026-04-24-notice-about-upcoming-new-format-for-github-app-installation-tokens/
+		// The expanded charset (`_`, `.`, `-`) covers the new body and
+		// the APPID separator; `{36,}` is length-agnostic per GitHub's
+		// "treat tokens as opaque" guidance while keeping a floor to
+		// avoid short false positives. The class deliberately excludes
+		// `@`, `"`, and whitespace so the match stops at credential
+		// boundaries (git remote URL `@`, JSON quote, whitespace)
+		// without over-consuming. Do NOT tidy this back to a fixed
+		// `{36}` length — that re-opens the new-format leak.
+		Regex: regexp.MustCompile(`ghs_[A-Za-z0-9_.\-]{36,}`),
 	},
 	{
 		Name:  "openai-api-key",
