@@ -284,6 +284,44 @@ func TestRenderStatusBody_ApprovalDecisionVerb(t *testing.T) {
 	}
 }
 
+// TestRenderStatusBody_ApproverMention_PrefersGithubLogin guards #755: the
+// "Latest activity" approval row must @-mention the resolved GitHub login
+// (#751, approver_github_login) — and must NEVER @-mention the raw MCP token
+// subject (brett@local-mcp), which would ping an unrelated real user.
+func TestRenderStatusBody_ApproverMention_PrefersGithubLogin(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+
+	t.Run("resolved github login preferred over token subject", func(t *testing.T) {
+		entries := []*audit.Entry{
+			auditEntry(runID, 1, "approval_submitted", "brett@local-mcp", now.Add(-1*time.Minute),
+				map[string]any{"decision": "approve", "approver_github_login": "kuhlman-labs"}),
+		}
+		body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+		if !strings.Contains(body, "@kuhlman-labs approved the plan") {
+			t.Errorf("expected @kuhlman-labs mention\n---\n%s", body)
+		}
+		if strings.Contains(body, "brett@local-mcp") {
+			t.Errorf("must NOT render the raw token subject (#755)\n---\n%s", body)
+		}
+	})
+
+	t.Run("non-login subject with no resolved login falls back to an approver", func(t *testing.T) {
+		entries := []*audit.Entry{
+			auditEntry(runID, 1, "approval_submitted", "brett@local-mcp", now.Add(-1*time.Minute),
+				map[string]any{"decision": "approve"}),
+		}
+		body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+		if !strings.Contains(body, "an approver approved the plan") {
+			t.Errorf("expected \"an approver\" fallback\n---\n%s", body)
+		}
+		if strings.Contains(body, "@brett") {
+			t.Errorf("must NOT @-mention a non-login subject (#755)\n---\n%s", body)
+		}
+	})
+}
+
 func TestRenderStatusBody_CIRetryAttemptSuffix(t *testing.T) {
 	// ci_failure_retry_dispatched payload carries retry_attempt +
 	// max_retries; the rendered line includes "(attempt N/M)".
