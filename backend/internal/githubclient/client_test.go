@@ -2049,12 +2049,16 @@ func TestGetUser_HappyPath(t *testing.T) {
 		t.Errorf("login = %q", user.Login)
 	}
 	if stub.installationCalled != 0 {
-		t.Errorf("Token() called with installationID %d; App-JWT path must not use installation tokens",
+		t.Errorf("Token() called with installationID %d; public-user lookup must not use installation tokens",
 			stub.installationCalled)
 	}
-	// Pins the auth shape: GET /users/{login} carries the App JWT as Bearer.
-	if fg.gotAuth != "Bearer ghs_app_jwt" {
-		t.Errorf("Authorization = %q, want App JWT", fg.gotAuth)
+	// Pins the auth shape (regression for #750): GET /users/{login} is a
+	// public endpoint and MUST carry no Authorization header. The App JWT
+	// is only valid for /app* endpoints; routing this call through it 401'd
+	// in production while the in-process server stub never exercised the
+	// wire, so #722 passed but the real fetch failed.
+	if fg.gotAuth != "" {
+		t.Errorf("Authorization = %q, want no auth header on public /users lookup", fg.gotAuth)
 	}
 	if fg.gotPath != "/users/fishhawk[bot]" {
 		t.Errorf("path = %q, want /users/fishhawk[bot]", fg.gotPath)
@@ -2071,14 +2075,23 @@ func TestGetUser_NoLogin(t *testing.T) {
 	}
 }
 
-func TestGetUser_NoAppJWT(t *testing.T) {
-	_, srv := newFakeGitHub(t)
+// TestGetUser_NoAppJWT_StillResolves proves GetUser is independent of the
+// App JWT (#750): with AppJWT nil it must still SUCCEED, because the public
+// /users/{login} lookup sends no Authorization header at all.
+func TestGetUser_NoAppJWT_StillResolves(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 	c.AppJWT = nil
 
-	_, err := c.GetUser(context.Background(), "fishhawk[bot]")
-	if err == nil || !strings.Contains(err.Error(), "AppJWT") {
-		t.Errorf("err = %v, want AppJWT-not-configured error", err)
+	user, err := c.GetUser(context.Background(), "fishhawk[bot]")
+	if err != nil {
+		t.Fatalf("GetUser with nil AppJWT: %v", err)
+	}
+	if user.ID != 41898282 || user.Login != "fishhawk[bot]" {
+		t.Errorf("decoded user = %+v, want id=41898282 login=fishhawk[bot]", user)
+	}
+	if fg.gotAuth != "" {
+		t.Errorf("Authorization = %q, want no auth header on public /users lookup", fg.gotAuth)
 	}
 }
 
