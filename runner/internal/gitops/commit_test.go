@@ -113,15 +113,14 @@ func TestCommitAndPush_AppBotAuthorIdentity(t *testing.T) {
 		wantEmail = "41898282+fishhawk[bot]@users.noreply.github.com"
 	)
 	p := &Pusher{}
-	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+	if _, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
 		RepoDir:       repo,
 		Branch:        "fishhawk/test/identity",
 		CommitMessage: "Identity commit",
 		RemoteURL:     bare,
 		AuthorName:    wantName,
 		AuthorEmail:   wantEmail,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("CommitAndPush: %v", err)
 	}
 
@@ -133,7 +132,6 @@ func TestCommitAndPush_AppBotAuthorIdentity(t *testing.T) {
 	if gotEmail != wantEmail {
 		t.Errorf("commit author email = %q, want %q", gotEmail, wantEmail)
 	}
-	_ = res
 }
 
 func TestCommitAndPush_NoChangesShortCircuits(t *testing.T) {
