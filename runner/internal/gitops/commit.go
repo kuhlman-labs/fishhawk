@@ -34,10 +34,14 @@ import (
 // "origin" in the GitHub Actions checkout shape.
 const DefaultRemote = "origin"
 
-// DefaultAuthorName + DefaultAuthorEmail are the bot identity used
-// when the caller doesn't override. Matches the pattern Actions uses
-// for github-actions[bot] but with a Fishhawk slug so audit consumers
-// can distinguish.
+// DefaultAuthorName + DefaultAuthorEmail are the dev/CLI fallback bot
+// identity used ONLY when the caller doesn't override — i.e. runs with no
+// resolvable GitHub App (local-runner, CLI, dev). For App-backed runs the
+// backend now resolves the App's own bot identity dynamically (App slug +
+// bot user-id) and threads it through CommitAndPushArgs.AuthorName/Email,
+// so attributed commits show `<slug>[bot]` rather than this constant (#722).
+// Matches the pattern Actions uses for github-actions[bot] but with a
+// Fishhawk slug so audit consumers can distinguish.
 const (
 	DefaultAuthorName  = "fishhawk-runner[bot]"
 	DefaultAuthorEmail = "fishhawk-runner@users.noreply.github.com"

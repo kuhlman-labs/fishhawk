@@ -60,6 +60,14 @@ type promptResponse struct {
 	// when no approved plan is available (plan_missing_for_implement) —
 	// the runner falls back to staging every change.
 	ScopeFiles []scopeFile `json:"scope_files,omitempty"`
+	// CommitAuthorName / CommitAuthorEmail are the GitHub App bot account's
+	// git commit identity, resolved from the App (slug + bot user-id) and
+	// echoed so the runner attributes App-backed commits to the App's bot
+	// account instead of its hardcoded fallback (#722). Empty/omitted when
+	// the identity can't be resolved (no App JWT, dev/CLI) — the runner then
+	// keeps gitops.DefaultAuthorName/DefaultAuthorEmail.
+	CommitAuthorName  string `json:"commit_author_name,omitempty"`
+	CommitAuthorEmail string `json:"commit_author_email,omitempty"`
 }
 
 // scopeFile is one entry in promptResponse.ScopeFiles: the path the
@@ -262,6 +270,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 
 	hash := signing.ComputeMessage([]byte(text))
 	verifyCmd, verifyTimeoutSecs := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
+	commitAuthorName, commitAuthorEmail := s.resolveAppBotIdentity(r.Context())
 	resp := promptResponse{
 		StageID:              stageID.String(),
 		StageType:            string(stage.Type),
@@ -275,6 +284,8 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
 		ScopeFiles:           scopeFiles,
+		CommitAuthorName:     commitAuthorName,
+		CommitAuthorEmail:    commitAuthorEmail,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -422,6 +433,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 
 	hash := signing.ComputeMessage([]byte(text))
 	verifyCmd, verifyTimeoutSecs := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
+	commitAuthorName, commitAuthorEmail := s.resolveAppBotIdentity(r.Context())
 	resp := promptResponse{
 		StageID:              stageID.String(),
 		StageType:            string(stage.Type),
@@ -435,6 +447,8 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
 		ScopeFiles:           scopeFiles,
+		CommitAuthorName:     commitAuthorName,
+		CommitAuthorEmail:    commitAuthorEmail,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -793,6 +807,104 @@ func (s *Server) issueGetter() issueGetter {
 		return nil
 	}
 	return s.cfg.GitHub
+}
+
+// appIdentityGetter is the slice of githubclient.Client that
+// resolveAppBotIdentity consumes. Defining the interface in the server
+// package lets tests substitute a stub without an httptest fake of
+// api.github.com — *githubclient.Client satisfies it in production.
+type appIdentityGetter interface {
+	GetApp(ctx context.Context) (*githubclient.App, error)
+	GetUser(ctx context.Context, login string) (*githubclient.User, error)
+}
+
+// appIdentityResolver returns the configured client cast to the small
+// interface resolveAppBotIdentity needs, or nil when GitHub is unset.
+// The appIdentityGetterOverride test seam takes precedence.
+func (s *Server) appIdentityResolver() appIdentityGetter {
+	if s.appIdentityGetterOverride != nil {
+		return s.appIdentityGetterOverride
+	}
+	if s.cfg.GitHub == nil {
+		return nil
+	}
+	return s.cfg.GitHub
+}
+
+// resolveAppBotIdentity returns the GitHub App bot account's git commit
+// identity (name, email) for echoing on the prompt response so App-backed
+// commits attribute to the App's bot account rather than the runner's
+// hardcoded fallback (#722). A SUCCESSFUL result is memoized for the
+// process lifetime (the App slug and bot user-id are App-global and
+// immutable), so GetApp + GetUser run at most once regardless of how many
+// stages dispatch.
+//
+// Returns ("", "") when GitHub is unconfigured, the App JWT isn't wired
+// (dev / CLI client built via New), or any API call fails — and a
+// failed/empty resolution is NOT cached, so a transient first-call error
+// can't permanently disable dynamic attribution; it is retried on the next
+// fetch (the runner falls back to gitops.DefaultAuthorName/Email meanwhile).
+// Failures log at WARN — never block the prompt response.
+func (s *Server) resolveAppBotIdentity(ctx context.Context) (name, email string) {
+	s.appBotIdentityMu.Lock()
+	if s.appBotIdentityResolved {
+		name, email = s.appBotIdentityName, s.appBotIdentityEmail
+		s.appBotIdentityMu.Unlock()
+		return name, email
+	}
+	s.appBotIdentityMu.Unlock()
+
+	// Not yet resolved. Compute outside the lock so concurrent prompt fetches
+	// don't serialize on the GetApp/GetUser round-trips; a rare double-compute
+	// is harmless (slug/bot-id are stable, so it yields the same result).
+	name, email = s.computeAppBotIdentity(ctx)
+	if name == "" {
+		// Transient/empty resolution is NOT cached — retry on the next fetch
+		// so a first-call hiccup can't permanently disable dynamic attribution.
+		return "", ""
+	}
+	s.appBotIdentityMu.Lock()
+	s.appBotIdentityName, s.appBotIdentityEmail = name, email
+	s.appBotIdentityResolved = true
+	s.appBotIdentityMu.Unlock()
+	return name, email
+}
+
+// computeAppBotIdentity performs the actual GetApp + GetUser resolution.
+// Split out from resolveAppBotIdentity so the sync.Once wrapper stays
+// trivial. Returns empty strings on any failure (logged at WARN).
+func (s *Server) computeAppBotIdentity(ctx context.Context) (name, email string) {
+	gh := s.appIdentityResolver()
+	if gh == nil {
+		return "", ""
+	}
+	app, err := gh.GetApp(ctx)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: resolve app bot identity: get app failed",
+			slog.String("error", err.Error()))
+		return "", ""
+	}
+	if app.Slug == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: resolve app bot identity: app slug empty")
+		return "", ""
+	}
+	login := app.Slug + "[bot]"
+	user, err := gh.GetUser(ctx, login)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: resolve app bot identity: get user failed",
+			slog.String("login", login), slog.String("error", err.Error()))
+		return "", ""
+	}
+	if user.ID == 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: resolve app bot identity: user id zero",
+			slog.String("login", login))
+		return "", ""
+	}
+	name = login
+	email = fmt.Sprintf("%d+%s@users.noreply.github.com", user.ID, login)
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: resolved app bot commit identity",
+		slog.String("name", name), slog.String("email", email))
+	return name, email
 }
 
 // resolveAgentTimeout returns the spec-governed timeout in seconds for the

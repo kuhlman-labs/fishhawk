@@ -292,6 +292,25 @@ type Server struct {
 	// implementP95CacheTTL. Defaults to time.Now; tests inject a fake to
 	// drive TTL expiry without sleeping.
 	nowFunc func() time.Time
+
+	// appBotIdentity{Mu,Resolved,Name,Email} memoize the GitHub App bot
+	// account's git commit identity (#722). The App slug and bot user-id are
+	// App-global and immutable for the process, so resolveAppBotIdentity runs
+	// GetApp + GetUser at most once on SUCCESS and caches the result. A
+	// failed/empty resolution is NOT cached — a transient error on the first
+	// prompt fetch (e.g. that caller's context cancelled) must not permanently
+	// disable dynamic attribution; it is retried on the next fetch, with the
+	// runner using its hardcoded fallback meanwhile.
+	appBotIdentityMu       sync.Mutex
+	appBotIdentityResolved bool
+	appBotIdentityName     string
+	appBotIdentityEmail    string
+
+	// appIdentityGetterOverride lets tests substitute a stub for the
+	// App-identity lookups resolveAppBotIdentity depends on without an
+	// httptest fake of api.github.com. nil in production; the resolver
+	// then falls through to cfg.GitHub.
+	appIdentityGetterOverride appIdentityGetter
 }
 
 // New builds a Server. It does not start listening; call Start.

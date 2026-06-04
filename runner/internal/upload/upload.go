@@ -351,6 +351,14 @@ type FetchedPrompt struct {
 	// Empty when no approved plan was available — the runner falls
 	// back to staging every change.
 	ScopeFiles []ScopeFile `json:"scope_files,omitempty"`
+	// CommitAuthorName / CommitAuthorEmail are the GitHub App bot
+	// account's git commit identity, resolved backend-side from the App
+	// (slug + bot user-id) so App-backed commits attribute to the App's
+	// bot account (#722). Empty when the backend couldn't resolve it (no
+	// App JWT, dev/CLI) — the runner falls back to
+	// gitops.DefaultAuthorName/DefaultAuthorEmail.
+	CommitAuthorName  string `json:"commit_author_name,omitempty"`
+	CommitAuthorEmail string `json:"commit_author_email,omitempty"`
 }
 
 // ScopeFile is one entry in FetchedPrompt.ScopeFiles: a declared path

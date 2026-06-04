@@ -447,6 +447,132 @@ func TestE2E_LocalRunner_ImplementTimeout_WidenedByPlan(t *testing.T) {
 	}
 }
 
+// TestE2E_LocalRunner_AppBotIdentity_ResolvedAndCarriedOnPrompt is the
+// backend half of the #722 cross-boundary seam: a stubbed GitHub App slug
+// (GET /app) + bot user-id (GET /users/<slug>[bot]) resolves on the backend
+// through the REAL githubclient (App-JWT auth against a fake GitHub), is
+// composed into the bot commit identity, and is carried on the implement
+// prompt-fetch response. The runner-consumer→git-author half of the seam is
+// covered in the runner module (gitops.TestCommitAndPush_AppBotAuthorIdentity
+// + the runner's CommitAndPush threading test) — the backend module must not
+// depend on the runner.
+//
+// The email format assertion pins the exact GitHub convention
+// `<bot-user-id>+<slug>[bot]@users.noreply.github.com`, the contract that
+// makes GitHub attribute the commit to the App's bot account.
+func TestE2E_LocalRunner_AppBotIdentity_ResolvedAndCarriedOnPrompt(t *testing.T) {
+	fx := newLocalRunnerFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const (
+		appSlug   = "fishhawk"
+		botUserID = 41898282
+		wantName  = "fishhawk[bot]"
+		wantEmail = "41898282+fishhawk[bot]@users.noreply.github.com"
+	)
+
+	// Fake GitHub: serves the two App-level endpoints resolveAppBotIdentity
+	// reads, asserting both carry the App JWT as Bearer auth.
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-app-jwt" {
+			t.Errorf("Authorization = %q, want App JWT bearer", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/app":
+			_, _ = io.WriteString(w, `{"slug":"`+appSlug+`"}`)
+		case "/users/" + appSlug + "[bot]":
+			_, _ = fmt.Fprintf(w, `{"id":%d,"login":"%s[bot]"}`, botUserID, appSlug)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(gh.Close)
+
+	// Backend server wired with a real githubclient pointed at the fake
+	// GitHub, with AppJWT supplied so the App-level endpoints authenticate.
+	ghClient := githubclient.New(nil)
+	ghClient.BaseURL = gh.URL
+	ghClient.AppJWT = func() (string, error) { return "test-app-jwt", nil }
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		ArtifactRepo: fx.artifactRepo,
+		GitHub:       ghClient,
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// CLI-triggered run (no issue ref → GetIssue never reached) with a plan
+	// stage + approved plan + implement stage.
+	r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef-appbot",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := fx.artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       cannedPlanJSON(t),
+		ContentHash:   "appbot-e2e",
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 2, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+
+	// Fetch the implement-stage prompt over the real HTTP handler.
+	url := fmt.Sprintf("%s/v0/stages/%s/prompt-render", httpSrv.URL, implStage.ID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("prompt-render request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prompt-render status = %d:\n%s", resp.StatusCode, body)
+	}
+
+	var pr struct {
+		CommitAuthorName  string `json:"commit_author_name"`
+		CommitAuthorEmail string `json:"commit_author_email"`
+	}
+	if err := json.Unmarshal(body, &pr); err != nil {
+		t.Fatalf("decode prompt response: %v\n%s", err, body)
+	}
+	if pr.CommitAuthorName != wantName {
+		t.Errorf("commit_author_name = %q, want %q", pr.CommitAuthorName, wantName)
+	}
+	if pr.CommitAuthorEmail != wantEmail {
+		t.Errorf("commit_author_email = %q, want %q (exact GitHub bot email convention)",
+			pr.CommitAuthorEmail, wantEmail)
+	}
+}
+
 // implementTimeoutPlanJSON returns a schema-valid standard_v1 plan with the
 // given predicted_runtime_minutes, marshalled to JSON for artifact storage.
 func implementTimeoutPlanJSON(t *testing.T, predictedMinutes int) []byte {

@@ -1994,6 +1994,91 @@ func TestRun_ImplementStage_NoScopeFiles_FallsBack(t *testing.T) {
 	}
 }
 
+// TestRun_ImplementStage_CommitAuthorThreaded verifies the #722 plumbing:
+// the prompt response's commit_author_name/commit_author_email are threaded
+// into CommitAndPushArgs.AuthorName/AuthorEmail so App-backed commits
+// attribute to the App's bot account.
+func TestRun_ImplementStage_CommitAuthorThreaded(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	stageID := "22222222-3333-4444-5555-666666666666"
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:           stageID,
+		StageType:         "implement",
+		Prompt:            "implement",
+		PromptHash:        "h",
+		CommitAuthorName:  "fishhawk[bot]",
+		CommitAuthorEmail: "41898282+fishhawk[bot]@users.noreply.github.com",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	if fp.gotArgs.AuthorName != "fishhawk[bot]" {
+		t.Errorf("AuthorName = %q, want fishhawk[bot]", fp.gotArgs.AuthorName)
+	}
+	if fp.gotArgs.AuthorEmail != "41898282+fishhawk[bot]@users.noreply.github.com" {
+		t.Errorf("AuthorEmail = %q", fp.gotArgs.AuthorEmail)
+	}
+}
+
+// TestRun_ImplementStage_NoCommitAuthor_FallsBack confirms that when the
+// prompt response omits the commit author identity, CommitAndPush receives
+// empty AuthorName/AuthorEmail so gitops applies its default bot identity.
+func TestRun_ImplementStage_NoCommitAuthor_FallsBack(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	stageID := "22222222-3333-4444-5555-666666666666"
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    stageID,
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	if fp.gotArgs.AuthorName != "" || fp.gotArgs.AuthorEmail != "" {
+		t.Errorf("Author identity = (%q,%q), want empty (gitops default fallback)",
+			fp.gotArgs.AuthorName, fp.gotArgs.AuthorEmail)
+	}
+}
+
 func TestRun_ImplementStage_HappyPath(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
