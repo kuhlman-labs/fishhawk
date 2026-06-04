@@ -2142,3 +2142,227 @@ func TestGetStagePrompt_ApprovalConditions_DecompositionFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestExtractScopePathsFromConditions(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{name: "empty", in: "", want: nil},
+		{
+			name: "backtick-quoted and bare paths",
+			in:   "Also update `backend/internal/server/prompt.go` and docs/api/v0.md please.",
+			want: []string{"backend/internal/server/prompt.go", "docs/api/v0.md"},
+		},
+		{
+			name: "dedups repeated path",
+			in:   "Touch pkg/a/file.go; then re-run pkg/a/file.go.",
+			want: []string{"pkg/a/file.go"},
+		},
+		{
+			name: "ignores prose tokens and extension-less words",
+			in:   "Use and/or as needed; keep the README and the TODO list intact.",
+			want: nil,
+		},
+		{
+			name: "ignores bare filename without slash",
+			in:   "Edit Makefile and config.yaml only.",
+			want: nil,
+		},
+		{
+			name: "trims trailing punctuation, parens and quotes",
+			in:   `Update ("dir/sub/file.ts"), and also (lib/x/y.rb).`,
+			want: []string{"dir/sub/file.ts", "lib/x/y.rb"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractScopePathsFromConditions(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("extractScopePathsFromConditions(%q) = %#v, want %#v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMergeConditionScopeFiles(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	strptr := func(v string) *string { return &v }
+
+	t.Run("no-op on empty scopeFiles", func(t *testing.T) {
+		got := s.mergeConditionScopeFiles(context.Background(), nil, strptr("touch pkg/a/file.go"))
+		if got != nil {
+			t.Errorf("empty scope must stay empty, got %#v", got)
+		}
+	})
+
+	t.Run("no-op on nil conditions", func(t *testing.T) {
+		in := []scopeFile{{Path: "a/b.go", Operation: "modify"}}
+		got := s.mergeConditionScopeFiles(context.Background(), in, nil)
+		if !reflect.DeepEqual(got, in) {
+			t.Errorf("nil conditions must not alter scope, got %#v", got)
+		}
+	})
+
+	t.Run("appends a new condition path", func(t *testing.T) {
+		in := []scopeFile{{Path: "a/b.go", Operation: "modify"}}
+		got := s.mergeConditionScopeFiles(context.Background(), in, strptr("also edit c/d.go"))
+		want := []scopeFile{
+			{Path: "a/b.go", Operation: "modify"},
+			{Path: "c/d.go", Operation: "modify"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("no duplicate when condition names a declared file", func(t *testing.T) {
+		in := []scopeFile{{Path: "a/b.go", Operation: "create"}}
+		got := s.mergeConditionScopeFiles(context.Background(), in, strptr("keep editing a/b.go"))
+		if !reflect.DeepEqual(got, in) {
+			t.Errorf("already-declared file must not be duplicated, got %#v", got)
+		}
+	})
+
+	t.Run("no-op when conditions name no path", func(t *testing.T) {
+		in := []scopeFile{{Path: "a/b.go", Operation: "modify"}}
+		got := s.mergeConditionScopeFiles(context.Background(), in, strptr("use the orthogonal-lens reviewer and/or skip"))
+		if !reflect.DeepEqual(got, in) {
+			t.Errorf("non-path conditions must not alter scope, got %#v", got)
+		}
+	})
+}
+
+// TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope crosses the full
+// audit-load -> resolveApprovalConditions -> mergeConditionScopeFiles ->
+// promptResponse.ScopeFiles seam (#730): an approved plan declares one scope
+// file, the binding approve-with-conditions comment names a SECOND file, and
+// the rendered implement-prompt's scope_files must carry BOTH — proving a
+// condition-authorized edit ships as a declared path rather than benign
+// scope_drift. The negative guard asserts a plan-missing (empty scope) run is
+// NOT augmented, preserving the runner's git add -A fallback.
+func TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+	const conditionFile = "backend/internal/server/runs_fake_test.go"
+
+	t.Run("condition file folded into declared scope", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		planStageID := uuid.New()
+		implStageID := uuid.New()
+
+		p := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "scoped plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{
+					{Path: plannedFile, Operation: plan.FileOpModify},
+				},
+			},
+		}
+		planBytes, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       planStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		condition := "Also update `" + conditionFile + "` to seed the audit entry."
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {makeApproveWithCommentEntry(runID, condition)},
+			}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got := make(map[string]bool, len(resp.ScopeFiles))
+		for _, f := range resp.ScopeFiles {
+			got[f.Path] = true
+		}
+		for _, want := range []string{plannedFile, conditionFile} {
+			if !got[want] {
+				t.Errorf("resp.ScopeFiles missing %q; got %#v", want, resp.ScopeFiles)
+			}
+		}
+	})
+
+	t.Run("plan-missing run is not augmented", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		implStageID := uuid.New()
+
+		// No plan artifact seeded → empty scope (plan_missing_for_implement).
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {}}
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		condition := "Also update `" + conditionFile + "` to seed the audit entry."
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {makeApproveWithCommentEntry(runID, condition)},
+			}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.ScopeFiles != nil {
+			t.Errorf("plan-missing run must keep empty scope (git add -A fallback), got %#v", resp.ScopeFiles)
+		}
+	})
+}
