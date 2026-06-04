@@ -1985,6 +1985,18 @@ paths:
                   enum: [approve, reject]
                 comment:
                   type: string
+                approver_github_login:
+                  type: string
+                  description: |
+                    Optional resolved GitHub login of the acting
+                    operator, threaded through by the MCP
+                    approve/reject tools (#751). Used only for
+                    issue-thread `@`-mention rendering in the
+                    plan-status footer; the audit `approver` field
+                    keeps the token subject as the acting identity
+                    (provenance). SPA/CLI callers omit it and are
+                    unaffected. `decision` remains the only required
+                    field.
       responses:
         '200':
           description: Approval recorded; stage state advanced.

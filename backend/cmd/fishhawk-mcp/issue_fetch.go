@@ -126,6 +126,35 @@ func fetchIssueViaGh(repo string, issueNumber int) (*IssueContext, error) {
 // payload (degraded prompt) rather than failing the tool call.
 var ErrGhNotInstalled = errors.New("gh CLI not found on PATH; install https://cli.github.com to enable inline issue fetch")
 
+// resolveGitHubLoginViaGh shells to `gh api user --jq .login` and
+// returns the authenticated operator's GitHub login (#751). The MCP
+// approve/reject tools thread this through to the approval call so the
+// issue-thread `@`-mention names the real operator (e.g. @kuhlman-labs)
+// instead of the raw token subject (e.g. brett@local-mcp), which
+// `@`-mentions an unrelated GitHub user.
+//
+// Best-effort by design — mirrors fetchIssueViaGh's degradation
+// posture. Returns ("", ErrGhNotInstalled) when the binary is absent
+// and ("", err) on any gh/exit error; the caller proceeds without a
+// resolved login (empty string) on failure and NEVER blocks or fails
+// the approval on this account.
+func resolveGitHubLoginViaGh() (string, error) {
+	if _, err := ghLookPath("gh"); err != nil {
+		return "", ErrGhNotInstalled
+	}
+	cmd := ghIssueCommand("gh", "api", "user", "--jq", ".login")
+	out, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", fmt.Errorf("gh api user: %s",
+				strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return "", fmt.Errorf("gh api user: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // inferIssueNumberFromTriggerRef extracts N from a trigger_ref of
 // the form `issue:N`. Returns 0 when the ref is empty or in any
 // other shape — auto-derive is a best-effort fallback, not a

@@ -458,6 +458,107 @@ func TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Reject(t *testing.T) {
 	}
 }
 
+// TestPlanStatusFooterForAuditPayload_PrefersGithubLogin pins the
+// #751 fix at the render seam: when the approval audit payload carries
+// a resolved approver_github_login, the footer `@`-mentions THAT login
+// even though the provenance `approver` is the raw MCP token subject
+// (brett@local-mcp). Without the resolved login, the bare token
+// subject falls back to "an approver" rather than `@`-mentioning an
+// unrelated GitHub user.
+func TestPlanStatusFooterForAuditPayload_PrefersGithubLogin(t *testing.T) {
+	withLogin := mustJSON(t, map[string]any{
+		"decision":              "approve",
+		"approver":              "brett@local-mcp",
+		"approver_github_login": "kuhlman-labs",
+	})
+	got := issuecomment.PlanStatusFooterForAuditPayload(withLogin)
+	if got != "_Status: approved by @kuhlman-labs · implementing now_" {
+		t.Errorf("with resolved login, footer = %q, want @kuhlman-labs mention", got)
+	}
+
+	bareSubject := mustJSON(t, map[string]any{
+		"decision": "approve",
+		"approver": "brett@local-mcp",
+	})
+	got = issuecomment.PlanStatusFooterForAuditPayload(bareSubject)
+	if got != "_Status: approved by an approver · implementing now_" {
+		t.Errorf("with bare token subject, footer = %q, want \"an approver\" (no ping)", got)
+	}
+}
+
+// TestPlanStatusFooterForAuditPayload_LoginValidation exercises the
+// tightened login validator (#751) through the exported render seam:
+// a syntactically-valid GitHub login renders as an `@`-mention; any
+// non-login string (containing '@'/'.', the "anonymous" placeholder,
+// empty, leading/trailing hyphen, or over 39 chars) falls back to
+// "an approver". The login is supplied as approver_github_login while
+// `approver` is left empty so the fallback is unambiguously "an
+// approver" on rejection.
+func TestPlanStatusFooterForAuditPayload_LoginValidation(t *testing.T) {
+	maxLogin := strings.Repeat("a", 39)
+	overLogin := strings.Repeat("a", 40)
+	cases := []struct {
+		name  string
+		login string
+		valid bool
+	}{
+		{"plain login", "kuhlman-labs", true},
+		{"single char", "a", true},
+		{"39 chars max", maxLogin, true},
+		{"internal hyphen", "a-b-c", true},
+		{"mcp token subject", "brett@local-mcp", false},
+		{"anonymous placeholder", "anonymous", false},
+		{"empty", "", false},
+		{"leading hyphen", "-foo", false},
+		{"trailing hyphen", "foo-", false},
+		{"40 chars over cap", overLogin, false},
+		{"dotted", "foo.bar", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := mustJSON(t, map[string]any{
+				"decision":              "approve",
+				"approver":              "",
+				"approver_github_login": tc.login,
+			})
+			got := issuecomment.PlanStatusFooterForAuditPayload(payload)
+			if tc.valid {
+				want := fmt.Sprintf("_Status: approved by @%s · implementing now_", tc.login)
+				if got != want {
+					t.Errorf("footer = %q, want %q", got, want)
+				}
+				return
+			}
+			if got != "_Status: approved by an approver · implementing now_" {
+				t.Errorf("footer = %q, want fallback to \"an approver\"", got)
+			}
+		})
+	}
+}
+
+// TestPlanStatusFooterForAuditPayload_NoDecisionAndMalformed confirms
+// the exported render seam returns "" for a payload with no terminal
+// decision and for a malformed payload (the awaiting-approval and
+// corrupt-row cases the live notifier treats as no-status-yet).
+func TestPlanStatusFooterForAuditPayload_NoDecisionAndMalformed(t *testing.T) {
+	noDecision := mustJSON(t, map[string]any{"approver": "kuhlman-labs"})
+	if got := issuecomment.PlanStatusFooterForAuditPayload(noDecision); got != "" {
+		t.Errorf("no-decision footer = %q, want empty", got)
+	}
+	if got := issuecomment.PlanStatusFooterForAuditPayload([]byte("not json")); got != "" {
+		t.Errorf("malformed footer = %q, want empty", got)
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}
+
 // TestNotifyPlanReady_FullPlanSpec_NoApprovalYet_NoFooter pins the
 // awaiting-approval first-post case: no `approval_submitted` rows
 // for the plan stage → no status footer in the body.

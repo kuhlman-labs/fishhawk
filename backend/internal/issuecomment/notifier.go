@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -299,18 +300,50 @@ func (n *Notifier) latestPlanApproval(ctx context.Context, runID, planStageID uu
 		if e.StageID == nil || *e.StageID != planStageID {
 			continue
 		}
-		var p struct {
-			Decision string `json:"decision"`
-			Approver string `json:"approver"`
-		}
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
+		st := decodeApprovalStatus(e.Payload)
+		if st == nil {
 			// Defensive: a malformed row shouldn't block the
 			// comment render. Treat as no-status-yet.
 			continue
 		}
-		return &planStatus{decision: approval.Decision(p.Decision), approver: p.Approver}, nil
+		return st, nil
 	}
 	return nil, nil
+}
+
+// decodeApprovalStatus decodes an `approval_submitted` audit payload
+// into a planStatus: the decision, the provenance `approver` (the
+// acting token subject), and the resolved `approver_github_login` the
+// MCP loop threads through (#751). ApproverGithubLogin is absent on
+// SPA/CLI approvals, where `approver` is itself a GitHub login.
+// Returns nil when the payload is malformed so callers treat a corrupt
+// row as "no status yet".
+func decodeApprovalStatus(payload []byte) *planStatus {
+	var p struct {
+		Decision            string `json:"decision"`
+		Approver            string `json:"approver"`
+		ApproverGithubLogin string `json:"approver_github_login"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil
+	}
+	return &planStatus{
+		decision:    approval.Decision(p.Decision),
+		approver:    p.Approver,
+		githubLogin: p.ApproverGithubLogin,
+	}
+}
+
+// PlanStatusFooterForAuditPayload renders the issue-thread plan-status
+// footer from a raw `approval_submitted` audit payload — the same
+// decode + render the live notifier applies when editing the
+// plan-on-issue comment. Exported so a cross-package caller (the #751
+// integration test in the server package) can assert the
+// wire→handler→audit-payload→render seam end to end without
+// reconstructing the full comment-post path. Returns "" when the
+// payload doesn't decode or carries no terminal decision.
+func PlanStatusFooterForAuditPayload(payload []byte) string {
+	return renderPlanStatusFooter(decodeApprovalStatus(payload))
 }
 
 // findPlanCommentID returns the most-recent github_comment_id from
@@ -412,7 +445,14 @@ func planOriginatingIssuePersistence(workflowSpec []byte, workflowID string, pla
 // approve / reject render named after the actor.
 type planStatus struct {
 	decision approval.Decision
+	// approver is the provenance identity — the acting token subject
+	// recorded server-side (e.g. brett@local-mcp for the MCP loop).
 	approver string
+	// githubLogin is the resolved GitHub login the MCP loop threads
+	// through for `@`-mention rendering (#751). Preferred over approver
+	// when it is a syntactically-valid login; empty on SPA/CLI
+	// approvals, where approver itself is the GitHub login.
+	githubLogin string
 }
 
 // renderFullPlanBody renders the entire standard_v1 plan as a
@@ -496,7 +536,14 @@ func renderPlanStatusFooter(s *planStatus) string {
 	if s == nil {
 		return ""
 	}
+	// Prefer the resolved GitHub login (#751) when present and valid;
+	// otherwise fall back to the acting subject, which renderApproverHandle
+	// reduces to "an approver" when it isn't a real login (e.g. the MCP
+	// token subject brett@local-mcp, or the "anonymous" placeholder).
 	actor := renderApproverHandle(s.approver)
+	if validApproverLogin(s.githubLogin) {
+		actor = renderApproverHandle(s.githubLogin)
+	}
 	switch s.decision {
 	case approval.DecisionApprove:
 		return fmt.Sprintf("_Status: approved by %s · implementing now_", actor)
@@ -1321,13 +1368,31 @@ func renderPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, extern
 	return b.String()
 }
 
-// validApproverLogin returns true when `s` is a real GitHub login
-// suitable for `@`-prefix display. Rejects the empty string and
-// the literal "anonymous" placeholder the HTTP handler stamps when
-// bearer auth didn't resolve an identity (so the SPA's "anonymous"
-// fallback never leaks into the issue thread as @anonymous).
+// githubLoginPattern matches a syntactically-valid GitHub login:
+// alphanumeric with single internal hyphens, no leading/trailing
+// hyphen, and at most 39 characters. Crucially it rejects any string
+// containing '@' or '.', so a non-login token subject like
+// brett@local-mcp can never be rendered as an `@`-mention (#751).
+// Compiled once at package init. Reference: GitHub username rules
+// (max 39 chars, alphanumeric + single hyphens).
+var githubLoginPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
+
+// validApproverLogin returns true when `s` is a syntactically-valid
+// GitHub login suitable for `@`-prefix display. Rejects the empty
+// string and the literal "anonymous" placeholder the HTTP handler
+// stamps when bearer auth didn't resolve an identity (so the SPA's
+// "anonymous" fallback never leaks into the issue thread as
+// @anonymous), and — as the stop-the-ping guarantee (#751) —
+// anything that isn't a real login, such as the MCP loop's token
+// subject brett@local-mcp. This defensive filter works independently
+// of the gh-login resolution: even if no resolved login is threaded
+// through, a non-login subject renders "an approver" rather than
+// pinging an unrelated GitHub user.
 func validApproverLogin(s string) bool {
-	return s != "" && s != "anonymous"
+	if s == "" || s == "anonymous" {
+		return false
+	}
+	return githubLoginPattern.MatchString(s)
 }
 
 // renderFileList renders Plan.Scope.Files as a markdown bullet list,

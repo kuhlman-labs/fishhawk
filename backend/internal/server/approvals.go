@@ -30,6 +30,15 @@ const AuditCompleteCheckName = "fishhawk_audit_complete"
 type approvalRequest struct {
 	Decision string `json:"decision"`
 	Comment  string `json:"comment,omitempty"`
+	// ApproverGithubLogin is the resolved GitHub login of the acting
+	// operator, threaded through by the MCP approve/reject tools (#751)
+	// so the issue-thread status footer `@`-mentions the real login
+	// rather than the raw token subject (e.g. brett@local-mcp). Optional
+	// and supplementary for rendering only: the audit `approver` field
+	// stays the token subject (provenance). Declared here so the
+	// DisallowUnknownFields decode accepts it; SPA/CLI callers omit it
+	// (omitempty) and are unaffected.
+	ApproverGithubLogin string `json:"approver_github_login,omitempty"`
 }
 
 // handleSubmitApproval implements POST /v0/stages/{stage_id}/approvals.
@@ -180,7 +189,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		s.writeApprovalAudit(r, stage, res.Approval, req.Comment)
+		s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin)
 
 		// Hand off to the orchestrator on both approve AND reject
 		// — approve dispatches the next stage; reject walks the
@@ -399,13 +408,23 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // When decision is reject and the comment contains "--decompose",
 // reject_reason=decompose_required is added to the payload so the
 // next plan-stage prompt can inject a decompose-required hint.
-func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment string) {
+//
+// When approverGithubLogin is non-empty (the MCP loop resolved the
+// operator's real GitHub login, #751), it is recorded under
+// approver_github_login for issue-thread `@`-mention rendering. The
+// `approver` field is left as the token subject so the audit row keeps
+// the true acting identity — the resolved login never overwrites
+// provenance.
+func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string) {
 	systemKind := audit.ActorKind("user")
 	auditPayload := map[string]any{
 		"stage_id": stage.ID.String(),
 		"decision": string(app.Decision),
 		"surface":  string(app.Surface),
 		"approver": app.ApproverSubject,
+	}
+	if approverGithubLogin != "" {
+		auditPayload["approver_github_login"] = approverGithubLogin
 	}
 	if app.Decision == approval.DecisionReject && strings.Contains(comment, "--decompose") {
 		auditPayload["reject_reason"] = "decompose_required"

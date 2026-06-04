@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -145,6 +146,57 @@ func TestFetchIssueViaGh_NotInstalled(t *testing.T) {
 func TestFetchIssueViaGh_CommandFails(t *testing.T) {
 	withFakeGhBroken(t)
 	_, err := fetchIssueViaGh("x/y", 42)
+	if err == nil {
+		t.Fatal("expected error from broken gh subprocess")
+	}
+	if errors.Is(err, ErrGhNotInstalled) {
+		t.Errorf("err should NOT be ErrGhNotInstalled: %v", err)
+	}
+}
+
+// --- resolveGitHubLoginViaGh (#751) ---
+
+func TestResolveGitHubLoginViaGh_Success(t *testing.T) {
+	// Record the args so we lock the exact `gh api user --jq .login`
+	// invocation, and return a trailing-newline-terminated login so the
+	// trim behavior is exercised (gh emits one line + \n).
+	var gotArgs []string
+	origCmd := ghIssueCommand
+	origLook := ghLookPath
+	ghIssueCommand = func(name string, args ...string) *exec.Cmd {
+		gotArgs = append([]string{name}, args...)
+		return exec.Command("sh", "-c", "printf 'kuhlman-labs\\n'")
+	}
+	ghLookPath = func(string) (string, error) { return "/fake/gh", nil }
+	t.Cleanup(func() {
+		ghIssueCommand = origCmd
+		ghLookPath = origLook
+	})
+
+	got, err := resolveGitHubLoginViaGh()
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got != "kuhlman-labs" {
+		t.Errorf("login = %q, want kuhlman-labs (trimmed)", got)
+	}
+	want := []string{"gh", "api", "user", "--jq", ".login"}
+	if strings.Join(gotArgs, " ") != strings.Join(want, " ") {
+		t.Errorf("gh invoked with %v, want %v", gotArgs, want)
+	}
+}
+
+func TestResolveGitHubLoginViaGh_NotInstalled(t *testing.T) {
+	withFakeGhMissing(t)
+	_, err := resolveGitHubLoginViaGh()
+	if !errors.Is(err, ErrGhNotInstalled) {
+		t.Errorf("err = %v, want ErrGhNotInstalled", err)
+	}
+}
+
+func TestResolveGitHubLoginViaGh_CommandFails(t *testing.T) {
+	withFakeGhBroken(t)
+	_, err := resolveGitHubLoginViaGh()
 	if err == nil {
 		t.Fatal("expected error from broken gh subprocess")
 	}
