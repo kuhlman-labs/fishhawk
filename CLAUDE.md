@@ -125,6 +125,7 @@ Because `--all` always rebuilds `fishhawk-mcp`, the `/mcp` reconnect banner is *
 1. `mkdir <name> && cd <name> && go mod init github.com/kuhlman-labs/fishhawk/<name>`
 2. Append `use ./<name>` to `/go.work`.
 3. Verify: `(cd <name> && go build ./... && go test ./... && golangci-lint run ./...)`.
+4. **Wire the module into `backend/Dockerfile`** if the image build must resolve it. The image runs `go mod download` against the whole `go.work` workspace inside the container, so EVERY module listed in `go.work` must have its `go.mod` copied before that step — add `COPY <name>/go.mod[ <name>/go.sum] ./<name>/` to the first COPY phase (omit `go.sum` if the module has none) and `COPY <name> ./<name>` to the source phase. A module added to `go.work` but not the Dockerfile fails `go mod download` with `cannot load module ../<name>` — and this was invisible at PR time until the PR-CI `docker-build` gate landed (#735), because the on-disk workspace the `go` job builds against always has the module present (the #733 / #672 break: red main for 5 merges).
 
 ## Git flow
 
