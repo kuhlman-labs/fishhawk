@@ -834,21 +834,40 @@ func (s *Server) appIdentityResolver() appIdentityGetter {
 // resolveAppBotIdentity returns the GitHub App bot account's git commit
 // identity (name, email) for echoing on the prompt response so App-backed
 // commits attribute to the App's bot account rather than the runner's
-// hardcoded fallback (#722). The result is memoized for the process
-// lifetime via appBotIdentityOnce — the App slug and bot user-id are
-// App-global and immutable — so the underlying GetApp + GetUser calls run
-// at most once regardless of how many stages dispatch.
+// hardcoded fallback (#722). A SUCCESSFUL result is memoized for the
+// process lifetime (the App slug and bot user-id are App-global and
+// immutable), so GetApp + GetUser run at most once regardless of how many
+// stages dispatch.
 //
 // Returns ("", "") when GitHub is unconfigured, the App JWT isn't wired
-// (dev / CLI client built via New), or any API call fails. The empty
-// result is cached too, so a failed resolution isn't retried on every
-// fetch; the runner falls back to gitops.DefaultAuthorName/Email in that
-// case. Failures log at WARN — never block the prompt response.
+// (dev / CLI client built via New), or any API call fails — and a
+// failed/empty resolution is NOT cached, so a transient first-call error
+// can't permanently disable dynamic attribution; it is retried on the next
+// fetch (the runner falls back to gitops.DefaultAuthorName/Email meanwhile).
+// Failures log at WARN — never block the prompt response.
 func (s *Server) resolveAppBotIdentity(ctx context.Context) (name, email string) {
-	s.appBotIdentityOnce.Do(func() {
-		s.appBotIdentityName, s.appBotIdentityEmail = s.computeAppBotIdentity(ctx)
-	})
-	return s.appBotIdentityName, s.appBotIdentityEmail
+	s.appBotIdentityMu.Lock()
+	if s.appBotIdentityResolved {
+		name, email = s.appBotIdentityName, s.appBotIdentityEmail
+		s.appBotIdentityMu.Unlock()
+		return name, email
+	}
+	s.appBotIdentityMu.Unlock()
+
+	// Not yet resolved. Compute outside the lock so concurrent prompt fetches
+	// don't serialize on the GetApp/GetUser round-trips; a rare double-compute
+	// is harmless (slug/bot-id are stable, so it yields the same result).
+	name, email = s.computeAppBotIdentity(ctx)
+	if name == "" {
+		// Transient/empty resolution is NOT cached — retry on the next fetch
+		// so a first-call hiccup can't permanently disable dynamic attribution.
+		return "", ""
+	}
+	s.appBotIdentityMu.Lock()
+	s.appBotIdentityName, s.appBotIdentityEmail = name, email
+	s.appBotIdentityResolved = true
+	s.appBotIdentityMu.Unlock()
+	return name, email
 }
 
 // computeAppBotIdentity performs the actual GetApp + GetUser resolution.

@@ -113,12 +113,38 @@ func TestResolveAppBotIdentity_EmptyOnError(t *testing.T) {
 			if name != "" || email != "" {
 				t.Errorf("identity = (%q,%q), want empty on failure", name, email)
 			}
-			// Empty result is cached too: a second call must not retry.
+			// A failed/empty resolution is NOT cached: a second call retries
+			// (so a transient first-call error can't stick for the process).
 			_, _ = s.resolveAppBotIdentity(context.Background())
-			if got := atomic.LoadInt32(&tc.stub.appCalls); got != 1 {
-				t.Errorf("GetApp called %d times, want 1 (empty result cached)", got)
+			if got := atomic.LoadInt32(&tc.stub.appCalls); got != 2 {
+				t.Errorf("GetApp called %d times, want 2 (failure retried, not cached)", got)
 			}
 		})
+	}
+}
+
+func TestResolveAppBotIdentity_RetriesAfterTransientFailure(t *testing.T) {
+	// Regression guard for the sync.Once-caches-failure trap (#722 review): a
+	// transient failure on the first resolve must NOT be memoized, so once the
+	// underlying call recovers a later resolve returns the real identity
+	// instead of a permanently-cached empty.
+	stub := &stubAppIdentityGetter{appErr: errors.New("transient boom")}
+	s := New(Config{Addr: "127.0.0.1:0"})
+	s.appIdentityGetterOverride = stub
+
+	if name, _ := s.resolveAppBotIdentity(context.Background()); name != "" {
+		t.Fatalf("first resolve: name = %q, want empty on transient failure", name)
+	}
+
+	// The hiccup clears; the next resolve must recover, not serve a cached empty.
+	stub.appErr = nil
+	stub.app = &githubclient.App{Slug: "fishhawk"}
+	stub.user = &githubclient.User{ID: 41898282, Login: "fishhawk[bot]"}
+
+	name, email := s.resolveAppBotIdentity(context.Background())
+	const wantEmail = "41898282+fishhawk[bot]@users.noreply.github.com"
+	if name != "fishhawk[bot]" || email != wantEmail {
+		t.Errorf("after recovery: (%q,%q), want resolved identity — failure must not be cached", name, email)
 	}
 }
 
