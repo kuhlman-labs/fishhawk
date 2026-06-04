@@ -457,6 +457,34 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 		return
 	}
 
+	// Push-and-open-pr implement gate (#742). When the implement stage will
+	// commit + push + open a PR AFTER this trace upload (the runner stamped
+	// push_and_open_pr in the manifest) AND the bundle carries a non-empty
+	// diff (so a commit + PR-open will actually follow), the terminal
+	// transition is driven by the /pull-request upload, NOT by trace upload.
+	// The commit/push/PR-open step runs after the trace ships, so advancing
+	// to awaiting_approval here would strand the run at the review gate with
+	// a null PR if that step fails — the zombie-run bug. Leave the stage in
+	// running and let handleShipPullRequest drive the terminal transition:
+	// succeeded/awaiting_approval on the success body, failed (category C/B)
+	// on the failure body. Mirrors the plan-stage advancement gate (#603).
+	//
+	// Emit the runtime-calibration row HERE before the early return: the
+	// bundle (and its timing) is only available at trace time, and the
+	// /pull-request handler never sees it (ADR-030/#649). Outcome is
+	// "succeeded" — the agent's work completed; only the PR-open is pending.
+	//
+	// An empty/absent diff is the no-changes path (agent made no edits → no
+	// commit → no PR → the runner's openPRAndShipArtifact short-circuits
+	// without a /pull-request POST). pushAndOpenPRGated returns false for it
+	// so the terminal transition below advances the stage as before, rather
+	// than hanging it in running. Non-push stages are byte-identical: the
+	// flag is false → the gate is a no-op.
+	if stage.Type == run.StageTypeImplement && s.pushAndOpenPRGated(bundleBytes) {
+		s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "succeeded")
+		return
+	}
+
 	terminal := run.StageStateAwaitingApproval
 	if !stage.RequiresApproval {
 		terminal = run.StageStateSucceeded
@@ -545,6 +573,33 @@ func (s *Server) planArtifactExists(ctx context.Context, stageID uuid.UUID) bool
 		return true
 	}
 	return false
+}
+
+// pushAndOpenPRGated reports whether an implement-stage trace upload should
+// DEFER its terminal transition to the /pull-request upload (#742). True
+// only when BOTH hold:
+//
+//   - the bundle manifest's push_and_open_pr flag is set (the runner will
+//     commit + push + open a PR after the trace ships), and
+//   - the bundle carries a non-empty git_diff (a commit + PR-open will
+//     actually follow, so a /pull-request upload is guaranteed to come).
+//
+// A false flag — every non-PR-opening stage (plan/review, --no-pr local
+// runs, decomposed children) and every older bundle — returns false so the
+// prior trace-driven transition is byte-identical. An empty or absent diff
+// is the no-changes path: the agent made no edits, so the runner opens no
+// PR and never POSTs to /pull-request; gating it would hang the stage in
+// running, so it returns false and the caller advances the stage as before.
+func (*Server) pushAndOpenPRGated(bundleBytes []byte) bool {
+	manifest, err := bundle.ExtractManifest(bundleBytes)
+	if err != nil || !manifest.PushAndOpenPR {
+		return false
+	}
+	diff, err := bundle.ExtractDiff(bundleBytes)
+	if err != nil {
+		return false
+	}
+	return len(diff.ChangedFiles) > 0
 }
 
 // notifyPlanReady fires the plan-ready comment-back hook after a

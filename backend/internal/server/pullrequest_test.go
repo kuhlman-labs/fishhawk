@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -265,6 +266,141 @@ func TestShipPullRequest_BearerHappyPath_201(t *testing.T) {
 	payload := string(au.appended[0].Payload)
 	if !strings.Contains(payload, `"auth_method":"bearer"`) {
 		t.Errorf("audit payload missing auth_method=bearer: %s", payload)
+	}
+}
+
+// newPRServerWithOrch wires the PR handler against the orchestratorRepo
+// (which validates stage transitions) plus a real orchestrator, so the
+// push-and-open-pr terminal-drive + failure paths (#742) can assert the
+// stage actually transitions and the run advances.
+func newPRServerWithOrch(t *testing.T) (*Server, *signingFake, *fakeArtifactRepo, *auditFake, *orchestratorRepo) {
+	t.Helper()
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := newOrchestratorRepo()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		ArtifactRepo: ar,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	return s, sf, ar, au, rr
+}
+
+// TestShipPullRequest_SuccessDrivesImplementTerminal is the #742 success
+// half: when the implement stage was left in `running` by the trace gate,
+// a success PR body is the authoritative driver of the terminal transition.
+// The stage must advance to awaiting_approval WITH a non-null PR URL.
+func TestShipPullRequest_SuccessDrivesImplementTerminal(t *testing.T) {
+	s, sf, ar, _, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, validPRBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval (success body must drive the gated terminal transition)", got.State)
+	}
+	gotRun, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.PullRequestURL == nil || *gotRun.PullRequestURL == "" {
+		t.Error("run.PullRequestURL not stamped on success")
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+}
+
+// TestShipPullRequest_FailureOutcome_FailsStageC is the #742 failure half:
+// a runner-reported commit/push/PR-open failure body must fail the gated
+// implement stage (category C, retryable) and advance the run — it must
+// NEVER reach review:awaiting_approval with a null PR (the b6811dc9 zombie).
+func TestShipPullRequest_FailureOutcome_FailsStageC(t *testing.T) {
+	s, sf, ar, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":  "failed",
+		"category": "C",
+		"reason":   "open PR: git push failed: network unreachable",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("stage.State = %q, want failed", got.State)
+	}
+	if got.State == run.StageStateAwaitingApproval {
+		t.Error("stage reached awaiting_approval on a PR-open failure (the zombie shape)")
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Errorf("FailureCategory = %v, want C (retryable)", got.FailureCategory)
+	}
+	gotRun, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.PullRequestURL != nil {
+		t.Errorf("run.PullRequestURL = %q, want nil on failure", *gotRun.PullRequestURL)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 (no PR artifact on failure)", len(ar.all))
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, e := range au.appended {
+		if e.Category == "pull_request_failed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no pull_request_failed audit entry recorded")
+	}
+}
+
+// TestShipPullRequest_FailureOutcome_InvalidCategory_400 pins the failure-
+// variant validation: an unknown category is a malformed body (#742).
+func TestShipPullRequest_FailureOutcome_InvalidCategory_400(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := []byte(`{"outcome":"failed","category":"Z","reason":"x"}`)
+	w := shipPRRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "pull_request_invalid") {
+		t.Errorf("body missing pull_request_invalid:\n%s", w.Body.String())
 	}
 }
 

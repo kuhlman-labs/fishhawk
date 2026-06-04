@@ -617,6 +617,27 @@ type ShipPullRequestArgs struct {
 	StageID    string
 	Body       []byte
 	PrivateKey ed25519.PrivateKey
+
+	// Outcome, when set to "failed", turns this into a failure-report POST
+	// (#742): instead of the success PR artifact in Body, ShipPullRequest
+	// signs and ships {"outcome":"failed","category":...,"reason":...} so
+	// the backend fails the implement stage its trace gate left in
+	// `running`. Category is "B" (invalid PR shape / compile-gate) or "C"
+	// (network/git/GitHub). When Outcome is empty the success Body path is
+	// used unchanged.
+	Outcome  string
+	Category string
+	Reason   string
+}
+
+// pullRequestFailureBody is the failure-report wire shape ShipPullRequest
+// marshals when Args.Outcome == "failed". Mirrors the optional fields the
+// backend's pullRequestBody decodes (#742); kept here so the runner owns
+// the bytes it signs.
+type pullRequestFailureBody struct {
+	Outcome  string `json:"outcome"`
+	Category string `json:"category"`
+	Reason   string `json:"reason"`
 }
 
 // ShipPullRequestResult is what the backend echoes back. Idempotent
@@ -643,14 +664,28 @@ type ShipPullRequestResult struct {
 // On 201 the backend created a fresh artifact; on 200 the upload
 // matched an existing one (Result.Idempotent==true).
 func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) (*ShipPullRequestResult, error) {
-	if len(args.Body) == 0 {
+	body := args.Body
+	if args.Outcome == "failed" {
+		// Failure-report POST (#742): build the failure body from the
+		// outcome fields rather than the (absent) success artifact.
+		marshalled, err := json.Marshal(pullRequestFailureBody{
+			Outcome:  args.Outcome,
+			Category: args.Category,
+			Reason:   args.Reason,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
+		}
+		body = marshalled
+	}
+	if len(body) == 0 {
 		return nil, errors.New("upload: empty pull-request body")
 	}
 	if len(args.PrivateKey) != ed25519.PrivateKeySize {
 		return nil, errors.New("upload: invalid private key length")
 	}
 
-	digest := sha256.Sum256(args.Body)
+	digest := sha256.Sum256(body)
 	signature := ed25519.Sign(args.PrivateKey, digest[:])
 	sigHex := hex.EncodeToString(signature)
 
@@ -680,14 +715,14 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			backoff *= 2
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(args.Body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("upload: build pull-request request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Fishhawk-Signature", sigHex)
 		req.Header.Set("Accept", "application/json")
-		req.ContentLength = int64(len(args.Body))
+		req.ContentLength = int64(len(body))
 
 		resp, err := c.HTTP.Do(req)
 		if err != nil {

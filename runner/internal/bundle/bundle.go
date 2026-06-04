@@ -76,6 +76,18 @@ type ManifestData struct {
 
 	AgentFailed        bool   `json:"agent_failed,omitempty"`
 	AgentFailureReason string `json:"agent_failure_reason,omitempty"`
+
+	// PushAndOpenPR signals that this implement stage will commit, push,
+	// and open a PR AFTER the trace upload. The backend's trace handler
+	// reads it to forward-gate the implement stage's terminal transition:
+	// it leaves the stage in `running` and lets the /pull-request upload
+	// drive the terminal transition, so a commit/push/PR-open failure
+	// lands the stage `failed` instead of stranding the run at the review
+	// gate with a null PR (the #742 zombie). omitempty keeps older bundles
+	// (and every non-PR-opening stage: plan/review, --no-pr, decomposed
+	// children) parsing as false — the prior trace-driven transition. Keep
+	// in lockstep with backend/internal/bundle.Manifest. (#742)
+	PushAndOpenPR bool `json:"push_and_open_pr,omitempty"`
 }
 
 // TrailerData is the payload of the last line of every bundle. The
@@ -117,6 +129,12 @@ type PackInputs struct {
 	// this is true.
 	AgentFailed        bool
 	AgentFailureReason string
+
+	// PushAndOpenPR flags an implement stage that will open a PR after the
+	// trace upload. The runner sets it for standalone implement stages
+	// (not --no-pr, not a decomposed child) so the backend forward-gates
+	// the terminal transition onto the /pull-request upload. (#742)
+	PushAndOpenPR bool
 
 	// Now returns the manifest's GeneratedAt timestamp. Default
 	// time.Now; overridable for deterministic tests.
@@ -172,6 +190,7 @@ func Pack(w io.Writer, in PackInputs, events []agent.Event) (int, error) {
 		GeneratedAt:        now(),
 		AgentFailed:        in.AgentFailed,
 		AgentFailureReason: in.AgentFailureReason,
+		PushAndOpenPR:      in.PushAndOpenPR,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("bundle: marshal manifest: %w", err)

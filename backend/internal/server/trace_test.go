@@ -1004,6 +1004,185 @@ func TestShipTrace_EmitRuntimeObserved_PlanStage(t *testing.T) {
 	}
 }
 
+// makePushPRBundle builds a gzip JSONL bundle whose manifest carries the
+// given push_and_open_pr flag, a git_diff event with fileCount changed
+// files (at t0), an agent_end event (at t1), and a trailer. The two
+// intermediate events give ExtractTiming a (t0, t1) window for runtime
+// calibration; the git_diff drives the trace handler's push-and-open-pr
+// gate (#742), which only defers the terminal transition when the diff is
+// non-empty.
+func makePushPRBundle(t *testing.T, pushAndOpenPR bool, fileCount int, t0, t1 time.Time) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		TS   time.Time       `json:"ts"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1", PushAndOpenPR: pushAndOpenPR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make([]map[string]string, 0, fileCount)
+	for i := 0; i < fileCount; i++ {
+		files = append(files, map[string]string{"path": fmt.Sprintf("file%d.go", i), "status": "modified"})
+	}
+	diffData, err := json.Marshal(map[string]any{
+		"kind": "git_diff", "base_ref": "main", "files": files, "num_files": fileCount,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []line{
+		{Seq: 1, TS: t0.Add(-time.Second), Kind: bundle.EventKindManifest, Data: mdata},
+		{Seq: 2, TS: t0, Kind: bundle.EventKindGitDiff, Data: diffData},
+		{Seq: 3, TS: t1, Kind: "agent_end", Data: json.RawMessage(`{}`)},
+		{Seq: 4, TS: t1.Add(time.Second), Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, err := json.Marshal(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// TestShipTrace_PushAndOpenPR_ImplementStaysRunning is the #742 forward
+// gate: when an implement stage's bundle stamps push_and_open_pr AND
+// carries a non-empty diff, the trace upload must leave the stage in
+// `running` (the /pull-request upload drives the terminal transition) — it
+// must NOT advance to awaiting_approval, or a later PR-open failure would
+// strand the run at the review gate with a null PR. The runtime_observed
+// calibration row must STILL fire (it can only be emitted at trace time,
+// where the bundle timing lives) so the gate doesn't silently disable
+// ADR-030 calibration.
+func TestShipTrace_PushAndOpenPR_ImplementStaysRunning(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(10 * time.Minute)
+	bundleBytes := makePushPRBundle(t, true, 2, t0, t1)
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+	})
+
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// The gate must leave the stage in running — NOT awaiting_approval.
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateRunning {
+		t.Errorf("stage.State = %q, want %q (gate must defer the terminal transition to /pull-request)",
+			got.State, run.StageStateRunning)
+	}
+
+	// runtime_observed must still fire (condition: the gate's early return
+	// must not disable ADR-030 calibration).
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for i := range au.appended {
+		if au.appended[i].Category == "runtime_observed" {
+			found = true
+			var payload map[string]any
+			if err := json.Unmarshal(au.appended[i].Payload, &payload); err != nil {
+				t.Fatalf("decode runtime_observed payload: %v", err)
+			}
+			if got, _ := payload["outcome"].(string); got != "succeeded" {
+				t.Errorf("runtime_observed outcome = %q, want succeeded", got)
+			}
+		}
+	}
+	if !found {
+		t.Error("no runtime_observed audit entry emitted for gated push_and_open_pr implement stage")
+	}
+}
+
+// TestShipTrace_PushAndOpenPR_EmptyDiffAdvances pins the no-changes carve-
+// out: an implement bundle stamps push_and_open_pr but carries an EMPTY
+// diff (the agent made no edits → no commit → no PR → the runner never
+// POSTs /pull-request). Gating it would hang the stage in running, so the
+// gate must NOT fire — the stage advances to awaiting_approval as before.
+func TestShipTrace_PushAndOpenPR_EmptyDiffAdvances(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(3 * time.Minute)
+	bundleBytes := makePushPRBundle(t, true, 0, t0, t1) // 0 files → empty diff
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+	})
+
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want %q (empty-diff no-changes path must NOT be gated)",
+			got.State, run.StageStateAwaitingApproval)
+	}
+}
+
 // packManifestBundle builds a minimal gzipped JSONL trace bundle whose
 // only line is a manifest carrying the given model + token split — the
 // signed wire form the cost rollup reads. Used by the cost seam test.

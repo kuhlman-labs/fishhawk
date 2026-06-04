@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
@@ -35,6 +37,20 @@ type pullRequestBody struct {
 	Title             string `json:"title"`
 	Body              string `json:"body,omitempty"`
 	FilesChangedCount int    `json:"files_changed_count"`
+
+	// Outcome, Category, and Reason form the optional failure-report
+	// variant (#742). When Outcome=="failed" the body is a runner-reported
+	// commit/push/PR-open failure — no PR was opened, so the PR fields above
+	// are absent. The handler then fails the implement stage its trace gate
+	// left in `running` (category C is retryable, B parks for re-scope)
+	// instead of creating a PR artifact, so the run never strands at
+	// review:awaiting_approval with a null PR. On the success body Outcome
+	// is empty and the PR fields are required. These are declared directly
+	// on the struct (with omitempty) so the handler's DisallowUnknownFields
+	// decoder accepts BOTH shapes without a separate discriminator struct.
+	Outcome  string `json:"outcome,omitempty"`
+	Category string `json:"category,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // validate returns a human-readable error if any required field is
@@ -43,6 +59,21 @@ type pullRequestBody struct {
 // wrong shape — the operator's audit log will need to be reconciled
 // by hand.
 func (p *pullRequestBody) validate() error {
+	// Failure-report variant (#742): no PR was opened, so the PR fields are
+	// absent. Require the outcome marker, a valid failure category, and a
+	// reason; the PR-field checks below don't apply.
+	if p.Outcome != "" {
+		if p.Outcome != "failed" {
+			return fmt.Errorf("outcome must be \"failed\" when set, got %q", p.Outcome)
+		}
+		if p.Category != "B" && p.Category != "C" {
+			return fmt.Errorf("category must be \"B\" or \"C\" for a failed outcome, got %q", p.Category)
+		}
+		if p.Reason == "" {
+			return errors.New("reason is required for a failed outcome")
+		}
+		return nil
+	}
 	switch {
 	case p.PRNumber <= 0:
 		return errors.New("pr_number must be a positive integer")
@@ -188,6 +219,16 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Failure-report variant (#742): the runner's commit/push/PR-open step
+	// failed after the trace gate left the implement stage in `running`.
+	// Fail the stage (category C is retryable) and advance the run so it
+	// never strands at review:awaiting_approval with a null PR. No artifact
+	// and no pull_request_url backfill — there is no PR.
+	if pr.Outcome == "failed" {
+		s.failPullRequestStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		return
+	}
+
 	contentHash := sha256Hex(body)
 
 	// Idempotency: dedup on (stage_id, content_hash). The runner
@@ -267,6 +308,17 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	// Push-and-open-pr terminal drive (#742). When the implement stage was
+	// left in `running` by the trace gate (the runner stamped
+	// push_and_open_pr), THIS upload is the authoritative driver of the
+	// stage's terminal transition — the PR is now durably recorded, so open
+	// the review gate. When the stage already advanced (the non-gated flow
+	// where the trace handler transitioned it), it isn't in `running` and
+	// the helper is a no-op — byte-identical to the prior behavior.
+	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+		s.advanceImplementStageAfterPR(r, runID, stage)
+	}
+
 	// Sticky status comment (E20.4 / #330). The PR-opened transition
 	// adds the PR URL to the run; the status comment's footer now
 	// surfaces the "Pull request →" link, so an update here is the
@@ -297,4 +349,119 @@ type pullRequestResponse struct {
 	PRURL       string    `json:"pr_url"`
 	HeadSHA     string    `json:"head_sha"`
 	Idempotent  bool      `json:"idempotent"`
+}
+
+// pullRequestFailureResponse is the 200 body for the failure-report
+// variant (#742): the runner-reported commit/push/PR-open failure was
+// recorded and the implement stage transitioned to failed.
+type pullRequestFailureResponse struct {
+	StageID  uuid.UUID `json:"stage_id"`
+	Outcome  string    `json:"outcome"`
+	Category string    `json:"category"`
+}
+
+// advanceImplementStageAfterPR drives the implement stage's terminal
+// transition once the PR artifact has landed (#742). The trace handler's
+// push-and-open-pr gate leaves the stage in `running` until the
+// /pull-request upload arrives, so this handler owns the running →
+// awaiting_approval (gated) or running → succeeded (gateless) transition,
+// mirroring advancePlanStageTerminal (#603).
+//
+// Best-effort: transition / advance errors are WARN-logged and never
+// unwind the upload response — the PR artifact + URL backfill are already
+// in place, and a stuck stage is recoverable via GET /v0/runs/{id}/stages.
+func (s *Server) advanceImplementStageAfterPR(r *http.Request, runID uuid.UUID, stage *run.Stage) {
+	terminal := run.StageStateAwaitingApproval
+	if !stage.RequiresApproval {
+		terminal = run.StageStateSucceeded
+	}
+	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stage.ID, terminal, nil); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"pull-request upload: transition implement stage to terminal failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("target", string(terminal)),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	// Gateless stages get no approval submission to drive the next dispatch
+	// — fire the orchestrator ourselves. Best-effort, like the plan handler.
+	if terminal == run.StageStateSucceeded && s.cfg.Orchestrator != nil {
+		if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"pull-request upload: orchestrator advance after gateless implement stage failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+}
+
+// failPullRequestStage handles the failure-report variant (#742): the
+// runner's commit/push/PR-open step failed after the trace gate left the
+// implement stage in `running`. It fails the stage with the reported
+// category (C is retryable via the failed → pending path; B parks for
+// re-scope), advances the run so the orchestrator walks it forward, records
+// a pull_request_failed audit entry pinning the runner's reason into the
+// chain, and responds 200. The stage row carries the canonical category +
+// reason; this never reaches review:awaiting_approval with a null PR.
+func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	cat := run.FailureC
+	if pr.Category == "B" {
+		cat = run.FailureB
+	}
+	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stage.ID, cat, pr.Reason); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"pull-request failure report: fail stage failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	// Advance the run so the orchestrator walks it forward — without this the
+	// run stays pending/running after the stage fails. Best-effort, mirroring
+	// the trace handler's advanceAfterFailure.
+	if s.cfg.Orchestrator != nil {
+		if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"pull-request failure report: orchestrator advance failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	stageID := stage.ID
+	auditPayload, _ := json.Marshal(map[string]any{
+		"run_id":      runID.String(),
+		"stage_id":    stageID.String(),
+		"category":    pr.Category,
+		"reason":      pr.Reason,
+		"auth_method": authMethod,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "pull_request_failed",
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      auditPayload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"pull-request failure report: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	s.notifyStatusUpdate(r.Context(), runID, "pr_failed")
+
+	s.writeJSON(w, r, http.StatusOK, pullRequestFailureResponse{
+		StageID:  stageID,
+		Outcome:  "failed",
+		Category: pr.Category,
+	})
 }
