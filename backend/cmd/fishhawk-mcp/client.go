@@ -138,6 +138,43 @@ func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return &r, nil
 }
 
+// BudgetStatus mirrors the backend's GET /v0/runs/{run_id}/budget body
+// (`backend/internal/server/budget_status.go::budgetStatusResponse`):
+// the current calendar-period status of the run's workflow periodic
+// budget (#693 / ADR-030). DISPLAY-ONLY — surfaced in the tool outputs
+// so the operator sees spend-vs-limit every stage; it never gates a run.
+//
+// Repeated here rather than imported because the MCP server's apiClient
+// is a thin local copy (the import direction is `cli → backend`, not the
+// reverse). The scalar fields are omitempty so the no-budget path — which
+// GetRunBudget collapses to a nil pointer — never marshals a half-empty
+// block.
+type BudgetStatus struct {
+	Period      string   `json:"period"`
+	PeriodStart string   `json:"period_start,omitempty"`
+	LimitUSD    float64  `json:"limit_usd,omitempty"`
+	SpentUSD    float64  `json:"spent_usd,omitempty"`
+	Fraction    float64  `json:"fraction,omitempty"`
+	WarnAt      *float64 `json:"warn_at,omitempty"`
+	Tier        string   `json:"tier,omitempty"`
+	Enforcement string   `json:"enforcement,omitempty"`
+}
+
+// GetRunBudget fetches the run's workflow periodic-budget status. The
+// backend returns 200 with an empty object when no budget is configured;
+// GetRunBudget collapses that to (nil, nil) so every caller treats "no
+// budget" uniformly by checking for a nil pointer.
+func (c *apiClient) GetRunBudget(ctx context.Context, runID uuid.UUID) (*BudgetStatus, error) {
+	var b BudgetStatus
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+runID.String()+"/budget", nil, &b); err != nil {
+		return nil, err
+	}
+	if b.Period == "" {
+		return nil, nil
+	}
+	return &b, nil
+}
+
 // createRunRequest mirrors the backend's `POST /v0/runs` request body
 // (`backend/internal/server/runs.go::createRunRequest`). Repeated here
 // rather than imported because the MCP server's apiClient is

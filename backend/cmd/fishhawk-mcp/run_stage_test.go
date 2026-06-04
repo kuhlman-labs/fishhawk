@@ -1398,3 +1398,101 @@ func TestRunStage_RunURL_ContainsRunID(t *testing.T) {
 		t.Errorf("RunURL = %q, want %q", out.RunURL, want)
 	}
 }
+
+// TestRunStage_SurfacesBudgetBlock is the run_stage half of the #693
+// wire-to-tool seam: after the runner exits the handler fetches
+// GET /v0/runs/{id}/budget and surfaces it on RunStageOutput.Budget.
+func TestRunStage_SurfacesBudgetBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+	warn := 0.8
+	seedBudget(fb, runID, BudgetStatus{
+		Period: "weekly", LimitUSD: 50, SpentUSD: 165.86, Fraction: 3.3172,
+		WarnAt: &warn, Tier: "over", Enforcement: "advisory",
+	})
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.Budget == nil {
+		t.Fatal("expected budget block surfaced after the stage ran; got nil")
+	}
+	if out.Budget.Tier != "over" {
+		t.Errorf("budget tier = %q, want over", out.Budget.Tier)
+	}
+}
+
+// TestRunStage_BudgetFetchError_WarnsNeverFails verifies the best-effort
+// contract (#693): a failing GET /v0/runs/{id}/budget must NOT fail the
+// stage — the stage still succeeds, Budget is nil, and the fetch error is
+// surfaced as a warning rather than a tool error.
+func TestRunStage_BudgetFetchError_WarnsNeverFails(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+	fb.budgetStatus = 500 // GET /budget returns 500 → GetRunBudget errors
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage must not fail on a budget-fetch error: %v", err)
+	}
+	if out.Budget != nil {
+		t.Errorf("budget should be nil on fetch error, got %+v", out.Budget)
+	}
+	var sawBudgetWarn bool
+	for _, w := range out.Warnings {
+		if strings.Contains(strings.ToLower(w), "budget") {
+			sawBudgetWarn = true
+		}
+	}
+	if !sawBudgetWarn {
+		t.Errorf("expected a budget warning on fetch error; warnings = %v", out.Warnings)
+	}
+}
+
+func TestRunStage_OmitsBudgetWhenNoBudget(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+	// No seedBudget → backend returns {} → field omitted.
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.Budget != nil {
+		t.Errorf("expected no budget block; got %+v", out.Budget)
+	}
+}

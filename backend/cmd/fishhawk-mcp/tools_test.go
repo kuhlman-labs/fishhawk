@@ -144,6 +144,15 @@ type fakeBackend struct {
 	calibrationResp      CalibrationResult
 	calibrationStatus    int
 	lastCalibrationQuery string
+
+	// Budget fixtures: GET /v0/runs/{run_id}/budget (#693).
+	// budgetByRun seeds the status per run; an unseeded run returns the
+	// empty object {} — mirroring the backend's no-budget 200.
+	// budgetStatus drives the HTTP status code (default 200).
+	// budgetCalledByID counts fetches per run id.
+	budgetByRun      map[uuid.UUID]BudgetStatus
+	budgetStatus     int
+	budgetCalledByID map[uuid.UUID]int
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -177,6 +186,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		approvalsStatus:          http.StatusOK,
 		approvalsCalledByID:      map[uuid.UUID]int{},
 		calibrationStatus:        http.StatusOK,
+		budgetByRun:              map[uuid.UUID]BudgetStatus{},
+		budgetStatus:             http.StatusOK,
+		budgetCalledByID:         map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
@@ -360,6 +372,26 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		w.WriteHeader(fb.perRunAuditStatus)
 		_ = json.NewEncoder(w).Encode(listAuditResult{Items: items, NextCursor: next})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/budget", func(w http.ResponseWriter, r *http.Request) {
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		w.Header().Set("Content-Type", "application/json")
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.budgetCalledByID[id]++
+		bs, ok := fb.budgetByRun[id]
+		status := fb.budgetStatus
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if !ok {
+			// No budget configured — empty object, as the backend does.
+			_, _ = w.Write([]byte("{}"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(bs)
 	})
 	mux.HandleFunc("GET /v0/audit", func(w http.ResponseWriter, r *http.Request) {
 		runIDQ := r.URL.Query().Get("run_id")
@@ -3145,5 +3177,119 @@ func TestRuntimeCalibration_BackendError(t *testing.T) {
 	_, _, err := r.runtimeCalibration(context.Background(), nil, RuntimeCalibrationInput{})
 	if err == nil {
 		t.Fatal("expected error on 500, got nil")
+	}
+}
+
+// --- budget status (#693 / ADR-030) ---
+//
+// Cross-boundary wire-to-tool seam: a stub backend serves
+// GET /v0/runs/{id}/budget and the three consuming tools surface the
+// same block (and omit it when the backend returns the empty no-budget
+// object). Per-layer unit tests alone would pass while the field
+// silently dropped at the seam (cf. #618), so these drive the full
+// apiClient.GetRunBudget -> tool-output path.
+
+func seedBudget(fb *fakeBackend, runID uuid.UUID, bs BudgetStatus) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.budgetByRun[runID] = bs
+}
+
+func warnFloat(f float64) *float64 { return &f }
+
+func TestStartRun_SurfacesBudgetBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.createRunResp = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "pending"}
+	seedBudget(fb, runID, BudgetStatus{
+		Period: "weekly", PeriodStart: "2026-06-01T00:00:00Z",
+		LimitUSD: 50, SpentUSD: 165.86, Fraction: 3.3172,
+		WarnAt: warnFloat(0.8), Tier: "over", Enforcement: "advisory",
+	})
+
+	_, out, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "deadbeef",
+		WorkflowSpec: validTrivialSpec,
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if out.Budget == nil {
+		t.Fatal("expected budget block surfaced from backend; got nil")
+	}
+	if out.Budget.Tier != "over" || out.Budget.Enforcement != "advisory" {
+		t.Errorf("budget = %+v, want tier=over enforcement=advisory", out.Budget)
+	}
+	if out.Budget.SpentUSD != 165.86 || out.Budget.LimitUSD != 50 {
+		t.Errorf("budget spend/limit = %g/%g, want 165.86/50", out.Budget.SpentUSD, out.Budget.LimitUSD)
+	}
+}
+
+func TestStartRun_OmitsBudgetWhenNoBudget(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.createRunResp = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "pending"}
+	// No seedBudget → backend returns {} → GetRunBudget yields nil.
+
+	_, out, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "deadbeef",
+		WorkflowSpec: validTrivialSpec,
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if out.Budget != nil {
+		t.Errorf("expected no budget block; got %+v", out.Budget)
+	}
+	// The no-budget block must omit the JSON key entirely (nil pointer
+	// + omitempty), not serialize a null.
+	raw, _ := json.Marshal(out)
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &m)
+	if _, ok := m["budget"]; ok {
+		t.Errorf("marshaled output must omit the budget key when no budget; got %s", raw)
+	}
+}
+
+func TestGetRunStatus_SurfacesBudgetBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+	seedBudget(fb, runID, BudgetStatus{
+		Period: "weekly", LimitUSD: 100, SpentUSD: 60, Fraction: 0.6,
+		WarnAt: warnFloat(0.5), Tier: "warn", Enforcement: "advisory",
+	})
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Budget == nil {
+		t.Fatal("expected budget block surfaced; got nil")
+	}
+	if out.Budget.Tier != "warn" {
+		t.Errorf("budget tier = %q, want warn", out.Budget.Tier)
+	}
+}
+
+func TestGetRunStatus_OmitsBudgetWhenNoBudget(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Budget != nil {
+		t.Errorf("expected no budget block; got %+v", out.Budget)
 	}
 }

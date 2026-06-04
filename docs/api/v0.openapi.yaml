@@ -599,6 +599,56 @@ components:
             GitHub comment ID from the last `status_comment_posted` audit entry.
             Zero when no comment has been posted yet (create-path).
 
+    RunBudgetStatus:
+      type: object
+      description: |
+        Current calendar-period status of a workflow's periodic budget
+        (#693 / ADR-030). **Display-only** — never gates or blocks a run.
+
+        When the workflow declares no budget the endpoint returns an
+        **empty object** (none of the fields below present); clients
+        detect "no budget" by the absence of `period`. The fields below
+        are present only when a budget is configured.
+      properties:
+        period:
+          type: string
+          enum: [weekly, monthly]
+          description: Budget reset cadence.
+        period_start:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 inclusive start of the current calendar period, in
+            the server's configured budget timezone.
+        limit_usd:
+          type: number
+          description: Configured spend ceiling in US dollars for the period.
+        spent_usd:
+          type: number
+          description: Cross-run workflow spend so far in the current period.
+        fraction:
+          type: number
+          description: |
+            `spent_usd / limit_usd`. May exceed 1 when over the ceiling.
+            Zero when the limit is non-positive (no usable ceiling).
+        warn_at:
+          type: [number, "null"]
+          description: |
+            Optional warn threshold as a fraction in (0,1]. Omitted when
+            the budget configures no warn threshold.
+        tier:
+          type: string
+          enum: [ok, warn, over]
+          description: |
+            `over` when `fraction >= 1`; `warn` when the configured
+            `warn_at` is crossed but not yet over; otherwise `ok`.
+        enforcement:
+          type: string
+          enum: [advisory, blocking]
+          description: |
+            Budget enforcement mode. A spec budget with no enforcement
+            value defaults to (and surfaces as) `advisory`.
+
     CalibrationResult:
       type: object
       description: |
@@ -1381,6 +1431,42 @@ paths:
             `validation_failed` — `stage_id` not a UUID, or `limit` out of range.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v0/runs/{run_id}/budget:
+    get:
+      operationId: getRunBudget
+      summary: Current periodic-budget status for a run's workflow
+      description: |
+        Returns the current calendar-period status of the workflow's
+        periodic budget (#693 / ADR-030): spend vs limit, the fraction
+        consumed, and the `ok`/`warn`/`over` tier. Reuses the same
+        evaluation chain the advisory alert path runs (period range →
+        cross-run cost sum → evaluate).
+
+        **Display-only.** This endpoint never gates or blocks a run; it
+        exists so the MCP loop can surface spend-vs-limit every stage
+        instead of relying on the advisory issue comment.
+
+        When the workflow declares no budget the response is **200 with
+        an empty object** (`{}`) rather than a 404, so clients branch on
+        the presence of `period`. A workflow with multiple budgets
+        surfaces only the first.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            Periodic-budget status, or an empty object when the workflow
+            declares no budget.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunBudgetStatus' }
+        '400':
+          description: "`validation_failed` — `run_id` not a UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: Run repository unavailable. }
 
   /v0/runs/{run_id}/status-comment:
     get:
