@@ -113,6 +113,22 @@ Notes:
   the same estimate caveat as the cost ledger: period spend undercounts
   invocations a backend reported no tokens for (`known_usage=false`, #685), so
   actual spend is a lower bound.
+- The advisory budget comment-dedup marker — `budget_alert_sent` (#758) — is an
+  **internal, system-actor audit kind, NOT an issue-comment surface**. Nothing
+  in `issuecomment` posts it to the issue thread; it has no Notifier method. The
+  trace upload handler (`trace.go::emitBudgetAlert`) writes it once per
+  `(workflow_id, period_start, tier)`, with a `system` actor and payload
+  `{workflow_id, period_start, tier}`, ONLY when `NotifyBudgetAlert` actually
+  posted the advisory comment. It exists to dedup the visible `budget_alert`
+  comment ACROSS runs, decoupled from the `budget_alert` crossing record above:
+  the crossing record is written even when the comment is suppressed (non-issue
+  run, nil installation), so gating the comment on the crossing record poisoned
+  the dedup for the whole period whenever the first over-threshold run could not
+  comment (the #758 bug). Because the marker is written only on a real post, a
+  comment-less first emission leaves no marker and the next capable run still
+  surfaces the comment. Read back only by `budgetAlertCommentSent`. Listed here
+  only so a future reader grepping the audit categories doesn't mistake it for a
+  comment surface.
 - The per-run budget tripwire audit kind — `run_budget_exceeded` (#653 /
   ADR-030) — is an **internal, system-actor audit kind, not an issue-comment
   surface**. Nothing in `issuecomment` posts it to the issue thread; it has no

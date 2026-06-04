@@ -38,8 +38,12 @@ func overPayload() issuecomment.BudgetAlertPayload {
 
 func TestNotifyBudgetAlert_WarnTier_PostsCommentAndAudit(t *testing.T) {
 	runID, gh, au, n := happyDeps(t)
-	if err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload()); err != nil {
+	posted, err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload())
+	if err != nil {
 		t.Fatalf("NotifyBudgetAlert: %v", err)
+	}
+	if !posted {
+		t.Fatalf("warn happy path: posted = false, want true")
 	}
 	if len(gh.calls) != 1 {
 		t.Fatalf("expected 1 GitHub call; got %d", len(gh.calls))
@@ -70,8 +74,12 @@ func TestNotifyBudgetAlert_WarnTier_PostsCommentAndAudit(t *testing.T) {
 
 func TestNotifyBudgetAlert_OverTier_RendersExhausted(t *testing.T) {
 	runID, gh, _, n := happyDeps(t)
-	if err := n.NotifyBudgetAlert(context.Background(), runID, overPayload()); err != nil {
+	posted, err := n.NotifyBudgetAlert(context.Background(), runID, overPayload())
+	if err != nil {
 		t.Fatalf("NotifyBudgetAlert: %v", err)
+	}
+	if !posted {
+		t.Fatalf("over happy path: posted = false, want true")
 	}
 	if len(gh.calls) != 1 {
 		t.Fatalf("expected 1 GitHub call; got %d", len(gh.calls))
@@ -89,19 +97,25 @@ func TestNotifyBudgetAlert_PerTierDedup(t *testing.T) {
 	runID, gh, au, n := happyDeps(t)
 
 	// First the warn tier posts.
-	if err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload()); err != nil {
+	if posted, err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload()); err != nil {
 		t.Fatal(err)
+	} else if !posted {
+		t.Fatalf("first warn should post; posted = false")
 	}
 	// A redelivery of the SAME (period_start, tier) is absorbed.
-	if err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload()); err != nil {
+	if posted, err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload()); err != nil {
 		t.Fatal(err)
+	} else if posted {
+		t.Errorf("warn redelivery should dedup; posted = true")
 	}
 	if len(gh.calls) != 1 {
 		t.Fatalf("warn redelivery should dedup; got %d calls", len(gh.calls))
 	}
 	// The 100% tier is a distinct crossing in the same period and posts.
-	if err := n.NotifyBudgetAlert(context.Background(), runID, overPayload()); err != nil {
+	if posted, err := n.NotifyBudgetAlert(context.Background(), runID, overPayload()); err != nil {
 		t.Fatal(err)
+	} else if !posted {
+		t.Fatalf("over tier should post; posted = false")
 	}
 	if len(gh.calls) != 2 {
 		t.Fatalf("over tier should post; got %d calls", len(gh.calls))
@@ -113,8 +127,10 @@ func TestNotifyBudgetAlert_PerTierDedup(t *testing.T) {
 	// A new calendar period's warn posts again (period_start differs).
 	next := warnPayload()
 	next.PeriodStart = "2026-05-11T00:00:00Z"
-	if err := n.NotifyBudgetAlert(context.Background(), runID, next); err != nil {
+	if posted, err := n.NotifyBudgetAlert(context.Background(), runID, next); err != nil {
 		t.Fatal(err)
+	} else if !posted {
+		t.Fatalf("next-period warn should post; posted = false")
 	}
 	if len(gh.calls) != 3 {
 		t.Fatalf("next-period warn should post; got %d calls", len(gh.calls))
@@ -130,8 +146,12 @@ func TestNotifyBudgetAlert_PreSeededDedup(t *testing.T) {
 		"period_start": "2026-05-04T00:00:00Z",
 		"budget_tier":  "warn",
 	})
-	if err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload()); err != nil {
+	posted, err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload())
+	if err != nil {
 		t.Fatal(err)
+	}
+	if posted {
+		t.Errorf("pre-seeded tier should dedup; posted = true")
 	}
 	if len(gh.calls) != 0 {
 		t.Errorf("pre-seeded tier should dedup; got %d calls", len(gh.calls))
@@ -157,8 +177,12 @@ func TestNotifyBudgetAlert_SkipsNonIssueTrigger(t *testing.T) {
 		ExternalURL: "https://app.fishhawk.example.com",
 		Now:         func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) },
 	})
-	if err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload()); err != nil {
+	posted, err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload())
+	if err != nil {
 		t.Fatal(err)
+	}
+	if posted {
+		t.Errorf("non-issue trigger should skip; posted = true")
 	}
 	if len(gh.calls) != 0 {
 		t.Errorf("non-issue trigger should skip; got %d calls", len(gh.calls))
@@ -172,8 +196,12 @@ func TestNotifyBudgetAlert_EmptyTier_NoOp(t *testing.T) {
 	runID, gh, _, n := happyDeps(t)
 	p := warnPayload()
 	p.Tier = ""
-	if err := n.NotifyBudgetAlert(context.Background(), runID, p); err != nil {
+	posted, err := n.NotifyBudgetAlert(context.Background(), runID, p)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if posted {
+		t.Errorf("empty tier should no-op; posted = true")
 	}
 	if len(gh.calls) != 0 {
 		t.Errorf("empty tier should no-op; got %d calls", len(gh.calls))

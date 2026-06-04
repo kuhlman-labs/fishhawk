@@ -175,6 +175,90 @@ func TestRecordCost_AdvisoryBudget_WarnThenOver(t *testing.T) {
 	}
 }
 
+// TestRecordCost_AdvisoryBudget_HealsAfterCommentlessFirstEmission is the
+// #758 regression: a comment-less first emission (a run that structurally
+// can't comment — nil installation_id) must NOT poison the audit-keyed
+// dedup for the whole period. It seeds run A with InstallationID=nil
+// (comment suppressed) and run B with InstallationID set, both
+// feature_change in the same calendar period over the limit. Driving
+// recordCost on A writes the budget_alert crossing record but posts no
+// comment; the later capable run B must NOT re-emit the crossing record
+// yet must still surface the advisory comment exactly once.
+func TestRecordCost_AdvisoryBudget_HealsAfterCommentlessFirstEmission(t *testing.T) {
+	au := newAuditFake()
+	rr := newApprovalRunRepo()
+	gh := newSlashGitHubRecorder()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	x, ok := pricing.Cost(model, inTok, outTok)
+	if !ok || x <= 0 {
+		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, x)
+	}
+	// limit = x/10, warn_at = 0.5: a single bundle's cost (x) already
+	// drives the period over 100%, so both runs cross the "over" tier.
+	spec := budgetAlertSpec(x/10, "advisory", 0.5)
+	triggerRef := "issue:42"
+
+	// Run A: no installation_id — the visible comment is structurally
+	// suppressed (contextForBudgetAlert returns ok=false).
+	stageA := rr.seedStage(run.StageStateRunning)
+	runA := stageA.RunID
+	rr.seedRun(&run.Run{
+		ID: runA, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+		InstallationID: nil,
+		WorkflowSpec:   spec,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// Run B: installation-bearing — the comment can land.
+	stageB := rr.seedStage(run.StageStateRunning)
+	runB := stageB.RunID
+	rr.seedRun(&run.Run{
+		ID: runB, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+		InstallationID: ptrInt64(99),
+		WorkflowSpec:   spec,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	bundleA := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0", RunID: runA.String(), StageID: stageA.ID.String(),
+		Agent: "claude-code", Model: model, InputTokens: inTok, OutputTokens: outTok,
+	})
+	bundleB := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0", RunID: runB.String(), StageID: stageB.ID.String(),
+		Agent: "claude-code", Model: model, InputTokens: inTok, OutputTokens: outTok,
+	})
+
+	ctx := context.Background()
+
+	// Run A first: crossing record written, comment suppressed.
+	s.recordCost(ctx, runA, stageA.ID, bundleA)
+	if got := countBudgetAlerts(au, "over"); got != 1 {
+		t.Fatalf("after run A: over budget_alert count = %d, want 1 (crossing recorded)", got)
+	}
+	if got := len(budgetCommentBodies(gh)); got != 0 {
+		t.Fatalf("after run A: budget comments = %d, want 0 (nil installation suppresses comment)", got)
+	}
+
+	// Run B next: no re-emit of the crossing record, but the comment
+	// now surfaces — the comment-less first emission did not poison it.
+	s.recordCost(ctx, runB, stageB.ID, bundleB)
+	if got := countBudgetAlerts(au, "over"); got != 1 {
+		t.Errorf("after run B: over budget_alert count = %d, want 1 (no re-emit)", got)
+	}
+	if got := len(budgetCommentBodies(gh)); got != 1 {
+		t.Fatalf("after run B: budget comments = %d, want 1 (comment heals on the capable run)", got)
+	}
+}
+
 // TestRecordCost_BlockingBudget_NoAdvisoryEmission confirms a blocking
 // budget never surfaces through the warn path — blocking enforcement is
 // an admission-time gate (scope item 4), out of scope here.

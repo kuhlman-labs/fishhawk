@@ -1466,14 +1466,41 @@ const (
 	budgetTierOver = "over"
 )
 
-// emitBudgetAlert appends a budget_alert audit entry and posts the
-// advisory issue comment for one crossed (budget, tier), deduped so each
-// tier fires at most once per (workflow_id, period_start, tier). Both
-// steps are best-effort: a dedup-read failure, an audit-append failure,
-// or a notifier failure all WARN-log and never unwind the upload.
+// budgetAlertSentCategory is the audit category of the cross-run
+// comment-delivery dedup marker (#758). It is NOT an issue-comment
+// surface: it is an internal, system-actor bookkeeping row written ONLY
+// when the advisory budget comment actually landed on the issue, gating
+// the COMMENT independently of the budget_alert crossing record. See
+// docs/issue-comment-surfaces.md.
+const budgetAlertSentCategory = "budget_alert_sent"
+
+// emitBudgetAlert records one crossed (budget, tier) and posts its
+// advisory issue comment. The two dedups are deliberately DECOUPLED
+// (#758):
+//
+//   - The budget_alert AUDIT entry is the canonical once-per-period
+//     crossing record. It is gated by budgetAlertAlreadyEmitted and
+//     written even when the visible comment is suppressed (non-issue
+//     run, nil installation), so the SPA's period-spend view and
+//     compliance consumers always see the crossing exactly once per
+//     (workflow_id, period_start, tier).
+//
+//   - The COMMENT is gated separately on a budget_alert_sent marker
+//     written ONLY when NotifyBudgetAlert actually posts. A crossing
+//     recorded on a run that structurally can't comment leaves no
+//     marker, so the next capable run still surfaces the comment for the
+//     period — fixing the bug where a comment-less first emission
+//     poisoned the dedup for the whole period.
+//
+// Every step is best-effort: a dedup-read failure, an audit-append
+// failure, or a notifier failure all WARN-log and never unwind the
+// upload.
 func (s *Server) emitBudgetAlert(ctx context.Context, runID, stageID uuid.UUID, runRow *run.Run, b spec.PeriodicBudget, d budget.Decision, tier string) {
 	periodStart := d.PeriodStart.Format(time.RFC3339)
 
+	// Canonical crossing record: gated ONLY around the budget_alert
+	// append so the once-per-period signal is preserved even for
+	// non-issue / comment-less runs.
 	already, err := s.budgetAlertAlreadyEmitted(ctx, runRow.WorkflowID, periodStart, tier)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -1482,47 +1509,62 @@ func (s *Server) emitBudgetAlert(ctx context.Context, runID, stageID uuid.UUID, 
 			slog.String("error", err.Error()))
 		return
 	}
-	if already {
-		return
-	}
-
-	payloadMap := map[string]any{
-		"workflow_id":  runRow.WorkflowID,
-		"repo":         runRow.Repo,
-		"period":       b.Period,
-		"period_start": periodStart,
-		"spent":        d.Spent,
-		"limit":        d.Limit,
-		"fraction":     d.Fraction,
-		"tier":         tier,
-		"enforcement":  "advisory",
-	}
-	if b.WarnAt != nil {
-		payloadMap["warn_at"] = *b.WarnAt
-	}
-	payload, _ := json.Marshal(payloadMap)
-	systemKind := audit.ActorKind("system")
-	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
-		RunID:     runID,
-		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
-		Category:  "budget_alert",
-		ActorKind: &systemKind,
-		Payload:   payload,
-	}); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"budget alert: append budget_alert audit entry failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()))
-		// Fall through: still try the comment so the surface fires even
-		// when the audit row didn't land.
+	if !already {
+		payloadMap := map[string]any{
+			"workflow_id":  runRow.WorkflowID,
+			"repo":         runRow.Repo,
+			"period":       b.Period,
+			"period_start": periodStart,
+			"spent":        d.Spent,
+			"limit":        d.Limit,
+			"fraction":     d.Fraction,
+			"tier":         tier,
+			"enforcement":  "advisory",
+		}
+		if b.WarnAt != nil {
+			payloadMap["warn_at"] = *b.WarnAt
+		}
+		payload, _ := json.Marshal(payloadMap)
+		systemKind := audit.ActorKind("system")
+		if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     runID,
+			StageID:   &stageID,
+			Timestamp: time.Now().UTC(),
+			Category:  "budget_alert",
+			ActorKind: &systemKind,
+			Payload:   payload,
+		}); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"budget alert: append budget_alert audit entry failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+			// Fall through: still try the comment so the surface fires
+			// even when the audit row didn't land.
+		}
 	}
 
 	if s.issueNotifier == nil {
 		return
 	}
-	if err := s.issueNotifier.NotifyBudgetAlert(ctx, runID, issuecomment.BudgetAlertPayload{
+
+	// Comment-delivery dedup, decoupled from the crossing record above.
+	// Keyed on the budget_alert_sent marker — written only when a
+	// comment actually posted — so a comment-less first emission does
+	// not suppress a later capable run.
+	commentSent, err := s.budgetAlertCommentSent(ctx, runRow.WorkflowID, periodStart, tier)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"budget alert: comment-dedup read failed — skipping comment",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if commentSent {
+		return
+	}
+
+	posted, err := s.issueNotifier.NotifyBudgetAlert(ctx, runID, issuecomment.BudgetAlertPayload{
 		WorkflowID:  runRow.WorkflowID,
 		Period:      b.Period,
 		PeriodStart: periodStart,
@@ -1531,10 +1573,40 @@ func (s *Server) emitBudgetAlert(ctx context.Context, runID, stageID uuid.UUID, 
 		Fraction:    d.Fraction,
 		WarnAt:      b.WarnAt,
 		Tier:        tier,
-	}); err != nil {
+	})
+	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"budget alert: post issue comment failed",
 			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+	}
+	if !posted {
+		// Comment was suppressed (non-issue run, nil installation,
+		// per-run dedup, or a post error). Leave NO budget_alert_sent
+		// marker so the next capable run still surfaces the comment.
+		return
+	}
+
+	// Comment landed — record the cross-run marker so later capable runs
+	// dedup the comment for this (workflow_id, period_start, tier).
+	sentPayload, _ := json.Marshal(map[string]any{
+		"workflow_id":  runRow.WorkflowID,
+		"period_start": periodStart,
+		"tier":         tier,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  budgetAlertSentCategory,
+		ActorKind: &systemKind,
+		Payload:   sentPayload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"budget alert: append budget_alert_sent marker failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 	}
 }
@@ -1550,6 +1622,39 @@ func (s *Server) emitBudgetAlert(ctx context.Context, runID, stageID uuid.UUID, 
 // best-effort surface in v0.
 func (s *Server) budgetAlertAlreadyEmitted(ctx context.Context, workflowID, periodStart, tier string) (bool, error) {
 	category := "budget_alert"
+	entries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &category})
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		var p struct {
+			WorkflowID  string `json:"workflow_id"`
+			PeriodStart string `json:"period_start"`
+			Tier        string `json:"tier"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		if p.WorkflowID == workflowID && p.PeriodStart == periodStart && p.Tier == tier {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// budgetAlertCommentSent reports whether the advisory budget COMMENT has
+// already been delivered for this (workflow_id, period_start, tier) — the
+// cross-run comment-delivery dedup introduced in #758. It scans
+// ListAll(category=budget_alert_sent) in memory, the same cheap
+// low-volume pattern as budgetAlertAlreadyEmitted (at most two markers
+// per workflow per period). This is DISTINCT from budgetAlertAlreadyEmitted:
+// that gates the once-per-period budget_alert crossing record (written
+// even for comment-less runs); this gates the visible comment on a marker
+// written ONLY when a comment actually landed, so a comment-less first
+// emission no longer poisons the period. Like the crossing key it is not
+// repo-scoped — mirroring the accepted v0 limitation in #688.
+func (s *Server) budgetAlertCommentSent(ctx context.Context, workflowID, periodStart, tier string) (bool, error) {
+	category := budgetAlertSentCategory
 	entries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &category})
 	if err != nil {
 		return false, err

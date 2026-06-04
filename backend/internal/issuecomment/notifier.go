@@ -745,27 +745,39 @@ type BudgetAlertPayload struct {
 // the cost recording — the budget_alert audit entry is the canonical
 // signal and the SPA renders period spend without the comment.
 //
-// Skips silently when:
+// Returns posted=true ONLY when a comment was actually created on the
+// issue; every silent-skip path returns posted=false (with a nil error)
+// and a real failure returns (false, err). The caller uses the posted
+// bit to decide whether to write the cross-run budget_alert_sent
+// comment-dedup marker (#758): a suppressed emission writes no marker,
+// so the next capable run still surfaces the comment for the period.
+//
+// Returns posted=false (and skips silently) when:
 //   - The receiver is nil.
+//   - The tier is empty.
 //   - The run isn't issue-triggered (CLI / PR / local runner with no
-//     installation_id) — contextForBudgetAlert validates this.
+//     installation_id), or its trigger ref / repo is unparseable —
+//     contextForBudgetAlert validates this.
 //   - A budget_alert comment with the SAME (period_start, tier) already
 //     landed on this run (per-period/per-tier dedup; a re-evaluation in
 //     the same period or a redelivered upload is absorbed, but the warn
 //     tier and the later 100% tier each post once).
-func (n *Notifier) NotifyBudgetAlert(ctx context.Context, runID uuid.UUID, p BudgetAlertPayload) error {
+func (n *Notifier) NotifyBudgetAlert(ctx context.Context, runID uuid.UUID, p BudgetAlertPayload) (posted bool, err error) {
 	if n == nil {
-		return nil
+		return false, nil
 	}
 	if p.Tier == "" {
-		return nil
+		return false, nil
 	}
 	ctxv, ok, err := n.contextForBudgetAlert(ctx, runID, p.PeriodStart, p.Tier)
 	if err != nil || !ok {
-		return err
+		return false, err
 	}
 	body := renderBudgetAlertBody(ctxv, p)
-	return n.postBudgetAlert(ctx, ctxv, p, body)
+	if err := n.postBudgetAlert(ctx, ctxv, p, body); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // contextForBudgetAlert mirrors contextFor but uses the per-period/
