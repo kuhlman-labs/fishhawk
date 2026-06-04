@@ -472,17 +472,23 @@ func TestE2E_LocalRunner_AppBotIdentity_ResolvedAndCarriedOnPrompt(t *testing.T)
 		wantEmail = "41898282+fishhawk[bot]@users.noreply.github.com"
 	)
 
-	// Fake GitHub: serves the two App-level endpoints resolveAppBotIdentity
-	// reads, asserting both carry the App JWT as Bearer auth.
+	// Fake GitHub: serves the two endpoints resolveAppBotIdentity reads,
+	// asserting auth PER PATH — the App-level /app endpoint must carry the
+	// App JWT, while the public /users/{login} lookup must carry NO auth
+	// header (the App JWT is only valid for /app* endpoints; routing it to
+	// /users 401s — that was the #750 bug this test now guards against).
 	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer test-app-jwt" {
-			t.Errorf("Authorization = %q, want App JWT bearer", got)
-		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/app":
+			if got := r.Header.Get("Authorization"); got != "Bearer test-app-jwt" {
+				t.Errorf("/app Authorization = %q, want App JWT bearer", got)
+			}
 			_, _ = io.WriteString(w, `{"slug":"`+appSlug+`"}`)
 		case "/users/" + appSlug + "[bot]":
+			if got := r.Header.Get("Authorization"); got != "" {
+				t.Errorf("/users Authorization = %q, want NO auth header (public lookup, #750)", got)
+			}
 			_, _ = fmt.Fprintf(w, `{"id":%d,"login":"%s[bot]"}`, botUserID, appSlug)
 		default:
 			w.WriteHeader(http.StatusNotFound)
