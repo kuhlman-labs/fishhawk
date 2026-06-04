@@ -727,6 +727,83 @@ func TestPostgres_StageGate_RoundTripPreservesShape(t *testing.T) {
 	}
 }
 
+func TestPostgres_ListReviewStagesAwaitingApproval_IncludesSLALess(t *testing.T) {
+	// #725 regression at the persistence→repository seam: the merge
+	// reconciler's listing must return review stages parked in
+	// awaiting_approval REGARDLESS of gate_sla. The feature_change review
+	// gate carries no sla, so the SLA ticker's gate_sla-filtered query
+	// (ListStagesAwaitingApproval) hides it — which is exactly why the
+	// reconciler needs its own SLA-independent query.
+	//
+	// The Go fake ignores gate_sla entirely, so only this real-SQL test
+	// proves the WHERE clause is right (cf. #618: per-layer units pass
+	// while the seam breaks).
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	// park transitions one review stage through the lifecycle to
+	// awaiting_approval and returns its id.
+	park := func(gateSLA *string) uuid.UUID {
+		r := makeRun(t, repo)
+		s, err := repo.CreateStage(ctx, run.CreateStageParams{
+			RunID:            r.ID,
+			Sequence:         0,
+			Type:             run.StageTypeReview,
+			ExecutorKind:     run.ExecutorHuman,
+			ExecutorRef:      "human",
+			RequiresApproval: true,
+			GateSLA:          gateSLA,
+		})
+		if err != nil {
+			t.Fatalf("CreateStage: %v", err)
+		}
+		for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateAwaitingApproval} {
+			if _, err := repo.TransitionStage(ctx, s.ID, to, nil); err != nil {
+				t.Fatalf("→%s: %v", to, err)
+			}
+		}
+		return s.ID
+	}
+
+	sla := "4_business_hours"
+	slaLessID := park(nil)     // the bug-defining case
+	slaBearingID := park(&sla) // the SLA ticker's case
+
+	// New query: BOTH review stages, SLA-independent.
+	reviewStages, err := repo.ListReviewStagesAwaitingApproval(ctx)
+	if err != nil {
+		t.Fatalf("ListReviewStagesAwaitingApproval: %v", err)
+	}
+	got := map[uuid.UUID]bool{}
+	for _, s := range reviewStages {
+		got[s.ID] = true
+	}
+	if !got[slaLessID] {
+		t.Errorf("ListReviewStagesAwaitingApproval dropped the SLA-less review stage %s (the #725 bug)", slaLessID)
+	}
+	if !got[slaBearingID] {
+		t.Errorf("ListReviewStagesAwaitingApproval dropped the SLA-bearing review stage %s", slaBearingID)
+	}
+
+	// Control: the unchanged SLA ticker query still excludes the SLA-less
+	// stage and includes only the SLA-bearing one.
+	slaStages, err := repo.ListStagesAwaitingApproval(ctx)
+	if err != nil {
+		t.Fatalf("ListStagesAwaitingApproval: %v", err)
+	}
+	slaGot := map[uuid.UUID]bool{}
+	for _, s := range slaStages {
+		slaGot[s.ID] = true
+	}
+	if slaGot[slaLessID] {
+		t.Errorf("ListStagesAwaitingApproval returned the SLA-less stage %s; its gate_sla filter should exclude it", slaLessID)
+	}
+	if !slaGot[slaBearingID] {
+		t.Errorf("ListStagesAwaitingApproval dropped the SLA-bearing stage %s", slaBearingID)
+	}
+}
+
 func TestPostgres_StageGate_NilWhenSpecHasNoGate(t *testing.T) {
 	// The dispatcher passes Gate=nil for gateless stages (e.g.
 	// implement). The persisted row's Gate must come back nil too,

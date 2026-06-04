@@ -150,6 +150,9 @@ func (r *promptRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]
 func (r *promptRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (r *promptRunRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 
 func (r *promptRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")

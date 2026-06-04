@@ -452,6 +452,59 @@ func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, erro
 	return items, nil
 }
 
+const listReviewStagesAwaitingApproval = `-- name: ListReviewStagesAwaitingApproval :many
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
+ WHERE state = 'awaiting_approval'
+   AND stage_type = 'review'
+ ORDER BY updated_at ASC
+`
+
+// The merge reconciler's candidate listing — every review stage parked
+// in awaiting_approval, SLA-independent BY DESIGN. Unlike the adjacent
+// ListStagesAwaitingApproval (which the SLA ticker keeps using with its
+// `gate_sla IS NOT NULL` filter), this query must NOT filter on gate_sla:
+// the feature_change review gate has no sla, so an SLA filter would hide
+// every feature_change merge from the reconciler and park those runs at
+// review awaiting_approval forever (#725). Ordered updated_at ASC.
+func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listReviewStagesAwaitingApproval)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Stage
+	for rows.Next() {
+		var i Stage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Sequence,
+			&i.StageType,
+			&i.ExecutorKind,
+			&i.ExecutorRef,
+			&i.State,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.FailureCategory,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.GateSla,
+			&i.RequiresApproval,
+			&i.GateType,
+			&i.GateApprovers,
+			&i.SelfRetryCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStagesAwaitingChildren = `-- name: ListStagesAwaitingChildren :many
 SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
  WHERE state = 'awaiting_children'

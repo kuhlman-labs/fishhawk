@@ -364,6 +364,9 @@ func (r *fakeOIDCRunRepo) ListStagesForRun(_ context.Context, _ uuid.UUID) ([]*r
 func (r *fakeOIDCRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (r *fakeOIDCRunRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 
 func (r *fakeOIDCRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")

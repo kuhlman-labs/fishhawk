@@ -74,8 +74,11 @@ type Resolver interface {
 // any whose PR has reached a terminal merge state. Run() blocks until
 // ctx is done.
 type Ticker struct {
-	// Runs lists awaiting-approval stages and reads the run row (for
-	// installation_id + pull_request_url). Required.
+	// Runs lists awaiting-approval review stages (via the dedicated,
+	// SLA-independent ListReviewStagesAwaitingApproval — NOT the SLA
+	// ticker's gate_sla-filtered query, which hides SLA-less review
+	// gates; #725) and reads the run row (for installation_id +
+	// pull_request_url). Required.
 	Runs run.Repository
 
 	// PRGetter reads live PR state from GitHub. Required.
@@ -141,7 +144,7 @@ func (t *Ticker) Tick(ctx context.Context) {
 		logger = slog.Default()
 	}
 
-	stages, err := t.Runs.ListStagesAwaitingApproval(ctx)
+	stages, err := t.Runs.ListReviewStagesAwaitingApproval(ctx)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "mergereconciler: list awaiting stages failed",
 			slog.String("error", err.Error()))
@@ -150,6 +153,10 @@ func (t *Ticker) Tick(ctx context.Context) {
 
 	for _, s := range stages {
 		if s.Type != run.StageTypeReview {
+			// Defense-in-depth: ListReviewStagesAwaitingApproval already
+			// filters to stage_type = 'review', so this is dead under the
+			// real query. Kept so a fake or future listing that returns a
+			// non-review stage can't reach reconcileStage.
 			continue
 		}
 		t.reconcileStage(ctx, logger, s)

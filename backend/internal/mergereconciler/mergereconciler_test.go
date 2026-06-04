@@ -23,7 +23,7 @@ type fakeRepo struct {
 	resolved map[uuid.UUID]bool // runs the resolver has moved out of awaiting
 }
 
-func (f *fakeRepo) ListStagesAwaitingApproval(_ context.Context) ([]*run.Stage, error) {
+func (f *fakeRepo) ListReviewStagesAwaitingApproval(_ context.Context) ([]*run.Stage, error) {
 	if f.awaitErr != nil {
 		return nil, f.awaitErr
 	}
@@ -72,8 +72,8 @@ type resolveCall struct {
 }
 
 // stubResolver records resolution calls. When repo is set it marks the
-// run resolved so the next ListStagesAwaitingApproval drops it — the
-// mechanism by which a second tick is a no-op.
+// run resolved so the next ListReviewStagesAwaitingApproval drops it —
+// the mechanism by which a second tick is a no-op.
 type stubResolver struct {
 	repo  *fakeRepo
 	calls []resolveCall
@@ -126,6 +126,29 @@ func TestTick_Merged_ResolvesSucceeded(t *testing.T) {
 
 	if len(res.calls) != 1 {
 		t.Fatalf("resolve calls = %d, want 1", len(res.calls))
+	}
+	if !res.calls[0].merged || res.calls[0].runID != r.ID {
+		t.Errorf("resolve call = %+v, want merged=true runID=%s", res.calls[0], r.ID)
+	}
+}
+
+func TestTick_SLALessReviewStage_Merged_Resolves(t *testing.T) {
+	// #725 regression: a review stage carrying NO gate SLA (the
+	// feature_change review gate's shape) must still be reconciled. The
+	// reconciler now lists via ListReviewStagesAwaitingApproval, which is
+	// SLA-independent, so a merged PR resolves merged=true even though the
+	// old gate_sla-filtered query would have hidden the stage entirely.
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	if s.GateSLA != nil {
+		t.Fatalf("precondition: review stage should have no gate SLA, got %v", *s.GateSLA)
+	}
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	newTicker(repo, pg, res).Tick(context.Background())
+
+	if len(res.calls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1 (SLA-less review stage must reconcile)", len(res.calls))
 	}
 	if !res.calls[0].merged || res.calls[0].runID != r.ID {
 		t.Errorf("resolve call = %+v, want merged=true runID=%s", res.calls[0], r.ID)

@@ -285,6 +285,9 @@ func (f *fakeRepo) ListStagesForRun(_ context.Context, _ uuid.UUID) ([]*run.Stag
 func (f *fakeRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("fakeRepo: ListStagesAwaitingApproval not implemented")
 }
+func (f *fakeRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("fakeRepo: ListStagesAwaitingApproval not implemented")
+}
 
 func (f *fakeRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("fakeRepo: ListStagesAwaitingApproval not implemented")

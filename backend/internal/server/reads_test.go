@@ -45,6 +45,9 @@ func (r *stagesRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]
 func (r *stagesRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (r *stagesRunRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 
 func (r *stagesRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")

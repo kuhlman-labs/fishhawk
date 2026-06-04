@@ -375,6 +375,19 @@ func (r *postgresRepo) ListStagesAwaitingApproval(ctx context.Context) ([]*Stage
 	return out, nil
 }
 
+func (r *postgresRepo) ListReviewStagesAwaitingApproval(ctx context.Context) ([]*Stage, error) {
+	q := rundb.New(r.pool)
+	rows, err := q.ListReviewStagesAwaitingApproval(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list review stages awaiting approval: %w", err)
+	}
+	out := make([]*Stage, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToStage(row))
+	}
+	return out, nil
+}
+
 func (r *postgresRepo) ListStagesDispatched(ctx context.Context) ([]*Stage, error) {
 	q := rundb.New(r.pool)
 	rows, err := q.ListStagesDispatched(ctx)
