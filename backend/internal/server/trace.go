@@ -1340,6 +1340,28 @@ type runCostSummer interface {
 	SumWorkflowCostInRange(ctx context.Context, repo, workflowID string, from, to time.Time) (float64, error)
 }
 
+// evaluateWorkflowBudget runs the shared period-range -> period-sum ->
+// evaluate chain for one periodic budget, against the workflow's spend
+// in the calendar period containing now (in loc). It is the single
+// source of that sequence for both the alert path (checkBudgetAlerts)
+// and the display path (runBudgetStatus, GET /v0/runs/{id}/budget).
+//
+// The bool reports whether the decision is usable: false (with a nil
+// error) means the budget's period was unrecognized and the caller must
+// skip it rather than bucket into the wrong window. A SumWorkflowCostInRange
+// failure is returned as the error.
+func evaluateWorkflowBudget(ctx context.Context, summer runCostSummer, repo, workflowID string, b spec.PeriodicBudget, now time.Time, loc *time.Location) (budget.Decision, bool, error) {
+	start, end := budget.PeriodRange(b.Period, now, loc)
+	if start.IsZero() {
+		return budget.Decision{}, false, nil
+	}
+	spent, err := summer.SumWorkflowCostInRange(ctx, repo, workflowID, start, end)
+	if err != nil {
+		return budget.Decision{}, false, err
+	}
+	return budget.Evaluate(spent, b.LimitUSD, b.WarnAt, b.Period, now, loc), true, nil
+}
+
 // checkBudgetAlerts evaluates the run's workflow advisory periodic
 // budgets (ADR-030 / #688) after the cost_recorded entry has been
 // accumulated into runs.cost_usd_total. For each advisory budget on the
@@ -1405,13 +1427,7 @@ func (s *Server) checkBudgetAlerts(ctx context.Context, runID, stageID uuid.UUID
 		if b.Enforcement == spec.EnforcementBlocking {
 			continue
 		}
-		start, end := budget.PeriodRange(b.Period, now, loc)
-		if start.IsZero() {
-			// Unrecognized period — the schema enum makes this
-			// unreachable, but don't bucket into the wrong window.
-			continue
-		}
-		spent, err := summer.SumWorkflowCostInRange(ctx, runRow.Repo, runRow.WorkflowID, start, end)
+		d, ok, err := evaluateWorkflowBudget(ctx, summer, runRow.Repo, runRow.WorkflowID, b, now, loc)
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"budget alert: sum period spend failed — skipping budget",
@@ -1421,7 +1437,11 @@ func (s *Server) checkBudgetAlerts(ctx context.Context, runID, stageID uuid.UUID
 				slog.String("error", err.Error()))
 			continue
 		}
-		d := budget.Evaluate(spent, b.LimitUSD, b.WarnAt, b.Period, now, loc)
+		if !ok {
+			// Unrecognized period — the schema enum makes this
+			// unreachable, but don't bucket into the wrong window.
+			continue
+		}
 		// Decide the tier this crossing represents. Over implies
 		// WarnCrossed (warn_at <= 1), so check Over first and emit only
 		// the higher tier per bundle; the 'warn' tier still fires on the

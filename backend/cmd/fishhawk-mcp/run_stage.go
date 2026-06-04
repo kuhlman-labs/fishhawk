@@ -143,6 +143,12 @@ type RunStageOutput struct {
 	TokensUsed     int    `json:"tokens_used,omitempty" jsonschema:"tokens consumed; from runner_completed when present, else the last heartbeat's running total"`
 	ElapsedSeconds int    `json:"elapsed_seconds,omitempty" jsonschema:"wall-clock seconds from the last stage_progress heartbeat"`
 	LastEventKind  string `json:"last_event_kind,omitempty" jsonschema:"the agent's last event kind from the last stage_progress heartbeat"`
+
+	// Budget is the workflow's current periodic-budget status (#693 /
+	// ADR-030), fetched best-effort after the stage runs. Omitted when
+	// the workflow declares no budget or the fetch failed (a fetch error
+	// appends to Warnings) — DISPLAY-ONLY, never gates the stage.
+	Budget *BudgetStatus `json:"budget,omitempty" jsonschema:"workflow periodic-budget status for the current calendar period (spend vs limit, tier ok|warn|over); omitted when no budget is configured. Display-only — never blocks the stage"`
 }
 
 // RunnerEvent wraps an unstructured runner event. Each event is the
@@ -565,6 +571,14 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		resultEvents = filtered
 	}
 
+	// Best-effort periodic-budget status (#693), fetched after the stage
+	// runs so it reflects this stage's spend. A fetch error appends a
+	// warning and leaves the field nil — never fails the stage.
+	budgetStatus, budgetWarn := r.fetchBudgetStatus(ctx, runUUID)
+	if budgetWarn != "" {
+		warnings = append(warnings, budgetWarn)
+	}
+
 	out := RunStageOutput{
 		ExitCode:       exitCode,
 		StageState:     stageState,
@@ -578,6 +592,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		TokensUsed:     summary.TokensUsed,
 		ElapsedSeconds: summary.ElapsedSeconds,
 		LastEventKind:  summary.LastEventKind,
+		Budget:         budgetStatus,
 	}
 
 	// Return-cancellation signal: if the parent ctx was the reason

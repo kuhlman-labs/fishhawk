@@ -589,6 +589,10 @@ type GetRunStatusOutput struct {
 	// fishhawk_await_review.
 	PlanReviewStatus      *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped, failed. 'pending' means a review was dispatched but no verdict has landed yet; 'failed' means the reviewer errored or timed out (terminal)"`
 	ImplementReviewStatus *ReviewStatus `json:"implement_review_status,omitempty" jsonschema:"review lifecycle for the implement stage: status is one of none, pending, complete, skipped, failed. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review; 'failed' means the reviewer errored or timed out (terminal)"`
+	// Budget is the workflow's current periodic-budget status (#693 /
+	// ADR-030), fetched best-effort. Omitted when the workflow declares
+	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
+	Budget *BudgetStatus `json:"budget,omitempty" jsonschema:"workflow periodic-budget status for the current calendar period (spend vs limit, tier ok|warn|over); omitted when no budget is configured. Display-only — never blocks the run"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -666,6 +670,10 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, GetRunStatusOutput{}, fmt.Errorf("implement review status: %w", err)
 	}
 
+	// Best-effort periodic-budget status (#693). On a fetch error the
+	// field stays nil — never fails the snapshot.
+	budgetStatus, _ := r.fetchBudgetStatus(ctx, runID)
+
 	return nil, GetRunStatusOutput{
 		Run:                   *runRow,
 		Stages:                stages,
@@ -673,6 +681,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		ImplementReviews:      implementReviews,
 		PlanReviewStatus:      planReviewStatus,
 		ImplementReviewStatus: implementReviewStatus,
+		Budget:                budgetStatus,
 	}, nil
 }
 
@@ -913,6 +922,24 @@ type StartRunInput struct {
 type StartRunOutput struct {
 	Run        Run  `json:"run"`
 	Idempotent bool `json:"idempotent" jsonschema:"true when this call replayed against an existing run via Idempotency-Key; false on fresh create"`
+	// Budget is the workflow's current periodic-budget status (#693 /
+	// ADR-030), fetched best-effort. Omitted when the workflow declares
+	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
+	Budget *BudgetStatus `json:"budget,omitempty" jsonschema:"workflow periodic-budget status for the current calendar period (spend vs limit, tier ok|warn|over); omitted when no budget is configured. Display-only — never blocks the run"`
+}
+
+// fetchBudgetStatus retrieves the run's periodic-budget status
+// best-effort. It NEVER fails the caller: on any error it returns
+// (nil, <warning>); on a no-budget response it returns (nil, ""). The
+// warning string is for callers that surface a Warnings slice
+// (run_stage); start_run / get_run_status simply discard it and omit
+// the field.
+func (r *runResolver) fetchBudgetStatus(ctx context.Context, runID uuid.UUID) (*BudgetStatus, string) {
+	bs, err := r.api.GetRunBudget(ctx, runID)
+	if err != nil {
+		return nil, fmt.Sprintf("budget status unavailable: %v", err)
+	}
+	return bs, ""
 }
 
 // registerStartRun wires the fishhawk_start_run tool (E22.1 / #390;
@@ -1111,13 +1138,21 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)
 	}
 
+	out := StartRunOutput{Run: *created, Idempotent: idempotent}
+	// Best-effort periodic-budget status (#693). A parse failure on the
+	// run id or a fetch error simply leaves the field nil — never fails
+	// the create.
+	if runUUID, perr := uuid.Parse(created.ID); perr == nil {
+		out.Budget, _ = r.fetchBudgetStatus(ctx, runUUID)
+	}
+
 	var meta *mcp.CallToolResult
 	if len(warnings) > 0 {
 		meta = &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(warnings, "\n")}},
 		}
 	}
-	return meta, StartRunOutput{Run: *created, Idempotent: idempotent}, nil
+	return meta, out, nil
 }
 
 // CancelRunInput is the fishhawk_cancel_run tool's input schema
