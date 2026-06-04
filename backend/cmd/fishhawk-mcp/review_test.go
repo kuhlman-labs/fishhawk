@@ -507,16 +507,16 @@ func TestAwaitReview_BoundedPolls_DoesNotHammerBackend(t *testing.T) {
 	if out.Status != "pending" {
 		t.Errorf("Status = %q, want pending", out.Status)
 	}
-	// The loop must terminate within a bounded, single-digit number of
-	// passes — at least one poll, never hundreds. The deterministic cancel
-	// above caps it; assert the observed bound rather than depending on
-	// wall-clock timing.
-	got := startedQueries.Load()
-	if got == 0 {
-		t.Error("expected at least one per-run audit poll")
-	}
-	if got >= 10 {
-		t.Errorf("started-category audit queries = %d, want bounded single digits", got)
+	// reviewStatusFor issues exactly one started-category query per pass,
+	// and the loop must exit on the first pass that observes cancellation —
+	// so the observed count equals the cancel threshold EXACTLY. This pins a
+	// real property of the loop (one query per poll iteration, prompt exit
+	// on cancel); a regression that issued multiple queries per iteration,
+	// or kept polling after cancellation, would push the count past the
+	// threshold (or hang) and fail here — unlike a `got < N` upper bound,
+	// which the deterministic cancel makes vacuously true by construction.
+	if got := startedQueries.Load(); got != cancelAfterStartedQueries {
+		t.Errorf("started-category audit queries = %d, want exactly %d (one query per pass, prompt exit on cancel)", got, cancelAfterStartedQueries)
 	}
 }
 
