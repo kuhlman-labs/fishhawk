@@ -2,7 +2,6 @@ package claudecode
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -57,8 +56,8 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 		return nil, "", fmt.Errorf("claudecode: inference failed: %w", err)
 	}
 
-	var verdict planreview.ReviewVerdict
-	if err := json.Unmarshal([]byte(responseText), &verdict); err != nil {
+	verdict, err := planreview.DecodeVerdict([]byte(responseText))
+	if err != nil {
 		return nil, "", fmt.Errorf("claudecode: decode verdict JSON: %w", err)
 	}
 

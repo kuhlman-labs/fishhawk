@@ -41,6 +41,13 @@ func TestHelperProcess(t *testing.T) {
 	case "bad_verdict":
 		// Valid envelope, valid JSON, but verdict outside the closed set.
 		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"maybe\"}"}`)
+	case "invalid_escape_regex":
+		// The #739 bug end-to-end: a success envelope whose result text is a
+		// verdict JSON that quotes a regex containing a lone `\-`. The envelope
+		// itself is valid JSON; after the envelope decode, responseText carries
+		// the lone backslash escape, which a strict json.Unmarshal rejects and
+		// DecodeVerdict must repair.
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"reject\",\"free_form\":\"redact ghs_[A-Za-z0-9_.\\-]{36,}\"}"}`)
 	case "killed":
 		// Reproduce the #620 SIGKILL with empty stderr: the child kills
 		// itself, surfacing as an *exec.ExitError ("signal: killed") with
@@ -154,6 +161,23 @@ func TestReviewer_UnknownVerdict(t *testing.T) {
 	_, _, err := reviewerWithMode("bad_verdict").Review(context.Background(), "review this plan")
 	if err == nil {
 		t.Fatal("expected error from unknown verdict value, got nil")
+	}
+}
+
+// TestReviewer_InvalidEscapeRegexDecodes drives the #739 bug through the full
+// envelope-decode -> verdict-decode -> validVerdicts seam: a verdict body
+// quoting a regex with a lone `\-` must yield a decoded verdict, not a "decode
+// verdict JSON" error, with the regex preserved verbatim in FreeForm.
+func TestReviewer_InvalidEscapeRegexDecodes(t *testing.T) {
+	verdict, _, err := reviewerWithMode("invalid_escape_regex").Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: got error for a verdict carrying a regex escape, want a decoded verdict: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictReject {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, planreview.VerdictReject)
+	}
+	if !strings.Contains(verdict.FreeForm, `ghs_[A-Za-z0-9_.\-]{36,}`) {
+		t.Errorf("FreeForm = %q, want it to contain the regex verbatim", verdict.FreeForm)
 	}
 }
 

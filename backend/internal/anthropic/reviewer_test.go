@@ -176,6 +176,34 @@ func TestReviewer_InvalidVerdictShape(t *testing.T) {
 	}
 }
 
+// TestReviewer_InvalidEscapeRegexDecodes drives the #739 bug through the SDK
+// backend: the model-emitted verdict text quotes a regex containing a lone
+// `\-` (illegal as a JSON string escape). The SDK envelope is valid JSON; the
+// nested verdict text carries the lone backslash, which must decode to a
+// verdict rather than a "decode verdict JSON" error, with the regex preserved.
+func TestReviewer_InvalidEscapeRegexDecodes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// The json encoder escapes the lone backslash to `\\-` on the wire;
+		// the SDK decodes it back to `\-` in the text field, reproducing the
+		// invalid-escape verdict text the model emitted.
+		_ = json.NewEncoder(w).Encode(okResp(`{"verdict":"reject","free_form":"redact ghs_[A-Za-z0-9_.\-]{36,}"}`))
+	}))
+	defer srv.Close()
+
+	reviewer := NewReviewer(testConfig(), option.WithBaseURL(srv.URL))
+	verdict, _, err := reviewer.Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: got error for a verdict carrying a regex escape, want a decoded verdict: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictReject {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, planreview.VerdictReject)
+	}
+	if !strings.Contains(verdict.FreeForm, `ghs_[A-Za-z0-9_.\-]{36,}`) {
+		t.Errorf("FreeForm = %q, want it to contain the regex verbatim", verdict.FreeForm)
+	}
+}
+
 // TestReviewer_PopulatesUsage asserts the SDK response's Usage block is
 // surfaced on the returned verdict (#681): the adapter attaches token usage
 // from the API envelope (not the agent JSON), with Known=true on the happy
