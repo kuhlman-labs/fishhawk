@@ -82,3 +82,30 @@ func TestDecodeVerdict_MalformedReturnsOriginalError(t *testing.T) {
 		t.Fatal("expected a decode error from truncated JSON, got nil")
 	}
 }
+
+// TestDecodeVerdict_UnicodeEscapeSurvivesSanitizer exercises the sanitizer's
+// `\uXXXX` branch (decode.go), which the strict-path round-trip test does not
+// reach. The input fails the strict decode (a lone `\-`), forcing the
+// sanitizing retry; a legitimate `é` in the SAME string must be consumed
+// intact (decoded to é), not doubled, while the `\-` is doubled to a literal.
+func TestDecodeVerdict_UnicodeEscapeSurvivesSanitizer(t *testing.T) {
+	// Raw model bytes: a valid é (é) and an illegal \- in one string.
+	raw := []byte(`{"verdict":"approve","free_form":"café matches \- here"}`)
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.Verdict != VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, VerdictApprove)
+	}
+	// é must have decoded to é (the sanitizer left the unicode escape
+	// intact rather than doubling its backslash).
+	if !strings.Contains(verdict.FreeForm, "café") {
+		t.Errorf("FreeForm = %q, want it to contain decoded unicode 'café'", verdict.FreeForm)
+	}
+	// The illegal \- must survive as a literal backslash-dash.
+	if !strings.Contains(verdict.FreeForm, `\-`) {
+		t.Errorf("FreeForm = %q, want it to contain literal \\-", verdict.FreeForm)
+	}
+}
