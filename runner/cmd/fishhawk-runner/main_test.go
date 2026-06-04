@@ -2957,6 +2957,11 @@ func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 	if fp.gotArgs.RebaseFromRemote {
 		t.Error("RebaseFromRemote = true, want false for first child (branch not yet on remote)")
 	}
+	// Compile gate (#728) is off for decomposed children: a child may
+	// legitimately not compile in isolation before later children land.
+	if fp.gotArgs.VerifyCommit != nil {
+		t.Error("VerifyCommit hook should be nil for decomposed children")
+	}
 	// First child: per ADR-032 the child no longer opens a PR — the parent
 	// run opens the single consolidated PR once all children settle.
 	if fpr.gotArgs != nil {
@@ -3615,5 +3620,224 @@ func TestRun_SelfRetry_RetryStage422_ExitsWithOriginalFailure(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"category":"A"`) {
 		t.Errorf("original category-A must be preserved:\n%s", stderr.String())
+	}
+}
+
+// --- #728 implement-stage compile gate -------------------------------
+
+// compileGateRepo inits a throwaway git repo with a commit-able identity
+// and signing disabled, returning the repo path and a bound runGit.
+func compileGateRepo(t *testing.T) (string, func(args ...string)) {
+	t.Helper()
+	repo := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	return repo, runGit
+}
+
+func gitHead(t *testing.T, repo string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// TestVerifyCommittedTreeCompiles_NoDriftFastPath: with no excluded
+// files, nothing build-required could have been dropped, so the gate
+// returns nil immediately without touching git or the toolchain.
+func TestVerifyCommittedTreeCompiles_NoDriftFastPath(t *testing.T) {
+	if err := verifyCommittedTreeCompiles(context.Background(), t.TempDir(), "deadbeef", nil, io.Discard); err != nil {
+		t.Errorf("no-drift fast path should return nil, got %v", err)
+	}
+}
+
+// TestVerifyCommittedTreeCompiles_NonGoRepoFastPath: a repo with no
+// go.work at its root is not a Go workspace to vet, so the gate skips
+// (returns nil) even when drift is present.
+func TestVerifyCommittedTreeCompiles_NonGoRepoFastPath(t *testing.T) {
+	if err := verifyCommittedTreeCompiles(context.Background(), t.TempDir(), "deadbeef", []string{"x.go"}, io.Discard); err != nil {
+		t.Errorf("non-Go-repo fast path should return nil, got %v", err)
+	}
+}
+
+// TestVerifyCommittedTreeCompiles_CompileFailureBlocks is the end-to-end
+// seam for #728: it crosses the commit→worktree→vet boundaries. A
+// scope-only committed tree drops a build-required conformance method,
+// so the committed tree fails `go vet` (the assertion lives in a test
+// file, which `go build` would skip but `go vet` typechecks). The
+// working tree carries the fix as drift on disk and compiles — proving
+// the gate builds the COMMITTED tree, not the working tree. The test is
+// hermetic: the module has no external dependencies.
+func TestVerifyCommittedTreeCompiles_CompileFailureBlocks(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	// impl does NOT implement Doer; the failing assertion is in a _test.go
+	// file so only `go vet` (not `go build`) catches it.
+	mustWrite(t, filepath.Join(repo, "mod", "doer.go"),
+		"package mod\n\ntype Doer interface{ Do() }\n\ntype impl struct{}\n")
+	mustWrite(t, filepath.Join(repo, "mod", "doer_test.go"),
+		"package mod\n\nvar _ Doer = impl{}\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "scope-only commit missing the Do() method")
+	head := gitHead(t, repo)
+
+	// Working-tree drift: add the conformance method on disk (uncommitted).
+	// The working tree now compiles, but the committed tree does not.
+	mustWrite(t, filepath.Join(repo, "mod", "doer.go"),
+		"package mod\n\ntype Doer interface{ Do() }\n\ntype impl struct{}\n\nfunc (impl) Do() {}\n")
+	vet := exec.Command("go", "vet", "./...")
+	vet.Dir = filepath.Join(repo, "mod")
+	if out, err := vet.CombinedOutput(); err != nil {
+		t.Fatalf("working tree should compile, but go vet failed: %v\n%s", err, out)
+	}
+
+	var log bytes.Buffer
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"mod/doer.go"}, &log)
+	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) {
+		t.Fatalf("err = %v, want ErrCommitWouldNotCompile\nlog: %s", err, log.String())
+	}
+	if !strings.Contains(err.Error(), "mod/doer.go") {
+		t.Errorf("error should name the drift file mod/doer.go: %v", err)
+	}
+}
+
+// TestVerifyCommittedTreeCompiles_DepResolutionFailureSkips: a `go vet`
+// non-zero exit caused by an unresolvable dependency (offline) is NOT a
+// compile/typecheck diagnostic, so it must skip (non-blocking) rather
+// than block. Hermetic: GOPROXY=off forces the failure to surface as a
+// dependency-resolution error with no network.
+func TestVerifyCommittedTreeCompiles_DepResolutionFailureSkips(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	t.Setenv("GOPROXY", "off")
+	t.Setenv("GOFLAGS", "-mod=mod")
+
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "use.go"),
+		"package mod\n\nimport _ \"example.com/totally/absent/pkg\"\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "imports an unavailable dependency")
+	head := gitHead(t, repo)
+
+	var log bytes.Buffer
+	if err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"mod/use.go"}, &log); err != nil {
+		t.Fatalf("dep-resolution failure must NOT block, got %v\nlog: %s", err, log.String())
+	}
+	if !strings.Contains(log.String(), "compile_gate_skipped") {
+		t.Errorf("expected compile_gate_skipped log, got: %s", log.String())
+	}
+}
+
+// TestLooksLikeCompileError covers the positive-allowlist classifier
+// that separates a genuine typecheck diagnostic (block) from a
+// dependency-resolution failure or vet-analyzer finding (skip).
+func TestLooksLikeCompileError(t *testing.T) {
+	block := []string{
+		"fake does not implement R (missing method Foo)",
+		"cannot use fake{} (variable of type fake) as R value",
+		"./x.go:3:9: undefined: Bar",
+	}
+	for _, s := range block {
+		if !looksLikeCompileError(s) {
+			t.Errorf("looksLikeCompileError(%q) = false, want true", s)
+		}
+	}
+	skip := []string{
+		"no required module provides package example.com/x; to add it: go get example.com/x",
+		"cannot find module providing package example.com/y",
+		"Printf format %d has arg s of wrong type string",
+		"",
+	}
+	for _, s := range skip {
+		if looksLikeCompileError(s) {
+			t.Errorf("looksLikeCompileError(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestRun_ImplementStage_CompileGateFailure_CategoryB confirms the #728
+// failure mode (documented by #742): when the pre-push compile gate
+// returns ErrCommitWouldNotCompile, the implement stage must surface as
+// FAILED with category B (re-scope/re-plan), exit non-zero, and abort
+// BEFORE opening a PR — no non-compiling PR, no null-PR "succeeded"
+// zombie. CommitAndPush returns the sentinel exactly as the real
+// gitops.Pusher does when its VerifyCommit hook fails.
+func TestRun_ImplementStage_CompileGateFailure_CategoryB(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: gitops.ErrCommitWouldNotCompile}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B on compile-gate failure, got:\n%s", stderr.String())
+	}
+	// Gate is wired on the standalone PR-opening path.
+	if fp.gotArgs == nil || fp.gotArgs.VerifyCommit == nil {
+		t.Error("VerifyCommit hook should be set on the standalone implement path")
+	}
+	// Aborted pre-PR: no non-compiling PR is opened, no artifact shipped.
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not be called after a compile-gate failure")
+	}
+	if fu.gotPRArgs != nil {
+		t.Error("ShipPullRequest must not be called after a compile-gate failure")
 	}
 }

@@ -424,6 +424,133 @@ func mustGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// TestCommitAndPush_VerifyCommit_AbortsBeforePush is the #728 gate seam:
+// the VerifyCommit hook runs AFTER the scope-only commit exists but
+// BEFORE the push, receives the committed HEAD SHA and the scope drift,
+// and a non-nil error aborts the push — so the bare remote never
+// receives the ref and the error surfaces via errors.Is.
+func TestCommitAndPush_VerifyCommit_AbortsBeforePush(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+
+	// README.md is in scope; stray.pid is drift (excluded from the commit).
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "stray.pid"), []byte("12345\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotSHA string
+	var gotDrift []string
+	called := false
+	p := &Pusher{}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/verify/branch",
+		CommitMessage: "Scoped commit",
+		RemoteURL:     bare,
+		ScopeFiles:    []string{"README.md"},
+		VerifyCommit: func(_ context.Context, headSHA string, drift []string) error {
+			called = true
+			gotSHA = headSHA
+			gotDrift = drift
+			// The commit must already exist when the hook runs.
+			if headSHA == "" {
+				t.Error("VerifyCommit got empty headSHA")
+			}
+			return ErrCommitWouldNotCompile
+		},
+	})
+	if !called {
+		t.Fatal("VerifyCommit was never invoked")
+	}
+	if !errors.Is(err, ErrCommitWouldNotCompile) {
+		t.Fatalf("CommitAndPush error = %v, want errors.Is ErrCommitWouldNotCompile", err)
+	}
+	// The hook saw the real committed HEAD SHA.
+	localHead := mustGitOut(t, repo, "rev-parse", "HEAD")
+	if gotSHA != localHead {
+		t.Errorf("VerifyCommit headSHA = %q, want committed HEAD %q", gotSHA, localHead)
+	}
+	// The hook saw the scope drift.
+	if len(gotDrift) != 1 || gotDrift[0] != "stray.pid" {
+		t.Errorf("VerifyCommit drift = %v, want [stray.pid]", gotDrift)
+	}
+	// The push was aborted: the bare remote has no such branch.
+	check := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/verify/branch")
+	if out, err := check.CombinedOutput(); err == nil {
+		t.Errorf("bare remote unexpectedly has the branch (push not aborted): %s", out)
+	}
+}
+
+// TestCommitAndPush_VerifyCommit_PassThroughPushes confirms the happy
+// path: a VerifyCommit that returns nil does not block the push.
+func TestCommitAndPush_VerifyCommit_PassThroughPushes(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/verify/ok",
+		CommitMessage: "Verified commit",
+		RemoteURL:     bare,
+		VerifyCommit: func(_ context.Context, _ string, _ []string) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush: %v", err)
+	}
+	// The branch landed in the bare remote.
+	out, err := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/verify/ok").Output()
+	if err != nil {
+		t.Fatalf("verify branch in bare: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != res.HeadSHA {
+		t.Errorf("bare branch sha = %q, want %q", strings.TrimSpace(string(out)), res.HeadSHA)
+	}
+}
+
 // Make sure `errors` is used so a refactor that drops the import
 // stays caught by go vet/imports tooling.
 var _ = errors.New

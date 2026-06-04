@@ -34,6 +34,14 @@ import (
 // "origin" in the GitHub Actions checkout shape.
 const DefaultRemote = "origin"
 
+// ErrCommitWouldNotCompile is the sentinel a VerifyCommit hook wraps
+// (via fmt.Errorf("%w: ...")) when the scope-only committed tree fails
+// to compile because build-required files were excluded as scope drift
+// (#728). CommitAndPush returns it BEFORE pushing, so the failure leaves
+// origin untouched — no broken branch, no PR. The runner classifies it
+// as a category-B failure (wrong-shaped output → re-scope/re-plan).
+var ErrCommitWouldNotCompile = errors.New("gitops: committed tree would not compile")
+
 // DefaultAuthorName + DefaultAuthorEmail are the dev/CLI fallback bot
 // identity used ONLY when the caller doesn't override — i.e. runs with no
 // resolvable GitHub App (local-runner, CLI, dev). For App-backed runs the
@@ -118,6 +126,19 @@ type CommitAndPushArgs struct {
 	// to `git add -A` (preserves the plan_missing_for_implement
 	// behavior). Paths are repo-relative, matching scope.files entries.
 	ScopeFiles []string
+
+	// VerifyCommit, when non-nil, is invoked AFTER the scope-only commit
+	// is created and BEFORE the push, with the new HEAD SHA and the scope
+	// drift (dirty-but-undeclared paths excluded from the commit). A
+	// non-nil error aborts the push and is returned to the caller verbatim
+	// — because no push has happened yet, a gate failure leaves origin
+	// untouched (no broken branch, no PR). This is the compile-gate hook
+	// for #728: the runner supplies a callback that compiles the committed
+	// tree in an isolated worktree and returns ErrCommitWouldNotCompile
+	// when build-required drift was dropped. Keeping the build logic in a
+	// caller-supplied callback keeps gitops toolchain-agnostic. Never
+	// invoked on the NoChanges short-circuit paths.
+	VerifyCommit func(ctx context.Context, headSHA string, drift []string) error
 }
 
 // CommitAndPushResult captures the SHAs the runner needs to populate
@@ -256,6 +277,18 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		return nil, fmt.Errorf("gitops: rev-parse new HEAD: %w", err)
 	}
 	headSHA = strings.TrimSpace(headSHA)
+
+	// Compile-gate hook (#728): verify the scope-only committed tree
+	// before any push. Runs after the commit exists (so headSHA is real
+	// and checkoutable in an isolated worktree) but before the push, so a
+	// gate failure leaves origin untouched. scopeDrift names the files the
+	// commit excluded — the candidate build-required set the callback
+	// reports in its error.
+	if args.VerifyCommit != nil {
+		if err := args.VerifyCommit(ctx, headSHA, scopeDrift); err != nil {
+			return nil, err
+		}
+	}
 
 	// Refresh the local extraheader if the caller supplied a fresh
 	// PushToken. This is the long-running-stage path: the workflow's
