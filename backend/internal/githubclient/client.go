@@ -1706,21 +1706,30 @@ func (c *Client) GetApp(ctx context.Context) (*App, error) {
 
 // User is the slice of a GitHub user/account payload Fishhawk needs:
 // the numeric account id, which composes the bot's no-reply commit
-// email (`<id>+<login>@users.noreply.github.com`).
+// email (`<id>+<login>@users.noreply.github.com`). Read via an
+// unauthenticated public-user lookup (GetUser), not the App JWT.
 type User struct {
 	ID    int64
 	Login string
 }
 
-// GetUser fetches a single account by login. Authenticates with the
-// App JWT (the bot user-id read here belongs to the App's own bot
-// account, resolved alongside GetApp in the commit-identity flow, #722).
+// GetUser fetches a single account by login via an UNAUTHENTICATED
+// public-user lookup. The bot user-id read here belongs to the App's
+// own bot account, resolved alongside GetApp in the commit-identity
+// flow (#722).
 //
 //	GET /users/{login}
 //
+// This endpoint is public and returns 200 without auth, so GetUser does
+// NOT send the App JWT — and must not. The App JWT is only valid for
+// /app* endpoints; routing this public call through it made GitHub 401
+// with "Bad credentials", silently failing the commit-identity resolve
+// and falling back to the hardcoded fishhawk-runner[bot] (#750). GetUser
+// is therefore independent of the App JWT and resolves even when AppJWT
+// is nil.
+//
 // Returns ErrNotFound when the login doesn't exist or isn't visible,
-// ErrForbidden on auth issues. A client without a wired signer hits the
-// AppJWT nil guard.
+// ErrForbidden on auth issues.
 func (c *Client) GetUser(ctx context.Context, login string) (*User, error) {
 	if login == "" {
 		return nil, errors.New("githubclient: login required")
@@ -1728,7 +1737,7 @@ func (c *Client) GetUser(ctx context.Context, login string) (*User, error) {
 
 	endpoint := c.endpoint("/users/" + url.PathEscape(login))
 
-	req, err := c.buildAppJWTRequest(ctx, http.MethodGet, endpoint, nil)
+	req, err := c.buildAnonymousRequest(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1769,6 +1778,23 @@ func (c *Client) buildAppJWTRequest(ctx context.Context, method, rawURL string, 
 		return nil, fmt.Errorf("githubclient: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	return req, nil
+}
+
+// buildAnonymousRequest constructs an http.Request with the standard
+// GitHub headers but NO Authorization header — for public endpoints
+// (e.g. GET /users/{login}) that return 200 unauthenticated and that
+// the App JWT must not touch (it is only valid for /app* endpoints; see
+// GetUser / #750). Unauthenticated requests share GitHub's lower
+// per-IP rate limit, acceptable here because the only caller resolves
+// once per process (#722).
+func (*Client) buildAnonymousRequest(ctx context.Context, method, rawURL string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: build request: %w", err)
+	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	return req, nil
