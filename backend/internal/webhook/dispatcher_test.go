@@ -966,6 +966,9 @@ func (s *stubRuns) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.
 func (s *stubRuns) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (s *stubRuns) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 
 func (s *stubRuns) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")

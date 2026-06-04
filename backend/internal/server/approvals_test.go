@@ -270,6 +270,9 @@ func (r *approvalRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.S
 func (r *approvalRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (r *approvalRunRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 
 func (r *approvalRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, nil
@@ -736,6 +739,10 @@ func (r *orchestratorRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) 
 }
 
 func (r *orchestratorRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
+func (r *orchestratorRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
 

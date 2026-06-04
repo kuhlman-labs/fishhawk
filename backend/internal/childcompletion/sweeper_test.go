@@ -100,6 +100,10 @@ func (f *fakeRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*r
 func (f *fakeRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (f *fakeRunRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (f *fakeRunRepo) ListStagesDispatched(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }

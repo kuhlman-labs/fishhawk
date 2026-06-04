@@ -66,6 +66,10 @@ func (r *statusCommentRunRepo) GetStage(context.Context, uuid.UUID) (*run.Stage,
 func (r *statusCommentRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (r *statusCommentRunRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
+
 func (r *statusCommentRunRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }

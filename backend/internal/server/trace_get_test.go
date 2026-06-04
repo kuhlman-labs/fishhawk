@@ -89,6 +89,9 @@ func (r *traceReadStageRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*ru
 func (r *traceReadStageRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
 }
+func (r *traceReadStageRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, errors.New("not used")
+}
 
 func (r *traceReadStageRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")

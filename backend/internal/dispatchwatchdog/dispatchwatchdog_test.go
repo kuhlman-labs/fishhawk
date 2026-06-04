@@ -109,6 +109,9 @@ func (f *fakeRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, e
 func (f *fakeRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, nil
 }
+func (f *fakeRepo) ListReviewStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
 
 func (f *fakeRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
 	return nil, nil

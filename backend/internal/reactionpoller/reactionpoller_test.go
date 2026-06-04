@@ -45,6 +45,10 @@ func (f *fakeRunRepo) ListStagesAwaitingApproval(_ context.Context) ([]*run.Stag
 	return f.stages, nil
 }
 
+func (f *fakeRunRepo) ListReviewStagesAwaitingApproval(_ context.Context) ([]*run.Stage, error) {
+	return nil, nil
+}
+
 func (f *fakeRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
