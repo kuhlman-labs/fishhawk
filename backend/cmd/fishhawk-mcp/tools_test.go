@@ -2723,6 +2723,9 @@ func TestApprovePlan_HappyPath_ResolvesAndPostsApprove(t *testing.T) {
 	r := newResolver(srv, nil)
 	runID := uuid.New()
 	stageID := seedPlanStage(fb, runID)
+	// gh resolves the operator's real login (#751); the approve tool
+	// threads it through as approver_github_login.
+	withFakeGh(t, "kuhlman-labs")
 
 	_, out, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
 		RunID:  runID.String(),
@@ -2730,6 +2733,9 @@ func TestApprovePlan_HappyPath_ResolvesAndPostsApprove(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.ApproverGithubLogin != "kuhlman-labs" {
+		t.Errorf("approver_github_login = %q, want kuhlman-labs", fb.approvalsBody.ApproverGithubLogin)
 	}
 	if out.StageID != stageID.String() {
 		t.Errorf("resolved StageID = %q, want %s", out.StageID, stageID.String())
@@ -2753,6 +2759,7 @@ func TestRejectPlan_HappyPath_ResolvesAndPostsReject(t *testing.T) {
 	r := newResolver(srv, nil)
 	runID := uuid.New()
 	stageID := seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
 
 	_, out, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
 		RunID:  runID.String(),
@@ -2760,6 +2767,9 @@ func TestRejectPlan_HappyPath_ResolvesAndPostsReject(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("rejectPlan: %v", err)
+	}
+	if fb.approvalsBody.ApproverGithubLogin != "kuhlman-labs" {
+		t.Errorf("approver_github_login = %q, want kuhlman-labs", fb.approvalsBody.ApproverGithubLogin)
 	}
 	if out.StageID != stageID.String() {
 		t.Errorf("resolved StageID = %q, want %s", out.StageID, stageID.String())
@@ -2784,6 +2794,7 @@ func TestApprovePlan_NoReason_PassesEmptyComment(t *testing.T) {
 	r := newResolver(srv, nil)
 	runID := uuid.New()
 	seedPlanStage(fb, runID)
+	withFakeGhMissing(t)
 
 	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
 	if err != nil {
@@ -2791,6 +2802,50 @@ func TestApprovePlan_NoReason_PassesEmptyComment(t *testing.T) {
 	}
 	if fb.approvalsBody.Comment != "" {
 		t.Errorf("comment = %q, want empty", fb.approvalsBody.Comment)
+	}
+}
+
+// TestApprovePlan_ForwardsResolvedGithubLogin pins the #751 thread:
+// the resolved gh login lands in the approval body's
+// approver_github_login field for issue-thread `@`-mention rendering.
+func TestApprovePlan_ForwardsResolvedGithubLogin(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.ApproverGithubLogin != "kuhlman-labs" {
+		t.Errorf("approver_github_login = %q, want kuhlman-labs", fb.approvalsBody.ApproverGithubLogin)
+	}
+}
+
+// TestApprovePlan_GhMissing_StillApprovesWithoutLogin keeps the
+// approval best-effort (#751): a missing gh yields an empty login and
+// a warning on the tool result, never a blocked approval.
+func TestApprovePlan_GhMissing_StillApprovesWithoutLogin(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGhMissing(t)
+
+	meta, out, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("approvePlan should not fail when gh is missing: %v", err)
+	}
+	if out.Stage.State != "succeeded" {
+		t.Errorf("State = %q, want succeeded", out.Stage.State)
+	}
+	if fb.approvalsBody.ApproverGithubLogin != "" {
+		t.Errorf("approver_github_login = %q, want empty when gh missing", fb.approvalsBody.ApproverGithubLogin)
+	}
+	if meta == nil || len(meta.Content) == 0 {
+		t.Error("expected a warning on the tool result when gh is missing")
 	}
 }
 
@@ -2846,6 +2901,7 @@ func TestApprovePlan_BackendStateMachineRefusal_PropagatesAsToolError(t *testing
 	r := newResolver(srv, nil)
 	runID := uuid.New()
 	seedPlanStage(fb, runID)
+	withFakeGhMissing(t)
 
 	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
 	if err == nil {
@@ -2864,6 +2920,7 @@ func TestRejectPlan_NoReason_PassesEmptyComment(t *testing.T) {
 	r := newResolver(srv, nil)
 	runID := uuid.New()
 	seedPlanStage(fb, runID)
+	withFakeGhMissing(t)
 
 	_, _, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{RunID: runID.String()})
 	if err != nil {

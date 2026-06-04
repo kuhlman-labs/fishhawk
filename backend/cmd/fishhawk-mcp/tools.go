@@ -1338,11 +1338,17 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, ApprovePlanOutput{}, fmt.Errorf("resolved plan stage has invalid id %q: %w", planStage.ID, err)
 	}
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason)
+	// Resolve the operator's real GitHub login best-effort (#751) so
+	// the issue-thread status footer `@`-mentions the right user
+	// instead of the raw token subject. A missing/unauthed gh yields a
+	// warning on the tool result and an empty login — never a blocked
+	// approval.
+	login, warn := resolveApproverGithubLogin()
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login)
 	if err != nil {
 		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
-	return nil, ApprovePlanOutput{Stage: *updated, StageID: updated.ID}, nil
+	return approverLoginWarning(warn), ApprovePlanOutput{Stage: *updated, StageID: updated.ID}, nil
 }
 
 // rejectPlan is the tool handler.
@@ -1355,11 +1361,45 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("resolved plan stage has invalid id %q: %w", planStage.ID, err)
 	}
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason)
+	// Resolve the operator's real GitHub login best-effort (#751); see
+	// approvePlan for the rationale. Empty on gh failure, never fatal.
+	login, warn := resolveApproverGithubLogin()
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login)
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
-	return nil, RejectPlanOutput{Stage: *updated, StageID: updated.ID}, nil
+	return approverLoginWarning(warn), RejectPlanOutput{Stage: *updated, StageID: updated.ID}, nil
+}
+
+// resolveApproverGithubLogin wraps resolveGitHubLoginViaGh for the
+// approve/reject tools (#751). It is strictly best-effort: any gh
+// failure (binary missing, unauthed, error) yields an empty login and
+// a human-readable warning string for the tool result, never an error
+// that would block the approval. The empty-login case degrades to the
+// notifier's "an approver" rendering rather than an incorrect mention.
+func resolveApproverGithubLogin() (login, warning string) {
+	resolved, err := resolveGitHubLoginViaGh()
+	switch {
+	case err == nil:
+		return resolved, ""
+	case errors.Is(err, ErrGhNotInstalled):
+		return "", "gh CLI not on PATH; recording the approval without a resolved GitHub login. The issue-thread status will read \"an approver\" instead of an @-mention."
+	default:
+		return "", fmt.Sprintf("could not resolve GitHub login via gh (%v); recording the approval without one — the issue-thread status will read \"an approver\".", err)
+	}
+}
+
+// approverLoginWarning turns a non-empty warning into a CallToolResult
+// carrying it as text content, or nil when there's nothing to report.
+// Mirrors startRun's warnings-on-the-result pattern so the operator
+// sees the degradation without it failing the call.
+func approverLoginWarning(warning string) *mcp.CallToolResult {
+	if warning == "" {
+		return nil
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: warning}},
+	}
 }
 
 // resolvePlanStage walks the run's stages and returns the one with

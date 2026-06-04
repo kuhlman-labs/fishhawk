@@ -185,20 +185,34 @@ type StartRunParams struct {
 type approvalRequest struct {
 	Decision string `json:"decision"`
 	Comment  string `json:"comment,omitempty"`
+	// ApproverGithubLogin is the resolved GitHub login of the acting
+	// operator (#751), threaded through so the issue-thread status
+	// footer `@`-mentions the real login rather than the raw token
+	// subject. Omitempty: SPA/CLI callers omit it and stay unaffected.
+	ApproverGithubLogin string `json:"approver_github_login,omitempty"`
 }
 
 // SubmitApproval posts an approve or reject decision against the
 // given stage. `decision` must be "approve" or "reject"; `comment`
 // is optional but recommended on rejects (the CLI emits a warning
-// when missing). Returns the updated Stage. 4xx surfaces:
+// when missing). `approverGithubLogin` is the resolved GitHub login
+// of the acting operator (#751) — empty when gh resolution was
+// unavailable; the backend records it in the approval audit payload
+// for issue-thread `@`-mention rendering while keeping the token
+// subject as the provenance identity. Returns the updated Stage. 4xx
+// surfaces:
 //   - 400 validation_failed (decision other than approve/reject)
 //   - 404 stage_not_found
 //   - 409 review_stage_managed_by_github (review-stage approvals
 //     live on GitHub per ADR-018; not relevant for the MCP plan-
 //     approval tools but the wrapper surfaces the code if a future
 //     caller reaches this method with a review-stage id)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment string) (*Stage, error) {
-	body, err := json.Marshal(approvalRequest{Decision: decision, Comment: comment})
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string) (*Stage, error) {
+	body, err := json.Marshal(approvalRequest{
+		Decision:            decision,
+		Comment:             comment,
+		ApproverGithubLogin: approverGithubLogin,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1399,6 +1400,107 @@ func TestSubmitApproval_Reject_RejectionCommentInAuditPayload(t *testing.T) {
 	if !foundSubmitted {
 		t.Errorf("expected approval_submitted audit entry, got %+v", au.appended)
 	}
+}
+
+// submitApprovalAs posts an approval with an explicit token subject,
+// bypassing the muxer (which would run bearerAuth and overwrite the
+// injected identity). Mirrors approveRequest in approvals_role_test.go
+// but takes the raw JSON body so the #751 test can thread
+// approver_github_login.
+func submitApprovalAs(t *testing.T, s *Server, stageID uuid.UUID, subject, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/stages/%s/approvals", stageID), strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("stage_id", stageID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{Subject: subject}))
+	w := httptest.NewRecorder()
+	s.handleSubmitApproval(w, req)
+	return w
+}
+
+// TestSubmitApproval_ApproverGithubLogin_CrossBoundary is the #751
+// cross-boundary seam: an MCP-loop approval whose token subject is the
+// non-login "brett@local-mcp" but which threads a resolved
+// approver_github_login must (a) record the token subject as the audit
+// `approver` (provenance) and the resolved login as a SUPPLEMENTARY
+// `approver_github_login`, and (b) render the issue-thread status
+// footer with the resolved login's `@`-mention — not the token
+// subject. It also pins the stop-the-ping guarantee: an approval with
+// only the bare token subject (no resolved login) renders "an
+// approver", never an `@`-mention. The seam crossed is HTTP body →
+// handler → approval_submitted audit payload → notifier footer render.
+func TestSubmitApproval_ApproverGithubLogin_CrossBoundary(t *testing.T) {
+	const tokenSubject = "brett@local-mcp"
+
+	// (1) Resolved-login path.
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApprovalAs(t, s, stage.ID, tokenSubject,
+		`{"decision":"approve","approver_github_login":"kuhlman-labs"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if got := payload["approver"]; got != tokenSubject {
+		t.Errorf("audit approver = %v, want %q (provenance must stay the token subject)", got, tokenSubject)
+	}
+	if got := payload["approver_github_login"]; got != "kuhlman-labs" {
+		t.Errorf("audit approver_github_login = %v, want kuhlman-labs", got)
+	}
+
+	// Render the footer from the exact audit payload the handler wrote.
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("re-marshal payload: %v", err)
+	}
+	footer := issuecomment.PlanStatusFooterForAuditPayload(raw)
+	if footer != "_Status: approved by @kuhlman-labs · implementing now_" {
+		t.Errorf("footer = %q, want @kuhlman-labs mention", footer)
+	}
+
+	// (2) Stop-the-ping path: bare token subject, no resolved login.
+	s2, _, rr2, au2 := newApprovalServer(t)
+	stage2 := rr2.seedStage(run.StageStateAwaitingApproval)
+
+	w2 := submitApprovalAs(t, s2, stage2.ID, tokenSubject, `{"decision":"approve"}`)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("bare-subject status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	bare := findApprovalSubmittedPayload(t, au2.appended)
+	if got := bare["approver"]; got != tokenSubject {
+		t.Errorf("bare audit approver = %v, want %q", got, tokenSubject)
+	}
+	if _, ok := bare["approver_github_login"]; ok {
+		t.Errorf("approver_github_login must be omitted when none was sent; payload: %v", bare)
+	}
+	rawBare, err := json.Marshal(bare)
+	if err != nil {
+		t.Fatalf("re-marshal bare payload: %v", err)
+	}
+	if got := issuecomment.PlanStatusFooterForAuditPayload(rawBare); got != "_Status: approved by an approver · implementing now_" {
+		t.Errorf("bare-subject footer = %q, want \"an approver\" (no ping)", got)
+	}
+}
+
+// findApprovalSubmittedPayload returns the decoded payload of the
+// single approval_submitted audit entry, failing the test when absent.
+func findApprovalSubmittedPayload(t *testing.T, appended []audit.ChainAppendParams) map[string]any {
+	t.Helper()
+	for _, e := range appended {
+		if e.Category != "approval_submitted" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal audit payload: %v", err)
+		}
+		return payload
+	}
+	t.Fatalf("expected an approval_submitted audit entry, got %+v", appended)
+	return nil
 }
 
 func TestSubmitApproval_Reject_EmptyComment_NoRejectionCommentInPayload(t *testing.T) {
