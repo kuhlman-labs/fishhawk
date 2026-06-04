@@ -195,6 +195,15 @@ type Repository interface {
 	// efficiency).
 	ListStagesAwaitingApproval(ctx context.Context) ([]*Stage, error)
 
+	// ListReviewStagesAwaitingApproval returns every review stage
+	// currently in awaiting_approval, REGARDLESS of GateSLA. The merge
+	// reconciler scans this to find review gates to resolve from live PR
+	// state. Distinct from ListStagesAwaitingApproval — that one filters
+	// to a non-null GateSLA for the SLA ticker, which would hide the
+	// feature_change review gate (it carries no sla) from the reconciler
+	// (#725). Ordered updated_at ASC.
+	ListReviewStagesAwaitingApproval(ctx context.Context) ([]*Stage, error)
+
 	// ListStagesAwaitingChildren returns every stage currently in
 	// awaiting_children state. The child-completion sweeper scans
 	// this to find parent stages whose children may have reached

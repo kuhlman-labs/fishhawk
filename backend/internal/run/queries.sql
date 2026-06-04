@@ -118,6 +118,19 @@ SELECT * FROM stages
    AND gate_sla IS NOT NULL
  ORDER BY updated_at ASC;
 
+-- name: ListReviewStagesAwaitingApproval :many
+-- The merge reconciler's candidate listing — every review stage parked
+-- in awaiting_approval, SLA-independent BY DESIGN. Unlike the adjacent
+-- ListStagesAwaitingApproval (which the SLA ticker keeps using with its
+-- `gate_sla IS NOT NULL` filter), this query must NOT filter on gate_sla:
+-- the feature_change review gate has no sla, so an SLA filter would hide
+-- every feature_change merge from the reconciler and park those runs at
+-- review awaiting_approval forever (#725). Ordered updated_at ASC.
+SELECT * FROM stages
+ WHERE state = 'awaiting_approval'
+   AND stage_type = 'review'
+ ORDER BY updated_at ASC;
+
 -- name: ListStagesDispatched :many
 -- Used by the dispatch watchdog (E8.4) to find stages stuck at
 -- 'dispatched' past a configurable timeout. Ordered by updated_at
