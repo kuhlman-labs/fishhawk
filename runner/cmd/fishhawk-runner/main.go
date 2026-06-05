@@ -1833,6 +1833,14 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		PushToken:        token,
 		ForceWithLease:   isDecomposed,
 		RebaseFromRemote: isSubsequent,
+		// Materialize refs/remotes/origin/<shared-branch> to the pushed HEAD
+		// after a decomposed-child URL push (#770). Only decomposed children
+		// share a branch across runs in one clone, so scope it to them; this
+		// keeps remoteBranchExists's routing read and resolvePolicyBaseRef's
+		// diff base (#765) observing the branch as present, and keeps the
+		// bare --force-with-lease's compared ref in sync with origin so the
+		// next child's lease holds instead of rejecting (stale info) (#767).
+		UpdateTrackingRef: isDecomposed,
 		// Scope-bounded commit (#581): stage exactly the approved
 		// plan's declared paths, excluding stray dirty files. Empty
 		// (plan_missing_for_implement) falls back to `git add -A`.

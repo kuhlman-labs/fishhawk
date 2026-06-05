@@ -551,6 +551,168 @@ func TestCommitAndPush_VerifyCommit_PassThroughPushes(t *testing.T) {
 	}
 }
 
+// TestCommitAndPush_UpdateTrackingRef_MaterializesRemoteRef pins #770: a
+// URL push (git push <url> HEAD:<branch>) never updates the local
+// remote-tracking ref refs/remotes/origin/<branch>, so the decomposition
+// fan-out's remoteBranchExists read sees the shared branch as absent and
+// mis-routes the next child. With UpdateTrackingRef:true the ref is
+// materialized to the pushed HEAD; with it false the ref stays absent
+// (the exact bug condition).
+func TestCommitAndPush_UpdateTrackingRef_MaterializesRemoteRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-abc123"
+
+	// setup builds a real repo + bare remote with one initial commit and a
+	// pending agent-style modification, returning the repo dir.
+	setup := func(t *testing.T) (repo, bare string) {
+		t.Helper()
+		dir := t.TempDir()
+		repo = filepath.Join(dir, "src")
+		bare = filepath.Join(dir, "origin.git")
+		if err := os.Mkdir(repo, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, "init", "--initial-branch=main")
+		mustGit(t, repo, "config", "user.name", "init")
+		mustGit(t, repo, "config", "user.email", "init@example.com")
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, "add", "-A")
+		mustGit(t, repo, "commit", "-m", "initial")
+		mustGit(t, repo, "init", "--bare", bare)
+		mustGit(t, repo, "remote", "add", "origin", bare)
+		if err := os.WriteFile(filepath.Join(repo, "child.txt"), []byte("child\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return repo, bare
+	}
+
+	t.Run("true materializes the tracking ref", func(t *testing.T) {
+		repo, bare := setup(t)
+		p := &Pusher{}
+		res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+			RepoDir:           repo,
+			Branch:            branch,
+			CommitMessage:     "child commit",
+			RemoteURL:         bare,
+			UpdateTrackingRef: true,
+		})
+		if err != nil {
+			t.Fatalf("CommitAndPush: %v", err)
+		}
+		// The tracking ref resolves and equals the pushed HEAD.
+		got := mustGitOut(t, repo, "show-ref", "--verify", "-s", "refs/remotes/origin/"+branch)
+		if got != res.HeadSHA {
+			t.Errorf("tracking ref = %q, want HeadSHA %q", got, res.HeadSHA)
+		}
+	})
+
+	t.Run("false leaves the tracking ref absent (the #770 bug condition)", func(t *testing.T) {
+		repo, bare := setup(t)
+		p := &Pusher{}
+		if _, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+			RepoDir:           repo,
+			Branch:            branch,
+			CommitMessage:     "child commit",
+			RemoteURL:         bare,
+			UpdateTrackingRef: false,
+		}); err != nil {
+			t.Fatalf("CommitAndPush: %v", err)
+		}
+		// show-ref --verify exits non-zero when the ref is absent.
+		cmd := exec.Command("git", "show-ref", "--verify", "refs/remotes/origin/"+branch)
+		cmd.Dir = repo
+		if err := cmd.Run(); err == nil {
+			t.Error("tracking ref unexpectedly present after URL push with UpdateTrackingRef:false")
+		}
+	})
+}
+
+// TestCommitAndPush_UpdateTrackingRef_KeepsForceWithLeaseFresh pins #767:
+// in a local fan-out, child A pushes the shared branch via a URL push with
+// UpdateTrackingRef:true; child B then commits through the SAME real Pusher
+// against the SAME bare remote with RebaseFromRemote+ForceWithLease. Because
+// the maintained tracking ref lets CommitAndPush pass an *explicit*
+// --force-with-lease=<branch>:<sha> (a bare lease can't be associated with a
+// URL push and always rejects with `(stale info)`), child B's push SUCCEEDS
+// instead of rejecting. The only residual stale-lease path is an out-of-band
+// branch advance (an operator fold-in mid-fan-out), which is operator
+// discipline, not a runner bug. Same git-state-staleness family as #770.
+func TestCommitAndPush_UpdateTrackingRef_KeepsForceWithLeaseFresh(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-shared01"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+
+	p := &Pusher{}
+
+	// Child A: first child of the fan-out. Not subsequent → checkout -b
+	// path. ForceWithLease + UpdateTrackingRef as the runner sets for
+	// decomposed children.
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:           repo,
+		Branch:            branch,
+		CommitMessage:     "child A",
+		RemoteURL:         bare,
+		ForceWithLease:    true,
+		UpdateTrackingRef: true,
+	}); err != nil {
+		t.Fatalf("child A CommitAndPush: %v", err)
+	}
+
+	// Child B: subsequent child. RebaseFromRemote + ForceWithLease. Without
+	// child A having materialized refs/remotes/origin/<branch>, CommitAndPush
+	// would fall back to a bare --force-with-lease, which a URL push rejects
+	// with `(stale info)`. The maintained ref lets it pass an explicit lease,
+	// so this push succeeds.
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resB, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:           repo,
+		Branch:            branch,
+		CommitMessage:     "child B",
+		RemoteURL:         bare,
+		RebaseFromRemote:  true,
+		ForceWithLease:    true,
+		UpdateTrackingRef: true,
+	})
+	if err != nil {
+		t.Fatalf("child B CommitAndPush (stale-lease regression #767): %v", err)
+	}
+
+	// The bare remote's shared branch now points at child B's HEAD.
+	got := mustGitOut(t, repo, "--git-dir="+bare, "rev-parse", branch)
+	if got != resB.HeadSHA {
+		t.Errorf("bare branch sha = %q, want child B HeadSHA %q", got, resB.HeadSHA)
+	}
+}
+
 // Make sure `errors` is used so a refactor that drops the import
 // stays caught by go vet/imports tooling.
 var _ = errors.New

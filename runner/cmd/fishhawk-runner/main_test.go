@@ -4288,3 +4288,88 @@ func TestComputeAndEmitDiff_DecompositionChild_MeasuresIncrement(t *testing.T) {
 		t.Fatalf("cumulative of %d over maxFiles %d must violate (pre-fix repro)", childAFiles+childBFiles, maxFiles)
 	}
 }
+
+// TestDecompositionFanout_TrackingRefMaterialized_RoutesSubsequent crosses
+// the real gitops push -> tracking-ref -> production remoteBranchExists ->
+// routing seam end-to-end (#770). The bug lives in that seam: a decomposed
+// child pushes the shared branch with a URL push (git push <url> HEAD:<branch>),
+// which never updates refs/remotes/origin/<branch>, so the production
+// remoteBranchExists read sees the branch as absent and mis-routes the next
+// child to the first-child `checkout -b` path (which then fails because the
+// local branch already exists). Per-layer unit tests on a swapped fake pusher
+// could not catch this — it only surfaces when the REAL Pusher's URL push
+// feeds the REAL remoteBranchExists. This is the same git-state-staleness
+// family as #767 (the stale --force-with-lease, fixed by the same maintained
+// ref). The test deliberately does NOT swap newPusher or remoteBranchExists.
+func TestDecompositionFanout_TrackingRefMaterialized_RoutesSubsequent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "base.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	runGit("init", "--bare", bare)
+	runGit("remote", "add", "origin", bare)
+
+	const parentRunID = "aaaaaaaabbbbcccc"
+	sharedBranch := "fishhawk/run-" + shortID(parentRunID)
+	ctx := context.Background()
+
+	// Before any child pushes, the production routing read must report the
+	// shared branch as absent (first-child path).
+	if remoteBranchExists(ctx, repo, sharedBranch) {
+		t.Fatal("remoteBranchExists = true before any push; want false")
+	}
+
+	// Child A: first child of the fan-out. Commit + push the shared branch
+	// via the REAL gitops.Pusher (a URL push), with UpdateTrackingRef:true as
+	// the runner sets for decomposed children. NOT a fake pusher — the bug is
+	// in the real URL-push-vs-tracking-ref seam.
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := &gitops.Pusher{}
+	if _, err := p.CommitAndPush(ctx, gitops.CommitAndPushArgs{
+		RepoDir:           repo,
+		Branch:            sharedBranch,
+		CommitMessage:     "child A",
+		RemoteURL:         bare,
+		ForceWithLease:    true,
+		UpdateTrackingRef: true,
+	}); err != nil {
+		t.Fatalf("child A CommitAndPush: %v", err)
+	}
+
+	// The seam AND the routing decision in one read: the upload phase computes
+	// child B's isSubsequent as exactly remoteBranchExists(ctx, repo, sharedBranch)
+	// (main.go), so this single call is both the #770 regression guard and the
+	// routing assertion. Even though child A pushed by URL, the production
+	// remoteBranchExists now observes the shared branch as present because
+	// CommitAndPush materialized refs/remotes/origin/<branch> — so child B
+	// routes to RebaseFromRemote, not the first-child `checkout -b` that would
+	// fail on the existing local branch. (A second identical call would add no
+	// signal — git state is unchanged — so it was removed per the review.)
+	if isSubsequent := remoteBranchExists(ctx, repo, sharedBranch); !isSubsequent {
+		t.Fatal("child B routing: remoteBranchExists = false after child A's URL push — the #770 bug (tracking ref not materialized); want true (RebaseFromRemote path)")
+	}
+}
