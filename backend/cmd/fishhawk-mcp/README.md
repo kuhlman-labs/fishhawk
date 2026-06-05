@@ -7,7 +7,7 @@ Two audiences share one surface:
 - The **in-runner Claude Code agent** reads its own run's state mid-execution — what's the active plan, what audit entries fired for the current retry, what constraints apply. Closes the agent-is-blind-to-Fishhawk-state gap that motivated ADR-019.
 - The **interactive Claude Code session** — an engineer asking "what's the status of my current run" — gets the answer through natural language without a CLI alt-tab.
 
-All v0 tools are read-only. Action verbs (approve, retry, cancel) stay in the CLI / SPA / GitHub. A future v0.x or v1 may add write-side tools.
+The v0 surface began read-only; action verbs (approve, reject, retry, cancel, start, run_stage, and the implement-review fix-up below) have since landed as scoped write tools so the loop can be driven end-to-end from the agent session. Write tools require an operator-side token with the matching `write:*` scope; a run-bound runner token is restricted to its own run.
 
 ## Status
 
@@ -96,6 +96,33 @@ The final tool result is **compact by default**: the routine `stage_progress` he
 | `turns` / `elapsed_seconds` / `last_event_kind` | the last `stage_progress` heartbeat |
 
 This roughly halves the driving agent's per-stage context cost without losing any durable signal — the audit log and signed trace bundle are unchanged. Pass `verbose: true` on the input to restore the full event list including every heartbeat (e.g. a driver that wants to inspect per-heartbeat progression).
+
+## Implement-review fix-up (`fishhawk_fixup_stage`)
+
+`fishhawk_fixup_stage` (E22.X / [#762](https://github.com/kuhlman-labs/fishhawk/issues/762)) routes one or more **advisory implement-review concerns** ([ADR-027](https://github.com/kuhlman-labs/fishhawk/issues/703) `approve_with_concerns`) back to the implement agent for a single fix-up pass, instead of the operator hand-editing the PR branch. It wraps `POST /v0/stages/{stage_id}/fixup`.
+
+Inputs:
+
+| Field | Required | Notes |
+|---|---|---|
+| `stage_id` | **yes** | The implement stage parked at the review gate. |
+| `concerns` | **yes** | Indices of the recorded implement-review concerns to route back (at least one). The indices address the concern set on the stage's `implement_reviewed` audit entry — inspect it via `fishhawk_list_audit`. |
+| `reason` | no | Operator note, recorded on the `stage_fixup_triggered` audit entry. |
+
+What a fix-up does — and how it differs from `fishhawk_retry_stage`:
+
+- The selected concerns are delivered to the agent as **binding instructions** (the [#558](https://github.com/kuhlman-labs/fishhawk/issues/558) condition-delivery framing: MANDATORY, win on conflict).
+- The agent commits onto the **same PR branch** and the existing PR is **updated** — a fix-up does **not** regenerate a fresh diff or open a new PR. (`retry` re-opens a *failed* stage and regenerates; fix-up re-opens a *healthy* review gate.)
+- The implement review re-runs on the result.
+- On success the stage flips `awaiting_approval → pending` (the orchestrator advances it to `dispatched`, re-firing `workflow_dispatch`); the tool returns the re-opened stage.
+
+**Operator-gated and bounded — this is never an unbounded auto-loop:**
+
+- The bound defaults to **one pass per stage**, enforced server-side by counting prior `stage_fixup_triggered` audit entries. A second attempt once the bound is spent returns a `fixup_budget_exhausted` tool error (its details carry `max_passes` + `used`). The remaining budget is `max − fix-ups already triggered`, surfaced on the audit entry's `remaining_budget` field (read it via `fishhawk_list_audit`); the success response itself carries only the re-opened stage.
+- **Operator owns the trigger and the merge.** A fix-up only ever happens when an operator calls this verb; the agent cannot self-trigger one, and the operator still approves the final merge.
+- **Auth:** a write tool requiring `write:stages` (or the dedicated `write:fixups`) scope. A run-bound token may fix up only stages **within its own run** — a cross-run target returns `cross_run_fixup` (403).
+
+Error surfaces propagated as tool errors: `validation_failed` (400, empty `concerns` / out-of-range index — empty selection is also caught locally before the HTTP hop), `cross_run_fixup` (403), `stage_not_found` (404), `fixup_not_applicable` (422, no recorded `approve_with_concerns` verdict to route back), `fixup_budget_exhausted` (422).
 
 ## Runner integration
 
