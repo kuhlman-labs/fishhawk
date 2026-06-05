@@ -439,7 +439,13 @@ func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to Sta
 			result = rowToStage(current)
 			return nil
 		}
-		if !ValidStageTransition(from, to) {
+		// The fix-up re-open (awaiting_approval → pending, #762) is an
+		// explicit override off the normal machine: admit it here in
+		// addition to the ordinary transitions so run.FixupStage can
+		// reuse this method without a dedicated repo verb. The domain
+		// gate in run.FixupStage is the real guard; ordinary callers
+		// never compute the fix-up edge by accident.
+		if !ValidStageTransition(from, to) && !ValidStageFixupTransition(from, to) {
 			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(to)}
 		}
 

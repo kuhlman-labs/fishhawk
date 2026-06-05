@@ -179,7 +179,10 @@ func (r *approvalRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to ru
 	if !ok {
 		return nil, run.ErrNotFound
 	}
-	if !run.ValidStageTransition(st.State, to) {
+	// Mirror postgresRepo: admit the fix-up override edge
+	// (awaiting_approval → pending, #762) alongside the normal
+	// transitions so the fix-up handler can reuse TransitionStage.
+	if !run.ValidStageTransition(st.State, to) && !run.ValidStageFixupTransition(st.State, to) {
 		return nil, run.InvalidTransitionError{
 			Kind: "stage", From: string(st.State), To: string(to),
 		}
