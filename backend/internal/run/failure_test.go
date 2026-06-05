@@ -116,6 +116,14 @@ func (m *memRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageS
 		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
 	}
 	s.State = to
+	// Mirror postgresRepo: a transition to a non-terminal state NULLs
+	// ended_at (postgres.go only sets it when to.IsTerminal()), so a
+	// fix-up re-open (succeeded→pending, #780) leaves the re-opened stage
+	// without a terminal timestamp. Keeps the fixture aligned with DB
+	// semantics so a future EndedAt assertion can't false-pass.
+	if !to.IsTerminal() {
+		s.EndedAt = nil
+	}
 	if c != nil {
 		s.FailureCategory = c.FailureCategory
 		s.FailureReason = c.FailureReason
