@@ -2262,31 +2262,44 @@ paths:
       operationId: fixupStage
       summary: Route advisory implement-review concerns back to the agent
       description: |
-        Re-opens an implement stage parked at the implement-review gate so
+        Re-opens an implement stage held at the implement-review gate so
         the agent can make a bounded, operator-gated fix-up pass against one
-        or more advisory implement-review concerns (E22.X / #762), instead
-        of the operator hand-editing the PR branch.
+        or more advisory implement-review concerns (E22.X / #762, #780),
+        instead of the operator hand-editing the PR branch.
 
         Preconditions:
 
         - the stage must be an **implement** stage (plan/review stages are
-          not eligible) and must be parked at `awaiting_approval`. Otherwise
-          422 (`fixup_not_applicable`).
+          not eligible). Otherwise 422 (`fixup_not_applicable`).
+        - the implement stage must be re-openable, in one of two flows.
+          Otherwise 422 (`fixup_not_applicable`):
+          - **commit-yourself**: the implement stage is its own gate, parked
+            at `awaiting_approval`; or
+          - **push_and_open_pr** (#780): the implement stage has
+            `succeeded` (it committed and opened the PR) and the run's
+            SEPARATE **review** stage is still parked at `awaiting_approval`
+            (the PR is open, not merged). Refused once the review stage has
+            merged/resolved, or when the run has no review stage.
         - the stage must carry a recorded **`approve_with_concerns`**
           implement-review verdict (the concern set the `concerns` indices
           address). With no recorded concerns, 422 (`fixup_not_applicable`).
 
-        On success the stage transitions `awaiting_approval → pending`, the
-        orchestrator walks `pending → dispatched` and fires
-        `workflow_dispatch`, and a `stage_fixup_triggered` audit entry is
-        written carrying the selected concern indices, the resolved concern
-        objects (read back by the prompt renderer to deliver them as binding
-        instructions — the #558 condition-delivery framing), and the
-        bounded-pass receipt (`pass_ordinal`, `max_passes`,
-        `remaining_budget`). Returns 200 with the post-orchestrator stage
-        (typically `dispatched`). Orchestrator failures are logged but don't
-        fail the request — the stage stays at `pending` and an operator can
-        re-fire Advance manually.
+        On success the implement stage transitions to `pending`
+        (`awaiting_approval → pending`, or `succeeded → pending` on the
+        push_and_open_pr flow); on the push_and_open_pr flow the review
+        stage is also re-parked `awaiting_approval → pending` so the
+        re-dispatched implement flows back into a fresh review (the
+        re-parked review stage id is recorded on the audit entry as
+        `reparked_review_stage_id`). The orchestrator then walks
+        `pending → dispatched` and fires `workflow_dispatch`, and a
+        `stage_fixup_triggered` audit entry is written carrying the selected
+        concern indices, the resolved concern objects (read back by the
+        prompt renderer to deliver them as binding instructions — the #558
+        condition-delivery framing), and the bounded-pass receipt
+        (`pass_ordinal`, `max_passes`, `remaining_budget`). Returns 200 with
+        the post-orchestrator stage (typically `dispatched`). Orchestrator
+        failures are logged but don't fail the request — the stage stays at
+        `pending` and an operator can re-fire Advance manually.
 
         **Distinct from `POST /v0/stages/{stage_id}/retry`:** retry re-opens
         a *failed* stage and regenerates a fresh diff; fix-up re-opens a
