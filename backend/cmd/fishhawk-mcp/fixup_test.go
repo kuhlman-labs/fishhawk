@@ -1,0 +1,176 @@
+package main
+
+import (
+	"context"
+	"net/http"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+)
+
+// --- fishhawk_fixup_stage (E22.X / #762) ---
+
+func TestFixupStage_HappyPath_ReopensToPending(t *testing.T) {
+	// A fix-up re-opens the implement stage awaiting_approval → pending;
+	// the orchestrator advances it (a backend-internal concern), so the
+	// fixture returns State="pending". The selected concern indices and
+	// reason must reach the backend body verbatim.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.fixupResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "pending",
+	}
+
+	_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:  stageID.String(),
+		Concerns: []int{0, 2},
+		Reason:   "address the unhandled error path",
+	})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if out.Stage.State != "pending" {
+		t.Errorf("State = %q, want pending", out.Stage.State)
+	}
+	if out.Stage.ID != stageID.String() {
+		t.Errorf("ID = %q, want %s", out.Stage.ID, stageID.String())
+	}
+	if fb.fixupCalledByID[stageID] != 1 {
+		t.Errorf("fixup called %d times, want 1", fb.fixupCalledByID[stageID])
+	}
+	if !reflect.DeepEqual(fb.fixupBody.Concerns, []int{0, 2}) {
+		t.Errorf("body concerns = %v, want [0 2]", fb.fixupBody.Concerns)
+	}
+	if fb.fixupBody.Reason != "address the unhandled error path" {
+		t.Errorf("body reason = %q, want the threaded reason", fb.fixupBody.Reason)
+	}
+}
+
+func TestFixupStage_InvalidUUID_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:  "not-a-uuid",
+		Concerns: []int{0},
+	})
+	if err == nil {
+		t.Fatal("expected validation error for bad UUID")
+	}
+	if !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("err = %v, want UUID parse error", err)
+	}
+	// Local validation short-circuits — backend never called.
+	if len(fb.fixupCalledByID) != 0 {
+		t.Errorf("backend fixup called %d times, want 0", len(fb.fixupCalledByID))
+	}
+}
+
+func TestFixupStage_EmptyConcerns_FailsLocally(t *testing.T) {
+	// At least one concern must be selected; the tool short-circuits
+	// before the HTTP hop so the backend's 400 is never needed.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:  uuid.NewString(),
+		Concerns: nil,
+	})
+	if err == nil {
+		t.Fatal("expected validation error for empty concerns")
+	}
+	if !strings.Contains(err.Error(), "at least one") {
+		t.Errorf("err = %v, want empty-concerns error", err)
+	}
+	if len(fb.fixupCalledByID) != 0 {
+		t.Errorf("backend fixup called %d times, want 0", len(fb.fixupCalledByID))
+	}
+}
+
+func TestFixupStage_NotFound_PropagatesAsToolError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.fixupStatus = http.StatusNotFound
+	fb.fixupErrBody = `{"error":{"code":"stage_not_found","message":"no stage with that id"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:  uuid.NewString(),
+		Concerns: []int{0},
+	})
+	if err == nil {
+		t.Fatal("expected error from backend 404; got nil")
+	}
+	if !strings.Contains(err.Error(), "stage_not_found") {
+		t.Errorf("err = %v, want it to mention stage_not_found", err)
+	}
+}
+
+func TestFixupStage_BudgetExhausted_PropagatesAs422(t *testing.T) {
+	// The bound defaults to one pass; a second attempt surfaces as a 422
+	// with code fixup_budget_exhausted. The MCP tool propagates the
+	// error envelope verbatim so the operator sees the exhausted bound.
+	fb, srv := newFakeBackend(t)
+	fb.fixupStatus = http.StatusUnprocessableEntity
+	fb.fixupErrBody = `{"error":{"code":"fixup_budget_exhausted","message":"fix-up budget exhausted","details":{"max_passes":1,"used":1}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:  uuid.NewString(),
+		Concerns: []int{0},
+	})
+	if err == nil {
+		t.Fatal("expected error from backend 422; got nil")
+	}
+	if !strings.Contains(err.Error(), "fixup_budget_exhausted") {
+		t.Errorf("err = %v, want fixup_budget_exhausted", err)
+	}
+}
+
+func TestFixupStage_NotApplicable_PropagatesAs422(t *testing.T) {
+	// A stage with no recorded approve_with_concerns implement-review
+	// verdict has nothing to route back; the backend surfaces a 422 with
+	// code fixup_not_applicable.
+	fb, srv := newFakeBackend(t)
+	fb.fixupStatus = http.StatusUnprocessableEntity
+	fb.fixupErrBody = `{"error":{"code":"fixup_not_applicable","message":"no recorded approve_with_concerns implement-review concerns"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:  uuid.NewString(),
+		Concerns: []int{0},
+	})
+	if err == nil {
+		t.Fatal("expected error from backend 422; got nil")
+	}
+	if !strings.Contains(err.Error(), "fixup_not_applicable") {
+		t.Errorf("err = %v, want fixup_not_applicable", err)
+	}
+}
+
+func TestFixupStage_CrossRun_PropagatesAs403(t *testing.T) {
+	// A run-bound MCP token may fix up only stages within its own run;
+	// the backend's subject-binding guard returns 403 cross_run_fixup,
+	// which the tool propagates verbatim.
+	fb, srv := newFakeBackend(t)
+	fb.fixupStatus = http.StatusForbidden
+	fb.fixupErrBody = `{"error":{"code":"cross_run_fixup","message":"mcp token may only fix up stages within its own run"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:  uuid.NewString(),
+		Concerns: []int{0},
+	})
+	if err == nil {
+		t.Fatal("expected error from backend 403; got nil")
+	}
+	if !strings.Contains(err.Error(), "cross_run_fixup") {
+		t.Errorf("err = %v, want cross_run_fixup", err)
+	}
+}

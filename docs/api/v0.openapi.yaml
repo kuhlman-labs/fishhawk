@@ -2231,6 +2231,119 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/stages/{stage_id}/fixup:
+    post:
+      operationId: fixupStage
+      summary: Route advisory implement-review concerns back to the agent
+      description: |
+        Re-opens an implement stage parked at the implement-review gate so
+        the agent can make a bounded, operator-gated fix-up pass against one
+        or more advisory implement-review concerns (E22.X / #762), instead
+        of the operator hand-editing the PR branch.
+
+        Preconditions:
+
+        - the stage must be an **implement** stage (plan/review stages are
+          not eligible) and must be parked at `awaiting_approval`. Otherwise
+          422 (`fixup_not_applicable`).
+        - the stage must carry a recorded **`approve_with_concerns`**
+          implement-review verdict (the concern set the `concerns` indices
+          address). With no recorded concerns, 422 (`fixup_not_applicable`).
+
+        On success the stage transitions `awaiting_approval → pending`, the
+        orchestrator walks `pending → dispatched` and fires
+        `workflow_dispatch`, and a `stage_fixup_triggered` audit entry is
+        written carrying the selected concern indices, the resolved concern
+        objects (read back by the prompt renderer to deliver them as binding
+        instructions — the #558 condition-delivery framing), and the
+        bounded-pass receipt (`pass_ordinal`, `max_passes`,
+        `remaining_budget`). Returns 200 with the post-orchestrator stage
+        (typically `dispatched`). Orchestrator failures are logged but don't
+        fail the request — the stage stays at `pending` and an operator can
+        re-fire Advance manually.
+
+        **Distinct from `POST /v0/stages/{stage_id}/retry`:** retry re-opens
+        a *failed* stage and regenerates a fresh diff; fix-up re-opens a
+        *healthy* review gate, commits onto the SAME PR branch (the runner's
+        rebase-from-remote shared-branch path), and UPDATES the existing PR
+        rather than opening a new one.
+
+        **Bounded + operator-gated.** The bound defaults to ONE pass per
+        stage, enforced server-side by counting prior `stage_fixup_triggered`
+        audit entries (there is no dedicated column). Once the bound is spent,
+        a further attempt returns 422 (`fixup_budget_exhausted`); a fresh run
+        or an operator hand-edit is the next step. The operator still owns the
+        merge.
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        description: |
+          Selects which recorded implement-review concerns to route back to
+          the agent.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [concerns]
+              properties:
+                concerns:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: integer
+                    minimum: 0
+                  description: |
+                    Indices of the recorded implement-review concerns to
+                    route back to the agent (at least one). The indices
+                    address the concern set in the stage's
+                    `implement_reviewed` audit entry, in append order across
+                    reviewers. An out-of-range or duplicate index is rejected
+                    (400 `validation_failed`).
+                reason:
+                  type: string
+                  description: |
+                    Optional operator rationale, recorded on the
+                    `stage_fixup_triggered` audit entry.
+      responses:
+        '200':
+          description: Stage re-opened for the fix-up pass; refreshed Stage row in body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stage' }
+        '400':
+          description: |
+            Malformed body, empty `concerns`, or an out-of-range / duplicate
+            concern index. Body's `error` is `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) bearer token lacks both `write:stages` and
+            `write:fixups` scope — body `error` is `insufficient_scope`;
+            (2) caller is an mcp token (subject `mcp:run:<uuid>`) whose run
+            scope does not match the target stage's `run_id` — body `error`
+            is `cross_run_fixup`. MCP tokens may only fix up stages within
+            their own run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            Fix-up not applicable. Either the stage is the wrong type/state
+            or carries no recorded `approve_with_concerns` concerns
+            (`fixup_not_applicable`), or the bounded pass count is already
+            spent (`fixup_budget_exhausted`). Body's `message` explains the
+            specific reason.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/artifacts/{artifact_id}:
     get:
       operationId: getArtifact

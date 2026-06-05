@@ -276,6 +276,43 @@ func (c *apiClient) RetryStage(ctx context.Context, id uuid.UUID) (*Stage, error
 	return &s, nil
 }
 
+// fixupRequest mirrors the backend's
+// `POST /v0/stages/{stage_id}/fixup` body
+// (`backend/internal/server/fixup.go::fixupRequest`). Concerns selects
+// which recorded implement-review concerns (by their index in the
+// stage's resolved concern set) to route back to the agent; it must be
+// non-empty. Reason is an optional operator note recorded on the audit
+// entry.
+type fixupRequest struct {
+	Concerns []int  `json:"concerns"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// FixupStage routes one or more advisory implement-review concerns back
+// to the implement agent for a bounded, operator-gated fix-up pass via
+// `POST /v0/stages/{stage_id}/fixup`. Distinct from RetryStage: fix-up
+// re-opens a HEALTHY review gate (awaiting_approval → pending), commits
+// onto the SAME PR branch, and is bounded (default one pass). Returns
+// the re-opened Stage row (pending, or dispatched once the orchestrator
+// advances it before the response returns). 4xx surfaces:
+//   - 400 validation_failed (empty concerns / out-of-range index)
+//   - 403 cross_run_fixup (a run-bound token reaching another run's stage)
+//   - 404 stage_not_found
+//   - 422 fixup_not_applicable (no recorded approve_with_concerns verdict)
+//   - 422 fixup_budget_exhausted (the bounded pass count is spent;
+//     details carry max_passes + used)
+func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concerns []int, reason string) (*Stage, error) {
+	body, err := json.Marshal(fixupRequest{Concerns: concerns, Reason: reason})
+	if err != nil {
+		return nil, fmt.Errorf("marshal fixup: %w", err)
+	}
+	var s Stage
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+id.String()+"/fixup", body, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 // CancelRun transitions a run to the cancelled state via
 // `POST /v0/runs/{run_id}/cancel`. Idempotent: cancelling an already-
 // cancelled run returns 200 with the same body. 4xx surfaces:

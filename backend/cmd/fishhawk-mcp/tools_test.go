@@ -122,6 +122,21 @@ type fakeBackend struct {
 	retryErrBody    string
 	retryCalledByID map[uuid.UUID]int
 
+	// E22.X fixtures: POST /v0/stages/{id}/fixup (#762).
+	// fixupBody captures the last decoded request body so tests can
+	// assert the selected concern indices + reason threading.
+	// fixupResp seeds the post-fixup Stage keyed by stage id; default is
+	// a minimal Stage with State="pending" (the re-opened outcome).
+	// fixupStatus drives the HTTP status (default 200).
+	// fixupErrBody, when set, is written verbatim — drives the 400 / 403
+	// / 404 / 422 error-path tests.
+	// fixupCalledByID counts fixup calls per stage id.
+	fixupBody       fixupRequest
+	fixupResp       map[uuid.UUID]Stage
+	fixupStatus     int
+	fixupErrBody    string
+	fixupCalledByID map[uuid.UUID]int
+
 	// E22.4 fixtures: POST /v0/stages/{id}/approvals.
 	// approvalsBody captures the last decoded body so tests can
 	// assert decision + comment threading.
@@ -182,6 +197,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		retryResp:                map[uuid.UUID]Stage{},
 		retryStatus:              http.StatusOK,
 		retryCalledByID:          map[uuid.UUID]int{},
+		fixupResp:                map[uuid.UUID]Stage{},
+		fixupStatus:              http.StatusOK,
+		fixupCalledByID:          map[uuid.UUID]int{},
 		approvalsResp:            map[uuid.UUID]Stage{},
 		approvalsStatus:          http.StatusOK,
 		approvalsCalledByID:      map[uuid.UUID]int{},
@@ -233,6 +251,32 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		status := fb.retryStatus
 		errBody := fb.retryErrBody
 		resp, ok := fb.retryResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = Stage{ID: id.String(), State: "pending"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body fixupRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.fixupCalledByID[id]++
+		fb.fixupBody = body
+		status := fb.fixupStatus
+		errBody := fb.fixupErrBody
+		resp, ok := fb.fixupResp[id]
 		fb.mu.Unlock()
 		w.WriteHeader(status)
 		if errBody != "" {

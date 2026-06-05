@@ -148,6 +148,40 @@ func ValidStageRetryTransition(from, to StageState) bool {
 	return ok
 }
 
+// stageFixupTransitions enumerates the explicit fix-up override off
+// the normal state machine — the implement-review fix-up re-open
+// (E22.X / #762).
+//
+// awaiting_approval → pending is the single fix-up edge: an advisory
+// implement reviewer returned approve_with_concerns, the implement
+// stage parked at the review gate (awaiting_approval), and an operator
+// routed one or more selected concerns back to the agent for a bounded
+// fix-up pass. Re-opening to pending lets the orchestrator walk pending
+// → dispatched and re-dispatch the implement stage with the concerns
+// delivered as binding instructions.
+//
+// This is deliberately a SEPARATE table from stageRetryTransitions:
+// a fix-up is a distinct semantic from a retry (no failure to clear,
+// no self_retry_count bump, re-opened from a healthy gate rather than
+// a terminal failure), so widening stageRetryTransitions would conflate
+// the two. The repo's TransitionStage consults this table in addition
+// to ValidStageTransition so the fix-up edge is admissible there
+// without loosening the normal machine for ordinary callers.
+var stageFixupTransitions = map[StageState]map[StageState]struct{}{
+	StageStateAwaitingApproval: {
+		StageStatePending: {},
+	},
+}
+
+// ValidStageFixupTransition reports whether `from` is allowed to
+// re-open into `to` via the fix-up path. The fix-up path is
+// intentionally narrow — callers that want a regular transition
+// should keep using ValidStageTransition + TransitionStage.
+func ValidStageFixupTransition(from, to StageState) bool {
+	_, ok := stageFixupTransitions[from][to]
+	return ok
+}
+
 // InvalidTransitionError describes a refused state transition.
 // Callers can errors.Is/As against it to surface a 409 Conflict at
 // the HTTP layer.

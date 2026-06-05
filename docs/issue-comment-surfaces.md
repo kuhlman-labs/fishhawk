@@ -226,6 +226,26 @@ Notes:
   accept the B-violating diff or bypass the gate (the `override_effect` field
   records this framing). Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
+- The implement-review fix-up audit kind — `stage_fixup_triggered` (#762) — is an
+  **internal, user-actor audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread; it has no Notifier method. The
+  fix-up handler (`server/fixup.go::handleFixupStage`,
+  `POST /v0/stages/{stage_id}/fixup`) writes it once on a successful re-open,
+  with the operator's `user` actor + subject and payload `{stage_id,
+  prior_state, selected_indices, concerns, reason, pass_ordinal, max_passes,
+  remaining_budget, admissibility_reason}`. It serves double duty: the canonical
+  receipt of who routed which advisory implement-review concerns back to the
+  agent, AND **the durable fix-up-pass counter** — the bound (default 1) is
+  enforced by counting prior `stage_fixup_triggered` entries for the stage, so
+  there is no dedicated column. The `concerns` field (the resolved
+  `[]planreview.Concern` the operator selected) is read back by the prompt
+  renderer (`server/prompt.go::resolveFixupConcerns`) to deliver the concerns to
+  the implement agent as binding instructions (the #558 condition-delivery
+  framing). Distinct from the failure-driven `stage_override_retried` / `stage_retried`
+  receipts: a fix-up re-opens a HEALTHY review gate (`awaiting_approval → pending`)
+  and commits onto the same PR branch rather than regenerating a fresh diff.
+  Listed here only so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
 
 ## Routing
 

@@ -3040,6 +3040,65 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	}
 }
 
+// TestRun_ImplementStage_Fixup_CommitsToExistingBranch verifies the
+// sub-plan C fix-up path (#762): when the prompt response marks the stage a
+// fix-up pass carrying the existing PR branch, the runner commits onto THAT
+// branch with RebaseFromRemote=true and does NOT open a new PR or ship a
+// fresh pull_request artifact — the open PR's head advances via the push.
+func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	existingBranch := "fishhawk/run-11111111/stage-22222222"
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:     "22222222-3333-4444-5555-666666666666",
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: existingBranch,
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	if fp.gotArgs.Branch != existingBranch {
+		t.Errorf("branch = %q, want %q (existing PR branch)", fp.gotArgs.Branch, existingBranch)
+	}
+	if !fp.gotArgs.RebaseFromRemote {
+		t.Error("RebaseFromRemote = false, want true (fix-up rebases the existing PR branch)")
+	}
+	// A fix-up updates the open PR; it must not open a new one or ship a
+	// fresh pull_request artifact.
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR called for fix-up pass — should be skipped (PR already exists)")
+	}
+	if fu.gotPRArgs != nil {
+		t.Error("ShipPullRequest called for fix-up pass — should be skipped")
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_fixup_pushed"`) {
+		t.Errorf("missing implement_fixup_pushed log line:\n%s", stderr.String())
+	}
+}
+
 // --- Verify gate (#441) ---
 
 // TestVerify_NoCmd_SkipsGate confirms that when --verify-cmd is absent

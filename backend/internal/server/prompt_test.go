@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -1432,11 +1433,20 @@ func (f *feedbackAuditRepo) ListGlobal(_ context.Context) ([]*audit.Entry, error
 func (f *feedbackAuditRepo) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
-func (f *feedbackAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, _ string) ([]*audit.Entry, error) {
+func (f *feedbackAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	return f.byRunID[runID], nil
+	// Honour the category filter so callers that query the wrong constant
+	// (e.g. a typo in CategoryStageFixupTriggered) see nothing — otherwise
+	// the resolver tests would pass without pinning the constant.
+	var out []*audit.Entry
+	for _, e := range f.byRunID[runID] {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 func (f *feedbackAuditRepo) ListAll(_ context.Context, _ audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, nil
@@ -1465,13 +1475,13 @@ func makeRejectionEntry(runID uuid.UUID, comment string) *audit.Entry {
 		"rejection_comment": comment,
 	})
 	rid := runID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
 }
 
 func makeApproveEntry(runID uuid.UUID) *audit.Entry {
 	payload, _ := json.Marshal(map[string]any{"decision": "approve"})
 	rid := runID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
 }
 
 func TestLoadPriorRejectionFeedback_NoPriorRuns_ReturnsNil(t *testing.T) {
@@ -1546,7 +1556,7 @@ func makeSchemaRetryEntry(runID uuid.UUID, validationErr string) *audit.Entry {
 		"validation_error": validationErr,
 	})
 	rid := runID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: "plan_schema_retry", RunID: &rid, Payload: payload}
 }
 
 func TestLoadPriorSchemaValidationError_NewestWins(t *testing.T) {
@@ -1656,6 +1666,180 @@ func TestGetStagePrompt_Implement_EchoesScopeFiles(t *testing.T) {
 	if resp.ScopeFiles[1].Path != "docs/api/v0.md" || resp.ScopeFiles[1].Operation != "modify" {
 		t.Errorf("scope_files[1] = %+v", resp.ScopeFiles[1])
 	}
+}
+
+// makeFixupEntry builds a stage_fixup_triggered audit entry bound to the
+// given stage, carrying the resolved selected concerns the prompt renderer
+// reads back (matching server/fixup.go's writeFixupAudit payload shape).
+func makeFixupEntry(runID, stageID uuid.UUID, concerns []planreview.Concern) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":         stageID.String(),
+		"selected_indices": []int{0},
+		"concerns":         concerns,
+		"reason":           "operator routed concerns back",
+		"pass_ordinal":     1,
+	})
+	rid := runID
+	sid := stageID
+	return &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
+}
+
+// TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded confirms that
+// when an implement stage carries a stage_fixup_triggered audit entry, the
+// prompt renders the selected concerns as binding instructions and folds a
+// file the concern names into the effective scope set (#762).
+func TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityHigh, Category: "coverage",
+			Note: "add a test in backend/internal/run/fixup_test.go for the bound"},
+	}
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		runID: {makeFixupEntry(runID, implStageID, concerns)},
+	}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// The prompt renders the binding fix-up concerns section.
+	for _, want := range []string{
+		"### Fix-up concerns",
+		"[high/coverage]",
+		"add a test in backend/internal/run/fixup_test.go for the bound",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+
+	// The concern-named file folds into the effective scope set alongside
+	// the plan's own scope file.
+	paths := map[string]bool{}
+	for _, f := range resp.ScopeFiles {
+		paths[f.Path] = true
+	}
+	if !paths["backend/internal/server/prompt.go"] {
+		t.Errorf("plan scope file missing from scope_files: %+v", resp.ScopeFiles)
+	}
+	if !paths["backend/internal/run/fixup_test.go"] {
+		t.Errorf("concern-named file not folded into scope_files: %+v", resp.ScopeFiles)
+	}
+}
+
+// TestResolveFixupConcerns covers the audit-payload reader directly: no
+// trigger entry, a wrong-stage entry, the happy path, and a malformed payload.
+func TestResolveFixupConcerns(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityMedium, Category: "security", Note: "check authz"},
+		{Severity: planreview.SeverityLow, Category: "scope", Note: "touch pkg/a/file.go"},
+	}
+
+	t.Run("no entries returns nil", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{}})
+		rendered, joined := s.resolveFixupConcerns(context.Background(), runID, stageID)
+		if rendered != nil || joined != "" {
+			t.Errorf("got (%v, %q), want (nil, \"\")", rendered, joined)
+		}
+	})
+
+	t.Run("entry for a different stage is ignored", func(t *testing.T) {
+		other := uuid.New()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntry(runID, other, concerns)}},
+		}})
+		rendered, _ := s.resolveFixupConcerns(context.Background(), runID, stageID)
+		if rendered != nil {
+			t.Errorf("got %v, want nil (entry bound to a different stage)", rendered)
+		}
+	})
+
+	t.Run("happy path renders and joins", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntry(runID, stageID, concerns)}},
+		}})
+		rendered, joined := s.resolveFixupConcerns(context.Background(), runID, stageID)
+		if len(rendered) != 2 {
+			t.Fatalf("rendered len = %d, want 2: %v", len(rendered), rendered)
+		}
+		if rendered[0] != "[medium/security] check authz" {
+			t.Errorf("rendered[0] = %q", rendered[0])
+		}
+		// The joined notes feed scope-file extraction.
+		if !strings.Contains(joined, "touch pkg/a/file.go") {
+			t.Errorf("joined notes missing the second concern: %q", joined)
+		}
+	})
+
+	t.Run("malformed payload is skipped", func(t *testing.T) {
+		rid := runID
+		sid := stageID
+		bad := &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: []byte("{not json")}
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {bad}},
+		}})
+		rendered, _ := s.resolveFixupConcerns(context.Background(), runID, stageID)
+		if rendered != nil {
+			t.Errorf("got %v, want nil (malformed payload)", rendered)
+		}
+	})
 }
 
 // TestGetStagePrompt_Implement_NoScopeFilesWhenPlanMissing confirms the
@@ -1942,7 +2126,7 @@ func makeApproveWithCommentEntry(runID uuid.UUID, comment string) *audit.Entry {
 		"comment":  comment,
 	})
 	rid := runID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
 }
 
 // TestGetStagePrompt_ApprovalConditions_DecompositionFallback is the

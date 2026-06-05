@@ -563,6 +563,57 @@ func TestFetchPrompt_ScopeFilesOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesFixup confirms the client decodes the backend's
+// fixup/fixup_branch response fields (#762) so the runner routes a fix-up
+// pass's commit onto the existing PR branch.
+func TestFetchPrompt_DecodesFixup(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"fixup": true,
+		"fixup_branch": "fishhawk/run-aaaaaaaa/stage-bbbbbbbb"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if !got.Fixup {
+		t.Error("Fixup = false, want true")
+	}
+	if got.FixupBranch != "fishhawk/run-aaaaaaaa/stage-bbbbbbbb" {
+		t.Errorf("FixupBranch = %q", got.FixupBranch)
+	}
+}
+
+// TestFetchPrompt_FixupOmittedWhenAbsent confirms the fix-up fields decode
+// to their zero values when the backend omits them (a normal implement
+// stage), so branch routing falls through to the per-stage branch.
+func TestFetchPrompt_FixupOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.Fixup || got.FixupBranch != "" {
+		t.Errorf("fixup = (%t,%q), want (false,\"\") when absent", got.Fixup, got.FixupBranch)
+	}
+}
+
 func TestFetchPrompt_SignatureRejected(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	priv, _ := makeKey(t, fb)

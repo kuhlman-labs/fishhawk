@@ -1071,6 +1071,80 @@ func TestBuild_Implement_ApprovalConditions_Nil_Absent(t *testing.T) {
 	}
 }
 
+func TestBuild_Implement_FixupConcerns_Rendered(t *testing.T) {
+	concerns := []string{
+		"[high/security] missing authz check on the fixup endpoint",
+		"[medium/coverage] no test for the bound-exhausted path",
+	}
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: concerns,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Fix-up concerns",
+		"AMEND the plan",
+		"MANDATORY",
+		"win on conflict",
+		concerns[0],
+		concerns[1],
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	// Concerns must appear before the approved plan so the agent sees the
+	// binding instructions before reading the plan steps (mirrors #558).
+	fixIdx := strings.Index(got, "### Fix-up concerns")
+	planIdx := strings.Index(got, "Approved plan (binding instruction)")
+	if fixIdx < 0 || planIdx < 0 || fixIdx > planIdx {
+		t.Errorf("fix-up concerns should appear before approved plan (fixIdx=%d planIdx=%d):\n%s",
+			fixIdx, planIdx, got)
+	}
+}
+
+func TestBuild_Implement_FixupConcerns_Empty_Absent(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// FixupConcerns deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Fix-up concerns") {
+		t.Errorf("Fix-up concerns section should not appear when FixupConcerns is empty:\n%s", got)
+	}
+}
+
+func TestBuild_Implement_FixupConcerns_Truncated(t *testing.T) {
+	// One concern just under the cap, then more that must be dropped with a
+	// truncation marker so a pathological concern set can't blow the prompt.
+	concerns := []string{
+		strings.Repeat("x", 3990),
+		"this concern should be truncated",
+		"so should this one",
+	}
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: concerns,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "...[remaining concerns truncated]") {
+		t.Errorf("expected truncation marker for oversized concern set:\n%s", got)
+	}
+	if strings.Contains(got, "so should this one") {
+		t.Errorf("concerns past the byte cap should be dropped:\n%s", got)
+	}
+}
+
 func TestBuild_PlanReview_ContainsVerdictSchema(t *testing.T) {
 	got, err := Build("plan_review", Trigger{
 		IssueNumber:  42,

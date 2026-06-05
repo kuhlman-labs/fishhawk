@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -325,6 +326,16 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// path rather than benign scope_drift (#730). No-op when scope is
 		// empty (keeps the runner's git add -A fallback).
 		scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, trigger.ApprovalConditions)
+		// Fix-up pass (#762): when the operator routed implement-review
+		// concerns back to this stage, deliver them as binding instructions
+		// (reusing #558's framing) and fold any file the concern names into
+		// the effective scope so a concern-authorized edit ships as a
+		// declared path rather than benign scope_drift. No-op for a normal
+		// (non-fix-up) implement dispatch.
+		if rendered, joined := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
+			trigger.FixupConcerns = rendered
+			scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, &joined)
+		}
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -493,6 +504,16 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// path rather than benign scope_drift (#730). No-op when scope is
 		// empty (keeps the runner's git add -A fallback).
 		scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, trigger.ApprovalConditions)
+		// Fix-up pass (#762): when the operator routed implement-review
+		// concerns back to this stage, deliver them as binding instructions
+		// (reusing #558's framing) and fold any file the concern names into
+		// the effective scope so a concern-authorized edit ships as a
+		// declared path rather than benign scope_drift. No-op for a normal
+		// (non-fix-up) implement dispatch.
+		if rendered, joined := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
+			trigger.FixupConcerns = rendered
+			scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, &joined)
+		}
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -1327,6 +1348,75 @@ func (s *Server) loadPriorSchemaValidationError(ctx context.Context, runID uuid.
 		}
 	}
 	return nil
+}
+
+// resolveFixupConcerns returns the operator-selected implement-review
+// concerns for an implement stage that has been re-opened for a bounded
+// fix-up pass (#762), rendered one-per-line for the prompt's binding
+// "### Fix-up concerns" section, alongside the same concern text joined for
+// scope-file extraction.
+//
+// It reads the stage_fixup_triggered audit entries the fix-up handler writes
+// (server/fixup.go), filters to the current stage, and uses the NEWEST entry
+// — a fix-up re-opens the stage to pending and the renderer must reflect the
+// most recent trigger. Each entry's `concerns` field is the resolved
+// []planreview.Concern set the operator selected; they are formatted as
+// "[severity/category] note" so the agent sees the full reviewer context.
+//
+// Returns (nil, "") when the AuditRepo is unconfigured, the stage carries no
+// fix-up trigger (the common, non-fix-up case), or on any error — best-effort,
+// same WARN-and-proceed posture as the other prompt resolvers. The joined
+// string is the input to mergeConditionScopeFiles so a concern that names a
+// file folds that path into the effective scope set.
+func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.UUID) (rendered []string, joined string) {
+	if s.cfg.AuditRepo == nil {
+		return nil, ""
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list stage_fixup_triggered audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, ""
+	}
+	// Scan newest-first (ListForRunByCategory returns entries ordered ASC by
+	// ts) for the first entry bound to this stage with a non-empty concern set.
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			Concerns []planreview.Concern `json:"concerns"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: unmarshal stage_fixup_triggered payload failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		if len(payload.Concerns) == 0 {
+			continue
+		}
+		var notes []string
+		rendered = make([]string, 0, len(payload.Concerns))
+		for _, c := range payload.Concerns {
+			rendered = append(rendered, fmt.Sprintf("[%s/%s] %s", c.Severity, c.Category, c.Note))
+			notes = append(notes, c.Note)
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: loaded fix-up concerns into implement prompt",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Int("concern_count", len(rendered)),
+		)
+		return rendered, strings.Join(notes, "\n")
+	}
+	return nil, ""
 }
 
 // matchDecomposedSubPlan returns the sub-plan whose title prefixes the
