@@ -1034,11 +1034,57 @@ func classifyErr(err error) string {
 // the underlying error for the caller's log line. The error is
 // intentionally NOT load-bearing on the run's res.OK; the in-band
 // constraint enforcer below is the one that demotes to category-B.
+// resolvePolicyBaseRef returns the git ref the implement-stage policy
+// diff (max_files_changed + forbidden/allowed file-list constraints)
+// should be measured against.
+//
+// For standalone runs and the FIRST child of a decomposition the answer
+// is cfg.checkBaseRef (main): a standalone run's increment IS the diff,
+// and the first child's HEAD == main so its increment equals the
+// cumulative diff too. For a SUBSEQUENT decomposition child the working
+// tree already sits on the shared-branch tip carrying every prior
+// child's commit, so diffing against main sums the whole fan-out and
+// wedges a legitimately-decomposed feature against its own per-child cap
+// (#765). In that case we measure against origin/<shared-branch> so each
+// child's constraints bound only its own increment.
+//
+// Fallback-safe by construction: anything that isn't a subsequent
+// decomposition child — including a subsequent child whose
+// remote-tracking ref is unexpectedly absent — returns cfg.checkBaseRef
+// unchanged, preserving the prior behavior exactly.
+func resolvePolicyBaseRef(ctx context.Context, cfg config, logSink io.Writer) string {
+	if cfg.decomposedFromRunID == "" {
+		return cfg.checkBaseRef
+	}
+	// Same shared-branch derivation and predicate the upload-phase
+	// isSubsequent routing uses (see the branch-routing block).
+	sharedBranch := "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	if !remoteBranchExists(ctx, repoDir, sharedBranch) {
+		// First child: shared branch not yet on the remote, HEAD == main.
+		return cfg.checkBaseRef
+	}
+	baseRef := "origin/" + sharedBranch
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"policy_base_decomposition_child","stage_id":%q,"shared_branch":%q,"base_ref":%q}`+"\n",
+		cfg.stageID, sharedBranch, baseRef)
+	return baseRef
+}
+
 func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent.Event, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
 	}
+
+	// Resolve the effective policy-diff base ref once. For a subsequent
+	// decomposition child this is origin/<shared-branch> so each child's
+	// constraints bound its own increment, not the cumulative fan-out
+	// (#765); for everything else it is cfg.checkBaseRef unchanged.
+	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
 
 	var events []agent.Event
 
@@ -1089,7 +1135,7 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	}
 
 	runner := &gitdiff.Runner{}
-	d, err := runner.Run(context.Background(), cfg.checkBaseRef, repoDir)
+	d, err := runner.Run(context.Background(), baseRef, repoDir)
 	if err != nil {
 		events = append(events, agent.Event{
 			Kind:    "policy_event",
@@ -1105,14 +1151,14 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	// name-status list (d, above) is the load-bearing policy input and
 	// is already in hand. The reviewer prompt falls back to its
 	// file-list rendering when the patch is absent.
-	patch, truncated, perr := runner.RunPatch(context.Background(), cfg.checkBaseRef, repoDir)
+	patch, truncated, perr := runner.RunPatch(context.Background(), baseRef, repoDir)
 	if perr != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"git_diff_patch_failed","base_ref":%q,"detail":%q}`+"\n",
-			cfg.checkBaseRef, perr.Error())
+			baseRef, perr.Error())
 		patch, truncated = "", false
 	}
-	events = append(events, makeGitDiffEvent(cfg.checkBaseRef, d, patch, truncated))
+	events = append(events, makeGitDiffEvent(baseRef, d, patch, truncated))
 	return d, events, nil
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
@@ -3897,5 +3898,148 @@ func TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater(t *tes
 	// moda's non-compile failure should have been logged as a skip.
 	if !strings.Contains(log.String(), "vet_nonzero_non_compile") {
 		t.Errorf("expected moda's non-compile vet failure to log a skip; log: %s", log.String())
+	}
+}
+
+// TestResolvePolicyBaseRef covers base-ref selection across the three
+// cases: standalone, first decomposition child, and subsequent child.
+// It drives the remoteBranchExists seam (#765).
+func TestResolvePolicyBaseRef(t *testing.T) {
+	const sharedRunID = "abcdef0123456789"
+	sharedBranch := "fishhawk/run-" + shortID(sharedRunID)
+
+	t.Run("standalone returns checkBaseRef", func(t *testing.T) {
+		// No seam override needed: the empty decomposedFromRunID short-
+		// circuits before remoteBranchExists is consulted.
+		cfg := config{checkBaseRef: "main"}
+		if got := resolvePolicyBaseRef(context.Background(), cfg, io.Discard); got != "main" {
+			t.Fatalf("resolvePolicyBaseRef = %q, want %q", got, "main")
+		}
+	})
+
+	t.Run("first child (shared branch absent) returns checkBaseRef", func(t *testing.T) {
+		withFakeRemoteBranchExists(t, false)
+		cfg := config{checkBaseRef: "main", decomposedFromRunID: sharedRunID}
+		if got := resolvePolicyBaseRef(context.Background(), cfg, io.Discard); got != "main" {
+			t.Fatalf("resolvePolicyBaseRef = %q, want %q", got, "main")
+		}
+	})
+
+	t.Run("subsequent child (shared branch present) returns origin/<shared-branch>", func(t *testing.T) {
+		withFakeRemoteBranchExists(t, true)
+		cfg := config{checkBaseRef: "main", decomposedFromRunID: sharedRunID, stageID: "s1"}
+		want := "origin/" + sharedBranch
+		if got := resolvePolicyBaseRef(context.Background(), cfg, io.Discard); got != want {
+			t.Fatalf("resolvePolicyBaseRef = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestComputeAndEmitDiff_DecompositionChild_MeasuresIncrement is the
+// end-to-end proof for #765: it crosses resolvePolicyBaseRef -> gitdiff
+// -> constraint.Evaluate against a real git repo. A 2-child
+// decomposition whose CUMULATIVE file count exceeds the cap passes
+// because each child's increment is measured against the prior
+// shared-branch tip; the pre-fix `main` base would have failed.
+func TestComputeAndEmitDiff_DecompositionChild_MeasuresIncrement(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	runGit("config", "tag.gpgsign", "false")
+
+	// Base commit on main.
+	if err := os.WriteFile(filepath.Join(repo, "base.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+
+	const maxFiles = 5
+
+	// Child A: a commit on the shared branch carrying enough files that
+	// the cumulative count (A + B) exceeds the cap.
+	sharedRunID := "abcdef0123456789"
+	sharedBranch := "fishhawk/run-" + shortID(sharedRunID)
+	runGit("checkout", "-b", sharedBranch)
+	const childAFiles = 4
+	for i := 0; i < childAFiles; i++ {
+		name := fmt.Sprintf("a%d.go", i)
+		if err := os.WriteFile(filepath.Join(repo, name), []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "child A")
+
+	// Mirror the post-push remote-tracking ref so remoteBranchExists and
+	// `git diff origin/<shared-branch>` both resolve the child-A tip
+	// without a network fetch.
+	runGit("update-ref", "refs/remotes/origin/"+sharedBranch, "HEAD")
+
+	// Child B increment: a small set of NEW files staged but not
+	// committed, under the cap on its own.
+	const childBFiles = 2
+	for i := 0; i < childBFiles; i++ {
+		name := fmt.Sprintf("b%d.go", i)
+		if err := os.WriteFile(filepath.Join(repo, name), []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sanity: cumulative (A + B) exceeds the cap, each increment is under it.
+	if childAFiles+childBFiles <= maxFiles {
+		t.Fatalf("test misconfigured: cumulative %d must exceed maxFiles %d", childAFiles+childBFiles, maxFiles)
+	}
+	if childBFiles > maxFiles {
+		t.Fatalf("test misconfigured: child-B increment %d must be under maxFiles %d", childBFiles, maxFiles)
+	}
+
+	cfg := config{
+		workingDir:          repo,
+		checkBaseRef:        "main",
+		decomposedFromRunID: sharedRunID,
+		stageID:             "s-childB",
+	}
+
+	// Subsequent child: remoteBranchExists reports the shared branch is
+	// present, so the policy diff resolves against origin/<shared-branch>.
+	withFakeRemoteBranchExists(t, true)
+	d, _, err := computeAndEmitDiff(cfg, io.Discard)
+	if err != nil {
+		t.Fatalf("computeAndEmitDiff: %v", err)
+	}
+	if got := len(d.ChangedFiles); got != childBFiles {
+		t.Fatalf("increment diff = %d files (%v), want %d (the child-B increment only)",
+			got, d.ChangedFiles, childBFiles)
+	}
+	if v := constraint.Evaluate(d, constraint.Constraints{MaxFilesChanged: maxFiles}); len(v) != 0 {
+		t.Fatalf("increment of %d under maxFiles %d should not violate; got %v", childBFiles, maxFiles, v)
+	}
+
+	// Pre-fix behavior: the same staged index measured against `main`
+	// yields the cumulative set that exceeds the cap (the #765 bug).
+	gd := &gitdiff.Runner{}
+	cumulative, err := gd.Run(context.Background(), "main", repo)
+	if err != nil {
+		t.Fatalf("cumulative diff: %v", err)
+	}
+	if got := len(cumulative.ChangedFiles); got != childAFiles+childBFiles {
+		t.Fatalf("cumulative diff = %d files, want %d", got, childAFiles+childBFiles)
+	}
+	if v := constraint.Evaluate(cumulative, constraint.Constraints{MaxFilesChanged: maxFiles}); len(v) == 0 {
+		t.Fatalf("cumulative of %d over maxFiles %d must violate (pre-fix repro)", childAFiles+childBFiles, maxFiles)
 	}
 }
