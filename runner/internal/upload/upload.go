@@ -359,6 +359,20 @@ type FetchedPrompt struct {
 	// gitops.DefaultAuthorName/DefaultAuthorEmail.
 	CommitAuthorName  string `json:"commit_author_name,omitempty"`
 	CommitAuthorEmail string `json:"commit_author_email,omitempty"`
+	// Fixup is true when this implement stage is an operator-triggered
+	// implement-review fix-up pass (sub-plan A / #762). A fix-up re-runs
+	// the implement agent against the selected concerns and commits the
+	// result onto the EXISTING PR branch (FixupBranch) via the runner's
+	// RebaseFromRemote path, UPDATING the open PR rather than opening a
+	// new one — distinct from a fresh implement stage. Both false/empty
+	// on a normal implement stage; the runner's branch routing falls
+	// through to the per-stage branch unchanged.
+	Fixup bool `json:"fixup,omitempty"`
+	// FixupBranch is the existing PR branch a fix-up pass commits onto.
+	// Non-empty only when Fixup is true. The runner checks out + rebases
+	// this branch (fetch + pull --rebase) and pushes the fix-up commit so
+	// the open PR's head advances; it does NOT call OpenPR.
+	FixupBranch string `json:"fixup_branch,omitempty"`
 }
 
 // ScopeFile is one entry in FetchedPrompt.ScopeFiles: a declared path

@@ -257,7 +257,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -277,6 +277,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.scopeFiles = scopeFiles
 		cfg.commitAuthorName = commitAuthorName
 		cfg.commitAuthorEmail = commitAuthorEmail
+		cfg.fixup = fixup
+		cfg.fixupBranch = fixupBranch
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
@@ -564,7 +566,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// stage's terminal transition onto the /pull-request upload (#742), and
 	// it gates the failure-report POST below so only a gated stage reports
 	// a commit/push/PR-open failure back to the backend.
-	willOpenPR := stageType == "implement" && !cfg.noPR && cfg.decomposedFromRunID == ""
+	//
+	// A fix-up pass (#762) commits onto the EXISTING PR branch and updates
+	// the open PR rather than opening a new one, so it is NOT a
+	// push_and_open_pr stage: willOpenPR stays false so the backend
+	// transitions the stage terminally on the trace upload (which the
+	// advisory implement re-review keys off), not on a /pull-request upload
+	// that a fix-up never ships.
+	willOpenPR := stageType == "implement" && !cfg.noPR && cfg.decomposedFromRunID == "" && !cfg.fixup
 
 	var rawBundle, redactedBundle []byte
 	if cfg.bundleOut != "" || cfg.uploadTrace {
@@ -918,17 +927,20 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // and retryAttempt drive the ADR-023 self-retry loop. commitAuthorName and
 // commitAuthorEmail are the backend-resolved App bot commit identity (#722);
 // both empty when the backend couldn't resolve it and the caller keeps the
-// gitops default bot identity.
+// gitops default bot identity. fixup and fixupBranch (#762) mark an
+// operator-triggered implement-review fix-up pass: when fixup is true the
+// implement stage commits onto the existing PR branch fixupBranch and updates
+// the open PR rather than opening a new one.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fetchErr
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -936,20 +948,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -1730,19 +1742,34 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		repoDir = "."
 	}
 
-	// Branch routing: decomposed children share a single parent branch;
-	// standalone runs get a per-stage branch.
+	// Branch routing: a fix-up pass commits onto the existing PR branch;
+	// decomposed children share a single parent branch; standalone runs
+	// get a per-stage branch.
 	var (
 		branch       string
 		isDecomposed bool
 		isSubsequent bool
+		isFixup      bool
 	)
-	if cfg.decomposedFromRunID != "" {
+	switch {
+	case cfg.fixup:
+		// Fix-up pass (#762): commit onto the EXISTING PR branch and rebase
+		// it from the remote first (fetch + checkout + pull --rebase), the
+		// same shared-branch path subsequent decomposed children use. The
+		// open PR tracks this branch, so the pushed fix-up commit updates it
+		// — no OpenPR (a PR already exists for head→base), no fresh artifact.
+		isFixup = true
+		branch = cfg.fixupBranch
+		isSubsequent = true
+	case cfg.decomposedFromRunID != "":
 		isDecomposed = true
 		branch = "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
 		isSubsequent = remoteBranchExists(ctx, repoDir, branch)
-	} else {
+	default:
 		branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
+	}
+	if isFixup && branch == "" {
+		return errors.New("upload: fix-up pass requires a non-empty existing PR branch (fixup_branch)")
 	}
 
 	title, body := prTitleAndBody(cfg, branch, logSink)
@@ -1814,6 +1841,20 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// No PR to open; no artifact to ship. The stage still
 		// counts as succeeded — the agent decided no edits were
 		// needed. Reviewer will see the empty trace + this log.
+		return nil
+	}
+
+	// Fix-up pass (#762): the commit is now on the existing PR branch and
+	// pushed, so the open PR's head has advanced. Don't open a new PR (one
+	// already exists for this head→base) and don't ship a pull_request
+	// artifact — willOpenPR is false for a fix-up, so the backend
+	// transitions this stage on the trace upload that already happened, and
+	// the advisory implement re-review keys off that upload. Done.
+	if isFixup {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"implement_fixup_pushed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
+		)
 		return nil
 	}
 

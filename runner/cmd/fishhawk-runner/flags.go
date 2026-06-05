@@ -85,6 +85,15 @@ type config struct {
 	// back to gitops.DefaultAuthorName/DefaultAuthorEmail.
 	commitAuthorName  string
 	commitAuthorEmail string
+
+	// fixup / fixupBranch are set at runtime (not flags) from the fetched
+	// prompt's fixup/fixup_branch (sub-plan C / #762). When fixup is true
+	// the implement stage commits onto the EXISTING PR branch fixupBranch
+	// via gitops RebaseFromRemote and UPDATES the open PR instead of
+	// opening a new one (willOpenPR=false semantics). Both zero on a
+	// normal implement stage.
+	fixup       bool
+	fixupBranch string
 }
 
 // parseFlags reads args and populates a config. Returns a usage
