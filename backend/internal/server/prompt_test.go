@@ -903,6 +903,16 @@ func TestGetStagePromptRender_MatchesSignatureAuthedPath(t *testing.T) {
 	if signedBody.PromptHash != renderedBody.PromptHash {
 		t.Errorf("hash diverged: %q vs %q", signedBody.PromptHash, renderedBody.PromptHash)
 	}
+	// The fix-up wire flag (#784) is set in BOTH handlers; assert they stay
+	// consistent so a change to one (runner-facing) handler that misses the
+	// other (SPA render) is caught. The fixup=true path itself is covered by
+	// TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded on the
+	// runner-facing handler; here both are false (plan stage, no fix-up entry),
+	// which still guards against a structural divergence between the two.
+	if signedBody.Fixup != renderedBody.Fixup || signedBody.FixupBranch != renderedBody.FixupBranch {
+		t.Errorf("fix-up wire flag diverged: signed={%v,%q} rendered={%v,%q}",
+			signedBody.Fixup, signedBody.FixupBranch, renderedBody.Fixup, renderedBody.FixupBranch)
+	}
 }
 
 // planStageSpecYAML is a valid feature_change workflow spec with a
@@ -1779,6 +1789,177 @@ func TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded(t *testing.T) 
 	}
 	if !paths["backend/internal/run/fixup_test.go"] {
 		t.Errorf("concern-named file not folded into scope_files: %+v", resp.ScopeFiles)
+	}
+
+	// Cross-boundary assertion (#784): the response carries the fix-up wire
+	// flag the runner reads, and fixup_branch matches the runner's per-stage
+	// branch formula byte-for-byte. A divergence here would re-create the
+	// `checkout -b <existing branch>` already-exists failure.
+	if !resp.Fixup {
+		t.Errorf("fixup = false, want true for a stage with an unconsumed stage_fixup_triggered entry")
+	}
+	wantBranch := fmt.Sprintf("fishhawk/run-%s/stage-%s", runID.String()[:8], implStageID.String()[:8])
+	if resp.FixupBranch != wantBranch {
+		t.Errorf("fixup_branch = %q, want %q", resp.FixupBranch, wantBranch)
+	}
+}
+
+// TestGetStagePrompt_Implement_NoFixup_OmitsWireFlag is the negative case for
+// #784: a normal implement dispatch with no stage_fixup_triggered audit entry
+// must leave fixup=false and fixup_branch empty so the runner's default
+// per-stage branch routing (checkout -b) stays unchanged.
+func TestGetStagePrompt_Implement_NoFixup_OmitsWireFlag(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo:    &feedbackAuditRepo{}, // no fix-up entry
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Fixup {
+		t.Errorf("fixup = true, want false for a normal (non-fix-up) implement dispatch")
+	}
+	if resp.FixupBranch != "" {
+		t.Errorf("fixup_branch = %q, want empty for a normal implement dispatch", resp.FixupBranch)
+	}
+}
+
+// TestGetStagePrompt_Implement_FixupDecomposedChild_SharedBranch covers the
+// decomposed-child fix-up branch form (#784): the runner routes a decomposed
+// child onto the shared parent branch fishhawk/run-<shortID(parentRunID)>, so
+// a fix-up on such a child must derive the same shared branch, not the
+// per-stage form.
+func TestGetStagePrompt_Implement_FixupDecomposedChild_SharedBranch(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	parentRunID := uuid.New()
+	childRunID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		childRunID: {
+			{ID: planStageID, RunID: childRunID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[childRunID] = &run.Run{
+		ID:             childRunID,
+		Repo:           "o/r",
+		WorkflowID:     "feature_change",
+		DecomposedFrom: &parentRunID,
+	}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement}
+
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityHigh, Category: "coverage", Note: "tighten the bound"},
+	}
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		childRunID: {makeFixupEntry(childRunID, implStageID, concerns)},
+	}
+
+	priv, _ := sf.issue(t, childRunID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, childRunID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Fixup {
+		t.Fatalf("fixup = false, want true")
+	}
+	wantBranch := "fishhawk/run-" + parentRunID.String()[:8]
+	if resp.FixupBranch != wantBranch {
+		t.Errorf("fixup_branch = %q, want shared parent branch %q", resp.FixupBranch, wantBranch)
 	}
 }
 
