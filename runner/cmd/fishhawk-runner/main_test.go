@@ -3180,6 +3180,43 @@ func TestRun_ImplementStage_DecomposedChildPushFailure_ReportsFailed(t *testing.
 	}
 }
 
+// TestRun_ImplementStage_DecomposedChildPushReportFailure_FailsStage covers the
+// load-bearing reverse-zombie case (#771): the push onto the shared branch
+// SUCCEEDS, but the Outcome=="pushed" report to /pull-request fails (e.g. a
+// backend 5xx after the push landed). The stage must still end as a failure
+// (exitFailure) — falling through to reportPullRequestFailure — NOT hang in the
+// trace-gated `running` state, since the trace handler deferred the terminal
+// transition pending a report.
+func TestRun_ImplementStage_DecomposedChildPushReportFailure_FailsStage(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, false)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             "22222222-3333-4444-5555-666666666666",
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		DecomposedFromRunID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}
+	// Push succeeds (fakePusher has no err); the child-push report fails.
+	fu.shipErr = errors.New("backend 503 on child-push report")
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure: a child-push report failure must fail the stage (retryable), not leave it hung in running", got)
+	}
+}
+
 // TestRun_ImplementStage_Fixup_CommitsToExistingBranch verifies the
 // sub-plan C fix-up path (#762): when the prompt response marks the stage a
 // fix-up pass carrying the existing PR branch, the runner commits onto THAT

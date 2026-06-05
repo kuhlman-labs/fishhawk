@@ -737,11 +737,18 @@ func TestE2E_LocalRunner_ImplementPRFailure_NoZombie(t *testing.T) {
 //
 //	(a) the child implement stage ends `failed` (category C, retryable) — NOT
 //	    succeeded, and the failed → pending retry transition is permitted;
-//	(b) the child run is not succeeded (no code-bearing succeeded child is
-//	    visible to the parent / the childcompletion sweeper); and
-//	(c) the parent run carries no pull_request_url and is not succeeded — no
-//	    consolidated PR missing the child was opened (the #698 awaiting-children
-//	    park holds).
+//	(b) the child run is not succeeded — no code-bearing succeeded child is
+//	    visible to the parent / the childcompletion sweeper.
+//
+// (a) and (b) are the load-bearing assertions: they catch the zombie at its
+// source (the child stage/run never reaches a terminal succeeded state on a
+// push failure). The downstream "parent does not consolidate a PR missing the
+// child" property follows transitively — the childcompletion sweeper only
+// consolidates a parent once every child RUN is terminal AND succeeded
+// (sweeper.go resolveParent), which a non-succeeded child (b) precludes. That
+// sweeper is not wired into this fixture, so this test does not re-assert the
+// parent state (an earlier (c) assertion on parent.PullRequestURL/State was
+// vacuous here and was removed).
 func TestE2E_LocalRunner_DecomposedChildPushFailure_NoZombie(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available; skipping decomposed-child push-failure E2E")
@@ -885,19 +892,10 @@ func TestE2E_LocalRunner_DecomposedChildPushFailure_NoZombie(t *testing.T) {
 	if gotChild.State == runpkg.StateSucceeded {
 		t.Errorf("child run State = succeeded, want non-succeeded after a push failure")
 	}
-
-	// (c) The parent run opened no consolidated PR and is not succeeded — the
-	// awaiting-children park holds, so no PR silently missing the child's code.
-	gotParent, err := fx.runRepo.GetRun(ctx, parent.ID)
-	if err != nil {
-		t.Fatalf("GetRun parent: %v", err)
-	}
-	if gotParent.PullRequestURL != nil {
-		t.Errorf("parent run.PullRequestURL = %q, want nil (no consolidated PR missing the child)", *gotParent.PullRequestURL)
-	}
-	if gotParent.State == runpkg.StateSucceeded {
-		t.Error("parent run reached succeeded with a failed child (consolidated a missing child)")
-	}
+	// The parent-does-not-consolidate-a-missing-child property follows from (b):
+	// see the function doc — the sweeper only consolidates terminal-succeeded
+	// children and is not wired into this fixture, so asserting parent state
+	// here would be vacuous.
 }
 
 // gitRepoInit makes dir a git repo on branch `main` with a single base

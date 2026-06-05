@@ -1905,6 +1905,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		filesChanged := 0
 		if d, err := (&gitdiff.Runner{}).Run(ctx, baseRef, repoDir); err == nil {
 			filesChanged = len(d.ChangedFiles)
+		} else {
+			// Informational only: files_changed_count is not load-bearing for
+			// the stage transition. Log rather than silently discard so a diff
+			// failure here is observable.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"child_push_files_changed_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, err.Error())
 		}
 		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 			RunID:             cfg.runID,
