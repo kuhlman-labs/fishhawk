@@ -903,6 +903,16 @@ func TestGetStagePromptRender_MatchesSignatureAuthedPath(t *testing.T) {
 	if signedBody.PromptHash != renderedBody.PromptHash {
 		t.Errorf("hash diverged: %q vs %q", signedBody.PromptHash, renderedBody.PromptHash)
 	}
+	// The fix-up wire flag (#784) is set in BOTH handlers; assert they stay
+	// consistent so a change to one (runner-facing) handler that misses the
+	// other (SPA render) is caught. The fixup=true path itself is covered by
+	// TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded on the
+	// runner-facing handler; here both are false (plan stage, no fix-up entry),
+	// which still guards against a structural divergence between the two.
+	if signedBody.Fixup != renderedBody.Fixup || signedBody.FixupBranch != renderedBody.FixupBranch {
+		t.Errorf("fix-up wire flag diverged: signed={%v,%q} rendered={%v,%q}",
+			signedBody.Fixup, signedBody.FixupBranch, renderedBody.Fixup, renderedBody.FixupBranch)
+	}
 }
 
 // planStageSpecYAML is a valid feature_change workflow spec with a
