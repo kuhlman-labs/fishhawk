@@ -4020,6 +4020,12 @@ func TestLooksLikeCompileError(t *testing.T) {
 		"fake does not implement R (missing method Foo)",
 		"cannot use fake{} (variable of type fake) as R value",
 		"./x.go:3:9: undefined: Bar",
+		// #774: the selector-on-type typecheck form (the exact #762 child D
+		// diagnostic) — "undefined:" does not match this, so the
+		// "undefined (" / "has no field or method" markers must.
+		"cmd/fishhawk-mcp/fixup_test.go:24:5: fb.fixupResp undefined (type *fakeBackend has no field or method fixupResp)",
+		"./x.go:5:9: int is not a type",
+		"./x.go:7:9: cannot convert s (variable of type string) to type int",
 	}
 	for _, s := range block {
 		if !looksLikeCompileError(s) {
