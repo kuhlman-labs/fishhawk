@@ -34,6 +34,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -189,8 +190,18 @@ func runServe(args []string, logSink io.Writer) int {
 			"Used only by the claudecode adapter — the anthropic SDK adapter has no retry field")
 	planReviewTimeout := fs.Duration("plan-review-timeout",
 		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", defaultPlanReviewTimeout),
-		"effective per-invocation bound for plan-review agent calls (since #584); "+
-			"must cover review of large standard_v1 plans — raised from 60s to 300s (#606)")
+		"FLOOR of the size-aware review budget (#747): the minimum per-invocation bound for "+
+			"plan-/implement-review agent calls. Preserves the #606 300s floor for small plans; "+
+			"larger diffs scale up via --review-budget-per-kb, capped by --review-budget-cap")
+	reviewBudgetPerKB := fs.Duration("review-budget-per-kb",
+		envOrDuration("FISHHAWKD_REVIEW_BUDGET_PER_KB", planreview.DefaultReviewBudget.PerKB),
+		"per-KB allowance added to the review-budget floor per kilobyte of prompt (#747); "+
+			"the budget is floor + per_kb*ceil(promptBytes/1024), clamped to [floor, cap]. "+
+			"Set to 0 to collapse the budget to a flat floor (today's fixed-timeout behaviour) without a redeploy")
+	reviewBudgetCap := fs.Duration("review-budget-cap",
+		envOrDuration("FISHHAWKD_REVIEW_BUDGET_CAP", planreview.DefaultReviewBudget.Cap),
+		"hard ceiling on the size-aware review budget (#747), bounding the worst-case "+
+			"synchronous gating wait for a very large diff. A non-positive value disables the ceiling")
 	spendAlertMultiple := fs.Float64("spend-alert-multiple",
 		envOrFloat("FISHHAWKD_SPEND_ALERT_MULTIPLE", spendalert.DefaultMultiple),
 		"warn-only spend-anomaly threshold (#649): the trace handler emits a spend_alert audit "+
@@ -222,7 +233,23 @@ func runServe(args []string, logSink io.Writer) int {
 
 	budgetLocation := resolveBudgetLocation(*budgetTimezone, logger)
 
-	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation}
+	// Size-aware review budget (#747): the plan-review timeout is the FLOOR,
+	// per-KB scales it up with prompt size, and the cap bounds the worst case.
+	// The per-adapter Config.Timeout below stays as the no-deadline fallback
+	// for callers that set no context deadline; the server's call sites apply
+	// this budget as the effective deadline.
+	reviewBudget := planreview.ReviewBudget{
+		Floor: *planReviewTimeout,
+		PerKB: *reviewBudgetPerKB,
+		Cap:   *reviewBudgetCap,
+	}
+	logger.Info("review budget resolved",
+		slog.Duration("floor", reviewBudget.Floor),
+		slog.Duration("per_kb", reviewBudget.PerKB),
+		slog.Duration("cap", reviewBudget.Cap),
+		slog.String("ref", "#747"))
+
+	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget}
 
 	// Plan-review agent wiring. Selection precedence (each branch logs which
 	// adapter is active at startup):

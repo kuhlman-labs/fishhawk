@@ -808,8 +808,10 @@ func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID
 // "implement_review_failed"). It mirrors emitReviewStarted's contract:
 // ActorKind=system, best-effort, WARN-log on append failure so the review
 // loop is never blocked. Observability-only — it records that a reviewer
-// failed without altering gating advance/degrade semantics (#574).
-func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model, reason string) {
+// failed without altering gating advance/degrade semantics (#574). timeout
+// sets the #747 discriminator: true when the reviewer was killed by the
+// size-aware per-invocation budget deadline, false for other failures.
+func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model, reason string, timeout bool) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}
@@ -817,6 +819,7 @@ func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID,
 		Reason:        reason,
 		ReviewerModel: model,
 		Authority:     authority,
+		Timeout:       timeout,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -848,21 +851,33 @@ func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID,
 func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, agents int, authority planreview.AuthorityMode, promptText, authorModel string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
+	budget := s.cfg.ReviewBudget.Budget(len(promptText))
 	for i := 0; i < agents; i++ {
-		verdict, model, err := s.cfg.PlanReviewer.Review(ctx, promptText)
+		// Apply the size-aware per-invocation budget (#747) as a context
+		// deadline so a large diff gets proportionally more wall-clock. The
+		// claudecode adapter honours this incoming deadline instead of capping
+		// at its own cfg.Timeout. cancel() is called directly each turn (not a
+		// deferred stack) so deadlines don't accumulate across reviewers.
+		invocationCtx, cancel := context.WithTimeout(ctx, budget)
+		verdict, model, err := s.cfg.PlanReviewer.Review(invocationCtx, promptText)
+		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
+		cancel()
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: reviewer invocation failed",
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
 				slog.Int("reviewer_index", i),
+				slog.Bool("timed_out", timedOut),
+				slog.Duration("budget", budget),
 				slog.String("error", err.Error()),
 			)
 			// Emit a terminal plan_review_failed audit entry (#664) so a
 			// timed-out / errored reviewer is observable as a definite
-			// 'failed' state rather than an ambiguous 'pending'. hasRejection
-			// is deliberately untouched — gating advance/degrade semantics
-			// are unchanged (#574); this is observability-only.
-			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, model, err.Error())
+			// 'failed' state rather than an ambiguous 'pending'. The timeout
+			// discriminator (#747) tells a budget-kill apart from a transport
+			// failure. hasRejection is deliberately untouched — gating
+			// advance/degrade semantics are unchanged (#574); observability-only.
+			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, model, err.Error(), timedOut)
 			continue
 		}
 

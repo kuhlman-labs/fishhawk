@@ -156,6 +156,16 @@ type ReviewFailedPayload struct {
 	Reason        string        `json:"reason"`
 	ReviewerModel string        `json:"reviewer_model,omitempty"`
 	Authority     AuthorityMode `json:"authority"`
+
+	// Timeout distinguishes a per-invocation budget kill from any other
+	// failure (#747): true when the reviewer was killed by the size-aware
+	// budget deadline (context.DeadlineExceeded at the call site), false for
+	// transport/decode/other errors. It is the additive discriminator the
+	// issue's "distinguish a timeout" requirement asks for — the audit
+	// category stays plan_review_failed / implement_review_failed so existing
+	// #664 and MCP await-review readers are unaffected. omitempty keeps the
+	// payload byte-identical to pre-#747 entries on the non-timeout path.
+	Timeout bool `json:"timeout,omitempty"`
 }
 
 // PlanReviewedPayload is the JSON payload stored in an audit entry

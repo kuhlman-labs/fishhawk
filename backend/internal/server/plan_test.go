@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -1294,6 +1295,12 @@ func TestShipPlan_ReviewAgents_ReviewerError_EmitsPlanReviewFailed(t *testing.T)
 	if got.Authority != planreview.AuthorityGating {
 		t.Errorf("authority = %q, want gating", got.Authority)
 	}
+	// #747: a fast, non-deadline error is NOT a timeout-kill. The discriminator
+	// must read false so a transport/decode failure is distinguishable from a
+	// budget-deadline kill.
+	if got.Timeout {
+		t.Errorf("timeout = true, want false for a non-deadline reviewer error")
+	}
 
 	// #574: an erroring gating reviewer must NOT fail the stage — gating
 	// advance/degrade semantics are unchanged by this observability-only PR.
@@ -1301,6 +1308,58 @@ func TestShipPlan_ReviewAgents_ReviewerError_EmitsPlanReviewFailed(t *testing.T)
 		if call.StageID == stageID && call.To == run.StageStateFailed {
 			t.Errorf("reviewer error must not transition the gating stage to failed-B")
 		}
+	}
+}
+
+// deadlineWaitingReviewer blocks each Review call until the invocation context
+// deadline (the size-aware #747 budget applied at the server call site) fires,
+// then returns ctx.Err(). It models a reviewer killed mid-inference by the
+// budget — the exact #747 failure mode — so the server-level seam test can
+// assert the resulting *_review_failed entry carries Timeout=true.
+type deadlineWaitingReviewer struct{}
+
+func (deadlineWaitingReviewer) Review(ctx context.Context, _ string) (*planreview.ReviewVerdict, string, error) {
+	<-ctx.Done()
+	return nil, "", ctx.Err()
+}
+
+// TestShipPlan_ReviewAgents_BudgetTimeout_EmitsTimeoutTrue is the #747
+// server-level seam test: it injects a reviewer that blocks until its
+// invocation deadline fires, sets a tiny review budget so the deadline fires
+// quickly, and asserts exactly one plan_review_failed entry carrying
+// Timeout=true. This exercises budget computation, deadline application at the
+// call site, and the audit emit together (cf. #618), not per-layer in isolation.
+func TestShipPlan_ReviewAgents_BudgetTimeout_EmitsTimeoutTrue(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, deadlineWaitingReviewer{}, specGatingReviewers)
+	// Collapse the budget to a tiny flat floor so the deadline fires fast.
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 20 * time.Millisecond}
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	var failedEntries []planreview.ReviewFailedPayload
+	for _, e := range au.appended {
+		switch e.Category {
+		case "plan_review_failed":
+			var p planreview.ReviewFailedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode plan_review_failed payload: %v", err)
+			}
+			failedEntries = append(failedEntries, p)
+		case "plan_reviewed":
+			t.Errorf("unexpected plan_reviewed entry on the budget-timeout path")
+		}
+	}
+	if len(failedEntries) != 1 {
+		t.Fatalf("plan_review_failed entries = %d, want 1", len(failedEntries))
+	}
+	if !failedEntries[0].Timeout {
+		t.Errorf("timeout = false, want true for a budget-deadline kill")
 	}
 }
 

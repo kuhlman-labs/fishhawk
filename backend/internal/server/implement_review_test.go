@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -364,10 +365,56 @@ func TestShipTrace_ImplementReview_ReviewerError_EmitsImplementReviewFailed(t *t
 	if failedEntries[0].Authority != planreview.AuthorityGating {
 		t.Errorf("authority = %q, want gating", failedEntries[0].Authority)
 	}
+	// #747: a fast, non-deadline error is not a timeout-kill.
+	if failedEntries[0].Timeout {
+		t.Errorf("timeout = true, want false for a non-deadline reviewer error")
+	}
 
 	// #574: an erroring gating reviewer must NOT fail the stage.
 	if implStage.State == run.StageStateFailed {
 		t.Errorf("reviewer error must not fail the gating implement stage; state = %q", implStage.State)
+	}
+}
+
+// TestShipTrace_ImplementReview_BudgetTimeout_EmitsTimeoutTrue is the #747
+// server-level seam test for the implement stage: a reviewer that blocks until
+// its invocation deadline fires, run under a tiny review budget, must produce
+// exactly one implement_review_failed entry carrying Timeout=true. Exercises
+// budget computation + deadline application + audit emit together (cf. #618).
+func TestShipTrace_ImplementReview_BudgetTimeout_EmitsTimeoutTrue(t *testing.T) {
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, deadlineWaitingReviewer{}, specImplementGatingReviewers)
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 20 * time.Millisecond}
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	var failedEntries []planreview.ReviewFailedPayload
+	au.mu.Lock()
+	for _, e := range au.appended {
+		switch e.Category {
+		case "implement_review_failed":
+			var p planreview.ReviewFailedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				au.mu.Unlock()
+				t.Fatalf("decode implement_review_failed payload: %v", err)
+			}
+			failedEntries = append(failedEntries, p)
+		case "implement_reviewed":
+			t.Errorf("unexpected implement_reviewed entry on the budget-timeout path")
+		}
+	}
+	au.mu.Unlock()
+	if len(failedEntries) != 1 {
+		t.Fatalf("implement_review_failed entries = %d, want 1", len(failedEntries))
+	}
+	if !failedEntries[0].Timeout {
+		t.Errorf("timeout = false, want true for a budget-deadline kill")
 	}
 }
 

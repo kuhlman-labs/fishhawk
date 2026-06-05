@@ -137,7 +137,15 @@ func (c *Client) Inference(ctx context.Context, prompt string) (responseText, mo
 // external/OOM SIGKILL). A timeout-kill (a slow review, #606) and every
 // deterministic fault return retryable=false so the loop fails fast.
 func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, retryable bool, err error) {
-	if c.cfg.Timeout > 0 {
+	// Honour a caller-supplied deadline. The server now computes a size-aware
+	// per-invocation budget (#747) and applies it as a ctx deadline at the
+	// review call site; capping it again with c.cfg.Timeout would defeat the
+	// budget for large diffs. So only impose c.cfg.Timeout when the incoming
+	// ctx carries NO deadline — preserving today's fixed-timeout fallback for
+	// no-deadline callers while letting the server's deadline win when set.
+	// The timeout-kill detection below keys off ctx.Err()==DeadlineExceeded
+	// regardless of which deadline fired, so it stays correct either way.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline && c.cfg.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.cfg.Timeout)
 		defer cancel()
