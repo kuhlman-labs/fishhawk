@@ -70,6 +70,44 @@ type promptResponse struct {
 	// keeps gitops.DefaultAuthorName/DefaultAuthorEmail.
 	CommitAuthorName  string `json:"commit_author_name,omitempty"`
 	CommitAuthorEmail string `json:"commit_author_email,omitempty"`
+	// Fixup is true when this implement stage is an operator-triggered
+	// implement-review fix-up pass (#762/#784): an unconsumed
+	// stage_fixup_triggered audit entry routed review concerns back to this
+	// stage. The runner takes its RebaseFromRemote same-branch path (fetch +
+	// checkout + pull --rebase on FixupBranch) and updates the open PR rather
+	// than opening a new one. Both false/empty on a normal implement dispatch,
+	// so the runner's branch routing falls through to the per-stage branch.
+	// Keys (`fixup`/`fixup_branch`) are byte-identical to what the runner's
+	// fetchPromptToFile reads (runner/internal/upload/upload.go).
+	Fixup bool `json:"fixup,omitempty"`
+	// FixupBranch is the existing PR branch a fix-up pass commits onto.
+	// Non-empty only when Fixup is true. Derived to EXACTLY match the runner's
+	// branch formula: non-decomposed
+	// `fishhawk/run-<shortID(runID)>/stage-<shortID(stageID)>`, decomposed
+	// `fishhawk/run-<shortID(decomposedFromRunID)>`. A divergence would
+	// re-create the `checkout -b <existing branch>` already-exists failure.
+	FixupBranch string `json:"fixup_branch,omitempty"`
+}
+
+// shortID returns the first 8 characters of a UUID's string form, mirroring
+// the runner's shortID (runner/cmd/fishhawk-runner/main.go) and
+// auditcomplete.shortID. Used to derive the fix-up branch name so the
+// backend-emitted FixupBranch matches the runner's branch-routing formula
+// byte-for-byte.
+func shortID(id uuid.UUID) string {
+	return id.String()[:8]
+}
+
+// fixupBranchFor derives the existing PR branch a fix-up pass commits onto,
+// matching the runner's branch-routing logic. For a decomposed child the
+// branch is the shared parent branch `fishhawk/run-<shortID(parentRunID)>`;
+// otherwise it is the per-stage branch
+// `fishhawk/run-<shortID(runID)>/stage-<shortID(stageID)>`.
+func fixupBranchFor(runRow *run.Run, stage *run.Stage) string {
+	if runRow.DecomposedFrom != nil {
+		return "fishhawk/run-" + shortID(*runRow.DecomposedFrom)
+	}
+	return fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(runRow.ID), shortID(stage.ID))
 }
 
 // scopeFile is one entry in promptResponse.ScopeFiles: the path the
@@ -291,6 +329,8 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// issue-only template and emit `plan_missing_for_implement` so
 	// the audit log captures the gap.
 	var scopeFiles []scopeFile
+	var fixup bool
+	var fixupBranch string
 	if stage.Type == run.StageTypeImplement {
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
@@ -335,6 +375,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		if rendered, joined := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, &joined)
+			// Emit the fix-up routing flag (#784): point the runner at the
+			// stage's existing PR branch so it takes the RebaseFromRemote
+			// same-branch path instead of `checkout -b <existing branch>`.
+			fixup = true
+			fixupBranch = fixupBranchFor(runRow, stage)
 		}
 	}
 
@@ -390,6 +435,8 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		ScopeFiles:           scopeFiles,
 		CommitAuthorName:     commitAuthorName,
 		CommitAuthorEmail:    commitAuthorEmail,
+		Fixup:                fixup,
+		FixupBranch:          fixupBranch,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -469,6 +516,8 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	// issue-only template and emit `plan_missing_for_implement` so
 	// the audit log captures the gap.
 	var scopeFiles []scopeFile
+	var fixup bool
+	var fixupBranch string
 	if stage.Type == run.StageTypeImplement {
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
@@ -513,6 +562,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if rendered, joined := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, &joined)
+			// Emit the fix-up routing flag (#784) so the rendered prompt view
+			// and the runner-facing response stay byte-consistent. The SPA path
+			// is read-only and never drives a commit; the same derivation keeps
+			// the displayed and dispatched responses identical.
+			fixup = true
+			fixupBranch = fixupBranchFor(runRow, stage)
 		}
 	}
 
@@ -568,6 +623,8 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		ScopeFiles:           scopeFiles,
 		CommitAuthorName:     commitAuthorName,
 		CommitAuthorEmail:    commitAuthorEmail,
+		Fixup:                fixup,
+		FixupBranch:          fixupBranch,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
