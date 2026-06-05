@@ -213,6 +213,14 @@ type Trigger struct {
 	// the approved-plan section. Nil means no conditions were given (section
 	// omitted).
 	ApprovalConditions *string
+	// FixupConcerns carries the operator-selected implement-review concerns
+	// for a bounded fix-up pass (#762). Each entry is one rendered concern
+	// (severity/category/note). When non-empty, buildImplement injects a
+	// binding "### Fix-up concerns" section — reusing #558's MANDATORY /
+	// win-on-conflict framing — so the implement agent resolves exactly the
+	// selected concerns on this pass. Empty/nil for a normal (non-fix-up)
+	// implement dispatch, in which case the section is omitted.
+	FixupConcerns []string
 	// Diff is the rendered changed-files summary for the implement-review
 	// prompt (ADR-027 impl 2/2). Populated by the trace handler from
 	// bundle.ExtractDiff (path + git status per file). Empty for any
@@ -309,6 +317,29 @@ func buildImplement(t Trigger) string {
 		b.WriteString("The operator approved this plan with the following conditions. These conditions AMEND the plan, are MANDATORY, and win on conflict with plan steps:\n\n")
 		b.WriteString(ac)
 		b.WriteString("\n\n")
+	}
+
+	// Fix-up concerns (#762): when the operator triggered a bounded implement-
+	// review fix-up pass, inject the selected concerns as binding instructions,
+	// reusing #558's MANDATORY / win-on-conflict framing. The agent's task on a
+	// fix-up pass is to resolve exactly these concerns on the existing PR
+	// branch — not to re-implement the plan from scratch. The total rendered
+	// size is capped like ApprovalConditions' 4000-byte condition cap.
+	if len(t.FixupConcerns) > 0 {
+		b.WriteString("### Fix-up concerns\n\n")
+		b.WriteString("The operator triggered a fix-up pass to route the following implement-review concerns back to you. These concerns AMEND the plan, are MANDATORY, and win on conflict with plan steps. Resolve each one with the smallest change that addresses it:\n\n")
+		const maxFixupConcernBytes = 4000
+		written := 0
+		for _, c := range t.FixupConcerns {
+			line := "- " + c + "\n"
+			if written+len(line) > maxFixupConcernBytes {
+				b.WriteString("- ...[remaining concerns truncated]\n")
+				break
+			}
+			b.WriteString(line)
+			written += len(line)
+		}
+		b.WriteString("\n")
 	}
 
 	// Plan-as-contract (#223): when the plan stage produced a
