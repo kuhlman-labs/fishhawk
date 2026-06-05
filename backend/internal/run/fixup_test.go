@@ -189,6 +189,30 @@ func TestFixupStage_ReparkFailureLeavesImplementSucceeded(t *testing.T) {
 	}
 }
 
+func TestFixupStage_ImplementReopenFailureLeavesReviewReparked(t *testing.T) {
+	// Partial-failure direction #2 (#780): re-park succeeds but the implement
+	// re-open fails. Because re-park runs FIRST and the implement re-open
+	// LAST, the run is left review=pending, implement=succeeded — a benign,
+	// recoverable state: the review simply re-dispatches and re-parks, the PR
+	// merges normally, and the fix-up silently no-ops (the operator can
+	// re-fire). The implement is never orphaned in pending without its
+	// review re-parked, which is the dangerous direction this ordering avoids.
+	repo, impl, review := implementWithReview(t, run.StageStateSucceeded, run.StageStateAwaitingApproval)
+	repo.failTransition(impl.ID, errors.New("re-open boom"))
+	ctx := context.Background()
+
+	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1})
+	if err == nil {
+		t.Fatal("FixupStage returned nil error on implement re-open failure")
+	}
+	if cur, _ := repo.GetStage(ctx, impl.ID); cur.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded) on re-open failure", cur.State)
+	}
+	if cur, _ := repo.GetStage(ctx, review.ID); cur.State != run.StageStatePending {
+		t.Errorf("review state = %q, want pending (re-parked before the failed implement re-open)", cur.State)
+	}
+}
+
 func TestFixupStage_RemainingBudgetWithHigherBound(t *testing.T) {
 	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
 
