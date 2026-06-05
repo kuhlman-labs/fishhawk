@@ -119,6 +119,17 @@ type CommitAndPushArgs struct {
 	// and restored afterwards.
 	RebaseFromRemote bool
 
+	// UpdateTrackingRef, when true, sets the local remote-tracking ref
+	// refs/remotes/<remote>/<branch> to the pushed HEAD after a
+	// successful push, so subsequent same-clone reads (decomposition
+	// fan-out routing + policy base ref) observe the branch as present.
+	// A URL push (git push <url> HEAD:<branch>) never creates or updates
+	// that tracking ref on its own, so without this the next child in a
+	// local fan-out mis-routes to the first-child `checkout -b` path
+	// (#770). The remote branch tip equals the pushed HEAD, so the ref is
+	// set deterministically with `git update-ref` (no fetch, no auth).
+	UpdateTrackingRef bool
+
 	// ScopeFiles is the approved plan's declared paths (#581). When
 	// non-empty, CommitAndPush stages exactly these paths instead of
 	// `git add -A`, and reports any dirty-but-undeclared paths via
@@ -311,10 +322,40 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 
 	pushArgs := []string{"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)}
 	if args.ForceWithLease {
-		pushArgs = append(pushArgs, "--force-with-lease")
+		// A *bare* --force-with-lease compares the push against the local
+		// remote-tracking ref, but git cannot associate that ref with a URL
+		// push (we push to RemoteURL, not the remote name), so a bare lease
+		// on a subsequent shared-branch push always rejects with
+		// `(stale info)` regardless of the ref's value (#767). When the
+		// tracking ref exists — a subsequent decomposed child, kept current
+		// by this function's post-push update-ref — pass it as the explicit
+		// lease expected-value so the lease is honored against the URL push.
+		// When it is absent (first child / brand-new branch) the bare form
+		// correctly permits the create.
+		lease := "--force-with-lease"
+		trackingRef := fmt.Sprintf("refs/remotes/%s/%s", remote, args.Branch)
+		if track, err := p.runOut(ctx, args.RepoDir, "rev-parse", "--verify", "--quiet", trackingRef); err == nil {
+			if sha := strings.TrimSpace(track); sha != "" {
+				lease = fmt.Sprintf("--force-with-lease=%s:%s", args.Branch, sha)
+			}
+		}
+		pushArgs = append(pushArgs, lease)
 	}
 	if err := p.run(ctx, args.RepoDir, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
+	}
+
+	// Materialize the local remote-tracking ref to the just-pushed HEAD
+	// (#770). A URL push doesn't update refs/remotes/<remote>/<branch>, so
+	// without this the next decomposed child reading that ref sees the
+	// shared branch as absent and mis-routes. The remote branch tip equals
+	// headSHA because we just pushed local HEAD to it, so this is exact
+	// with no fetch and no remote auth.
+	if args.UpdateTrackingRef {
+		trackingRef := fmt.Sprintf("refs/remotes/%s/%s", remote, args.Branch)
+		if err := p.run(ctx, args.RepoDir, "update-ref", trackingRef, headSHA); err != nil {
+			return nil, fmt.Errorf("gitops: update tracking ref %s: %w", trackingRef, err)
+		}
 	}
 
 	return &CommitAndPushResult{
