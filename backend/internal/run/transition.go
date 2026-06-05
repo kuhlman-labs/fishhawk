@@ -152,13 +152,23 @@ func ValidStageRetryTransition(from, to StageState) bool {
 // the normal state machine — the implement-review fix-up re-open
 // (E22.X / #762).
 //
-// awaiting_approval → pending is the single fix-up edge: an advisory
-// implement reviewer returned approve_with_concerns, the implement
-// stage parked at the review gate (awaiting_approval), and an operator
-// routed one or more selected concerns back to the agent for a bounded
-// fix-up pass. Re-opening to pending lets the orchestrator walk pending
-// → dispatched and re-dispatch the implement stage with the concerns
-// delivered as binding instructions.
+// Two fix-up edges live here, both selecting the implement stage's
+// re-open target (pending) so the orchestrator walks pending →
+// dispatched and re-dispatches the implement stage with the selected
+// concerns delivered as binding instructions:
+//
+//   - awaiting_approval → pending is the commit-yourself flow: the
+//     implement stage parked at its OWN review gate (awaiting_approval),
+//     an advisory implement reviewer returned approve_with_concerns, and
+//     an operator routed concerns back for a bounded fix-up pass.
+//   - succeeded → pending is the push_and_open_pr re-open (#780): with
+//     push_and_open_pr=true the implement stage SUCCEEDS (it commits and
+//     opens the PR) and the human gate is a SEPARATE review stage parked
+//     at awaiting_approval. The PR is open, not merged, so a fix-up
+//     commit onto the same PR branch is still meaningful. This edge is
+//     admitted only when run.FixupStage has confirmed the run's review
+//     stage is still at its gate (see fixup.go); the same re-park of the
+//     review stage (awaiting_approval → pending) reuses the first edge.
 //
 // This is deliberately a SEPARATE table from stageRetryTransitions:
 // a fix-up is a distinct semantic from a retry (no failure to clear,
@@ -169,6 +179,9 @@ func ValidStageRetryTransition(from, to StageState) bool {
 // without loosening the normal machine for ordinary callers.
 var stageFixupTransitions = map[StageState]map[StageState]struct{}{
 	StageStateAwaitingApproval: {
+		StageStatePending: {},
+	},
+	StageStateSucceeded: {
 		StageStatePending: {},
 	},
 }

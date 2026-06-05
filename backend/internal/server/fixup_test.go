@@ -58,6 +58,20 @@ func seedConcernsReview(au *auditFake, stage *run.Stage, concerns ...planreview.
 	})
 }
 
+// seedPushOpenPRStages seeds the push_and_open_pr shape (#780): an
+// implement stage that has SUCCEEDED (PR opened) plus a review stage in
+// the given state, both sharing one RunID. Returns (implement, review).
+func seedPushOpenPRStages(repo *approvalRunRepo, reviewState run.StageState) (*run.Stage, *run.Stage) {
+	impl := repo.seedGatelessStage(run.StageStateSucceeded)
+	review := repo.seedStage(reviewState)
+	repo.mu.Lock()
+	review.RunID = impl.RunID
+	review.Type = run.StageTypeReview
+	review.Sequence = 2
+	repo.mu.Unlock()
+	return impl, review
+}
+
 func postFixup(t *testing.T, s *Server, stageID uuid.UUID, body fixupRequest) *httptest.ResponseRecorder {
 	t.Helper()
 	raw, _ := json.Marshal(body)
@@ -118,6 +132,75 @@ func TestFixupStage_HappyPath(t *testing.T) {
 	c0 := concerns[0].(map[string]any)
 	if c0["category"] != "scope" {
 		t.Errorf("selected concern category = %v, want scope", c0["category"])
+	}
+}
+
+func TestFixupStage_PushOpenPRReopensAndReparks(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	impl, review := seedPushOpenPRStages(repo, run.StageStateAwaitingApproval)
+	seedConcernsReview(au, impl,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "out-of-scope file"},
+	)
+
+	w := postFixup(t, s, impl.ID, fixupRequest{Concerns: []int{0}, Reason: "address scope drift on the PR branch"})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Implement re-opened to pending (no orchestrator wired).
+	if body.State != string(run.StageStatePending) {
+		t.Errorf("implement state = %q, want pending", body.State)
+	}
+	// Review re-parked to pending.
+	curReview, err := repo.GetStage(context.Background(), review.ID)
+	if err != nil {
+		t.Fatalf("GetStage(review): %v", err)
+	}
+	if curReview.State != run.StageStatePending {
+		t.Errorf("review state = %q, want pending (re-parked)", curReview.State)
+	}
+
+	// One audit entry carrying the re-parked review stage id.
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["prior_state"] != string(run.StageStateSucceeded) {
+		t.Errorf("prior_state = %v, want succeeded", payload["prior_state"])
+	}
+	if payload["reparked_review_stage_id"] != review.ID.String() {
+		t.Errorf("reparked_review_stage_id = %v, want %s", payload["reparked_review_stage_id"], review.ID)
+	}
+}
+
+func TestFixupStage_PushOpenPRReviewResolvedReturns422(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	// Review gate already closed (merged/succeeded): no longer a fix-up
+	// candidate even though the implement stage succeeded.
+	impl, _ := seedPushOpenPRStages(repo, run.StageStateSucceeded)
+	seedConcernsReview(au, impl,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	w := postFixup(t, s, impl.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_not_applicable") {
+		t.Errorf("body missing fixup_not_applicable code: %s", w.Body.String())
+	}
+	// No fix-up audit entry written on the refusal.
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			t.Errorf("unexpected stage_fixup_triggered entry on refused fix-up")
+		}
 	}
 }
 

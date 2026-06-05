@@ -73,14 +73,26 @@ func TestFailureCategoryDescriptionUnknownPassesThrough(t *testing.T) {
 type memRepo struct {
 	mu     sync.Mutex
 	stages map[uuid.UUID]*run.Stage
+	// transitionErr forces TransitionStage to fail for a specific stage
+	// id, letting tests model a re-park failure mid-fix-up (#780).
+	transitionErr map[uuid.UUID]error
 }
 
 func newMemRepo(s ...*run.Stage) *memRepo {
-	m := &memRepo{stages: map[uuid.UUID]*run.Stage{}}
+	m := &memRepo{stages: map[uuid.UUID]*run.Stage{}, transitionErr: map[uuid.UUID]error{}}
 	for _, st := range s {
 		m.stages[st.ID] = st
 	}
 	return m
+}
+
+// failTransition arms TransitionStage to return err for the given
+// stage id — used to assert the fix-up re-park ordering leaves the
+// implement stage untouched on a re-park failure (#780).
+func (m *memRepo) failTransition(id uuid.UUID, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.transitionErr[id] = err
 }
 
 func (m *memRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
@@ -97,6 +109,9 @@ func (m *memRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) 
 func (m *memRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.transitionErr[id]; err != nil {
+		return nil, err
+	}
 	s, ok := m.stages[id]
 	if !ok {
 		return nil, run.ErrNotFound
@@ -109,9 +124,10 @@ func (m *memRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageS
 		cp := *s
 		return &cp, nil
 	}
-	// Mirror postgresRepo: admit the fix-up override edge
-	// (awaiting_approval → pending, #762) in addition to the normal
-	// transitions so FixupStage can reuse TransitionStage.
+	// Mirror postgresRepo: admit the fix-up override edges
+	// (awaiting_approval → pending and succeeded → pending, #762/#780)
+	// in addition to the normal transitions so FixupStage can reuse
+	// TransitionStage.
 	if !run.ValidStageTransition(s.State, to) && !run.ValidStageFixupTransition(s.State, to) {
 		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
 	}
@@ -119,6 +135,16 @@ func (m *memRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageS
 	if c != nil {
 		s.FailureCategory = c.FailureCategory
 		s.FailureReason = c.FailureReason
+	}
+	// Mirror postgresRepo's ended_at handling: stamp it when entering a
+	// terminal state, NULL it otherwise (a re-open to a non-terminal
+	// target clears the terminal timestamp). Keeps the fixture's
+	// succeeded → pending fix-up semantics aligned with Postgres (#780).
+	if to.IsTerminal() {
+		now := time.Now().UTC()
+		s.EndedAt = &now
+	} else {
+		s.EndedAt = nil
 	}
 	cp := *s
 	return &cp, nil
@@ -149,8 +175,21 @@ func (m *memRepo) SetRunPullRequestURL(context.Context, uuid.UUID, string) (*run
 func (m *memRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
-func (m *memRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
+
+// ListStagesForRun returns every stage sharing the queried RunID, so
+// FixupStage's push_and_open_pr applicability check can locate the
+// run's review stage (#780). Returns copies to mirror GetStage.
+func (m *memRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*run.Stage
+	for _, s := range m.stages {
+		if s.RunID == runID {
+			cp := *s
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
 }
 func (m *memRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")

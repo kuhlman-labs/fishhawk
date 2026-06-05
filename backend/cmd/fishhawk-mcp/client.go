@@ -291,14 +291,19 @@ type fixupRequest struct {
 // FixupStage routes one or more advisory implement-review concerns back
 // to the implement agent for a bounded, operator-gated fix-up pass via
 // `POST /v0/stages/{stage_id}/fixup`. Distinct from RetryStage: fix-up
-// re-opens a HEALTHY review gate (awaiting_approval → pending), commits
-// onto the SAME PR branch, and is bounded (default one pass). Returns
-// the re-opened Stage row (pending, or dispatched once the orchestrator
-// advances it before the response returns). 4xx surfaces:
+// re-opens a HEALTHY review gate, commits onto the SAME PR branch, and
+// is bounded (default one pass). It applies in either flow: the implement
+// stage parked at its own gate (awaiting_approval → pending), or a
+// succeeded implement stage whose run still holds a separate review stage
+// at awaiting_approval (succeeded → pending, the review stage re-parked
+// alongside — the push_and_open_pr flow, #780). Returns the re-opened
+// Stage row (pending, or dispatched once the orchestrator advances it
+// before the response returns). 4xx surfaces:
 //   - 400 validation_failed (empty concerns / out-of-range index)
 //   - 403 cross_run_fixup (a run-bound token reaching another run's stage)
 //   - 404 stage_not_found
-//   - 422 fixup_not_applicable (no recorded approve_with_concerns verdict)
+//   - 422 fixup_not_applicable (no recorded approve_with_concerns verdict,
+//     or the stage is not at the gate / its review gate already resolved)
 //   - 422 fixup_budget_exhausted (the bounded pass count is spent;
 //     details carry max_passes + used)
 func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concerns []int, reason string) (*Stage, error) {
