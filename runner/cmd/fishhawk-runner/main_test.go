@@ -4360,19 +4360,16 @@ func TestDecompositionFanout_TrackingRefMaterialized_RoutesSubsequent(t *testing
 		t.Fatalf("child A CommitAndPush: %v", err)
 	}
 
-	// The seam: even though child A pushed by URL, the production
-	// remoteBranchExists now observes the shared branch as present, because
-	// CommitAndPush materialized refs/remotes/origin/<branch>.
-	if !remoteBranchExists(ctx, repo, sharedBranch) {
-		t.Fatal("remoteBranchExists = false after child A's URL push; the #770 bug — tracking ref not materialized")
-	}
-
-	// Routing: the upload phase computes isSubsequent = remoteBranchExists(...)
-	// for child B, which now correctly resolves to true → RebaseFromRemote
-	// (not the first-child `checkout -b` that would fail on the existing
-	// local branch).
-	isSubsequent := remoteBranchExists(ctx, repo, sharedBranch)
-	if !isSubsequent {
-		t.Error("child B routing: isSubsequent = false, want true (RebaseFromRemote path)")
+	// The seam AND the routing decision in one read: the upload phase computes
+	// child B's isSubsequent as exactly remoteBranchExists(ctx, repo, sharedBranch)
+	// (main.go), so this single call is both the #770 regression guard and the
+	// routing assertion. Even though child A pushed by URL, the production
+	// remoteBranchExists now observes the shared branch as present because
+	// CommitAndPush materialized refs/remotes/origin/<branch> — so child B
+	// routes to RebaseFromRemote, not the first-child `checkout -b` that would
+	// fail on the existing local branch. (A second identical call would add no
+	// signal — git state is unchanged — so it was removed per the review.)
+	if isSubsequent := remoteBranchExists(ctx, repo, sharedBranch); !isSubsequent {
+		t.Fatal("child B routing: remoteBranchExists = false after child A's URL push — the #770 bug (tracking ref not materialized); want true (RebaseFromRemote path)")
 	}
 }
