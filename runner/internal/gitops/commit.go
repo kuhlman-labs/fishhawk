@@ -229,21 +229,34 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 
 	if args.RebaseFromRemote {
 		// Shared-branch path for subsequent decomposed children: the remote
-		// branch already exists. Stash uncommitted agent edits, fetch+rebase,
-		// restore the edits, then fall through to add+commit+push.
+		// branch already exists. Stash uncommitted agent edits, fetch the
+		// remote tip over the run's own credential, reset the local branch
+		// to it, restore the edits, then fall through to add+commit+push.
+		//
+		// The fetch targets args.RemoteURL (the authenticated HTTPS URL),
+		// not the named remote — in the operator's checkout the named
+		// `origin` is typically an SSH URL whose auth depends on the
+		// operator's SSH agent, which may be unavailable (#772). Configure
+		// the same extraheader the push uses BEFORE the fetch so the fetch
+		// authenticates with the run's installation token.
+		if err := p.configureExtraheader(ctx, args.RepoDir, args.RemoteURL, args.PushToken); err != nil {
+			return nil, err
+		}
 		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
 			return nil, fmt.Errorf("gitops: stash: %w", err)
 		}
-		if err := p.run(ctx, args.RepoDir, "fetch", remote, args.Branch); err != nil {
+		// Fetch the remote branch tip into FETCH_HEAD. A URL fetch does not
+		// create or update any refs/remotes/<name>/<branch> tracking ref, so
+		// the subsequent checkout references FETCH_HEAD explicitly.
+		if err := p.run(ctx, args.RepoDir, "fetch", args.RemoteURL, args.Branch); err != nil {
 			return nil, fmt.Errorf("gitops: fetch %s: %w", args.Branch, err)
 		}
-		// DWIM checkout creates a local tracking branch when it doesn't
-		// exist yet; is a no-op (switches to it) when it does.
-		if err := p.run(ctx, args.RepoDir, "checkout", args.Branch); err != nil {
+		// Create/reset the local branch to the fetched remote tip. The agent's
+		// edits are stashed (uncommitted), so there are no local commits to
+		// rebase — this is equivalent to the prior fetch+checkout+pull --rebase
+		// with the branch fast-forwarded to the remote tip.
+		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
 			return nil, fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)
-		}
-		if err := p.run(ctx, args.RepoDir, "pull", "--rebase", remote, args.Branch); err != nil {
-			return nil, fmt.Errorf("gitops: pull --rebase: %w", err)
 		}
 		if err := p.run(ctx, args.RepoDir, "stash", "pop"); err != nil {
 			return nil, fmt.Errorf("gitops: stash pop: %w", err)
@@ -308,16 +321,8 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	// TTL — agents that take >55min outlive the original. The
 	// runner pre-fetches a fresh token and hands it here so the
 	// push always authenticates with a non-expired credential.
-	if args.PushToken != "" && strings.HasPrefix(args.RemoteURL, "https://") {
-		host, err := pushHost(args.RemoteURL)
-		if err != nil {
-			return nil, fmt.Errorf("gitops: parse remote URL: %w", err)
-		}
-		header := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+args.PushToken))
-		if err := p.run(ctx, args.RepoDir, "config", "--local", "--replace-all",
-			"http."+host+".extraheader", header); err != nil {
-			return nil, fmt.Errorf("gitops: refresh extraheader: %w", err)
-		}
+	if err := p.configureExtraheader(ctx, args.RepoDir, args.RemoteURL, args.PushToken); err != nil {
+		return nil, err
 	}
 
 	pushArgs := []string{"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)}
@@ -424,6 +429,34 @@ func porcelainPath(line string) string {
 		rest = rest[idx+len(" -> "):]
 	}
 	return strings.Trim(rest, `"`)
+}
+
+// configureExtraheader sets the local `http.<host>.extraheader` to a Basic
+// auth header derived from pushToken, so subsequent git operations (fetch and
+// push) over an HTTPS remoteURL authenticate with the run's installation
+// token rather than the operator's ambient credentials. The token never
+// appears on the command line — it's written into the extraheader, preserving
+// the no-URL-embedded-credential discipline.
+//
+// It no-ops when pushToken is empty (ambient-auth path) or remoteURL is not
+// HTTPS (file-path bare-repo tests, SSH). `--replace-all` overwrites any
+// existing single value rather than appending, so it is idempotent and safe to
+// call both before the rebase fetch and before the push without producing the
+// duplicate-Authorization-header failure of #199 / #200.
+func (p *Pusher) configureExtraheader(ctx context.Context, repoDir, remoteURL, pushToken string) error {
+	if pushToken == "" || !strings.HasPrefix(remoteURL, "https://") {
+		return nil
+	}
+	host, err := pushHost(remoteURL)
+	if err != nil {
+		return fmt.Errorf("gitops: parse remote URL: %w", err)
+	}
+	header := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+pushToken))
+	if err := p.run(ctx, repoDir, "config", "--local", "--replace-all",
+		"http."+host+".extraheader", header); err != nil {
+		return fmt.Errorf("gitops: refresh extraheader: %w", err)
+	}
+	return nil
 }
 
 // pushHost extracts the `<scheme>://<host>/` string git config keys

@@ -2,6 +2,7 @@ package gitops
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"os/exec"
@@ -711,6 +712,154 @@ func TestCommitAndPush_UpdateTrackingRef_KeepsForceWithLeaseFresh(t *testing.T) 
 	if got != resB.HeadSHA {
 		t.Errorf("bare branch sha = %q, want child B HeadSHA %q", got, resB.HeadSHA)
 	}
+}
+
+// TestCommitAndPush_RebaseFromRemote_FetchesViaRemoteURL pins #772: the
+// RebaseFromRemote path must fetch the shared branch over args.RemoteURL (the
+// run's authenticated HTTPS URL), NOT the named `origin` remote, which in the
+// operator's checkout is typically an SSH URL whose auth depends on an SSH
+// agent that may be unavailable. The test wires `origin` to a deliberately
+// unreachable SSH-style URL while passing a good bare repo as RemoteURL; the
+// rebase path must still succeed and advance the bare branch to the new HEAD.
+// On the old code (fetch+pull against `origin`) this fails exit 128.
+func TestCommitAndPush_RebaseFromRemote_FetchesViaRemoteURL(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-shared772"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+
+	p := &Pusher{}
+
+	// Child A: first child establishes the shared branch on the bare remote
+	// via the checkout -b path (origin still points at the good bare repo).
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:           repo,
+		Branch:            branch,
+		CommitMessage:     "child A",
+		RemoteURL:         bare,
+		UpdateTrackingRef: true,
+	}); err != nil {
+		t.Fatalf("child A CommitAndPush: %v", err)
+	}
+
+	// Now break `origin`: repoint it at an unreachable SSH URL, reproducing
+	// the operator checkout whose SSH agent is unavailable. The fixed code
+	// fetches args.RemoteURL (the good bare repo), so this must not matter.
+	mustGit(t, repo, "remote", "set-url", "origin", "git@example.invalid:kuhlman-labs/fishhawk.git")
+
+	// Child B: subsequent child takes the RebaseFromRemote path. The fetch
+	// targets RemoteURL=bare, sidestepping the broken origin.
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resB, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:           repo,
+		Branch:            branch,
+		CommitMessage:     "child B",
+		RemoteURL:         bare,
+		RebaseFromRemote:  true,
+		UpdateTrackingRef: true,
+	})
+	if err != nil {
+		t.Fatalf("child B CommitAndPush (#772 SSH-origin regression): %v", err)
+	}
+
+	// The bare remote's shared branch advanced to child B's HEAD, and the
+	// reapplied stash (b.txt) is part of that commit.
+	got := mustGitOut(t, repo, "--git-dir="+bare, "rev-parse", branch)
+	if got != resB.HeadSHA {
+		t.Errorf("bare branch sha = %q, want child B HeadSHA %q", got, resB.HeadSHA)
+	}
+	tree := mustGitOut(t, repo, "--git-dir="+bare, "ls-tree", "--name-only", branch)
+	if !strings.Contains(tree, "b.txt") {
+		t.Errorf("bare branch tree missing reapplied edit b.txt; got %q", tree)
+	}
+}
+
+// TestConfigureExtraheader_SetsCredentialForHTTPS covers the credential-
+// configuration path the #772 fetch test cannot reach: that test passes a bare
+// filesystem path as RemoteURL, so configureExtraheader no-ops on the
+// not-HTTPS branch in both the rebase and push call sites. Here we exercise the
+// helper directly against a real repo to assert (1) an HTTPS RemoteURL with a
+// non-empty PushToken writes the host-scoped `http.<host>.extraheader` to the
+// Basic auth header derived from the token, (2) an empty token is a no-op
+// (ambient-auth path), and (3) a non-HTTPS RemoteURL is a no-op. This is the
+// branch coverage the helper's straight extraction shares with the already-
+// tested push-side block; pinning it here makes the credential path explicit.
+func TestConfigureExtraheader_SetsCredentialForHTTPS(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+	p := &Pusher{}
+
+	const (
+		httpsURL = "https://github.com/kuhlman-labs/fishhawk.git"
+		token    = "ghs-test-token"
+		key      = "http.https://github.com/.extraheader"
+	)
+	wantHeader := "AUTHORIZATION: basic " +
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+
+	// HTTPS + token: the host-scoped extraheader is written with the token's
+	// Basic auth header. The token lives in the config value, never on argv.
+	if err := p.configureExtraheader(context.Background(), repo, httpsURL, token); err != nil {
+		t.Fatalf("configureExtraheader (https+token): %v", err)
+	}
+	if got := mustGitOut(t, repo, "config", "--local", "--get", key); got != wantHeader {
+		t.Errorf("extraheader = %q, want %q", got, wantHeader)
+	}
+
+	// Empty token is a no-op (ambient-auth path) — no second value appended,
+	// and a fresh repo would have none at all.
+	repoEmpty := initRepo(t)
+	if err := p.configureExtraheader(context.Background(), repoEmpty, httpsURL, ""); err != nil {
+		t.Fatalf("configureExtraheader (empty token): %v", err)
+	}
+	if gitConfigPresent(t, repoEmpty, key) {
+		t.Error("empty token should not write an extraheader")
+	}
+
+	// Non-HTTPS RemoteURL (the bare-repo / SSH path) is a no-op even with a
+	// token — the same branch the #772 fetch test hits.
+	repoSSH := initRepo(t)
+	if err := p.configureExtraheader(context.Background(), repoSSH, "/tmp/origin.git", token); err != nil {
+		t.Fatalf("configureExtraheader (non-https): %v", err)
+	}
+	if gitConfigPresent(t, repoSSH, key) {
+		t.Error("non-HTTPS RemoteURL should not write an extraheader")
+	}
+}
+
+// gitConfigPresent reports whether a local git config key is set. `git config
+// --get` exits non-zero (code 1) when the key is absent, which is the "no-op
+// happened" signal we assert on rather than a test failure.
+func gitConfigPresent(t *testing.T, dir, key string) bool {
+	t.Helper()
+	cmd := exec.Command("git", "config", "--local", "--get", key)
+	cmd.Dir = dir
+	return cmd.Run() == nil
 }
 
 // Make sure `errors` is used so a refactor that drops the import
