@@ -185,6 +185,22 @@ func TestFixupStage_OutOfRangeIndexReturns400(t *testing.T) {
 	}
 }
 
+func TestFixupStage_DuplicateIndexReturns400(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "verification", Note: "untested"},
+	)
+
+	// Both indices are in range, but the duplicate must be rejected by
+	// selectConcerns (mapped to 400) — not silently deduplicated.
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0, 0}})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a duplicate concern index:\n%s", w.Code, w.Body.String())
+	}
+}
+
 func TestFixupStage_NoRecordedConcernsReturns422(t *testing.T) {
 	s, repo, _ := fixupServer(t)
 	stage := seedImplementGateStage(repo)

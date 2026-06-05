@@ -1433,11 +1433,20 @@ func (f *feedbackAuditRepo) ListGlobal(_ context.Context) ([]*audit.Entry, error
 func (f *feedbackAuditRepo) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
-func (f *feedbackAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, _ string) ([]*audit.Entry, error) {
+func (f *feedbackAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	return f.byRunID[runID], nil
+	// Honour the category filter so callers that query the wrong constant
+	// (e.g. a typo in CategoryStageFixupTriggered) see nothing — otherwise
+	// the resolver tests would pass without pinning the constant.
+	var out []*audit.Entry
+	for _, e := range f.byRunID[runID] {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 func (f *feedbackAuditRepo) ListAll(_ context.Context, _ audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, nil
@@ -1466,13 +1475,13 @@ func makeRejectionEntry(runID uuid.UUID, comment string) *audit.Entry {
 		"rejection_comment": comment,
 	})
 	rid := runID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
 }
 
 func makeApproveEntry(runID uuid.UUID) *audit.Entry {
 	payload, _ := json.Marshal(map[string]any{"decision": "approve"})
 	rid := runID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
 }
 
 func TestLoadPriorRejectionFeedback_NoPriorRuns_ReturnsNil(t *testing.T) {
@@ -1547,7 +1556,7 @@ func makeSchemaRetryEntry(runID uuid.UUID, validationErr string) *audit.Entry {
 		"validation_error": validationErr,
 	})
 	rid := runID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: "plan_schema_retry", RunID: &rid, Payload: payload}
 }
 
 func TestLoadPriorSchemaValidationError_NewestWins(t *testing.T) {
@@ -1672,7 +1681,7 @@ func makeFixupEntry(runID, stageID uuid.UUID, concerns []planreview.Concern) *au
 	})
 	rid := runID
 	sid := stageID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, StageID: &sid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
 }
 
 // TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded confirms that
@@ -1822,7 +1831,7 @@ func TestResolveFixupConcerns(t *testing.T) {
 	t.Run("malformed payload is skipped", func(t *testing.T) {
 		rid := runID
 		sid := stageID
-		bad := &audit.Entry{ID: uuid.New(), RunID: &rid, StageID: &sid, Payload: []byte("{not json")}
+		bad := &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: []byte("{not json")}
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
 			byRunID: map[uuid.UUID][]*audit.Entry{runID: {bad}},
 		}})
@@ -2117,7 +2126,7 @@ func makeApproveWithCommentEntry(runID uuid.UUID, comment string) *audit.Entry {
 		"comment":  comment,
 	})
 	rid := runID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid, Payload: payload}
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
 }
 
 // TestGetStagePrompt_ApprovalConditions_DecompositionFallback is the
