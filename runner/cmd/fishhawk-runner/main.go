@@ -1504,16 +1504,24 @@ var (
 // dep-fetch failure or an unrelated vet warning degrades to a
 // non-blocking skip rather than killing every implement stage (#728,
 // reviewer concern 2). The first three are the markers the reviewer
-// named explicitly; the rest cover the same typecheck-error class.
+// named explicitly; the rest cover the same typecheck-error class —
+// including the selector-on-type form 'X undefined (type Y has no field
+// or method Z)' ("undefined (" + "has no field or method"), which the
+// colon form "undefined:" does not match (#774, surfaced driving #762
+// child D whose broken HEAD opened as a PR).
 var compileDiagnosticMarkers = []string{
 	"does not implement",
 	"cannot use",
 	"undefined:",
+	"undefined (",
+	"has no field or method",
 	"missing method",
 	"undeclared name",
 	"redeclared",
 	"not enough arguments",
 	"too many arguments",
+	"is not a type",
+	"cannot convert",
 }
 
 // looksLikeCompileError reports whether `go vet` output contains a
