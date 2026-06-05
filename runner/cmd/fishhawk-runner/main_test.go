@@ -3023,6 +3023,14 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	if !fp.gotArgs.RebaseFromRemote {
 		t.Error("RebaseFromRemote = false, want true for subsequent child (branch exists on remote)")
 	}
+	// (#766): the compile gate is wired on EVERY decomposed-child commit
+	// path, not just the first child. Asserting it here too closes the gap
+	// where a guard re-introduced as `isDecomposed && isSubsequent` would
+	// leave the gate off for subsequent children while DecomposedFirstChild
+	// still passed.
+	if fp.gotArgs.VerifyCommit == nil {
+		t.Error("VerifyCommit hook should be set for subsequent decomposed children (#766)")
+	}
 	// Subsequent child: PR must NOT be opened (first child already did it).
 	if fpr.gotArgs != nil {
 		t.Error("OpenPR called for subsequent decomposed child — should be skipped")
