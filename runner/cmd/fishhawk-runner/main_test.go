@@ -2969,8 +2969,22 @@ func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 	if fpr.gotArgs != nil {
 		t.Error("OpenPR called for first decomposed child — should be suppressed (parent opens the PR)")
 	}
-	if fu.gotPRArgs != nil {
-		t.Error("ShipPullRequest called for first decomposed child — should be suppressed")
+	// But the child DOES report its push success via /pull-request with
+	// Outcome=="pushed" (#771) so the backend can drive the child stage's
+	// terminal transition its push_to_shared_branch trace gate left in
+	// `running`. No PR artifact — just the shared-branch commit coordinates.
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (child-push report) not called for first decomposed child (#771)")
+	}
+	if fu.gotPRArgs.Outcome != "pushed" {
+		t.Errorf("child-push report Outcome = %q, want \"pushed\"", fu.gotPRArgs.Outcome)
+	}
+	if fu.gotPRArgs.Branch != wantBranch {
+		t.Errorf("child-push report Branch = %q, want %q", fu.gotPRArgs.Branch, wantBranch)
+	}
+	if fu.gotPRArgs.HeadSHA == "" || fu.gotPRArgs.BaseSHA == "" {
+		t.Errorf("child-push report must carry head_sha + base_sha; got head=%q base=%q",
+			fu.gotPRArgs.HeadSHA, fu.gotPRArgs.BaseSHA)
 	}
 }
 
@@ -3035,8 +3049,134 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	if fpr.gotArgs != nil {
 		t.Error("OpenPR called for subsequent decomposed child — should be skipped")
 	}
-	if fu.gotPRArgs != nil {
-		t.Error("ShipPullRequest called for subsequent decomposed child — should be skipped")
+	// A subsequent child still reports its push success (#771) — the gate is
+	// per-child, not first-child-only.
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (child-push report) not called for subsequent decomposed child (#771)")
+	}
+	if fu.gotPRArgs.Outcome != "pushed" {
+		t.Errorf("child-push report Outcome = %q, want \"pushed\"", fu.gotPRArgs.Outcome)
+	}
+	if fu.gotPRArgs.Branch != wantBranch {
+		t.Errorf("child-push report Branch = %q, want %q", fu.gotPRArgs.Branch, wantBranch)
+	}
+}
+
+// TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix asserts the
+// push_to_shared_branch manifest flag (#771) and its mutual exclusivity with
+// push_and_open_pr across the {standalone, decomposed child, fix-up, --no-pr}
+// stage matrix. A decomposed child stamps push_to_shared_branch (and never
+// push_and_open_pr); a standalone stamps push_and_open_pr (and never the
+// child flag); a fix-up and a --no-pr local run stamp neither (they transition
+// on the trace upload as today).
+func TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix(t *testing.T) {
+	const parentRunID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	cases := []struct {
+		name           string
+		decomposedFrom string
+		fixup          bool
+		fixupBranch    string
+		noPR           bool
+		wantOpenPR     bool
+		wantPushChild  bool
+	}{
+		{name: "standalone", wantOpenPR: true, wantPushChild: false},
+		{name: "decomposed_child", decomposedFrom: parentRunID, wantOpenPR: false, wantPushChild: true},
+		{name: "fixup", fixup: true, fixupBranch: "fishhawk/run-11111111/stage-22222222", wantOpenPR: false, wantPushChild: false},
+		{name: "no_pr", noPR: true, wantOpenPR: false, wantPushChild: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			implementEnv(t, "kuhlman-labs/fishhawk", "main")
+			withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+			withFakeRemoteBranchExists(t, false)
+			fu := newFakeUploader(t)
+			fu.promptResp = &upload.FetchedPrompt{
+				StageID:             "22222222-3333-4444-5555-666666666666",
+				StageType:           "implement",
+				Prompt:              "implement",
+				PromptHash:          "h",
+				DecomposedFromRunID: tc.decomposedFrom,
+				Fixup:               tc.fixup,
+				FixupBranch:         tc.fixupBranch,
+			}
+			withFakeUploader(t, fu)
+			withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+			args := []string{
+				"--run-id", "11111111-2222-3333-4444-555555555555",
+				"--backend-url", "https://api.fishhawk.test",
+				"--workflow", "feature_change", "--stage", "implement",
+				"--stage-id", "22222222-3333-4444-5555-666666666666",
+				"--fetch-prompt", "--upload-trace",
+			}
+			if tc.noPR {
+				args = append(args, "--no-pr")
+			}
+			var stderr strings.Builder
+			if got := run(args, &stderr); got != exitOK {
+				t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+			}
+			if len(fu.gotShipCalls) == 0 {
+				t.Fatal("no trace uploaded")
+			}
+			manifest, _, _, err := openBundleForTest(fu.gotShipCalls[0].Bundle)
+			if err != nil {
+				t.Fatalf("open bundle: %v", err)
+			}
+			if manifest.PushAndOpenPR != tc.wantOpenPR {
+				t.Errorf("manifest.PushAndOpenPR = %v, want %v", manifest.PushAndOpenPR, tc.wantOpenPR)
+			}
+			if manifest.PushToSharedBranch != tc.wantPushChild {
+				t.Errorf("manifest.PushToSharedBranch = %v, want %v", manifest.PushToSharedBranch, tc.wantPushChild)
+			}
+			if manifest.PushAndOpenPR && manifest.PushToSharedBranch {
+				t.Error("push_and_open_pr and push_to_shared_branch must be mutually exclusive")
+			}
+		})
+	}
+}
+
+// TestRun_ImplementStage_DecomposedChildPushFailure_ReportsFailed confirms
+// the load-bearing #771 fix: when a decomposed child's commit/push onto the
+// shared branch fails (a generic git/network error → category C), the runner
+// reports the failure to /pull-request with Outcome=="failed" so the backend
+// fails the child stage its push_to_shared_branch trace gate left in `running`
+// — instead of leaving the trace-time succeeded zombie with no code on the
+// shared branch.
+func TestRun_ImplementStage_DecomposedChildPushFailure_ReportsFailed(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, false)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             "22222222-3333-4444-5555-666666666666",
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		DecomposedFromRunID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: errors.New("ssh-agent fetch failed")}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after a child push failure (#771)")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "C" {
+		t.Errorf("child-push failure report = {outcome:%q, category:%q}, want {failed, C}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
 	}
 }
 

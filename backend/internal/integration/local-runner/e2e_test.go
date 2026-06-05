@@ -721,6 +721,185 @@ func TestE2E_LocalRunner_ImplementPRFailure_NoZombie(t *testing.T) {
 	}
 }
 
+// TestE2E_LocalRunner_DecomposedChildPushFailure_NoZombie is the
+// decomposition-child analogue of TestE2E_LocalRunner_ImplementPRFailure_NoZombie
+// (#771). A decomposed child opens no PR — it commits + pushes onto the shared
+// parent branch — but the same zombie hole applied: before #771 the child's
+// implement stage advanced to its terminal state at trace-upload time, BEFORE
+// the push, so a push failure left the child run terminal-succeeded with no
+// code on the shared branch and the childcompletion sweeper would consolidate
+// the parent into a PR silently missing that child's work.
+//
+// This drives a real decomposed-child implement stage (run.DecomposedFrom set,
+// so the prompt stamps decomposed_from_run_id and the runner stamps
+// push_to_shared_branch) whose push step fails hermetically (no App
+// installation + denied gh-CLI token, exactly as the #742 e2e). It asserts:
+//
+//	(a) the child implement stage ends `failed` (category C, retryable) — NOT
+//	    succeeded, and the failed → pending retry transition is permitted;
+//	(b) the child run is not succeeded (no code-bearing succeeded child is
+//	    visible to the parent / the childcompletion sweeper); and
+//	(c) the parent run carries no pull_request_url and is not succeeded — no
+//	    consolidated PR missing the child was opened (the #698 awaiting-children
+//	    park holds).
+func TestE2E_LocalRunner_DecomposedChildPushFailure_NoZombie(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available; skipping decomposed-child push-failure E2E")
+	}
+	fx := newLocalRunnerFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// Parent run: the decomposition root the child is minted from.
+	parent, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef-childpush-parent",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun parent: %v", err)
+	}
+
+	// Child run: DecomposedFrom = parent.ID, so the prompt response stamps
+	// decomposed_from_run_id and the runner takes the push-to-shared-branch
+	// path (push_to_shared_branch manifest flag, no PR open).
+	child, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef-childpush-child",
+		TriggerSource:  runpkg.TriggerCLI,
+		RunnerKind:     runpkg.RunnerKindLocal,
+		DecomposedFrom: &parent.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun child: %v", err)
+	}
+
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: child.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := fx.artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       scopedPlanJSON(t, "added.txt"),
+		ContentHash:   "childpush-e2e",
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: child.ID, Sequence: 2, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code", RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+
+	// Working tree: a git repo on `main` with one base commit, so the child's
+	// scope-bounded diff (added.txt) is non-empty — the signal that fires the
+	// push_to_shared_branch gate.
+	workDir := t.TempDir()
+	gitRepoInit(t, workDir)
+
+	fakeDir := t.TempDir()
+	fakeScript := filepath.Join(fakeDir, "claude")
+	if runtime.GOOS == "windows" {
+		fakeScript = filepath.Join(fakeDir, "claude.bat")
+	}
+	scriptBody := "#!/bin/sh\nprintf '{\"type\":\"result\"}\\n'\necho 'package main' > added.txt\n"
+	if err := os.WriteFile(fakeScript, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+
+	// Deny the gh-CLI push fallback (#713) so the push step cannot
+	// authenticate — the hermetic forced failure.
+	ghConfigDir := t.TempDir()
+
+	cmd := exec.CommandContext(ctx, fx.runnerBinary,
+		"--run-id", child.ID.String(),
+		"--backend-url", fx.url,
+		"--workflow", "feature_change",
+		"--stage", "implement",
+		"--stage-id", implStage.ID.String(),
+		"--fetch-prompt",
+		"--upload-trace",
+		"--working-dir", workDir,
+		"--check-base-ref", "main",
+		"--github-repo", "kuhlman-labs/fishhawk",
+		"--base-branch", "main",
+	)
+	runnerEnv := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		switch {
+		case strings.HasPrefix(e, "PATH="):
+			e = "PATH=" + fakeDir + ":" + strings.TrimPrefix(e, "PATH=")
+		case strings.HasPrefix(e, "GH_TOKEN="), strings.HasPrefix(e, "GITHUB_TOKEN="), strings.HasPrefix(e, "GH_CONFIG_DIR="):
+			continue
+		}
+		runnerEnv = append(runnerEnv, e)
+	}
+	runnerEnv = append(runnerEnv, "GH_TOKEN=", "GITHUB_TOKEN=", "GH_CONFIG_DIR="+ghConfigDir)
+	cmd.Env = runnerEnv
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	// The runner is EXPECTED to exit non-zero: the child push step fails.
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("runner exited 0; expected failure on the child push step\noutput:\n%s", out.String())
+	}
+
+	// (a) The child implement stage must land FAILED with category C — never
+	// the terminal succeeded zombie.
+	got, err := fx.runRepo.GetStage(ctx, implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != runpkg.StageStateFailed {
+		t.Fatalf("child implement stage State = %q, want failed\nrunner output:\n%s", got.State, out.String())
+	}
+	if got.State == runpkg.StageStateSucceeded {
+		t.Error("child implement stage reached succeeded on a push failure (the zombie shape)")
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != runpkg.FailureC {
+		t.Errorf("FailureCategory = %v, want C (retryable)\nrunner output:\n%s", got.FailureCategory, out.String())
+	}
+	if !runpkg.ValidStageRetryTransition(got.State, runpkg.StageStatePending) {
+		t.Errorf("category-C failed stage should permit retry (failed → pending)")
+	}
+
+	// (b) The child run is not succeeded — no code-bearing succeeded child is
+	// visible to the parent / the childcompletion sweeper.
+	gotChild, err := fx.runRepo.GetRun(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("GetRun child: %v", err)
+	}
+	if gotChild.State == runpkg.StateSucceeded {
+		t.Errorf("child run State = succeeded, want non-succeeded after a push failure")
+	}
+
+	// (c) The parent run opened no consolidated PR and is not succeeded — the
+	// awaiting-children park holds, so no PR silently missing the child's code.
+	gotParent, err := fx.runRepo.GetRun(ctx, parent.ID)
+	if err != nil {
+		t.Fatalf("GetRun parent: %v", err)
+	}
+	if gotParent.PullRequestURL != nil {
+		t.Errorf("parent run.PullRequestURL = %q, want nil (no consolidated PR missing the child)", *gotParent.PullRequestURL)
+	}
+	if gotParent.State == runpkg.StateSucceeded {
+		t.Error("parent run reached succeeded with a failed child (consolidated a missing child)")
+	}
+}
+
 // gitRepoInit makes dir a git repo on branch `main` with a single base
 // commit, so an implement stage run against it produces a non-empty diff.
 func gitRepoInit(t *testing.T, dir string) {

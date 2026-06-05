@@ -480,7 +480,18 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// so the terminal transition below advances the stage as before, rather
 	// than hanging it in running. Non-push stages are byte-identical: the
 	// flag is false → the gate is a no-op.
-	if stage.Type == run.StageTypeImplement && s.pushAndOpenPRGated(bundleBytes) {
+	//
+	// The decomposed-child push (#771) is gated identically: a child stamps
+	// push_to_shared_branch (not push_and_open_pr) and commits + pushes onto
+	// the shared parent branch after the trace ships. childPushGated mirrors
+	// pushAndOpenPRGated — leave the child stage in `running` and let the
+	// /pull-request "pushed"/"failed" report drive the terminal transition,
+	// so a child commit/push failure lands the stage `failed` instead of
+	// reaching terminal succeeded with no code on the shared branch (the
+	// childcompletion sweeper would otherwise consolidate the parent into a
+	// PR silently missing that child's work).
+	if stage.Type == run.StageTypeImplement &&
+		(s.pushAndOpenPRGated(bundleBytes) || s.childPushGated(bundleBytes)) {
 		s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "succeeded")
 		return
 	}
@@ -593,6 +604,35 @@ func (s *Server) planArtifactExists(ctx context.Context, stageID uuid.UUID) bool
 func (*Server) pushAndOpenPRGated(bundleBytes []byte) bool {
 	manifest, err := bundle.ExtractManifest(bundleBytes)
 	if err != nil || !manifest.PushAndOpenPR {
+		return false
+	}
+	diff, err := bundle.ExtractDiff(bundleBytes)
+	if err != nil {
+		return false
+	}
+	return len(diff.ChangedFiles) > 0
+}
+
+// childPushGated reports whether a decomposed-child implement-stage trace
+// upload should DEFER its terminal transition to the /pull-request upload
+// (#771). It mirrors pushAndOpenPRGated for the decomposition-child case.
+// True only when BOTH hold:
+//
+//   - the bundle manifest's push_to_shared_branch flag is set (the runner is
+//     a decomposed child that will commit + push onto the shared parent
+//     branch after the trace ships, without opening its own PR), and
+//   - the bundle carries a non-empty git_diff (a commit + push will actually
+//     follow, so a /pull-request "pushed"/"failed" report is guaranteed).
+//
+// A false flag — every non-child stage and every older bundle — returns
+// false so the prior trace-driven transition is byte-identical. An empty or
+// absent diff is the no-changes path: the child made no edits, so the runner
+// pushes nothing and never POSTs to /pull-request; gating it would hang the
+// stage in running, so it returns false and the caller advances the stage as
+// before (matching the push_and_open_pr empty-diff case).
+func (*Server) childPushGated(bundleBytes []byte) bool {
+	manifest, err := bundle.ExtractManifest(bundleBytes)
+	if err != nil || !manifest.PushToSharedBranch {
 		return false
 	}
 	diff, err := bundle.ExtractDiff(bundleBytes)

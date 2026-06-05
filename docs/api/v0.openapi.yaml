@@ -400,7 +400,7 @@ components:
         Stored verbatim as the artifact's content; v0 doesn't carry a
         schema_version because the field shape isn't yet schema-stable.
 
-        Has two variants (#742):
+        Has three variants (#742, #771):
 
         - **Success** (default): `outcome` is absent. The PR fields
           (`pr_number`, `pr_url`, `branch`, `head_sha`, `base_sha`,
@@ -415,6 +415,15 @@ components:
           absent. The handler fails the implement stage instead of
           creating an artifact, so the run never strands at
           review:awaiting_approval with a null PR.
+        - **Child push** (`outcome: pushed`, #771): a decomposed child
+          committed + pushed onto the shared parent branch but opened no PR
+          (the parent run opens one consolidated PR after all children
+          settle). `branch`, `head_sha`, and `base_sha` are required;
+          `pr_number`/`pr_url`/`title` are absent. The handler drives the
+          child stage's terminal transition its push_to_shared_branch trace
+          gate left in `running`, without creating a PR artifact — so a child
+          whose push failed (reported via `outcome: failed`) never reaches
+          terminal succeeded with no code on the shared branch.
       required: [pr_number, pr_url, branch, head_sha, base_sha, title, files_changed_count]
       properties:
         pr_number:
@@ -446,11 +455,14 @@ components:
           example: 3
         outcome:
           type: string
-          enum: [failed]
+          enum: [failed, pushed]
           description: |
-            Present only on the failure variant (#742). When set to
-            `failed`, the body reports a commit/push/PR-open failure and
-            the PR fields above are absent.
+            Present only on the non-success variants. `failed` (#742)
+            reports a commit/push/PR-open failure (PR fields absent;
+            `category` + `reason` required). `pushed` (#771) reports a
+            decomposed child's successful push onto the shared parent branch
+            (no PR opened; `branch` + `head_sha` + `base_sha` required,
+            `pr_number`/`pr_url`/`title` absent).
         category:
           type: string
           enum: [B, C]
@@ -491,6 +503,20 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         outcome: { type: string, enum: [failed] }
         category: { type: string, enum: [B, C] }
+
+    PullRequestChildPushResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/pull-request` for the child-push
+        variant (`outcome: pushed`, #771): a decomposed child pushed onto the
+        shared parent branch and the child implement stage transitioned
+        terminally. No PR artifact is created.
+      required: [stage_id, outcome, branch, head_sha]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        outcome: { type: string, enum: [pushed] }
+        branch: { type: string }
+        head_sha: { type: string }
 
     PlanUploadResponse:
       type: object
@@ -2576,7 +2602,7 @@ paths:
       summary: Upload a pull-request artifact for an implement stage
       description: |
         Called after an implement-stage run to report its commit/push/
-        PR-open outcome. The body has two variants (#742):
+        PR-open outcome. The body has three variants (#742, #771):
 
         - **Success**: a real GitHub PR was opened. The body carries
           `{ pr_number, pr_url, branch, head_sha, base_sha, title,
@@ -2590,6 +2616,13 @@ paths:
           `B` parks for re-scope) instead of creating an artifact —
           closing the zombie-run hole where a commit/push failure
           stranded the run at review with a null PR.
+        - **Child push** (`{ outcome: "pushed", branch, head_sha,
+          base_sha, files_changed_count }`, #771): a decomposed child
+          pushed onto the shared parent branch without opening a PR. The
+          handler drives the child stage's terminal transition its
+          push_to_shared_branch trace gate left in `running`, without
+          creating a PR artifact — the decomposition-child analogue of the
+          #742 zombie fix.
 
         Two auth paths are accepted:
 
@@ -2649,13 +2682,17 @@ paths:
               exists for the stage (idempotent re-upload returns the
               existing artifact unchanged), or
             - the failure variant (`outcome: failed`) was accepted and
-              the implement stage was transitioned to `failed` (#742).
+              the implement stage was transitioned to `failed` (#742), or
+            - the child-push variant (`outcome: pushed`) was accepted and
+              the decomposed-child implement stage was transitioned
+              terminally (#771).
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: '#/components/schemas/PullRequestUploadResponse'
                   - $ref: '#/components/schemas/PullRequestFailureResponse'
+                  - $ref: '#/components/schemas/PullRequestChildPushResponse'
         '400':
           description: |
             Body missing required fields (`code: pull_request_invalid`)

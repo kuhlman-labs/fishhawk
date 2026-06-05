@@ -234,3 +234,47 @@ func TestShipPullRequest_RejectsBadInputs(t *testing.T) {
 		t.Errorf("expected key-length error, got %v", err)
 	}
 }
+
+// TestShipPullRequest_ChildPushOutcome_MarshalsPushBody confirms the #771
+// child-push success report: Outcome=="pushed" causes ShipPullRequest to
+// build the {outcome:"pushed", branch, head_sha, base_sha, files_changed_count}
+// body from the args (ignoring the absent success Body) and sign over those
+// bytes — no PR artifact.
+func TestShipPullRequest_ChildPushOutcome_MarshalsPushBody(t *testing.T) {
+	pf, srv := newPRFakeBackend(t)
+	pf.status = http.StatusOK
+	pf.body = `{"stage_id":"stage-bbb","outcome":"pushed","branch":"fishhawk/run-aaa","head_sha":"head-abc"}`
+	c := quickPRClient(srv)
+	priv := makePRKey(t)
+
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID:             "run-aaa",
+		StageID:           "stage-bbb",
+		PrivateKey:        priv,
+		Outcome:           "pushed",
+		Branch:            "fishhawk/run-aaa",
+		HeadSHA:           "head-abc",
+		BaseSHA:           "base-def",
+		FilesChangedCount: 3,
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+
+	var sent pullRequestChildPushBody
+	if err := json.Unmarshal(pf.receivedBody, &sent); err != nil {
+		t.Fatalf("unmarshal received body: %v", err)
+	}
+	want := pullRequestChildPushBody{
+		Outcome: "pushed", Branch: "fishhawk/run-aaa",
+		HeadSHA: "head-abc", BaseSHA: "base-def", FilesChangedCount: 3,
+	}
+	if sent != want {
+		t.Errorf("sent body = %+v, want %+v", sent, want)
+	}
+	// Signature must cover the marshalled push body, not the empty success Body.
+	digest := sha256.Sum256(pf.receivedBody)
+	wantSig := hex.EncodeToString(ed25519.Sign(priv, digest[:]))
+	if pf.receivedSig != wantSig {
+		t.Error("signature must cover the child-push body bytes")
+	}
+}
