@@ -2958,10 +2958,11 @@ func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 	if fp.gotArgs.RebaseFromRemote {
 		t.Error("RebaseFromRemote = true, want false for first child (branch not yet on remote)")
 	}
-	// Compile gate (#728) is off for decomposed children: a child may
-	// legitimately not compile in isolation before later children land.
-	if fp.gotArgs.VerifyCommit != nil {
-		t.Error("VerifyCommit hook should be nil for decomposed children")
+	// Compile gate (#728) is now wired on the decomposed-child path too
+	// (#766): a scope-bounded child commit is the highest-risk path for a
+	// drift-dropped non-compiling HEAD, so it must be gated, not tolerated.
+	if fp.gotArgs.VerifyCommit == nil {
+		t.Error("VerifyCommit hook should be set for decomposed children (#766)")
 	}
 	// First child: per ADR-032 the child no longer opens a PR — the parent
 	// run opens the single consolidated PR once all children settle.
@@ -3021,6 +3022,14 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	}
 	if !fp.gotArgs.RebaseFromRemote {
 		t.Error("RebaseFromRemote = false, want true for subsequent child (branch exists on remote)")
+	}
+	// (#766): the compile gate is wired on EVERY decomposed-child commit
+	// path, not just the first child. Asserting it here too closes the gap
+	// where a guard re-introduced as `isDecomposed && isSubsequent` would
+	// leave the gate off for subsequent children while DecomposedFirstChild
+	// still passed.
+	if fp.gotArgs.VerifyCommit == nil {
+		t.Error("VerifyCommit hook should be set for subsequent decomposed children (#766)")
 	}
 	// Subsequent child: PR must NOT be opened (first child already did it).
 	if fpr.gotArgs != nil {

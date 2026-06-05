@@ -1748,26 +1748,24 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	title, body := prTitleAndBody(cfg, branch, logSink)
 	commitMessage := title + "\n\n" + body
 
-	// Compile-gate the scope-only committed tree before push (#728), but
-	// only on the standalone PR-opening path. Decomposed children push
-	// intermediate commits to a shared branch and may legitimately not
-	// compile in isolation before later children land, so gating them
-	// would false-positive — leave them ungated (the parent run's
-	// consolidated tip is a separate follow-up). The hook runs inside
-	// CommitAndPush after the commit and before the push, so a failure
-	// leaves origin untouched.
-	var verifyCommit func(ctx context.Context, headSHA string, drift []string) error
-	if !isDecomposed {
-		verifyCommit = func(ctx context.Context, headSHA string, drift []string) error {
-			if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, logSink); err != nil {
-				driftJSON, _ := json.Marshal(drift)
-				_, _ = fmt.Fprintf(logSink,
-					`{"event":"compile_gate_failed","run_id":%q,"stage_id":%q,"head_sha":%q,"drift":%s}`+"\n",
-					cfg.runID, cfg.stageID, headSHA, driftJSON)
-				return err
-			}
-			return nil
+	// Compile-gate the scope-only committed tree before push (#728), on every
+	// implement push including decomposed children (#766). A scope-bounded
+	// child commit is the highest-risk path for a drift-dropped non-compiling
+	// HEAD: StageScoped (#581) can strip build-required drift, so an
+	// incomplete child commit is a scope-drift defect to surface, not a
+	// tolerated intermediate. The gate's isolated worktree checks out the
+	// specific headSHA, so it works unchanged for a shared-branch child
+	// commit. The hook runs inside CommitAndPush after the commit and before
+	// the push, so a failure leaves origin untouched.
+	verifyCommit := func(ctx context.Context, headSHA string, drift []string) error {
+		if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, logSink); err != nil {
+			driftJSON, _ := json.Marshal(drift)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"compile_gate_failed","run_id":%q,"stage_id":%q,"head_sha":%q,"drift":%s}`+"\n",
+				cfg.runID, cfg.stageID, headSHA, driftJSON)
+			return err
 		}
+		return nil
 	}
 
 	cap, err := newPusher().CommitAndPush(ctx, gitops.CommitAndPushArgs{
@@ -1794,8 +1792,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// plan's declared paths, excluding stray dirty files. Empty
 		// (plan_missing_for_implement) falls back to `git add -A`.
 		ScopeFiles: scopePaths(cfg.scopeFiles),
-		// Compile-gate the committed tree before push (#728). nil on the
-		// decomposed-child path (see above), which leaves the gate off.
+		// Compile-gate the committed tree before push (#728). Always wired,
+		// including the decomposed-child path (#766, see above) — the gate
+		// runs on every implement push.
 		VerifyCommit: verifyCommit,
 	})
 	if err != nil {
