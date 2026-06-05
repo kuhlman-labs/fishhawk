@@ -109,7 +109,10 @@ func (m *memRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageS
 		cp := *s
 		return &cp, nil
 	}
-	if !run.ValidStageTransition(s.State, to) {
+	// Mirror postgresRepo: admit the fix-up override edge
+	// (awaiting_approval → pending, #762) in addition to the normal
+	// transitions so FixupStage can reuse TransitionStage.
+	if !run.ValidStageTransition(s.State, to) && !run.ValidStageFixupTransition(s.State, to) {
 		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
 	}
 	s.State = to
