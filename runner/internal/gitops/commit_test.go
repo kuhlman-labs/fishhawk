@@ -2,6 +2,7 @@ package gitops
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"os/exec"
@@ -794,6 +795,71 @@ func TestCommitAndPush_RebaseFromRemote_FetchesViaRemoteURL(t *testing.T) {
 	if !strings.Contains(tree, "b.txt") {
 		t.Errorf("bare branch tree missing reapplied edit b.txt; got %q", tree)
 	}
+}
+
+// TestConfigureExtraheader_SetsCredentialForHTTPS covers the credential-
+// configuration path the #772 fetch test cannot reach: that test passes a bare
+// filesystem path as RemoteURL, so configureExtraheader no-ops on the
+// not-HTTPS branch in both the rebase and push call sites. Here we exercise the
+// helper directly against a real repo to assert (1) an HTTPS RemoteURL with a
+// non-empty PushToken writes the host-scoped `http.<host>.extraheader` to the
+// Basic auth header derived from the token, (2) an empty token is a no-op
+// (ambient-auth path), and (3) a non-HTTPS RemoteURL is a no-op. This is the
+// branch coverage the helper's straight extraction shares with the already-
+// tested push-side block; pinning it here makes the credential path explicit.
+func TestConfigureExtraheader_SetsCredentialForHTTPS(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+	p := &Pusher{}
+
+	const (
+		httpsURL = "https://github.com/kuhlman-labs/fishhawk.git"
+		token    = "ghs-test-token"
+		key      = "http.https://github.com/.extraheader"
+	)
+	wantHeader := "AUTHORIZATION: basic " +
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+
+	// HTTPS + token: the host-scoped extraheader is written with the token's
+	// Basic auth header. The token lives in the config value, never on argv.
+	if err := p.configureExtraheader(context.Background(), repo, httpsURL, token); err != nil {
+		t.Fatalf("configureExtraheader (https+token): %v", err)
+	}
+	if got := mustGitOut(t, repo, "config", "--local", "--get", key); got != wantHeader {
+		t.Errorf("extraheader = %q, want %q", got, wantHeader)
+	}
+
+	// Empty token is a no-op (ambient-auth path) — no second value appended,
+	// and a fresh repo would have none at all.
+	repoEmpty := initRepo(t)
+	if err := p.configureExtraheader(context.Background(), repoEmpty, httpsURL, ""); err != nil {
+		t.Fatalf("configureExtraheader (empty token): %v", err)
+	}
+	if gitConfigPresent(t, repoEmpty, key) {
+		t.Error("empty token should not write an extraheader")
+	}
+
+	// Non-HTTPS RemoteURL (the bare-repo / SSH path) is a no-op even with a
+	// token — the same branch the #772 fetch test hits.
+	repoSSH := initRepo(t)
+	if err := p.configureExtraheader(context.Background(), repoSSH, "/tmp/origin.git", token); err != nil {
+		t.Fatalf("configureExtraheader (non-https): %v", err)
+	}
+	if gitConfigPresent(t, repoSSH, key) {
+		t.Error("non-HTTPS RemoteURL should not write an extraheader")
+	}
+}
+
+// gitConfigPresent reports whether a local git config key is set. `git config
+// --get` exits non-zero (code 1) when the key is absent, which is the "no-op
+// happened" signal we assert on rather than a test failure.
+func gitConfigPresent(t *testing.T, dir, key string) bool {
+	t.Helper()
+	cmd := exec.Command("git", "config", "--local", "--get", key)
+	cmd.Dir = dir
+	return cmd.Run() == nil
 }
 
 // Make sure `errors` is used so a refactor that drops the import
