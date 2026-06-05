@@ -48,15 +48,25 @@ type fixupRequest struct {
 
 // handleFixupStage implements POST /v0/stages/{stage_id}/fixup.
 //
-// The implement-review fix-up (E22.X / #762) routes one or more
+// The implement-review fix-up (E22.X / #762, #780) routes one or more
 // advisory implement-review concerns (ADR-027 approve_with_concerns)
 // back to the implement agent for a bounded, operator-gated fix-up
 // pass, instead of the operator hand-editing the PR branch. It re-opens
-// the implement stage parked at the review gate (awaiting_approval →
-// pending) and hands off to the orchestrator, which re-dispatches the
-// implement stage. The selected concerns are delivered to the agent as
-// binding instructions by the prompt renderer (reading them back from
-// the audit entry this handler writes).
+// the implement stage to pending and hands off to the orchestrator,
+// which re-dispatches it. Two flows are admitted by run.FixupStage:
+//
+//   - commit-yourself: the implement stage is its own gate
+//     (awaiting_approval → pending);
+//   - push_and_open_pr (#780): the implement stage SUCCEEDED (PR opened)
+//     and the human gate is a SEPARATE review stage at awaiting_approval.
+//     The implement stage re-opens succeeded → pending AND the review
+//     stage is re-parked awaiting_approval → pending so the re-dispatched
+//     implement flows back into a fresh review. The re-parked review
+//     stage id is recorded on the audit entry (reparked_review_stage_id).
+//
+// The selected concerns are delivered to the agent as binding
+// instructions by the prompt renderer (reading them back from the audit
+// entry this handler writes).
 //
 // Distinct from POST /v0/stages/{stage_id}/retry: retry re-opens a
 // FAILED stage and regenerates a fresh diff; fix-up re-opens a HEALTHY
@@ -328,6 +338,12 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 		"remaining_budget": dec.RemainingBudget,
 		"admissibility_reason": fmt.Sprintf("fix-up pass %d of %d; %d concern(s) routed back; via %s",
 			passOrdinal, defaultMaxFixupPasses, len(selected), fixupScopeUsed(id)),
+	}
+	// push_and_open_pr flow (#780): record the review stage re-parked
+	// alongside the implement re-open, so the audit trail captures the
+	// full state change (and downstream tooling can correlate the gate).
+	if dec.ReparkedReview != nil {
+		fields["reparked_review_stage_id"] = dec.ReparkedReview.ID.String()
 	}
 
 	payload, _ := json.Marshal(fields)

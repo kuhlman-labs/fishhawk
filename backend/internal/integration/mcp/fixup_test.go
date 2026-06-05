@@ -225,6 +225,146 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 	}
 }
 
+// TestE2E_Fixup_PushOpenPRReopensImplementAndReparksReview drives the
+// push_and_open_pr fix-up seam end-to-end (#780): with push_and_open_pr
+// the implement stage SUCCEEDS (it opens the PR) and the human gate is a
+// SEPARATE review stage at awaiting_approval. A fix-up must re-open the
+// succeeded implement stage AND re-park the review stage, both persisted
+// through real MCP binary → backend HTTP → Postgres. This is the leg the
+// per-layer unit tests can't cover on their own (cf. #618).
+func TestE2E_Fixup_PushOpenPRReopensImplementAndReparksReview(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+
+	// 1. Implement stage that SUCCEEDED — the push_and_open_pr shape: it
+	// committed and opened the PR, so it is terminal, not at a gate.
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+
+	// 2. Separate review stage holding the human gate at awaiting_approval.
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         2,
+		Type:             runpkg.StageTypeReview,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	// 3. Record the implement-review concern keyed to the implement stage.
+	scopeConcern := planreview.Concern{
+		Severity: planreview.SeverityMedium,
+		Category: "scope",
+		Note:     "guard the new fix-up edge against a missing review stage",
+	}
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID, scopeConcern)
+
+	// 4. Trigger the fix-up through the real fishhawk-mcp binary.
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "address the scope concern on the open PR",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+
+	// The succeeded implement stage re-opened to pending.
+	var fixupOut struct {
+		Stage struct {
+			ID    string `json:"id"`
+			State string `json:"state"`
+		} `json:"stage"`
+	}
+	decodeStructured(t, result, &fixupOut)
+	if fixupOut.Stage.ID != impl.ID.String() {
+		t.Errorf("fix-up stage id = %q, want %s", fixupOut.Stage.ID, impl.ID)
+	}
+	if fixupOut.Stage.State != string(runpkg.StageStatePending) {
+		t.Errorf("fix-up stage state = %q, want pending", fixupOut.Stage.State)
+	}
+
+	// The review stage was re-parked awaiting_approval → pending.
+	curReview, err := fx.runRepo.GetStage(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("GetStage(review): %v", err)
+	}
+	if curReview.State != runpkg.StageStatePending {
+		t.Errorf("review state = %q, want pending (re-parked)", curReview.State)
+	}
+
+	// The stage_fixup_triggered audit entry landed carrying the selected
+	// concern AND the re-parked review stage id (#780 CONDITION 3).
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 1", len(entries))
+	}
+	var triggered struct {
+		PassOrdinal           int                  `json:"pass_ordinal"`
+		PriorState            string               `json:"prior_state"`
+		Concerns              []planreview.Concern `json:"concerns"`
+		ReparkedReviewStageID string               `json:"reparked_review_stage_id"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &triggered); err != nil {
+		t.Fatalf("unmarshal stage_fixup_triggered payload: %v", err)
+	}
+	if triggered.PassOrdinal != 1 {
+		t.Errorf("pass_ordinal = %d, want 1", triggered.PassOrdinal)
+	}
+	if triggered.PriorState != string(runpkg.StageStateSucceeded) {
+		t.Errorf("prior_state = %q, want succeeded", triggered.PriorState)
+	}
+	if triggered.ReparkedReviewStageID != review.ID.String() {
+		t.Errorf("reparked_review_stage_id = %q, want %s", triggered.ReparkedReviewStageID, review.ID)
+	}
+	if len(triggered.Concerns) != 1 || triggered.Concerns[0].Category != "scope" {
+		t.Fatalf("persisted concerns = %+v, want the single scope concern", triggered.Concerns)
+	}
+}
+
+// walkToSucceeded walks a stage pending → dispatched → running →
+// succeeded, the push_and_open_pr terminal shape for an implement stage
+// that committed and opened the PR.
+func walkToSucceeded(t *testing.T, ctx context.Context, repo runpkg.Repository, stageID uuid.UUID) {
+	t.Helper()
+	for _, to := range []runpkg.StageState{
+		runpkg.StageStateDispatched,
+		runpkg.StageStateRunning,
+		runpkg.StageStateSucceeded,
+	} {
+		if _, err := repo.TransitionStage(ctx, stageID, to, nil); err != nil {
+			t.Fatalf("TransitionStage → %s: %v", to, err)
+		}
+	}
+}
+
 // parkAtGate walks an implement stage pending → dispatched → running →
 // awaiting_approval, the precondition for a fix-up. The stage may start
 // in pending (fresh) or pending (just re-opened by a prior fix-up).

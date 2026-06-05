@@ -16,7 +16,7 @@ import (
 // audit entry) to route back to the agent; it must be non-empty. Reason
 // is an optional operator note recorded on the fix-up audit entry.
 type FixupStageInput struct {
-	StageID  string `json:"stage_id" jsonschema:"the Fishhawk implement stage UUID to fix up (the stage parked at the implement-review gate)"`
+	StageID  string `json:"stage_id" jsonschema:"the Fishhawk implement stage UUID to fix up (parked at the implement-review gate, or succeeded with the run's review gate still open)"`
 	Concerns []int  `json:"concerns" jsonschema:"indices of the recorded implement-review concerns to route back to the agent; at least one required"`
 	Reason   string `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the stage_fixup_triggered audit entry"`
 }
@@ -70,8 +70,18 @@ editing the PR branch yourself. The fix-up:
     fishhawk_retry_stage);
   - re-runs the implement review on the result.
 
+Applies to an implement stage in either flow:
+  - the implement stage is itself parked at the review gate
+    (awaiting_approval), OR
+  - the implement stage has succeeded (it opened the PR) and the run's
+    SEPARATE review stage is still parked at awaiting_approval — the
+    push_and_open_pr flow. The review stage is re-parked alongside the
+    re-open so the fix-up flows back into a fresh review. Refused once
+    the review gate has merged/resolved.
+
 Inputs:
-  - stage_id : the implement stage parked at the review gate.
+  - stage_id : the implement stage (parked at the review gate, or
+    succeeded with the run's review gate still open).
   - concerns : indices of the recorded implement-review concerns to route
     back (at least one). The indices address the concern set in the
     stage's implement_reviewed audit entry; inspect it via
@@ -91,7 +101,8 @@ Returns a tool error on:
   - validation_failed (empty concerns / out-of-range index, 400)
   - cross_run_fixup (a run-bound token reaching another run's stage, 403)
   - stage_not_found (404)
-  - fixup_not_applicable (no recorded approve_with_concerns verdict, 422)
+  - fixup_not_applicable (no recorded approve_with_concerns verdict, or
+    the stage is not at the gate / its review gate already resolved, 422)
   - fixup_budget_exhausted (the bounded pass count is spent, 422)
 `),
 	}, resolver.fixupStage)

@@ -268,8 +268,20 @@ func (r *approvalRunRepo) SumWorkflowCostInRange(_ context.Context, repo, workfl
 func (r *approvalRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
-func (r *approvalRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
+
+// ListStagesForRun returns every seeded stage sharing the queried
+// RunID, so the fix-up handler's push_and_open_pr applicability check
+// (run.FixupStage) can locate the run's review stage (#780).
+func (r *approvalRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*run.Stage
+	for _, st := range r.stages {
+		if st.RunID == runID {
+			out = append(out, st)
+		}
+	}
+	return out, nil
 }
 func (r *approvalRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
