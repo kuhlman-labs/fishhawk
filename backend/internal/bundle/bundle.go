@@ -76,6 +76,17 @@ type Manifest struct {
 	// preserving the prior trace-driven transition. Keep in lockstep with
 	// runner/internal/bundle.ManifestData.
 	PushAndOpenPR bool `json:"push_and_open_pr,omitempty"`
+	// PushToSharedBranch signals a decomposed-child implement stage that will
+	// commit + push onto the shared parent branch after the trace upload
+	// (without opening its own PR). The trace handler reads it to forward-gate
+	// the child stage's terminal transition onto the /pull-request upload
+	// (#771), closing the decomposition-child analogue of the #742 zombie:
+	// a child reaching terminal succeeded with no code on the shared branch
+	// after a commit/push failure, which the childcompletion sweeper would
+	// then consolidate into a PR silently missing that child's work. Older
+	// bundles (and every non-child stage) omit it and decode to false. Keep
+	// in lockstep with runner/internal/bundle.ManifestData.
+	PushToSharedBranch bool `json:"push_to_shared_branch,omitempty"`
 }
 
 // Errors callers may want to switch on.

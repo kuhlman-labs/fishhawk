@@ -44,10 +44,20 @@ type pullRequestBody struct {
 	// are absent. The handler then fails the implement stage its trace gate
 	// left in `running` (category C is retryable, B parks for re-scope)
 	// instead of creating a PR artifact, so the run never strands at
-	// review:awaiting_approval with a null PR. On the success body Outcome
-	// is empty and the PR fields are required. These are declared directly
-	// on the struct (with omitempty) so the handler's DisallowUnknownFields
-	// decoder accepts BOTH shapes without a separate discriminator struct.
+	// review:awaiting_approval with a null PR.
+	//
+	// When Outcome=="pushed" the body is a decomposed-child push-success
+	// report (#771): the child committed + pushed onto the shared parent
+	// branch but opened no PR (the parent run opens one consolidated PR after
+	// all children settle, per ADR-032). The PR fields (pr_number/pr_url) are
+	// absent; branch/head_sha/base_sha carry the pushed commit. The handler
+	// drives the child stage's terminal transition its push_to_shared_branch
+	// trace gate left in `running` without creating a PR artifact.
+	//
+	// On the success body Outcome is empty and the PR fields are required.
+	// These are declared directly on the struct (with omitempty) so the
+	// handler's DisallowUnknownFields decoder accepts ALL shapes without a
+	// separate discriminator struct.
 	Outcome  string `json:"outcome,omitempty"`
 	Category string `json:"category,omitempty"`
 	Reason   string `json:"reason,omitempty"`
@@ -62,10 +72,7 @@ func (p *pullRequestBody) validate() error {
 	// Failure-report variant (#742): no PR was opened, so the PR fields are
 	// absent. Require the outcome marker, a valid failure category, and a
 	// reason; the PR-field checks below don't apply.
-	if p.Outcome != "" {
-		if p.Outcome != "failed" {
-			return fmt.Errorf("outcome must be \"failed\" when set, got %q", p.Outcome)
-		}
+	if p.Outcome == "failed" {
 		if p.Category != "B" && p.Category != "C" {
 			return fmt.Errorf("category must be \"B\" or \"C\" for a failed outcome, got %q", p.Category)
 		}
@@ -73,6 +80,24 @@ func (p *pullRequestBody) validate() error {
 			return errors.New("reason is required for a failed outcome")
 		}
 		return nil
+	}
+	// Child-push success variant (#771): a decomposed child pushed onto the
+	// shared parent branch without opening a PR. No pr_number/pr_url; require
+	// the shared-branch commit coordinates so the audit entry pins what
+	// landed.
+	if p.Outcome == "pushed" {
+		switch {
+		case p.Branch == "":
+			return errors.New("branch is required for a pushed outcome")
+		case p.HeadSHA == "":
+			return errors.New("head_sha is required for a pushed outcome")
+		case p.BaseSHA == "":
+			return errors.New("base_sha is required for a pushed outcome")
+		}
+		return nil
+	}
+	if p.Outcome != "" {
+		return fmt.Errorf("outcome must be \"failed\" or \"pushed\" when set, got %q", p.Outcome)
 	}
 	switch {
 	case p.PRNumber <= 0:
@@ -229,6 +254,16 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Child-push success variant (#771): a decomposed child pushed its commit
+	// onto the shared parent branch (no PR). Drive the child stage's terminal
+	// transition its push_to_shared_branch trace gate left in `running`, write
+	// a child_pushed audit entry, and respond 200. No PR artifact and no
+	// pull_request_url backfill — the parent run opens the consolidated PR.
+	if pr.Outcome == "pushed" {
+		s.succeedChildPushStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		return
+	}
+
 	contentHash := sha256Hex(body)
 
 	// Idempotency: dedup on (stage_id, content_hash). The runner
@@ -360,6 +395,16 @@ type pullRequestFailureResponse struct {
 	Category string    `json:"category"`
 }
 
+// pullRequestChildPushResponse is the 200 body for the child-push success
+// variant (#771): a decomposed child pushed onto the shared parent branch and
+// the child stage transitioned terminally. HeadSHA echoes the pushed commit.
+type pullRequestChildPushResponse struct {
+	StageID uuid.UUID `json:"stage_id"`
+	Outcome string    `json:"outcome"`
+	Branch  string    `json:"branch"`
+	HeadSHA string    `json:"head_sha"`
+}
+
 // advanceImplementStageAfterPR drives the implement stage's terminal
 // transition once the PR artifact has landed (#742). The trace handler's
 // push-and-open-pr gate leaves the stage in `running` until the
@@ -396,6 +441,57 @@ func (s *Server) advanceImplementStageAfterPR(r *http.Request, runID uuid.UUID, 
 				slog.String("error", err.Error()))
 		}
 	}
+}
+
+// succeedChildPushStage handles the child-push success variant (#771): a
+// decomposed child committed + pushed onto the shared parent branch (no PR)
+// after the trace gate left the child implement stage in `running`. It drives
+// the running → terminal transition via advanceImplementStageAfterPR (a no-op
+// if the stage already advanced — e.g. an older runner that never gated),
+// writes a child_pushed audit entry pinning the shared-branch commit into the
+// chain, fires the sticky status comment, and responds 200. No PR artifact,
+// no pull_request_url backfill — the parent run opens the consolidated PR
+// after all children settle.
+func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+		s.advanceImplementStageAfterPR(r, runID, stage)
+	}
+
+	stageID := stage.ID
+	auditPayload, _ := json.Marshal(map[string]any{
+		"run_id":              runID.String(),
+		"stage_id":            stageID.String(),
+		"branch":              pr.Branch,
+		"head_sha":            pr.HeadSHA,
+		"base_sha":            pr.BaseSHA,
+		"files_changed_count": pr.FilesChangedCount,
+		"auth_method":         authMethod,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "child_pushed",
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      auditPayload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"child-push report: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	s.notifyStatusUpdate(r.Context(), runID, "child_pushed")
+
+	s.writeJSON(w, r, http.StatusOK, pullRequestChildPushResponse{
+		StageID: stageID,
+		Outcome: "pushed",
+		Branch:  pr.Branch,
+		HeadSHA: pr.HeadSHA,
+	})
 }
 
 // failPullRequestStage handles the failure-report variant (#742): the

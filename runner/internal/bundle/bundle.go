@@ -88,6 +88,22 @@ type ManifestData struct {
 	// children) parsing as false — the prior trace-driven transition. Keep
 	// in lockstep with backend/internal/bundle.Manifest. (#742)
 	PushAndOpenPR bool `json:"push_and_open_pr,omitempty"`
+
+	// PushToSharedBranch signals that this implement stage is a decomposed
+	// child that will commit + push onto the shared parent branch AFTER the
+	// trace upload (but never open a PR — the parent run opens one
+	// consolidated PR after all children settle, per ADR-032). The backend's
+	// trace handler reads it to forward-gate the child stage's terminal
+	// transition exactly like PushAndOpenPR does for standalone children: it
+	// leaves the stage in `running` and lets the /pull-request upload drive
+	// the terminal transition, so a commit/push failure lands the stage
+	// `failed` instead of reaching the terminal succeeded state with no code
+	// on the shared branch (the #771 zombie — the decomposition-child
+	// analogue of #742). Mutually exclusive with PushAndOpenPR (a decomposed
+	// child never opens its own PR). omitempty keeps older bundles (and every
+	// non-child stage) parsing as false. Keep in lockstep with
+	// backend/internal/bundle.Manifest. (#771)
+	PushToSharedBranch bool `json:"push_to_shared_branch,omitempty"`
 }
 
 // TrailerData is the payload of the last line of every bundle. The
@@ -135,6 +151,13 @@ type PackInputs struct {
 	// (not --no-pr, not a decomposed child) so the backend forward-gates
 	// the terminal transition onto the /pull-request upload. (#742)
 	PushAndOpenPR bool
+
+	// PushToSharedBranch flags a decomposed-child implement stage that will
+	// commit + push onto the shared parent branch after the trace upload
+	// (without opening a PR). The runner sets it for decomposed children so
+	// the backend forward-gates the child stage's terminal transition onto
+	// the /pull-request upload. Mutually exclusive with PushAndOpenPR. (#771)
+	PushToSharedBranch bool
 
 	// Now returns the manifest's GeneratedAt timestamp. Default
 	// time.Now; overridable for deterministic tests.
@@ -191,6 +214,7 @@ func Pack(w io.Writer, in PackInputs, events []agent.Event) (int, error) {
 		AgentFailed:        in.AgentFailed,
 		AgentFailureReason: in.AgentFailureReason,
 		PushAndOpenPR:      in.PushAndOpenPR,
+		PushToSharedBranch: in.PushToSharedBranch,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("bundle: marshal manifest: %w", err)

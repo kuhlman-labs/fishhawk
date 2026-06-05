@@ -575,6 +575,21 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// that a fix-up never ships.
 	willOpenPR := stageType == "implement" && !cfg.noPR && cfg.decomposedFromRunID == "" && !cfg.fixup
 
+	// willPushChild is the decomposed-child complement of willOpenPR: an
+	// implement stage that will commit + push onto the shared parent branch
+	// after the trace upload but never open a PR (the parent run opens one
+	// consolidated PR after all children settle, per ADR-032). It stamps
+	// push_to_shared_branch in the bundle manifest so the backend
+	// forward-gates the child stage's terminal transition onto the
+	// /pull-request upload (#771) — the decomposition-child analogue of the
+	// #742 forward-gate — and it gates the failure-report POST below so a
+	// child commit/push failure lands the stage `failed` instead of leaving
+	// the trace-time succeeded zombie. willOpenPR and willPushChild are
+	// mutually exclusive: a decomposed child has decomposedFromRunID != "" so
+	// willOpenPR is false; a fix-up pass sets neither and transitions on the
+	// trace upload as today.
+	willPushChild := stageType == "implement" && cfg.decomposedFromRunID != "" && !cfg.fixup
+
 	var rawBundle, redactedBundle []byte
 	if cfg.bundleOut != "" || cfg.uploadTrace {
 		agentFailed := res.FailureCategory == "A"
@@ -596,6 +611,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			AgentFailed:        agentFailed,
 			AgentFailureReason: agentFailureReason,
 			PushAndOpenPR:      willOpenPR,
+			PushToSharedBranch: willPushChild,
 		}
 		bytesData, _, err := bundle.PackBytes(manifestRaw, res.Events)
 		if err != nil {
@@ -759,14 +775,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"pull_request_upload","detail":%q}`+"\n", err.Error())
 				// Report the failure to /pull-request so the backend fails the
-				// implement stage that its trace gate left in `running` (#742).
-				// Without this the gated stage would hang until the SLA watchdog
-				// reaps it. Gated on willOpenPR: only a push_and_open_pr stage
-				// was left in running; a decomposed-child / --no-pr failure was
-				// never gated, so reporting one would wrongly fail an
-				// already-advanced stage. Best-effort — the failure exit stands
-				// regardless of whether the report lands.
-				if willOpenPR {
+				// implement stage that its trace gate left in `running` (#742,
+				// #771). Without this the gated stage would hang until the SLA
+				// watchdog reaps it. Gated on willOpenPR || willPushChild: a
+				// push_and_open_pr stage (#742) AND a decomposed child
+				// (push_to_shared_branch, #771) are both left in running by the
+				// trace gate, so both must report a commit/push failure; a
+				// --no-pr / fix-up failure was never gated, so reporting one
+				// would wrongly fail an already-advanced stage. Best-effort —
+				// the failure exit stands regardless of whether the report lands.
+				if willOpenPR || willPushChild {
 					reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, err.Error())
 				}
 				logCompletion(logSink, res, invokeErr)
@@ -1870,6 +1888,46 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"implement_child_pushed","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q,"is_subsequent":%t}`+"\n",
 			cfg.runID, cfg.stageID, branch, cap.HeadSHA, isSubsequent,
+		)
+
+		// Report child-push SUCCESS to the backend (#771). The backend's
+		// trace handler left this child stage in `running` (push_to_shared_branch
+		// gate), so THIS report is the authoritative driver of the child
+		// stage's terminal transition — without it the stage would hang in
+		// running until the SLA watchdog reaps it, and a commit/push failure
+		// (reported via reportPullRequestFailure above) could never be
+		// distinguished from a still-pending push. No PR was opened, so the
+		// "pushed" outcome carries only branch/head_sha/base_sha + the diff
+		// size; the backend writes a child_pushed audit entry (no PR
+		// artifact). A report error is category-C (network) and is surfaced
+		// like the success ShipPullRequest error below so the failure path
+		// reports it.
+		filesChanged := 0
+		if d, err := (&gitdiff.Runner{}).Run(ctx, baseRef, repoDir); err == nil {
+			filesChanged = len(d.ChangedFiles)
+		} else {
+			// Informational only: files_changed_count is not load-bearing for
+			// the stage transition. Log rather than silently discard so a diff
+			// failure here is observable.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"child_push_files_changed_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, err.Error())
+		}
+		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+			RunID:             cfg.runID,
+			StageID:           cfg.stageID,
+			PrivateKey:        issued.PrivateKey,
+			Outcome:           "pushed",
+			Branch:            branch,
+			HeadSHA:           cap.HeadSHA,
+			BaseSHA:           cap.BaseSHA,
+			FilesChangedCount: filesChanged,
+		}); err != nil {
+			return fmt.Errorf("report child push: %w", err)
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"implement_child_push_reported","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
 		)
 		return nil
 	}

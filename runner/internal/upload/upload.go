@@ -637,11 +637,29 @@ type ShipPullRequestArgs struct {
 	// signs and ships {"outcome":"failed","category":...,"reason":...} so
 	// the backend fails the implement stage its trace gate left in
 	// `running`. Category is "B" (invalid PR shape / compile-gate) or "C"
-	// (network/git/GitHub). When Outcome is empty the success Body path is
+	// (network/git/GitHub).
+	//
+	// When Outcome is "pushed", this is a decomposed-child push-success
+	// report (#771): no PR was opened, so instead of the success PR artifact
+	// in Body, ShipPullRequest signs and ships
+	// {"outcome":"pushed","branch":...,"head_sha":...,"base_sha":...,
+	// "files_changed_count":...} so the backend drives the child stage's
+	// terminal transition its push_to_shared_branch trace gate left in
+	// `running`. Branch/HeadSHA/BaseSHA carry the pushed shared-branch commit.
+	//
+	// When Outcome is empty the success Body path (a real PR artifact) is
 	// used unchanged.
 	Outcome  string
 	Category string
 	Reason   string
+
+	// Branch, HeadSHA, BaseSHA, and FilesChangedCount carry the pushed
+	// shared-branch commit details for the Outcome=="pushed" child-push
+	// report (#771). Unused for the "failed" and empty (success Body) paths.
+	Branch            string
+	HeadSHA           string
+	BaseSHA           string
+	FilesChangedCount int
 }
 
 // pullRequestFailureBody is the failure-report wire shape ShipPullRequest
@@ -652,6 +670,21 @@ type pullRequestFailureBody struct {
 	Outcome  string `json:"outcome"`
 	Category string `json:"category"`
 	Reason   string `json:"reason"`
+}
+
+// pullRequestChildPushBody is the success-report wire shape ShipPullRequest
+// marshals when Args.Outcome == "pushed" (#771). A decomposed child pushes
+// onto the shared parent branch without opening a PR, so the body carries the
+// pushed commit's branch + SHAs + diff size rather than a PR number/URL. The
+// backend decodes these optional fields from the same pullRequestBody as the
+// success and failure variants; kept here so the runner owns the bytes it
+// signs.
+type pullRequestChildPushBody struct {
+	Outcome           string `json:"outcome"`
+	Branch            string `json:"branch"`
+	HeadSHA           string `json:"head_sha"`
+	BaseSHA           string `json:"base_sha"`
+	FilesChangedCount int    `json:"files_changed_count"`
 }
 
 // ShipPullRequestResult is what the backend echoes back. Idempotent
@@ -668,8 +701,11 @@ type ShipPullRequestResult struct {
 }
 
 // ShipPullRequest signs the body and POSTs it to
-// /v0/runs/{run_id}/pull-request?stage_id=…. Retries 5xx with
-// exponential backoff. Permanent failures bubble up:
+// /v0/runs/{run_id}/pull-request?stage_id=…. The body is the success PR
+// artifact (Args.Body) when Args.Outcome is empty, a failure report when
+// Outcome=="failed" (#742), or a decomposed-child push-success report when
+// Outcome=="pushed" (#771). Retries 5xx with exponential backoff. Permanent
+// failures bubble up:
 //
 //   - 400 pull_request_invalid → ErrPullRequestInvalid (runner shipped wrong shape)
 //   - 401 signature_*          → ErrSignatureRejected
@@ -679,7 +715,8 @@ type ShipPullRequestResult struct {
 // matched an existing one (Result.Idempotent==true).
 func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) (*ShipPullRequestResult, error) {
 	body := args.Body
-	if args.Outcome == "failed" {
+	switch args.Outcome {
+	case "failed":
 		// Failure-report POST (#742): build the failure body from the
 		// outcome fields rather than the (absent) success artifact.
 		marshalled, err := json.Marshal(pullRequestFailureBody{
@@ -689,6 +726,20 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
+		}
+		body = marshalled
+	case "pushed":
+		// Child-push success report (#771): build the push body from the
+		// shared-branch commit details rather than the (absent) PR artifact.
+		marshalled, err := json.Marshal(pullRequestChildPushBody{
+			Outcome:           args.Outcome,
+			Branch:            args.Branch,
+			HeadSHA:           args.HeadSHA,
+			BaseSHA:           args.BaseSHA,
+			FilesChangedCount: args.FilesChangedCount,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("upload: marshal pull-request child-push body: %w", err)
 		}
 		body = marshalled
 	}
