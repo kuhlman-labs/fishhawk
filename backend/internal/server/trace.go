@@ -2024,19 +2024,32 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid.UUID, agents int, authority planreview.AuthorityMode, promptText, authorModel string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
+	budget := s.cfg.ReviewBudget.Budget(len(promptText))
 	for i := 0; i < agents; i++ {
-		verdict, model, err := s.cfg.PlanReviewer.Review(ctx, promptText)
+		// Apply the size-aware per-invocation budget (#747) as a context
+		// deadline. Implement-review inputs (the diff) are larger than plan
+		// review, so the size-aware formula naturally grants a larger budget
+		// here with no separate per-stage default. cancel() per turn so
+		// deadlines don't accumulate across reviewers.
+		invocationCtx, cancel := context.WithTimeout(ctx, budget)
+		verdict, model, err := s.cfg.PlanReviewer.Review(invocationCtx, promptText)
+		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
+		cancel()
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: reviewer invocation failed",
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
 				slog.Int("reviewer_index", i),
+				slog.Bool("timed_out", timedOut),
+				slog.Duration("budget", budget),
 				slog.String("error", err.Error()),
 			)
 			// Terminal implement_review_failed audit entry (#664), mirroring
 			// the plan path: surfaces a timed-out / errored reviewer as a
-			// definite 'failed' state. hasRejection untouched (#574).
-			s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, err.Error())
+			// definite 'failed' state, with the #747 timeout discriminator
+			// distinguishing a budget-kill from a transport failure.
+			// hasRejection untouched (#574).
+			s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, err.Error(), timedOut)
 			continue
 		}
 

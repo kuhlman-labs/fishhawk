@@ -63,6 +63,14 @@ func TestHelperProcess(t *testing.T) {
 		// the child is killed with ctx.Err()==DeadlineExceeded (the
 		// timeout class, which must NOT be retried).
 		time.Sleep(5 * time.Second)
+	case "slow_brief":
+		// Sleep longer than a short cfg.Timeout but shorter than an incoming
+		// ctx deadline, then succeed. Used to prove invokeOnce honours the
+		// incoming deadline and does NOT cap it at cfg.Timeout (#747): if the
+		// short cfg.Timeout were applied the child would be killed before this
+		// sleep finishes.
+		time.Sleep(300 * time.Millisecond)
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\"}"}`)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
 		os.Exit(2)
@@ -252,6 +260,52 @@ func TestReviewer_TimeoutNotRetried(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "timeout") {
 		t.Errorf("error = %q, want it to be labelled a timeout", err)
+	}
+}
+
+// TestReviewer_IncomingDeadlineHonoredNotCapped asserts invokeOnce respects a
+// caller-supplied ctx deadline and does NOT cap it at cfg.Timeout (#747). The
+// helper sleeps 300ms — longer than the 50ms cfg.Timeout but well under the 5s
+// incoming deadline — and then succeeds. If cfg.Timeout were still applied, the
+// child would be killed at 50ms and the review would error; success proves the
+// server-computed size-aware deadline is the effective one for large diffs.
+func TestReviewer_IncomingDeadlineHonoredNotCapped(t *testing.T) {
+	cfg := testConfig()
+	cfg.Timeout = 50 * time.Millisecond
+	r := NewReviewer(cfg)
+	r.client.Cmd = helperCommand("slow_brief")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	verdict, _, err := r.Review(ctx, "review this plan")
+	if err != nil {
+		t.Fatalf("Review with a generous incoming deadline must not be capped by cfg.Timeout: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, planreview.VerdictApprove)
+	}
+}
+
+// TestReviewer_ExpiredIncomingDeadline asserts that an already-expired incoming
+// ctx deadline yields the non-retryable (timeout) error (#747) — the budget
+// deadline applied at the server call site surfaces here exactly as the
+// internal per-attempt deadline does.
+func TestReviewer_ExpiredIncomingDeadline(t *testing.T) {
+	var attempts int
+	cfg := testConfig()
+	r := NewReviewer(cfg)
+	r.client.Cmd = countingHelperCommand("happy", &attempts)
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	_, _, err := r.Review(ctx, "review this plan")
+	if err == nil {
+		t.Fatal("expected error from an expired incoming deadline, got nil")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (an expired deadline must not be retried)", attempts)
 	}
 }
 

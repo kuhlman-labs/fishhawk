@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -200,6 +201,17 @@ type Config struct {
 	// inject a fake via this field.
 	PlanReviewer PlanReviewer
 
+	// ReviewBudget is the size-aware per-invocation timeout policy for plan-
+	// and implement-review agent calls (#747). The server applies
+	// ReviewBudget.Budget(len(promptText)) as a context deadline at each
+	// review call site, so a large diff gets proportionally more wall-clock
+	// while the worst case stays bounded by the Cap. A zero-value budget is
+	// defaulted to planreview.DefaultReviewBudget in New. This is the single
+	// place the server reads the budget policy from; serve.go wires it from
+	// the FISHHAWKD_PLAN_REVIEW_TIMEOUT (Floor), FISHHAWKD_REVIEW_BUDGET_PER_KB
+	// (PerKB), and FISHHAWKD_REVIEW_BUDGET_CAP (Cap) inputs.
+	ReviewBudget planreview.ReviewBudget
+
 	// SpendAlertMultiple is the trip threshold for the spend-anomaly
 	// check (#649): the trace handler warns (spend_alert audit entry)
 	// when the current hour's estimated model spend exceeds this
@@ -323,6 +335,12 @@ func New(cfg Config) *Server {
 	}
 	if cfg.ShutdownTimeout == 0 {
 		cfg.ShutdownTimeout = 15 * time.Second
+	}
+	// Default a zero-value review budget to the documented policy (#747) so a
+	// server constructed without explicit budget config still bounds reviewer
+	// invocations size-awarely rather than with a never-firing zero deadline.
+	if cfg.ReviewBudget == (planreview.ReviewBudget{}) {
+		cfg.ReviewBudget = planreview.DefaultReviewBudget
 	}
 
 	s := &Server{cfg: cfg, p95Cache: map[string]p95CacheEntry{}}

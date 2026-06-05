@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 )
 
 // TestRun_NoArgs falls through to serve — but we don't actually want
@@ -164,6 +166,63 @@ func TestResolveBudgetLocation(t *testing.T) {
 		loc := resolveBudgetLocation("Not/AZone", logger)
 		if loc != time.UTC {
 			t.Errorf("got %v, want time.UTC fallback", loc)
+		}
+	})
+}
+
+// TestReviewBudgetEnvWiring asserts the #747 size-aware review budget resolves
+// from FISHHAWKD_PLAN_REVIEW_TIMEOUT (floor), FISHHAWKD_REVIEW_BUDGET_PER_KB
+// (per-KB allowance), and FISHHAWKD_REVIEW_BUDGET_CAP (ceiling) — and that the
+// floor input still feeds planReviewTimeoutBelowDefault so the warn predicate
+// continues to track the Floor.
+func TestReviewBudgetEnvWiring(t *testing.T) {
+	t.Run("unset falls back to documented defaults", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_PLAN_REVIEW_TIMEOUT", "")
+		t.Setenv("FISHHAWKD_REVIEW_BUDGET_PER_KB", "")
+		t.Setenv("FISHHAWKD_REVIEW_BUDGET_CAP", "")
+		b := planreview.ReviewBudget{
+			Floor: envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", defaultPlanReviewTimeout),
+			PerKB: envOrDuration("FISHHAWKD_REVIEW_BUDGET_PER_KB", planreview.DefaultReviewBudget.PerKB),
+			Cap:   envOrDuration("FISHHAWKD_REVIEW_BUDGET_CAP", planreview.DefaultReviewBudget.Cap),
+		}
+		if b != planreview.DefaultReviewBudget {
+			t.Errorf("budget = %+v, want defaults %+v", b, planreview.DefaultReviewBudget)
+		}
+	})
+
+	t.Run("explicit env values resolve and scale", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_PLAN_REVIEW_TIMEOUT", "120s")
+		t.Setenv("FISHHAWKD_REVIEW_BUDGET_PER_KB", "5s")
+		t.Setenv("FISHHAWKD_REVIEW_BUDGET_CAP", "600s")
+		b := planreview.ReviewBudget{
+			Floor: envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", defaultPlanReviewTimeout),
+			PerKB: envOrDuration("FISHHAWKD_REVIEW_BUDGET_PER_KB", planreview.DefaultReviewBudget.PerKB),
+			Cap:   envOrDuration("FISHHAWKD_REVIEW_BUDGET_CAP", planreview.DefaultReviewBudget.Cap),
+		}
+		if b.Floor != 120*time.Second || b.PerKB != 5*time.Second || b.Cap != 600*time.Second {
+			t.Fatalf("budget = %+v, want {120s 5s 600s}", b)
+		}
+		// 10KB prompt: 120s + 10*5s = 170s, under the cap.
+		if got := b.Budget(10 * 1024); got != 170*time.Second {
+			t.Errorf("Budget(10KB) = %v, want 170s", got)
+		}
+		// The floor input still drives the #664 warn predicate.
+		if !planReviewTimeoutBelowDefault(b.Floor) {
+			t.Errorf("floor %v should trip the below-default warn predicate", b.Floor)
+		}
+	})
+
+	t.Run("per-kb zero collapses to a flat floor", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_PLAN_REVIEW_TIMEOUT", "")
+		t.Setenv("FISHHAWKD_REVIEW_BUDGET_PER_KB", "0s")
+		t.Setenv("FISHHAWKD_REVIEW_BUDGET_CAP", "")
+		b := planreview.ReviewBudget{
+			Floor: envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", defaultPlanReviewTimeout),
+			PerKB: envOrDuration("FISHHAWKD_REVIEW_BUDGET_PER_KB", planreview.DefaultReviewBudget.PerKB),
+			Cap:   envOrDuration("FISHHAWKD_REVIEW_BUDGET_CAP", planreview.DefaultReviewBudget.Cap),
+		}
+		if got := b.Budget(500 * 1024); got != defaultPlanReviewTimeout {
+			t.Errorf("Budget with PerKB=0 = %v, want flat floor %v", got, defaultPlanReviewTimeout)
 		}
 	})
 }
