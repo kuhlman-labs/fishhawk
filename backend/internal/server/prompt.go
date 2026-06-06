@@ -42,6 +42,11 @@ type promptResponse struct {
 	DecomposedFromRunID  string `json:"decomposed_from_run_id,omitempty"`
 	VerifyCommand        string `json:"verify_command,omitempty"`
 	VerifyTimeoutSeconds int    `json:"verify_timeout_seconds,omitempty"`
+	// VerifyMaxIterations is the verify-fix loop budget from
+	// executor.verify.max_iterations. 0 (or absent) preserves the
+	// single-shot demote-on-failure gate; >0 enables the bounded fix
+	// loop. Wired through but not yet consumed by the runner.
+	VerifyMaxIterations int `json:"verify_max_iterations,omitempty"`
 	// MinRunnerVersion is the minimum runner version the backend requires.
 	// Runners that are older than this should exit with a version-skew error
 	// rather than proceeding to invoke the agent.
@@ -418,7 +423,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hash := signing.ComputeMessage([]byte(text))
-	verifyCmd, verifyTimeoutSecs := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
+	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
 	commitAuthorName, commitAuthorEmail := s.resolveAppBotIdentity(r.Context())
 	resp := promptResponse{
 		StageID:              stageID.String(),
@@ -428,6 +433,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		AgentTimeoutSeconds:  s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
+		VerifyMaxIterations:  verifyMaxIterations,
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
@@ -606,7 +612,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	}
 
 	hash := signing.ComputeMessage([]byte(text))
-	verifyCmd, verifyTimeoutSecs := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
+	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
 	commitAuthorName, commitAuthorEmail := s.resolveAppBotIdentity(r.Context())
 	resp := promptResponse{
 		StageID:              stageID.String(),
@@ -616,6 +622,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		AgentTimeoutSeconds:  s.resolveAgentTimeout(r.Context(), runRow, stage.Type),
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
+		VerifyMaxIterations:  verifyMaxIterations,
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
@@ -1194,13 +1201,14 @@ func (s *Server) resolveImplementTimeout(ctx context.Context, runRow *run.Run, s
 	return candidate
 }
 
-// resolveVerifyConfig returns the verify command and timeout (in seconds)
-// for the given stage from the run's workflow spec. Returns ("", 0) when
-// the spec is absent, the stage declares no executor.verify block, or the
-// timeout is zero. Mirrors resolveAgentTimeout's parse + lookup pattern.
-func (s *Server) resolveVerifyConfig(ctx context.Context, runRow *run.Run, stageType run.StageType) (command string, timeoutSecs int) {
+// resolveVerifyConfig returns the verify command, timeout (in seconds),
+// and max-iterations budget for the given stage from the run's workflow
+// spec. Returns ("", 0, 0) when the spec is absent, the stage declares no
+// executor.verify block, or the timeout is zero. Mirrors
+// resolveAgentTimeout's parse + lookup pattern.
+func (s *Server) resolveVerifyConfig(ctx context.Context, runRow *run.Run, stageType run.StageType) (command string, timeoutSecs int, maxIterations int) {
 	if runRow.WorkflowSpec == nil {
-		return "", 0
+		return "", 0, 0
 	}
 	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
@@ -1208,11 +1216,11 @@ func (s *Server) resolveVerifyConfig(ctx context.Context, runRow *run.Run, stage
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("error", err.Error()),
 		)
-		return "", 0
+		return "", 0, 0
 	}
 	wf, ok := parsed.Workflows[runRow.WorkflowID]
 	if !ok {
-		return "", 0
+		return "", 0, 0
 	}
 	var specStage spec.Stage
 	for _, st := range wf.Stages {
@@ -1230,10 +1238,10 @@ func (s *Server) resolveVerifyConfig(ctx context.Context, runRow *run.Run, stage
 		}
 	}
 	if specStage.Executor.Verify == nil || specStage.Executor.Verify.Command == "" {
-		return "", 0
+		return "", 0, 0
 	}
 	secs := int(specStage.Executor.Verify.Timeout.Seconds())
-	return specStage.Executor.Verify.Command, secs
+	return specStage.Executor.Verify.Command, secs, specStage.Executor.Verify.MaxIterations
 }
 
 // parseIssueRef extracts the issue number from a TriggerRef of the

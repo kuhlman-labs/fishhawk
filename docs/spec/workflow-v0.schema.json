@@ -171,6 +171,12 @@
                   "type": "string",
                   "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
                   "description": "Wall-clock cap on the verify command. Parsed by time.ParseDuration. Defaults to 10m when absent."
+                },
+                "max_iterations": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 0,
+                  "description": "0 (default) preserves today's single-shot demote-on-failure verify gate; >0 enables a bounded evaluator-optimizer fix loop run against the committed scope-only tree, capping the TOTAL verify-fix agent invocations across the stage at this value. Worst-case wall clock is bounded by (max_iterations+1) x executor.timeout plus (max_iterations+1) x verify.timeout; max_iterations is the control surface and ties to the periodic cost budget (ADR-030)."
                 }
               }
             },

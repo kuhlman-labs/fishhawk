@@ -2860,6 +2860,38 @@ func TestParseFlags_LocalRunnerFields_DefaultsEmpty(t *testing.T) {
 	}
 }
 
+func TestParseFlags_VerifyMaxIterations(t *testing.T) {
+	// --verify-max-iterations parses into cfg; absent defaults to 0
+	// (single-shot demote-on-failure gate).
+	var out strings.Builder
+	cfg, err := parseFlags([]string{
+		"--run-id", "1",
+		"--backend-url", "https://x",
+		"--workflow", "w",
+		"--stage", "s",
+		"--verify-max-iterations", "4",
+	}, &out)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if cfg.verifyMaxIterations != 4 {
+		t.Errorf("verifyMaxIterations = %d, want 4", cfg.verifyMaxIterations)
+	}
+
+	cfgDefault, err := parseFlags([]string{
+		"--run-id", "1",
+		"--backend-url", "https://x",
+		"--workflow", "w",
+		"--stage", "s",
+	}, &out)
+	if err != nil {
+		t.Fatalf("parseFlags (default): %v", err)
+	}
+	if cfgDefault.verifyMaxIterations != 0 {
+		t.Errorf("verifyMaxIterations default = %d, want 0", cfgDefault.verifyMaxIterations)
+	}
+}
+
 // TestRun_FetchPrompt_ServerTimeout_Applied verifies that when --timeout is
 // not passed (default 0) and FetchPrompt returns AgentTimeoutSeconds=1800,
 // the agent invocation's Budget.Timeout equals 30 minutes.

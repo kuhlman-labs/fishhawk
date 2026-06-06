@@ -653,6 +653,65 @@ func TestParse_NoTimeout_BackwardCompat(t *testing.T) {
 	}
 }
 
+func TestParse_VerifyMaxIterations_RoundTrip(t *testing.T) {
+	// executor.verify.max_iterations round-trips into VerifyConfig.
+	yml := []byte(`
+version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "scripts/test"
+            max_iterations: 3
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	v := s.Workflows["feature_change"].Stages[0].Executor.Verify
+	if v == nil {
+		t.Fatal("Verify should round-trip non-nil")
+	}
+	if v.MaxIterations != 3 {
+		t.Errorf("MaxIterations = %d, want 3", v.MaxIterations)
+	}
+}
+
+func TestParse_VerifyMaxIterations_DefaultsZero(t *testing.T) {
+	// A verify block without max_iterations defaults to 0 (single-shot).
+	yml := []byte(`
+version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "scripts/test"
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	v := s.Workflows["feature_change"].Stages[0].Executor.Verify
+	if v == nil {
+		t.Fatal("Verify should round-trip non-nil")
+	}
+	if v.MaxIterations != 0 {
+		t.Errorf("MaxIterations = %d, want 0 when absent", v.MaxIterations)
+	}
+}
+
 func TestResolveStageTimeout(t *testing.T) {
 	const def = 15 * time.Minute
 

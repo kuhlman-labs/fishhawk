@@ -58,6 +58,12 @@ type config struct {
 	// through the prompt-fetch response.
 	verifyCmd     string
 	verifyTimeout time.Duration
+	// verifyMaxIterations is the verify-fix loop budget. 0 (default)
+	// preserves the single-shot demote-on-failure gate; >0 enables the
+	// bounded fix loop. Corresponds to executor.verify.max_iterations in
+	// the workflow spec; operator override via --verify-max-iterations.
+	// Threaded through but not yet consumed.
+	verifyMaxIterations int
 
 	// decomposedFromRunID is set at runtime (not a flag) when the
 	// fetched prompt reveals that this run is a decomposed child.
@@ -146,6 +152,8 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"shell command run as the in-band test gate after the agent exits cleanly (executed via sh -c); empty means skip. Corresponds to executor.verify.command in the workflow spec.")
 	fs.DurationVar(&cfg.verifyTimeout, "verify-timeout", 0,
 		"wall-clock cap on the verify command; 0 means fall back to 10m inside runVerifyGate")
+	fs.IntVar(&cfg.verifyMaxIterations, "verify-max-iterations", 0,
+		"verify-fix loop budget; 0 (default) preserves the single-shot demote-on-failure gate. Corresponds to executor.verify.max_iterations in the workflow spec.")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
