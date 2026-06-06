@@ -222,9 +222,17 @@ type Executor struct {
 // Command is a shell expression (passed to sh -c) that must exit 0
 // for the stage to succeed. Timeout caps the gate's wall-clock run;
 // zero means the runner applies its own 10-minute fallback.
+//
+// MaxIterations is the verify-fix loop budget: 0 (default) preserves
+// today's single-shot demote-on-failure gate; >0 enables a bounded
+// evaluator-optimizer fix loop run against the committed scope-only
+// tree, capping total verify-fix agent invocations across the stage at
+// this value. No behavior consumes it yet — it is wired through the
+// prompt response so the runner can read it.
 type VerifyConfig struct {
-	Command string   `json:"command" yaml:"command"`
-	Timeout Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	Command       string   `json:"command" yaml:"command"`
+	Timeout       Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	MaxIterations int      `json:"max_iterations,omitempty" yaml:"max_iterations,omitempty"`
 }
 
 // Input is either a trigger (Source set) or an artifact handoff from

@@ -257,7 +257,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -298,6 +298,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		if cfg.verifyTimeout == 0 && specVerifyTimeoutSecs > 0 {
 			cfg.verifyTimeout = time.Duration(specVerifyTimeoutSecs) * time.Second
+		}
+		if cfg.verifyMaxIterations == 0 && specVerifyMaxIterations > 0 {
+			cfg.verifyMaxIterations = specVerifyMaxIterations
 		}
 		// ADR-023 self-retry fields — set from prompt response, not CLI flags.
 		cfg.agentSelfRetry = agentSelfRetry
@@ -481,7 +484,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// Verify gate: optional in-band test gate that fires after constraint
 		// evaluation and before bundle building. Non-zero exit from the
 		// verify command demotes to category-A (#441).
-		if res.OK && cfg.verifyCmd != "" {
+		//
+		// Single-shot working-tree gate. It runs UNLESS the committed-tree
+		// verify-fix loop (#651) owns this stage — i.e. an implement push
+		// (stageType=="implement" && !cfg.noPR) with a non-zero
+		// verifyMaxIterations. On that path the loop below runs the verify
+		// command against the isolated committed scope-only tree instead, so
+		// firing here too would double-run the command and demote inside the
+		// ADR-023 self-retry loop (the very compounding c2 forbids). A --no-pr
+		// implement run keeps the dirty working tree and has no committed tree
+		// to gate, so it retains this single-shot gate; so do plan stages.
+		if res.OK && cfg.verifyCmd != "" &&
+			(cfg.verifyMaxIterations == 0 || stageType != "implement" || cfg.noPR) {
 			ev, demote := runVerifyGate(ctx, cfg, logSink)
 			res.Events = append(res.Events, ev)
 			if demote != nil {
@@ -524,12 +538,33 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		break
 	}
 
+	// Committed-tree verify-fix loop (#651). On the implement push path,
+	// when executor.verify.max_iterations > 0, run the verify command
+	// against the isolated committed SCOPE-ONLY tree (the same drift-
+	// excluded HEAD the #728/#800 compile+test gate checks) and, on
+	// failure with budget remaining, feed the captured output back into a
+	// fresh agent invocation and re-verify — a bounded evaluator-optimizer
+	// loop that converges to ONE commit before the PR opens.
+	//
+	// This lives OUTSIDE and AFTER the ADR-023 self-retry for{} loop by
+	// construction: a verify-fix exhaustion is TERMINAL (it can never reach
+	// the `continue` that calls client.RetryStage), so the total verify-fix
+	// agent invocations are capped at max_iterations with no multiplicative
+	// compounding (DECISION c2). It is placed BEFORE EmitStage so the span's
+	// token/model counts include the fix-loop invocations' cost (ADR-030).
+	if res.OK && stageType == "implement" && !cfg.noPR &&
+		cfg.verifyCmd != "" && cfg.verifyMaxIterations > 0 {
+		runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink)
+	}
+
 	// Emit the GenAI observability span for this stage as soon as the
 	// agent invocation (and any self-retries) settled — before bundle
 	// packing / upload, so a downstream upload failure doesn't lose
 	// the model-call span. Token counts + model come from the
 	// aggregated Result; the span carries an estimated cost via
-	// pricing.Cost. No-op when OTel emission is gated off.
+	// pricing.Cost. No-op when OTel emission is gated off. The committed-
+	// tree verify-fix loop above (#651) runs before this point so its
+	// fix-iteration token usage is folded into res and captured here.
 	emitter.EmitStage(ctx, otelemit.StageSpan{
 		RunID:        cfg.runID,
 		Stage:        cfg.stage,
@@ -959,9 +994,9 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // for plan stages, commit+push+PR upload for implement stages).
 // agentTimeoutSecs is the spec-resolved wall-clock cap; 0 means the
 // server didn't resolve one and the caller should apply the local
-// 15-minute fallback. verifyCmd and verifyTimeoutSecs are the
-// spec-resolved verify gate settings; both zero/empty when the spec
-// declares none. decomposedFromRunID is non-empty when this run is a
+// 15-minute fallback. verifyCmd, verifyTimeoutSecs, and
+// verifyMaxIterations are the spec-resolved verify gate settings;
+// zero/empty when the spec declares none. decomposedFromRunID is non-empty when this run is a
 // decomposed child. minRunnerVersion is non-empty when the backend
 // requires a minimum runner version; the caller checks it against
 // runnerVersion() before proceeding. agentSelfRetry, maxRetriesSnapshot,
@@ -975,13 +1010,13 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -989,20 +1024,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -1458,6 +1493,299 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 		}),
 	}
 	return ev, gateErr
+}
+
+// runVerifyFixLoop is the committed-tree verify-fix loop (#651). It runs
+// ONLY on the implement push path with executor.verify.max_iterations > 0
+// (the caller gates that). Per iteration it:
+//
+//  1. stages the scope-only files (StageScoped, #581) and makes a THROWAWAY
+//     local commit to materialize a committed-HEAD SHA;
+//  2. runs the verify command against that committed SHA in an isolated git
+//     worktree (runVerifyCommittedTree) — NOT the dirty working tree, so a
+//     drift-excluded test failure surfaces here exactly as it would in CI;
+//  3. on PASS: undoes the throwaway commit (git reset --soft HEAD~1, which
+//     leaves the converged working-tree edits + index intact) so the real
+//     CommitAndPush in openPRAndShipArtifact makes the single push commit;
+//  4. on FAIL with budget remaining: undoes the throwaway commit, then
+//     re-invokes the agent in-place with a fix prompt embedding the captured
+//     verify output. The next iteration re-commits scope-only onto the SAME
+//     base — one converged commit, never a stack of fix commits on a bad base;
+//  5. on FAIL with the budget exhausted (iter == max_iterations): undoes the
+//     throwaway commit and demotes res to category-A. This is TERMINAL — the
+//     loop is outside the ADR-023 self-retry for{} loop, so it can never call
+//     RetryStage (DECISION c2, non-compounding).
+//
+// Every fix re-invocation's Result.Events are appended to res.Events and its
+// token usage folded into res, so a multi-iteration run produces a complete
+// audit trace and an honest cost (every other invoker.Invoke site replaces
+// res wholesale; here append is the correct handling). A verify_summary event
+// is appended once the loop settles, carrying the verdict + iteration count.
+func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) {
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	scopeFiles := scopePaths(cfg.scopeFiles)
+	timeout := cfg.verifyTimeout
+	if timeout == 0 {
+		timeout = 10 * time.Minute
+	}
+
+	var (
+		passed      bool
+		attempts    int
+		lastOutput  string
+		lastIterErr error // non-nil only on an infra failure that aborts the loop
+	)
+
+	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
+		// (a) Stage scope-only and make a throwaway commit so the verify
+		// command sees the drift-excluded committed tree, not the working tree.
+		if _, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopeFiles); err != nil {
+			lastIterErr = fmt.Errorf("verify-fix: stage scoped: %w", err)
+			break
+		}
+		committed, err := commitVerifyWIP(ctx, cfg, repoDir)
+		if err != nil {
+			lastIterErr = err
+			break
+		}
+		if !committed {
+			// Nothing staged — no scope-only changes to gate. The real
+			// openPRAndShipArtifact will hit its NoChanges short-circuit; treat
+			// the loop as satisfied so it doesn't demote a no-op stage.
+			passed = true
+			break
+		}
+
+		// (b) Resolve the throwaway commit's SHA.
+		headSHA, err := gitRevParseHEAD(ctx, repoDir)
+		if err != nil {
+			// Undo the throwaway commit before bailing so the working tree is
+			// left as the real push expects it.
+			_ = gitResetSoftHEAD1(ctx, repoDir)
+			lastIterErr = err
+			break
+		}
+
+		// (c) Verify against the committed tree.
+		ev, out, ok := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+		res.Events = append(res.Events, ev)
+		attempts++
+		lastOutput = out
+
+		// (d)/(e)/(f) Always undo the throwaway commit first — git reset --soft
+		// moves HEAD without touching the index or working tree, so the agent's
+		// edits + staged scope survive for either the real push (pass) or the
+		// next iteration's re-commit (fail+retry).
+		if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
+			lastIterErr = rerr
+			break
+		}
+
+		if ok {
+			passed = true
+			break
+		}
+		if iter == cfg.verifyMaxIterations {
+			// Budget exhausted — terminal demotion, no re-invoke.
+			break
+		}
+
+		// Re-invoke the agent in-place with a fix prompt embedding the captured
+		// verify output. The agent edits the same repoDir working tree; the
+		// next iteration re-commits scope-only onto the same base.
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"verify_fix_reinvoke","run_id":%q,"stage_id":%q,"iteration":%d}`+"\n",
+			cfg.runID, cfg.stageID, iter+1)
+		fixInv := baseInv
+		fixInv.Prompt = verifyFixPrompt(cfg.verifyCmd, out)
+		fixRes, _ := invoker.Invoke(ctx, fixInv)
+		res.Events = append(res.Events, fixRes.Events...)
+		res.TokensUsed += fixRes.TokensUsed
+		res.InputTokens += fixRes.InputTokens
+		res.OutputTokens += fixRes.OutputTokens
+		if fixRes.Model != "" {
+			res.Model = fixRes.Model
+		}
+	}
+
+	outcome := "passed"
+	if !passed {
+		outcome = "failed"
+	}
+	res.Events = append(res.Events, agent.Event{
+		Kind: "verify_summary",
+		Payload: agent.MakePayload(map[string]any{
+			"outcome":        outcome,
+			"iterations":     attempts,
+			"max_iterations": cfg.verifyMaxIterations,
+		}),
+	})
+
+	if lastIterErr != nil {
+		// An infra failure inside the loop (git/stage error) is a non-blocking
+		// skip — never invent a new failure source from gate plumbing. The
+		// stage proceeds to the real push, which runs its own #728/#800 gate.
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"verify_fix_skipped","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, lastIterErr.Error())
+		return
+	}
+
+	if !passed {
+		res.OK = false
+		res.FailureCategory = "A"
+		res.FailureReason = fmt.Sprintf("verify command %q still failing after %d iteration(s):\n%s",
+			cfg.verifyCmd, attempts, lastOutput)
+	}
+}
+
+// verifyFixPrompt builds the fix-iteration prompt fed back to the agent when
+// the committed-tree verify command fails. It embeds the failing command and
+// its captured output and instructs the agent to make the tests pass without
+// relying on files outside the approved scope.
+func verifyFixPrompt(verifyCmd, output string) string {
+	return fmt.Sprintf(`The verify command failed against the committed scope-only tree.
+
+Command:
+%s
+
+Output:
+%s
+
+Edit the code so this command passes. The fix must live in the files you are
+already allowed to change (the approved scope) — a change that only works
+because of an out-of-scope file will be dropped when the commit is scoped and
+will fail verification again. Make the smallest change that turns the command
+green.`, verifyCmd, output)
+}
+
+// runVerifyCommittedTree runs the verify command against the committed HEAD
+// SHA in an isolated git worktree (#651), reusing the #728/#800 worktree
+// pattern: `git worktree add --detach` checks out the committed scope-only
+// tree without disturbing the runner's working tree, so the verify command
+// sees the drift-excluded tree and not the dirty working tree. It emits a
+// verify_run event carrying the committed head_sha and returns the captured
+// output plus whether the command exited zero.
+//
+// Setpgid + cmd.Cancel kill the whole process group on context cancellation
+// so the verify command's grandchildren (e.g. `go test` subprocesses) don't
+// keep the output pipe open and block CombinedOutput — the same hazard
+// runVerifyGate handles. A worktree-add failure (infra) returns passed=true
+// so the loop does not invent a failure from gate plumbing; the real push's
+// own #728/#800 gate still runs.
+func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration) (agent.Event, string, bool) {
+	parent, err := os.MkdirTemp("", "fishhawk-verify-*")
+	if err != nil {
+		return verifyRunEvent(verifyCmd, headSHA, -1, "worktree_tmp: "+err.Error(), "skipped"), "", true
+	}
+	wt := filepath.Join(parent, "tree")
+	defer func() {
+		_ = exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "remove", "--force", wt).Run()
+		_ = os.RemoveAll(parent)
+	}()
+	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"worktree", "add", "--detach", wt, headSHA).CombinedOutput(); err != nil {
+		return verifyRunEvent(verifyCmd, headSHA, -1,
+			"worktree_add: "+strings.TrimSpace(string(out)), "skipped"), "", true
+	}
+
+	childCtx, childCancel := context.WithTimeout(ctx, timeout)
+	defer childCancel()
+	cmd := exec.CommandContext(childCtx, "sh", "-c", verifyCmd)
+	cmd.Dir = wt
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+
+	output, cmdErr := cmd.CombinedOutput()
+	exitCode := 0
+	if cmdErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(cmdErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	outcome := "passed"
+	if exitCode != 0 {
+		outcome = "failed"
+	}
+	return verifyRunEvent(verifyCmd, headSHA, exitCode, string(output), outcome), string(output), exitCode == 0
+}
+
+// verifyRunEvent builds the verify_run trace event for a committed-tree verify
+// run, carrying the committed head_sha alongside the command/exit/output the
+// working-tree gate (runVerifyGate) emits.
+func verifyRunEvent(command, headSHA string, exitCode int, output, outcome string) agent.Event {
+	return agent.Event{
+		Kind: "verify_run",
+		Payload: agent.MakePayload(map[string]any{
+			"command":   command,
+			"head_sha":  headSHA,
+			"exit_code": exitCode,
+			"output":    output,
+			"outcome":   outcome,
+		}),
+	}
+}
+
+// commitVerifyWIP stages nothing new (the caller already ran StageScoped) and
+// makes a throwaway local commit to materialize a committed-HEAD SHA for the
+// verify-fix loop. It returns committed=false (and no error) when there is
+// nothing staged to commit, so a no-op stage doesn't error the loop. The bot
+// identity + gpgsign=false + --no-verify keep it hermetic and hook-free.
+func commitVerifyWIP(ctx context.Context, cfg config, repoDir string) (committed bool, err error) {
+	// Nothing staged → nothing to gate.
+	if exec.CommandContext(ctx, "git", "-C", repoDir, "diff", "--cached", "--quiet").Run() == nil {
+		return false, nil
+	}
+	name := cfg.commitAuthorName
+	if name == "" {
+		name = gitops.DefaultAuthorName
+	}
+	email := cfg.commitAuthorEmail
+	if email == "" {
+		email = gitops.DefaultAuthorEmail
+	}
+	out, cerr := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"-c", "user.name="+name,
+		"-c", "user.email="+email,
+		"-c", "commit.gpgsign=false",
+		"commit", "--no-verify", "-m", "fishhawk verify wip").CombinedOutput()
+	if cerr != nil {
+		return false, fmt.Errorf("verify-fix: throwaway commit: %s", strings.TrimSpace(string(out)))
+	}
+	return true, nil
+}
+
+// gitRevParseHEAD returns the current HEAD SHA of repoDir.
+func gitRevParseHEAD(ctx context.Context, repoDir string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "", fmt.Errorf("verify-fix: rev-parse HEAD: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// gitResetSoftHEAD1 undoes the most recent commit with `git reset --soft
+// HEAD~1`, which moves HEAD back one commit WITHOUT touching the index or the
+// working tree — so the staged scope and the agent's edits both survive. This
+// is what lets each verify-fix iteration re-commit scope-only onto the same
+// base rather than stacking fix commits.
+func gitResetSoftHEAD1(ctx context.Context, repoDir string) error {
+	out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "reset", "--soft", "HEAD~1").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("verify-fix: reset --soft HEAD~1: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // emitEvents writes one JSON object per line. This is the

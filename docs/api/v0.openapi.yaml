@@ -1759,6 +1759,9 @@ paths:
                   verify_timeout_seconds:
                     type: integer
                     description: Wall-clock cap for the verify command in seconds; 0 or absent means the runner applies its 10-minute fallback.
+                  verify_max_iterations:
+                    type: integer
+                    description: Verify-fix loop budget from executor.verify.max_iterations; 0 or absent preserves the single-shot demote-on-failure gate, >0 caps the total verify-fix agent invocations across the stage.
                   min_runner_version:
                     type: string
                     description: Minimum runner version the backend requires; absent when the backend has no constraint. Runners older than this value must exit with code 3 (version_skew) rather than invoking the agent.
@@ -1890,6 +1893,9 @@ paths:
                   verify_timeout_seconds:
                     type: integer
                     description: Wall-clock cap for the verify command in seconds; 0 or absent means the runner applies its 10-minute fallback.
+                  verify_max_iterations:
+                    type: integer
+                    description: Verify-fix loop budget from executor.verify.max_iterations; 0 or absent preserves the single-shot demote-on-failure gate, >0 caps the total verify-fix agent invocations across the stage.
                   min_runner_version:
                     type: string
                     description: Minimum runner version the backend requires; absent when the backend has no constraint.

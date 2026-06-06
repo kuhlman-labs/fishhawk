@@ -41,6 +41,7 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
     verify:                   # optional; in-band test gate (see ### Verify gate)
       command: 'scripts/test'
       timeout: '10m'
+      max_iterations: 0       # optional; 0 = single-shot gate, >0 = bounded fix loop
     agent_self_retry: false   # optional; opt-in per ADR-023 (see ### Agent self-retry)
     # OR
     human: true
@@ -66,9 +67,12 @@ executor:
   verify:
     command: 'scripts/test'   # executed via sh -c; non-zero exit → category-A
     timeout: '10m'            # optional; defaults to 10m when absent
+    max_iterations: 0         # optional; 0 (default) = single-shot demote-on-failure
 ```
 
 The runner captures combined stdout+stderr into a `verify_run` bundle event so operators can inspect why the gate failed without re-running. Fields: `command`, `exit_code`, `output`, `outcome` (`"passed"` | `"failed"`).
+
+`max_iterations` is the verify-fix loop budget (integer, minimum 0, default 0). `0` preserves today's single-shot demote-on-failure gate; `>0` enables a bounded evaluator-optimizer fix loop run against the committed scope-only tree, capping the total verify-fix agent invocations across the stage at this value. Worst-case wall clock is bounded by `(max_iterations+1) × executor.timeout` plus `(max_iterations+1) × verify.timeout`; `max_iterations` is the control surface and ties to the periodic cost budget (ADR-030). The value is delivered to the runner via `verify_max_iterations` in the prompt-fetch response (the runner's `--verify-max-iterations` flag overrides it).
 
 The gate fires only when the agent itself succeeded (i.e., `res.OK` is true) — a failing agent already produces a category-A trace, and re-running the tests against a broken working tree would be misleading.
 

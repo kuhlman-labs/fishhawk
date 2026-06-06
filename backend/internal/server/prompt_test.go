@@ -1308,7 +1308,7 @@ func TestGetStagePromptRender_DecomposedFromRunID_Present(t *testing.T) {
 }
 
 // specWithVerifyYAML is a minimal feature_change spec where the implement
-// stage declares executor.verify.command and executor.verify.timeout.
+// stage declares executor.verify.command, .timeout, and .max_iterations.
 const specWithVerifyYAML = `version: "0.3"
 workflows:
   feature_change:
@@ -1327,6 +1327,7 @@ workflows:
           verify:
             command: "scripts/test"
             timeout: "5m"
+            max_iterations: 3
         produces:
           - artifact: pull_request
 `
@@ -1363,6 +1364,40 @@ func TestGetStagePrompt_VerifyConfig_Present(t *testing.T) {
 	}
 	if resp.VerifyTimeoutSeconds != 300 {
 		t.Errorf("VerifyTimeoutSeconds = %d, want 300 (5m)", resp.VerifyTimeoutSeconds)
+	}
+	if resp.VerifyMaxIterations != 3 {
+		t.Errorf("VerifyMaxIterations = %d, want 3", resp.VerifyMaxIterations)
+	}
+}
+
+// TestGetStagePrompt_VerifyMaxIterations_SignedEndpoint confirms the
+// signed GET /v0/stages/{id}/prompt endpoint serves verify_max_iterations
+// from executor.verify.max_iterations, mirroring the prompt-render path.
+func TestGetStagePrompt_VerifyMaxIterations_SignedEndpoint(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "x/y",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+		WorkflowSpec:  []byte(specWithVerifyYAML),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.VerifyMaxIterations != 3 {
+		t.Errorf("VerifyMaxIterations = %d, want 3", resp.VerifyMaxIterations)
 	}
 }
 
