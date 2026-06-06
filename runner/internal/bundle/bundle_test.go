@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -158,6 +159,79 @@ func TestPack_AgentFailedDefaultsFalseAndOmitsField(t *testing.T) {
 	}
 	if manifest.AgentFailed {
 		t.Error("manifest.AgentFailed = true on a no-failure bundle")
+	}
+}
+
+func TestPack_PushFixupFlagRoundTrips(t *testing.T) {
+	// #794 wire-flag lockstep: the push_fixup field must marshal under the
+	// exact json key and round-trip through Open. There is no schema-sync CI
+	// for this wire format, so this test plus the backend reader's decode test
+	// are what keep the two modules in lockstep.
+	in := PackInputs{
+		RunID:     "11111111-2222-3333-4444-555555555555",
+		StageID:   "22222222-3333-4444-5555-666666666666",
+		Agent:     "claude-code",
+		PushFixup: true,
+		Now:       frozenNow(),
+	}
+	data, _, err := PackBytes(in, sampleEvents())
+	if err != nil {
+		t.Fatalf("PackBytes: %v", err)
+	}
+	manifest, _, _, err := Open(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !manifest.PushFixup {
+		t.Error("manifest.PushFixup = false, want true")
+	}
+
+	// Assert the exact on-the-wire json key so a rename can't silently drift
+	// from the backend reader's `json:"push_fixup"` tag.
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"push_fixup":true`)) {
+		t.Errorf("bundle manifest missing exact key %q; got:\n%s", `"push_fixup":true`, raw)
+	}
+}
+
+func TestPack_PushFixupDefaultsFalseAndOmitsField(t *testing.T) {
+	// omitempty back-compat: an older bundle (and every non-fix-up stage) packs
+	// without the field and decodes to PushFixup=false. Lock that in by
+	// asserting the key is absent from the wire bytes and decodes false.
+	in := PackInputs{
+		RunID:   "11111111-2222-3333-4444-555555555555",
+		StageID: "22222222-3333-4444-5555-666666666666",
+		Agent:   "claude-code",
+		Now:     frozenNow(),
+	}
+	data, _, err := PackBytes(in, sampleEvents())
+	if err != nil {
+		t.Fatalf("PackBytes: %v", err)
+	}
+	manifest, _, _, err := Open(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if manifest.PushFixup {
+		t.Error("manifest.PushFixup = true on a non-fix-up bundle")
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if bytes.Contains(raw, []byte("push_fixup")) {
+		t.Errorf("omitempty failed: push_fixup present on a non-fix-up bundle:\n%s", raw)
 	}
 }
 

@@ -109,6 +109,51 @@ func TestExtractManifest_OlderBundleParsesAgentFailedAsFalse(t *testing.T) {
 	}
 }
 
+func TestExtractManifest_PushFixupRoundTrips(t *testing.T) {
+	// #794 wire-flag lockstep: the read side must decode the exact
+	// `push_fixup` json key the runner stamps. No schema-sync CI guards this
+	// wire format, so this test pins the backend half of the contract.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{
+			"bundle_schema":"v1",
+			"run_id":"run-1",
+			"stage_id":"stage-1",
+			"agent":"claude-code",
+			"push_fixup":true
+		}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractManifest(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractManifest: %v", err)
+	}
+	if !got.PushFixup {
+		t.Error("PushFixup = false, want true")
+	}
+}
+
+func TestExtractManifest_OlderBundleParsesPushFixupAsFalse(t *testing.T) {
+	// An older bundle (and every non-fix-up stage) omits the field; the read
+	// side must default to PushFixup=false so the prior trace-driven transition
+	// is preserved.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{
+			"bundle_schema":"v1",
+			"run_id":"run-1",
+			"stage_id":"stage-1",
+			"agent":"claude-code"
+		}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractManifest(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractManifest: %v", err)
+	}
+	if got.PushFixup {
+		t.Error("PushFixup = true on a bundle without the field")
+	}
+}
+
 func TestExtractManifest_EmptyBundle(t *testing.T) {
 	_, err := ExtractManifest(packLines(t, nil))
 	if !errors.Is(err, ErrNoManifest) {

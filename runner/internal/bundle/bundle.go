@@ -104,6 +104,22 @@ type ManifestData struct {
 	// non-child stage) parsing as false. Keep in lockstep with
 	// backend/internal/bundle.Manifest. (#771)
 	PushToSharedBranch bool `json:"push_to_shared_branch,omitempty"`
+
+	// PushFixup signals that this implement stage is a fix-up re-dispatch
+	// (#762) that will commit onto the EXISTING PR branch AFTER the trace
+	// upload (updating the open PR, not opening a new one). The backend's
+	// trace handler reads it to forward-gate the fix-up stage's terminal
+	// transition exactly like PushAndOpenPR/PushToSharedBranch do for the
+	// PR-opening and decomposed-child cases: it leaves the stage in `running`
+	// and lets the /pull-request upload drive the terminal transition, so a
+	// commit/push/compile-gate failure lands the stage `failed` (firing #788
+	// fix-up recovery) instead of reaching terminal succeeded with the
+	// implement re-review approving an unlanded diff (the #794 swallow).
+	// Mutually exclusive with PushAndOpenPR and PushToSharedBranch (a fix-up
+	// neither opens a PR nor pushes to a shared parent branch). omitempty keeps
+	// older bundles (and every non-fix-up stage) parsing as false. Keep in
+	// lockstep with backend/internal/bundle.Manifest. (#794)
+	PushFixup bool `json:"push_fixup,omitempty"`
 }
 
 // TrailerData is the payload of the last line of every bundle. The
@@ -158,6 +174,13 @@ type PackInputs struct {
 	// the backend forward-gates the child stage's terminal transition onto
 	// the /pull-request upload. Mutually exclusive with PushAndOpenPR. (#771)
 	PushToSharedBranch bool
+
+	// PushFixup flags a fix-up re-dispatch implement stage that will commit
+	// onto the EXISTING PR branch after the trace upload (updating the open PR).
+	// The runner sets it for fix-up passes so the backend forward-gates the
+	// fix-up stage's terminal transition onto the /pull-request upload. Mutually
+	// exclusive with PushAndOpenPR and PushToSharedBranch. (#794)
+	PushFixup bool
 
 	// Now returns the manifest's GeneratedAt timestamp. Default
 	// time.Now; overridable for deterministic tests.
@@ -215,6 +238,7 @@ func Pack(w io.Writer, in PackInputs, events []agent.Event) (int, error) {
 		AgentFailureReason: in.AgentFailureReason,
 		PushAndOpenPR:      in.PushAndOpenPR,
 		PushToSharedBranch: in.PushToSharedBranch,
+		PushFixup:          in.PushFixup,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("bundle: marshal manifest: %w", err)
