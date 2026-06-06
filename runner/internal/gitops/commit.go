@@ -42,6 +42,17 @@ const DefaultRemote = "origin"
 // as a category-B failure (wrong-shaped output → re-scope/re-plan).
 var ErrCommitWouldNotCompile = errors.New("gitops: committed tree would not compile")
 
+// ErrCommittedTestsFailed is the test-gate analogue of
+// ErrCommitWouldNotCompile (#800): the scope-only committed tree COMPILES
+// (go vet passes) but a touched package's tests fail because a build- or
+// test-required file was excluded as scope drift — e.g. a test fake/helper
+// the plan didn't declare, present only in the agent's working tree, so the
+// committed tree's tests are red while the working tree's are green
+// (#780/#776). Like the compile gate it is returned BEFORE pushing, so the
+// failure leaves origin untouched, and the runner classifies it as a
+// category-B failure (wrong-shaped output → re-scope/re-plan).
+var ErrCommittedTestsFailed = errors.New("gitops: committed tree tests failed")
+
 // DefaultAuthorName + DefaultAuthorEmail are the dev/CLI fallback bot
 // identity used ONLY when the caller doesn't override — i.e. runs with no
 // resolvable GitHub App (local-runner, CLI, dev). For App-backed runs the

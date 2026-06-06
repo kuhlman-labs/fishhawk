@@ -778,9 +778,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// re-scope/re-plan). ErrPullRequestInvalid is the backend
 				// rejecting the artifact shape; ErrCommitWouldNotCompile is
 				// the pre-push compile gate (#728) catching a scope-only
-				// commit that dropped build-required drift. Everything else
-				// (network, git, GitHub API) is category-C infra.
-				if errors.Is(err, upload.ErrPullRequestInvalid) || errors.Is(err, gitops.ErrCommitWouldNotCompile) {
+				// commit that dropped build-required drift; ErrCommittedTestsFailed
+				// is the test-phase extension (#800) catching a scope-only commit
+				// whose touched-package tests fail because a drift-excluded test
+				// fake was dropped. Everything else (network, git, GitHub API) is
+				// category-C infra.
+				if errors.Is(err, upload.ErrPullRequestInvalid) ||
+					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
+					errors.Is(err, gitops.ErrCommittedTestsFailed) {
 					res.FailureCategory = "B"
 				} else {
 					res.FailureCategory = "C"
@@ -1555,6 +1560,38 @@ func looksLikeCompileError(output string) bool {
 	return false
 }
 
+// testFailureMarkers are substrings that positively identify a GENUINE
+// `go test` failure to block on (#800), as opposed to a test-binary build
+// failure, a setup failure, or a dependency-resolution error. The test
+// gate blocks ONLY when one of these appears — a positive allowlist
+// symmetric with compileDiagnosticMarkers, the inverse of the compile
+// gate. `--- FAIL` is a failed assertion / sub-test; `panic:` is a test
+// panic. Deliberately EXCLUDED are the bare `FAIL\t<pkg> [build failed]`
+// and `[setup failed]` lines, which are infra (the test binary won't
+// build / deps unresolvable) and must SKIP, plus `ok\t<pkg>`, `no test
+// files`, and dep-resolution errors. The asymmetry favors SKIP on its
+// own: a false BLOCK breaks a legitimate push (worse — it stalls the loop
+// on gate infra), while a false SKIP merely misses one detection CI still
+// catches. When uncertain, skip.
+var testFailureMarkers = []string{
+	"--- FAIL",
+	"panic:",
+}
+
+// looksLikeTestFailure reports whether `go test` output contains a
+// genuine test failure (a failed assertion or a panic), as opposed to a
+// test-binary build/setup failure or a dependency-resolution error. Used
+// to separate a real test failure (block, category-B) from gate
+// infrastructure failures (skip, non-blocking).
+func looksLikeTestFailure(output string) bool {
+	for _, m := range testFailureMarkers {
+		if strings.Contains(output, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // verifyCommittedTreeCompiles compile-gates the scope-only committed
 // tree before the runner pushes it (#728). When a scope-bounded commit
 // drops build-required drift (e.g. an interface-conformance stub left in
@@ -1574,7 +1611,21 @@ func looksLikeCompileError(output string) bool {
 // NON-blocking skip (logged as compile_gate_skipped, returns nil), so
 // the gate never becomes a new failure source in non-Go or misconfigured
 // environments. It degrades to today's "open the PR" behavior instead.
-func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, drift []string, logSink io.Writer) error {
+//
+// After the per-module `go vet` compile check passes, it runs a second
+// phase (#800): `go test` on the touched packages (the packages
+// containing the DECLARED scopeFiles, NOT the drift dirs — drift is
+// excluded from the committed tree) in the SAME isolated committed-HEAD
+// worktree. This catches the drift-excluded-test-failure class
+// (#780/#776) where a scope-only commit compiles but a necessary test
+// fake/helper was dropped as scope drift, so the committed tree's tests
+// are red while the agent's full working tree is green. A genuine test
+// failure (`--- FAIL`/`panic:`) returns ErrCommittedTestsFailed; every
+// test-infrastructure failure (test binary won't build, deps
+// unresolvable, exec error) is a non-blocking skip (test_gate_skipped).
+// The test phase runs ONLY on the drift-present path — the len(drift)==0
+// and empty-scope fast paths return before it.
+func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, drift, scopeFiles []string, logSink io.Writer) error {
 	// Fast paths (zero runtime on the common case): no excluded files
 	// means nothing build-required could have been dropped; no go.work at
 	// the repo root means this isn't a Go workspace to vet.
@@ -1665,7 +1716,96 @@ func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, d
 		return fmt.Errorf("%w: PR would not compile; %d file(s) outside scope are build-required: %s\n%s",
 			gitops.ErrCommitWouldNotCompile, len(drift), strings.Join(drift, ", "), vetOut)
 	}
+
+	// Test phase (#800): the committed tree compiles, but a dropped
+	// scope-drift test fake/helper can still leave a touched package's
+	// tests red. Run `go test` on the packages containing the declared
+	// scope files (NOT the drift dirs — those are excluded from the tree)
+	// in the SAME committed-HEAD worktree. Plain `go test` (no -race): CI
+	// runs -race separately; this is the fast touched-package pre-push
+	// check. Empty scope (plan_missing `git add -A` fallback) → nothing to
+	// derive packages from, skip.
+	if len(scopeFiles) == 0 {
+		return nil
+	}
+	skipTest := func(reason, detail string) {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"test_gate_skipped","head_sha":%q,"reason":%q,"detail":%q}`+"\n",
+			headSHA, reason, detail)
+	}
+	for _, m := range workspace.Use {
+		pkgArgs := touchedPackageArgs(m.DiskPath, scopeFiles)
+		if len(pkgArgs) == 0 {
+			continue
+		}
+		testCmd := exec.CommandContext(ctx, "go", append([]string{"test"}, pkgArgs...)...)
+		testCmd.Dir = filepath.Join(wt, m.DiskPath)
+		out, terr := testCmd.CombinedOutput()
+		if terr == nil {
+			continue
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(terr, &exitErr) {
+			// go test never ran (go missing / exec start failure) — infra-skip.
+			skipTest("test_exec", terr.Error())
+			continue
+		}
+		// go test ran and exited non-zero. Block ONLY on a positively
+		// identified test failure (`--- FAIL`/`panic:`); a test-binary build
+		// failure (`[build failed]`), setup failure, or dep-resolution error
+		// is a non-blocking skip — never block on gate infrastructure.
+		testOut := strings.TrimSpace(string(out))
+		if !looksLikeTestFailure(testOut) {
+			skipTest("test_nonzero_non_failure", testOut)
+			continue
+		}
+		return fmt.Errorf("%w: committed tree tests fail; %d file(s) outside scope are build/test-required: %s\n%s",
+			gitops.ErrCommittedTestsFailed, len(drift), strings.Join(drift, ", "), testOut)
+	}
 	return nil
+}
+
+// touchedPackageArgs derives the `go test` package arguments for one
+// go.work module from the declared scope files (#800). For each scope
+// file that falls under the module's DiskPath, it collects the distinct
+// module-relative directory as a `./<reldir>/...` pattern (a root-level
+// file maps to `.`), bounding the test phase to the touched packages
+// rather than the whole module (`./...`). Returns nil when no scope file
+// lies under the module, so non-Go scope files in other modules neither
+// block nor false-skip.
+func touchedPackageArgs(diskPath string, scopeFiles []string) []string {
+	modPrefix := filepath.ToSlash(filepath.Clean(diskPath))
+	if modPrefix == "." {
+		modPrefix = ""
+	}
+	seen := map[string]bool{}
+	var args []string
+	for _, f := range scopeFiles {
+		f = filepath.ToSlash(filepath.Clean(f))
+		var rel string
+		switch {
+		case modPrefix == "":
+			rel = f
+		case f == modPrefix:
+			rel = "."
+		case strings.HasPrefix(f, modPrefix+"/"):
+			rel = strings.TrimPrefix(f, modPrefix+"/")
+		default:
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(rel))
+		var arg string
+		if dir == "." {
+			arg = "."
+		} else {
+			arg = "./" + dir + "/..."
+		}
+		if !seen[arg] {
+			seen[arg] = true
+			args = append(args, arg)
+		}
+	}
+	return args
 }
 
 // openPRAndShipArtifact is the implement-stage post-processing
@@ -1828,12 +1968,20 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// specific headSHA, so it works unchanged for a shared-branch child
 	// commit. The hook runs inside CommitAndPush after the commit and before
 	// the push, so a failure leaves origin untouched.
+	gateScopeFiles := scopePaths(cfg.scopeFiles)
 	verifyCommit := func(ctx context.Context, headSHA string, drift []string) error {
-		if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, logSink); err != nil {
+		if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, gateScopeFiles, logSink); err != nil {
 			driftJSON, _ := json.Marshal(drift)
+			// The test phase (#800) shares the gate; emit a test_gate_failed
+			// event for a committed-test failure and compile_gate_failed for a
+			// compile failure so the two phases are distinguishable in the trace.
+			event := "compile_gate_failed"
+			if errors.Is(err, gitops.ErrCommittedTestsFailed) {
+				event = "test_gate_failed"
+			}
 			_, _ = fmt.Fprintf(logSink,
-				`{"event":"compile_gate_failed","run_id":%q,"stage_id":%q,"head_sha":%q,"drift":%s}`+"\n",
-				cfg.runID, cfg.stageID, headSHA, driftJSON)
+				`{"event":%q,"run_id":%q,"stage_id":%q,"head_sha":%q,"drift":%s}`+"\n",
+				event, cfg.runID, cfg.stageID, headSHA, driftJSON)
 			return err
 		}
 		return nil
