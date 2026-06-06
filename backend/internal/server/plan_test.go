@@ -642,12 +642,16 @@ func TestShipPlan_HappyPath(t *testing.T) {
 		t.Errorf("artifacts = %d, want 1", len(ar.all))
 	}
 
-	// One audit entry, category plan_generated.
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	// Two audit entries: plan_generated then the advisory plan_surface_sweep
+	// (#763), which appends unconditionally on every parseable ship.
+	if len(au.appended) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(au.appended))
 	}
 	if got := au.appended[0].Category; got != "plan_generated" {
 		t.Errorf("audit category = %q, want plan_generated", got)
+	}
+	if got := au.appended[1].Category; got != "plan_surface_sweep" {
+		t.Errorf("audit[1].category = %q, want plan_surface_sweep", got)
 	}
 }
 
@@ -676,9 +680,11 @@ func TestShipPlan_Idempotent_SecondUploadReturnsExisting(t *testing.T) {
 	if len(ar.all) != 1 {
 		t.Errorf("artifacts = %d, want 1 (no duplicate row)", len(ar.all))
 	}
-	// No second audit entry — plan_generated fires once per artifact.
-	if len(au.appended) != 1 {
-		t.Errorf("audit entries = %d, want 1 (no second plan_generated)", len(au.appended))
+	// First upload appended plan_generated + the advisory plan_surface_sweep
+	// (#763); the idempotent second upload returns before either, so the
+	// count stays at 2 (plan_generated fires once per artifact).
+	if len(au.appended) != 2 {
+		t.Errorf("audit entries = %d, want 2 (no second plan_generated)", len(au.appended))
 	}
 }
 
@@ -705,15 +711,19 @@ func TestShipPlan_CoercibleSchemaError_Returns201(t *testing.T) {
 		t.Errorf("artifacts = %d, want 1", len(ar.all))
 	}
 
-	// Two audit entries: plan_coerced then plan_generated.
-	if len(au.appended) != 2 {
-		t.Fatalf("audit entries = %d, want 2 (plan_coerced + plan_generated)", len(au.appended))
+	// Three audit entries: plan_coerced, plan_generated, then the advisory
+	// plan_surface_sweep (#763).
+	if len(au.appended) != 3 {
+		t.Fatalf("audit entries = %d, want 3 (plan_coerced + plan_generated + plan_surface_sweep)", len(au.appended))
 	}
 	if got := au.appended[0].Category; got != "plan_coerced" {
 		t.Errorf("audit[0].category = %q, want plan_coerced", got)
 	}
 	if got := au.appended[1].Category; got != "plan_generated" {
 		t.Errorf("audit[1].category = %q, want plan_generated", got)
+	}
+	if got := au.appended[2].Category; got != "plan_surface_sweep" {
+		t.Errorf("audit[2].category = %q, want plan_surface_sweep", got)
 	}
 
 	// Coerced plans must NOT transition to failed-B. (#603: the success

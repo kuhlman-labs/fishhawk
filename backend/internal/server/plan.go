@@ -333,6 +333,17 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// calls). Advisory + fail-open: never blocks or unwinds the upload.
 	s.runScopePrecheck(r.Context(), runID, stageID, body)
 
+	// Plan-gate surface sweep (#763): check the plan's scope.files against
+	// the static multi-surface pattern registry and record an advisory
+	// plan_surface_sweep audit entry naming any sibling surfaces the change
+	// must move in lockstep with (e.g. an @-mention render site touched
+	// without its sibling, or a new audit kind without the surfaces doc).
+	// Run it after runScopePrecheck and before runPlanReviews so the sweep
+	// entry precedes any plan_reviewed entries in the audit sequence, on the
+	// request context (cheap, synchronous, no external calls). Advisory +
+	// fail-open: never blocks or unwinds the upload.
+	s.runSurfaceSweep(r.Context(), runID, stageID, body)
+
 	// Plan review: invoke configured review agents after the artifact
 	// is stored and audited, before advancing the stage. Returns true
 	// when authority is gating and at least one verdict is reject;

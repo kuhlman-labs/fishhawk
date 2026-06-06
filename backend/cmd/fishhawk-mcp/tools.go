@@ -303,6 +303,30 @@ type GetPlanOutput struct {
 	// (#658): scope.files evaluated against the implement stage's
 	// forbidden_paths/allowed_paths/max_files_changed before approval.
 	ScopePrecheck *ScopePrecheck `json:"scope_precheck,omitempty" jsonschema:"plan-gate scope pre-check (#658): flags scope.files that would violate the implement stage's forbidden_paths/allowed_paths/max_files_changed constraints, using the same matcher as the post-implement gate. Present (possibly with empty violations) when the plan stage ran the pre-check; absent on older runs predating it. A non-empty violations[] means this plan's scope would fail the implement stage's path constraints before any code is written — most often a sign the run is on the wrong workflow"`
+	// SurfaceSweep surfaces the plan-gate multi-surface pattern sweep
+	// (#763): scope.files matched against a static registry of surfaces that
+	// must move in lockstep with siblings.
+	SurfaceSweep *SurfaceSweep `json:"surface_sweep,omitempty" jsonschema:"plan-gate surface sweep (#763): when scope.files touches one instance of a known multi-surface pattern (an @-mention render site, or an audit-kind-emitting surface) but omits its sibling surfaces, each missing sibling is flagged here. Present (possibly with empty findings) when the plan stage ran the sweep; absent on older runs predating it. Advisory only — a non-empty findings[] means the plan likely needs to add the named sibling paths to scope.files so the change stays consistent across all surfaces it touches"`
+}
+
+// SurfaceSweepFinding is one matched multi-surface pattern decoded from a
+// plan_surface_sweep audit entry (#763). Pattern names the registry entry;
+// TriggerPath is the scope.files path that matched; MissingSiblings lists
+// the sibling surface paths absent from scope.files. Mirrors the
+// server-side SurfaceSweepFinding shape exactly.
+type SurfaceSweepFinding struct {
+	Pattern         string   `json:"pattern"`
+	TriggerPath     string   `json:"trigger_path"`
+	MissingSiblings []string `json:"missing_siblings"`
+}
+
+// SurfaceSweep is the plan-gate surface sweep result decoded from the
+// newest plan_surface_sweep audit entry (#763). Findings is empty when the
+// plan's scope.files touch no multi-surface pattern incompletely;
+// ScannedFiles is the number of scope.files the sweep evaluated.
+type SurfaceSweep struct {
+	Findings     []SurfaceSweepFinding `json:"findings,omitempty" jsonschema:"sibling-surface gaps; empty when the plan's scope.files touch each matched multi-surface pattern completely (or touch none)"`
+	ScannedFiles int                   `json:"scanned_files" jsonschema:"number of scope.files the sweep evaluated"`
 }
 
 // ScopePrecheckViolation is one path-constraint mismatch decoded from a
@@ -398,6 +422,10 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if err != nil {
 				return nil, GetPlanOutput{}, fmt.Errorf("load scope precheck: %w", err)
 			}
+			surfaceSweep, err := r.loadSurfaceSweep(ctx, current)
+			if err != nil {
+				return nil, GetPlanOutput{}, fmt.Errorf("load surface sweep: %w", err)
+			}
 			return nil, GetPlanOutput{
 				Status:           "available",
 				Plan:             p,
@@ -405,6 +433,7 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 				Reviews:          reviews,
 				PlanReviewStatus: reviewStatus,
 				ScopePrecheck:    scopePrecheck,
+				SurfaceSweep:     surfaceSweep,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -556,6 +585,40 @@ func (r *runResolver) loadScopePrecheck(ctx context.Context, runID uuid.UUID) (*
 		return nil, nil
 	}
 	return &sp, nil
+}
+
+// loadSurfaceSweep fetches the NEWEST plan_surface_sweep audit entry (#763)
+// for the run and decodes its payload into a SurfaceSweep. Mirrors
+// loadScopePrecheck exactly: the per-run audit endpoint returns entries
+// sequence-ascending so the authoritative entry is the last one (a
+// schema-retry run re-opens the plan stage and writes a second sweep on the
+// re-upload). Returns nil when no entry exists (an older run predating the
+// sweep, or a fail-open no-op) so the field is omitted. A corrupt payload
+// is treated as "not checked" rather than failing the whole plan fetch.
+func (r *runResolver) loadSurfaceSweep(ctx context.Context, runID uuid.UUID) (*SurfaceSweep, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "plan_surface_sweep",
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return nil, nil
+	}
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return nil, nil
+	}
+	var ss SurfaceSweep
+	if uerr := json.Unmarshal(raw, &ss); uerr != nil {
+		return nil, nil
+	}
+	return &ss, nil
 }
 
 // auditLimitDefault is the default value for the get_run_status

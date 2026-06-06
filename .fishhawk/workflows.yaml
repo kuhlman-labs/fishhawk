@@ -83,6 +83,19 @@ workflows:
         type: implement
         executor:
           agent: claude-code
+          # #651 DOGFOOD (temporary, 2026-06-06): execution-grounded
+          # verifier. After the agent exits, run the project test command
+          # against the COMMITTED scope-only tree (the #800/#766 worktree),
+          # NOT the working tree; on a test failure, feed the captured output
+          # back to the agent for a bounded fix loop, then re-verify, before
+          # the PR opens. max_iterations=1 = one fix attempt (cost-bounded for
+          # the first dogfood); 0 (or removing this block) restores the prior
+          # single-shot behavior. scripts/test is hermetic — integration tests
+          # use testcontainers. See #651; robustness follow-up #804.
+          verify:
+            command: "scripts/test"
+            timeout: "12m"
+            max_iterations: 1
         # Advisory implement-review (ADR-027 impl 2/2, #561): an agent
         # reviewer reads the diff against the approved plan and surfaces a
         # verdict (incl. scope-drift flag). agent>0 + human>0 → advisory, so
