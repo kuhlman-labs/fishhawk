@@ -149,6 +149,16 @@ type RunStageOutput struct {
 	// the workflow declares no budget or the fetch failed (a fetch error
 	// appends to Warnings) — DISPLAY-ONLY, never gates the stage.
 	Budget *BudgetStatus `json:"budget,omitempty" jsonschema:"workflow periodic-budget status for the current calendar period (spend vs limit, tier ok|warn|over); omitted when no budget is configured. Display-only — never blocks the stage"`
+
+	// ReviewActionHint is a display-only next-action pointer (#777),
+	// populated only after an IMPLEMENT stage when its review landed with
+	// unresolved approve_with_concerns concerns and the bounded fix-up
+	// budget is not yet spent. It points at fishhawk_fixup_stage (route the
+	// concerns back to the agent) vs approving to merge. Omitted on plan and
+	// review stages (no implement review exists there) and when there is
+	// nothing to act on — never gates the stage. Plan stages and start_run
+	// are intentionally excluded.
+	ReviewActionHint *ReviewActionHint `json:"review_action_hint,omitempty" jsonschema:"display-only next-action pointer after an implement stage whose review returned unresolved approve_with_concerns concerns and a non-spent fix-up budget; points at fishhawk_fixup_stage vs approving to merge. Omitted for non-implement stages and when there is nothing to act on. Never gates the stage"`
 }
 
 // RunnerEvent wraps an unstructured runner event. Each event is the
@@ -579,20 +589,39 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		warnings = append(warnings, budgetWarn)
 	}
 
+	// Best-effort review-action hint (#777), only for implement stages —
+	// plan and review stages have no implement review to act on. Query the
+	// implement review status here (run_stage has no pre-computed status)
+	// and feed it in. A fetch error appends a warning and leaves the field
+	// nil — never fails the stage. start_run is excluded by construction.
+	var reviewActionHint *ReviewActionHint
+	if in.Stage == "implement" {
+		implementReviewStatus, hintErr := r.reviewStatusFor(ctx, runUUID, "implement")
+		if hintErr != nil {
+			warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
+		} else {
+			reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, implementReviewStatus)
+			if hintErr != nil {
+				warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
+			}
+		}
+	}
+
 	out := RunStageOutput{
-		ExitCode:       exitCode,
-		StageState:     stageState,
-		Events:         resultEvents,
-		Warnings:       warnings,
-		DiffSummary:    diffSummary,
-		AuditPointer:   auditPointer,
-		RunURL:         runURL,
-		Outcome:        summary.Outcome,
-		Turns:          summary.Turns,
-		TokensUsed:     summary.TokensUsed,
-		ElapsedSeconds: summary.ElapsedSeconds,
-		LastEventKind:  summary.LastEventKind,
-		Budget:         budgetStatus,
+		ExitCode:         exitCode,
+		StageState:       stageState,
+		Events:           resultEvents,
+		Warnings:         warnings,
+		DiffSummary:      diffSummary,
+		AuditPointer:     auditPointer,
+		RunURL:           runURL,
+		Outcome:          summary.Outcome,
+		Turns:            summary.Turns,
+		TokensUsed:       summary.TokensUsed,
+		ElapsedSeconds:   summary.ElapsedSeconds,
+		LastEventKind:    summary.LastEventKind,
+		Budget:           budgetStatus,
+		ReviewActionHint: reviewActionHint,
 	}
 
 	// Return-cancellation signal: if the parent ctx was the reason

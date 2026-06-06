@@ -349,6 +349,119 @@ func TestE2E_Fixup_PushOpenPRReopensImplementAndReparksReview(t *testing.T) {
 	}
 }
 
+// TestE2E_Fixup_ReviewActionHintSurfacesAndSuppresses drives the
+// review-action-hint seam end to end (#777): the audit-persistence →
+// hint-compute → MCP-response layers in one test (cf. #618), which the
+// per-function units can't express. An implement-review approve_with_concerns
+// verdict in Postgres must surface as review_action_hint on
+// fishhawk_get_run_status; once a fix-up pass spends the bounded budget, the
+// hint must suppress. The suppression assertion is the only guard against a
+// silently-wrong RemainingFixupBudget if the mirrored maxFixupPasses const
+// drifts from the backend's enforced bound.
+func TestE2E_Fixup_ReviewActionHintSurfacesAndSuppresses(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+
+	// 1. Implement stage parked at the review gate (a valid fix-up candidate).
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	// 2. Record an implement-review approve_with_concerns verdict with two
+	// concerns keyed to the stage.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "guard the nil stage"},
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "rename the var"})
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+
+	// 3. fishhawk_get_run_status surfaces the hint: two concerns, full budget.
+	hint := getReviewActionHint(t, ctx, session, fx.runID)
+	if hint == nil {
+		t.Fatalf("review_action_hint absent; want a populated hint with the recorded concerns")
+	}
+	if hint.Concerns != 2 {
+		t.Errorf("review_action_hint.concerns = %d, want 2", hint.Concerns)
+	}
+	if hint.RemainingFixupBudget != 1 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d, want 1", hint.RemainingFixupBudget)
+	}
+	if !strings.Contains(hint.Message, "fishhawk_fixup_stage") {
+		t.Errorf("review_action_hint.message should point at fishhawk_fixup_stage; got %q", hint.Message)
+	}
+
+	// 4. Spend the bounded fix-up budget via the real fix-up tool — one
+	// stage_fixup_triggered entry lands in Postgres.
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": stage.ID.String(),
+			"concerns": []int{0},
+			"reason":   "address the scope concern",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want exactly 1", len(entries))
+	}
+
+	// 5. The hint is now suppressed — the single budget unit is spent. This
+	// is the guard against a drifting maxFixupPasses mirror.
+	if hint := getReviewActionHint(t, ctx, session, fx.runID); hint != nil {
+		t.Errorf("review_action_hint should suppress after one fix-up pass; got %+v", hint)
+	}
+}
+
+// reviewActionHint mirrors the MCP server's ReviewActionHint output shape so
+// the integration test can decode it off the get_run_status response.
+type reviewActionHint struct {
+	Concerns             int    `json:"concerns"`
+	RemainingFixupBudget int    `json:"remaining_fixup_budget"`
+	Message              string `json:"message"`
+}
+
+// getReviewActionHint calls fishhawk_get_run_status and returns the decoded
+// review_action_hint (nil when absent).
+func getReviewActionHint(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) *reviewActionHint {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_run_status",
+		Arguments: map[string]any{"run_id": runID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_get_run_status: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("get_run_status tool returned error: %s", toolContentString(t, result))
+	}
+	var out struct {
+		ReviewActionHint *reviewActionHint `json:"review_action_hint"`
+	}
+	decodeStructured(t, result, &out)
+	return out.ReviewActionHint
+}
+
 // walkToSucceeded walks a stage pending → dispatched → running →
 // succeeded, the push_and_open_pr terminal shape for an implement stage
 // that committed and opened the PR.

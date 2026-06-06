@@ -594,6 +594,15 @@ type GetRunStatusOutput struct {
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
 	Budget *BudgetStatus `json:"budget,omitempty" jsonschema:"workflow periodic-budget status for the current calendar period (spend vs limit, tier ok|warn|over); omitted when no budget is configured. Display-only — never blocks the run"`
+	// ReviewActionHint is a display-only next-action pointer (#777) surfaced
+	// when the implement review has landed with unresolved approve_with_concerns
+	// concerns and the bounded fix-up budget is not yet spent. It points at
+	// fishhawk_fixup_stage (route the concerns back to the agent) vs approving
+	// to merge, plus the concern count and remaining fix-up budget. Omitted
+	// when there is no actionable concern or the budget is exhausted — never
+	// gates the run (mirrors the periodic-budget block). Not surfaced on
+	// fishhawk_start_run: no implement review exists at run start.
+	ReviewActionHint *ReviewActionHint `json:"review_action_hint,omitempty" jsonschema:"display-only next-action pointer when an implement review returned unresolved approve_with_concerns concerns and the fix-up budget is not spent; points at fishhawk_fixup_stage vs approving to merge. Omitted when there is nothing to act on. Never gates the run"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -619,6 +628,13 @@ free_form; a {category:"scope"} concern flags scope.files drift
 (flag-only, never an auto-reject). Read these before approving the
 implement stage. A verdict of "skipped" with a reason marks an agent
 layer that was configured but not wired on the backend.
+
+Also returns review_action_hint when the implement review landed with
+unresolved approve_with_concerns concerns and the bounded fix-up budget
+is not yet spent: a one-line pointer at fishhawk_fixup_stage (route the
+concerns back to the agent) vs approving to merge, with the concern
+count and remaining fix-up budget. Display-only — never gates the run;
+omitted when there is nothing to act on or the budget is exhausted.
 
 Use this as the agent's "where are we" query — replaces a sequential
 chain of GetRun / ListStages / ListAudit calls with a single
@@ -675,6 +691,16 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// field stays nil — never fails the snapshot.
 	budgetStatus, _ := r.fetchBudgetStatus(ctx, runID)
 
+	// Best-effort review-action hint (#777). Derived from the SAME
+	// implementReviewStatus computed above (single audit read — the hint
+	// and ImplementReviewStatus cannot disagree) plus the implement stage's
+	// fix-up-pass count. On any error or when no implement stage exists the
+	// field stays nil — never fails the snapshot.
+	var reviewActionHint *ReviewActionHint
+	if implementStageID, ok := stageIDOfType(stages, "implement"); ok {
+		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, implementReviewStatus)
+	}
+
 	return nil, GetRunStatusOutput{
 		Run:                   *runRow,
 		Stages:                stages,
@@ -683,7 +709,24 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		PlanReviewStatus:      planReviewStatus,
 		ImplementReviewStatus: implementReviewStatus,
 		Budget:                budgetStatus,
+		ReviewActionHint:      reviewActionHint,
 	}, nil
+}
+
+// stageIDOfType returns the UUID of the first stage of the given type in the
+// run's stage list, or (uuid.Nil, false) when none matches or the id does not
+// parse. Used to resolve the implement stage for the review-action hint (#777).
+func stageIDOfType(stages []Stage, stageType string) (uuid.UUID, bool) {
+	for _, s := range stages {
+		if s.Type == stageType {
+			id, err := uuid.Parse(s.ID)
+			if err != nil {
+				return uuid.Nil, false
+			}
+			return id, true
+		}
+	}
+	return uuid.Nil, false
 }
 
 // loadImplementReviews queries implement_reviewed audit entries for the
