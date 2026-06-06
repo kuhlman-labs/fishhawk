@@ -215,6 +215,136 @@ func TestRetryStage_AHappyPathWithOrchestrator(t *testing.T) {
 	}
 }
 
+// TestRetryStage_AReopensRunAndAdvancesToReview is the load-bearing
+// #798 regression test. It crosses the full handler → run repo →
+// orchestrator → stage seam: (a) retry a category-A-failed implement
+// stage on a FAILED run and assert the run is reopened to running and
+// the implement stage re-dispatched; then (b) drive the re-run to
+// success and assert the run is STILL running AND the review gate
+// reached awaiting_approval. Part (b) is the actual #798 regression —
+// the orphan bug left run=failed / review=pending because Advance
+// no-ops on a terminal run, so re-opening only the stage stranded the
+// run. Per-layer unit checks (stage reopened to pending; run reopened
+// to running) each pass while this seam breaks; only the end-to-end
+// assertion catches it.
+func TestRetryStage_AReopensRunAndAdvancesToReview(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.State = run.StateFailed // a category-A failure left the run terminal-failed
+
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	cat := run.FailureA
+	reason := "agent crashed: SIGSEGV"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	// Pending review gate at sequence 1. Human executor so dispatchStage
+	// walks it pending → dispatched → running → awaiting_approval with no
+	// GitHub client wired.
+	review := rr.seedStage(r.ID, 1, run.StageStatePending)
+	review.Type = run.StageTypeReview
+	review.ExecutorKind = run.ExecutorHuman
+
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr} // no GitHub: dispatch is skipped, transitions happen
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+	})
+
+	// (a) Retry the failed implement stage.
+	w := postRetry(t, s, implement.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	gotRun, err := rr.GetRun(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if gotRun.State != run.StateRunning {
+		t.Fatalf("run state after retry = %q, want running (reopen failed: #798 orphan)", gotRun.State)
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != string(run.StageStateDispatched) {
+		t.Fatalf("implement state after retry = %q, want dispatched", body.State)
+	}
+
+	// (b) Drive the re-run to success and Advance to the next gate.
+	ctx := context.Background()
+	if _, err := rr.TransitionStage(ctx, implement.ID, run.StageStateRunning, nil); err != nil {
+		t.Fatalf("implement dispatched → running: %v", err)
+	}
+	if _, err := rr.TransitionStage(ctx, implement.ID, run.StageStateSucceeded, nil); err != nil {
+		t.Fatalf("implement running → succeeded: %v", err)
+	}
+	if _, err := o.Advance(ctx, r.ID); err != nil {
+		t.Fatalf("advance after implement success: %v", err)
+	}
+
+	// The #798 assertion: the run is still running (NOT failed) and the
+	// review gate opened (NOT stuck at pending).
+	gotRun, err = rr.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if gotRun.State != run.StateRunning {
+		t.Errorf("run state after re-run success = %q, want running (#798: orphan would leave it failed)", gotRun.State)
+	}
+	gotReview, err := rr.GetStage(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("get review stage: %v", err)
+	}
+	if gotReview.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval (#798: orphan would leave it pending)", gotReview.State)
+	}
+}
+
+// TestRetryStage_NonFailedRunLeavesRunStateUnchanged locks in that the
+// run-reopen is gated on State == failed and is not a blanket RetryRun
+// call. seedRun seeds StateRunning; RetryRun's failed → running-only
+// transition table would reject running → running, so an unguarded call
+// would surface an InvalidTransitionError. The retry must still return
+// 200 and leave the run state unchanged.
+func TestRetryStage_NonFailedRunLeavesRunStateUnchanged(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun() // State == running
+
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	cat := run.FailureA
+	reason := "agent crashed: SIGSEGV"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+	})
+
+	w := postRetry(t, s, implement.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	gotRun, err := rr.GetRun(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if gotRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running unchanged (reopen must be gated on failed)", gotRun.State)
+	}
+}
+
 func TestRetryStage_NotFailedReturns422(t *testing.T) {
 	s, repo, _ := retryServer(t)
 	stage := repo.seedStage(run.StageStateAwaitingApproval) // never failed
