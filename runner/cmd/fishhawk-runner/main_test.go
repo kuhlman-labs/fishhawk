@@ -3986,7 +3986,7 @@ func mustWrite(t *testing.T, path, content string) {
 // files, nothing build-required could have been dropped, so the gate
 // returns nil immediately without touching git or the toolchain.
 func TestVerifyCommittedTreeCompiles_NoDriftFastPath(t *testing.T) {
-	if err := verifyCommittedTreeCompiles(context.Background(), t.TempDir(), "deadbeef", nil, io.Discard); err != nil {
+	if err := verifyCommittedTreeCompiles(context.Background(), t.TempDir(), "deadbeef", nil, nil, io.Discard); err != nil {
 		t.Errorf("no-drift fast path should return nil, got %v", err)
 	}
 }
@@ -3995,7 +3995,7 @@ func TestVerifyCommittedTreeCompiles_NoDriftFastPath(t *testing.T) {
 // go.work at its root is not a Go workspace to vet, so the gate skips
 // (returns nil) even when drift is present.
 func TestVerifyCommittedTreeCompiles_NonGoRepoFastPath(t *testing.T) {
-	if err := verifyCommittedTreeCompiles(context.Background(), t.TempDir(), "deadbeef", []string{"x.go"}, io.Discard); err != nil {
+	if err := verifyCommittedTreeCompiles(context.Background(), t.TempDir(), "deadbeef", []string{"x.go"}, []string{"x.go"}, io.Discard); err != nil {
 		t.Errorf("non-Go-repo fast path should return nil, got %v", err)
 	}
 }
@@ -4042,7 +4042,7 @@ func TestVerifyCommittedTreeCompiles_CompileFailureBlocks(t *testing.T) {
 	}
 
 	var log bytes.Buffer
-	err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"mod/doer.go"}, &log)
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"mod/doer.go"}, []string{"mod/doer.go"}, &log)
 	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) {
 		t.Fatalf("err = %v, want ErrCommitWouldNotCompile\nlog: %s", err, log.String())
 	}
@@ -4079,7 +4079,7 @@ func TestVerifyCommittedTreeCompiles_DepResolutionFailureSkips(t *testing.T) {
 	head := gitHead(t, repo)
 
 	var log bytes.Buffer
-	if err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"mod/use.go"}, &log); err != nil {
+	if err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"mod/use.go"}, []string{"mod/use.go"}, &log); err != nil {
 		t.Fatalf("dep-resolution failure must NOT block, got %v\nlog: %s", err, log.String())
 	}
 	if !strings.Contains(log.String(), "compile_gate_skipped") {
@@ -4217,13 +4217,188 @@ func TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater(t *tes
 	head := gitHead(t, repo)
 
 	var log bytes.Buffer
-	err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"modb/doer.go"}, &log)
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"modb/doer.go"}, []string{"modb/doer.go"}, &log)
 	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) {
 		t.Fatalf("err = %v, want ErrCommitWouldNotCompile (modb compile error must be caught despite moda vet warning)\nlog: %s", err, log.String())
 	}
 	// moda's non-compile failure should have been logged as a skip.
 	if !strings.Contains(log.String(), "vet_nonzero_non_compile") {
 		t.Errorf("expected moda's non-compile vet failure to log a skip; log: %s", log.String())
+	}
+}
+
+// TestVerifyCommittedTreeTests_DriftExcludedFailureBlocks is the #800/#780
+// proof: a committed tree that COMPILES (go vet passes) but has a FAILING
+// test in a touched package because a helper file was excluded as scope
+// drift (present only in the working tree). seed.go seeds a package var an
+// init reads; dropping it from the commit leaves Get returning the zero
+// value, so the committed test fails while the working tree (with seed.go)
+// would pass. The gate must return ErrCommittedTestsFailed naming the
+// failing package — the class the vet-only gate (#728) could not catch.
+func TestVerifyCommittedTreeTests_DriftExcludedFailureBlocks(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"),
+		"package mod\n\nvar registry = map[string]int{}\n\nfunc Get(k string) int { return registry[k] }\n")
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"),
+		"package mod\n\nimport \"testing\"\n\nfunc TestGet(t *testing.T) {\n\tif Get(\"x\") != 42 {\n\t\tt.Fatalf(\"Get(x) = %d, want 42\", Get(\"x\"))\n\t}\n}\n")
+	// reg.go + reg_test.go compile and the test passes ONLY when seed.go is
+	// present. Commit WITHOUT seed.go (it is the scope drift).
+	runGit("add", "-A")
+	runGit("commit", "-m", "scope-only commit missing the seed helper")
+	head := gitHead(t, repo)
+
+	// Working-tree drift: add the seed helper on disk (uncommitted). The
+	// working tree's tests now pass; the committed tree's do not.
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+
+	var log bytes.Buffer
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head,
+		[]string{"mod/seed.go"}, []string{"mod/reg.go", "mod/reg_test.go"}, &log)
+	if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Fatalf("err = %v, want ErrCommittedTestsFailed\nlog: %s", err, log.String())
+	}
+	if !strings.Contains(err.Error(), "mod/seed.go") {
+		t.Errorf("error should name the drift file mod/seed.go: %v", err)
+	}
+}
+
+// TestVerifyCommittedTreeTests_GreenWithDriftPasses: a fully-green
+// committed tree (the touched package's tests pass) with drift present
+// must pass the gate (nil) — the test phase runs but finds no failure.
+func TestVerifyCommittedTreeTests_GreenWithDriftPasses(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "add.go"),
+		"package mod\n\nfunc Add(a, b int) int { return a + b }\n")
+	mustWrite(t, filepath.Join(repo, "mod", "add_test.go"),
+		"package mod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 2) != 4 {\n\t\tt.Fatal(\"bad add\")\n\t}\n}\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "green committed tree")
+	head := gitHead(t, repo)
+
+	var log bytes.Buffer
+	// Drift is non-empty (so the gate runs past the fast path) but unrelated
+	// to the touched package; the committed tests are green.
+	if err := verifyCommittedTreeCompiles(context.Background(), repo, head,
+		[]string{"README.md"}, []string{"mod/add.go"}, &log); err != nil {
+		t.Fatalf("green committed tree with drift must pass, got %v\nlog: %s", err, log.String())
+	}
+}
+
+// TestVerifyCommittedTreeTests_UnbuildableTestPackageSkips: a touched
+// package whose test binary won't build (a test-only import that can't be
+// resolved offline, the `[build failed]` shape) is gate infrastructure,
+// not a genuine test failure, so it must SKIP (non-blocking) and log
+// test_gate_skipped — never block a legitimate push on gate infra.
+func TestVerifyCommittedTreeTests_UnbuildableTestPackageSkips(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	t.Setenv("GOPROXY", "off")
+	t.Setenv("GOFLAGS", "-mod=mod")
+
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "use.go"),
+		"package mod\n\nfunc F() int { return 1 }\n")
+	mustWrite(t, filepath.Join(repo, "mod", "use_test.go"),
+		"package mod\n\nimport (\n\t\"testing\"\n\n\t_ \"example.com/totally/absent/pkg\"\n)\n\nfunc TestF(t *testing.T) { _ = F() }\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "test imports an unavailable dependency")
+	head := gitHead(t, repo)
+
+	var log bytes.Buffer
+	if err := verifyCommittedTreeCompiles(context.Background(), repo, head,
+		[]string{"mod/dropped.go"}, []string{"mod/use.go"}, &log); err != nil {
+		t.Fatalf("unbuildable test package must NOT block, got %v\nlog: %s", err, log.String())
+	}
+	if !strings.Contains(log.String(), "test_gate_skipped") {
+		t.Errorf("expected test_gate_skipped log, got: %s", log.String())
+	}
+}
+
+// TestLooksLikeTestFailure covers the positive-allowlist classifier that
+// separates a genuine test failure (block) from a test-binary build
+// failure, setup failure, dep-resolution error, or success (skip). The
+// asymmetry is load-bearing (#800 condition 1): block only on a positively
+// identified failure, skip everything else.
+func TestLooksLikeTestFailure(t *testing.T) {
+	block := []string{
+		"--- FAIL: TestX (0.00s)",
+		"panic: runtime error: invalid memory address",
+	}
+	for _, s := range block {
+		if !looksLikeTestFailure(s) {
+			t.Errorf("looksLikeTestFailure(%q) = false, want true", s)
+		}
+	}
+	skip := []string{
+		"FAIL\texample.com/mod [build failed]",
+		"FAIL\texample.com/mod [setup failed]",
+		"ok  \texample.com/mod\t0.012s",
+		"?   \texample.com/mod\t[no test files]",
+		"no required module provides package example.com/x; to add it: go get example.com/x",
+		"",
+	}
+	for _, s := range skip {
+		if looksLikeTestFailure(s) {
+			t.Errorf("looksLikeTestFailure(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestTouchedPackageArgs covers the module-relative package derivation
+// from declared scope files (#800): only files under the module map to a
+// `./<reldir>/...` pattern (root-level files map to `.`), distinct dirs
+// dedupe, and files in other modules are excluded.
+func TestTouchedPackageArgs(t *testing.T) {
+	got := touchedPackageArgs("./backend", []string{
+		"backend/internal/gitops/commit.go",
+		"backend/internal/gitops/push.go", // same dir → dedup
+		"backend/main.go",                 // root → "."
+		"runner/cmd/x.go",                 // other module → excluded
+		"docs/ARCHITECTURE.md",            // other module → excluded
+	})
+	want := []string{"./internal/gitops/...", "."}
+	if len(got) != len(want) {
+		t.Fatalf("touchedPackageArgs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("touchedPackageArgs = %v, want %v", got, want)
+		}
+	}
+	if args := touchedPackageArgs("./runner", []string{"backend/x.go"}); args != nil {
+		t.Errorf("no files under module should yield nil, got %v", args)
 	}
 }
 
