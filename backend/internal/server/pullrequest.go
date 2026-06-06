@@ -454,11 +454,36 @@ func (s *Server) advanceImplementStageAfterPR(r *http.Request, runID uuid.UUID, 
 // after all children settle.
 func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	stageID := stage.ID
+
+	// Idempotency (#776): a runner retry after a 5xx — or a duplicate delivery —
+	// must not append a second child_pushed audit entry or fire a redundant
+	// status-comment update. Dedup on (stage_id, head_sha): an identical re-push
+	// of the SAME commit is suppressed, but a genuine push of NEW work to the
+	// shared parent branch carries a different head_sha and is still recorded.
+	// Guard first, before advance/audit/notify, so the duplicate is a clean
+	// no-op. Fail-open on a read error: a transient failure must never silently
+	// drop a legitimate child-push report, so we WARN and fall through.
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, "child_pushed"); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"child-push report: list child_pushed audit entries failed; proceeding without idempotency guard",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	} else if childPushAlreadyRecorded(entries, stageID, pr.HeadSHA) {
+		s.writeJSON(w, r, http.StatusOK, pullRequestChildPushResponse{
+			StageID: stageID,
+			Outcome: "pushed",
+			Branch:  pr.Branch,
+			HeadSHA: pr.HeadSHA,
+		})
+		return
+	}
+
 	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
 		s.advanceImplementStageAfterPR(r, runID, stage)
 	}
 
-	stageID := stage.ID
 	auditPayload, _ := json.Marshal(map[string]any{
 		"run_id":              runID.String(),
 		"stage_id":            stageID.String(),
@@ -492,6 +517,31 @@ func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, r
 		Branch:  pr.Branch,
 		HeadSHA: pr.HeadSHA,
 	})
+}
+
+// childPushAlreadyRecorded reports whether a child_pushed audit entry for the
+// given stage with the same head_sha already exists, so a runner retry or a
+// duplicate delivery can be suppressed (#776). It mirrors pickRedactedTraceHash
+// (trace.go): the entries are sequence-ascending per ListForRunByCategory's
+// contract, and we skip any whose StageID is nil or mismatched. The keying is
+// (stage_id, head_sha) — a NEW push to the shared parent branch carries a
+// different head_sha and is not suppressed.
+func childPushAlreadyRecorded(entries []*audit.Entry, stageID uuid.UUID, headSHA string) bool {
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.HeadSHA == headSHA {
+			return true
+		}
+	}
+	return false
 }
 
 // failPullRequestStage handles the failure-report variant (#742): the
