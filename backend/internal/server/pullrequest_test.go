@@ -448,6 +448,77 @@ func TestShipPullRequest_ChildPushOutcome_DrivesChildTerminal(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_ChildPushOutcome_IsIdempotent pins the #776 guard: a
+// runner retry after a 5xx — or a duplicate delivery — of an identical pushed
+// report must NOT append a second child_pushed audit entry (and, since the
+// status-comment notify is downstream of the same guard, fires no redundant
+// status update). The guard keys on (stage_id, head_sha), so a genuine push of
+// NEW work carrying a different head_sha to the same shared branch is still
+// recorded — asserted here as cheap insurance against an over-broad guard.
+func TestShipPullRequest_ChildPushOutcome_IsIdempotent(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "pushed",
+		"branch":              "fishhawk/run-aaaaaaaa",
+		"head_sha":            "head-abc",
+		"base_sha":            "base-def",
+		"files_changed_count": 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two identical deliveries — the second is the retry/duplicate the guard
+	// must suppress. Both must return 200.
+	for i := 0; i < 2; i++ {
+		w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("delivery %d: status = %d, want 200:\n%s", i, w.Code, w.Body.String())
+		}
+	}
+
+	countChildPushed := func() int {
+		au.mu.Lock()
+		defer au.mu.Unlock()
+		var n int
+		for _, e := range au.appended {
+			if e.Category == "child_pushed" {
+				n++
+			}
+		}
+		return n
+	}
+	if got := countChildPushed(); got != 1 {
+		t.Fatalf("child_pushed audit entries after duplicate = %d, want 1 (guard must suppress the retry)", got)
+	}
+
+	// A genuinely NEW push to the same shared branch carries a different
+	// head_sha and must still be recorded — the equality keying guarantees
+	// this by construction; assert it as insurance against an over-broad guard.
+	body2, err := json.Marshal(map[string]any{
+		"outcome":             "pushed",
+		"branch":              "fishhawk/run-aaaaaaaa",
+		"head_sha":            "head-xyz",
+		"base_sha":            "base-def",
+		"files_changed_count": 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body2, ""); w.Code != http.StatusOK {
+		t.Fatalf("new-head_sha delivery: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := countChildPushed(); got != 2 {
+		t.Errorf("child_pushed audit entries after new head_sha = %d, want 2 (a different head_sha must not be suppressed)", got)
+	}
+}
+
 // TestShipPullRequest_ChildPushOutcome_RejectsMissingCoords pins the #771
 // validation: the pushed variant requires branch + head_sha + base_sha (no
 // PR was opened, so those coordinates are the only record of what landed).
