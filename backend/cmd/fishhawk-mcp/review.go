@@ -312,7 +312,11 @@ func registerAwaitReview(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_await_review",
 		Description: strings.TrimSpace(`
-Block until a Fishhawk stage's agent review reaches a terminal state.
+Block until a stage's agent review reaches a terminal state. Use this
+when fishhawk_get_run_status or fishhawk_run_stage reports a review
+status of "pending" and you need the verdict before acting (e.g. deciding
+on fishhawk_fixup_stage) — the block-until-terminal companion to those
+snapshot tools.
 
 The ergonomic replacement for curl-polling /v0/runs/{id}/audit for a
 plan_reviewed / implement_reviewed entry. Resolves the review_status from

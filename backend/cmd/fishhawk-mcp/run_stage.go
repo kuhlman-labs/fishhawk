@@ -203,8 +203,9 @@ func registerRunStage(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_run_stage",
 		Description: strings.TrimSpace(`
-Drive one stage of a Fishhawk run to completion by spawning the
-fishhawk-runner binary on the operator's host.
+Drive one stage of a run to completion. Use this after fishhawk_start_run
+to execute each stage in turn — it spawns the fishhawk-runner binary on
+the operator's host.
 
 Mirrors the CLI's "fishhawk runner start" verb. Pair with
 fishhawk_start_run + fishhawk_approve_plan for the full

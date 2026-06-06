@@ -80,7 +80,12 @@ func registerGetActiveRun(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_get_active_run",
 		Description: strings.TrimSpace(`
-Resolve the Fishhawk run for the current context.
+Resolve the Fishhawk run UUID for the current context when you do not
+already have it. Reach for this first when you hold a PR number, a
+trigger ref (e.g. "issue:42"), or the runner's FISHHAWK_RUN_ID env but
+need the run id that fishhawk_get_run_status / fishhawk_get_plan take —
+the "which run" resolver, as distinct from fishhawk_list_runs (browse
+many runs).
 
 Resolution order:
   1. If pr_number is set, returns the most-recent run on that PR.
@@ -330,7 +335,10 @@ func registerGetPlan(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_get_plan",
 		Description: strings.TrimSpace(`
-Fetch the approved plan for a Fishhawk run.
+Read a run's approved plan artifact. Use this after run_stage(plan) and
+before fishhawk_approve_plan / fishhawk_reject_plan to inspect what the
+agent proposed — the plan-artifact read, as distinct from
+fishhawk_get_run_status (the lifecycle snapshot).
 
 Walks parent_run_id up to 8 levels so CI-retry runs (which skip the
 plan stage and re-execute against the parent's plan) resolve to the
@@ -614,7 +622,12 @@ func registerGetRunStatus(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_get_run_status",
 		Description: strings.TrimSpace(`
-Snapshot a Fishhawk run's current state in one call.
+Snapshot a run's current state in one call — the agent's "where are we"
+query. Use this when you need to know what stage a run is on, what just
+happened, or whether a review has landed; it replaces a sequential
+GetRun / ListStages / ListAudit chain. Distinct from fishhawk_get_plan
+(reads the plan artifact) and fishhawk_get_active_run (resolves which
+run); for deeper audit pagination use fishhawk_list_audit.
 
 Returns the Run row (state, workflow, trigger, PR URL when stamped),
 the full ordered stage list (each stage's id / type / state /
@@ -635,10 +648,6 @@ is not yet spent: a one-line pointer at fishhawk_fixup_stage (route the
 concerns back to the agent) vs approving to merge, with the concern
 count and remaining fix-up budget. Display-only — never gates the run;
 omitted when there is nothing to act on or the budget is exhausted.
-
-Use this as the agent's "where are we" query — replaces a sequential
-chain of GetRun / ListStages / ListAudit calls with a single
-round-trip. For deeper audit pagination, use fishhawk_list_audit.
 `),
 	}, resolver.getRunStatus)
 }
@@ -802,7 +811,10 @@ func registerListAudit(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_list_audit",
 		Description: strings.TrimSpace(`
-List audit entries for a Fishhawk run with optional filters.
+List a run's audit entries with optional filters and cursor pagination.
+Use this when you need the filtered or paginated audit trail rather than
+the recent slice — e.g. to read the implement_reviewed concern indices
+that fishhawk_fixup_stage takes, or to walk a single category.
 
 Returns rows sequence-ascending (matches the per-run scope the
 backend exposes for the run-detail UI + verifier path). For "most-
@@ -1009,7 +1021,10 @@ func registerStartRun(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_start_run",
 		Description: strings.TrimSpace(`
-Create a new Fishhawk run.
+Create a new Fishhawk run — step 1 of the agent-driven local loop. Use
+this to mint a run before fishhawk_run_stage drives its stages; the
+sequence is fishhawk_run_stage (plan) → fishhawk_approve_plan →
+fishhawk_run_stage (implement).
 
 Mirrors the CLI's "fishhawk run start" verb. The new run is created
 in pending state and dispatched immediately via the existing
@@ -1223,7 +1238,9 @@ func registerCancelRun(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_cancel_run",
 		Description: strings.TrimSpace(`
-Cancel a Fishhawk run.
+Cancel a whole run. Use this when you want to abandon an in-flight or
+stuck run outright — distinct from fishhawk_retry_stage (re-run one
+failed stage) and fishhawk_reject_plan (fail just the plan gate).
 
 Mirrors the CLI's "fishhawk run cancel" verb. Transitions the run to
 the cancelled state via the existing state-machine rules.
@@ -1254,7 +1271,7 @@ func (r *runResolver) cancelRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 // RetryStageInput is the fishhawk_retry_stage tool's input schema
 // (E22.3 / #392). Mirrors `POST /v0/stages/{stage_id}/retry`.
 type RetryStageInput struct {
-	StageID string `json:"stage_id" jsonschema:"the Fishhawk stage UUID to retry"`
+	StageID string `json:"stage_id" jsonschema:"the Fishhawk stage UUID to retry; must be a stage in a failed state"`
 }
 
 // RetryStageOutput surfaces the post-retry Stage row. Category-A/C
@@ -1281,7 +1298,10 @@ func registerRetryStage(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_retry_stage",
 		Description: strings.TrimSpace(`
-Retry a failed Fishhawk stage.
+Retry a FAILED stage. Use this when a stage has failed and you want the
+orchestrator to re-run it fresh — distinct from fishhawk_fixup_stage,
+which re-opens a HEALTHY implement-review gate on the same PR branch.
+Precondition: the stage must be in a failed state.
 
 Mirrors the CLI's "fishhawk run retry <stage-id>" verb. The backend's
 state machine decides whether the stage is retryable per its failure
@@ -1325,7 +1345,7 @@ func (r *runResolver) retryStage(ctx context.Context, _ *mcp.CallToolRequest, in
 // plan stage internally.
 type ApprovePlanInput struct {
 	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being approved"`
-	Reason string `json:"reason,omitempty" jsonschema:"optional reviewer rationale, recorded on the approval row as 'comment'"`
+	Reason string `json:"reason,omitempty" jsonschema:"optional reviewer rationale; injected to the implement agent as binding approval conditions (#558), so use it to amend the plan — also recorded on the approval row as 'comment'"`
 }
 
 // ApprovePlanOutput surfaces the post-approve Stage row plus the
@@ -1342,7 +1362,7 @@ type ApprovePlanOutput struct {
 // because reject without a rationale is poor practice.
 type RejectPlanInput struct {
 	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being rejected"`
-	Reason string `json:"reason,omitempty" jsonschema:"reviewer rationale; recommended on rejects (the CLI warns when missing)"`
+	Reason string `json:"reason,omitempty" jsonschema:"reviewer rationale; recommended on rejects (the CLI warns when missing). Propagates to a fresh run's plan as prior-rejection feedback"`
 }
 
 // RejectPlanOutput mirrors ApprovePlanOutput.
@@ -1365,7 +1385,10 @@ func registerApprovePlan(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_approve_plan",
 		Description: strings.TrimSpace(`
-Approve a Fishhawk plan.
+Approve a run's plan so it can proceed to the implement stage. Use this
+after reading fishhawk_get_plan, once the plan is sound and its plan
+stage is parked awaiting approval — the approve counterpart to
+fishhawk_reject_plan.
 
 Mirrors the CLI's "fishhawk plan approve <run-id> [--reason …]" verb.
 Takes a run id; the tool resolves the plan stage internally by
@@ -1391,7 +1414,9 @@ func registerRejectPlan(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_reject_plan",
 		Description: strings.TrimSpace(`
-Reject a Fishhawk plan.
+Reject a run's plan, failing the plan gate. Use this after reading
+fishhawk_get_plan, once the plan is wrong and its plan stage is parked
+awaiting approval — the reject counterpart to fishhawk_approve_plan.
 
 Mirrors the CLI's "fishhawk plan reject <run-id> [--reason …]" verb.
 Takes a run id; the tool resolves the plan stage internally.
@@ -1558,7 +1583,10 @@ func registerListRuns(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_list_runs",
 		Description: strings.TrimSpace(`
-List Fishhawk runs with optional filters.
+List runs with optional filters — the "what runs do I have" enumeration.
+Use this to find runs by repo / workflow / state when you don't already
+have a specific run in context; to resolve a single run from a PR or
+trigger ref instead, use fishhawk_get_active_run.
 
 Mirrors the CLI's "fishhawk run list" verb. Returns runs ordered by
 created_at descending; pagination via opaque cursor (feed back into
@@ -1643,10 +1671,10 @@ func registerRuntimeCalibration(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_runtime_calibration",
 		Description: strings.TrimSpace(`
-Fetch runtime calibration statistics for Fishhawk implement stages.
-
-Call this BEFORE writing a plan to self-correct predicted_runtime_minutes
-using historical actual vs. predicted data. The key fields:
+Fetch runtime calibration statistics for Fishhawk implement stages. Use
+this BEFORE writing a plan (the run_stage plan step) to self-correct
+predicted_runtime_minutes using historical actual vs. predicted data.
+The key fields:
 
   - calibration_ratio: actual_p50 / predicted_p50. Multiply your raw
     estimate by this ratio to get a historically calibrated value.
