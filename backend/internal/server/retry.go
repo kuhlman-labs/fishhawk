@@ -216,6 +216,34 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		s.writeRetryAudit(r, dec, runRow)
 	}
 
+	// Un-terminal the run (failed → running) before the orchestrator
+	// handoff. This is MANDATORY, not cosmetic: orchestrator.Advance
+	// returns OutcomeNoOp without acting when run.State.IsTerminal()
+	// (orchestrator.go early-return after GetRun), so re-opening only
+	// the stage would strand the run with the re-run's work landed and
+	// the next gate never opening — the #798 orphan. Mirrors #698's
+	// RedriveChild, which performs the identical failed → running reopen
+	// via the same RetryRun primitive (the runRetryTransitions table in
+	// transition.go permits only failed → running). Gated on
+	// State == failed so it is inert when no run row is resolvable
+	// (runRow nil) and a no-op-by-rejection is avoided for an
+	// already-running run (running → running is not in the retry table).
+	// Applied on the retryable path generally (not only the pending
+	// branch) so the D-timeout → awaiting_approval case is also
+	// un-terminalled and a later approve's Advance is not a no-op.
+	// Best-effort: the stage transition already committed inside
+	// run.RetryStage, so a RetryRun error here logs and does not fail
+	// the request — same audit-first posture as the Advance handoff.
+	if runRow != nil && runRow.State == run.StateFailed {
+		if _, err := s.cfg.RunRepo.RetryRun(r.Context(), dec.Stage.RunID, run.StateRunning); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+				"reopen run failed → running for retry failed",
+				slog.String("run_id", dec.Stage.RunID.String()),
+				slog.String("stage_id", dec.Stage.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+
 	// A/C retries land the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire
 	// workflow_dispatch. D-timeout retries land at
