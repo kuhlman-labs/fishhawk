@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -306,14 +307,37 @@ func TestRetryStage_AReopensRunAndAdvancesToReview(t *testing.T) {
 	}
 }
 
+// retryRunSpy wraps orchestratorRepo to count RetryRun invocations and
+// optionally force an error from it. The call count lets the guard tests
+// distinguish "the State == failed guard prevented the RetryRun call"
+// from "the guard was absent but RetryRun's error was silently swallowed"
+// — a distinction the run-state assertion alone cannot make, because the
+// reopen is best-effort (logged, not fatal) so a stray running → running
+// call would also leave the run state unchanged (#798 fix-up).
+type retryRunSpy struct {
+	*orchestratorRepo
+	retryRunCalls int
+	forceErr      error
+}
+
+func (r *retryRunSpy) RetryRun(ctx context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	r.retryRunCalls++
+	if r.forceErr != nil {
+		return nil, r.forceErr
+	}
+	return r.orchestratorRepo.RetryRun(ctx, id, to)
+}
+
 // TestRetryStage_NonFailedRunLeavesRunStateUnchanged locks in that the
 // run-reopen is gated on State == failed and is not a blanket RetryRun
-// call. seedRun seeds StateRunning; RetryRun's failed → running-only
-// transition table would reject running → running, so an unguarded call
-// would surface an InvalidTransitionError. The retry must still return
-// 200 and leave the run state unchanged.
+// call. seedRun seeds StateRunning, so the guard must SKIP RetryRun
+// entirely — asserted via the spy's call count being zero. The bare
+// run-state check is insufficient on its own: because the reopen is
+// best-effort, an unguarded running → running call would return
+// InvalidTransitionError, be logged, and STILL leave the state unchanged,
+// so only the call-count assertion proves the guard fired.
 func TestRetryStage_NonFailedRunLeavesRunStateUnchanged(t *testing.T) {
-	rr := newOrchestratorRepo()
+	rr := &retryRunSpy{orchestratorRepo: newOrchestratorRepo()}
 	r := rr.seedRun() // State == running
 
 	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
@@ -336,12 +360,55 @@ func TestRetryStage_NonFailedRunLeavesRunStateUnchanged(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
+	if rr.retryRunCalls != 0 {
+		t.Errorf("RetryRun calls = %d, want 0 (guard must skip the reopen on a non-failed run)", rr.retryRunCalls)
+	}
 	gotRun, err := rr.GetRun(context.Background(), r.ID)
 	if err != nil {
 		t.Fatalf("get run: %v", err)
 	}
 	if gotRun.State != run.StateRunning {
 		t.Errorf("run state = %q, want running unchanged (reopen must be gated on failed)", gotRun.State)
+	}
+}
+
+// TestRetryStage_ReopenErrorIsBestEffort covers the guarded-but-failing
+// path: the run IS failed (so the guard fires and RetryRun is called) but
+// RetryRun itself returns an error. Per the approved plan the reopen is
+// best-effort — a RetryRun error after the stage transition already
+// committed must be LOGGED, not fail the request. So the handler must
+// still return 200, and the spy must record exactly one RetryRun call
+// (proving the error path was exercised, not skipped by the guard).
+func TestRetryStage_ReopenErrorIsBestEffort(t *testing.T) {
+	rr := &retryRunSpy{
+		orchestratorRepo: newOrchestratorRepo(),
+		forceErr:         errors.New("transient reopen failure"),
+	}
+	r := rr.seedRun()
+	r.State = run.StateFailed // guard fires: run is terminal-failed
+
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	cat := run.FailureA
+	reason := "agent crashed: SIGSEGV"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+	})
+
+	w := postRetry(t, s, implement.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (reopen error must be logged, not fatal):\n%s", w.Code, w.Body.String())
+	}
+	if rr.retryRunCalls != 1 {
+		t.Errorf("RetryRun calls = %d, want 1 (guard fires on a failed run, then error path runs)", rr.retryRunCalls)
 	}
 }
 
