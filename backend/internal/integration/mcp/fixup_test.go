@@ -2,11 +2,13 @@ package mcpe2e_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,11 +20,13 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -355,7 +359,7 @@ func TestE2E_Fixup_PushOpenPRReopensImplementAndReparksReview(t *testing.T) {
 }
 
 // TestE2E_Fixup_FailedRedispatchRestoresReviewGate drives the fix-up
-// FAILURE-RECOVERY seam end to end (#788): a push_and_open_pr fix-up
+// FAILURE-RECOVERY seam end to end (#788/#794): a push_fixup fix-up
 // re-dispatch that FAILS must restore the run to its pre-fix-up review
 // gate rather than leaving it an unrecoverable failed casualty. This
 // crosses the run state-machine ↔ backend HTTP ↔ Postgres ↔ audit seam
@@ -434,13 +438,26 @@ func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
 		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
 	}
 
-	// 3. Simulate the re-dispatched implement landing in `running` (the #742
-	// trace gate's state) then FAILING its commit/push step.
-	for _, to := range []runpkg.StageState{runpkg.StageStateDispatched, runpkg.StageStateRunning} {
-		if _, err := fx.runRepo.TransitionStage(ctx, impl.ID, to, nil); err != nil {
-			t.Fatalf("re-dispatch TransitionStage → %s: %v", to, err)
-		}
+	// 3. Ship the re-dispatched implement's trace bundle carrying push_fixup —
+	// the trace handler walks pending → dispatched → running and the
+	// fixupPushGated forward-gate DEFERS the terminal transition (#794). This
+	// replaces a manual TransitionStage so the failure leg exercises the real
+	// trace gate, not a simulated `running`.
+	shipPushFixupTraceViaBackend(t, ctx, fx, impl.ID)
+
+	// CONDITION 2: after the push_fixup trace upload and before any /pull-request
+	// report, the fix-up implement stage is `running`, NOT succeeded — proving
+	// the terminal transition is forward-gated so a later push failure can still
+	// flip it to failed and fire #788 recovery.
+	gated, err := fx.runRepo.GetStage(ctx, impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage(implement) after trace: %v", err)
 	}
+	if gated.State != runpkg.StageStateRunning {
+		t.Fatalf("implement state after push_fixup trace = %q, want running (forward-gated)", gated.State)
+	}
+
+	// Now simulate the re-dispatched implement FAILING its commit/push step.
 	failPushPRViaBackend(t, ctx, fx, impl.ID)
 
 	// 4. The run was restored to its pre-fix-up review gate — the PR stays
@@ -533,6 +550,239 @@ func failPushPRViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, sta
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
 		t.Fatalf("pull-request failure status %d: %s", resp.StatusCode, raw)
+	}
+}
+
+// TestE2E_Fixup_PushFixupForwardGateDrivesTerminal drives the #794 fix-up
+// forward-gate SUCCESS seam end to end: a fix-up re-dispatch whose trace bundle
+// carries push_fixup must leave the implement stage in `running` at trace-upload
+// time (CONDITION 2 — the terminal transition is deferred), and the subsequent
+// /pull-request {outcome:"fixup_pushed"} report must drive the stage terminal
+// AND write a fixup_pushed audit entry. This crosses the runner-emitted manifest
+// flag → backend trace forward-gate → /pull-request terminal-drive seam the
+// per-layer units cannot (cf. #618): without the gate the trace upload would
+// terminalize the stage at upload time, swallowing a later push failure.
+func TestE2E_Fixup_PushFixupForwardGateDrivesTerminal(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+
+	// 1. Fix-up shape: implement SUCCEEDED (PR open), separate review at the gate.
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         2,
+		Type:             runpkg.StageTypeReview,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	// 2. Trigger the fix-up through the real fishhawk-mcp binary — re-opens
+	// implement → pending, re-parks review → pending.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "address the scope concern on the open PR",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+
+	// 3. Ship the re-dispatched implement's trace bundle carrying push_fixup.
+	// The trace handler walks pending → dispatched → running, then the
+	// fixupPushGated forward-gate DEFERS the terminal transition.
+	shipPushFixupTraceViaBackend(t, ctx, fx, impl.ID)
+
+	// CONDITION 2: immediately after the push_fixup trace upload and BEFORE any
+	// /pull-request report, the fix-up implement stage is `running`, NOT
+	// succeeded — the terminal transition is forward-gated.
+	curImpl, err := fx.runRepo.GetStage(ctx, impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage(implement): %v", err)
+	}
+	if curImpl.State != runpkg.StageStateRunning {
+		t.Fatalf("implement state after push_fixup trace = %q, want running (terminal transition must be forward-gated)", curImpl.State)
+	}
+
+	// 4. The /pull-request {fixup_pushed} report drives the deferred terminal
+	// transition. RequiresApproval=false → succeeded.
+	succeedFixupPushViaBackend(t, ctx, fx, impl.ID)
+
+	curImpl, err = fx.runRepo.GetStage(ctx, impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage(implement) after report: %v", err)
+	}
+	if curImpl.State != runpkg.StageStateSucceeded {
+		t.Errorf("implement state after fixup_pushed = %q, want succeeded (report drives the gated terminal transition)", curImpl.State)
+	}
+
+	// 5. A fixup_pushed audit entry landed pinning the pushed commit.
+	pushed, err := auditRepo.ListForRunByCategory(ctx, fx.runID, "fixup_pushed")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(fixup_pushed): %v", err)
+	}
+	if len(pushed) != 1 {
+		t.Fatalf("fixup_pushed entries = %d, want 1", len(pushed))
+	}
+}
+
+// buildPushFixupBundle returns a gzipped JSONL trace bundle whose manifest
+// carries push_fixup=true plus a git_diff event with fileCount files — the
+// signed wire form the trace handler's fixupPushGated check reads (#794).
+// Mirrors the per-layer makeFixupPushBundle helper in the server package; kept
+// here because the integration test is in a different package.
+func buildPushFixupBundle(t *testing.T, fileCount int) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		TS   time.Time       `json:"ts"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(5 * time.Minute)
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1", PushFixup: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make([]map[string]string, 0, fileCount)
+	for i := 0; i < fileCount; i++ {
+		files = append(files, map[string]string{"path": fmt.Sprintf("file%d.go", i), "status": "modified"})
+	}
+	diffData, err := json.Marshal(map[string]any{
+		"kind": "git_diff", "base_ref": "main", "files": files, "num_files": fileCount,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []line{
+		{Seq: 1, TS: t0.Add(-time.Second), Kind: bundle.EventKindManifest, Data: mdata},
+		{Seq: 2, TS: t0, Kind: bundle.EventKindGitDiff, Data: diffData},
+		{Seq: 3, TS: t1, Kind: "agent_end", Data: json.RawMessage(`{}`)},
+		{Seq: 4, TS: t1.Add(time.Second), Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, err := json.Marshal(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// shipPushFixupTraceViaBackend POSTs a signed push_fixup trace bundle for the
+// implement stage, standing up a backend server with TraceStore wired (the
+// shared fixture omits it). Both servers share the pool, so the state the trace
+// handler writes is visible through fx.runRepo.
+func shipPushFixupTraceViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID) {
+	t.Helper()
+	s := server.New(server.Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     fx.runRepo,
+		SigningRepo: signing.NewPostgresRepository(fx.pool),
+		AuditRepo:   audit.NewPostgresRepository(fx.pool),
+		TraceStore:  tracestore.NewMem(),
+	})
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	body := buildPushFixupBundle(t, 2)
+	message := signing.ComputeMessage(body)
+	signature := ed25519.Sign(fx.signingPriv, message)
+	url := srv.URL + "/v0/runs/" + fx.runID.String() + "/trace?stage_id=" + stageID.String() + "&variant=raw"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build trace request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(signature))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("trace POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("trace status %d: %s", resp.StatusCode, raw)
+	}
+}
+
+// succeedFixupPushViaBackend POSTs a /pull-request {outcome:"fixup_pushed"}
+// report for the implement stage, signed with the run's signing key. Mirrors
+// failPushPRViaBackend's server wiring.
+func succeedFixupPushViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID) {
+	t.Helper()
+	s := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		SigningRepo:  signing.NewPostgresRepository(fx.pool),
+		AuditRepo:    audit.NewPostgresRepository(fx.pool),
+		ArtifactRepo: artifact.NewPostgresRepository(fx.pool),
+	})
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	body := []byte(`{"outcome":"fixup_pushed","branch":"fishhawk/fixup-branch","head_sha":"head-abc","base_sha":"base-def","files_changed_count":2}`)
+	digest := sha256.Sum256(body)
+	signature := ed25519.Sign(fx.signingPriv, digest[:])
+	url := srv.URL + "/v0/runs/" + fx.runID.String() + "/pull-request?stage_id=" + stageID.String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build pull-request request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(signature))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("fixup_pushed POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("fixup_pushed status %d: %s", resp.StatusCode, raw)
 	}
 }
 

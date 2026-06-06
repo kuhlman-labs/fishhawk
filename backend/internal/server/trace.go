@@ -490,8 +490,20 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// reaching terminal succeeded with no code on the shared branch (the
 	// childcompletion sweeper would otherwise consolidate the parent into a
 	// PR silently missing that child's work).
+	// The fix-up re-dispatch push (#794) is gated identically: a fix-up stamps
+	// push_fixup (not push_and_open_pr / push_to_shared_branch) and commits onto
+	// the EXISTING PR branch after the trace ships. fixupPushGated mirrors
+	// pushAndOpenPRGated — leave the fix-up stage in `running` and let the
+	// /pull-request "fixup_pushed"/"failed" report drive the terminal
+	// transition, so a fix-up commit/push/compile-gate failure lands the stage
+	// `failed` (firing #788 fix-up recovery) instead of reaching terminal
+	// succeeded with the implement re-review approving an unlanded diff (the
+	// #794 swallow). The advisory implement re-review above still fires at trace
+	// time on the bundle diff while the stage stays running — the gate defers
+	// only the TERMINAL transition, and on a later push failure #788 recovery
+	// un-advances the run.
 	if stage.Type == run.StageTypeImplement &&
-		(s.pushAndOpenPRGated(bundleBytes) || s.childPushGated(bundleBytes)) {
+		(s.pushAndOpenPRGated(bundleBytes) || s.childPushGated(bundleBytes) || s.fixupPushGated(bundleBytes)) {
 		s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "succeeded")
 		return
 	}
@@ -633,6 +645,35 @@ func (*Server) pushAndOpenPRGated(bundleBytes []byte) bool {
 func (*Server) childPushGated(bundleBytes []byte) bool {
 	manifest, err := bundle.ExtractManifest(bundleBytes)
 	if err != nil || !manifest.PushToSharedBranch {
+		return false
+	}
+	diff, err := bundle.ExtractDiff(bundleBytes)
+	if err != nil {
+		return false
+	}
+	return len(diff.ChangedFiles) > 0
+}
+
+// fixupPushGated reports whether a fix-up re-dispatch implement-stage trace
+// upload should DEFER its terminal transition to the /pull-request upload
+// (#794). It mirrors pushAndOpenPRGated/childPushGated for the fix-up case.
+// True only when BOTH hold:
+//
+//   - the bundle manifest's push_fixup flag is set (the runner is a fix-up
+//     re-dispatch that will commit onto the EXISTING PR branch after the trace
+//     ships, updating the open PR rather than opening a new one), and
+//   - the bundle carries a non-empty git_diff (a commit + push will actually
+//     follow, so a /pull-request "fixup_pushed"/"failed" report is guaranteed).
+//
+// A false flag — every non-fix-up stage and every older bundle — returns false
+// so the prior trace-driven transition is byte-identical. An empty or absent
+// diff is the no-changes path: the fix-up made no edits, so the runner pushes
+// nothing and never POSTs to /pull-request; gating it would hang the stage in
+// running, so it returns false and the caller advances the stage as before
+// (matching the push_and_open_pr / push_to_shared_branch empty-diff cases).
+func (*Server) fixupPushGated(bundleBytes []byte) bool {
+	manifest, err := bundle.ExtractManifest(bundleBytes)
+	if err != nil || !manifest.PushFixup {
 		return false
 	}
 	diff, err := bundle.ExtractDiff(bundleBytes)

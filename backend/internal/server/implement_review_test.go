@@ -442,6 +442,48 @@ func TestShipTrace_ImplementReview_GatingApprove_Advances(t *testing.T) {
 	}
 }
 
+// TestShipTrace_ImplementReview_FixupForwardGated_StillReviews is CONDITION 3
+// of #794: the advisory implement RE-REVIEW must still fire at trace time for a
+// forward-gated fix-up stage. The fix-up bundle stamps push_fixup AND carries a
+// non-empty diff, so the trace handler defers the TERMINAL transition (the stage
+// stays `running` until the /pull-request fixup_pushed report) — but the
+// re-review runs on the bundle diff while the stage stays running. A regression
+// that silently stopped the fix-up re-review from firing must fail here.
+func TestShipTrace_ImplementReview_FixupForwardGated_StillReviews(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(5 * time.Minute)
+	bundleBytes := makeFixupPushBundle(t, true, 2, t0, t1)
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// Forward-gated: the terminal transition is deferred to the /pull-request
+	// report, so the stage stays running (NOT awaiting_approval).
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateRunning {
+		t.Errorf("fix-up stage state = %q, want %q (terminal transition deferred)",
+			got.State, run.StageStateRunning)
+	}
+
+	// Re-review still fired at trace time despite the gate. Advisory reviews
+	// run detached (#584); drain before asserting on the audit entry.
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed entries = %d, want 1 (fix-up re-review must fire even when the terminal transition is forward-gated)", n)
+	}
+}
+
 // TestShipTrace_ImplementReview_ScopeDriftOnly_Advances asserts the
 // flag-only contract (ADR-027 Decision Q6): a reviewer returning
 // approve_with_concerns with a single {category:"scope"} concern under

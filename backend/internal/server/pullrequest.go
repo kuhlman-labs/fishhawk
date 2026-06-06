@@ -54,6 +54,13 @@ type pullRequestBody struct {
 	// drives the child stage's terminal transition its push_to_shared_branch
 	// trace gate left in `running` without creating a PR artifact.
 	//
+	// When Outcome=="fixup_pushed" the body is a fix-up re-dispatch
+	// push-success report (#794): the fix-up committed + pushed onto the
+	// EXISTING PR branch (no new PR — the open PR already tracks the branch).
+	// The PR fields are absent; branch/head_sha/base_sha carry the pushed
+	// commit. The handler drives the fix-up stage's terminal transition its
+	// push_fixup trace gate left in `running` without creating a PR artifact.
+	//
 	// On the success body Outcome is empty and the PR fields are required.
 	// These are declared directly on the struct (with omitempty) so the
 	// handler's DisallowUnknownFields decoder accepts ALL shapes without a
@@ -96,8 +103,23 @@ func (p *pullRequestBody) validate() error {
 		}
 		return nil
 	}
+	// Fix-up push success variant (#794): a fix-up re-dispatch committed onto
+	// the EXISTING PR branch without opening a new PR. Same shape as the
+	// child-push "pushed" variant — no pr_number/pr_url; require the
+	// existing-branch commit coordinates so the audit entry pins what landed.
+	if p.Outcome == "fixup_pushed" {
+		switch {
+		case p.Branch == "":
+			return errors.New("branch is required for a fixup_pushed outcome")
+		case p.HeadSHA == "":
+			return errors.New("head_sha is required for a fixup_pushed outcome")
+		case p.BaseSHA == "":
+			return errors.New("base_sha is required for a fixup_pushed outcome")
+		}
+		return nil
+	}
 	if p.Outcome != "" {
-		return fmt.Errorf("outcome must be \"failed\" or \"pushed\" when set, got %q", p.Outcome)
+		return fmt.Errorf("outcome must be \"failed\", \"pushed\", or \"fixup_pushed\" when set, got %q", p.Outcome)
 	}
 	switch {
 	case p.PRNumber <= 0:
@@ -261,6 +283,16 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// pull_request_url backfill — the parent run opens the consolidated PR.
 	if pr.Outcome == "pushed" {
 		s.succeedChildPushStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		return
+	}
+
+	// Fix-up push success variant (#794): a fix-up re-dispatch committed +
+	// pushed onto the EXISTING PR branch (no new PR). Drive the fix-up stage's
+	// terminal transition its push_fixup trace gate left in `running`, write a
+	// fixup_pushed audit entry, and respond 200. No PR artifact and no
+	// pull_request_url backfill — the PR already exists and tracks this branch.
+	if pr.Outcome == "fixup_pushed" {
+		s.succeedFixupPushStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
 		return
 	}
 
@@ -519,6 +551,94 @@ func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, r
 	})
 }
 
+// pullRequestFixupPushResponse is the 200 body for the fix-up push success
+// variant (#794): a fix-up re-dispatch pushed onto the EXISTING PR branch and
+// the fix-up stage transitioned terminally. HeadSHA echoes the pushed commit.
+type pullRequestFixupPushResponse struct {
+	StageID uuid.UUID `json:"stage_id"`
+	Outcome string    `json:"outcome"`
+	Branch  string    `json:"branch"`
+	HeadSHA string    `json:"head_sha"`
+}
+
+// succeedFixupPushStage handles the fix-up push success variant (#794): a
+// fix-up re-dispatch committed + pushed onto the EXISTING PR branch (no new PR)
+// after the trace gate left the fix-up implement stage in `running`. It drives
+// the running → terminal transition via advanceImplementStageAfterPR (a no-op
+// if the stage already advanced — e.g. an older runner that never gated), writes
+// a fixup_pushed audit entry pinning the pushed commit into the chain, fires the
+// sticky status comment, and responds 200. No PR artifact, no pull_request_url
+// backfill — the PR already exists and tracks this branch. The terminal
+// transition is what the advisory implement re-review (fired at trace time)
+// keys off; deferring it here is the #794 fix.
+//
+// Idempotency-guarded on (stage_id, head_sha) mirroring succeedChildPushStage
+// (#776): a runner retry after a 5xx — or a duplicate delivery — must not append
+// a second fixup_pushed audit entry or fire a redundant status-comment update.
+func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	stageID := stage.ID
+
+	// Dedup on (stage_id, head_sha): an identical re-push of the SAME commit is
+	// suppressed, but a genuine push of NEW work carries a different head_sha
+	// and is still recorded. Guard first, before advance/audit/notify. Fail-open
+	// on a read error: WARN and fall through so a transient failure never drops a
+	// legitimate fix-up-push report.
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, "fixup_pushed"); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"fix-up push report: list fixup_pushed audit entries failed; proceeding without idempotency guard",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	} else if childPushAlreadyRecorded(entries, stageID, pr.HeadSHA) {
+		s.writeJSON(w, r, http.StatusOK, pullRequestFixupPushResponse{
+			StageID: stageID,
+			Outcome: "fixup_pushed",
+			Branch:  pr.Branch,
+			HeadSHA: pr.HeadSHA,
+		})
+		return
+	}
+
+	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+		s.advanceImplementStageAfterPR(r, runID, stage)
+	}
+
+	auditPayload, _ := json.Marshal(map[string]any{
+		"run_id":              runID.String(),
+		"stage_id":            stageID.String(),
+		"branch":              pr.Branch,
+		"head_sha":            pr.HeadSHA,
+		"base_sha":            pr.BaseSHA,
+		"files_changed_count": pr.FilesChangedCount,
+		"auth_method":         authMethod,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "fixup_pushed",
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      auditPayload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"fix-up push report: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	s.notifyStatusUpdate(r.Context(), runID, "fixup_pushed")
+
+	s.writeJSON(w, r, http.StatusOK, pullRequestFixupPushResponse{
+		StageID: stageID,
+		Outcome: "fixup_pushed",
+		Branch:  pr.Branch,
+		HeadSHA: pr.HeadSHA,
+	})
+}
+
 // childPushAlreadyRecorded reports whether a child_pushed audit entry for the
 // given stage with the same head_sha already exists, so a runner retry or a
 // duplicate delivery can be suppressed (#776). It mirrors pickRedactedTraceHash
@@ -566,8 +686,8 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 			slog.String("error", err.Error()))
 	}
 
-	// Fix-up recovery (#788): a push_and_open_pr fix-up re-dispatch whose
-	// commit/push/PR-open step fails reaches here after FailStage lands the
+	// Fix-up recovery (#788): a push_fixup fix-up re-dispatch whose
+	// commit/push/compile-gate step fails reaches here after FailStage lands the
 	// implement stage in `failed`. If this is a failed fix-up re-dispatch,
 	// maybeRecoverFixupFailure restores the run to its pre-fix-up review gate
 	// (implement → succeeded, review → awaiting_approval) and we SKIP the

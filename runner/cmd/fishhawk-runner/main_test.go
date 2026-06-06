@@ -3062,13 +3062,14 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	}
 }
 
-// TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix asserts the
-// push_to_shared_branch manifest flag (#771) and its mutual exclusivity with
-// push_and_open_pr across the {standalone, decomposed child, fix-up, --no-pr}
-// stage matrix. A decomposed child stamps push_to_shared_branch (and never
-// push_and_open_pr); a standalone stamps push_and_open_pr (and never the
-// child flag); a fix-up and a --no-pr local run stamp neither (they transition
-// on the trace upload as today).
+// TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix asserts the three
+// forward-gate manifest flags (push_and_open_pr #742, push_to_shared_branch
+// #771, push_fixup #794) and their MUTUAL EXCLUSIVITY across the {standalone,
+// decomposed child, fix-up, --no-pr} stage matrix. A decomposed child stamps
+// push_to_shared_branch; a standalone stamps push_and_open_pr; a fix-up stamps
+// push_fixup; a --no-pr local run stamps none (it transitions on the trace
+// upload as today). EXACTLY ONE of the three may be set per stage kind — no
+// double-gating (CONDITION 5 of #794).
 func TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix(t *testing.T) {
 	const parentRunID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	cases := []struct {
@@ -3079,11 +3080,12 @@ func TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix(t *testing.T) {
 		noPR           bool
 		wantOpenPR     bool
 		wantPushChild  bool
+		wantPushFixup  bool
 	}{
-		{name: "standalone", wantOpenPR: true, wantPushChild: false},
-		{name: "decomposed_child", decomposedFrom: parentRunID, wantOpenPR: false, wantPushChild: true},
-		{name: "fixup", fixup: true, fixupBranch: "fishhawk/run-11111111/stage-22222222", wantOpenPR: false, wantPushChild: false},
-		{name: "no_pr", noPR: true, wantOpenPR: false, wantPushChild: false},
+		{name: "standalone", wantOpenPR: true, wantPushChild: false, wantPushFixup: false},
+		{name: "decomposed_child", decomposedFrom: parentRunID, wantOpenPR: false, wantPushChild: true, wantPushFixup: false},
+		{name: "fixup", fixup: true, fixupBranch: "fishhawk/run-11111111/stage-22222222", wantOpenPR: false, wantPushChild: false, wantPushFixup: true},
+		{name: "no_pr", noPR: true, wantOpenPR: false, wantPushChild: false, wantPushFixup: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3130,8 +3132,20 @@ func TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix(t *testing.T) {
 			if manifest.PushToSharedBranch != tc.wantPushChild {
 				t.Errorf("manifest.PushToSharedBranch = %v, want %v", manifest.PushToSharedBranch, tc.wantPushChild)
 			}
-			if manifest.PushAndOpenPR && manifest.PushToSharedBranch {
-				t.Error("push_and_open_pr and push_to_shared_branch must be mutually exclusive")
+			if manifest.PushFixup != tc.wantPushFixup {
+				t.Errorf("manifest.PushFixup = %v, want %v", manifest.PushFixup, tc.wantPushFixup)
+			}
+			// Exactly one of the three forward-gate flags may be set per stage
+			// kind (no double-gating). --no-pr sets zero, which is also valid.
+			set := 0
+			for _, b := range []bool{manifest.PushAndOpenPR, manifest.PushToSharedBranch, manifest.PushFixup} {
+				if b {
+					set++
+				}
+			}
+			if set > 1 {
+				t.Errorf("forward-gate flags not mutually exclusive: push_and_open_pr=%v push_to_shared_branch=%v push_fixup=%v",
+					manifest.PushAndOpenPR, manifest.PushToSharedBranch, manifest.PushFixup)
 			}
 		})
 	}
@@ -3268,11 +3282,72 @@ func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
 	if fpr.gotArgs != nil {
 		t.Error("OpenPR called for fix-up pass — should be skipped (PR already exists)")
 	}
-	if fu.gotPRArgs != nil {
-		t.Error("ShipPullRequest called for fix-up pass — should be skipped")
+	// A fix-up DOES report push success via a {outcome:"fixup_pushed"}
+	// /pull-request report (#794) so the backend drives the terminal
+	// transition its push_fixup trace gate deferred — it must NOT ship a fresh
+	// PR artifact (empty Outcome with a Body).
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (fixup_pushed report) must be called after a fix-up push (#794)")
+	}
+	if fu.gotPRArgs.Outcome != "fixup_pushed" {
+		t.Errorf("fix-up report outcome = %q, want %q", fu.gotPRArgs.Outcome, "fixup_pushed")
+	}
+	if fu.gotPRArgs.Branch != existingBranch {
+		t.Errorf("fix-up report branch = %q, want %q", fu.gotPRArgs.Branch, existingBranch)
+	}
+	if len(fu.gotPRArgs.Body) != 0 {
+		t.Errorf("fix-up report must not carry a PR artifact body, got %d bytes", len(fu.gotPRArgs.Body))
 	}
 	if !strings.Contains(stderr.String(), `"event":"implement_fixup_pushed"`) {
 		t.Errorf("missing implement_fixup_pushed log line:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_fixup_push_reported"`) {
+		t.Errorf("missing implement_fixup_push_reported log line:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_FixupPushFailure_ReportsFailed is the #794 analogue
+// of the decomposed-child push-failure test: when a fix-up re-dispatch's
+// commit/push fails (e.g. the #728 compile gate blocks a drift-incomplete tree
+// → category B, or a generic git/network error → category C), the runner
+// reports the failure to /pull-request with Outcome=="failed" so the backend
+// fails the fix-up stage its push_fixup trace gate left in `running` and fires
+// #788 fix-up recovery — instead of leaving the trace-time succeeded zombie
+// whose implement re-review approves an unlanded diff.
+func TestRun_ImplementStage_FixupPushFailure_ReportsFailed(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, true)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:     "22222222-3333-4444-5555-666666666666",
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: "fishhawk/run-11111111/stage-22222222",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: errors.New("ssh-agent fetch failed")}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after a fix-up push failure (#794)")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "C" {
+		t.Errorf("fix-up push failure report = {outcome:%q, category:%q}, want {failed, C}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
 	}
 }
 

@@ -87,6 +87,17 @@ type Manifest struct {
 	// bundles (and every non-child stage) omit it and decode to false. Keep
 	// in lockstep with runner/internal/bundle.ManifestData.
 	PushToSharedBranch bool `json:"push_to_shared_branch,omitempty"`
+	// PushFixup signals a fix-up re-dispatch implement stage that will commit
+	// onto the EXISTING PR branch after the trace upload (updating the open PR
+	// rather than opening a new one). The trace handler reads it to forward-gate
+	// the fix-up stage's terminal transition onto the /pull-request upload
+	// (#794), closing the fix-up analogue of the #742/#771 zombies: a fix-up
+	// re-dispatch reaching terminal succeeded after a commit/push/compile-gate
+	// failure, so the implement re-review approves an unlanded diff and the #788
+	// recovery never fires. Older bundles (and every non-fix-up stage) omit it
+	// and decode to false. Keep in lockstep with
+	// runner/internal/bundle.ManifestData.
+	PushFixup bool `json:"push_fixup,omitempty"`
 }
 
 // Errors callers may want to switch on.

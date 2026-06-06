@@ -400,7 +400,7 @@ components:
         Stored verbatim as the artifact's content; v0 doesn't carry a
         schema_version because the field shape isn't yet schema-stable.
 
-        Has three variants (#742, #771):
+        Has four variants (#742, #771, #794):
 
         - **Success** (default): `outcome` is absent. The PR fields
           (`pr_number`, `pr_url`, `branch`, `head_sha`, `base_sha`,
@@ -424,6 +424,15 @@ components:
           gate left in `running`, without creating a PR artifact — so a child
           whose push failed (reported via `outcome: failed`) never reaches
           terminal succeeded with no code on the shared branch.
+        - **Fix-up push** (`outcome: fixup_pushed`, #794): a fix-up
+          re-dispatch committed + pushed onto the EXISTING PR branch but
+          opened no new PR (the open PR already tracks the branch). `branch`,
+          `head_sha`, and `base_sha` are required; `pr_number`/`pr_url`/`title`
+          are absent. The handler drives the fix-up stage's terminal transition
+          its push_fixup trace gate left in `running`, without creating a PR
+          artifact — so a fix-up whose push/compile-gate step failed (reported
+          via `outcome: failed`) never reaches terminal succeeded with the
+          implement re-review approving an unlanded diff.
       required: [pr_number, pr_url, branch, head_sha, base_sha, title, files_changed_count]
       properties:
         pr_number:
@@ -455,13 +464,16 @@ components:
           example: 3
         outcome:
           type: string
-          enum: [failed, pushed]
+          enum: [failed, pushed, fixup_pushed]
           description: |
             Present only on the non-success variants. `failed` (#742)
             reports a commit/push/PR-open failure (PR fields absent;
             `category` + `reason` required). `pushed` (#771) reports a
             decomposed child's successful push onto the shared parent branch
             (no PR opened; `branch` + `head_sha` + `base_sha` required,
+            `pr_number`/`pr_url`/`title` absent). `fixup_pushed` (#794) reports
+            a fix-up re-dispatch's successful push onto the EXISTING PR branch
+            (no new PR; `branch` + `head_sha` + `base_sha` required,
             `pr_number`/`pr_url`/`title` absent).
         category:
           type: string
@@ -515,6 +527,20 @@ components:
       properties:
         stage_id: { $ref: '#/components/schemas/UUID' }
         outcome: { type: string, enum: [pushed] }
+        branch: { type: string }
+        head_sha: { type: string }
+
+    PullRequestFixupPushResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/pull-request` for the fix-up push
+        variant (`outcome: fixup_pushed`, #794): a fix-up re-dispatch pushed
+        onto the EXISTING PR branch and the fix-up implement stage transitioned
+        terminally. No PR artifact is created.
+      required: [stage_id, outcome, branch, head_sha]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        outcome: { type: string, enum: [fixup_pushed] }
         branch: { type: string }
         head_sha: { type: string }
 
@@ -2726,7 +2752,10 @@ paths:
               the implement stage was transitioned to `failed` (#742), or
             - the child-push variant (`outcome: pushed`) was accepted and
               the decomposed-child implement stage was transitioned
-              terminally (#771).
+              terminally (#771), or
+            - the fix-up push variant (`outcome: fixup_pushed`) was accepted
+              and the fix-up implement stage was transitioned terminally
+              (#794).
           content:
             application/json:
               schema:
@@ -2734,6 +2763,7 @@ paths:
                   - $ref: '#/components/schemas/PullRequestUploadResponse'
                   - $ref: '#/components/schemas/PullRequestFailureResponse'
                   - $ref: '#/components/schemas/PullRequestChildPushResponse'
+                  - $ref: '#/components/schemas/PullRequestFixupPushResponse'
         '400':
           description: |
             Body missing required fields (`code: pull_request_invalid`)

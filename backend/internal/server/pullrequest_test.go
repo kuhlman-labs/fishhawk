@@ -541,6 +541,153 @@ func TestShipPullRequest_ChildPushOutcome_RejectsMissingCoords(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_FixupPushOutcome_DrivesTerminal is the #794 success half:
+// a fix-up re-dispatch's {outcome:"fixup_pushed", branch, head_sha, base_sha}
+// report must drive the gated fix-up implement stage's terminal transition
+// (running → awaiting_approval) and record a fixup_pushed audit entry — WITHOUT
+// creating a PR artifact or backfilling pull_request_url (the PR already exists
+// and tracks the branch).
+func TestShipPullRequest_FixupPushOutcome_DrivesTerminal(t *testing.T) {
+	s, sf, ar, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"head_sha":            "head-abc",
+		"base_sha":            "base-def",
+		"files_changed_count": 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval (fixup_pushed body must drive the gated terminal transition)", got.State)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 (no PR artifact for a fix-up push)", len(ar.all))
+	}
+	gotRun, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.PullRequestURL != nil {
+		t.Errorf("run.PullRequestURL = %q, want nil (fix-up updates the existing PR)", *gotRun.PullRequestURL)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, e := range au.appended {
+		if e.Category == "fixup_pushed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no fixup_pushed audit entry recorded")
+	}
+}
+
+// TestShipPullRequest_FixupPushOutcome_IsIdempotent pins the #794 guard
+// (mirroring #776 for child push): a runner retry or duplicate delivery of an
+// identical fixup_pushed report must NOT append a second fixup_pushed audit
+// entry. The guard keys on (stage_id, head_sha), so a genuine push of NEW work
+// carrying a different head_sha is still recorded.
+func TestShipPullRequest_FixupPushOutcome_IsIdempotent(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"head_sha":            "head-abc",
+		"base_sha":            "base-def",
+		"files_changed_count": 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("delivery %d: status = %d, want 200:\n%s", i, w.Code, w.Body.String())
+		}
+	}
+
+	countFixupPushed := func() int {
+		au.mu.Lock()
+		defer au.mu.Unlock()
+		var n int
+		for _, e := range au.appended {
+			if e.Category == "fixup_pushed" {
+				n++
+			}
+		}
+		return n
+	}
+	if got := countFixupPushed(); got != 1 {
+		t.Fatalf("fixup_pushed audit entries after duplicate = %d, want 1 (guard must suppress the retry)", got)
+	}
+
+	body2, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"head_sha":            "head-xyz",
+		"base_sha":            "base-def",
+		"files_changed_count": 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body2, ""); w.Code != http.StatusOK {
+		t.Fatalf("new-head_sha delivery: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := countFixupPushed(); got != 2 {
+		t.Errorf("fixup_pushed audit entries after new head_sha = %d, want 2 (a different head_sha must not be suppressed)", got)
+	}
+}
+
+// TestShipPullRequest_FixupPushOutcome_RejectsMissingCoords pins the #794
+// validation: the fixup_pushed variant requires branch + head_sha + base_sha
+// (no new PR was opened, so those coordinates are the only record of what
+// landed onto the existing PR branch).
+func TestShipPullRequest_FixupPushOutcome_RejectsMissingCoords(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	for _, body := range []string{
+		`{"outcome":"fixup_pushed","head_sha":"h","base_sha":"b"}`, // missing branch
+		`{"outcome":"fixup_pushed","branch":"br","base_sha":"b"}`,  // missing head_sha
+		`{"outcome":"fixup_pushed","branch":"br","head_sha":"h"}`,  // missing base_sha
+	} {
+		w := shipPRRequest(t, s, runID, stageID, priv, []byte(body), "")
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400:\n%s", body, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "pull_request_invalid") {
+			t.Errorf("body %s: missing pull_request_invalid:\n%s", body, w.Body.String())
+		}
+	}
+}
+
 // TestShipPullRequest_FailureOutcome_InvalidCategory_400 pins the failure-
 // variant validation: an unknown category is a malformed body (#742).
 func TestShipPullRequest_FailureOutcome_InvalidCategory_400(t *testing.T) {

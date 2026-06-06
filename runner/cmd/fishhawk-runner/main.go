@@ -569,10 +569,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	//
 	// A fix-up pass (#762) commits onto the EXISTING PR branch and updates
 	// the open PR rather than opening a new one, so it is NOT a
-	// push_and_open_pr stage: willOpenPR stays false so the backend
-	// transitions the stage terminally on the trace upload (which the
-	// advisory implement re-review keys off), not on a /pull-request upload
-	// that a fix-up never ships.
+	// push_and_open_pr stage: willOpenPR stays false. The fix-up path is now
+	// forward-gated on its own flag (willPushFixup / push_fixup, #794) and
+	// ships a {outcome:"fixup_pushed"} /pull-request report after the push.
 	willOpenPR := stageType == "implement" && !cfg.noPR && cfg.decomposedFromRunID == "" && !cfg.fixup
 
 	// willPushChild is the decomposed-child complement of willOpenPR: an
@@ -589,6 +588,21 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// willOpenPR is false; a fix-up pass sets neither and transitions on the
 	// trace upload as today.
 	willPushChild := stageType == "implement" && cfg.decomposedFromRunID != "" && !cfg.fixup
+
+	// willPushFixup is the fix-up-pass complement of willOpenPR/willPushChild:
+	// a fix-up re-dispatch implement stage (#762) that commits onto the EXISTING
+	// PR branch after the trace upload (updating the open PR, not opening a new
+	// one). It stamps push_fixup in the bundle manifest so the backend
+	// forward-gates the fix-up stage's terminal transition onto the
+	// /pull-request upload (#794) — the fix-up analogue of the #742/#771
+	// forward-gate — and it gates the failure-report POST below so a fix-up
+	// commit/push/compile-gate failure lands the stage `failed` (firing #788
+	// recovery) instead of leaving the trace-time succeeded zombie whose
+	// implement re-review approves an unlanded diff. willOpenPR, willPushChild,
+	// and willPushFixup are mutually exclusive: willOpenPR and willPushChild are
+	// both false for a fix-up (each requires !cfg.fixup), and a fix-up is never
+	// a decomposed child (decomposedFromRunID == "").
+	willPushFixup := stageType == "implement" && cfg.fixup
 
 	var rawBundle, redactedBundle []byte
 	if cfg.bundleOut != "" || cfg.uploadTrace {
@@ -612,6 +626,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			AgentFailureReason: agentFailureReason,
 			PushAndOpenPR:      willOpenPR,
 			PushToSharedBranch: willPushChild,
+			PushFixup:          willPushFixup,
 		}
 		bytesData, _, err := bundle.PackBytes(manifestRaw, res.Events)
 		if err != nil {
@@ -776,15 +791,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					`{"event":"runner_failed","reason":"pull_request_upload","detail":%q}`+"\n", err.Error())
 				// Report the failure to /pull-request so the backend fails the
 				// implement stage that its trace gate left in `running` (#742,
-				// #771). Without this the gated stage would hang until the SLA
-				// watchdog reaps it. Gated on willOpenPR || willPushChild: a
-				// push_and_open_pr stage (#742) AND a decomposed child
-				// (push_to_shared_branch, #771) are both left in running by the
-				// trace gate, so both must report a commit/push failure; a
-				// --no-pr / fix-up failure was never gated, so reporting one
-				// would wrongly fail an already-advanced stage. Best-effort —
+				// #771, #794). Without this the gated stage would hang until the
+				// SLA watchdog reaps it. Gated on willOpenPR || willPushChild ||
+				// willPushFixup: a push_and_open_pr stage (#742), a decomposed
+				// child (push_to_shared_branch, #771), AND a fix-up re-dispatch
+				// (push_fixup, #794) are all left in running by the trace gate, so
+				// each must report a commit/push/compile-gate failure; a --no-pr
+				// failure was never gated, so reporting one would wrongly fail an
+				// already-advanced stage. For a fix-up, the backend's
+				// failPullRequestStage → maybeRecoverFixupFailure (#788) then
+				// restores the run to its pre-fix-up review gate. Best-effort —
 				// the failure exit stands regardless of whether the report lands.
-				if willOpenPR || willPushChild {
+				if willOpenPR || willPushChild || willPushFixup {
 					reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, err.Error())
 				}
 				logCompletion(logSink, res, invokeErr)
@@ -1881,12 +1899,47 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// Fix-up pass (#762): the commit is now on the existing PR branch and
 	// pushed, so the open PR's head has advanced. Don't open a new PR (one
 	// already exists for this head→base) and don't ship a pull_request
-	// artifact — willOpenPR is false for a fix-up, so the backend
-	// transitions this stage on the trace upload that already happened, and
-	// the advisory implement re-review keys off that upload. Done.
+	// artifact. Instead REPORT push success to the backend (#794): the trace
+	// handler left this fix-up stage in `running` (push_fixup gate), so THIS
+	// report is the authoritative driver of the stage's terminal transition —
+	// without it the stage would hang in running until the SLA watchdog reaps
+	// it, and a commit/push/compile-gate failure (reported via
+	// reportPullRequestFailure above → #788 recovery) could never be
+	// distinguished from a still-pending push. The "fixup_pushed" outcome
+	// carries only branch/head_sha/base_sha + the diff size; the backend
+	// writes a fixup_pushed audit entry (no PR artifact) and drives the
+	// running → terminal transition the advisory implement re-review keys off.
+	// A report error is category-C (network) and is surfaced so the failure
+	// path reports it.
 	if isFixup {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"implement_fixup_pushed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
+		)
+		filesChanged := 0
+		if d, err := (&gitdiff.Runner{}).Run(ctx, baseRef, repoDir); err == nil {
+			filesChanged = len(d.ChangedFiles)
+		} else {
+			// Informational only: files_changed_count is not load-bearing for
+			// the stage transition. Log rather than silently discard.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_push_files_changed_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, err.Error())
+		}
+		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+			RunID:             cfg.runID,
+			StageID:           cfg.stageID,
+			PrivateKey:        issued.PrivateKey,
+			Outcome:           "fixup_pushed",
+			Branch:            branch,
+			HeadSHA:           cap.HeadSHA,
+			BaseSHA:           cap.BaseSHA,
+			FilesChangedCount: filesChanged,
+		}); err != nil {
+			return fmt.Errorf("report fix-up push: %w", err)
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"implement_fixup_push_reported","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
 		)
 		return nil

@@ -258,6 +258,19 @@ Notes:
   durable record that a fix-up failure was absorbed without making the run a failed
   casualty. Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
+- The fix-up push-success audit kind — `fixup_pushed` (#794) — is an **internal,
+  system-actor audit kind, not an issue-comment surface**. Nothing in `issuecomment`
+  posts it; it has no Notifier method. `server/pullrequest.go::succeedFixupPushStage`
+  writes it once (idempotency-guarded on `(stage_id, head_sha)`) when a fix-up
+  re-dispatch reports `{outcome:"fixup_pushed"}` after committing onto the EXISTING
+  PR branch, with a `system` (or operator, on the bearer path) actor and payload
+  `{run_id, stage_id, branch, head_sha, base_sha, files_changed_count, auth_method}`.
+  It is the durable record of which commit the fix-up landed onto the open PR; it
+  drives the fix-up stage's terminal transition but posts nothing to the issue
+  thread (the existing PR's sticky status comment is refreshed via the separate
+  `notifyStatusUpdate` hook, not this audit kind). Mirrors the sibling `child_pushed`
+  (#771). Listed here only so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
 
 ## Routing
 

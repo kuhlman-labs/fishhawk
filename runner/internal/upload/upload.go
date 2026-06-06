@@ -647,6 +647,14 @@ type ShipPullRequestArgs struct {
 	// terminal transition its push_to_shared_branch trace gate left in
 	// `running`. Branch/HeadSHA/BaseSHA carry the pushed shared-branch commit.
 	//
+	// When Outcome is "fixup_pushed", this is a fix-up re-dispatch
+	// push-success report (#794): no PR was opened (the fix-up commit landed on
+	// the EXISTING PR branch), so instead of the success PR artifact in Body,
+	// ShipPullRequest signs and ships
+	// {"outcome":"fixup_pushed","branch":...,"head_sha":...,"base_sha":...,
+	// "files_changed_count":...} so the backend drives the fix-up stage's
+	// terminal transition its push_fixup trace gate left in `running`.
+	//
 	// When Outcome is empty the success Body path (a real PR artifact) is
 	// used unchanged.
 	Outcome  string
@@ -654,8 +662,9 @@ type ShipPullRequestArgs struct {
 	Reason   string
 
 	// Branch, HeadSHA, BaseSHA, and FilesChangedCount carry the pushed
-	// shared-branch commit details for the Outcome=="pushed" child-push
-	// report (#771). Unused for the "failed" and empty (success Body) paths.
+	// commit details for the Outcome=="pushed" child-push (#771) and
+	// Outcome=="fixup_pushed" fix-up (#794) reports. Unused for the "failed"
+	// and empty (success Body) paths.
 	Branch            string
 	HeadSHA           string
 	BaseSHA           string
@@ -728,9 +737,11 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
 		}
 		body = marshalled
-	case "pushed":
-		// Child-push success report (#771): build the push body from the
-		// shared-branch commit details rather than the (absent) PR artifact.
+	case "pushed", "fixup_pushed":
+		// Child-push (#771) / fix-up-push (#794) success report: build the push
+		// body from the pushed commit details rather than the (absent) PR
+		// artifact. Both outcomes share the same wire shape (branch + SHAs +
+		// diff size); only the outcome discriminator differs.
 		marshalled, err := json.Marshal(pullRequestChildPushBody{
 			Outcome:           args.Outcome,
 			Branch:            args.Branch,
@@ -739,7 +750,7 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			FilesChangedCount: args.FilesChangedCount,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("upload: marshal pull-request child-push body: %w", err)
+			return nil, fmt.Errorf("upload: marshal pull-request push body: %w", err)
 		}
 		body = marshalled
 	}

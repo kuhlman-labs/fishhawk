@@ -131,6 +131,11 @@ type auditFake struct {
 	appended       []audit.ChainAppendParams
 	globalAppended []audit.GlobalChainAppendParams
 	appendErr      error
+	// listByCategoryErr, when set, makes ListForRunByCategory return an
+	// error. The child-push idempotency guard (#776) reads the chain via
+	// ListForRunByCategory and is fail-open on a read error (WARN + fall
+	// through); this lets a test exercise that path.
+	listByCategoryErr error
 	// seeded is pre-existing history returned by ListAll alongside the
 	// entries appended during the test. The spend-alert check (#649)
 	// reads cost_recorded entries via ListAll to build its rolling
@@ -204,8 +209,35 @@ func (a *auditFake) ListAll(_ context.Context, p audit.ListAllParams) ([]*audit.
 func (a *auditFake) Get(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("auditFake: Get not used")
 }
-func (a *auditFake) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit.Entry, error) {
-	return nil, errors.New("auditFake: ListForRun not used")
+
+// ListForRun returns the seeded + appended entries for one run across all
+// categories. Backs the issue-comment notifier's status-comment render
+// (NotifyStatusUpdateForRun reads the full chain) when a test wires
+// s.issueNotifier against this fake.
+func (a *auditFake) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []*audit.Entry
+	for _, e := range a.seeded {
+		if e.RunID != nil && *e.RunID == runID {
+			out = append(out, e)
+		}
+	}
+	for i := range a.appended {
+		ap := a.appended[i]
+		if ap.RunID != runID {
+			continue
+		}
+		rid := ap.RunID
+		out = append(out, &audit.Entry{
+			RunID:     &rid,
+			StageID:   ap.StageID,
+			Timestamp: ap.Timestamp,
+			Category:  ap.Category,
+			Payload:   ap.Payload,
+		})
+	}
+	return out, nil
 }
 func (a *auditFake) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("auditFake: LastForRun not used")
@@ -216,6 +248,9 @@ func (a *auditFake) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, er
 // per-surface dedup (e.g. the advisory budget_alert per-period/per-tier
 // guard, #688) when a test wires s.issueNotifier against this fake.
 func (a *auditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.listByCategoryErr != nil {
+		return nil, a.listByCategoryErr
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var out []*audit.Entry
@@ -1348,6 +1383,174 @@ func TestShipTrace_ChildPush_EmptyDiffAdvances(t *testing.T) {
 	}
 	if got.State != run.StageStateAwaitingApproval {
 		t.Errorf("stage.State = %q, want %q (empty-diff child must NOT be gated)",
+			got.State, run.StageStateAwaitingApproval)
+	}
+}
+
+// makeFixupPushBundle builds a fix-up re-dispatch trace bundle: a manifest
+// carrying push_fixup plus a git_diff event with fileCount files. It exercises
+// the trace handler's fixupPushGated check (#794), which only defers the
+// terminal transition when push_fixup is set AND the diff is non-empty.
+func makeFixupPushBundle(t *testing.T, pushFixup bool, fileCount int, t0, t1 time.Time) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		TS   time.Time       `json:"ts"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1", PushFixup: pushFixup})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make([]map[string]string, 0, fileCount)
+	for i := 0; i < fileCount; i++ {
+		files = append(files, map[string]string{"path": fmt.Sprintf("file%d.go", i), "status": "modified"})
+	}
+	diffData, err := json.Marshal(map[string]any{
+		"kind": "git_diff", "base_ref": "main", "files": files, "num_files": fileCount,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []line{
+		{Seq: 1, TS: t0.Add(-time.Second), Kind: bundle.EventKindManifest, Data: mdata},
+		{Seq: 2, TS: t0, Kind: bundle.EventKindGitDiff, Data: diffData},
+		{Seq: 3, TS: t1, Kind: "agent_end", Data: json.RawMessage(`{}`)},
+		{Seq: 4, TS: t1.Add(time.Second), Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, err := json.Marshal(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// TestFixupPushGated is the true/false matrix for the #794 gate predicate.
+func TestFixupPushGated(t *testing.T) {
+	s := &Server{}
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Minute)
+
+	if !s.fixupPushGated(makeFixupPushBundle(t, true, 2, t0, t1)) {
+		t.Error("flag set + non-empty diff → want gated (true)")
+	}
+	if s.fixupPushGated(makeFixupPushBundle(t, true, 0, t0, t1)) {
+		t.Error("flag set + empty diff → want NOT gated (false): no-changes fix-up POSTs no report")
+	}
+	if s.fixupPushGated(makeFixupPushBundle(t, false, 2, t0, t1)) {
+		t.Error("flag unset + non-empty diff → want NOT gated (false): a non-fix-up / older bundle")
+	}
+}
+
+// TestShipTrace_FixupPush_ImplementStaysRunning is CONDITION 2 of #794: a
+// fix-up re-dispatch implement bundle stamps push_fixup AND carries a non-empty
+// diff, so the trace upload must leave the stage in `running` (the
+// /pull-request "fixup_pushed"/"failed" report drives the terminal transition).
+// It must NOT reach terminal succeeded immediately after the trace upload, or a
+// later push failure could not flip it to failed and #788 recovery never fires,
+// leaving the implement re-review to approve an unlanded diff.
+func TestShipTrace_FixupPush_ImplementStaysRunning(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(10 * time.Minute)
+	bundleBytes := makeFixupPushBundle(t, true, 2, t0, t1)
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+	})
+
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateRunning {
+		t.Errorf("stage.State = %q, want %q (fix-up push gate must defer the terminal transition)",
+			got.State, run.StageStateRunning)
+	}
+}
+
+// TestShipTrace_FixupPush_EmptyDiffAdvances pins the no-changes carve-out for
+// the fix-up gate: an empty-diff fix-up POSTs no /pull-request report, so gating
+// it would hang the stage in running — the gate must NOT fire and the stage
+// advances as before.
+func TestShipTrace_FixupPush_EmptyDiffAdvances(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(3 * time.Minute)
+	bundleBytes := makeFixupPushBundle(t, true, 0, t0, t1) // 0 files → empty diff
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+	})
+
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want %q (empty-diff fix-up must NOT be gated)",
 			got.State, run.StageStateAwaitingApproval)
 	}
 }
