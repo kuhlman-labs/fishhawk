@@ -3958,6 +3958,182 @@ func TestRun_VerifyFixLoop_Exhaustion_TerminalNoRetry(t *testing.T) {
 	assertVerifySummary(t, readBundleEvents(t, bundlePath), "failed", 3, 2)
 }
 
+// TestRun_VerifyFixLoop_TransientFixInvokeError_RetriesWithoutBudgetBurn is the
+// #804 Gap-1 transient case: the FIRST fix re-invocation returns an infra error
+// (a #798-style agent-API blip); the in-place retry succeeds and the loop
+// converges. The transient error must NOT consume a fix-loop budget unit — the
+// verify-attempt count stays equal to the no-error FailThenPass case (2) — and
+// it must be RECORDED as a verify_fix_reinvoke_error trace event + log line,
+// never swallowed.
+func TestRun_VerifyFixLoop_TransientFixInvokeError_RetriesWithoutBudgetBurn(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	mustWrite(t, regPath, regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+
+	invoker := &fakeInvoker{
+		// idx 0: initial agent. idx 1: fix re-invoke #1 -> infra error (retried in
+		// place). idx 2: fix re-invoke retry -> success.
+		cannedSeq: []agent.Result{
+			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		},
+		errSeq: []error{nil, agent.ErrAgentFailed, nil},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			// Only the SUCCESSFUL fix invoke (idx 2) brings the fix into a scope
+			// file; the errored attempt (idx 1) leaves the tree unchanged.
+			if idx == 2 {
+				mustWrite(t, regPath, regGetFixed)
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 2,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// 3 invocations: initial + errored fix + retried fix. The no-error
+	// FailThenPass case is 2 (initial + one fix); the extra call is the in-place
+	// infra retry, NOT an extra verify iteration.
+	if invoker.callIdx != 3 {
+		t.Errorf("Invoke call count = %d, want 3 (initial + errored fix + retry)", invoker.callIdx)
+	}
+	if fp.gotArgs == nil {
+		t.Error("CommitAndPush should run after convergence")
+	}
+
+	events := readBundleEvents(t, bundlePath)
+	reinvokeErrs := 0
+	for _, ev := range events {
+		if ev.Kind == "verify_fix_reinvoke_error" {
+			reinvokeErrs++
+		}
+	}
+	if reinvokeErrs != 1 {
+		t.Errorf("verify_fix_reinvoke_error events = %d, want 1 (recorded, not swallowed)", reinvokeErrs)
+	}
+	if !strings.Contains(stderr.String(), "verify_fix_reinvoke_error") {
+		t.Errorf("missing verify_fix_reinvoke_error log line:\n%s", stderr.String())
+	}
+	// Budget NOT burned: still exactly 2 verify attempts (== the no-error case),
+	// converged outcome.
+	assertVerifySummary(t, events, "passed", 2, 2)
+}
+
+// TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip is the #804
+// Gap-1/Gap-2 persistent case: EVERY fix re-invocation returns an infra error.
+// The loop must (a) hard-bound the fix-Invokes at maxFixInvokeInfraRetries per
+// iteration — total Invoke calls EXACTLY 1 (initial) + maxFixInvokeInfraRetries
+// — (b) route exhaustion through the non-blocking skip (verify_fix_skipped),
+// NOT category-A, (c) let the real push proceed, and (d) emit verify_summary
+// EXACTLY ONCE with outcome=skipped.
+func TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{
+		// idx 0: initial agent (success). idx >= 1: every fix re-invoke errors
+		// (errSeq's last entry repeats once the slice is exhausted).
+		cannedSeq: []agent.Result{
+			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		},
+		errSeq: []error{nil, agent.ErrAgentFailed},
+	}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 1,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	// Non-blocking skip: the stage succeeds and proceeds to the real push.
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (non-blocking skip):\n%s", got, stderr.String())
+	}
+	// Hard bound pinned: 1 (initial) + maxFixInvokeInfraRetries fix attempts.
+	wantCalls := 1 + maxFixInvokeInfraRetries
+	if invoker.callIdx != wantCalls {
+		t.Errorf("Invoke call count = %d, want %d (initial + maxFixInvokeInfraRetries)", invoker.callIdx, wantCalls)
+	}
+	// Exhaustion is a non-blocking skip, NEVER a category-A code failure.
+	if strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("fix-invoke infra exhaustion must NOT demote to category-A:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "verify_fix_skipped") {
+		t.Errorf("expected verify_fix_skipped non-blocking skip:\n%s", stderr.String())
+	}
+	// The real push proceeds after the skip.
+	if fp.gotArgs == nil {
+		t.Error("CommitAndPush should run after a non-blocking verify-fix skip")
+	}
+	if fpr.gotArgs == nil {
+		t.Error("OpenPR should run after a non-blocking verify-fix skip")
+	}
+
+	events := readBundleEvents(t, bundlePath)
+	reinvokeErrs, summaries := 0, 0
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_fix_reinvoke_error":
+			reinvokeErrs++
+		case "verify_summary":
+			summaries++
+		}
+	}
+	if reinvokeErrs != maxFixInvokeInfraRetries {
+		t.Errorf("verify_fix_reinvoke_error events = %d, want %d", reinvokeErrs, maxFixInvokeInfraRetries)
+	}
+	// verify_summary emitted EXACTLY ONCE on the errored-exit path (Gap-2 fix).
+	if summaries != 1 {
+		t.Errorf("verify_summary event count = %d, want exactly 1", summaries)
+	}
+	assertVerifySummary(t, events, "skipped", 1, 1)
+}
+
 // TestRun_VerifyFixLoop_MaxIterationsZero_SingleShotNoReinvoke confirms the
 // default-off behavior: max_iterations==0 keeps today's single-shot
 // working-tree gate (#441) — one verify attempt, demote-on-failure, no

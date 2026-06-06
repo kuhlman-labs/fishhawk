@@ -1495,6 +1495,21 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 	return ev, gateErr
 }
 
+// maxFixInvokeInfraRetries bounds the fix re-invocation against a transient
+// agent-API/transport failure (#804). Its value is the MAXIMUM TOTAL number of
+// invoker.Invoke attempts for the fix re-invocation WITHIN A SINGLE outer
+// verify iteration — i.e. the first attempt plus up to (maxFixInvokeInfraRetries-1)
+// in-place retries. The counter is local to one outer iteration and resets
+// when the next iteration begins; that reset is intentional and does NOT make
+// the total unbounded, because the outer loop is itself hard-bounded by
+// verifyMaxIterations. The worst-case total fix-Invokes across an entire
+// runVerifyFixLoop call is therefore O(verifyMaxIterations * maxFixInvokeInfraRetries)
+// — finite. A transient blip here must not advance the outer iteration counter
+// (the verify that consumed this iteration already ran and was counted), so a
+// retry does not burn a fix-loop budget unit. Exhausting all attempts routes to
+// the existing non-blocking skip path (verify_fix_skipped), never category-A.
+const maxFixInvokeInfraRetries = 2
+
 // runVerifyFixLoop is the committed-tree verify-fix loop (#651). It runs
 // ONLY on the implement push path with executor.verify.max_iterations > 0
 // (the caller gates that). Per iteration it:
@@ -1601,7 +1616,48 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			cfg.runID, cfg.stageID, iter+1)
 		fixInv := baseInv
 		fixInv.Prompt = verifyFixPrompt(cfg.verifyCmd, out)
-		fixRes, _ := invoker.Invoke(ctx, fixInv)
+
+		// Bounded infra-retry on the fix re-invocation (#804). A transient
+		// agent-API/transport failure (invoker.Invoke returns a non-nil error,
+		// e.g. a #798 Claude usage-limit blip) is RETRIED IN PLACE — up to
+		// maxFixInvokeInfraRetries total attempts within THIS outer iteration —
+		// WITHOUT advancing iter, so a transient blip does not burn a fix-loop
+		// budget unit by re-verifying an unchanged tree. The error is never
+		// silently swallowed: each failed attempt emits a verify_fix_reinvoke_error
+		// log line AND an auditable trace event on res.Events. Only a SUCCESSFUL
+		// invoke (fixErr == nil) contributes events/tokens/model to res; an errored
+		// zero-value fixRes contributes nothing. Exhausting all attempts is an
+		// infra failure that aborts the loop into the non-blocking skip path
+		// below (verify_fix_skipped), never a category-A code failure.
+		var (
+			fixRes agent.Result
+			fixErr error
+		)
+		for attempt := 1; attempt <= maxFixInvokeInfraRetries; attempt++ {
+			fixRes, fixErr = invoker.Invoke(ctx, fixInv)
+			if fixErr == nil {
+				break
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_fix_reinvoke_error","run_id":%q,"stage_id":%q,"iteration":%d,"attempt":%d,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, iter+1, attempt, fixErr.Error())
+			res.Events = append(res.Events, agent.Event{
+				Kind: "verify_fix_reinvoke_error",
+				Payload: agent.MakePayload(map[string]any{
+					"iteration": iter + 1,
+					"attempt":   attempt,
+					"detail":    fixErr.Error(),
+				}),
+			})
+		}
+		if fixErr != nil {
+			// Every fix-Invoke attempt for this iteration failed on infra. Route
+			// through the existing non-blocking skip — the verify already ran and
+			// was counted; the iteration counter is NOT advanced.
+			lastIterErr = fmt.Errorf("verify-fix: fix re-invocation failed after %d attempts: %w",
+				maxFixInvokeInfraRetries, fixErr)
+			break
+		}
 		res.Events = append(res.Events, fixRes.Events...)
 		res.TokensUsed += fixRes.TokensUsed
 		res.InputTokens += fixRes.InputTokens
@@ -1611,17 +1667,27 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		}
 	}
 
-	outcome := "passed"
-	if !passed {
-		outcome = "failed"
+	// Emit verify_summary EXACTLY ONCE on every exit path (#804 Gap 2). The
+	// outcome must reflect the real exit: an infra abort short-circuits the loop
+	// into the non-blocking skip below, so it is "skipped" (carrying the abort
+	// detail), NOT "failed" — the old `if !passed` form mislabelled the
+	// errored-exit path as failed.
+	summary := map[string]any{
+		"iterations":     attempts,
+		"max_iterations": cfg.verifyMaxIterations,
+	}
+	switch {
+	case lastIterErr != nil:
+		summary["outcome"] = "skipped"
+		summary["detail"] = lastIterErr.Error()
+	case !passed:
+		summary["outcome"] = "failed"
+	default:
+		summary["outcome"] = "passed"
 	}
 	res.Events = append(res.Events, agent.Event{
-		Kind: "verify_summary",
-		Payload: agent.MakePayload(map[string]any{
-			"outcome":        outcome,
-			"iterations":     attempts,
-			"max_iterations": cfg.verifyMaxIterations,
-		}),
+		Kind:    "verify_summary",
+		Payload: agent.MakePayload(summary),
 	})
 
 	if lastIterErr != nil {
