@@ -1591,6 +1591,133 @@ func TestGetPlan_ScopePrecheck_AbsentWhenNoEntry(t *testing.T) {
 	}
 }
 
+// seedSurfaceSweepAudit marshals a SERVER-side SurfaceSweepPayload and
+// feeds it back through the fake backend as a plan_surface_sweep audit
+// entry. Using the real server type is the point of the seam test (#618):
+// it exercises the backend-write -> mcp-read JSON contract end to end, so a
+// drift in either side's struct tags fails here rather than silently in
+// production.
+func seedSurfaceSweepAudit(fb *fakeBackend, runID uuid.UUID, payload server.SurfaceSweepPayload) {
+	raw, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(raw, &decoded)
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "plan_surface_sweep",
+		Payload:  decoded,
+	})
+	fb.mu.Unlock()
+}
+
+func TestGetPlan_SurfaceSweep_CrossBoundarySeam(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedSurfaceSweepAudit(fb, runID, server.SurfaceSweepPayload{
+		ScannedFiles: 1,
+		Findings: []server.SurfaceSweepFinding{
+			{
+				Pattern:         "actor @-mention render surfaces",
+				TriggerPath:     "backend/internal/issuecomment/status_template.go",
+				MissingSiblings: []string{"backend/internal/issuecomment/notifier.go"},
+			},
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SurfaceSweep == nil {
+		t.Fatal("SurfaceSweep is nil; want populated")
+	}
+	if out.SurfaceSweep.ScannedFiles != 1 {
+		t.Errorf("ScannedFiles = %d, want 1", out.SurfaceSweep.ScannedFiles)
+	}
+	if got := len(out.SurfaceSweep.Findings); got != 1 {
+		t.Fatalf("len(Findings) = %d, want 1", got)
+	}
+	f := out.SurfaceSweep.Findings[0]
+	if f.Pattern != "actor @-mention render surfaces" {
+		t.Errorf("Pattern = %q", f.Pattern)
+	}
+	if f.TriggerPath != "backend/internal/issuecomment/status_template.go" {
+		t.Errorf("TriggerPath = %q", f.TriggerPath)
+	}
+	if len(f.MissingSiblings) != 1 || f.MissingSiblings[0] != "backend/internal/issuecomment/notifier.go" {
+		t.Errorf("MissingSiblings = %v, want [notifier.go]", f.MissingSiblings)
+	}
+}
+
+func TestGetPlan_SurfaceSweep_NewestEntryWins(t *testing.T) {
+	// A schema-retry run writes two plan_surface_sweep entries; the
+	// authoritative one is the newest (last, sequence-ascending). The first
+	// carries a finding; the second (the re-upload) is clean.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedSurfaceSweepAudit(fb, runID, server.SurfaceSweepPayload{
+		ScannedFiles: 1,
+		Findings: []server.SurfaceSweepFinding{
+			{Pattern: "stale", TriggerPath: "x", MissingSiblings: []string{"y"}},
+		},
+	})
+	seedSurfaceSweepAudit(fb, runID, server.SurfaceSweepPayload{
+		ScannedFiles: 2,
+		Findings:     []server.SurfaceSweepFinding{},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SurfaceSweep == nil {
+		t.Fatal("SurfaceSweep is nil; want populated")
+	}
+	if out.SurfaceSweep.ScannedFiles != 2 {
+		t.Errorf("ScannedFiles = %d, want 2 (newest entry)", out.SurfaceSweep.ScannedFiles)
+	}
+	if len(out.SurfaceSweep.Findings) != 0 {
+		t.Errorf("newest entry is clean; want zero findings, got %+v", out.SurfaceSweep.Findings)
+	}
+}
+
+func TestGetPlan_SurfaceSweep_AbsentWhenNoEntry(t *testing.T) {
+	// An older run predating the sweep has no plan_surface_sweep entry —
+	// SurfaceSweep must be nil so the field is omitted.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SurfaceSweep != nil {
+		t.Errorf("SurfaceSweep should be nil with no entry; got %+v", out.SurfaceSweep)
+	}
+}
+
 func TestGetPlan_ReviewAuditError_Surfaced(t *testing.T) {
 	// The per-run audit endpoint returns 500 → the error propagates
 	// through loadPlanReviews and surfaces as a getPlan error.
