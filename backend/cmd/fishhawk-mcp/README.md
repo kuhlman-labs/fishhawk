@@ -13,10 +13,10 @@ The v0 surface began read-only; action verbs (approve, reject, retry, cancel, st
 
 E19.2 / #342 shipped scaffolding + handshake. E19.3–E19.6 landed the v0 tool surface (all read-only per ADR-021):
 
-- `fishhawk_get_active_run` (E19.3 / #343) — resolves "the run for the current context" from `pr_number`, `trigger_ref`, or `FISHHAWK_RUN_ID` env.
-- `fishhawk_get_plan` (E19.4 / #344) — returns the approved standard_v1 plan; walks `parent_run_id` up to 8 levels for CI-retry chains.
-- `fishhawk_get_run_status` (E19.5 / #345) — bundles Run + ordered stages + recent audit (time-descending) into one call. The agent's "where are we" query.
-- `fishhawk_list_audit` (E19.6 / #346) — filtered audit access (category, stage_id) with cursor pagination. Mirrors the CLI's `fishhawk audit list`.
+- `fishhawk_get_active_run` (E19.3 / #343) — the "which run" resolver: use it when you hold a `pr_number`, `trigger_ref`, or `FISHHAWK_RUN_ID` env but need the run UUID the other tools take.
+- `fishhawk_get_plan` (E19.4 / #344) — read the approved standard_v1 plan artifact after the plan stage and before approve/reject; walks `parent_run_id` up to 8 levels for CI-retry chains.
+- `fishhawk_get_run_status` (E19.5 / #345) — the agent's "where are we" query: bundles Run + ordered stages + recent audit (time-descending) into one call.
+- `fishhawk_list_audit` (E19.6 / #346) — use when you need the filtered or paginated audit trail (category, stage_id) rather than the recent slice — e.g. to read `implement_reviewed` concern indices for `fishhawk_fixup_stage`. Mirrors the CLI's `fishhawk audit list`.
 
 E19.7 / #347 wires the binary into the release pipeline next.
 

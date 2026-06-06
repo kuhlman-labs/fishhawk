@@ -35,7 +35,9 @@ func registerVerifyRun(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_verify_run",
 		Description: strings.TrimSpace(`
-Verify audit chain integrity for a Fishhawk run.
+Verify a run's audit-chain integrity. Use this before opening or merging
+a PR as a halt gate — verified=false means the tamper-evident chain is
+broken, so stop and file an incident rather than ship.
 
 Fetches every audit entry via cursor pagination and checks:
   1. Sequence monotonicity — entries must be strictly increasing.
@@ -43,9 +45,6 @@ Fetches every audit entry via cursor pagination and checks:
      recomputed from the entry's fields.
   3. Chain link — each entry's prev_hash must match the preceding
      entry's entry_hash.
-
-verified=false is a halt condition before opening a PR. File an
-incident when the chain is broken on a completed run.
 
 Response:
   - verified        — true when every check passes.

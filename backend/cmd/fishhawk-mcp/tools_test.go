@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -753,6 +754,89 @@ func TestRegisterTools_RegistersGetActiveRun(t *testing.T) {
 		getenv: envFuncFromMap(nil),
 	}
 	registerTools(srv, resolver)
+}
+
+// TestToolDescriptions_ConformToHouseStyle is the #778 guardrail: it
+// enumerates the FULL registered tool set over an in-memory MCP ListTools
+// session (the same path a real client sees) and asserts every tool's
+// description meets the structural bar — non-empty, above a minimum length
+// FLOOR (a stub/empty-description catch, NOT a target to pad toward), and
+// leading with a when/eligibility trigger token so the description tells the
+// driving agent WHEN to reach for the tool. Adding a tool without a
+// conformant description fails this test.
+func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{
+		api:    newAPIClient(cfg),
+		getenv: envFuncFromMap(nil),
+	}
+	registerTools(srv, resolver)
+
+	// Drive the server's tool list through a real ListTools round-trip over
+	// an in-memory transport, so the assertions run against the wire-visible
+	// descriptions rather than the in-process registration structs.
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+
+	// when/eligibility trigger tokens (case-insensitive). A conformant
+	// description leads with one so the agent reads WHEN to use the tool.
+	triggerTokens := []string{"use this when", "when ", "after ", "once ", "before "}
+	// Minimum description length is a FLOOR that catches an empty/stub
+	// description, not a target — the #778 density guard wants dense, not
+	// padded, prose.
+	const minDescriptionLen = 80
+	// The registered tool set is the 15 fishhawk_* tools swept in #778. Bump
+	// this and give the new tool a conformant description when adding one.
+	const wantToolCount = 15
+
+	if len(res.Tools) != wantToolCount {
+		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
+			len(res.Tools), wantToolCount)
+	}
+
+	for _, tool := range res.Tools {
+		if !strings.HasPrefix(tool.Name, "fishhawk_") {
+			t.Errorf("tool %q: name does not start with fishhawk_", tool.Name)
+		}
+		desc := strings.TrimSpace(tool.Description)
+		if desc == "" {
+			t.Errorf("tool %q: empty description", tool.Name)
+			continue
+		}
+		if len(desc) < minDescriptionLen {
+			t.Errorf("tool %q: description length %d is below the %d floor; it must state WHEN to use the tool and name sibling tools",
+				tool.Name, len(desc), minDescriptionLen)
+		}
+		lower := strings.ToLower(desc)
+		hasTrigger := false
+		for _, tok := range triggerTokens {
+			if strings.Contains(lower, tok) {
+				hasTrigger = true
+				break
+			}
+		}
+		if !hasTrigger {
+			t.Errorf("tool %q: description has no when/eligibility trigger token (one of %v); lead with WHEN to reach for the tool",
+				tool.Name, triggerTokens)
+		}
+	}
 }
 
 // --- get_plan (E19.4 / #344) ---
