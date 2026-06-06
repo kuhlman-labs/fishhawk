@@ -213,6 +213,131 @@ func TestFixupStage_ImplementReopenFailureLeavesReviewReparked(t *testing.T) {
 	}
 }
 
+// --- RestoreFixupStage (fix-up recovery, #788) ---
+
+func TestRestoreFixupStage_PushFlowRestoresSucceededAndRepark(t *testing.T) {
+	// push_and_open_pr flow: the fix-up re-dispatch failed, so the
+	// implement stage is `failed` and the re-parked review stage is
+	// `pending`. Recovery restores implement → succeeded and review →
+	// awaiting_approval.
+	repo, impl, review := implementWithReview(t, run.StageStateFailed, run.StageStatePending)
+	cat := run.FailureA
+	reason := "agent crashed mid fix-up"
+	impl.FailureCategory = &cat
+	impl.FailureReason = &reason
+	repo.mu.Lock()
+	repo.stages[impl.ID].FailureCategory = &cat
+	repo.stages[impl.ID].FailureReason = &reason
+	repo.mu.Unlock()
+	ctx := context.Background()
+
+	rec, err := run.RestoreFixupStage(ctx, repo, impl.ID, run.StageStateSucceeded, &review.ID)
+	if err != nil {
+		t.Fatalf("RestoreFixupStage: %v", err)
+	}
+	if rec.Stage.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded", rec.Stage.State)
+	}
+	// The captured prior failure metadata is surfaced for the audit entry.
+	if rec.PriorFailureCategory == nil || *rec.PriorFailureCategory != run.FailureA {
+		t.Errorf("PriorFailureCategory = %v, want A", rec.PriorFailureCategory)
+	}
+	if rec.PriorFailureReason == nil || *rec.PriorFailureReason != reason {
+		t.Errorf("PriorFailureReason = %v, want %q", rec.PriorFailureReason, reason)
+	}
+	// The restored implement stage has its stale failure metadata cleared.
+	cur, _ := repo.GetStage(ctx, impl.ID)
+	if cur.FailureCategory != nil {
+		t.Errorf("restored FailureCategory = %v, want nil", cur.FailureCategory)
+	}
+	if cur.FailureReason != nil {
+		t.Errorf("restored FailureReason = %v, want nil", cur.FailureReason)
+	}
+	// The review stage was re-parked back to its gate.
+	if rec.RestoredReview == nil || rec.RestoredReview.ID != review.ID {
+		t.Fatalf("RestoredReview = %+v, want the re-parked review stage", rec.RestoredReview)
+	}
+	curReview, _ := repo.GetStage(ctx, review.ID)
+	if curReview.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval (restored)", curReview.State)
+	}
+}
+
+func TestRestoreFixupStage_CommitYourselfRestoresAwaitingApproval(t *testing.T) {
+	// commit-yourself flow: the implement stage is its own gate, so there
+	// is no separate review stage. Recovery restores implement → awaiting_approval.
+	repo, impl := implementStage(t, run.StageStateFailed)
+	cat := run.FailureB
+	reason := "implement review rejected"
+	repo.mu.Lock()
+	repo.stages[impl.ID].FailureCategory = &cat
+	repo.stages[impl.ID].FailureReason = &reason
+	repo.mu.Unlock()
+	ctx := context.Background()
+
+	rec, err := run.RestoreFixupStage(ctx, repo, impl.ID, run.StageStateAwaitingApproval, nil)
+	if err != nil {
+		t.Fatalf("RestoreFixupStage: %v", err)
+	}
+	if rec.Stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("implement state = %q, want awaiting_approval", rec.Stage.State)
+	}
+	if rec.RestoredReview != nil {
+		t.Errorf("RestoredReview = %+v, want nil (no separate review stage)", rec.RestoredReview)
+	}
+	cur, _ := repo.GetStage(ctx, impl.ID)
+	if cur.FailureCategory != nil || cur.FailureReason != nil {
+		t.Errorf("restored failure metadata = (%v, %v), want both nil", cur.FailureCategory, cur.FailureReason)
+	}
+}
+
+func TestRestoreFixupStage_NotFailedIsNoOp(t *testing.T) {
+	// The implement stage is not currently failed — nothing to recover.
+	// RestoreFixupStage signals ErrFixupRecoveryNotApplicable and touches
+	// nothing.
+	repo, impl := implementStage(t, run.StageStateSucceeded)
+	ctx := context.Background()
+
+	_, err := run.RestoreFixupStage(ctx, repo, impl.ID, run.StageStateSucceeded, nil)
+	if !errors.Is(err, run.ErrFixupRecoveryNotApplicable) {
+		t.Fatalf("err = %v, want ErrFixupRecoveryNotApplicable", err)
+	}
+	if cur, _ := repo.GetStage(ctx, impl.ID); cur.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded)", cur.State)
+	}
+}
+
+func TestRestoreFixupStage_RejectsInvalidPriorState(t *testing.T) {
+	// Only succeeded / awaiting_approval are restorable gate states.
+	repo, impl := implementStage(t, run.StageStateFailed)
+	ctx := context.Background()
+
+	_, err := run.RestoreFixupStage(ctx, repo, impl.ID, run.StageStatePending, nil)
+	if err == nil {
+		t.Fatal("RestoreFixupStage accepted prior_state=pending; want an error")
+	}
+	if errors.Is(err, run.ErrFixupRecoveryNotApplicable) {
+		t.Errorf("err = %v, want a validation error (not the not-applicable no-op)", err)
+	}
+}
+
+func TestRestoreFixupStage_ReparkFailureLeavesImplementFailed(t *testing.T) {
+	// Partial-failure ordering (#788): if the review re-park fails, the
+	// implement stage must stay `failed` — never restored to a healthy
+	// state while the review gate is still gone.
+	repo, impl, review := implementWithReview(t, run.StageStateFailed, run.StageStatePending)
+	repo.failTransition(review.ID, errors.New("re-park boom"))
+	ctx := context.Background()
+
+	_, err := run.RestoreFixupStage(ctx, repo, impl.ID, run.StageStateSucceeded, &review.ID)
+	if err == nil {
+		t.Fatal("RestoreFixupStage returned nil error on re-park failure")
+	}
+	if cur, _ := repo.GetStage(ctx, impl.ID); cur.State != run.StageStateFailed {
+		t.Errorf("implement state = %q, want unchanged (failed) on re-park failure", cur.State)
+	}
+}
+
 func TestFixupStage_RemainingBudgetWithHigherBound(t *testing.T) {
 	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
 

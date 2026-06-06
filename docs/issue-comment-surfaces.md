@@ -247,6 +247,18 @@ Notes:
   Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
 
+- The fix-up failure-recovery audit kind — `stage_fixup_recovered` (#788) — is an
+  **internal, system-actor audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it; it has no Notifier method. `server/fixup.go::maybeRecoverFixupFailure`
+  writes it once when a FAILED fix-up re-dispatch is recovered back to the run's
+  pre-fix-up review gate (the implement stage restored `failed → succeeded`/`awaiting_approval`
+  and the re-parked review stage restored `pending → awaiting_approval`), with a
+  `system` actor and payload `{stage_id, restored_state, restored_review_stage_id,
+  restored_review_state, source_failure_category, source_failure_reason}`. It is the
+  durable record that a fix-up failure was absorbed without making the run a failed
+  casualty. Listed here only so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
+
 ## Routing
 
 All surfaces above only fire when the run's `TriggerSource = github_issue`.

@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -356,6 +357,221 @@ func withMCPFixupAuth(req *http.Request, runID uuid.UUID) *http.Request {
 		Scopes:  []string{"mcp:read", "write:fixups"},
 	}
 	return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+}
+
+// --- Fix-up recovery (maybeRecoverFixupFailure, #788) ---
+
+// fixupRecoveryRepo extends orchestratorRepo to admit the fix-up RECOVERY
+// edges (failed → succeeded/awaiting_approval, review pending →
+// awaiting_approval, #788) and to clear failure metadata on a nil
+// completion — exactly what the production postgresRepo does via
+// ValidStageFixupRecoveryTransition + UpdateStageState. The base
+// orchestratorRepo only admits the normal transitions, so
+// RestoreFixupStage's recovery transitions would be refused without this.
+type fixupRecoveryRepo struct {
+	*orchestratorRepo
+}
+
+func (r *fixupRecoveryRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stagesByID[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if s.State == to {
+		return s, nil
+	}
+	if !run.ValidStageTransition(s.State, to) &&
+		!run.ValidStageFixupTransition(s.State, to) &&
+		!run.ValidStageFixupRecoveryTransition(s.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
+	}
+	s.State = to
+	if c != nil {
+		s.FailureCategory = c.FailureCategory
+		s.FailureReason = c.FailureReason
+	} else {
+		s.FailureCategory = nil
+		s.FailureReason = nil
+	}
+	return s, nil
+}
+
+// seedFixupTriggered appends the durable stage_fixup_triggered audit
+// entry the recovery detector keys off — recording the implement stage's
+// prior gate state and (on the push_and_open_pr flow) the re-parked
+// review stage id.
+func seedFixupTriggered(t *testing.T, au *storingAuditFake, runID, stageID uuid.UUID, priorState run.StageState, reviewID *uuid.UUID) {
+	t.Helper()
+	fields := map[string]any{
+		"stage_id":    stageID.String(),
+		"prior_state": string(priorState),
+	}
+	if reviewID != nil {
+		fields["reparked_review_stage_id"] = reviewID.String()
+	}
+	payload, _ := json.Marshal(fields)
+	kind := audit.ActorKind("user")
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Category:  CategoryStageFixupTriggered,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("seed stage_fixup_triggered: %v", err)
+	}
+}
+
+// seedFailedFixupRun stands up a run (running) with a failed implement
+// stage and a re-parked (pending) review stage — the state a
+// push_and_open_pr fix-up re-dispatch failure lands in. Returns the run,
+// implement, and review rows.
+func seedFailedFixupRun(rr *fixupRecoveryRepo) (*run.Run, *run.Stage, *run.Stage) {
+	runRow := rr.seedRun() // StateRunning
+	impl := rr.seedStage(runRow.ID, 1, run.StageStateFailed)
+	review := rr.seedStage(runRow.ID, 2, run.StageStatePending)
+	rr.mu.Lock()
+	impl.Type = run.StageTypeImplement
+	cat := run.FailureA
+	reason := "agent crashed mid fix-up"
+	impl.FailureCategory = &cat
+	impl.FailureReason = &reason
+	review.Type = run.StageTypeReview
+	rr.mu.Unlock()
+	return runRow, impl, review
+}
+
+func TestMaybeRecoverFixupFailure_RecoversAndEmits(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newStoringAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	seedFixupTriggered(t, au, runRow.ID, impl.ID, run.StageStateSucceeded, &review.ID)
+
+	if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = false, want true (recovered)")
+	}
+
+	// Implement restored to succeeded with cleared failure metadata.
+	curImpl, _ := rr.GetStage(ctx, impl.ID)
+	if curImpl.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded", curImpl.State)
+	}
+	if curImpl.FailureCategory != nil || curImpl.FailureReason != nil {
+		t.Errorf("implement failure metadata = (%v, %v), want both nil", curImpl.FailureCategory, curImpl.FailureReason)
+	}
+	// Review re-parked back to its gate.
+	curReview, _ := rr.GetStage(ctx, review.ID)
+	if curReview.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval", curReview.State)
+	}
+
+	// A stage_fixup_recovered audit entry landed carrying the source failure.
+	entries, err := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageFixupRecovered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stage_fixup_recovered entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal stage_fixup_recovered payload: %v", err)
+	}
+	if payload["restored_state"] != string(run.StageStateSucceeded) {
+		t.Errorf("restored_state = %v, want succeeded", payload["restored_state"])
+	}
+	if payload["source_failure_category"] != string(run.FailureA) {
+		t.Errorf("source_failure_category = %v, want A", payload["source_failure_category"])
+	}
+	if payload["restored_review_stage_id"] != review.ID.String() {
+		t.Errorf("restored_review_stage_id = %v, want %s", payload["restored_review_stage_id"], review.ID)
+	}
+}
+
+func TestMaybeRecoverFixupFailure_NoPriorEntryReturnsFalse(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newStoringAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	ctx := context.Background()
+
+	runRow, impl, _ := seedFailedFixupRun(rr)
+	// No stage_fixup_triggered entry seeded: this is an ordinary failure.
+
+	if s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = true, want false (no fix-up entry → normal failure path)")
+	}
+	// The implement stage was not touched.
+	if curImpl, _ := rr.GetStage(ctx, impl.ID); curImpl.State != run.StageStateFailed {
+		t.Errorf("implement state = %q, want unchanged (failed)", curImpl.State)
+	}
+	// No recovery audit entry written.
+	entries, _ := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageFixupRecovered)
+	if len(entries) != 0 {
+		t.Errorf("stage_fixup_recovered entries = %d, want 0", len(entries))
+	}
+}
+
+func TestAdvanceAfterFailure_SkipsAdvanceOnRecovery(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newStoringAuditFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	seedFixupTriggered(t, au, runRow.ID, impl.ID, run.StageStateSucceeded, &review.ID)
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	s.advanceAfterFailure(req, runRow.ID, impl.ID)
+
+	// Recovery ran, so the run-failing Advance was skipped: the run stays
+	// running and the stages are restored to their pre-fix-up gate.
+	curRun, _ := rr.GetRun(context.Background(), runRow.ID)
+	if curRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (Advance skipped on recovery)", curRun.State)
+	}
+	if curImpl, _ := rr.GetStage(context.Background(), impl.ID); curImpl.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded (restored)", curImpl.State)
+	}
+	if curReview, _ := rr.GetStage(context.Background(), review.ID); curReview.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval (restored)", curReview.State)
+	}
+}
+
+func TestAdvanceAfterFailure_NoFixupEntryFailsRun(t *testing.T) {
+	// The differential control for the skip test: with NO fix-up entry the
+	// same failed implement stage drives the orchestrator to complete the
+	// run as failed — the behavior recovery overrides.
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newStoringAuditFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	runRow, impl, _ := seedFailedFixupRun(rr)
+	// No stage_fixup_triggered entry: ordinary failure path.
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	s.advanceAfterFailure(req, runRow.ID, impl.ID)
+
+	curRun, _ := rr.GetRun(context.Background(), runRow.ID)
+	if curRun.State != run.StateFailed {
+		t.Errorf("run state = %q, want failed (no recovery → normal Advance-to-failed)", curRun.State)
+	}
+	if curImpl, _ := rr.GetStage(context.Background(), impl.ID); curImpl.State != run.StageStateFailed {
+		t.Errorf("implement state = %q, want unchanged (failed)", curImpl.State)
+	}
 }
 
 func TestFixupStage_MCPTokenMismatchedRunReturns403(t *testing.T) {

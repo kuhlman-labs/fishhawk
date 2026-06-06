@@ -442,10 +442,18 @@ func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to Sta
 		// The fix-up re-open (awaiting_approval → pending, #762) is an
 		// explicit override off the normal machine: admit it here in
 		// addition to the ordinary transitions so run.FixupStage can
-		// reuse this method without a dedicated repo verb. The domain
-		// gate in run.FixupStage is the real guard; ordinary callers
-		// never compute the fix-up edge by accident.
-		if !ValidStageTransition(from, to) && !ValidStageFixupTransition(from, to) {
+		// reuse this method without a dedicated repo verb. The fix-up
+		// RECOVERY edges (failed → succeeded/awaiting_approval, review
+		// pending → awaiting_approval, #788) are admitted the same way so
+		// run.RestoreFixupStage can restore the review gate on a failed
+		// fix-up re-dispatch. The domain gates in run.FixupStage /
+		// run.RestoreFixupStage are the real guards; ordinary callers
+		// never compute these edges by accident. Note `failed → succeeded`
+		// is admissible ONLY through the recovery table — it must never
+		// leak into the ordinary path, where it would fake success.
+		if !ValidStageTransition(from, to) &&
+			!ValidStageFixupTransition(from, to) &&
+			!ValidStageFixupRecoveryTransition(from, to) {
 			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(to)}
 		}
 
