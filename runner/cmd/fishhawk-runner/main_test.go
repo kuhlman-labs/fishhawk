@@ -66,22 +66,32 @@ type fakeInvoker struct {
 	cannedSeq []agent.Result
 	errSeq    []error
 	callIdx   int
+
+	// onInvoke, when set, runs before each canned result is returned,
+	// receiving the 0-based call index and the Invocation. The verify-fix
+	// loop tests (#651) use it to mutate the working tree between invocations
+	// so the committed scope-only tree changes across iterations.
+	onInvoke func(callIdx int, inv agent.Invocation)
 }
 
 func (f *fakeInvoker) Invoke(_ context.Context, inv agent.Invocation) (agent.Result, error) {
 	i := inv
 	f.gotInv = &i
+	idx := f.callIdx
+	f.callIdx++
+	if f.onInvoke != nil {
+		f.onInvoke(idx, inv)
+	}
 	if len(f.cannedSeq) > 0 {
-		idx := f.callIdx
-		if idx >= len(f.cannedSeq) {
-			idx = len(f.cannedSeq) - 1
+		si := idx
+		if si >= len(f.cannedSeq) {
+			si = len(f.cannedSeq) - 1
 		}
-		f.callIdx++
 		var err error
-		if idx < len(f.errSeq) {
-			err = f.errSeq[idx]
+		if si < len(f.errSeq) {
+			err = f.errSeq[si]
 		}
-		return f.cannedSeq[idx], err
+		return f.cannedSeq[si], err
 	}
 	return f.canned, f.returnErr
 }
@@ -3690,6 +3700,324 @@ func TestRun_FetchPrompt_OperatorVerifyCmdWins(t *testing.T) {
 	}
 	if !sawPassed {
 		t.Errorf("expected verify_run with command=true outcome=passed (operator wins):\n%+v", events)
+	}
+}
+
+// --- Committed-tree verify-fix loop (#651) ---
+
+// verifyFixBaseRepo inits a real git repo with a committed go.work + module
+// skeleton (go.work, mod/go.mod) — the "base branch" the implement stage
+// builds on. The scope files (mod/reg.go, mod/reg_test.go) and any drift are
+// left for the caller to write into the working tree, simulating the agent's
+// uncommitted edits. Skips when go or git is unavailable.
+func verifyFixBaseRepo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base: go.work + empty module")
+	return repo
+}
+
+// regGetBuggy: the registry is empty, so TestGet (wants 42) fails on the
+// committed scope-only tree. regGetFixed adds the seeding init INSIDE the
+// scope file so the committed tree passes without the dropped drift helper.
+const regGetBuggy = "package mod\n\nvar registry = map[string]int{}\n\nfunc Get(k string) int { return registry[k] }\n"
+const regGetFixed = "package mod\n\nvar registry = map[string]int{}\n\nfunc init() { registry[\"x\"] = 42 }\n\nfunc Get(k string) int { return registry[k] }\n"
+const regGetTest = "package mod\n\nimport \"testing\"\n\nfunc TestGet(t *testing.T) {\n\tif Get(\"x\") != 42 {\n\t\tt.Fatalf(\"Get(x) = %d, want 42\", Get(\"x\"))\n\t}\n}\n"
+
+// assertVerifySummary finds the verify_summary trace event and checks its
+// outcome + iteration count (#651 audit-trace requirement).
+func assertVerifySummary(t *testing.T, events []bundle.Line, wantOutcome string, wantIterations, wantMax int) {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Kind != "verify_summary" {
+			continue
+		}
+		var got struct {
+			Outcome       string `json:"outcome"`
+			Iterations    int    `json:"iterations"`
+			MaxIterations int    `json:"max_iterations"`
+		}
+		if err := json.Unmarshal(ev.Data, &got); err != nil {
+			t.Fatalf("verify_summary payload unmarshal: %v (%s)", err, ev.Data)
+		}
+		if got.Outcome != wantOutcome || got.Iterations != wantIterations || got.MaxIterations != wantMax {
+			t.Errorf("verify_summary = %+v, want {outcome:%q iterations:%d max_iterations:%d}",
+				got, wantOutcome, wantIterations, wantMax)
+		}
+		return
+	}
+	t.Errorf("no verify_summary event in bundle:\n%+v", events)
+}
+
+func readBundleEvents(t *testing.T, path string) []bundle.Line {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatalf("open bundle: %v", err)
+	}
+	return events
+}
+
+const verifyFixRunID = "11111111-2222-3333-4444-555555555555"
+const verifyFixStageID = "22222222-3333-4444-5555-666666666666"
+
+func verifyFixRunArgs(repo, bundlePath string) []string {
+	return []string{
+		"--run-id", verifyFixRunID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", verifyFixStageID,
+		"--working-dir", repo,
+		"--fetch-prompt", "--upload-trace",
+		"--bundle-out", bundlePath,
+	}
+}
+
+// TestRun_VerifyFixLoop_FailThenPass_CommittedTree is the #651 cross-boundary
+// e2e. It seeds a DRIFT-EXCLUDED failure: a test that fails on the committed
+// scope-only tree (the seeding helper seed.go is out of scope, so StageScoped
+// drops it) but PASSES on the agent's full working tree. The loop must run
+// against the committed tree (would false-green against the working tree),
+// re-invoke the agent with the captured output, converge within the budget,
+// and proceed to the push.
+func TestRun_VerifyFixLoop_FailThenPass_CommittedTree(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	// Working tree (agent's uncommitted edits): scope files + a DRIFT helper
+	// (seed.go) that makes the WORKING tree green but is dropped from the
+	// committed scope-only tree.
+	mustWrite(t, regPath, regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			// idx 0 is the initial agent (files seeded above). idx 1 is the fix
+			// re-invoke: bring the fix into a SCOPE file so the committed
+			// scope-only tree passes without the dropped drift helper.
+			if idx == 1 {
+				mustWrite(t, regPath, regGetFixed)
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 2,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// Proves committed-tree execution: a working-tree verify would pass on
+	// iteration 0 (seed.go present) and never re-invoke. Two invocations
+	// (initial + one fix) means iteration 0 failed against the committed tree.
+	if invoker.callIdx != 2 {
+		t.Errorf("Invoke call count = %d, want 2 (initial + one fix)", invoker.callIdx)
+	}
+	// Push proceeded after convergence.
+	if fp.gotArgs == nil {
+		t.Error("CommitAndPush should run after the verify-fix loop converges")
+	}
+	if fpr.gotArgs == nil {
+		t.Error("OpenPR should run after the verify-fix loop converges")
+	}
+
+	events := readBundleEvents(t, bundlePath)
+	var sawFailed, sawPassed, sawHeadSHA bool
+	for _, ev := range events {
+		if ev.Kind != "verify_run" {
+			continue
+		}
+		p := string(ev.Data)
+		if strings.Contains(p, `"head_sha"`) {
+			sawHeadSHA = true
+		}
+		if strings.Contains(p, `"outcome":"failed"`) {
+			sawFailed = true
+		}
+		if strings.Contains(p, `"outcome":"passed"`) {
+			sawPassed = true
+		}
+	}
+	if !sawHeadSHA {
+		t.Error("committed-tree verify_run events must carry head_sha")
+	}
+	if !sawFailed {
+		t.Error("iteration 0 must fail against the committed tree (missing verify_run outcome=failed)")
+	}
+	if !sawPassed {
+		t.Error("iteration 1 must pass after the fix (missing verify_run outcome=passed)")
+	}
+	assertVerifySummary(t, events, "passed", 2, 2)
+}
+
+// TestRun_VerifyFixLoop_Exhaustion_TerminalNoRetry is the both-enabled
+// non-compounding proof (#651, DECISION c2): with agent_self_retry on AND a
+// verify-fix budget, an agent that never fixes the failure must demote the
+// stage TERMINALLY — capped at max_iterations+1 total invocations, NO
+// RetryStage call, and no push.
+func TestRun_VerifyFixLoop_Exhaustion_TerminalNoRetry(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	// A failing test the agent never fixes — the committed scope-only tree is
+	// red on every iteration.
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		// No onInvoke fix: the failure persists across all iterations.
+	}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 2,
+		// Both enabled: self-retry on AND a verify-fix budget. The verify-fix
+		// loop lives outside the self-retry loop, so exhaustion must NOT call
+		// RetryStage.
+		AgentSelfRetry:     true,
+		MaxRetriesSnapshot: 3,
+		RetryAttempt:       0,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("expected category-A terminal demotion:\n%s", stderr.String())
+	}
+	// Non-compounding (DECISION c2): RetryStage NEVER called.
+	if len(fu.gotRetryArgs) != 0 {
+		t.Errorf("RetryStage called %d times; verify-fix exhaustion must be terminal (no RetryStage)", len(fu.gotRetryArgs))
+	}
+	// Total agent invocations capped at max_iterations+1 (initial + 2 fixes).
+	if invoker.callIdx != 3 {
+		t.Errorf("Invoke call count = %d, want 3 (initial + 2 fixes = max_iterations+1)", invoker.callIdx)
+	}
+	// Terminal: no push.
+	if fp.gotArgs != nil {
+		t.Error("CommitAndPush must not run after a terminal verify-fix exhaustion")
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run after a terminal verify-fix exhaustion")
+	}
+	assertVerifySummary(t, readBundleEvents(t, bundlePath), "failed", 3, 2)
+}
+
+// TestRun_VerifyFixLoop_MaxIterationsZero_SingleShotNoReinvoke confirms the
+// default-off behavior: max_iterations==0 keeps today's single-shot
+// working-tree gate (#441) — one verify attempt, demote-on-failure, no
+// re-invoke, and NO committed-tree loop (no verify_summary event).
+func TestRun_VerifyFixLoop_MaxIterationsZero_SingleShotNoReinvoke(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "false",
+		VerifyMaxIterations: 0, // default-off → single-shot working-tree gate
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", verifyFixRunID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", verifyFixStageID,
+		"--fetch-prompt", "--upload-trace",
+		"--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("expected category-A demote on single-shot verify failure:\n%s", stderr.String())
+	}
+	// No re-invoke: the committed-tree loop never ran.
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (single-shot, no re-invoke)", invoker.callIdx)
+	}
+	events := readBundleEvents(t, bundlePath)
+	var verifyRuns int
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			verifyRuns++
+			if strings.Contains(string(ev.Data), `"head_sha"`) {
+				t.Error("single-shot working-tree gate must not carry head_sha")
+			}
+		case "verify_summary":
+			t.Error("max_iterations==0 must not emit a verify_summary event (committed-tree loop disabled)")
+		}
+	}
+	if verifyRuns != 1 {
+		t.Errorf("verify_run count = %d, want 1 (single shot)", verifyRuns)
 	}
 }
 
