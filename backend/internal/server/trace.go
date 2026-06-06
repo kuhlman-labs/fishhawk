@@ -989,6 +989,18 @@ func (s *Server) noDiffCaptured(ctx context.Context, stageID uuid.UUID, bundleBy
 // of bug we want surfaced via /v0/runs (state != pending) rather
 // than via a 500 on the upload that already wrote the audit row.
 func (s *Server) advanceAfterFailure(r *http.Request, runID, stageID uuid.UUID) {
+	// Fix-up recovery (#788): if this terminal failure is a failed fix-up
+	// re-dispatch, restore the run to its pre-fix-up review gate instead
+	// of failing it. maybeRecoverFixupFailure un-fails the implement stage
+	// + re-parks the review stage and returns true; we then SKIP the
+	// run-failing Advance so the run stays `running` at its gate. This is
+	// the single chokepoint for the cat-A agent-fail path, the cat-B
+	// implement-review gating-reject path, and failStageCategoryB/C — all
+	// funnel through here. A non-recovery failure (the common case) returns
+	// false and the orchestrator Advance below runs unchanged.
+	if s.maybeRecoverFixupFailure(r.Context(), runID, stageID) {
+		return
+	}
 	if s.cfg.Orchestrator == nil {
 		return
 	}

@@ -126,15 +126,27 @@ func (m *memRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageS
 	}
 	// Mirror postgresRepo: admit the fix-up override edges
 	// (awaiting_approval → pending and succeeded → pending, #762/#780)
-	// in addition to the normal transitions so FixupStage can reuse
+	// AND the fix-up RECOVERY edges (failed → succeeded/awaiting_approval,
+	// review pending → awaiting_approval, #788) in addition to the normal
+	// transitions so FixupStage / RestoreFixupStage can reuse
 	// TransitionStage.
-	if !run.ValidStageTransition(s.State, to) && !run.ValidStageFixupTransition(s.State, to) {
+	if !run.ValidStageTransition(s.State, to) &&
+		!run.ValidStageFixupTransition(s.State, to) &&
+		!run.ValidStageFixupRecoveryTransition(s.State, to) {
 		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
 	}
 	s.State = to
+	// Mirror postgresRepo's UpdateStageState, which sets
+	// failure_category/failure_reason directly (not COALESCE): a nil
+	// completion clears the stale failure metadata to SQL NULL. This is
+	// what lets a recovery transition (failed → succeeded, nil) un-fail
+	// the stage AND drop its prior FailureCategory/FailureReason (#788).
 	if c != nil {
 		s.FailureCategory = c.FailureCategory
 		s.FailureReason = c.FailureReason
+	} else {
+		s.FailureCategory = nil
+		s.FailureReason = nil
 	}
 	// Mirror postgresRepo's ended_at handling: stamp it when entering a
 	// terminal state, NULL it otherwise (a re-open to a non-terminal

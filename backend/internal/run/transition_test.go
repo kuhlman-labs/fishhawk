@@ -110,6 +110,57 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 	}
 }
 
+// TestStageFixupRecoveryTransitions table-tests the narrow fix-up
+// recovery override (#788). Exactly three edges are valid; everything
+// else — including unrelated edges through the recovery validator — is
+// refused, because the recovery path un-fails a stage to a healthy prior
+// state and must stay a separate, confined semantic.
+func TestStageFixupRecoveryTransitions(t *testing.T) {
+	cases := []struct {
+		from, to StageState
+		want     bool
+	}{
+		// The three recovery edges.
+		{StageStateFailed, StageStateSucceeded, true},         // push_and_open_pr restore
+		{StageStateFailed, StageStateAwaitingApproval, true},  // commit-yourself restore
+		{StageStatePending, StageStateAwaitingApproval, true}, // review re-park restore
+		// Unrelated edges the recovery validator must refuse.
+		{StageStateSucceeded, StageStateFailed, false},
+		{StageStateFailed, StageStatePending, false},           // that is the A/C RETRY edge, not recovery
+		{StageStateAwaitingApproval, StageStatePending, false}, // that is the fix-up edge, not recovery
+		{StageStateRunning, StageStateSucceeded, false},
+		{StageStateFailed, StageStateFailed, false},
+		{StageStateCancelled, StageStateAwaitingApproval, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.from)+"→"+string(tc.to), func(t *testing.T) {
+			if got := ValidStageFixupRecoveryTransition(tc.from, tc.to); got != tc.want {
+				t.Errorf("ValidStageFixupRecoveryTransition(%q, %q) = %v, want %v", tc.from, tc.to, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFailedToSucceededLeaksOnlyThroughRecovery is the critical
+// safety invariant (#788 CONDITION 3): the `failed → succeeded` edge —
+// the one that would FAKE SUCCESS if it ever escaped the recovery verb —
+// must be admitted ONLY by the recovery validator, never by the ordinary
+// transition machine or the retry/fix-up override tables.
+func TestFailedToSucceededLeaksOnlyThroughRecovery(t *testing.T) {
+	if ValidStageTransition(StageStateFailed, StageStateSucceeded) {
+		t.Error("ValidStageTransition admits failed → succeeded; it must not (would fake success)")
+	}
+	if ValidStageRetryTransition(StageStateFailed, StageStateSucceeded) {
+		t.Error("ValidStageRetryTransition admits failed → succeeded; the retry path must not")
+	}
+	if ValidStageFixupTransition(StageStateFailed, StageStateSucceeded) {
+		t.Error("ValidStageFixupTransition admits failed → succeeded; the fix-up path must not")
+	}
+	if !ValidStageFixupRecoveryTransition(StageStateFailed, StageStateSucceeded) {
+		t.Error("ValidStageFixupRecoveryTransition must admit failed → succeeded (the recovery edge)")
+	}
+}
+
 func TestInvalidTransitionError_FormatsHumanReadable(t *testing.T) {
 	err := InvalidTransitionError{Kind: "run", From: "pending", To: "succeeded"}
 	want := "invalid run transition: pending → succeeded"

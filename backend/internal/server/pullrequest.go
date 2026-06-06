@@ -516,10 +516,24 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 			slog.String("error", err.Error()))
 	}
 
+	// Fix-up recovery (#788): a push_and_open_pr fix-up re-dispatch whose
+	// commit/push/PR-open step fails reaches here after FailStage lands the
+	// implement stage in `failed`. If this is a failed fix-up re-dispatch,
+	// maybeRecoverFixupFailure restores the run to its pre-fix-up review gate
+	// (implement → succeeded, review → awaiting_approval) and we SKIP the
+	// run-failing Advance below so the run stays `running` and the original
+	// mergeable PR is not orphaned. A non-fix-up PR-open failure (the common
+	// case) returns false and the orchestrator Advance runs unchanged. The
+	// pull_request_failed audit entry is still written either way — it is the
+	// honest record that the commit/push/PR-open step failed.
+	recovered := s.maybeRecoverFixupFailure(r.Context(), runID, stage.ID)
+
 	// Advance the run so the orchestrator walks it forward — without this the
 	// run stays pending/running after the stage fails. Best-effort, mirroring
-	// the trace handler's advanceAfterFailure.
-	if s.cfg.Orchestrator != nil {
+	// the trace handler's advanceAfterFailure. Skipped on recovery: the stage
+	// is no longer failed, so advancing would not fail the run, but skipping
+	// keeps the intent explicit and avoids a redundant walk.
+	if !recovered && s.cfg.Orchestrator != nil {
 		if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
 			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 				"pull-request failure report: orchestrator advance failed",

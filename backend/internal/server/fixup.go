@@ -29,6 +29,18 @@ import (
 // configured max-passes ceiling — there is no dedicated column.
 const CategoryStageFixupTriggered = "stage_fixup_triggered"
 
+// CategoryStageFixupRecovered is the audit-log category for the entry
+// maybeRecoverFixupFailure writes when a FAILED fix-up re-dispatch is
+// recovered back to the run's pre-fix-up review gate (E22.X / #788).
+// A fix-up re-opens an implement stage from a HEALTHY gate (the PR is
+// open and mergeable); if the re-dispatched implement run fails, the
+// stage would land terminal `failed` and destroy the intact original
+// work. This entry records the restoration — the implement stage's
+// restored prior state, the re-parked review stage id (when any), and
+// the source failure category/reason the re-dispatch failed with. It is
+// a system-actor, internal audit kind — NOT an issue-comment surface.
+const CategoryStageFixupRecovered = "stage_fixup_recovered"
+
 // defaultMaxFixupPasses bounds the number of fix-up passes a single
 // implement stage may consume. Default 1 — a fix-up is a bounded,
 // operator-gated single pass, never an unbounded auto-loop. Making
@@ -362,6 +374,136 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 			"stage_id", dec.Stage.ID,
 			"error", err.Error(),
 		)
+	}
+}
+
+// maybeRecoverFixupFailure detects a failed fix-up re-dispatch and, when
+// it is one, restores the run to its pre-fix-up review gate instead of
+// letting the run fail (E22.X / #788). It returns true ONLY when it
+// recovered the run — the caller then SKIPS the run-failing orchestrator
+// advance so the run stays `running` at its gate. On any miss (not an
+// implement stage, no prior fix-up entry, payload unparseable, restore
+// not applicable) it returns false and the normal failure path proceeds.
+//
+// The recovery signal is the durable stage_fixup_triggered audit entry:
+// a fix-up re-opens an implement stage from a HEALTHY gate, so the only
+// way the stage is `failed` AFTER such an entry exists is a re-dispatch
+// failure. With defaultMaxFixupPasses==1 at most one such entry exists
+// per stage, so {entry present + stage failed} unambiguously identifies
+// the fix-up re-dispatch failure (not an earlier unrelated failure).
+//
+// Best-effort and self-contained: it owns the recovery transition, the
+// audit emission, and the status-comment refresh; a failure in any step
+// returns false so the caller's normal Advance-to-failed path runs.
+func (s *Server) maybeRecoverFixupFailure(ctx context.Context, runID, stageID uuid.UUID) bool {
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return false
+	}
+
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil || stage.Type != run.StageTypeImplement {
+		return false
+	}
+
+	// Find the most-recent stage_fixup_triggered entry for this stage.
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		return false
+	}
+	var triggered *audit.Entry
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			triggered = e // entries are append-ordered; keep the last
+		}
+	}
+	if triggered == nil {
+		return false
+	}
+
+	var payload struct {
+		PriorState            string `json:"prior_state"`
+		ReparkedReviewStageID string `json:"reparked_review_stage_id"`
+	}
+	if err := json.Unmarshal(triggered.Payload, &payload); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup recovery: malformed stage_fixup_triggered payload — leaving failure path in force",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+
+	var reviewStageID *uuid.UUID
+	if payload.ReparkedReviewStageID != "" {
+		rid, perr := uuid.Parse(payload.ReparkedReviewStageID)
+		if perr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"fixup recovery: unparseable reparked_review_stage_id — leaving failure path in force",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", perr.Error()))
+			return false
+		}
+		reviewStageID = &rid
+	}
+
+	recovery, err := run.RestoreFixupStage(ctx, s.cfg.RunRepo, stageID,
+		run.StageState(payload.PriorState), reviewStageID)
+	if err != nil {
+		// ErrFixupRecoveryNotApplicable (the stage was not failed) is the
+		// benign no-op; any other error means the restore didn't land.
+		// Either way the normal failure path must proceed, so return false.
+		if !errors.Is(err, run.ErrFixupRecoveryNotApplicable) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"fixup recovery: restore failed — leaving failure path in force",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+		}
+		return false
+	}
+
+	s.writeFixupRecoveredAudit(ctx, runID, recovery)
+	s.notifyStatusUpdate(ctx, runID, "stage_fixup_recovered")
+	return true
+}
+
+// writeFixupRecoveredAudit appends a stage_fixup_recovered entry capturing
+// the restored implement state, the re-parked review stage id (when any),
+// and the source failure category/reason the fix-up re-dispatch failed
+// with. Best-effort: the recovery transition is already committed, so a
+// failure here logs but doesn't unwind.
+func (s *Server) writeFixupRecoveredAudit(ctx context.Context, runID uuid.UUID, rec *run.FixupRecovery) {
+	fields := map[string]any{
+		"stage_id":       rec.Stage.ID.String(),
+		"restored_state": string(rec.Stage.State),
+	}
+	if rec.RestoredReview != nil {
+		fields["restored_review_stage_id"] = rec.RestoredReview.ID.String()
+		fields["restored_review_state"] = string(rec.RestoredReview.State)
+	}
+	if rec.PriorFailureCategory != nil {
+		fields["source_failure_category"] = string(*rec.PriorFailureCategory)
+	}
+	if rec.PriorFailureReason != nil {
+		fields["source_failure_reason"] = *rec.PriorFailureReason
+	}
+	payload, _ := json.Marshal(fields)
+
+	systemKind := audit.ActorSystem
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &rec.Stage.ID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryStageFixupRecovered,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup recovery: append stage_fixup_recovered audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", rec.Stage.ID.String()),
+			slog.String("error", err.Error()))
 	}
 }
 

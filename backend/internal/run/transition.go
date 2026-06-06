@@ -195,6 +195,59 @@ func ValidStageFixupTransition(from, to StageState) bool {
 	return ok
 }
 
+// stageFixupRecoveryTransitions enumerates the explicit fix-up
+// RECOVERY override off the normal state machine — the edges used to
+// restore a run to its pre-fix-up review gate when a fix-up
+// re-dispatch FAILS (E22.X / #788).
+//
+// A fix-up re-opens an implement stage from a HEALTHY gate (the PR is
+// open and mergeable); if the re-dispatched implement run then fails,
+// the implement stage lands terminal `failed` and the review gate is
+// gone — even though the original work is intact. A fix-up is a
+// best-effort optional pass, so its failure must NOT destroy that
+// work. Recovery un-fails the implement stage back to its captured
+// prior state and re-parks the review stage that the fix-up re-parked:
+//
+//   - implement failed → succeeded restores the push_and_open_pr flow
+//     (#780): the implement stage had SUCCEEDED (PR opened) before the
+//     fix-up re-opened it. Restoring it to succeeded re-stamps ended_at
+//     and clears the stale failure metadata (TransitionStage's
+//     UpdateStageState sets failure_category/failure_reason directly,
+//     not COALESCE).
+//   - implement failed → awaiting_approval restores the commit-yourself
+//     flow: the implement stage was its OWN gate at awaiting_approval
+//     before the re-open.
+//   - review pending → awaiting_approval restores the re-parked review
+//     gate: the fix-up re-parked the review stage awaiting_approval →
+//     pending (#780); recovery puts it back at its gate.
+//
+// This is deliberately a SEPARATE table from stageRetryTransitions and
+// stageFixupTransitions. Admitting `failed → succeeded` is the critical
+// safety hazard: if it leaked into the ordinary retry/transition path
+// it would FAKE SUCCESS for any failed stage. Keeping it reachable only
+// via ValidStageFixupRecoveryTransition (consulted by TransitionStage,
+// guarded at the domain layer by RestoreFixupStage) confines that edge
+// to the recovery verb.
+var stageFixupRecoveryTransitions = map[StageState]map[StageState]struct{}{
+	StageStateFailed: {
+		StageStateSucceeded:        {},
+		StageStateAwaitingApproval: {},
+	},
+	StageStatePending: {
+		StageStateAwaitingApproval: {},
+	},
+}
+
+// ValidStageFixupRecoveryTransition reports whether `from` is allowed
+// to recover into `to` via the fix-up recovery path. The recovery path
+// is intentionally narrow and SEPARATE from every other table — callers
+// that want a regular transition should keep using ValidStageTransition
+// + TransitionStage, and only run.RestoreFixupStage reaches this edge.
+func ValidStageFixupRecoveryTransition(from, to StageState) bool {
+	_, ok := stageFixupRecoveryTransitions[from][to]
+	return ok
+}
+
 // InvalidTransitionError describes a refused state transition.
 // Callers can errors.Is/As against it to surface a 409 Conflict at
 // the HTTP layer.

@@ -1,7 +1,11 @@
 package mcpe2e_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -346,6 +351,188 @@ func TestE2E_Fixup_PushOpenPRReopensImplementAndReparksReview(t *testing.T) {
 	}
 	if len(triggered.Concerns) != 1 || triggered.Concerns[0].Category != "scope" {
 		t.Fatalf("persisted concerns = %+v, want the single scope concern", triggered.Concerns)
+	}
+}
+
+// TestE2E_Fixup_FailedRedispatchRestoresReviewGate drives the fix-up
+// FAILURE-RECOVERY seam end to end (#788): a push_and_open_pr fix-up
+// re-dispatch that FAILS must restore the run to its pre-fix-up review
+// gate rather than leaving it an unrecoverable failed casualty. This
+// crosses the run state-machine ↔ backend HTTP ↔ Postgres ↔ audit seam
+// that per-layer units cannot (cf. #618): the per-function tests pass
+// while the FailStage → maybeRecoverFixupFailure → RestoreFixupStage
+// chain across the /pull-request handler could break.
+//
+// The flow: implement SUCCEEDED + review at the gate → fix-up re-open
+// via the real MCP binary (implement → pending, review → pending) →
+// simulate the re-dispatched implement FAILING via the backend's
+// /pull-request {outcome:"failed"} report → assert the run is restored
+// to its review gate (implement succeeded, review awaiting_approval, run
+// running, a stage_fixup_recovered audit entry present) so the original
+// PR stays mergeable.
+func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+
+	// Put the run in `running` (the state it holds while awaiting review
+	// approval) so the post-recovery "still running, not failed" assertion
+	// is meaningful.
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+
+	// 1. push_and_open_pr shape: implement SUCCEEDED (PR opened), separate
+	// review stage at the gate.
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         2,
+		Type:             runpkg.StageTypeReview,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	// 2. Record the implement-review concern and trigger the fix-up through
+	// the real fishhawk-mcp binary — re-opens implement → pending, re-parks
+	// review → pending, writes stage_fixup_triggered.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "address the scope concern on the open PR",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+
+	// 3. Simulate the re-dispatched implement landing in `running` (the #742
+	// trace gate's state) then FAILING its commit/push step.
+	for _, to := range []runpkg.StageState{runpkg.StageStateDispatched, runpkg.StageStateRunning} {
+		if _, err := fx.runRepo.TransitionStage(ctx, impl.ID, to, nil); err != nil {
+			t.Fatalf("re-dispatch TransitionStage → %s: %v", to, err)
+		}
+	}
+	failPushPRViaBackend(t, ctx, fx, impl.ID)
+
+	// 4. The run was restored to its pre-fix-up review gate — the PR stays
+	// mergeable rather than the run becoming a failed casualty.
+	curImpl, err := fx.runRepo.GetStage(ctx, impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage(implement): %v", err)
+	}
+	if curImpl.State != runpkg.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded (restored)", curImpl.State)
+	}
+	if curImpl.FailureCategory != nil {
+		t.Errorf("implement FailureCategory = %v, want nil (cleared on recovery)", curImpl.FailureCategory)
+	}
+	curReview, err := fx.runRepo.GetStage(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("GetStage(review): %v", err)
+	}
+	if curReview.State != runpkg.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval (restored)", curReview.State)
+	}
+	curRun, err := fx.runRepo.GetRun(ctx, fx.runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if curRun.State != runpkg.StateRunning {
+		t.Errorf("run state = %q, want running (NOT failed)", curRun.State)
+	}
+
+	// 5. A stage_fixup_recovered audit entry landed recording the restore.
+	recovered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupRecovered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(recovered): %v", err)
+	}
+	if len(recovered) != 1 {
+		t.Fatalf("stage_fixup_recovered entries = %d, want 1", len(recovered))
+	}
+	var payload struct {
+		RestoredState         string `json:"restored_state"`
+		RestoredReviewStageID string `json:"restored_review_stage_id"`
+		SourceFailureCategory string `json:"source_failure_category"`
+	}
+	if err := json.Unmarshal(recovered[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal stage_fixup_recovered payload: %v", err)
+	}
+	if payload.RestoredState != string(runpkg.StageStateSucceeded) {
+		t.Errorf("restored_state = %q, want succeeded", payload.RestoredState)
+	}
+	if payload.RestoredReviewStageID != review.ID.String() {
+		t.Errorf("restored_review_stage_id = %q, want %s", payload.RestoredReviewStageID, review.ID)
+	}
+	if payload.SourceFailureCategory != "C" {
+		t.Errorf("source_failure_category = %q, want C", payload.SourceFailureCategory)
+	}
+}
+
+// failPushPRViaBackend POSTs a /pull-request {outcome:"failed"} report for
+// the implement stage, signed with the run's signing key. It stands up a
+// second backend server on the same Postgres pool with ArtifactRepo wired
+// (the shared fixture omits it), since the /pull-request handler requires
+// the artifact repo even on the failure variant. Both servers share the
+// pool, so the state the recovery writes is visible through fx.runRepo.
+func failPushPRViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID) {
+	t.Helper()
+	s := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		SigningRepo:  signing.NewPostgresRepository(fx.pool),
+		AuditRepo:    audit.NewPostgresRepository(fx.pool),
+		ArtifactRepo: artifact.NewPostgresRepository(fx.pool),
+	})
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	body := []byte(`{"outcome":"failed","category":"C","reason":"commit/push onto PR branch failed"}`)
+	digest := sha256.Sum256(body)
+	signature := ed25519.Sign(fx.signingPriv, digest[:])
+	url := srv.URL + "/v0/runs/" + fx.runID.String() + "/pull-request?stage_id=" + stageID.String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build pull-request request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(signature))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("pull-request failure POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("pull-request failure status %d: %s", resp.StatusCode, raw)
 	}
 }
 
