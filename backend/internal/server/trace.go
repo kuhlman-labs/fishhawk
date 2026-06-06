@@ -307,7 +307,7 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo != nil {
 		switch {
 		case len(violations) == 0:
-			s.advanceStageAfterTrace(r, runID, stageID, body)
+			s.advanceStageAfterTrace(r, runID, stageID, variant, body)
 		case s.noDiffCaptured(r.Context(), stageID, body, violations):
 			// #691/#692: an implement stage whose bundle carries a
 			// present-but-empty diff is a staging/capture miss, not a
@@ -345,7 +345,7 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 //
 // bundleBytes is passed through for runtime calibration emit after
 // the terminal transition.
-func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUID, bundleBytes []byte) {
+func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUID, variant tracestore.Variant, bundleBytes []byte) {
 	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -398,7 +398,22 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// for every non-implement stage; runImplementReviews itself
 	// short-circuits when reviewers.agent==0, so reviewer-less implement
 	// runs are unaffected too.
-	if stage.Type == run.StageTypeImplement {
+	//
+	// Gate on the raw variant so the review is dispatched exactly once per
+	// stage bundle (#793). The runner POSTs both the raw and the redacted
+	// variant of the same bundle, and a push_and_open_pr implement stage
+	// stays in `running` across both uploads (the terminal transition is
+	// deferred to the /pull-request report), so advanceStageAfterTrace
+	// re-enters this block on the redacted upload too — dispatching a SECOND
+	// implement review (2x cost, divergent verdicts, and #777's
+	// review_action_hint over-firing on the stale first verdict). Gating on
+	// raw mirrors the recordCost #678 gate above (trace.go ~line 218): raw is
+	// the first/authoritative upload and is always shipped in v0. This
+	// structurally cannot suppress a fix-up re-dispatch (#762/#788/#794):
+	// FixupStage re-opens the SAME stage_id with a NEW diff/head_sha and the
+	// runner re-uploads raw first, so the fix-up's own raw variant fires its
+	// own single review on the new diff.
+	if stage.Type == run.StageTypeImplement && variant == tracestore.VariantRaw {
 		// Diff source is the trace bundle, regardless of whether a PR was
 		// opened (local --no-pr runs still carry the git_diff event). An
 		// extraction error skips review and proceeds to the terminal

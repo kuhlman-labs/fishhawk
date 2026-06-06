@@ -484,6 +484,85 @@ func TestShipTrace_ImplementReview_FixupForwardGated_StillReviews(t *testing.T) 
 	}
 }
 
+// TestShipTrace_ImplementReview_DoubleVariantUpload_DispatchesOnce is the
+// #793 regression: the runner POSTs BOTH the raw and the redacted variant of
+// the same bundle, and a forward-gated implement stage (push_fixup here) stays
+// in `running` across both uploads, so advanceStageAfterTrace re-enters the
+// implement-review block on the redacted upload too. Before the variant gate
+// this dispatched a SECOND review (2x cost, divergent verdicts). With the
+// raw-variant gate (mirroring the recordCost #678 gate) the redacted upload is
+// a no-op: exactly one implement_review_started and one implement_reviewed for
+// the bundle. Fails on main with two of each.
+func TestShipTrace_ImplementReview_DoubleVariantUpload_DispatchesOnce(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(5 * time.Minute)
+	// One bundle, two variants. The runner uploads raw first, then redacted,
+	// as two separate signed requests over the same stage_id.
+	bundleBytes := makeFixupPushBundle(t, true, 2, t0, t1)
+	for _, variant := range []string{"raw", "redacted"} {
+		w := shipRequest(t, s, runRow.ID, implStage.ID, variant, priv, bundleBytes, "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("%s upload status = %d, want 202:\n%s", variant, w.Code, w.Body.String())
+		}
+	}
+
+	// Advisory reviews run detached (#584); drain before asserting.
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_review_started"); n != 1 {
+		t.Errorf("implement_review_started entries = %d, want 1 (redacted variant must not re-dispatch)", n)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed entries = %d, want 1 (redacted variant must not re-dispatch)", n)
+	}
+}
+
+// TestShipTrace_ImplementReview_FixupRedispatch_StillReviews is CONDITION 3 of
+// the #793 plan and the guard against a stage_id-only dedup regression. A
+// fix-up re-dispatch (#788/#794) re-opens the SAME stage_id with a NEW diff and
+// re-uploads its own raw variant — it is a separate upload cycle, not the
+// redacted half of the first. The raw-variant gate must NOT suppress it: each
+// cycle's raw upload fires its own single review on its own diff. A guard keyed
+// on stage_id alone would find the first cycle's implement_review_started and
+// skip the fix-up's re-review entirely — this test fails in that case.
+func TestShipTrace_ImplementReview_FixupRedispatch_StillReviews(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(5 * time.Minute)
+	// Two separate upload cycles for the SAME stage_id. The forward-gate keeps
+	// the stage in `running` across both, mirroring a fix-up re-dispatch onto
+	// the existing PR branch. The differing fileCount stands in for the new
+	// diff/head_sha each cycle carries.
+	for _, fileCount := range []int{2, 3} {
+		bundleBytes := makeFixupPushBundle(t, true, fileCount, t0, t1)
+		w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("fix-up cycle (%d files) status = %d, want 202:\n%s", fileCount, w.Code, w.Body.String())
+		}
+	}
+
+	// Advisory reviews run detached (#584); drain before asserting.
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_review_started"); n != 2 {
+		t.Errorf("implement_review_started entries = %d, want 2 (fix-up re-dispatch must get its own review)", n)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 2 {
+		t.Errorf("implement_reviewed entries = %d, want 2 (fix-up re-dispatch must get its own review)", n)
+	}
+}
+
 // TestShipTrace_ImplementReview_ScopeDriftOnly_Advances asserts the
 // flag-only contract (ADR-027 Decision Q6): a reviewer returning
 // approve_with_concerns with a single {category:"scope"} concern under
