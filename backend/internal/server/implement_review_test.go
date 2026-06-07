@@ -232,6 +232,73 @@ func TestShipTrace_ImplementReview_ScopeDriftThreadedIntoPrompt(t *testing.T) {
 	}
 }
 
+// TestShipTrace_ImplementReview_AmendedScopeThreadedIntoPrompt is the
+// cross-boundary integration test for #829: an operator-authorized scope
+// amendment recorded at approval time — via the #824 structured
+// add_scope_files fold AND the #730 approval-condition prose fold — must reach
+// the implement-review prompt's "Scope amended at approval" section so the
+// reviewer treats those paths as in-scope instead of flagging them as drift.
+// runImplementReviews builds the review prompt directly from the raw plan
+// scope, so this proves the approval-store -> trace-handler -> prompt-builder
+// seam end-to-end: the resolvers are re-applied review-side, not just on the
+// implement-stage prompt path (handleGetStagePrompt). Per-layer units miss
+// this seam.
+func TestShipTrace_ImplementReview_AmendedScopeThreadedIntoPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	// Seed the approval entries the resolvers read back: one structured
+	// add_scope_files fold (#824) and one approval-condition comment naming a
+	// path (#730). The raw plan scope is backend/internal/foo/foo.go (seeded by
+	// newImplementReviewServer); neither amended path is in it.
+	au.seeded = append(au.seeded,
+		makeApproveWithScopeFilesEntry(runRow.ID, []string{"backend/cmd/fishhawk-mcp/README.md"}),
+		makeApproveWithCommentEntry(runRow.ID, "Approved — also update docs/extra.md to reflect the change."),
+	)
+
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"Scope amended at approval (operator-authorized — in-scope, NOT drift)",
+		"backend/cmd/fishhawk-mcp/README.md", // #824 structured fold
+		"docs/extra.md",                      // #730 prose fold
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q from threaded amended scope:\n%s", want, got)
+		}
+	}
+	// The raw plan scope file must NOT appear in the amended-scope section — it
+	// is already rendered by writePlanForReview. Assert it is not listed as a
+	// bullet under the amended-scope header.
+	amendedIdx := strings.Index(got, "### Scope amended at approval")
+	if amendedIdx < 0 {
+		t.Fatalf("amended-scope section header absent:\n%s", got)
+	}
+	nextSection := strings.Index(got[amendedIdx+1:], "\n### ")
+	end := len(got)
+	if nextSection >= 0 {
+		end = amendedIdx + 1 + nextSection
+	}
+	if strings.Contains(got[amendedIdx:end], "- backend/internal/foo/foo.go") {
+		t.Errorf("raw plan scope file must not be listed in amended-scope section:\n%s", got[amendedIdx:end])
+	}
+}
+
 // TestShipTrace_ImplementReview_PatchThreadedIntoPrompt asserts the
 // git_diff event's patch text reaches the reviewer prompt end-to-end:
 // the trace handler sets trig.DiffPatch from diff.Patch, and

@@ -245,6 +245,17 @@ type Trigger struct {
 	// ship even though it is absent from the diff. Empty/nil when there was
 	// no drift, the event was stripped, or for any non-implement-review build.
 	ScopeDrift []string
+	// AmendedScopeFiles is the list of paths authorized at approval time via
+	// the #730 approval-condition prose fold or the #824 add_scope_files
+	// structured fold that are NOT already in the plan's raw scope.files. The
+	// implement-stage prompt folds these into the effective scope, but
+	// runImplementReviews builds the review prompt directly from the raw plan
+	// scope, so without this field an operator-authorized amendment shows as
+	// scope drift (#829). buildImplementReview renders an informational
+	// "Scope amended at approval" section and standing criterion 4 treats these
+	// paths as in-scope — the reviewer must NOT flag them as drift. Empty/nil
+	// when no amendment was folded or for any non-implement-review build.
+	AmendedScopeFiles []string
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -738,6 +749,26 @@ func buildImplementReview(t Trigger) string {
 		b.WriteString("\n")
 	}
 
+	// Scope-amended-at-approval section (#829). Paths the operator authorized
+	// at approval time — via an approval condition (#730) or the structured
+	// add_scope_files fold (#824) — that are NOT in the plan's raw scope.files.
+	// The implement stage folds these into its effective scope, so an edit to
+	// one of them is operator-authorized and in-scope. The review prompt is
+	// built from the raw plan scope, so without naming them here the reviewer
+	// would flag them as scope drift under criterion 4. Naming them is what
+	// keeps the review-side signal aligned with the stage-side effective scope.
+	if len(t.AmendedScopeFiles) > 0 {
+		b.WriteString("### Scope amended at approval (operator-authorized — in-scope, NOT drift)\n\n")
+		b.WriteString("The paths below were folded into the effective scope at approval time — the operator " +
+			"authorized them via an approval condition or an add_scope_files amendment, even though they are not " +
+			"in the plan's original scope.files. They ARE in-scope. Do NOT record a scope-drift concern for any " +
+			"of them — touching them is expected and authorized:\n\n")
+		for _, p := range t.AmendedScopeFiles {
+			fmt.Fprintf(&b, "- %s\n", p)
+		}
+		b.WriteString("\n")
+	}
+
 	// Approved plan section — what the diff is being measured against.
 	if t.ApprovedPlan != nil {
 		writePlanForReview(&b, t.ApprovedPlan)
@@ -793,6 +824,9 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("Three standing criteria orthogonal to the lenses above also apply:\n\n")
 	b.WriteString("4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
 		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
+		"Files listed in the 'Scope amended at approval' section above (when present) ARE in-scope — they were " +
+		"operator-authorized at approval time — and must NOT be flagged as drift. Only files the diff touches " +
+		"that are in NEITHER scope.files NOR the amended-scope list are drift. " +
 		"Do NOT reject solely for scope drift — drift is a flag, not a blocker.\n")
 	b.WriteString("5. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project " +
 		"convention — MUST be one you can quote verbatim from the context provided in this prompt or from a " +

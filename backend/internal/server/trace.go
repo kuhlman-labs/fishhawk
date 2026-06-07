@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -2021,6 +2022,15 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// reviewer distinguish an operator-stageable drift path from a
 		// genuinely missing file. Empty/nil when there was no drift.
 		ScopeDrift: scopeDrift,
+		// Paths the operator authorized at approval time via the #730
+		// approval-condition prose fold or the #824 add_scope_files structured
+		// fold that are NOT already in the raw plan scope.files (#829). The
+		// implement-stage prompt folds these into its effective scope, but this
+		// review prompt is built directly from approvedPlan, so we recompute the
+		// folds here (reusing the same resolvers handleGetStagePrompt uses) and
+		// thread the remainder through so the reviewer treats them as in-scope
+		// rather than flagging them as scope drift.
+		AmendedScopeFiles: s.amendedScopeFilesForReview(ctx, runRow, approvedPlan),
 	}
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title
@@ -2079,6 +2089,52 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// Gating: run synchronously so the caller can fail the stage as
 	// category-B before the terminal transition.
 	return s.runImplementReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+}
+
+// amendedScopeFilesForReview computes the approval-time scope folds that the
+// implement-review prompt must treat as in-scope rather than as scope drift
+// (#829). It reuses the same resolvers handleGetStagePrompt applies to the
+// implement-stage prompt — resolveApprovalAddScopeFiles (#824 structured fold)
+// and resolveApprovalConditions + extractScopePathsFromConditions (#730 prose
+// fold) — so the review-side and stage-side folds stay in lockstep (single
+// source of truth). It returns the union of both fold sources, deduped and
+// EXCLUDING any path already present in the raw plan scope.files (those are
+// already rendered by writePlanForReview, so naming them again would only
+// restate the existing scope).
+//
+// It mirrors the merge helpers' empty-scope philosophy: when the plan declares
+// no scope.files the reviewer has no baseline to drift against, so there is
+// nothing to amend and it returns nil. Returns nil (not an empty slice) when
+// there is no amendment, keeping the review prompt byte-identical to today.
+func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run, approvedPlan *plan.Plan) []string {
+	if approvedPlan == nil || len(approvedPlan.Scope.Files) == 0 {
+		return nil
+	}
+	inRawScope := make(map[string]struct{}, len(approvedPlan.Scope.Files))
+	for _, f := range approvedPlan.Scope.Files {
+		inRawScope[f.Path] = struct{}{}
+	}
+
+	var amended []string
+	seen := make(map[string]struct{})
+	add := func(paths []string) {
+		for _, p := range paths {
+			if _, ok := inRawScope[p]; ok {
+				continue
+			}
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			amended = append(amended, p)
+		}
+	}
+
+	add(s.resolveApprovalAddScopeFiles(ctx, runRow))
+	if conds := s.resolveApprovalConditions(ctx, runRow); conds != nil {
+		add(extractScopePathsFromConditions(*conds))
+	}
+	return amended
 }
 
 // runImplementReviewLoop runs the per-reviewer implement-review loop
