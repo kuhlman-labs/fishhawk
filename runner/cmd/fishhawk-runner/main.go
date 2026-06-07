@@ -853,14 +853,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// commit that dropped build-required drift; ErrCommittedTestsFailed
 				// is the test-phase extension (#800) catching a scope-only commit
 				// whose touched-package tests fail because a drift-excluded test
-				// fake was dropped. ErrFixupCreatedOutOfScope is the fix-up-only
-				// gate (#818) catching a fix-up that created net-new out-of-scope
-				// files (silently stripped → misleadingly-green partial). Everything
-				// else (network, git, GitHub API) is category-C infra.
+				// fake was dropped. ErrCreatedOutOfScope is the created-out-of-scope
+				// gate (#818, generalized to the open-PR push by #825) catching a
+				// stage that created net-new out-of-scope files (silently stripped →
+				// misleadingly-green partial); it matches both the open-PR and the
+				// fix-up (ErrFixupCreatedOutOfScope) wrapped errors. Everything else
+				// (network, git, GitHub API) is category-C infra.
 				if errors.Is(err, upload.ErrPullRequestInvalid) ||
 					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
 					errors.Is(err, gitops.ErrCommittedTestsFailed) ||
-					errors.Is(err, gitops.ErrFixupCreatedOutOfScope) {
+					errors.Is(err, gitops.ErrCreatedOutOfScope) {
 					res.FailureCategory = "B"
 				} else {
 					res.FailureCategory = "C"
@@ -2527,32 +2529,48 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// the push, so a failure leaves origin untouched.
 	gateScopeFiles := scopePaths(cfg.scopeFiles)
 	verifyCommit := func(ctx context.Context, headSHA string, drift []string) error {
-		// Fix-up-only created-out-of-scope gate (#818). A fix-up pass cannot
-		// widen the stage's fixed scope.files, so any net-new (untracked)
-		// out-of-scope file it created was silently stripped from the
-		// scope-only commit while in-scope edits referencing it landed — a
-		// misleadingly-green partial fix-up. Fail category-B BEFORE the push
-		// (origin untouched); #788 fix-up recovery then restores the run to its
-		// pre-fix-up review gate. Checked before the compile gate as the more
-		// specific signal. Modified-but-out-of-scope drift stays flag-only
-		// (ADR-027) — only CREATED files trip this, so we filter drift to the
-		// untracked subset.
-		if cfg.fixup {
+		// Created-out-of-scope gate (#818, generalized to the open-PR path by
+		// #825). A net-new (untracked) out-of-scope file is silently stripped
+		// from the scope-only commit by StageScoped (#581) while in-scope edits
+		// referencing it land — a misleadingly-green partial result. Fail
+		// category-B BEFORE the push (origin untouched). Checked before the
+		// compile gate as the more specific signal. Modified-but-out-of-scope
+		// drift stays flag-only (ADR-027) — only CREATED files trip this, so we
+		// filter drift to the untracked subset.
+		//
+		// The gate runs on the fix-up pass AND the normal open-PR implement push,
+		// but NOT on decomposed children: a child may legitimately create files a
+		// later child declares, so the shared-branch path tolerates net-new
+		// out-of-scope files. (cfg.noPR is already excluded by the early return
+		// upstream.) The fix-up and open-PR paths emit distinct events and wrap
+		// distinct sentinels with path-specific recovery guidance.
+		if cfg.fixup || (!isFixup && !isDecomposed) {
 			created, uerr := gitops.UntrackedPaths(ctx, repoDir, drift)
 			if uerr != nil {
 				return uerr
 			}
 			if len(created) > 0 {
 				createdJSON, _ := json.Marshal(created)
+				if cfg.fixup {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"fixup_created_out_of_scope","run_id":%q,"stage_id":%q,"head_sha":%q,"created":%s}`+"\n",
+						cfg.runID, cfg.stageID, headSHA, createdJSON)
+					return fmt.Errorf("%w: the fix-up created %d file(s) outside the stage's fixed scope.files: %s. "+
+						"A fix-up cannot widen scope.files, so these net-new files were rejected rather than silently "+
+						"stripped (which would ship a misleadingly-green partial result). The run has been restored to "+
+						"its pre-fix-up review gate — hand-apply the named file(s), or start a fresh run with a corrected "+
+						"scope that declares them",
+						gitops.ErrFixupCreatedOutOfScope, len(created), strings.Join(created, ", "))
+				}
 				_, _ = fmt.Fprintf(logSink,
-					`{"event":"fixup_created_out_of_scope","run_id":%q,"stage_id":%q,"head_sha":%q,"created":%s}`+"\n",
+					`{"event":"created_out_of_scope","run_id":%q,"stage_id":%q,"head_sha":%q,"created":%s}`+"\n",
 					cfg.runID, cfg.stageID, headSHA, createdJSON)
-				return fmt.Errorf("%w: the fix-up created %d file(s) outside the stage's fixed scope.files: %s. "+
-					"A fix-up cannot widen scope.files, so these net-new files were rejected rather than silently "+
-					"stripped (which would ship a misleadingly-green partial result). The run has been restored to "+
-					"its pre-fix-up review gate — hand-apply the named file(s), or start a fresh run with a corrected "+
+				return fmt.Errorf("%w: the implement stage created %d file(s) outside the approved scope.files: %s. "+
+					"These net-new files were rejected rather than silently stripped (which would ship a "+
+					"misleadingly-green partial PR). Amend the scope to declare them — name the files in the approval "+
+					"condition, or use the structured add_scope_files param once it exists — or replan with a corrected "+
 					"scope that declares them",
-					gitops.ErrFixupCreatedOutOfScope, len(created), strings.Join(created, ", "))
+					gitops.ErrCreatedOutOfScope, len(created), strings.Join(created, ", "))
 			}
 		}
 		if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, gateScopeFiles, logSink); err != nil {
