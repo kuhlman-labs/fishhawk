@@ -1655,6 +1655,68 @@ func TestBuild_ImplementReview_StandingAntiFalseRejectRule_AlwaysPresent(t *test
 	}
 }
 
+func TestBuild_ImplementReview_AmendedScope_RendersSection(t *testing.T) {
+	// #829: when an operator authorizes additional scope paths at approval
+	// time (#730 condition prose / #824 add_scope_files), the trace handler
+	// threads them onto Trigger.AmendedScopeFiles. The review prompt names them
+	// as in-scope so the reviewer does NOT flag them as scope drift under
+	// criterion 4.
+	got, err := Build("implement_review", Trigger{
+		Repo:              "kuhlman-labs/example",
+		ApprovedPlan:      fixturePlan(),
+		Diff:              "- M pkg/bar/bar.go\n",
+		AmendedScopeFiles: []string{"backend/cmd/fishhawk-mcp/README.md", "docs/extra.md"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"Scope amended at approval (operator-authorized — in-scope, NOT drift)",
+		"backend/cmd/fishhawk-mcp/README.md",
+		"docs/extra.md",
+		"Do NOT record a scope-drift concern for any",
+		// Criterion 4 must reference the amended list.
+		"Scope amended at approval' section above (when present) ARE in-scope",
+		"in NEITHER scope.files NOR the amended-scope list are drift",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("amended-scope prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_AmendedScope_AbsentWhenEmpty(t *testing.T) {
+	// #829: the amended-scope section is guarded by len>0, so a review prompt
+	// with no amendment is byte-identical to today (additive property). Build
+	// twice — once with a nil AmendedScopeFiles, once omitting the field — and
+	// assert the section header never appears and both renders match.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	withNil := base
+	withNil.AmendedScopeFiles = nil
+
+	gotBase, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build base: %v", err)
+	}
+	gotNil, err := Build("implement_review", withNil)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	// Check for the section header specifically — criterion 4 references the
+	// phrase "Scope amended at approval" unconditionally, so a bare-substring
+	// check would false-positive.
+	if strings.Contains(gotBase, "### Scope amended at approval") {
+		t.Errorf("amended-scope section should be absent when AmendedScopeFiles is empty:\n%s", gotBase)
+	}
+	if gotBase != gotNil {
+		t.Errorf("explicit-nil AmendedScopeFiles must be byte-identical to omitting it")
+	}
+}
+
 func TestBuild_ImplementReview_WithPatch_RendersHunks(t *testing.T) {
 	patch := "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n" +
 		"@@ -1,3 +1,3 @@\n-old line\n+new line\n"
