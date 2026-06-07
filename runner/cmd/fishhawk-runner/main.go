@@ -844,11 +844,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// commit that dropped build-required drift; ErrCommittedTestsFailed
 				// is the test-phase extension (#800) catching a scope-only commit
 				// whose touched-package tests fail because a drift-excluded test
-				// fake was dropped. Everything else (network, git, GitHub API) is
-				// category-C infra.
+				// fake was dropped. ErrFixupCreatedOutOfScope is the fix-up-only
+				// gate (#818) catching a fix-up that created net-new out-of-scope
+				// files (silently stripped → misleadingly-green partial). Everything
+				// else (network, git, GitHub API) is category-C infra.
 				if errors.Is(err, upload.ErrPullRequestInvalid) ||
 					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
-					errors.Is(err, gitops.ErrCommittedTestsFailed) {
+					errors.Is(err, gitops.ErrCommittedTestsFailed) ||
+					errors.Is(err, gitops.ErrFixupCreatedOutOfScope) {
 					res.FailureCategory = "B"
 				} else {
 					res.FailureCategory = "C"
@@ -2478,6 +2481,34 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// the push, so a failure leaves origin untouched.
 	gateScopeFiles := scopePaths(cfg.scopeFiles)
 	verifyCommit := func(ctx context.Context, headSHA string, drift []string) error {
+		// Fix-up-only created-out-of-scope gate (#818). A fix-up pass cannot
+		// widen the stage's fixed scope.files, so any net-new (untracked)
+		// out-of-scope file it created was silently stripped from the
+		// scope-only commit while in-scope edits referencing it landed — a
+		// misleadingly-green partial fix-up. Fail category-B BEFORE the push
+		// (origin untouched); #788 fix-up recovery then restores the run to its
+		// pre-fix-up review gate. Checked before the compile gate as the more
+		// specific signal. Modified-but-out-of-scope drift stays flag-only
+		// (ADR-027) — only CREATED files trip this, so we filter drift to the
+		// untracked subset.
+		if cfg.fixup {
+			created, uerr := gitops.UntrackedPaths(ctx, repoDir, drift)
+			if uerr != nil {
+				return uerr
+			}
+			if len(created) > 0 {
+				createdJSON, _ := json.Marshal(created)
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"fixup_created_out_of_scope","run_id":%q,"stage_id":%q,"head_sha":%q,"created":%s}`+"\n",
+					cfg.runID, cfg.stageID, headSHA, createdJSON)
+				return fmt.Errorf("%w: the fix-up created %d file(s) outside the stage's fixed scope.files: %s. "+
+					"A fix-up cannot widen scope.files, so these net-new files were rejected rather than silently "+
+					"stripped (which would ship a misleadingly-green partial result). The run has been restored to "+
+					"its pre-fix-up review gate — hand-apply the named file(s), or start a fresh run with a corrected "+
+					"scope that declares them",
+					gitops.ErrFixupCreatedOutOfScope, len(created), strings.Join(created, ", "))
+			}
+		}
 		if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, gateScopeFiles, logSink); err != nil {
 			driftJSON, _ := json.Marshal(drift)
 			// The test phase (#800) shares the gate; emit a test_gate_failed
