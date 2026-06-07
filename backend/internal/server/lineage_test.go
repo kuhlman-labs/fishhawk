@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -307,6 +308,94 @@ func TestVerifyBranchLineage_NonDefaultBase(t *testing.T) {
 	}
 }
 
+// TestVerifyBranchLineage_ChildPush_Contamination exercises the guard's
+// SECOND call site — succeedChildPushStage (Outcome="pushed"), the
+// decomposed-child shared-branch boundary. A foreign commit on the shared
+// branch must fail the child implement stage category-B, emit a
+// foreign_commit_on_branch violation, and NOT advance the stage. The child
+// push body carries no PR number, so the anchor resolves from the run's
+// tracked pull_request_url.
+func TestVerifyBranchLineage_ChildPush_Contamination(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const head = "1111111111111111111111111111111111111111"
+	const foreign = "ffffffffffffffffffffffffffffffffffffffff" // not in ledger
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {foreign, head}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, sf, au, rr := newLineageServer(t, gh, runRow, stage)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPRRequest(t, s, runID, stageID, priv, mustChildPushBody(t, head), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	v := foreignViolation(au)
+	if v == nil {
+		t.Fatal("expected a foreign_commit_on_branch invariant_violation audit entry, got none")
+	}
+	var payload struct {
+		OffendingSHA string `json:"offending_sha"`
+	}
+	if err := json.Unmarshal(v.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal violation payload: %v", err)
+	}
+	if payload.OffendingSHA != foreign {
+		t.Errorf("offending_sha = %q, want %q", payload.OffendingSHA, foreign)
+	}
+	if !transitionedTo(rr, run.StageStateFailed) {
+		t.Error("child-push stage was not failed")
+	}
+	if transitionedTo(rr, run.StageStateAwaitingApproval) {
+		t.Error("child-push stage advanced despite a lineage violation")
+	}
+	if stub.lastCompareBase != "main" {
+		t.Errorf("compare base = %q, want %q (PR base ref)", stub.lastCompareBase, "main")
+	}
+}
+
+// TestVerifyBranchLineage_LedgerDegradesOnReadError exercises
+// buildReportedHeadLedger's WARN-and-skip branch: when ListForRunByCategory
+// returns an error for the ledger categories, the ledger degrades gracefully
+// (falling back to the current report's head_sha bootstrap) and a clean run
+// still PASSES rather than being blocked. A read error must never produce a
+// false foreign-commit verdict.
+func TestVerifyBranchLineage_LedgerDegradesOnReadError(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const head = "1111111111111111111111111111111111111111"
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {head}}, // only the run's own commit
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, sf, au, rr := newLineageServer(t, gh, runRow, stage)
+	au.listByCategoryErr = errors.New("audit read boom") // ledger category reads fail
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPRRequest(t, s, runID, stageID, priv, mustPRBody(t, head), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("ledger read-error path emitted a violation: %+v", v)
+	}
+	if !transitionedTo(rr, run.StageStateAwaitingApproval) {
+		t.Error("ledger degradation path did not advance the happy path")
+	}
+}
+
 // TestVerifyBranchLineage_CaseC_FailOpenOnCompareError: a CompareCommits
 // error (transient GitHub failure) must WARN and proceed — the happy path
 // advances, no violation.
@@ -402,6 +491,20 @@ func mustPRBody(t *testing.T, headSHA string) []byte {
 		BaseSHA:           "2222222222222222222222222222222222222222",
 		Title:             "A change.",
 		FilesChangedCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func mustChildPushBody(t *testing.T, headSHA string) []byte {
+	t.Helper()
+	b, err := json.Marshal(pullRequestBody{
+		Outcome: "pushed",
+		Branch:  "fishhawk/run/stage",
+		HeadSHA: headSHA,
+		BaseSHA: "2222222222222222222222222222222222222222",
 	})
 	if err != nil {
 		t.Fatal(err)
