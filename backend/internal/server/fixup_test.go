@@ -136,6 +136,90 @@ func TestFixupStage_HappyPath(t *testing.T) {
 	}
 }
 
+// TestFixupStage_AllowCreatePersisted asserts the validated allow_create
+// paths land on the stage_fixup_triggered audit payload (#823) so the
+// prompt renderer can fold them into the effective scope.files.
+func TestFixupStage_AllowCreatePersisted(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "needs a new helper file"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		Concerns:    []int{0},
+		Reason:      "add the helper",
+		AllowCreate: []string{"  backend/internal/server/helper.go  ", "docs/api/v0.md"},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload struct {
+		AllowCreate []string `json:"allow_create"`
+	}
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	// Entries are trimmed; order preserved.
+	want := []string{"backend/internal/server/helper.go", "docs/api/v0.md"}
+	if len(payload.AllowCreate) != len(want) {
+		t.Fatalf("allow_create = %v, want %v", payload.AllowCreate, want)
+	}
+	for i := range want {
+		if payload.AllowCreate[i] != want[i] {
+			t.Errorf("allow_create[%d] = %q, want %q", i, payload.AllowCreate[i], want[i])
+		}
+	}
+}
+
+// TestFixupStage_AllowCreateInvalidRejected asserts an absolute,
+// ".."-containing, or empty allow_create entry returns 400
+// validation_failed with field=allow_create, before any state change.
+func TestFixupStage_AllowCreateInvalidRejected(t *testing.T) {
+	cases := map[string][]string{
+		"absolute":  {"/etc/passwd"},
+		"traversal": {"../../etc/passwd"},
+		"empty":     {"   "},
+	}
+	for name, paths := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, repo, au := fixupServer(t)
+			stage := seedImplementGateStage(repo)
+			seedConcernsReview(au, stage,
+				planreview.Concern{Severity: planreview.SeverityLow, Category: "scope", Note: "x"},
+			)
+
+			w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, AllowCreate: paths})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			var env struct {
+				Error struct {
+					Code    string         `json:"code"`
+					Details map[string]any `json:"details"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+				t.Fatalf("unmarshal error: %v", err)
+			}
+			if env.Error.Code != "validation_failed" {
+				t.Errorf("code = %q, want validation_failed", env.Error.Code)
+			}
+			if env.Error.Details["field"] != "allow_create" {
+				t.Errorf("field = %v, want allow_create", env.Error.Details["field"])
+			}
+			// No state change: the transition is never reached, so no audit
+			// entry is appended.
+			if len(au.appended) != 0 {
+				t.Errorf("audit entries = %d, want 0 (rejected before transition)", len(au.appended))
+			}
+		})
+	}
+}
+
 func TestFixupStage_PushOpenPRReopensAndReparks(t *testing.T) {
 	s, repo, au := fixupServer(t)
 	impl, review := seedPushOpenPRStages(repo, run.StageStateAwaitingApproval)

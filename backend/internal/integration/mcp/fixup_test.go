@@ -234,6 +234,162 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 	}
 }
 
+// TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope is the cross-boundary
+// integration test for the fix-up allow-create allow-list (#823). It
+// drives the seam the per-layer unit tests can't cover alone (cf. #618):
+// the MCP tool input → HTTP request → stage_fixup_triggered audit payload
+// persist → prompt renderer's effective scope.files. It proves both
+// directions at once:
+//
+//   - a path DECLARED via allow_create folds into the implement prompt's
+//     scope.files — the exact union the runner's #818 created-out-of-scope
+//     gate diffs created files against — so the runner stages it and the
+//     gate no longer trips for it;
+//   - a path NOT declared (nor in the approved plan scope) does NOT appear
+//     in the effective scope.files, so the #818 silent-strip hole stays
+//     closed: an undeclared created file is still category-B.
+func TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Second backend over the SAME pool with GitHub + ArtifactRepo wired so
+	// the implement prompt can load the approved plan's scope.files. (The
+	// fixture's own server has neither.)
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// 1. Seed a plan stage carrying an approved standard_v1 plan whose
+	// scope.files is non-empty (the empty-scope fold guard requires it).
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:        fx.runID,
+		Sequence:     1,
+		Type:         runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent,
+		ExecutorRef:  "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	planContent, err := json.Marshal(map[string]any{
+		"plan_version": "standard_v1",
+		"summary":      "scoped plan",
+		"verification": map[string]any{"test_strategy": "ts", "rollback_plan": "rb"},
+		"scope": map[string]any{
+			"files": []map[string]any{
+				{"path": "backend/internal/server/prompt.go", "operation": "modify"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	sum := sha256.Sum256(planContent)
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planContent,
+		ContentHash:   hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+
+	// 2. Seed the implement stage parked at the review gate.
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         2,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, implStage.ID)
+
+	// 3. Record the implement-review concern the fix-up routes back: a
+	// concern requiring a NET-NEW file.
+	concern := planreview.Concern{
+		Severity: planreview.SeverityMedium,
+		Category: "scope",
+		Note:     "extract the helper into a new file backend/internal/server/helper.go",
+	}
+	seedImplementReview(t, ctx, auditRepo, fx.runID, implStage.ID, concern)
+
+	// 4. Trigger the fix-up through the real MCP binary, declaring the
+	// net-new file via allow_create. An UNDECLARED sibling path is named
+	// only here in the test — never passed to the tool.
+	const declared = "backend/internal/server/helper.go"
+	const undeclared = "backend/internal/server/undeclared.go"
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":     implStage.ID.String(),
+			"concerns":     []int{0},
+			"reason":       "create the declared helper file",
+			"allow_create": []string{declared},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+
+	// 5. The stage_fixup_triggered audit entry persisted the declared path.
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 1", len(entries))
+	}
+	var triggered struct {
+		AllowCreate []string `json:"allow_create"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &triggered); err != nil {
+		t.Fatalf("unmarshal stage_fixup_triggered payload: %v", err)
+	}
+	if len(triggered.AllowCreate) != 1 || triggered.AllowCreate[0] != declared {
+		t.Fatalf("persisted allow_create = %v, want [%s]", triggered.AllowCreate, declared)
+	}
+
+	// 6. The end-to-end assertion: the implement prompt's effective
+	// scope.files CONTAINS the declared path (folded in alongside the plan
+	// scope file) and does NOT contain the undeclared sibling.
+	scopeFiles := getPromptRenderScopeFiles(t, ctx, httpSrv.URL, implStage.ID)
+	inScope := map[string]bool{}
+	for _, p := range scopeFiles {
+		inScope[p] = true
+	}
+	if !inScope["backend/internal/server/prompt.go"] {
+		t.Errorf("plan scope file missing from effective scope.files: %v", scopeFiles)
+	}
+	if !inScope[declared] {
+		t.Errorf("declared allow_create path %q not folded into effective scope.files: %v", declared, scopeFiles)
+	}
+	if inScope[undeclared] {
+		t.Errorf("undeclared path %q leaked into effective scope.files — #818 silent-strip hole reopened: %v", undeclared, scopeFiles)
+	}
+}
+
 // TestE2E_Fixup_PushOpenPRReopensImplementAndReparksReview drives the
 // push_and_open_pr fix-up seam end-to-end (#780): with push_and_open_pr
 // the implement stage SUCCEEDS (it opens the PR) and the human gate is a
@@ -984,6 +1140,40 @@ func getPromptRender(t *testing.T, ctx context.Context, baseURL string, stageID 
 		t.Fatalf("decode prompt-render response: %v", err)
 	}
 	return out.Prompt
+}
+
+// getPromptRenderScopeFiles fetches GET /v0/stages/{id}/prompt-render and
+// returns the effective scope.files paths (the union the runner's #818
+// created-out-of-scope gate diffs against), in order.
+func getPromptRenderScopeFiles(t *testing.T, ctx context.Context, baseURL string, stageID uuid.UUID) []string {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		baseURL+"/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	if err != nil {
+		t.Fatalf("build prompt-render request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("prompt-render request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prompt-render status %d: %s", resp.StatusCode, raw)
+	}
+	var out struct {
+		ScopeFiles []struct {
+			Path string `json:"path"`
+		} `json:"scope_files"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode prompt-render response: %v", err)
+	}
+	paths := make([]string, 0, len(out.ScopeFiles))
+	for _, f := range out.ScopeFiles {
+		paths = append(paths, f.Path)
+	}
+	return paths
 }
 
 // decodeStructured marshals a tool result's StructuredContent and

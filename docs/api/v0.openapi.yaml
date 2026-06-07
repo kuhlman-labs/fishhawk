@@ -2430,6 +2430,22 @@ paths:
                   description: |
                     Optional operator rationale, recorded on the
                     `stage_fixup_triggered` audit entry.
+                allow_create:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    Optional repo-relative paths this fix-up will CREATE
+                    (#823). Each declared path is folded into the implement
+                    stage's effective `scope.files` for THIS fix-up pass only
+                    (never the persisted plan scope) so the runner stages the
+                    net-new file instead of failing the created-out-of-scope
+                    gate (category-B, #818). Any created file NOT declared here
+                    still fails category-B — declaring a path widens the
+                    legitimate set without reopening the silent-strip hole.
+                    Entries must be repo-relative: an absolute path or one
+                    containing `..` is rejected (400 `validation_failed`,
+                    `field: allow_create`).
       responses:
         '200':
           description: Stage re-opened for the fix-up pass; refreshed Stage row in body.

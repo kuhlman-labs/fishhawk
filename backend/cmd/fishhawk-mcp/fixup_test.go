@@ -53,6 +53,34 @@ func TestFixupStage_HappyPath_ReopensToPending(t *testing.T) {
 	}
 }
 
+func TestFixupStage_AllowCreate_ThreadsIntoBody(t *testing.T) {
+	// allow_create (#823) must reach the backend request body verbatim so
+	// the declared net-new files fold into the effective scope for the pass.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.fixupResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "pending",
+	}
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:     stageID.String(),
+		Concerns:    []int{0},
+		Reason:      "add the new helper file",
+		AllowCreate: []string{"backend/internal/server/helper.go", "docs/api/v0.md"},
+	})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if !reflect.DeepEqual(fb.fixupBody.AllowCreate, []string{"backend/internal/server/helper.go", "docs/api/v0.md"}) {
+		t.Errorf("body allow_create = %v, want the threaded paths", fb.fixupBody.AllowCreate)
+	}
+}
+
 func TestFixupStage_InvalidUUID_FailsLocally(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
