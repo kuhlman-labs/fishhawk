@@ -396,6 +396,53 @@ func TestVerifyBranchLineage_LedgerDegradesOnReadError(t *testing.T) {
 	}
 }
 
+// TestVerifyBranchLineage_MultiPushLedgerReadErrorFailsOpen is the regression
+// for the partial-ledger false-block: on a MULTI-push run (compare returns the
+// original PR-open head h1 PLUS the current head h2 — both legitimate), if the
+// audit reads fail, an incomplete ledger would degrade to {h2} only and
+// false-flag h1 as foreign, producing a false category-B failure of a clean
+// run. The guard must instead FAIL OPEN when the ledger cannot be built
+// completely (a contamination MISS is acceptable; a false BLOCK is not). With
+// the fix the run advances with no violation; pre-fix it failed the stage and
+// emitted a foreign_commit_on_branch violation against h1.
+func TestVerifyBranchLineage_MultiPushLedgerReadErrorFailsOpen(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const h1 = "1111111111111111111111111111111111111111" // original PR-open head (legit)
+	const h2 = "2222222222222222222222222222222222222222" // current fix-up head (legit)
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {h1, h2}}, // both legitimate run commits
+	}
+	gh := newLineageGitHubClient(t, stub)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, sf, au, rr := newLineageServer(t, gh, runRow, stage)
+	// h1's ledger entry exists, but every category read fails — so it cannot be
+	// loaded and the ledger is incomplete. Without fail-open, h1 is mis-flagged.
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "pull_request_opened",
+		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, h1)),
+	})
+	au.listByCategoryErr = errors.New("audit read boom")
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPRRequest(t, s, runID, stageID, priv, mustFixupBody(t, h2), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("incomplete-ledger path false-flagged a legitimate prior head: %+v", v)
+	}
+	if !transitionedTo(rr, run.StageStateAwaitingApproval) {
+		t.Error("incomplete-ledger fail-open did not advance the clean multi-push run")
+	}
+}
+
 // TestVerifyBranchLineage_CaseC_FailOpenOnCompareError: a CompareCommits
 // error (transient GitHub failure) must WARN and proceed — the happy path
 // advances, no violation.

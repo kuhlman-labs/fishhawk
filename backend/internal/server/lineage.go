@@ -87,7 +87,24 @@ func (s *Server) verifyBranchLineage(ctx context.Context, runID uuid.UUID,
 		return true
 	}
 
-	ledger := s.buildReportedHeadLedger(ctx, runID, headSHA)
+	ledger, complete := s.buildReportedHeadLedger(ctx, runID, headSHA)
+	if !complete {
+		// Could not build the COMPLETE set of this run's legitimate head
+		// SHAs (an audit read failed). Enforcing against a partial ledger
+		// would false-flag a legitimate prior-push commit as foreign on a
+		// multi-push run (e.g. after a fixup_pushed: the original PR-open
+		// head + the fix-up head) — exactly the false BLOCK this guard must
+		// never produce. If we cannot enumerate what is legitimate, we
+		// cannot safely call anything foreign: fail open (defer), as on a
+		// CompareCommits error or a missing anchor. A contamination MISS is
+		// acceptable (the invariant monitor backstops it); a false block is
+		// not.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch lineage: reported-head ledger incomplete (audit read failed); skipping check",
+			slog.String("run_id", runID.String()),
+			slog.String("head_sha", headSHA))
+		return true
+	}
 
 	commits, err := s.cfg.GitHub.CompareCommits(ctx, *runRow.InstallationID, repo, baseRef, headSHA)
 	if err != nil {
@@ -152,16 +169,23 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 // reported across its pull_request_opened / child_pushed / fixup_pushed
 // audit entries, plus the current report's headSHA (the first-report
 // bootstrap — the PR-open report itself may not yet be in the chain
-// when the guard runs). A read error on any category is WARNed and that
-// category is skipped; the current headSHA is always a member, so the
-// run's own just-pushed commit is never flagged.
-func (s *Server) buildReportedHeadLedger(ctx context.Context, runID uuid.UUID, headSHA string) map[string]struct{} {
-	ledger := map[string]struct{}{headSHA: {}}
+// when the guard runs).
+//
+// It returns complete=false if a read error on ANY ledger category
+// prevented building the full set. The caller MUST fail open on an
+// incomplete ledger rather than enforce membership against it: a partial
+// ledger missing a legitimate prior-push head would false-flag that
+// commit as foreign on a multi-push run. complete=true means every
+// category was read successfully and the ledger is authoritative.
+func (s *Server) buildReportedHeadLedger(ctx context.Context, runID uuid.UUID, headSHA string) (ledger map[string]struct{}, complete bool) {
+	ledger = map[string]struct{}{headSHA: {}}
+	complete = true
 	for _, cat := range lineageLedgerCategories {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
 		if err != nil {
+			complete = false
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"branch lineage: list audit entries failed; ledger may be incomplete",
+				"branch lineage: list audit entries failed; ledger incomplete (guard fails open)",
 				slog.String("run_id", runID.String()),
 				slog.String("category", cat),
 				slog.String("error", err.Error()))
@@ -179,7 +203,7 @@ func (s *Server) buildReportedHeadLedger(ctx context.Context, runID uuid.UUID, h
 			}
 		}
 	}
-	return ledger
+	return ledger, complete
 }
 
 // recordForeignCommitViolation fails the stage category-B, writes the
