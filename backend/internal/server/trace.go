@@ -436,7 +436,26 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 				)
 				scopeDrift = nil
 			}
-			if s.runImplementReviews(r.Context(), runID, stageID, diff, scopeDrift) {
+			// Extract the bundle's verify_run head_sha as the #797 dedup key
+			// threaded into runImplementReviews. Best-effort: ErrNoHeadSHA
+			// (the no-verify / head_sha-less case) leaves headSHA empty
+			// without a WARN (the ordinary case); any other error WARN-logs
+			// and also degrades to an empty key. An empty key never blocks —
+			// the guard fails open and dedup falls back to the retained
+			// raw-variant gate (the redacted double is still prevented).
+			headSHA, hserr := bundle.ExtractHeadSHA(bundleBytes)
+			if hserr != nil {
+				if !errors.Is(hserr, bundle.ErrNoHeadSHA) {
+					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+						"trace upload: extract head_sha failed — proceeding with no dedup key",
+						slog.String("run_id", runID.String()),
+						slog.String("stage_id", stageID.String()),
+						slog.String("error", hserr.Error()),
+					)
+				}
+				headSHA = ""
+			}
+			if s.runImplementReviews(r.Context(), runID, stageID, diff, scopeDrift, headSHA) {
 				cat := run.FailureB
 				reason := "implement_review_rejected: agent review verdict reject under gating authority"
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
@@ -1944,7 +1963,7 @@ func (s *Server) sumRunTokens(ctx context.Context, runID uuid.UUID) int64 {
 //
 // Per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't block the stage — the diff is already stored.
-func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string) bool {
+func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA string) bool {
 	if s.cfg.RunRepo == nil {
 		return false
 	}
@@ -2060,13 +2079,37 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		return false
 	}
 
+	// Idempotency guard (#797): the outer raw-variant gate (#793) already
+	// dedups the raw+redacted pair of one pack, but a retried raw upload (a
+	// transient 5xx after the review already dispatched → runner re-POSTs
+	// raw) would otherwise dispatch a SECOND review with divergent verdicts
+	// and #777 hint over-fire. Skip dispatch when an implement_review_started
+	// entry already exists for this stage with the SAME head_sha. Keying on
+	// (stage_id, head_sha) preserves the legitimate FixupStage re-review
+	// (same stage_id, NEW head_sha). Fails open: implementReviewAlreadyStarted
+	// returns false for an empty headSHA (the no-verify / head_sha-less path),
+	// and a read error WARN-logs and falls through to dispatch — an absent or
+	// unreadable key never suppresses a review.
+	if headSHA != "" && s.cfg.AuditRepo != nil {
+		started, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
+		if lerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list implement_review_started failed — proceeding with dispatch",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", lerr.Error()),
+			)
+		} else if implementReviewAlreadyStarted(started, stageID, headSHA) {
+			return false
+		}
+	}
+
 	// Pending-signal (#600): emit an implement_review_started audit entry
 	// now that a reviewer will actually run. Emitted synchronously before
 	// the dispatch loop so started precedes every implement_reviewed entry
 	// under both authorities — the MCP review_status proxy reads it to tell
 	// 'configured + running' (pending) from 'none configured'. Mirrors the
 	// plan path (runPlanReviews). Best-effort: never blocks dispatch.
-	s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.Agent)
+	s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.Agent, headSHA)
 
 	// Detach the reviewer context from the request lifecycle (#584); see
 	// runPlanReviews for the rationale. The goroutine / loop closes over
@@ -2345,6 +2388,40 @@ func (s *Server) handleGetStageTrace(w http.ResponseWriter, r *http.Request) {
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// implementReviewAlreadyStarted reports whether an implement_review_started
+// audit entry for the given stage with the same head_sha already exists, so a
+// retried raw trace upload can be deduped before re-dispatching the review
+// (#797). It mirrors childPushAlreadyRecorded (#776): the entries are
+// sequence-ascending per ListForRunByCategory's contract, and we skip any
+// whose StageID is nil or mismatched. The keying is (stage_id, head_sha) — a
+// FixupStage re-review reopens the SAME stage_id with a NEW head_sha and is
+// not suppressed.
+//
+// CRUCIALLY it returns false immediately for an empty headSHA so an absent
+// head_sha NEVER suppresses dispatch (fail-open): the no-verify path, the
+// gate-skipped/infra-failure paths, and older entries without the field all
+// degrade to the retained #793 raw-variant gate rather than blocking a review.
+func implementReviewAlreadyStarted(entries []*audit.Entry, stageID uuid.UUID, headSHA string) bool {
+	if headSHA == "" {
+		return false
+	}
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.HeadSHA == headSHA {
+			return true
+		}
+	}
+	return false
 }
 
 // pickRedactedTraceHash walks the run's trace_uploaded audit entries

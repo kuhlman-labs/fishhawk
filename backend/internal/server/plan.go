@@ -731,7 +731,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// has a lower audit sequence than reviewed under both gating
 	// (synchronous) and advisory (detached) authority. Best-effort:
 	// WARN-log and continue on append failure so dispatch is never blocked.
-	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.Agent)
+	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.Agent, "")
 
 	// Detach the reviewer context from the request lifecycle (#584).
 	// context.WithoutCancel keeps the parent's values but is NOT
@@ -786,13 +786,17 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 // as proof that a review is pending rather than absent. Mirrors the
 // skipped-entry error handling: WARN-log and continue on append failure
 // so the dispatch path is never blocked.
-func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int) {
+func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, headSHA string) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}
 	payload, _ := json.Marshal(planreview.ReviewStartedPayload{
 		ConfiguredAgents: configuredAgents,
 		Authority:        authority,
+		// Empty for the plan path (no diff/head_sha; omitempty keeps the
+		// payload byte-identical); the implement path passes the bundle's
+		// verify_run head_sha as the #797 dedup key.
+		HeadSHA: headSHA,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

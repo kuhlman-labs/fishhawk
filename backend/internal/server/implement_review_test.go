@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
@@ -184,6 +185,45 @@ func implementDiffBundleWithScopeDrift(t *testing.T, files []map[string]string, 
 		"seq": 3, "kind": "policy_event", "data": json.RawMessage(driftPayload),
 	})
 	raw.Write(driftLine)
+	raw.WriteByte('\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+// implementFixupBundleWithHeadSHA builds a push_fixup implement bundle (so the
+// forward-gate keeps the stage in `running` across uploads, like a fix-up
+// re-dispatch / a retried raw upload) carrying a git_diff AND a verify_run
+// event with the given committed-tree head_sha. The head_sha is the #797
+// implement-review dedup key: raw and redacted variants of one pack carry the
+// same value, while a re-pack carries a new one.
+func implementFixupBundleWithHeadSHA(t *testing.T, fileCount int, headSHA string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	manifest, _ := json.Marshal(bundle.Manifest{BundleSchema: "v1", PushFixup: true})
+	manifestLine, _ := json.Marshal(map[string]any{"seq": 1, "kind": "manifest", "data": json.RawMessage(manifest)})
+	raw.Write(manifestLine)
+	raw.WriteByte('\n')
+
+	files := make([]map[string]string, 0, fileCount)
+	for i := 0; i < fileCount; i++ {
+		files = append(files, map[string]string{"path": fmt.Sprintf("file%d.go", i), "status": "modified"})
+	}
+	diffPayload, _ := json.Marshal(map[string]any{
+		"kind": "name_status", "base_ref": "origin/main", "files": files, "num_files": fileCount,
+	})
+	diffLine, _ := json.Marshal(map[string]any{"seq": 2, "kind": "git_diff", "data": json.RawMessage(diffPayload)})
+	raw.Write(diffLine)
+	raw.WriteByte('\n')
+
+	verifyPayload, _ := json.Marshal(map[string]any{
+		"command": "go build ./...", "head_sha": headSHA, "exit_code": 0, "output": "", "outcome": "passed",
+	})
+	verifyLine, _ := json.Marshal(map[string]any{"seq": 3, "kind": "verify_run", "data": json.RawMessage(verifyPayload)})
+	raw.Write(verifyLine)
 	raw.WriteByte('\n')
 
 	var gz bytes.Buffer
@@ -606,17 +646,17 @@ func TestShipTrace_ImplementReview_FixupRedispatch_StillReviews(t *testing.T) {
 	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
 	priv, _ := sf.issue(t, runRow.ID)
 
-	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
-	t1 := t0.Add(5 * time.Minute)
 	// Two separate upload cycles for the SAME stage_id. The forward-gate keeps
 	// the stage in `running` across both, mirroring a fix-up re-dispatch onto
-	// the existing PR branch. The differing fileCount stands in for the new
-	// diff/head_sha each cycle carries.
-	for _, fileCount := range []int{2, 3} {
-		bundleBytes := makeFixupPushBundle(t, true, fileCount, t0, t1)
+	// the existing PR branch. Each cycle carries a DISTINCT verify_run head_sha
+	// (a re-pack runs a new committed-tree verify → new commit SHA), proving the
+	// (stage_id, head_sha) key discriminates by SHA — not merely by the
+	// empty-head_sha bypass.
+	for i, headSHA := range []string{"fixupsha-cycle-1", "fixupsha-cycle-2"} {
+		bundleBytes := implementFixupBundleWithHeadSHA(t, 2+i, headSHA)
 		w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
 		if w.Code != http.StatusAccepted {
-			t.Fatalf("fix-up cycle (%d files) status = %d, want 202:\n%s", fileCount, w.Code, w.Body.String())
+			t.Fatalf("fix-up cycle (head_sha %s) status = %d, want 202:\n%s", headSHA, w.Code, w.Body.String())
 		}
 	}
 
@@ -627,6 +667,46 @@ func TestShipTrace_ImplementReview_FixupRedispatch_StillReviews(t *testing.T) {
 	}
 	if n := countAuditCategory(au, "implement_reviewed"); n != 2 {
 		t.Errorf("implement_reviewed entries = %d, want 2 (fix-up re-dispatch must get its own review)", n)
+	}
+}
+
+// TestShipTrace_ImplementReview_RetriedRawUpload_DedupsBySHA is the #797
+// regression: the raw-variant gate (#793) dedups the raw+redacted pair of one
+// pack, but NOT a RETRIED raw upload — a transient 5xx after the review already
+// dispatched makes the runner re-POST the same raw bundle, which under the
+// variant-only gate dispatched a SECOND review (divergent verdicts, #777 hint
+// over-fire). The (stage_id, head_sha) idempotency guard suppresses the retry:
+// the same head_sha already has an implement_review_started entry, so the
+// second raw upload is a no-op. This drives the real extract → emit → guard
+// seam end-to-end (advanceStageAfterTrace → bundle.ExtractHeadSHA →
+// runImplementReviews → emitReviewStarted write → implementReviewAlreadyStarted
+// read) — a per-layer unit would pass while this producer/consumer seam breaks
+// (cf. #618). Fails before #797 with two of each.
+func TestShipTrace_ImplementReview_RetriedRawUpload_DedupsBySHA(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	// One pack with a fixed verify_run head_sha, POSTed raw TWICE — a
+	// transient-5xx retry re-uploads the identical raw bundle.
+	bundleBytes := implementFixupBundleWithHeadSHA(t, 2, "retried-raw-sha")
+	for i := 0; i < 2; i++ {
+		w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("raw upload %d status = %d, want 202:\n%s", i, w.Code, w.Body.String())
+		}
+	}
+
+	// Advisory reviews run detached (#584); drain before asserting.
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_review_started"); n != 1 {
+		t.Errorf("implement_review_started entries = %d, want 1 (retried raw upload must dedup on head_sha)", n)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed entries = %d, want 1 (retried raw upload must dedup on head_sha)", n)
 	}
 }
 
@@ -844,7 +924,7 @@ func TestShipTrace_ImplementReview_Advisory_ContextDetached(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Advisory → dispatches a detached goroutine and returns false.
-	if s.runImplementReviews(ctx, runRow.ID, implStage.ID, diff, nil) {
+	if s.runImplementReviews(ctx, runRow.ID, implStage.ID, diff, nil, "") {
 		t.Fatal("advisory runImplementReviews returned true (advisory must never gate)")
 	}
 
