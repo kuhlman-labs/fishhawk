@@ -227,6 +227,12 @@ type approvalRequest struct {
 	// footer `@`-mentions the real login rather than the raw token
 	// subject. Omitempty: SPA/CLI callers omit it and stay unaffected.
 	ApproverGithubLogin string `json:"approver_github_login,omitempty"`
+	// AddScopeFiles is the structured, authoritative scope amendment (#824):
+	// repo-relative paths to fold into the implement stage's scope.files on
+	// approve. A trailing slash marks a directory. The DisallowUnknownFields
+	// decoder on the backend requires the field be declared here too; reject
+	// and conditionless approve callers pass nil (omitempty).
+	AddScopeFiles []string `json:"add_scope_files,omitempty"`
 }
 
 // SubmitApproval posts an approve or reject decision against the
@@ -236,7 +242,9 @@ type approvalRequest struct {
 // of the acting operator (#751) — empty when gh resolution was
 // unavailable; the backend records it in the approval audit payload
 // for issue-thread `@`-mention rendering while keeping the token
-// subject as the provenance identity. Returns the updated Stage. 4xx
+// subject as the provenance identity. `addScopeFiles` is the structured
+// scope amendment (#824) folded into the implement stage's scope.files on
+// approve; nil on reject and conditionless approve. Returns the updated Stage. 4xx
 // surfaces:
 //   - 400 validation_failed (decision other than approve/reject)
 //   - 404 stage_not_found
@@ -244,11 +252,12 @@ type approvalRequest struct {
 //     live on GitHub per ADR-018; not relevant for the MCP plan-
 //     approval tools but the wrapper surfaces the code if a future
 //     caller reaches this method with a review-stage id)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string) (*Stage, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string) (*Stage, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:            decision,
 		Comment:             comment,
 		ApproverGithubLogin: approverGithubLogin,
+		AddScopeFiles:       addScopeFiles,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)

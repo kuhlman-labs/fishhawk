@@ -2169,6 +2169,30 @@ paths:
                     (provenance). SPA/CLI callers omit it and are
                     unaffected. `decision` remains the only required
                     field.
+                add_scope_files:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    Optional, authoritative list of repo-relative
+                    paths to fold into the implement stage's
+                    `scope.files` on approve (#824). The structured,
+                    lossless replacement for naming paths in the
+                    free-text `comment`, whose regex scrape (#730)
+                    silently misses directories, extensionless or
+                    repo-root files (e.g. `go.work`), and
+                    described-but-not-spelled paths. A trailing slash
+                    marks a directory whose created files all stage
+                    under it (e.g. `pkg/testdata/corpus/`). Recorded on
+                    the approval audit payload and consumed by the
+                    prompt builder; the `comment` prose fold remains a
+                    fallback that composes with this field (structured
+                    first, then prose, both deduping by path). No-op
+                    when the plan declares an empty scope (preserves the
+                    runner's `git add -A` fallback). Does NOT weaken the
+                    policy gate: a folded path matching `forbidden_paths`
+                    still fails category-B against the produced diff.
+                    Honored only on `approve`; ignored on `reject`.
       responses:
         '200':
           description: Approval recorded; stage state advanced.

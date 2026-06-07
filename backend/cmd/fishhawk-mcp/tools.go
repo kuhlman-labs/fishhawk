@@ -1410,6 +1410,12 @@ func (r *runResolver) retryStage(ctx context.Context, _ *mcp.CallToolRequest, in
 type ApprovePlanInput struct {
 	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being approved"`
 	Reason string `json:"reason,omitempty" jsonschema:"optional reviewer rationale; injected to the implement agent as binding approval conditions (#558), so use it to amend the plan — also recorded on the approval row as 'comment'"`
+	// AddScopeFiles is the structured, authoritative way to add files to the
+	// implement stage's scope at approval time (#824) — preferred over naming
+	// paths in the free-text reason, which is regex-scraped (#730) and silently
+	// misses directories, extensionless/repo-root files, and described-not-spelled
+	// paths.
+	AddScopeFiles []string `json:"add_scope_files,omitempty" jsonschema:"optional authoritative list of repo-relative paths to fold into the implement stage's scope.files; preferred over naming paths in 'reason'. A trailing slash marks a directory (e.g. 'pkg/testdata/corpus/') whose created files all stage; handles extensionless and repo-root files (e.g. 'go.work') the prose fallback misses"`
 }
 
 // ApprovePlanOutput surfaces the post-approve Stage row plus the
@@ -1512,7 +1518,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles)
 	if err != nil {
 		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
@@ -1532,7 +1538,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan for the rationale. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil)
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}

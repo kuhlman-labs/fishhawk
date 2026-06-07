@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -3038,6 +3039,30 @@ func TestApprovePlan_HappyPath_ResolvesAndPostsApprove(t *testing.T) {
 	}
 	if fb.approvalsCalledByID[stageID] != 1 {
 		t.Errorf("approvals call count = %d, want 1", fb.approvalsCalledByID[stageID])
+	}
+}
+
+// TestApprovePlan_AddScopeFiles_PlumbedToSubmitApproval pins the #824 wire
+// seam: ApprovePlanInput.AddScopeFiles must reach the approvals request body
+// the backend decodes (MCP input -> client approvalRequest -> HTTP body).
+func TestApprovePlan_AddScopeFiles_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	paths := []string{"backend/internal/agenteval/testdata/corpus/newcase/", "go.work"}
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:         runID.String(),
+		Reason:        "fold the fixture dir",
+		AddScopeFiles: paths,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !reflect.DeepEqual(fb.approvalsBody.AddScopeFiles, paths) {
+		t.Errorf("add_scope_files = %v, want %v", fb.approvalsBody.AddScopeFiles, paths)
 	}
 }
 

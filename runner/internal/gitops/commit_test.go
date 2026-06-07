@@ -275,6 +275,85 @@ func TestStageScoped_StagesFileInBrandNewDir(t *testing.T) {
 	}
 }
 
+// TestStageScoped_DirPrefixStagesFolderContents is the #824 gating test: a
+// trailing-slash scope entry is a folded DIRECTORY whose created files should
+// all stage, so a directory the operator names via add_scope_files actually
+// reaches the commit. A file created OUTSIDE the prefix is still drift, and
+// the exact-match entries keep their precise behavior.
+func TestStageScoped_DirPrefixStagesFolderContents(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	// Two created files under a folded directory plus an out-of-prefix stray.
+	newDir := filepath.Join(repo, "testdata", "corpus", "newcase")
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newDir, "input.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newDir, "expected.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "stray.pid"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	drift, err := p.StageScoped(context.Background(), repo, []string{"testdata/corpus/newcase/"})
+	if err != nil {
+		t.Fatalf("StageScoped: %v", err)
+	}
+
+	staged := mustGitOut(t, repo, "diff", "--cached", "--name-only")
+	want := "testdata/corpus/newcase/expected.json\ntestdata/corpus/newcase/input.json"
+	if staged != want {
+		t.Errorf("staged files = %q, want %q", staged, want)
+	}
+	if len(drift) != 1 || drift[0] != "stray.pid" {
+		t.Errorf("drift = %v, want [stray.pid]", drift)
+	}
+}
+
+// TestStageScoped_ExactEntryDoesNotPrefixMatch pins the #824 condition that the
+// trailing-slash directory matching must NOT bleed into exact-path entries: a
+// plain (non-slash) scope entry stays exact-match, so a declared file must not
+// prefix-match a sibling that shares its name as a prefix (foo/bar.go must not
+// stage foo/bar.go.bak).
+func TestStageScoped_ExactEntryDoesNotPrefixMatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	dir := filepath.Join(repo, "foo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bar.go"), []byte("package foo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bar.go.bak"), []byte("backup\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	drift, err := p.StageScoped(context.Background(), repo, []string{"foo/bar.go"})
+	if err != nil {
+		t.Fatalf("StageScoped: %v", err)
+	}
+
+	staged := mustGitOut(t, repo, "diff", "--cached", "--name-only")
+	if staged != "foo/bar.go" {
+		t.Errorf("staged files = %q, want only foo/bar.go", staged)
+	}
+	if len(drift) != 1 || drift[0] != "foo/bar.go.bak" {
+		t.Errorf("drift = %v, want [foo/bar.go.bak] (sibling must not prefix-match)", drift)
+	}
+}
+
 // TestUntrackedPaths_IsolatesCreatedFromModified is the #818 gate seam:
 // UntrackedPaths must return only the brand-new (untracked) candidates, not
 // a modified-but-tracked one — that distinction is what lets the fix-up gate

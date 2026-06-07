@@ -427,8 +427,18 @@ func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []s
 	if err != nil {
 		return nil, fmt.Errorf("gitops: status: %w", err)
 	}
+	// Split declared entries into exact-match paths and directory prefixes.
+	// A trailing-slash entry (#824) is a folded directory: every created
+	// file beneath it should stage. A plain entry stays exact-match — a
+	// regular file must not prefix-match a sibling (foo/bar.go must never
+	// stage foo/bar.go.bak).
 	declared := make(map[string]bool, len(scopeFiles))
+	var dirPrefixes []string
 	for _, f := range scopeFiles {
+		if strings.HasSuffix(f, "/") {
+			dirPrefixes = append(dirPrefixes, f)
+			continue
+		}
 		declared[f] = true
 	}
 	var toStage []string
@@ -437,7 +447,7 @@ func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []s
 		if path == "" {
 			continue
 		}
-		if declared[path] {
+		if declared[path] || hasDirPrefix(path, dirPrefixes) {
 			toStage = append(toStage, path)
 		} else {
 			drift = append(drift, path)
@@ -450,6 +460,20 @@ func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []s
 		}
 	}
 	return drift, nil
+}
+
+// hasDirPrefix reports whether path lies under any of the trailing-slash
+// directory prefixes (#824). `git status --porcelain -uall` lists each
+// created file by its full repo-relative path, so a file inside a folded
+// directory (e.g. `corpus/newcase/`) surfaces as `corpus/newcase/x.json` and
+// matches the prefix. An empty prefix list short-circuits to false.
+func hasDirPrefix(path string, dirPrefixes []string) bool {
+	for _, prefix := range dirPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // UntrackedPaths returns the subset of candidates that git reports as
