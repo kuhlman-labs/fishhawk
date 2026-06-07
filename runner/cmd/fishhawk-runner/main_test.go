@@ -4546,6 +4546,44 @@ func TestRunVerifyGateCommitted_PostCommitResetFailureFatal(t *testing.T) {
 	}
 }
 
+// TestRunVerifyFixLoop_PostCommitResetFailureFatal is the #816 fix: the fix
+// loop's twin of TestRunVerifyGateCommitted_PostCommitResetFailureFatal. A
+// gitResetSoftHEAD1 failure AFTER a successful throwaway commit is FATAL (hard
+// error), not a non-blocking verify_fix_skipped. We force it by committing into
+// a repo with no prior commit, so the throwaway is the ROOT commit and
+// `git reset --soft HEAD~1` fails (no parent), leaving HEAD on the throwaway
+// commit. Swallowing that to a skip would let openPRAndShipArtifact stack the
+// real commit on top and push the WIP commit into the PR.
+func TestRunVerifyFixLoop_PostCommitResetFailureFatal(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, _ := compileGateRepo(t) // git init, no commits yet
+	mustWrite(t, filepath.Join(repo, "a.txt"), "hello\n")
+	cfg := config{
+		workingDir:          repo,
+		verifyCmd:           "true", // the command passes; the reset is what fails
+		verifyMaxIterations: 1,
+		scopeFiles:          []upload.ScopeFile{{Path: "a.txt", Operation: "create"}},
+	}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	if err == nil {
+		t.Fatal("a post-commit reset failure must be FATAL (hard error), not a non-blocking skip")
+	}
+	// HEAD must still point at the throwaway commit — the fatal error is exactly
+	// what stops openPRAndShipArtifact from stacking the real commit on top.
+	if _, herr := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output(); herr != nil {
+		t.Fatalf("expected a throwaway commit at HEAD: %v", herr)
+	}
+	// The fatal path must NOT route through the non-blocking skip.
+	if strings.Contains(logSink.String(), "verify_fix_skipped") {
+		t.Errorf("post-commit reset failure must not emit verify_fix_skipped:\n%s", logSink.String())
+	}
+}
+
 // TestRun_VerifyGateCommitted_Routing_NoPRKeepsWorkingTreeGate: a --no-pr
 // implement run has no committed tree to gate, so it keeps the #441 single-shot
 // WORKING-TREE gate (category A), NOT the committed gate.
