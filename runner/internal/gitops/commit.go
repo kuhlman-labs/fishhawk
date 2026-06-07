@@ -42,19 +42,32 @@ const DefaultRemote = "origin"
 // as a category-B failure (wrong-shaped output → re-scope/re-plan).
 var ErrCommitWouldNotCompile = errors.New("gitops: committed tree would not compile")
 
-// ErrFixupCreatedOutOfScope is the fix-up analogue of ErrCommitWouldNotCompile
-// / ErrCommittedTestsFailed (#818). A fix-up pass cannot widen the stage's fixed
-// scope.files, so a net-new file the fix-up needed to create is out of scope by
-// construction and would be silently stripped from the scope-only commit by
-// StageScoped (#581) — leaving the in-scope edits that REFERENCE it landed,
-// which ships a self-inconsistent, misleadingly-green partial result. The runner
-// wraps this (via fmt.Errorf("%w: ...")) from a fix-up-only VerifyCommit branch
-// and returns it BEFORE pushing, so origin is untouched. It is classified
-// category-B (re-scope/re-plan); the backend's #788 fix-up recovery then
+// ErrCreatedOutOfScope is the general created-out-of-scope sentinel (#825,
+// extending #818). It is the analogue of ErrCommitWouldNotCompile /
+// ErrCommittedTestsFailed for the case where the agent CREATED net-new
+// (untracked) files outside the approved scope.files: StageScoped (#581) would
+// silently strip them from the scope-only commit while the in-scope edits that
+// REFERENCE them land, shipping a self-inconsistent, misleadingly-green partial
+// result. The gate is no longer fix-up-specific — it covers both the open-PR
+// implement push and the fix-up pass; ErrFixupCreatedOutOfScope is the fix-up
+// specialization that wraps this sentinel. The runner wraps the relevant value
+// (via fmt.Errorf("%w: ...")) from a VerifyCommit branch and returns it BEFORE
+// pushing, so origin is untouched. It is classified category-B (re-scope/re-plan).
+// Only CREATED (untracked) out-of-scope files trip this; modified-but-out-of-scope
+// drift stays flag-only (ADR-027).
+var ErrCreatedOutOfScope = errors.New("gitops: created out-of-scope files")
+
+// ErrFixupCreatedOutOfScope is the fix-up specialization of ErrCreatedOutOfScope
+// (#818). A fix-up pass cannot widen the stage's fixed scope.files, so a net-new
+// file the fix-up needed to create is out of scope by construction. It wraps
+// ErrCreatedOutOfScope, so it satisfies BOTH errors.Is(err, ErrFixupCreatedOutOfScope)
+// and errors.Is(err, ErrCreatedOutOfScope). The runner wraps this from the fix-up
+// VerifyCommit branch and returns it BEFORE pushing, so origin is untouched. It is
+// classified category-B (re-scope/re-plan); the backend's #788 fix-up recovery then
 // restores the run to its pre-fix-up review gate. Only CREATED (untracked)
 // out-of-scope files trip this; modified-but-out-of-scope drift stays flag-only
 // (ADR-027).
-var ErrFixupCreatedOutOfScope = errors.New("gitops: fix-up created out-of-scope files")
+var ErrFixupCreatedOutOfScope = fmt.Errorf("%w (fix-up)", ErrCreatedOutOfScope)
 
 // ErrCommittedTestsFailed is the test-gate analogue of
 // ErrCommitWouldNotCompile (#800): the scope-only committed tree COMPILES

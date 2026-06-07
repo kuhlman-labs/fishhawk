@@ -318,6 +318,21 @@ func TestUntrackedPaths_IsolatesCreatedFromModified(t *testing.T) {
 	}
 }
 
+// TestErrFixupCreatedOutOfScope_WrapsGeneralSentinel pins the error-wrapping
+// relationship the runner's category-B classification relies on (#825):
+// ErrFixupCreatedOutOfScope is a specialization that wraps ErrCreatedOutOfScope,
+// so a single errors.Is(err, ErrCreatedOutOfScope) check matches both the
+// open-PR and fix-up wrapped errors. The reverse must NOT hold — the general
+// sentinel is not the fix-up specialization.
+func TestErrFixupCreatedOutOfScope_WrapsGeneralSentinel(t *testing.T) {
+	if !errors.Is(ErrFixupCreatedOutOfScope, ErrCreatedOutOfScope) {
+		t.Error("ErrFixupCreatedOutOfScope must wrap ErrCreatedOutOfScope")
+	}
+	if errors.Is(ErrCreatedOutOfScope, ErrFixupCreatedOutOfScope) {
+		t.Error("ErrCreatedOutOfScope must NOT match the fix-up specialization")
+	}
+}
+
 // TestCommitAndPush_ScopeBounded_CommitsOnlyDeclared exercises the full
 // commit boundary: the stray file is excluded from the commit and
 // surfaced as ScopeDrift while still left dirty in the working tree.
