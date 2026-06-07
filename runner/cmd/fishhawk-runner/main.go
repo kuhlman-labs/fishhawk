@@ -554,7 +554,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// token/model counts include the fix-loop invocations' cost (ADR-030).
 	if res.OK && stageType == "implement" && !cfg.noPR &&
 		cfg.verifyCmd != "" && cfg.verifyMaxIterations > 0 {
-		runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink)
+		// A POST-commit reset failure (#816) is fatal: the throwaway commit is
+		// still on HEAD, so the stage must NOT proceed to the real push. Demote
+		// to category-B (park for re-scope/re-plan; no self-retry), mirroring
+		// runVerifyGateCommitted's treatment of its post-commit reset failure.
+		if ferr := runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink); ferr != nil {
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = ferr.Error()
+			invokeErr = ferr
+		}
 	}
 
 	// Committed-tree single-shot verify gate (#802). On the implement push
@@ -1562,12 +1571,26 @@ const maxFixInvokeInfraRetries = 2
 //     loop is outside the ADR-023 self-retry for{} loop, so it can never call
 //     RetryStage (DECISION c2, non-compounding).
 //
+// Failure handling splits on WHERE HEAD is when the failing op runs, symmetric
+// with runVerifyGateCommitted (#816):
+//
+//   - A PRE-commit infra error (StageScoped / commitVerifyWIP / commit produced
+//     nothing) left HEAD untouched, so it routes through the NON-BLOCKING skip
+//     path (verify_fix_skipped, nil return) — never invent a failure from gate
+//     plumbing; the real push runs its own #728/#800 gate.
+//   - A POST-commit gitResetSoftHEAD1 failure is FATAL, not a skip. Once the
+//     throwaway commit is materialized, a failed undo leaves HEAD on the
+//     throwaway commit, so openPRAndShipArtifact's real CommitAndPush would
+//     stack on top and push the bot-identity, --no-verify WIP commit into the
+//     PR. Return it as a hard error so the stage fails loudly (category-B at the
+//     call site) instead of silently shipping a throwaway commit.
+//
 // Every fix re-invocation's Result.Events are appended to res.Events and its
 // token usage folded into res, so a multi-iteration run produces a complete
 // audit trace and an honest cost (every other invoker.Invoke site replaces
 // res wholesale; here append is the correct handling). A verify_summary event
 // is appended once the loop settles, carrying the verdict + iteration count.
-func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) {
+func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) error {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
@@ -1582,7 +1605,8 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		passed      bool
 		attempts    int
 		lastOutput  string
-		lastIterErr error // non-nil only on an infra failure that aborts the loop
+		lastIterErr error // non-nil only on a PRE-commit infra failure → non-blocking skip
+		fatalErr    error // non-nil only on a POST-commit reset failure → hard abort (#816)
 	)
 
 	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
@@ -1605,12 +1629,18 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			break
 		}
 
-		// (b) Resolve the throwaway commit's SHA.
+		// (b) Resolve the throwaway commit's SHA. HEAD has now moved, so any undo
+		// failure from here on is FATAL (see (d)).
 		headSHA, err := gitRevParseHEAD(ctx, repoDir)
 		if err != nil {
-			// Undo the throwaway commit before bailing so the working tree is
-			// left as the real push expects it.
-			_ = gitResetSoftHEAD1(ctx, repoDir)
+			// rev-parse failed but the commit landed — undo it so the working
+			// tree is left as the real push expects, then non-blocking skip. A
+			// failed undo here is FATAL for the same reason as (d): HEAD is left
+			// on the throwaway commit and the real push would stack on top.
+			if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
+				fatalErr = rerr
+				break
+			}
 			lastIterErr = err
 			break
 		}
@@ -1624,9 +1654,12 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		// (d)/(e)/(f) Always undo the throwaway commit first — git reset --soft
 		// moves HEAD without touching the index or working tree, so the agent's
 		// edits + staged scope survive for either the real push (pass) or the
-		// next iteration's re-commit (fail+retry).
+		// next iteration's re-commit (fail+retry). A reset failure here is FATAL
+		// (#816): HEAD is left on the throwaway commit and the real push would
+		// stack on top, pushing the WIP commit into the PR. Do NOT swallow it to
+		// the non-blocking skip — abort the stage hard.
 		if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
-			lastIterErr = rerr
+			fatalErr = rerr
 			break
 		}
 
@@ -1698,16 +1731,20 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		}
 	}
 
-	// Emit verify_summary EXACTLY ONCE on every exit path (#804 Gap 2). The
-	// outcome must reflect the real exit: an infra abort short-circuits the loop
-	// into the non-blocking skip below, so it is "skipped" (carrying the abort
-	// detail), NOT "failed" — the old `if !passed` form mislabelled the
-	// errored-exit path as failed.
+	// Emit verify_summary EXACTLY ONCE on every exit path (#804 Gap 2, #816). The
+	// outcome must reflect the real exit: a POST-commit reset failure aborts the
+	// stage hard, so it is "failed" (carrying the abort detail) and returns a
+	// hard error; a PRE-commit infra abort short-circuits into the non-blocking
+	// skip below, so it is "skipped" (carrying the abort detail), NOT "failed" —
+	// the old `if !passed` form mislabelled the errored-exit path as failed.
 	summary := map[string]any{
 		"iterations":     attempts,
 		"max_iterations": cfg.verifyMaxIterations,
 	}
 	switch {
+	case fatalErr != nil:
+		summary["outcome"] = "failed"
+		summary["detail"] = fatalErr.Error()
 	case lastIterErr != nil:
 		summary["outcome"] = "skipped"
 		summary["detail"] = lastIterErr.Error()
@@ -1721,14 +1758,22 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		Payload: agent.MakePayload(summary),
 	})
 
+	if fatalErr != nil {
+		// A POST-commit reset failure left HEAD on the throwaway commit (#816).
+		// Abort the stage hard — the call site demotes to category-B so the real
+		// push never stacks the real commit on top of the throwaway WIP commit.
+		return fatalErr
+	}
+
 	if lastIterErr != nil {
-		// An infra failure inside the loop (git/stage error) is a non-blocking
-		// skip — never invent a new failure source from gate plumbing. The
-		// stage proceeds to the real push, which runs its own #728/#800 gate.
+		// A PRE-commit infra failure inside the loop (git/stage error) is a
+		// non-blocking skip — never invent a new failure source from gate
+		// plumbing. The stage proceeds to the real push, which runs its own
+		// #728/#800 gate.
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_fix_skipped","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, lastIterErr.Error())
-		return
+		return nil
 	}
 
 	if !passed {
@@ -1737,6 +1782,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		res.FailureReason = fmt.Sprintf("verify command %q still failing after %d iteration(s):\n%s",
 			cfg.verifyCmd, attempts, lastOutput)
 	}
+	return nil
 }
 
 // runVerifyGateCommitted is the single-shot committed-tree verify gate (#802):
