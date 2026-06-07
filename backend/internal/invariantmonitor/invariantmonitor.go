@@ -56,6 +56,15 @@ const CategoryInvariantViolation = "invariant_violation"
 // in awaiting_approval on a push-and-open-pr run with no PR URL.
 const KindReviewAwaitingApprovalNullPR = "review_awaiting_approval_null_pr"
 
+// KindForeignCommitOnBranch is the run-branch lineage violation kind
+// (ADR-035, #858) recorded in the audit payload's `kind` field: the
+// branch carries a commit not attributable to any of THIS run's own
+// reported head SHAs. It is written by server/lineage.go under the
+// existing CategoryInvariantViolation by the system actor — an
+// internal audit kind, NOT an issue-comment surface (see
+// docs/issue-comment-surfaces.md).
+const KindForeignCommitOnBranch = "foreign_commit_on_branch"
+
 // listRunsPageSize bounds each ListRuns page the sweep walks. Matches
 // the constant ReconcileStuckRuns uses — at v0 scale the running-run
 // set is tiny; this only bounds memory if it ever grows.

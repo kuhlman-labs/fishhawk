@@ -669,6 +669,12 @@ type PullRequest struct {
 	HeadSHA string
 	State   string // "open" | "closed"
 	Merged  bool   // true when state=closed and the PR was merged
+	// BaseRef is the PR's target branch name (the `base.ref` field).
+	// It is the independently-trustworthy compare anchor for the run
+	// branch lineage guard (ADR-035, #858): GitHub knows what the PR
+	// targets, so a contaminated branch commit cannot launder it the
+	// way a runner-reported base_sha can.
+	BaseRef string
 	// Number and HTMLURL are populated by CreatePullRequest and
 	// ListOpenPullRequestsByHead (the consolidated-PR path, #714).
 	// GetPullRequest leaves them zero/empty — its callers only need
@@ -722,6 +728,9 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
 		Head   struct {
 			SHA string `json:"sha"`
 		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("githubclient: decode pr: %w", err)
@@ -734,7 +743,69 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
 		HeadSHA: body.Head.SHA,
 		State:   body.State,
 		Merged:  body.Merged,
+		BaseRef: body.Base.Ref,
 	}, nil
+}
+
+// CompareCommits returns the SHAs of the commits on head since its
+// merge-base with base, i.e. the commits the branch added relative to
+// base — (merge-base, head].
+//
+//	GET /repos/{owner}/{repo}/compare/{base}...{head}
+//
+// The three-dot form anchors the comparison on the merge-base, so
+// commits merged into base while the run was open are excluded (no
+// false positive if the target branch advances mid-run). It is the
+// branch-lineage guard's enumeration of every commit on the run
+// branch (ADR-035, #858); each returned SHA is checked for membership
+// in the run's own reported-head ledger.
+//
+// No pagination: the compare API returns up to 250 commits, far above
+// any realistic run branch's commit count. A branch exceeding 250
+// would under-return, and the guard fails open on that (no false
+// positive). Returns a typed error (ErrNotFound / ErrValidation /
+// ErrForbidden) on non-2xx so callers can fail open on a transient
+// GitHub failure.
+func (c *Client) CompareCommits(ctx context.Context, installationID int64,
+	repo RepoRef, base, head string) ([]string, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if base == "" || head == "" {
+		return nil, errors.New("githubclient: compare base and head required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/compare/" + escapePath(base) + "..." + escapePath(head))
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: compare commits: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := classifyStatus("compare commits", resp); err != nil {
+		return nil, err
+	}
+	var body struct {
+		Commits []struct {
+			SHA string `json:"sha"`
+		} `json:"commits"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode compare: %w", err)
+	}
+	shas := make([]string, 0, len(body.Commits))
+	for _, cm := range body.Commits {
+		shas = append(shas, cm.SHA)
+	}
+	return shas, nil
 }
 
 // CreatePullRequest opens a pull request from head into base (#714 /
