@@ -4134,22 +4134,162 @@ func TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip(t *testing.T
 	assertVerifySummary(t, events, "skipped", 1, 1)
 }
 
-// TestRun_VerifyFixLoop_MaxIterationsZero_SingleShotNoReinvoke confirms the
-// default-off behavior: max_iterations==0 keeps today's single-shot
-// working-tree gate (#441) — one verify attempt, demote-on-failure, no
-// re-invoke, and NO committed-tree loop (no verify_summary event).
-func TestRun_VerifyFixLoop_MaxIterationsZero_SingleShotNoReinvoke(t *testing.T) {
-	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+// TestRun_VerifyGateCommitted_DriftExcludedFailureBlocks is the #802
+// single-shot committed-tree gate's core proof: on the implement push path
+// with max_iterations==0, the configured verify command runs ONCE against the
+// committed SCOPE-ONLY tree (the drift-excluded HEAD), not the agent's dirty
+// working tree. A test that passes on the working tree (because an out-of-scope
+// seed helper is present) but fails on the committed tree (#780/#776) must block
+// as category B (symmetric with #800), name the drift, and NOT push. There is no
+// fix re-invoke (single-shot) and no verify_summary (a fix-loop-only event).
+func TestRun_VerifyGateCommitted_DriftExcludedFailureBlocks(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	// DRIFT helper: makes the WORKING tree green but is dropped from the
+	// committed scope-only tree, so the committed tree's test fails.
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+
 	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
 	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
 		StageID:             verifyFixStageID,
 		StageType:           "implement",
 		Prompt:              "implement",
 		PromptHash:          "h",
-		VerifyCommand:       "false",
-		VerifyMaxIterations: 0, // default-off → single-shot working-tree gate
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 0, // single-shot committed gate (#802)
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B demote on committed-tree verify failure:\n%s", stderr.String())
+	}
+	// Single-shot: no fix re-invoke.
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (single-shot committed gate, no re-invoke)", invoker.callIdx)
+	}
+	// Drift named in the failure reason.
+	if !strings.Contains(stderr.String(), "mod/seed.go") {
+		t.Errorf("failure reason should name the drift file mod/seed.go:\n%s", stderr.String())
+	}
+	// Blocked: no push.
+	if fp.gotArgs != nil {
+		t.Error("CommitAndPush must not run after a committed-tree gate block")
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run after a committed-tree gate block")
+	}
+	// Committed-tree execution proof: verify_run carries head_sha; no
+	// verify_summary (that is the fix-loop's event, not the single-shot gate).
+	events := readBundleEvents(t, bundlePath)
+	var sawHeadSHA, sawFailed bool
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			if strings.Contains(string(ev.Data), `"head_sha"`) {
+				sawHeadSHA = true
+			}
+			if strings.Contains(string(ev.Data), `"outcome":"failed"`) {
+				sawFailed = true
+			}
+		case "verify_summary":
+			t.Error("single-shot committed gate must not emit verify_summary (fix-loop-only)")
+		}
+	}
+	if !sawHeadSHA {
+		t.Error("committed-tree verify_run must carry head_sha")
+	}
+	if !sawFailed {
+		t.Error("committed-tree verify_run must record outcome=failed")
+	}
+}
+
+// TestRun_VerifyGateCommitted_PassProceeds: when the fix lives in a scope file
+// so the committed scope-only tree is green, the single-shot gate passes and the
+// push proceeds.
+func TestRun_VerifyGateCommitted_PassProceeds(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	// regGetFixed seeds the registry INSIDE the scope file, so the committed
+	// scope-only tree passes without any drift helper.
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 0,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Error("CommitAndPush should run after the committed-tree gate passes")
+	}
+	if fpr.gotArgs == nil {
+		t.Error("OpenPR should run after the committed-tree gate passes")
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (single-shot, no re-invoke)", invoker.callIdx)
+	}
+}
+
+// TestRun_VerifyGateCommitted_NothingStaged_NoOp: when no scope-only change is
+// present on disk, the throwaway commit has nothing to stage, so the gate is a
+// no-op skip (no demotion) and the push proceeds — matching the fix loop's
+// no-change handling.
+func TestRun_VerifyGateCommitted_NothingStaged_NoOp(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	// No scope-file edits on disk: the base repo's tree is unchanged, so
+	// StageScoped stages nothing.
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "false", // would fail if it ran against a committed tree
+		VerifyMaxIterations: 0,
 		ScopeFiles: []upload.ScopeFile{
 			{Path: "mod/reg.go", Operation: "modify"},
 		},
@@ -4161,10 +4301,139 @@ func TestRun_VerifyFixLoop_MaxIterationsZero_SingleShotNoReinvoke(t *testing.T) 
 
 	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
 	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK (no-op skip):\n%s", got, stderr.String())
+	}
+	// The gate emitted a skipped verify_run, never ran the command, never failed.
+	events := readBundleEvents(t, bundlePath)
+	for _, ev := range events {
+		if ev.Kind == "verify_run" && strings.Contains(string(ev.Data), `"outcome":"failed"`) {
+			t.Errorf("no-op gate must not run the verify command: %s", ev.Data)
+		}
+	}
+}
+
+// TestRunVerifyGateCommitted_InfraSkipNonBlocking: a PRE-commit infra error (here
+// a non-git working dir, so StageScoped fails) is a NON-BLOCKING skip — HEAD was
+// never moved, so the helper returns a skipped event + nil error and the real
+// push runs its own gate.
+func TestRunVerifyGateCommitted_InfraSkipNonBlocking(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	cfg := config{
+		workingDir: t.TempDir(), // not a git repo → StageScoped errors
+		verifyCmd:  "true",
+		scopeFiles: []upload.ScopeFile{{Path: "a.txt", Operation: "modify"}},
+	}
+	ev, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if err != nil {
+		t.Fatalf("pre-commit infra error must be a non-blocking skip, got %v", err)
+	}
+	if !strings.Contains(string(ev.Payload), `"outcome":"skipped"`) {
+		t.Errorf("expected skipped verify_run on infra error, got %s", ev.Payload)
+	}
+}
+
+// TestRunVerifyGateCommitted_PostCommitResetFailureFatal is the #802 approval
+// condition: a gitResetSoftHEAD1 failure AFTER a successful throwaway commit is
+// FATAL, not a skip. We force it by committing into a repo with no prior commit,
+// so the throwaway is the ROOT commit and `git reset --soft HEAD~1` fails (no
+// parent). In that state HEAD is left on the throwaway commit, so swallowing the
+// error would push the WIP commit into the PR. Distinct from the pre-commit
+// infra-skip case, which must stay non-blocking.
+func TestRunVerifyGateCommitted_PostCommitResetFailureFatal(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, _ := compileGateRepo(t) // git init, no commits yet
+	mustWrite(t, filepath.Join(repo, "a.txt"), "hello\n")
+	cfg := config{
+		workingDir: repo,
+		verifyCmd:  "true", // the command itself passes; the reset is what fails
+		scopeFiles: []upload.ScopeFile{{Path: "a.txt", Operation: "create"}},
+	}
+	_, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if err == nil {
+		t.Fatal("a post-commit reset failure must be FATAL (hard error), not swallowed to a skip")
+	}
+	// HEAD must still point at the throwaway commit — the fatal error is exactly
+	// what stops openPRAndShipArtifact from stacking the real commit on top.
+	if _, herr := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output(); herr != nil {
+		t.Fatalf("expected a throwaway commit at HEAD: %v", herr)
+	}
+}
+
+// TestRun_VerifyGateCommitted_Routing_NoPRKeepsWorkingTreeGate: a --no-pr
+// implement run has no committed tree to gate, so it keeps the #441 single-shot
+// WORKING-TREE gate (category A), NOT the committed gate.
+func TestRun_VerifyGateCommitted_Routing_NoPRKeepsWorkingTreeGate(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "false",
+		VerifyMaxIterations: 0,
+		ScopeFiles:          []upload.ScopeFile{{Path: "mod/reg.go", Operation: "modify"}},
+	}
+	withFakeUploader(t, fu)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
 	got := run([]string{
 		"--run-id", verifyFixRunID,
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", verifyFixStageID,
+		"--no-pr",
+		"--fetch-prompt", "--upload-trace",
+		"--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("--no-pr must keep the working-tree gate (category A):\n%s", stderr.String())
+	}
+	// Working-tree gate carries no head_sha and emits no verify_summary.
+	for _, ev := range readBundleEvents(t, bundlePath) {
+		if ev.Kind == "verify_run" && strings.Contains(string(ev.Data), `"head_sha"`) {
+			t.Error("working-tree gate must not carry head_sha")
+		}
+		if ev.Kind == "verify_summary" {
+			t.Error("working-tree gate must not emit verify_summary")
+		}
+	}
+}
+
+// TestRun_VerifyGateCommitted_Routing_PlanStageKeepsWorkingTreeGate: a plan
+// stage has no committed tree to gate, so it keeps the working-tree gate
+// (category A), NOT the committed gate.
+func TestRun_VerifyGateCommitted_Routing_PlanStageKeepsWorkingTreeGate(t *testing.T) {
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "plan",
+		Prompt:              "plan",
+		PromptHash:          "h",
+		VerifyCommand:       "false",
+		VerifyMaxIterations: 0,
+	}
+	withFakeUploader(t, fu)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", verifyFixRunID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
 		"--stage-id", verifyFixStageID,
 		"--fetch-prompt", "--upload-trace",
 		"--bundle-out", bundlePath,
@@ -4173,29 +4442,19 @@ func TestRun_VerifyFixLoop_MaxIterationsZero_SingleShotNoReinvoke(t *testing.T) 
 		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), `"category":"A"`) {
-		t.Errorf("expected category-A demote on single-shot verify failure:\n%s", stderr.String())
+		t.Errorf("plan stage must keep the working-tree gate (category A):\n%s", stderr.String())
 	}
-	// No re-invoke: the committed-tree loop never ran.
-	if invoker.callIdx != 1 {
-		t.Errorf("Invoke call count = %d, want 1 (single-shot, no re-invoke)", invoker.callIdx)
-	}
-	events := readBundleEvents(t, bundlePath)
-	var verifyRuns int
-	for _, ev := range events {
-		switch ev.Kind {
-		case "verify_run":
-			verifyRuns++
-			if strings.Contains(string(ev.Data), `"head_sha"`) {
-				t.Error("single-shot working-tree gate must not carry head_sha")
-			}
-		case "verify_summary":
-			t.Error("max_iterations==0 must not emit a verify_summary event (committed-tree loop disabled)")
+	for _, ev := range readBundleEvents(t, bundlePath) {
+		if ev.Kind == "verify_summary" {
+			t.Error("plan-stage working-tree gate must not emit verify_summary")
 		}
 	}
-	if verifyRuns != 1 {
-		t.Errorf("verify_run count = %d, want 1 (single shot)", verifyRuns)
-	}
 }
+
+// Routing case maxIterations>0 (implement push) → runVerifyFixLoop, NOT the
+// single-shot committed gate, is covered by TestRun_VerifyFixLoop_* above: those
+// assert a verify_summary event, which ONLY the fix loop emits. The single-shot
+// committed gate emits no verify_summary, so the partition is unambiguous.
 
 // TestSemverLT covers the semverLT helper including numeric comparison
 // (not string comparison) so v0.9.0 < v0.10.0 is handled correctly.

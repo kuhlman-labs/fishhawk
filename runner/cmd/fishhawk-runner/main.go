@@ -485,17 +485,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// evaluation and before bundle building. Non-zero exit from the
 		// verify command demotes to category-A (#441).
 		//
-		// Single-shot working-tree gate. It runs UNLESS the committed-tree
-		// verify-fix loop (#651) owns this stage — i.e. an implement push
-		// (stageType=="implement" && !cfg.noPR) with a non-zero
-		// verifyMaxIterations. On that path the loop below runs the verify
-		// command against the isolated committed scope-only tree instead, so
-		// firing here too would double-run the command and demote inside the
-		// ADR-023 self-retry loop (the very compounding c2 forbids). A --no-pr
-		// implement run keeps the dirty working tree and has no committed tree
-		// to gate, so it retains this single-shot gate; so do plan stages.
+		// Single-shot WORKING-TREE gate. It runs ONLY on the paths that have
+		// no committed scope-only tree to gate: plan/non-implement stages and
+		// --no-pr implement runs (which keep the dirty working tree). Every
+		// implement push (stageType=="implement" && !cfg.noPR) is now owned by
+		// a committed-tree gate below instead — the verify-fix loop (#651) when
+		// verifyMaxIterations>0, or the single-shot committed gate (#802) when
+		// verifyMaxIterations==0. Firing here too on those paths would double-run
+		// the command and demote inside the ADR-023 self-retry loop (the very
+		// compounding c2 forbids).
 		if res.OK && cfg.verifyCmd != "" &&
-			(cfg.verifyMaxIterations == 0 || stageType != "implement" || cfg.noPR) {
+			(stageType != "implement" || cfg.noPR) {
 			ev, demote := runVerifyGate(ctx, cfg, logSink)
 			res.Events = append(res.Events, ev)
 			if demote != nil {
@@ -555,6 +555,34 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	if res.OK && stageType == "implement" && !cfg.noPR &&
 		cfg.verifyCmd != "" && cfg.verifyMaxIterations > 0 {
 		runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink)
+	}
+
+	// Committed-tree single-shot verify gate (#802). On the implement push
+	// path with executor.verify.max_iterations == 0, run the configured
+	// verify command ONCE against the isolated committed SCOPE-ONLY tree —
+	// the language-agnostic single-shot twin of the #728/#800 Go gate. This
+	// catches a drift-excluded test failure (#780/#776) for ANY language
+	// without the fix-loop cost; the older max_iterations==0 path ran against
+	// the dirty working tree and false-greened that class. A failure blocks
+	// as category B (artifact broken → park for re-scope/re-plan; category B
+	// does not self-retry, consistent with the operator opting OUT of the fix
+	// loop at max_iterations==0). Placed here — a sibling of runVerifyFixLoop,
+	// OUTSIDE the ADR-023 self-retry for{} loop and BEFORE EmitStage so the
+	// throwaway-commit work is reflected and the demotion happens before
+	// openPRAndShipArtifact. The three verify guards now partition the
+	// cfg.verifyCmd!="" space with no overlap: working-tree in-loop gate =
+	// (plan || --no-pr); this committed single-shot gate = implement &&
+	// !noPR && maxIter==0; fix loop = implement && !noPR && maxIter>0.
+	if res.OK && stageType == "implement" && !cfg.noPR &&
+		cfg.verifyCmd != "" && cfg.verifyMaxIterations == 0 {
+		ev, demote := runVerifyGateCommitted(ctx, cfg, logSink)
+		res.Events = append(res.Events, ev)
+		if demote != nil {
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = demote.Error()
+			invokeErr = demote
+		}
 	}
 
 	// Emit the GenAI observability span for this stage as soon as the
@@ -1706,6 +1734,92 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		res.FailureReason = fmt.Sprintf("verify command %q still failing after %d iteration(s):\n%s",
 			cfg.verifyCmd, attempts, lastOutput)
 	}
+}
+
+// runVerifyGateCommitted is the single-shot committed-tree verify gate (#802):
+// the language-agnostic twin of the #728/#800 Go gate. On the implement push
+// path with executor.verify.max_iterations == 0, it runs the configured verify
+// command ONCE against the isolated committed SCOPE-ONLY tree (not the agent's
+// dirty working tree), so a drift-excluded test failure (#780/#776) is caught
+// for ANY language without the fix-loop cost. It reuses the #651 scaffolding:
+// StageScoped + a throwaway commit + runVerifyCommittedTree + reset --soft.
+//
+// Failure handling splits on WHERE HEAD is when the failing op runs:
+//
+//   - A PRE-commit infra error (StageScoped / commitVerifyWIP / rev-parse) left
+//     HEAD untouched, so it is a NON-BLOCKING skip: emit a skipped verify_run +
+//     nil error — never invent a failure from gate plumbing. The real push runs
+//     its own #728/#800 gate.
+//   - A non-zero verify exit returns the event plus an error wrapping
+//     gitops.ErrCommittedTestsFailed, naming the drift files + captured output
+//     (category-B at the call site, symmetric with #800).
+//   - A POST-commit gitResetSoftHEAD1 failure is FATAL, not a skip (#802
+//     approval condition). After the throwaway commit is materialized, a failed
+//     undo leaves HEAD on the throwaway commit, so openPRAndShipArtifact's real
+//     commit would stack on top and push the WIP commit into the PR. Propagate
+//     it as a hard error so the stage fails loudly instead of silently shipping
+//     a throwaway commit.
+func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent.Event, error) {
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	scopeFiles := scopePaths(cfg.scopeFiles)
+	timeout := cfg.verifyTimeout
+	if timeout == 0 {
+		timeout = 10 * time.Minute
+	}
+
+	// (a) Stage scope-only, capturing the drift list for the failure message.
+	// Pre-commit infra error — HEAD never moved; non-blocking skip.
+	drift, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopeFiles)
+	if err != nil {
+		return verifyRunEvent(cfg.verifyCmd, "", -1, "stage_scoped: "+err.Error(), "skipped"), nil
+	}
+
+	// (b) Throwaway commit to materialize a committed-HEAD SHA. Still pre-commit
+	// from HEAD's perspective on error (the commit failed) → non-blocking skip.
+	committed, err := commitVerifyWIP(ctx, cfg, repoDir)
+	if err != nil {
+		return verifyRunEvent(cfg.verifyCmd, "", -1, "commit_wip: "+err.Error(), "skipped"), nil
+	}
+	if !committed {
+		// Nothing staged — no scope-only change to gate. The real push hits its
+		// NoChanges short-circuit; treat as a no-op skip (no demotion).
+		return verifyRunEvent(cfg.verifyCmd, "", 0, "no scope-only changes to gate", "skipped"), nil
+	}
+
+	// (c) Resolve the throwaway commit's SHA. HEAD has now moved, so any undo
+	// failure from here on is FATAL (see (e)).
+	headSHA, err := gitRevParseHEAD(ctx, repoDir)
+	if err != nil {
+		// rev-parse failed but the commit landed — undo it so the working tree
+		// is left as the real push expects, then non-blocking skip. A failed
+		// undo here is FATAL for the same reason as (e).
+		if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
+			return verifyRunEvent(cfg.verifyCmd, "", -1, "reset_after_revparse: "+rerr.Error(), "failed"), rerr
+		}
+		return verifyRunEvent(cfg.verifyCmd, "", -1, "rev_parse: "+err.Error(), "skipped"), nil
+	}
+
+	// (d) Verify against the committed scope-only tree.
+	ev, out, ok := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+
+	// (e) ALWAYS undo the throwaway commit so the working tree + index survive
+	// for openPRAndShipArtifact's real commit. A reset failure here is FATAL:
+	// HEAD is left on the throwaway commit and the real push would stack on top,
+	// pushing the WIP commit into the PR. Do NOT swallow it to a skip (#802
+	// approval condition) — propagate it so the stage fails loudly.
+	if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
+		return ev, rerr
+	}
+
+	// (f) Non-zero exit blocks as category-B, symmetric with #800.
+	if !ok {
+		return ev, fmt.Errorf("%w: committed tree verify command %q failed; %d file(s) outside scope are build/test-required: %s\n%s",
+			gitops.ErrCommittedTestsFailed, cfg.verifyCmd, len(drift), strings.Join(drift, ", "), out)
+	}
+	return ev, nil
 }
 
 // verifyFixPrompt builds the fix-iteration prompt fed back to the agent when
