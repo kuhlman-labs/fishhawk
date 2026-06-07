@@ -2,6 +2,9 @@ package plan_test
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -424,4 +427,130 @@ func TestTryCoerce_NullRequiredFieldNotDropped(t *testing.T) {
 			t.Errorf("required field /summary was coerced/dropped; want left in place")
 		}
 	}
+}
+
+// corpusGlob resolves to the repo-root shared coercion corpus. The Go test
+// binary runs with the package source directory as its working directory, so
+// ../../../ from this package reaches repo root; the runner mirror
+// (runner/internal/plan) uses the identical relative path.
+const corpusGlob = "../../../testdata/coercion-corpus/*.json"
+
+// corpusExpectedCoercion pins one Coercion record that must be present.
+type corpusExpectedCoercion struct {
+	FieldPath    string          `json:"field_path"`
+	OriginalType string          `json:"original_type"`
+	CoercedTo    json.RawMessage `json:"coerced_to,omitempty"`
+}
+
+// corpusCase is one self-describing coercion case. See
+// testdata/coercion-corpus/README.md for the field semantics.
+type corpusCase struct {
+	Name                  string                   `json:"name"`
+	Input                 json.RawMessage          `json:"input"`
+	ExpectedOutput        json.RawMessage          `json:"expected_output,omitempty"`
+	ExpectedCoercions     []corpusExpectedCoercion `json:"expected_coercions,omitempty"`
+	ExpectedCoercionCount int                      `json:"expected_coercion_count"`
+	ExpectError           bool                     `json:"expect_error,omitempty"`
+}
+
+// TestCoercionCorpus walks the shared repo-root corpus and runs this module's
+// TryCoerce against every case, asserting the EXACT coercion count, the pinned
+// coercion records, and the semantic equality of the coerced output. The runner
+// module runs a near-duplicate test against the same corpus; if either mirror's
+// TryCoerce drifts, that module's corpus test fails — the cross-module drift
+// guard from #834 (root cause of #832).
+func TestCoercionCorpus(t *testing.T) {
+	files, err := filepath.Glob(corpusGlob)
+	if err != nil {
+		t.Fatalf("glob corpus %q: %v", corpusGlob, err)
+	}
+	if len(files) == 0 {
+		t.Fatalf("coercion corpus is empty: glob %q matched no files", corpusGlob)
+	}
+
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read corpus case %s: %v", file, err)
+		}
+		var tc corpusCase
+		if err := json.Unmarshal(data, &tc); err != nil {
+			t.Fatalf("parse corpus case %s: %v", file, err)
+		}
+		name := tc.Name
+		if name == "" {
+			name = filepath.Base(file)
+		}
+
+		t.Run(name, func(t *testing.T) {
+			coerced, coercions, err := plan.TryCoerce([]byte(tc.Input), testNow)
+
+			if tc.ExpectError {
+				if err == nil {
+					t.Errorf("err = nil, want non-nil (expect_error case)")
+				}
+			} else if err != nil {
+				t.Fatalf("TryCoerce: unexpected error: %v", err)
+			}
+
+			if len(coercions) != tc.ExpectedCoercionCount {
+				t.Errorf("coercion count = %d, want %d; coercions = %+v", len(coercions), tc.ExpectedCoercionCount, coercions)
+			}
+
+			for _, want := range tc.ExpectedCoercions {
+				assertPinnedCoercion(t, coercions, want)
+			}
+
+			if len(tc.ExpectedOutput) > 0 {
+				got := coerced
+				if got == nil {
+					// Zero-coercion / already-valid path: TryCoerce returns the
+					// original bytes unchanged (content-hash stability).
+					got = []byte(tc.Input)
+				}
+				if !jsonSemanticEqual(t, tc.ExpectedOutput, got) {
+					t.Errorf("coerced output mismatch\n got: %s\nwant: %s", got, tc.ExpectedOutput)
+				}
+			}
+		})
+	}
+}
+
+// assertPinnedCoercion finds a coercion at want.FieldPath and checks its
+// OriginalType and (when pinned) CoercedTo match.
+func assertPinnedCoercion(t *testing.T, coercions []plan.Coercion, want corpusExpectedCoercion) {
+	t.Helper()
+	for _, got := range coercions {
+		if got.FieldPath != want.FieldPath {
+			continue
+		}
+		if got.OriginalType != want.OriginalType {
+			t.Errorf("coercion %q: original_type = %q, want %q", want.FieldPath, got.OriginalType, want.OriginalType)
+		}
+		if len(want.CoercedTo) > 0 {
+			gotBytes, err := json.Marshal(got.CoercedTo)
+			if err != nil {
+				t.Fatalf("marshal coerced_to for %q: %v", want.FieldPath, err)
+			}
+			if !jsonSemanticEqual(t, want.CoercedTo, gotBytes) {
+				t.Errorf("coercion %q: coerced_to = %s, want %s", want.FieldPath, gotBytes, want.CoercedTo)
+			}
+		}
+		return
+	}
+	t.Errorf("expected coercion at %q not found; coercions = %+v", want.FieldPath, coercions)
+}
+
+// jsonSemanticEqual reports whether two JSON byte slices are equal ignoring key
+// order and whitespace, by decoding both to any and comparing with DeepEqual.
+func jsonSemanticEqual(t *testing.T, a, b []byte) bool {
+	t.Helper()
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		t.Fatalf("unmarshal %s: %v", a, err)
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		t.Fatalf("unmarshal %s: %v", b, err)
+	}
+	return reflect.DeepEqual(av, bv)
 }
