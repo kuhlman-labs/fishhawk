@@ -1,0 +1,10 @@
+{
+  "outcome": "diff_produced",
+  "tool_sequence": ["Read", "Grep", "Edit", "Edit", "Edit", "Bash"],
+  "tool_calls": 6,
+  "unnecessary_retries": 0,
+  "loop_detected": false,
+  "evidence_before_edit": true,
+  "out_of_tree_writes": [],
+  "scope_drift_paths": []
+}

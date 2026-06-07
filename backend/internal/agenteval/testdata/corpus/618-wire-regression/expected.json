@@ -1,0 +1,10 @@
+{
+  "outcome": "diff_produced",
+  "tool_sequence": ["Edit", "Edit", "Bash"],
+  "tool_calls": 3,
+  "unnecessary_retries": 0,
+  "loop_detected": false,
+  "evidence_before_edit": false,
+  "out_of_tree_writes": [],
+  "scope_drift_paths": ["backend/internal/render/view.go"]
+}
