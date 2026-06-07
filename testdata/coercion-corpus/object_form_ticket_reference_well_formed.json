@@ -1,0 +1,26 @@
+{
+  "name": "object_form_ticket_reference_well_formed",
+  "input": {
+    "plan_version": "standard_v1",
+    "ticket_reference": { "type": "github_issue", "url": "https://github.com/x/y/issues/742", "id": "x/y#742" },
+    "generated_by": { "agent": "claude-code", "model": "claude-opus-4-7", "timestamp": "2026-01-01T00:00:00Z" },
+    "summary": "Add a thing.",
+    "scope": { "files": [{ "path": "a.go", "operation": "create" }] },
+    "approach": [{ "step": 1, "description": "Do the work." }],
+    "verification": { "test_strategy": "Run the tests.", "rollback_plan": "Revert the PR." },
+    "predicted_runtime_minutes": 20,
+    "predicted_runtime_confidence": "medium"
+  },
+  "expected_output": {
+    "plan_version": "standard_v1",
+    "ticket_reference": { "type": "github_issue", "url": "https://github.com/x/y/issues/742", "id": "x/y#742" },
+    "generated_by": { "agent": "claude-code", "model": "claude-opus-4-7", "timestamp": "2026-01-01T00:00:00Z" },
+    "summary": "Add a thing.",
+    "scope": { "files": [{ "path": "a.go", "operation": "create" }] },
+    "approach": [{ "step": 1, "description": "Do the work." }],
+    "verification": { "test_strategy": "Run the tests.", "rollback_plan": "Revert the PR." },
+    "predicted_runtime_minutes": 20,
+    "predicted_runtime_confidence": "medium"
+  },
+  "expected_coercion_count": 0
+}
