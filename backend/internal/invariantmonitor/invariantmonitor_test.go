@@ -51,15 +51,21 @@ workflows:
 // stage lists.
 type fakeRuns struct {
 	run.BaseFake
-	runs   []*run.Run
-	stages map[uuid.UUID][]*run.Stage
+	runs       []*run.Run
+	stages     map[uuid.UUID][]*run.Stage
+	listErr    error
+	stagesCall int
 }
 
 func (f *fakeRuns) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.runs, nil
 }
 
 func (f *fakeRuns) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*run.Stage, error) {
+	f.stagesCall++
 	return f.stages[id], nil
 }
 
@@ -240,6 +246,36 @@ func TestTick_ReconcileError_DoesNotPanic(t *testing.T) {
 
 	if got := aud.violations(); got != 1 {
 		t.Fatalf("invariant_violation count = %d, want 1 (sweep runs despite reconcile error)", got)
+	}
+}
+
+// TestTick_ListRunsError_AbortsCleanly drives a ListRuns failure: the
+// invariant-2 sweep is best-effort by design, so a paging error must be
+// logged and the sweep must abort without panicking, without emitting any
+// violation, and without proceeding to the per-run stage walk. Invariant
+// 1's reconcile still runs (it precedes the sweep).
+func TestTick_ListRunsError_AbortsCleanly(t *testing.T) {
+	runs := &fakeRuns{
+		stages:  map[uuid.UUID][]*run.Stage{},
+		listErr: context.DeadlineExceeded,
+	}
+	aud := &fakeAudit{}
+	var reconciled int
+	tk := newTicker(t, runs, aud, func(context.Context) (int, error) {
+		reconciled++
+		return 0, nil
+	})
+
+	tk.Tick(context.Background())
+
+	if got := aud.violations(); got != 0 {
+		t.Fatalf("invariant_violation count = %d, want 0 on a list failure", got)
+	}
+	if runs.stagesCall != 0 {
+		t.Errorf("ListStagesForRun called %d times, want 0 (sweep must abort before the per-run walk)", runs.stagesCall)
+	}
+	if reconciled != 1 {
+		t.Errorf("reconcile ran %d times, want 1 (invariant 1 precedes the sweep)", reconciled)
 	}
 }
 

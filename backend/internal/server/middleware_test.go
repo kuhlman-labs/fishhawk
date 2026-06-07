@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 )
 
 func TestRequestID_GeneratesWhenAbsent(t *testing.T) {
@@ -129,6 +130,81 @@ func TestBearerAuth_DBUnavailable_Returns503(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Bearer fhk_deadbeef")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "service_unavailable") {
+		t.Errorf("body missing service_unavailable code:\n%s", rec.Body.String())
+	}
+	if handlerRan {
+		t.Error("handler should not run on a 503 short-circuit")
+	}
+}
+
+// stubSessionAuth implements sessionAuthenticator with a fixed return
+// so the cookie path's dberr classification seam can be driven without a
+// real session repository.
+type stubSessionAuth struct {
+	user *auth.User
+	sess *auth.Session
+	err  error
+}
+
+func (s stubSessionAuth) Authenticate(context.Context, string) (*auth.User, *auth.Session, error) {
+	return s.user, s.sess, s.err
+}
+
+// TestBearerAuth_SessionDBUnavailable_Returns503 mirrors the apitoken
+// 503 seam for the cookie path (#764): the session authenticator fails
+// because the database is unreachable, so the middleware must
+// short-circuit with 503 rather than fall through to anonymous. Without
+// this test the cookie path's dberr guard could be dropped in a refactor
+// with nothing to catch it.
+func TestBearerAuth_SessionDBUnavailable_Returns503(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	dbDown := fmt.Errorf("auth: lookup: %w", &pgconn.ConnectError{})
+	sessions := stubSessionAuth{err: dbDown}
+
+	var handlerRan bool
+	h := s.bearerAuth(nil, nil, sessions)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		handlerRan = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: "fhs_deadbeef"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "service_unavailable") {
+		t.Errorf("body missing service_unavailable code:\n%s", rec.Body.String())
+	}
+	if handlerRan {
+		t.Error("handler should not run on a 503 short-circuit")
+	}
+}
+
+// TestBearerAuth_MCPTokenDBUnavailable_Returns503 mirrors the apitoken
+// 503 seam for the MCP-token (fhm_) path (#764): the MCP authenticator
+// fails because the database is unreachable. Guards the third dberr
+// short-circuit in bearerAuth against a silent refactor regression.
+func TestBearerAuth_MCPTokenDBUnavailable_Returns503(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	dbDown := fmt.Errorf("mcptoken: lookup: %w", &pgconn.ConnectError{})
+	mcpAuth := &stubMCPAuthenticator{err: dbDown}
+
+	var handlerRan bool
+	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		handlerRan = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer fhm_deadbeef")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
