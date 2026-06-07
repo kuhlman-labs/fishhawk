@@ -1,0 +1,10 @@
+{
+  "outcome": "agent_failed",
+  "tool_sequence": ["Edit", "Edit", "Edit"],
+  "tool_calls": 3,
+  "unnecessary_retries": 1,
+  "loop_detected": true,
+  "evidence_before_edit": false,
+  "out_of_tree_writes": ["/etc/hosts"],
+  "scope_drift_paths": []
+}
