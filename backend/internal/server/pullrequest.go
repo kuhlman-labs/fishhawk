@@ -375,6 +375,27 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	// Branch lineage guard (ADR-035, #858). Before opening the clean
+	// review gate, verify every commit on the run branch is attributable
+	// to this run's own reported head SHAs. A foreign commit (#797) fails
+	// the stage category-B here instead of riding into the PR diff. The
+	// PR number is in the report body, so the anchor resolves directly to
+	// the PR's base ref. On a violation the helper already failed the
+	// stage + emitted the audit + notified; respond and RETURN without
+	// advancing to the review gate.
+	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, pr.PRNumber) {
+		s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
+			ID:          created.ID,
+			StageID:     created.StageID,
+			ContentHash: created.ContentHash,
+			PRNumber:    pr.PRNumber,
+			PRURL:       pr.PRURL,
+			HeadSHA:     pr.HeadSHA,
+			Idempotent:  false,
+		})
+		return
+	}
+
 	// Push-and-open-pr terminal drive (#742). When the implement stage was
 	// left in `running` by the trace gate (the runner stamped
 	// push_and_open_pr), THIS upload is the authoritative driver of the
@@ -512,6 +533,20 @@ func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
+	// Branch lineage guard (ADR-035, #858). No PR number in the body — the
+	// parent run opens the consolidated PR later — so the anchor resolves
+	// from the run's tracked pull_request_url (0 = unknown → fail open). A
+	// foreign commit on the shared branch fails the stage category-B here.
+	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, 0) {
+		s.writeJSON(w, r, http.StatusOK, pullRequestChildPushResponse{
+			StageID: stageID,
+			Outcome: "pushed",
+			Branch:  pr.Branch,
+			HeadSHA: pr.HeadSHA,
+		})
+		return
+	}
+
 	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
 		s.advanceImplementStageAfterPR(r, runID, stage)
 	}
@@ -591,6 +626,21 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 	} else if childPushAlreadyRecorded(entries, stageID, pr.HeadSHA) {
+		s.writeJSON(w, r, http.StatusOK, pullRequestFixupPushResponse{
+			StageID: stageID,
+			Outcome: "fixup_pushed",
+			Branch:  pr.Branch,
+			HeadSHA: pr.HeadSHA,
+		})
+		return
+	}
+
+	// Branch lineage guard (ADR-035, #858). The PR already exists and the
+	// run tracks its pull_request_url, so the anchor resolves to the PR's
+	// base ref (0 = no body PR number → resolved from the run). A foreign
+	// commit on the PR branch fails the stage category-B here instead of
+	// advancing the fix-up review gate.
+	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, 0) {
 		s.writeJSON(w, r, http.StatusOK, pullRequestFixupPushResponse{
 			StageID: stageID,
 			Outcome: "fixup_pushed",

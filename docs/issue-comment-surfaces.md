@@ -297,6 +297,18 @@ Notes:
   never reaches `review:awaiting_approval` with a null PR. Listed here only so a
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
+- The run-branch lineage violation kind — `foreign_commit_on_branch` (ADR-035,
+  #858) — is an **internal, audit-only kind, not an issue-comment surface**.
+  Nothing in `issuecomment` posts it; it has no Notifier method. It is written
+  under category `invariant_violation` (shared with the invariant monitor) by a
+  `system` actor: `server/lineage.go::recordForeignCommitViolation` calls
+  `AuditRepo.AppendChained` when the branch-lineage guard detects a commit on
+  the run branch that is not attributable to any of the run's own reported head
+  SHAs. The payload is `{kind, run_id, stage_id, offending_sha, head_sha}`. The
+  guard also fails the implement stage category-B and fires the sticky status
+  comment (`notifyStatusUpdate`), but the audit kind itself posts nothing.
+  Listed here only so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
 
 ## Routing
 
