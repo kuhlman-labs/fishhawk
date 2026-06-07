@@ -102,10 +102,20 @@ regression would fail the negative case. This is the deterministic
 analogue of #652's "introduce a known-bad edit, confirm the suite
 catches it" acceptance test.
 
+The third negative case `loop-failure-out-of-tree` closes the remaining
+coverage gap: it asserts the **non-zero** branch of every signal the
+first two cases leave at its zero value — `outcome=agent_failed`,
+`unnecessary_retries=1`, `loop_detected=true`, and a non-empty
+`out_of_tree_writes` (which exercises the `out_of_tree_write` payload
+unmarshal + path-extraction path no other case reaches). Without it a
+scorer that silently dropped any of those signals would still pass the
+suite.
+
 ### The seed cases are SYNTHETIC
 
-Both seed fixtures are **hand-authored reconstructions** of the #618 /
-healthy *shapes*, not byte-for-byte captures from production runs. No
+All seed fixtures are **hand-authored reconstructions** of the #618 /
+healthy / failure-mode *shapes*, not byte-for-byte captures from
+production runs. No
 labeled corpus exists yet; this is a v0 bootstrap to prove the
 mechanism + discrimination. The byte shapes mirror the real Claude Code
 stream-json + bundle event-kind wire format so the scorer exercises the
