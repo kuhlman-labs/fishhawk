@@ -212,6 +212,116 @@ func TestTryCoerce_IntegerTicketReference(t *testing.T) {
 	}
 }
 
+// TestTryCoerce_TicketReferenceObjectWrongType verifies that an object-form
+// ticket_reference whose `type` is set to a non-canonical value is normalized
+// to the sole valid enum value (github_issue) and validates on the first pass
+// with exactly one coercion at /ticket_reference/type. Reproduces run
+// a5838fb1's exact failure (object-form ticket_reference with type != the sole
+// enum value), which the runner mirror previously failed to coerce.
+func TestTryCoerce_TicketReferenceObjectWrongType(t *testing.T) {
+	m := planfixture.Valid()
+	m["ticket_reference"] = map[string]any{
+		"type": "issue", // wrong value — not in the single-element enum
+		"url":  "https://github.com/x/y/issues/742",
+		"id":   "x/y#742",
+	}
+	data := marshal(t, m)
+
+	coercedBytes, coercions, err := plan.TryCoerce(data, testNow)
+	if err != nil {
+		t.Fatalf("TryCoerce: unexpected error: %v", err)
+	}
+	if len(coercions) != 1 {
+		t.Fatalf("coercions = %d, want 1", len(coercions))
+	}
+	if got := coercions[0].FieldPath; got != "/ticket_reference/type" {
+		t.Errorf("FieldPath = %q, want /ticket_reference/type", got)
+	}
+	if got := coercions[0].OriginalType; got != "string" {
+		t.Errorf("OriginalType = %q, want string", got)
+	}
+	if got, ok := coercions[0].OriginalValue.(string); !ok || got != "issue" {
+		t.Errorf("OriginalValue = %v, want string \"issue\"", coercions[0].OriginalValue)
+	}
+	if got := coercions[0].CoercedTo; got != "github_issue" {
+		t.Errorf("CoercedTo = %v, want github_issue", got)
+	}
+	if coercedBytes == nil {
+		t.Fatal("coercedBytes is nil")
+	}
+	if err := plan.Validate(coercedBytes); err != nil {
+		t.Errorf("coerced plan does not validate: %v", err)
+	}
+}
+
+// TestTryCoerce_TicketReferenceObjectMissingType verifies that an object-form
+// ticket_reference with `type` missing entirely is normalized to the sole valid
+// enum value and validates on the first pass with exactly one coercion.
+func TestTryCoerce_TicketReferenceObjectMissingType(t *testing.T) {
+	m := planfixture.Valid()
+	m["ticket_reference"] = map[string]any{
+		"url": "https://github.com/x/y/issues/742",
+		"id":  "x/y#742",
+	}
+	data := marshal(t, m)
+
+	coercedBytes, coercions, err := plan.TryCoerce(data, testNow)
+	if err != nil {
+		t.Fatalf("TryCoerce: unexpected error: %v", err)
+	}
+	if len(coercions) != 1 {
+		t.Fatalf("coercions = %d, want 1", len(coercions))
+	}
+	if got := coercions[0].FieldPath; got != "/ticket_reference/type" {
+		t.Errorf("FieldPath = %q, want /ticket_reference/type", got)
+	}
+	if got := coercions[0].OriginalType; got != "missing" {
+		t.Errorf("OriginalType = %q, want missing", got)
+	}
+	if coercions[0].OriginalValue != nil {
+		t.Errorf("OriginalValue = %v, want nil", coercions[0].OriginalValue)
+	}
+	if got := coercions[0].CoercedTo; got != "github_issue" {
+		t.Errorf("CoercedTo = %v, want github_issue", got)
+	}
+	if coercedBytes == nil {
+		t.Fatal("coercedBytes is nil")
+	}
+	if err := plan.Validate(coercedBytes); err != nil {
+		t.Errorf("coerced plan does not validate: %v", err)
+	}
+}
+
+// TestTryCoerce_TicketReferenceObjectWellFormed verifies that a well-formed
+// object-form ticket_reference (type already github_issue) produces zero
+// coercions and is left unchanged — the no-op / keep-original path that
+// guards content_hash stability.
+func TestTryCoerce_TicketReferenceObjectWellFormed(t *testing.T) {
+	m := planfixture.Valid()
+	m["ticket_reference"] = map[string]any{
+		"type": "github_issue",
+		"url":  "https://github.com/x/y/issues/742",
+		"id":   "x/y#742",
+	}
+	data := marshal(t, m)
+
+	coercedBytes, coercions, err := plan.TryCoerce(data, testNow)
+	if err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+	for _, c := range coercions {
+		if strings.HasPrefix(c.FieldPath, "/ticket_reference") {
+			t.Errorf("unexpected coercion at %q on well-formed ticket_reference", c.FieldPath)
+		}
+	}
+	if len(coercions) != 0 {
+		t.Errorf("coercions = %d, want 0 on already-valid plan", len(coercions))
+	}
+	if coercedBytes != nil {
+		t.Errorf("coercedBytes = non-nil on already-valid plan")
+	}
+}
+
 // TestTryCoerce_PartialCoercionWithRemainingViolation exercises the production
 // failure shape: agent emits a coercible field (generated_by as bare string)
 // AND a non-coercible field (approach as bare string — expects array). Coercion

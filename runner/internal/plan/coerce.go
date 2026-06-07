@@ -25,14 +25,16 @@ type Coercion struct {
 // coercionEntry describes how to coerce a bare string at a given schema path.
 type coercionEntry struct {
 	isArrayItem bool
-	principal   string         // field that receives the bare string value
-	defaults    map[string]any // non-principal defaults; "<<runtime:now>>" is substituted at coercion time
+	principal   string            // field that receives the bare string value
+	defaults    map[string]any    // non-principal defaults; "<<runtime:now>>" is substituted at coercion time
+	singleEnums map[string]string // field -> sole valid enum value, for object-form normalization
 }
 
 // coercionAnnotation holds the x-coerce-* data extracted from a $defs entry.
 type coercionAnnotation struct {
-	principal string
-	defaults  map[string]any
+	principal   string
+	defaults    map[string]any
+	singleEnums map[string]string
 }
 
 // coercionRegistry is the schema-derived set of paths that TryCoerce handles,
@@ -122,7 +124,28 @@ func buildCoercionRegistry() map[string]coercionEntry {
 		for k, v := range defaultsRaw {
 			defaults[k] = v
 		}
-		annotByDef[name] = coercionAnnotation{principal, defaults}
+		// Scan the def's properties for single-element enum fields. A field
+		// whose enum has exactly one valid value can be force-normalized on
+		// object-form inputs (missing or wrong value → the sole value). A
+		// multi-value enum is intentionally skipped: the correct value is then
+		// ambiguous and must not be rewritten.
+		singleEnums := make(map[string]string)
+		if propsRaw, ok := def["properties"].(map[string]any); ok {
+			for fieldName, fpRaw := range propsRaw {
+				fp, ok := fpRaw.(map[string]any)
+				if !ok {
+					continue
+				}
+				enumRaw, ok := fp["enum"].([]any)
+				if !ok || len(enumRaw) != 1 {
+					continue
+				}
+				if s, ok := enumRaw[0].(string); ok {
+					singleEnums[fieldName] = s
+				}
+			}
+		}
+		annotByDef[name] = coercionAnnotation{principal, defaults, singleEnums}
 	}
 
 	reg := make(map[string]coercionEntry)
@@ -145,7 +168,7 @@ func walkSchemaProps(props map[string]any, prefix string, defs map[string]any, a
 		if ref, ok := prop["$ref"].(string); ok {
 			defName := defNameFromRef(ref)
 			if ann, ok := annotByDef[defName]; ok {
-				reg[path] = coercionEntry{isArrayItem: false, principal: ann.principal, defaults: ann.defaults}
+				reg[path] = coercionEntry{isArrayItem: false, principal: ann.principal, defaults: ann.defaults, singleEnums: ann.singleEnums}
 			} else if defName != "" {
 				// Recurse into the referenced def's own properties.
 				if def, ok := defs[defName].(map[string]any); ok {
@@ -163,7 +186,7 @@ func walkSchemaProps(props map[string]any, prefix string, defs map[string]any, a
 				if ref, ok := items["$ref"].(string); ok {
 					defName := defNameFromRef(ref)
 					if ann, ok := annotByDef[defName]; ok {
-						reg[path] = coercionEntry{isArrayItem: true, principal: ann.principal, defaults: ann.defaults}
+						reg[path] = coercionEntry{isArrayItem: true, principal: ann.principal, defaults: ann.defaults, singleEnums: ann.singleEnums}
 					}
 				}
 			}
@@ -199,6 +222,27 @@ func buildCoerced(entry coercionEntry, value string, now time.Time) map[string]a
 	}
 	coerced[entry.principal] = value
 	return coerced
+}
+
+// jsonTypeName returns the JSON type name of a value decoded by encoding/json,
+// used to record the prior type in a Coercion when normalizing an object field.
+func jsonTypeName(v any) string {
+	switch v.(type) {
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case float64, json.Number:
+		return "number"
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	case nil:
+		return "null"
+	default:
+		return "unknown"
+	}
 }
 
 // navigateTo walks a path segment slice through a map[string]any tree and
@@ -319,18 +363,42 @@ func TryCoerce(data []byte, now time.Time) ([]byte, []Coercion, error) {
 			if !ok {
 				continue
 			}
-			s, ok := v.(string)
-			if !ok {
+			if s, ok := v.(string); ok {
+				coerced := buildCoerced(entry, s, now)
+				coercions = append(coercions, Coercion{
+					FieldPath:     path,
+					OriginalType:  "string",
+					OriginalValue: s,
+					CoercedTo:     coerced,
+				})
+				m[parts[0]] = coerced
 				continue
 			}
-			coerced := buildCoerced(entry, s, now)
-			coercions = append(coercions, Coercion{
-				FieldPath:     path,
-				OriginalType:  "string",
-				OriginalValue: s,
-				CoercedTo:     coerced,
-			})
-			m[parts[0]] = coerced
+			// Object-form input: normalize each single-value enum field whose
+			// current value is missing or not the sole valid value. A
+			// well-formed object (every such field already correct) produces no
+			// coercions here, preserving the keep-original behavior.
+			if obj, ok := v.(map[string]any); ok {
+				for field, soleValue := range entry.singleEnums {
+					if cur, present := obj[field].(string); present && cur == soleValue {
+						continue
+					}
+					cur, present := obj[field]
+					origType := "missing"
+					var origValue any
+					if present {
+						origType = jsonTypeName(cur)
+						origValue = cur
+					}
+					obj[field] = soleValue
+					coercions = append(coercions, Coercion{
+						FieldPath:     path + "/" + field,
+						OriginalType:  origType,
+						OriginalValue: origValue,
+						CoercedTo:     soleValue,
+					})
+				}
+			}
 		}
 	}
 
