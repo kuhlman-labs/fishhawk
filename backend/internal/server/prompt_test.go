@@ -2059,6 +2059,157 @@ func TestResolveFixupConcerns(t *testing.T) {
 	})
 }
 
+// makeFixupEntryWithAllowCreate builds a stage_fixup_triggered audit entry
+// carrying both the selected concerns and the declared allow_create paths
+// (#823), matching server/fixup.go's writeFixupAudit payload shape.
+func makeFixupEntryWithAllowCreate(runID, stageID uuid.UUID, concerns []planreview.Concern, allowCreate []string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":         stageID.String(),
+		"selected_indices": []int{0},
+		"concerns":         concerns,
+		"allow_create":     allowCreate,
+		"reason":           "operator declared a net-new file",
+		"pass_ordinal":     1,
+	})
+	rid := runID
+	sid := stageID
+	return &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
+}
+
+func TestResolveFixupAllowCreate(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	concerns := []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "needs a new file"}}
+
+	t.Run("no entries returns nil", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{}})
+		if got := s.resolveFixupAllowCreate(context.Background(), runID, stageID); got != nil {
+			t.Errorf("got %v, want nil", got)
+		}
+	})
+
+	t.Run("entry for a different stage is ignored", func(t *testing.T) {
+		other := uuid.New()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithAllowCreate(runID, other, concerns, []string{"a/b.go"})}},
+		}})
+		if got := s.resolveFixupAllowCreate(context.Background(), runID, stageID); got != nil {
+			t.Errorf("got %v, want nil (entry bound to a different stage)", got)
+		}
+	})
+
+	t.Run("returns the newest entry's declared paths", func(t *testing.T) {
+		old := makeFixupEntryWithAllowCreate(runID, stageID, concerns, []string{"old/path.go"})
+		newest := makeFixupEntryWithAllowCreate(runID, stageID, concerns, []string{"new/a.go", "new/b.go"})
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {old, newest}},
+		}})
+		got := s.resolveFixupAllowCreate(context.Background(), runID, stageID)
+		if len(got) != 2 || got[0] != "new/a.go" || got[1] != "new/b.go" {
+			t.Errorf("got %v, want [new/a.go new/b.go] (newest entry)", got)
+		}
+	})
+
+	t.Run("entry without allow_create returns nil", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntry(runID, stageID, concerns)}},
+		}})
+		if got := s.resolveFixupAllowCreate(context.Background(), runID, stageID); got != nil {
+			t.Errorf("got %v, want nil (no allow_create on the entry)", got)
+		}
+	})
+}
+
+// TestGetStagePrompt_Implement_FixupAllowCreate_Folded confirms an operator-
+// declared net-new file (allow_create, #823) folds into the effective
+// scope.files — the exact set the runner's #818 created-out-of-scope gate
+// diffs against — while an undeclared path stays absent.
+func TestGetStagePrompt_Implement_FixupAllowCreate_Folded(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityMedium, Category: "scope", Note: "extract the helper into a new file"},
+	}
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		runID: {makeFixupEntryWithAllowCreate(runID, implStageID, concerns, []string{"backend/internal/server/helper.go"})},
+	}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	paths := map[string]bool{}
+	for _, f := range resp.ScopeFiles {
+		paths[f.Path] = true
+	}
+	// The declared net-new file is folded in alongside the plan scope file.
+	if !paths["backend/internal/server/prompt.go"] {
+		t.Errorf("plan scope file missing from scope_files: %+v", resp.ScopeFiles)
+	}
+	if !paths["backend/internal/server/helper.go"] {
+		t.Errorf("allow_create file not folded into scope_files: %+v", resp.ScopeFiles)
+	}
+	// An undeclared path is NOT in the effective scope — the #818 gate would
+	// still trip for it (the silent-strip hole stays closed).
+	if paths["backend/internal/server/undeclared.go"] {
+		t.Errorf("undeclared path leaked into scope_files: %+v", resp.ScopeFiles)
+	}
+}
+
 // TestGetStagePrompt_Implement_NoScopeFilesWhenPlanMissing confirms the
 // scope_files field is omitted when no approved plan is available, so
 // the runner falls back to `git add -A`.

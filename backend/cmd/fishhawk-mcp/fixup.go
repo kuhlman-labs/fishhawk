@@ -19,6 +19,8 @@ type FixupStageInput struct {
 	StageID  string `json:"stage_id" jsonschema:"the Fishhawk implement stage UUID to fix up (parked at the implement-review gate, or succeeded with the run's review gate still open)"`
 	Concerns []int  `json:"concerns" jsonschema:"indices of the recorded implement-review concerns to route back to the agent; at least one required"`
 	Reason   string `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the stage_fixup_triggered audit entry"`
+	// AllowCreate declares net-new files this fix-up will create (#823).
+	AllowCreate []string `json:"allow_create,omitempty" jsonschema:"optional repo-relative paths the fix-up will CREATE; folded into the effective scope.files for THIS pass only (bounded, explicit, operator-authorized) so the runner stages them instead of failing category-B created-out-of-scope. Any created file NOT declared here still fails category-B."`
 }
 
 // FixupStageOutput surfaces the re-opened Stage row. A successful fix-up
@@ -87,6 +89,14 @@ Inputs:
     stage's implement_reviewed audit entry; inspect it via
     fishhawk_list_audit.
   - reason   : optional operator note, recorded on the audit entry.
+  - allow_create : optional repo-relative paths the fix-up will CREATE.
+    Each declared path is folded into the effective scope.files for THIS
+    pass only (bounded, explicit, operator-authorized), so the runner
+    stages the new file instead of failing the #818 created-out-of-scope
+    gate. Use this when a concern requires a NET-NEW file. Any created
+    file NOT declared here still fails category-B (the #818 fail-loud
+    contract is preserved). Entries must be repo-relative (no absolute
+    paths, no '..'); a bad entry returns validation_failed.
 
 Bounded + operator-gated: the bound defaults to ONE pass per stage. The
 budget is the number of remaining passes (max − fix-ups already
@@ -119,7 +129,7 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	if len(in.Concerns) == 0 {
 		return nil, FixupStageOutput{}, fmt.Errorf("concerns must select at least one recorded implement-review concern")
 	}
-	fixed, err := r.api.FixupStage(ctx, stageID, in.Concerns, in.Reason)
+	fixed, err := r.api.FixupStage(ctx, stageID, in.Concerns, in.Reason, in.AllowCreate)
 	if err != nil {
 		return nil, FixupStageOutput{}, fmt.Errorf("fixup stage: %w", err)
 	}

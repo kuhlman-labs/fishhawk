@@ -52,10 +52,39 @@ const defaultMaxFixupPasses = 1
 // Concerns selects which recorded implement-review concerns (by their
 // index in the stage's resolved concern set) to route back to the
 // agent; it must be non-empty. Reason is an optional operator note
-// recorded on the audit entry.
+// recorded on the audit entry. AllowCreate declares net-new files this
+// fix-up pass will create (#823); the paths are folded into the
+// effective scope.files for THAT dispatch only so the runner's #818
+// created-out-of-scope gate stages them rather than failing category-B.
+// Any created file NOT declared here still trips the gate.
 type fixupRequest struct {
-	Concerns []int  `json:"concerns"`
-	Reason   string `json:"reason"`
+	Concerns    []int    `json:"concerns"`
+	Reason      string   `json:"reason"`
+	AllowCreate []string `json:"allow_create"`
+}
+
+// validateAllowCreate normalizes and validates the fix-up allow-create
+// paths (#823). Each entry is trimmed; empty/whitespace-only, absolute,
+// and ".."-containing entries are rejected so the allow-list stays
+// repo-relative and contained (it cannot widen scope outside the tree).
+// Returns the trimmed paths on success, or a (field, message) describing
+// the first bad entry for a 400 validation_failed envelope.
+func validateAllowCreate(paths []string) ([]string, string, string) {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			return nil, "allow_create", "allow_create entries must be non-empty repo-relative paths"
+		}
+		if strings.HasPrefix(trimmed, "/") {
+			return nil, "allow_create", fmt.Sprintf("allow_create entry %q must be repo-relative, not absolute", trimmed)
+		}
+		if strings.Contains(trimmed, "..") {
+			return nil, "allow_create", fmt.Sprintf("allow_create entry %q must not contain '..'", trimmed)
+		}
+		out = append(out, trimmed)
+	}
+	return out, "", ""
 }
 
 // handleFixupStage implements POST /v0/stages/{stage_id}/fixup.
@@ -126,6 +155,15 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"concerns must select at least one recorded implement-review concern",
 			map[string]any{"field": "concerns"})
+		return
+	}
+
+	// Validate the optional allow-create paths (#823) before any state
+	// change: trim, reject empty/absolute/".."-containing entries.
+	allowCreate, badField, badMsg := validateAllowCreate(reqBody.AllowCreate)
+	if badField != "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			badMsg, map[string]any{"field": badField})
 		return
 	}
 
@@ -226,7 +264,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// Audit first so the fix-up intent (and the selected concerns the
 	// prompt renderer reads back) is recorded even if the orchestrator
 	// handoff below fails. Same posture as the retry handler.
-	s.writeFixupAudit(r, dec, selected, reqBody.Concerns, reqBody.Reason, priorPasses)
+	s.writeFixupAudit(r, dec, selected, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses)
 
 	// The fix-up re-open lands the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire
@@ -328,9 +366,11 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // writeFixupAudit appends a stage_fixup_triggered entry capturing the
 // selected concern indices, the resolved concern objects (so the prompt
 // renderer delivers them as binding instructions), the operator reason,
-// and the bounded-pass receipt fields. Best-effort: the transition is
-// already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, indices []int, reason string, priorPasses int) {
+// the declared allow-create paths (#823, folded into the effective
+// scope.files for the fix-up dispatch), and the bounded-pass receipt
+// fields. Best-effort: the transition is already committed, so a failure
+// here logs but doesn't unwind.
+func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, indices []int, reason string, allowCreate []string, priorPasses int) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -345,6 +385,7 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 		"selected_indices": indices,
 		"concerns":         selected,
 		"reason":           reason,
+		"allow_create":     allowCreate,
 		"pass_ordinal":     passOrdinal,
 		"max_passes":       defaultMaxFixupPasses,
 		"remaining_budget": dec.RemainingBudget,

@@ -295,6 +295,10 @@ func (c *apiClient) RetryStage(ctx context.Context, id uuid.UUID) (*Stage, error
 type fixupRequest struct {
 	Concerns []int  `json:"concerns"`
 	Reason   string `json:"reason,omitempty"`
+	// AllowCreate declares net-new files the fix-up will create (#823),
+	// folded into the effective scope.files for that pass only. omitempty:
+	// the common fix-up omits it and stays unaffected.
+	AllowCreate []string `json:"allow_create,omitempty"`
 }
 
 // FixupStage routes one or more advisory implement-review concerns back
@@ -315,8 +319,12 @@ type fixupRequest struct {
 //     or the stage is not at the gate / its review gate already resolved)
 //   - 422 fixup_budget_exhausted (the bounded pass count is spent;
 //     details carry max_passes + used)
-func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concerns []int, reason string) (*Stage, error) {
-	body, err := json.Marshal(fixupRequest{Concerns: concerns, Reason: reason})
+//
+// allowCreate declares net-new files this pass will create (#823), folded
+// into the effective scope.files for that dispatch only; an invalid entry
+// (absolute / containing "..") surfaces 400 validation_failed.
+func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concerns []int, reason string, allowCreate []string) (*Stage, error) {
+	body, err := json.Marshal(fixupRequest{Concerns: concerns, Reason: reason, AllowCreate: allowCreate})
 	if err != nil {
 		return nil, fmt.Errorf("marshal fixup: %w", err)
 	}

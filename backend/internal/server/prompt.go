@@ -230,6 +230,18 @@ func (s *Server) mergeStructuredScopeFiles(ctx context.Context, scopeFiles []sco
 	return s.foldScopePaths(ctx, scopeFiles, paths, "approval-add-scope-files")
 }
 
+// mergeFixupAllowCreate folds the net-new file paths an operator declared on a
+// fix-up (#823) into the implement stage's effective scope set, so the runner
+// stages them and the #818 created-out-of-scope gate no longer trips for them.
+// Shares the same empty-scope guard as the other folders: an otherwise-empty
+// scope stays empty so the runner's `git add -A` fallback isn't narrowed.
+func (s *Server) mergeFixupAllowCreate(ctx context.Context, scopeFiles []scopeFile, paths []string) []scopeFile {
+	if len(scopeFiles) == 0 || len(paths) == 0 {
+		return scopeFiles
+	}
+	return s.foldScopePaths(ctx, scopeFiles, paths, "fixup-allow-create")
+}
+
 // foldScopePaths appends paths not already present (compared by .Path) to the
 // scope set with Operation=modify, dedups, and info-logs the additions. It is
 // the shared body behind mergeConditionScopeFiles (#730 prose fold) and
@@ -413,6 +425,12 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		if rendered, joined := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, &joined)
+			// Fold the operator-declared net-new files (#823) into the
+			// effective scope so the runner's #818 created-out-of-scope gate
+			// stages them rather than failing category-B. No-op on an empty
+			// scope (keeps the runner's git add -A fallback). Any created file
+			// NOT declared here still trips the gate.
+			scopeFiles = s.mergeFixupAllowCreate(r.Context(), scopeFiles, s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID))
 			// Emit the fix-up routing flag (#784): point the runner at the
 			// stage's existing PR branch so it takes the RebaseFromRemote
 			// same-branch path instead of `checkout -b <existing branch>`.
@@ -610,6 +628,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if rendered, joined := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, &joined)
+			// Fold the operator-declared net-new files (#823) into the
+			// effective scope so the runner's #818 created-out-of-scope gate
+			// stages them rather than failing category-B. No-op on an empty
+			// scope (keeps the runner's git add -A fallback). Any created file
+			// NOT declared here still trips the gate.
+			scopeFiles = s.mergeFixupAllowCreate(r.Context(), scopeFiles, s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID))
 			// Emit the fix-up routing flag (#784) so the rendered prompt view
 			// and the runner-facing response stay byte-consistent. The SPA path
 			// is read-only and never drives a commit; the same derivation keeps
@@ -1524,6 +1548,67 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		return rendered, strings.Join(notes, "\n")
 	}
 	return nil, ""
+}
+
+// resolveFixupAllowCreate returns the net-new file paths the operator
+// declared on the fix-up that re-opened this implement stage (#823),
+// folded into the effective scope.files so the runner's #818
+// created-out-of-scope gate stages them rather than failing category-B.
+//
+// It mirrors resolveFixupConcerns: it reads the stage_fixup_triggered
+// audit entries (server/fixup.go), filters to the current stage, and
+// uses the NEWEST entry (a fix-up re-opens the stage to pending and the
+// renderer must reflect the most recent trigger). Each entry's
+// `allow_create` field is the validated, repo-relative path slice the
+// fix-up handler persisted.
+//
+// Returns nil when the AuditRepo is unconfigured, the stage carries no
+// fix-up trigger (the common, non-fix-up case), the newest trigger
+// declared no paths, or on any error — best-effort, same WARN-and-proceed
+// posture as the other prompt resolvers.
+func (s *Server) resolveFixupAllowCreate(ctx context.Context, runID, stageID uuid.UUID) []string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list stage_fixup_triggered audit for allow_create failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	// Scan newest-first (ListForRunByCategory returns entries ordered ASC by
+	// ts) for the first entry bound to this stage.
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			AllowCreate []string `json:"allow_create"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: unmarshal stage_fixup_triggered allow_create failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()),
+			)
+			return nil
+		}
+		if len(payload.AllowCreate) == 0 {
+			return nil
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: loaded fix-up allow_create paths into implement scope",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Int("count", len(payload.AllowCreate)),
+		)
+		return payload.AllowCreate
+	}
+	return nil
 }
 
 // matchDecomposedSubPlan returns the sub-plan whose title prefixes the

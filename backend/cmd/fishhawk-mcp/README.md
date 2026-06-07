@@ -108,6 +108,9 @@ Inputs:
 | `stage_id` | **yes** | The implement stage parked at the review gate. |
 | `concerns` | **yes** | Indices of the recorded implement-review concerns to route back (at least one). The indices address the concern set on the stage's `implement_reviewed` audit entry — inspect it via `fishhawk_list_audit`. |
 | `reason` | no | Operator note, recorded on the `stage_fixup_triggered` audit entry. |
+| `allow_create` | no | Repo-relative paths this fix-up will **create** ([#823](https://github.com/kuhlman-labs/fishhawk/issues/823)). See below. |
+
+**Declaring net-new files (`allow_create`)** — a concern that requires a *new* file needs `allow_create`. Each declared path is folded into the implement stage's **effective `scope.files` for THIS fix-up pass only** (never the persisted plan scope), reusing the same [#824](https://github.com/kuhlman-labs/fishhawk/issues/824) `foldScopePaths` machinery `add_scope_files` uses. Because the runner's created-out-of-scope gate ([#818](https://github.com/kuhlman-labs/fishhawk/issues/818)) keys off that effective union, folding the path in makes the runner stage the new file so the gate stops tripping for it. The pass is bounded and operator-authorized: a fix-up only happens when the operator calls this verb, and `allow_create` widens the legitimate set only by the paths the operator names. **Preserved contract:** any created file **NOT** declared here still fails category-B per #818 — declaring paths does not reopen the silent-strip hole. Entries must be repo-relative; an absolute path or one containing `..` is rejected (`validation_failed`, 400, `field: allow_create`). The OpenAPI/`v0.md` surface remains the authoritative parameter reference.
 
 What a fix-up does — and how it differs from `fishhawk_retry_stage`:
 
