@@ -42,6 +42,20 @@ const DefaultRemote = "origin"
 // as a category-B failure (wrong-shaped output → re-scope/re-plan).
 var ErrCommitWouldNotCompile = errors.New("gitops: committed tree would not compile")
 
+// ErrFixupCreatedOutOfScope is the fix-up analogue of ErrCommitWouldNotCompile
+// / ErrCommittedTestsFailed (#818). A fix-up pass cannot widen the stage's fixed
+// scope.files, so a net-new file the fix-up needed to create is out of scope by
+// construction and would be silently stripped from the scope-only commit by
+// StageScoped (#581) — leaving the in-scope edits that REFERENCE it landed,
+// which ships a self-inconsistent, misleadingly-green partial result. The runner
+// wraps this (via fmt.Errorf("%w: ...")) from a fix-up-only VerifyCommit branch
+// and returns it BEFORE pushing, so origin is untouched. It is classified
+// category-B (re-scope/re-plan); the backend's #788 fix-up recovery then
+// restores the run to its pre-fix-up review gate. Only CREATED (untracked)
+// out-of-scope files trip this; modified-but-out-of-scope drift stays flag-only
+// (ADR-027).
+var ErrFixupCreatedOutOfScope = errors.New("gitops: fix-up created out-of-scope files")
+
 // ErrCommittedTestsFailed is the test-gate analogue of
 // ErrCommitWouldNotCompile (#800): the scope-only committed tree COMPILES
 // (go vet passes) but a touched package's tests fail because a build- or
@@ -423,6 +437,42 @@ func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []s
 		}
 	}
 	return drift, nil
+}
+
+// UntrackedPaths returns the subset of candidates that git reports as
+// untracked (created, non-gitignored) in repoDir — i.e. brand-new files
+// the working tree carries that are not in the index. It runs
+// `git ls-files --others --exclude-standard` (the supported enumeration of
+// untracked, non-ignored files) and intersects the result with candidates.
+//
+// This isolates the created-vs-modified distinction the fix-up scope gate
+// (#818) needs: a modified-but-out-of-scope tracked file is flag-only drift
+// (ADR-027), but a CREATED out-of-scope file would be silently stripped from a
+// fix-up's scope-only commit while the in-scope change that references it lands.
+// It is a package-level function (not a *Pusher method) because the caller is a
+// VerifyCommit closure with no *Pusher in scope, matching the package-level
+// gate helpers.
+func UntrackedPaths(ctx context.Context, repoDir string, candidates []string) ([]string, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	out, err := (&Pusher{}).runOut(ctx, repoDir, "ls-files", "--others", "--exclude-standard")
+	if err != nil {
+		return nil, fmt.Errorf("gitops: ls-files --others: %w", err)
+	}
+	untracked := make(map[string]bool)
+	for _, line := range strings.Split(out, "\n") {
+		if p := strings.TrimSpace(line); p != "" {
+			untracked[p] = true
+		}
+	}
+	var created []string
+	for _, c := range candidates {
+		if untracked[c] {
+			created = append(created, c)
+		}
+	}
+	return created, nil
 }
 
 // porcelainPath extracts the repo-relative path from one `git status

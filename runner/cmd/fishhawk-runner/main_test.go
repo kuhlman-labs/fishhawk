@@ -3393,6 +3393,188 @@ func TestRun_ImplementStage_FixupPushFailure_ReportsFailed(t *testing.T) {
 	}
 }
 
+// TestRun_ImplementStage_FixupCreatedOutOfScope_CategoryB is the #818
+// downstream-classification seam: when a fix-up's pre-push gate returns
+// gitops.ErrFixupCreatedOutOfScope (the fix-up created net-new out-of-scope
+// files that StageScoped would silently strip), the implement stage must
+// surface FAILED with category B and report the failure via the /pull-request
+// path (outcome=failed / category=B, no PR artifact body) so the backend's
+// #788 fix-up recovery restores the run to its pre-fix-up review gate. The
+// fakePusher returns the sentinel exactly as the real gitops.Pusher does when
+// its VerifyCommit hook fails before the push.
+func TestRun_ImplementStage_FixupCreatedOutOfScope_CategoryB(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:     "22222222-3333-4444-5555-666666666666",
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: "fishhawk/run-11111111/stage-22222222",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: gitops.ErrFixupCreatedOutOfScope}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B on fix-up created-out-of-scope failure, got:\n%s", stderr.String())
+	}
+	// A fix-up never opens a fresh PR.
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not be called for a fix-up pass")
+	}
+	// #788 recovery hinges on the /pull-request FAILURE report (outcome=failed,
+	// category=B, no artifact body) being driven by the fix-up push path.
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after a fix-up gate failure")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Errorf("failure report = {outcome:%q, category:%q}, want {failed, B}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
+	}
+	if len(fu.gotPRArgs.Body) != 0 {
+		t.Errorf("failure report must not carry a PR artifact body, got %d bytes", len(fu.gotPRArgs.Body))
+	}
+}
+
+// captureImplementVerifyCommit runs the implement upload flow with a fake
+// pusher pointed at repo and returns the verifyCommit closure the runner wires
+// into CommitAndPush, so the #818 gate logic can be exercised directly against
+// a real working tree. fixup toggles the fix-up prompt path (the gate is
+// cfg.fixup-only).
+func captureImplementVerifyCommit(t *testing.T, repo string, fixup bool) func(context.Context, string, []string) error {
+	t.Helper()
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	pr := &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	if fixup {
+		pr.Fixup = true
+		pr.FixupBranch = "fishhawk/run-11111111/stage-22222222"
+	}
+	fu.promptResp = pr
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--working-dir", repo,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil || fp.gotArgs.VerifyCommit == nil {
+		t.Fatal("VerifyCommit hook not captured")
+	}
+	return fp.gotArgs.VerifyCommit
+}
+
+// TestRun_ImplementStage_FixupCreatedOutOfScopeGate exercises the #818 gate
+// decision (error vs nil) directly through the wired verifyCommit closure
+// against a real working tree. The "fails BEFORE push (origin untouched)"
+// property is the contract of CommitAndPush — a VerifyCommit error aborts
+// before the push — and is proven in gitops by
+// TestCommitAndPush_VerifyCommit_AbortsBeforePush; here we prove the closure
+// returns that error for exactly the right working-tree shapes.
+func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	// (a) A fix-up whose working tree carries an untracked out-of-scope created
+	// file fails with ErrFixupCreatedOutOfScope, naming the file.
+	t.Run("created_out_of_scope_fails", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
+		runGit("add", "-A")
+		runGit("commit", "-m", "init")
+		mustWrite(t, filepath.Join(repo, "newfile.go"), "package x\n") // untracked, out of scope
+		head := gitHead(t, repo)
+
+		vc := captureImplementVerifyCommit(t, repo, true)
+		err := vc(context.Background(), head, []string{"newfile.go"})
+		if !errors.Is(err, gitops.ErrFixupCreatedOutOfScope) {
+			t.Fatalf("err = %v, want ErrFixupCreatedOutOfScope", err)
+		}
+		if !strings.Contains(err.Error(), "newfile.go") {
+			t.Errorf("error should name the created file newfile.go: %v", err)
+		}
+	})
+
+	// (b) A fix-up that creates only in-scope files leaves no out-of-scope
+	// drift (StageScoped staged them), so the gate does not fire.
+	t.Run("in_scope_only_passes", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
+		runGit("add", "-A")
+		runGit("commit", "-m", "init")
+		head := gitHead(t, repo)
+
+		vc := captureImplementVerifyCommit(t, repo, true)
+		if err := vc(context.Background(), head, nil); err != nil {
+			t.Errorf("empty drift must pass the gate, got: %v", err)
+		}
+	})
+
+	// (c) A fix-up with only modified-but-out-of-scope drift (a tracked file)
+	// still passes — modified-out-of-scope stays flag-only (ADR-027); only
+	// CREATED (untracked) files trip the gate.
+	t.Run("modified_out_of_scope_stays_flag_only", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
+		runGit("add", "-A")
+		runGit("commit", "-m", "init")
+		mustWrite(t, filepath.Join(repo, "README.md"), "# modified\n") // tracked, modified
+		head := gitHead(t, repo)
+
+		vc := captureImplementVerifyCommit(t, repo, true)
+		if err := vc(context.Background(), head, []string{"README.md"}); err != nil {
+			t.Errorf("modified-out-of-scope drift must stay flag-only, got: %v", err)
+		}
+	})
+
+	// (d) The SAME untracked out-of-scope working tree on a NON-fix-up implement
+	// push is NOT failed by this gate — it is cfg.fixup-only.
+	t.Run("non_fixup_unaffected", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
+		runGit("add", "-A")
+		runGit("commit", "-m", "init")
+		mustWrite(t, filepath.Join(repo, "newfile.go"), "package x\n") // untracked, out of scope
+		head := gitHead(t, repo)
+
+		vc := captureImplementVerifyCommit(t, repo, false)
+		if err := vc(context.Background(), head, []string{"newfile.go"}); err != nil {
+			t.Errorf("gate is fix-up-only; a non-fix-up push must be unaffected, got: %v", err)
+		}
+	})
+}
+
 // --- Verify gate (#441) ---
 
 // TestVerify_NoCmd_SkipsGate confirms that when --verify-cmd is absent

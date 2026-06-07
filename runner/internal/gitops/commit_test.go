@@ -275,6 +275,49 @@ func TestStageScoped_StagesFileInBrandNewDir(t *testing.T) {
 	}
 }
 
+// TestUntrackedPaths_IsolatesCreatedFromModified is the #818 gate seam:
+// UntrackedPaths must return only the brand-new (untracked) candidates, not
+// a modified-but-tracked one — that distinction is what lets the fix-up gate
+// hard-fail on a created out-of-scope file while leaving modified-out-of-scope
+// drift flag-only (ADR-027).
+func TestUntrackedPaths_IsolatesCreatedFromModified(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	// Modify the tracked README (out-of-scope, but tracked → modified) and
+	// create a brand-new untracked out-of-scope file.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "newfile.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := UntrackedPaths(context.Background(), repo, []string{"README.md", "newfile.go"})
+	if err != nil {
+		t.Fatalf("UntrackedPaths: %v", err)
+	}
+	if len(created) != 1 || created[0] != "newfile.go" {
+		t.Errorf("created = %v, want [newfile.go] (modified-tracked README excluded)", created)
+	}
+
+	// No candidate untracked → empty.
+	none, err := UntrackedPaths(context.Background(), repo, []string{"README.md"})
+	if err != nil {
+		t.Fatalf("UntrackedPaths (none): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("created = %v, want empty when no candidate is untracked", none)
+	}
+
+	// Empty candidates → empty, no git invocation needed.
+	if got, err := UntrackedPaths(context.Background(), repo, nil); err != nil || len(got) != 0 {
+		t.Errorf("UntrackedPaths(nil) = %v, %v; want empty, nil", got, err)
+	}
+}
+
 // TestCommitAndPush_ScopeBounded_CommitsOnlyDeclared exercises the full
 // commit boundary: the stray file is excluded from the commit and
 // surfaced as ScopeDrift while still left dirty in the working tree.
