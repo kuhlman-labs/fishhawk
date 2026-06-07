@@ -522,3 +522,134 @@ func TestExtractDiff_StatusValuesRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// makeVerifyRunLine builds a verify_run event line carrying the given
+// head_sha (#797). Mirrors the runner's verifyRunEvent payload shape.
+func makeVerifyRunLine(t *testing.T, seq int, headSHA string) Line {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"command":   "go build ./...",
+		"head_sha":  headSHA,
+		"exit_code": 0,
+		"output":    "",
+		"outcome":   "passed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Line{Seq: seq, Kind: EventKindVerifyRun, Data: payload}
+}
+
+func TestExtractHeadSHA_HappyPath(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+		makeVerifyRunLine(t, 3, "deadbeefcafe"),
+	}
+	got, err := ExtractHeadSHA(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractHeadSHA: %v", err)
+	}
+	if got != "deadbeefcafe" {
+		t.Errorf("head_sha = %q, want deadbeefcafe", got)
+	}
+}
+
+func TestExtractHeadSHA_NoVerifyRun(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+	}
+	got, err := ExtractHeadSHA(packLines(t, lines))
+	if !errors.Is(err, ErrNoHeadSHA) {
+		t.Errorf("err = %v, want ErrNoHeadSHA", err)
+	}
+	if got != "" {
+		t.Errorf("head_sha = %q, want empty", got)
+	}
+}
+
+// A gate-skipped / infra-failure verify_run carries an empty head_sha; when
+// it precedes a real verify_run, ExtractHeadSHA must skip the empty one and
+// return the first NON-EMPTY SHA (binding approval refinement on step 1).
+func TestExtractHeadSHA_SkipsEmptyReturnsFirstNonEmpty(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeVerifyRunLine(t, 2, ""),        // gate-skipped: empty head_sha
+		makeVerifyRunLine(t, 3, "realsha"), // later real verify
+	}
+	got, err := ExtractHeadSHA(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractHeadSHA: %v", err)
+	}
+	if got != "realsha" {
+		t.Errorf("head_sha = %q, want realsha", got)
+	}
+}
+
+// A bundle whose only verify_run events carry empty head_shas is treated as
+// head_sha-less → ErrNoHeadSHA (fail open to the variant gate).
+func TestExtractHeadSHA_OnlyEmptyReturnsErrNoHeadSHA(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeVerifyRunLine(t, 2, ""),
+	}
+	_, err := ExtractHeadSHA(packLines(t, lines))
+	if !errors.Is(err, ErrNoHeadSHA) {
+		t.Errorf("err = %v, want ErrNoHeadSHA", err)
+	}
+}
+
+func TestExtractHeadSHA_BadGzip(t *testing.T) {
+	_, err := ExtractHeadSHA([]byte("not gzipped"))
+	if !errors.Is(err, ErrBadGzip) {
+		t.Errorf("err = %v, want ErrBadGzip", err)
+	}
+}
+
+func TestExtractHeadSHA_BadPayload(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: EventKindVerifyRun, Data: json.RawMessage(`[1,2,3]`)},
+	}
+	_, err := ExtractHeadSHA(packLines(t, lines))
+	if err == nil || !strings.Contains(err.Error(), "parse verify_run payload") {
+		t.Errorf("err = %v, want parse-payload error", err)
+	}
+}
+
+// The raw and redacted variants of one pack carry the IDENTICAL verify_run
+// head_sha — the discrimination the (stage_id, head_sha) dedup key relies on
+// (#797). Redaction strips secrets from event output, never the git SHA, so
+// both variants of the same pack return the same value here.
+func TestExtractHeadSHA_RawAndRedactedVariantsMatch(t *testing.T) {
+	raw := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeVerifyRunLine(t, 2, "samesha123"),
+	}
+	// Redacted variant: same head_sha, output field redacted.
+	redactedPayload, err := json.Marshal(map[string]any{
+		"command":   "go build ./...",
+		"head_sha":  "samesha123",
+		"exit_code": 0,
+		"output":    "[redacted]",
+		"outcome":   "passed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	redacted := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindVerifyRun, Data: redactedPayload},
+	}
+	gotRaw, err := ExtractHeadSHA(packLines(t, raw))
+	if err != nil {
+		t.Fatalf("ExtractHeadSHA(raw): %v", err)
+	}
+	gotRedacted, err := ExtractHeadSHA(packLines(t, redacted))
+	if err != nil {
+		t.Fatalf("ExtractHeadSHA(redacted): %v", err)
+	}
+	if gotRaw != gotRedacted {
+		t.Errorf("raw head_sha %q != redacted head_sha %q", gotRaw, gotRedacted)
+	}
+}

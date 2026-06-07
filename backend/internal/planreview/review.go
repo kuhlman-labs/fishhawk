@@ -137,6 +137,15 @@ type ReviewSkippedPayload struct {
 type ReviewStartedPayload struct {
 	ConfiguredAgents int           `json:"configured_agents"`
 	Authority        AuthorityMode `json:"authority"`
+
+	// HeadSHA is the implement-review idempotency key (#797): the bundle's
+	// verify_run committed-tree head_sha, recorded on the
+	// implement_review_started entry so a retried raw upload (transient 5xx
+	// after the review already dispatched) is deduped on (stage_id,
+	// head_sha) before re-dispatching a second review. omitempty keeps the
+	// plan path byte-identical — plan_review_started has no diff/head_sha
+	// and passes "", so its payload is unchanged.
+	HeadSHA string `json:"head_sha,omitempty"`
 }
 
 // ReviewFailedPayload is the JSON payload stored in an audit entry with

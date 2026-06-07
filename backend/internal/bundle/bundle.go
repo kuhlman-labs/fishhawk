@@ -43,6 +43,12 @@ const EventKindManifest = "manifest"
 // scope_drift event read by ExtractScopeDrift.
 const EventKindPolicyEvent = "policy_event"
 
+// EventKindVerifyRun is the kind the runner stamps on a committed-tree
+// verify run (#651). Its payload carries the throwaway committed-tree
+// WIP-commit head_sha, read by ExtractHeadSHA as the #797 implement-review
+// idempotency key.
+const EventKindVerifyRun = "verify_run"
+
 // Manifest mirrors runner/internal/bundle.ManifestData. Backend
 // owns the read side; agreeing field-by-field with the runner is
 // the contract — there's no schema-sync CI for this format
@@ -119,6 +125,15 @@ var (
 	// handler treats this as a malformed upload and rejects the
 	// request rather than guessing at the missing context.
 	ErrNoManifest = errors.New("bundle: manifest line missing or first line had wrong kind")
+
+	// ErrNoHeadSHA means the bundle parsed cleanly but carried no
+	// verify_run event with a non-empty head_sha (the common no-verify
+	// case, or a bundle whose only verify_run events were gate-skipped /
+	// infra-failed and so carry an empty head_sha). Returned by
+	// ExtractHeadSHA so the caller can fail open — an absent head_sha must
+	// never suppress the implement-review dispatch (#797). Mirrors
+	// ErrNoDiffEvent.
+	ErrNoHeadSHA = errors.New("bundle: no verify_run event with a head_sha found")
 )
 
 // Line is the on-the-wire envelope for one JSONL line. Mirrors
@@ -164,6 +179,15 @@ type scopeDriftPayload struct {
 	Check      string   `json:"check"`
 	Outcome    string   `json:"outcome"`
 	Undeclared []string `json:"undeclared"`
+}
+
+// verifyRunPayload mirrors the runner's verify_run event payload
+// (verifyRunEvent in runner/cmd/fishhawk-runner/main.go). Only head_sha
+// is read here; like the other payloads this is a lockstep runner↔backend
+// wire contract, not a JSON Schema, so the `head_sha` json tag MUST stay
+// identical to the emitter.
+type verifyRunPayload struct {
+	HeadSHA string `json:"head_sha"`
 }
 
 // ReadEvents decompresses bundleBytes and returns every JSONL line
@@ -316,6 +340,50 @@ func ExtractScopeDrift(bundleBytes []byte) ([]string, error) {
 		return payload.Undeclared, nil
 	}
 	return nil, nil
+}
+
+// ExtractHeadSHA returns the head_sha carried in the bundle's verify_run
+// event (#651 committed-tree verify), or ErrNoHeadSHA if the bundle parsed
+// cleanly but carried no verify_run event with a non-empty head_sha. It is
+// the #797 implement-review idempotency key: the raw and redacted variants
+// of one pack carry the IDENTICAL verify_run head_sha (the event is emitted
+// once per stage execution and copied verbatim into both variants —
+// redaction strips secrets, not a git SHA), while a FixupStage re-pack runs
+// a new committed-tree verify on a new diff → new WIP commit → a NEW
+// head_sha. That is exactly the discrimination the (stage_id, head_sha) key
+// needs to dedup a retried raw upload while still re-reviewing a fix-up.
+//
+// The returned SHA is the throwaway committed-tree WIP-commit SHA (the
+// runner reset --soft's it away immediately), NOT the final pushed PR head
+// SHA — fine for dedup since it is deterministic across raw+redacted of one
+// pack and distinct per re-pack.
+//
+// The first NON-EMPTY head_sha wins: the gate-skipped / worktree-add-failure
+// / infra-failure verify_run paths emit a verify_run with an empty head_sha,
+// and a multi-iteration fix loop or a skipped first gate can place such an
+// empty-head_sha event ahead of a real one. Returning the empty value would
+// needlessly disable the dedup, so we skip empties and return the first real
+// SHA (fail-open intent: only a genuinely head_sha-less bundle degrades to
+// the variant gate). Only a corrupt gzip frame / malformed line propagates
+// as an error.
+func ExtractHeadSHA(bundleBytes []byte) (string, error) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range lines {
+		if line.Kind != EventKindVerifyRun {
+			continue
+		}
+		var payload verifyRunPayload
+		if err := json.Unmarshal(line.Data, &payload); err != nil {
+			return "", fmt.Errorf("bundle: parse verify_run payload: %w", err)
+		}
+		if payload.HeadSHA != "" {
+			return payload.HeadSHA, nil
+		}
+	}
+	return "", ErrNoHeadSHA
 }
 
 // byteReader is the smallest io.Reader over a []byte that
