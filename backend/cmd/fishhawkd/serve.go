@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
@@ -144,6 +145,12 @@ func runServe(args []string, logSink io.Writer) int {
 	childCompletionInterval := fs.Duration("child-completion-interval",
 		60*time.Second,
 		"child-completion sweeper scan interval; 60s is the upper bound on parent latency after the last child terminates")
+	enableInvariantMonitor := fs.Bool("enable-invariant-monitor",
+		envOr("FISHHAWKD_ENABLE_INVARIANT_MONITOR", "false") == "true",
+		"start the self-consistency invariant monitor (#764); periodically auto-reconciles the safe {all stages terminal, run non-terminal} class and surfaces (audit + WARN log) the unrecoverable {review awaiting_approval, null pull_request_url on a push-and-open-pr run} class. Off by default to match the other tickers' dev-loop posture.")
+	invariantMonitorInterval := fs.Duration("invariant-monitor-interval",
+		60*time.Second,
+		"invariant monitor scan interval")
 	oidcAudience := fs.String("oidc-audience",
 		envOr("FISHHAWKD_OIDC_AUDIENCE", ""),
 		"GitHub Actions OIDC audience the signing-key endpoint requires; when set, callers must present a valid id_token whose aud matches this value")
@@ -686,6 +693,39 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Warn("startup stuck-run reconciliation failed", slog.String("error", err.Error()))
 		} else if n > 0 {
 			logger.Info("startup stuck-run reconciliation completed", slog.Int("rescued", n))
+		}
+	}
+
+	// Self-consistency invariant monitor (#764). Generalizes the
+	// one-shot startup ReconcileStuckRuns above into a periodic sweep:
+	// invariant 1 (all-stages-terminal + run non-terminal) auto-
+	// reconciles via the same Orchestrator method; invariant 2 (review
+	// awaiting_approval + null PR on a push-and-open-pr run) is surface-
+	// only (audit + WARN). Off by default to match the other tickers'
+	// dev-loop posture. Requires RunRepo + AuditRepo; Reconcile is wired
+	// only when the Orchestrator is configured.
+	if *enableInvariantMonitor {
+		if cfg.RunRepo == nil || cfg.AuditRepo == nil {
+			logger.Warn("--enable-invariant-monitor set but RunRepo or AuditRepo unconfigured; monitor not started")
+		} else {
+			var reconcile func(context.Context) (int, error)
+			if cfg.Orchestrator != nil {
+				reconcile = cfg.Orchestrator.ReconcileStuckRuns
+			}
+			ticker := &invariantmonitor.Ticker{
+				Runs:      cfg.RunRepo,
+				Audit:     cfg.AuditRepo,
+				Reconcile: reconcile,
+				Logger:    logger,
+				Interval:  *invariantMonitorInterval,
+			}
+			go func() {
+				if err := ticker.Run(ctx); err != nil {
+					logger.Error("invariant monitor exited with error", slog.String("error", err.Error()))
+				}
+			}()
+			logger.Info("invariant monitor started",
+				slog.Duration("interval", *invariantMonitorInterval))
 		}
 	}
 

@@ -2,12 +2,18 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 )
 
 func TestRequestID_GeneratesWhenAbsent(t *testing.T) {
@@ -81,14 +87,85 @@ func TestRecovery_CatchesPanicAndLogs(t *testing.T) {
 }
 
 func TestBearerAuth_NoHeader_Anonymous(t *testing.T) {
+	s := newServer(t, newFakeRepo())
 	var captured Identity
-	h := bearerAuth(nil, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := s.bearerAuth(nil, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 
 	if !captured.IsAnonymous() {
 		t.Errorf("identity = %+v, want anonymous", captured)
+	}
+}
+
+// stubAPITokenAuth is a minimal apitokenAuthenticator that returns a
+// fixed (token, err) pair. Used to drive the dberr classification seam
+// without a real repository.
+type stubAPITokenAuth struct {
+	tok *apitoken.Token
+	err error
+}
+
+func (s stubAPITokenAuth) Authenticate(context.Context, string) (*apitoken.Token, error) {
+	return s.tok, s.err
+}
+
+// TestBearerAuth_DBUnavailable_Returns503 is the cross-seam case
+// (#764): the apitoken authenticator fails because the database is
+// unreachable (an error wrapping *pgconn.ConnectError). The middleware
+// must classify it via dberr and short-circuit with 503
+// service_unavailable rather than masking the outage as a fall-through
+// 401. Drives dberr → middleware → error envelope end-to-end (cf. #618).
+func TestBearerAuth_DBUnavailable_Returns503(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	dbDown := fmt.Errorf("apitoken: lookup: %w", &pgconn.ConnectError{})
+	auth := stubAPITokenAuth{err: dbDown}
+
+	var handlerRan bool
+	h := s.bearerAuth(auth, nil, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		handlerRan = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer fhk_deadbeef")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "service_unavailable") {
+		t.Errorf("body missing service_unavailable code:\n%s", rec.Body.String())
+	}
+	if handlerRan {
+		t.Error("handler should not run on a 503 short-circuit")
+	}
+}
+
+// TestBearerAuth_BadToken_HealthyDB_FallsThrough is the invariant the
+// 503 change must NOT break: when the DB is healthy and the token is
+// simply wrong (apitoken.ErrNotFound), the middleware falls through to
+// the anonymous identity — the per-handler 401 is preserved, not a 503.
+func TestBearerAuth_BadToken_HealthyDB_FallsThrough(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	auth := stubAPITokenAuth{err: apitoken.ErrNotFound}
+
+	var captured Identity
+	h := s.bearerAuth(auth, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer fhk_deadbeef")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (handler ran with anonymous identity)", rec.Code)
+	}
+	if !captured.IsAnonymous() {
+		t.Errorf("identity = %+v, want anonymous fall-through on a bad token", captured)
 	}
 }
 

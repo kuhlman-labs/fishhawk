@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/dberr"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 )
 
@@ -206,10 +207,23 @@ func recovery(logger *slog.Logger) func(http.Handler) http.Handler {
 // identity; the middleware does NOT 401 on its own. Per-handler
 // logic decides whether anonymous is acceptable.
 //
+// The one exception is a database-UNAVAILABLE condition (#764): if
+// the authenticator for the credential actually presented fails
+// because the database is unreachable (dberr.IsUnavailable), the
+// middleware short-circuits with 503 service_unavailable instead of
+// falling through to anonymous. Falling through would mask an outage
+// as a per-handler 401 — telling the caller their credential is bad
+// when in fact the lookup never ran. An ordinary bad-credential
+// error (no matching row) is NOT unavailable, so it still falls
+// through and the per-handler 401 is preserved when the DB is healthy.
+//
+// It is a Server method (not a free function) so it can reach
+// s.writeError to emit the standard error envelope on the 503 path.
+//
 // Either repo may be nil — the bootstrap path can run without
 // either backend, in which case the corresponding credential
 // never resolves.
-func bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, sessions sessionAuthenticator) func(http.Handler) http.Handler {
+func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, sessions sessionAuthenticator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id := Identity{Subject: "anonymous"}
@@ -219,7 +233,12 @@ func bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, s
 			// "github:<login>" value.
 			if sessions != nil {
 				if c, err := r.Cookie(auth.SessionCookieName); err == nil && c.Value != "" {
-					if user, sess, err := sessions.Authenticate(r.Context(), c.Value); err == nil {
+					user, sess, err := sessions.Authenticate(r.Context(), c.Value)
+					if dberr.IsUnavailable(err) {
+						s.writeDBUnavailable(w, r)
+						return
+					}
+					if err == nil {
 						id = Identity{
 							Subject:   "github:" + user.GitHubLogin,
 							UserID:    user.ID,
@@ -238,7 +257,12 @@ func bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, s
 				if tok, ok := tokenFromHeader(r); ok {
 					switch {
 					case mcpTokens != nil && mcptoken.HasPrefix(tok):
-						if rec, err := mcpTokens.Authenticate(r.Context(), tok); err == nil {
+						rec, err := mcpTokens.Authenticate(r.Context(), tok)
+						if dberr.IsUnavailable(err) {
+							s.writeDBUnavailable(w, r)
+							return
+						}
+						if err == nil {
 							id = Identity{
 								// Subject encodes the run scope so
 								// handlers that audit auth or
@@ -252,7 +276,12 @@ func bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, s
 							}
 						}
 					case tokens != nil:
-						if rec, err := tokens.Authenticate(r.Context(), tok); err == nil {
+						rec, err := tokens.Authenticate(r.Context(), tok)
+						if dberr.IsUnavailable(err) {
+							s.writeDBUnavailable(w, r)
+							return
+						}
+						if err == nil {
 							id = Identity{
 								Subject: rec.Subject,
 								TokenID: rec.ID.String(),
@@ -267,6 +296,15 @@ func bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, s
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// writeDBUnavailable emits the 503 service_unavailable envelope used
+// when an auth lookup fails because the database is unreachable
+// (#764). Centralized so the three credential paths in bearerAuth
+// stay identical.
+func (s *Server) writeDBUnavailable(w http.ResponseWriter, r *http.Request) {
+	s.writeError(w, r, http.StatusServiceUnavailable, "service_unavailable",
+		"database unavailable; retry shortly", nil)
 }
 
 // tokenFromHeader extracts a Fishhawk bearer token from the

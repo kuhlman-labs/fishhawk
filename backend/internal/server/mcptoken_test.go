@@ -398,7 +398,7 @@ func TestBearerAuth_MCPTokenRoutesToMCPAuthenticator(t *testing.T) {
 	}
 
 	var captured Identity
-	h := bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := newServer(t, newFakeRepo()).bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/v0/runs", http.NoBody)
@@ -419,7 +419,7 @@ func TestBearerAuth_MCPTokenRoutesToMCPAuthenticator(t *testing.T) {
 
 func TestBearerAuth_APITokenSkipsMCPRoute(t *testing.T) {
 	mcpAuth := &stubMCPAuthenticator{}
-	h := bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	h := newServer(t, newFakeRepo()).bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 	req := httptest.NewRequest(http.MethodGet, "/v0/runs", http.NoBody)
 	req.Header.Set("Authorization", "Bearer fhk_apitokenstylevaluethatishhopefullyenoughlong")
 	rr := httptest.NewRecorder()
