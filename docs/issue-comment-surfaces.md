@@ -271,6 +271,18 @@ Notes:
   `notifyStatusUpdate` hook, not this audit kind). Mirrors the sibling `child_pushed`
   (#771). Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
+- The self-consistency invariant kind — `invariant_violation` (#764) — is an
+  **internal, system-actor audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it; it has no Notifier method.
+  `invariantmonitor.Ticker.checkReviewPRInvariant` writes it from the periodic
+  invariant monitor when a run is parked at its review gate (`awaiting_approval`)
+  with a null/empty `pull_request_url` despite its workflow intending to open a PR
+  (the #742 shape) — a `system` actor and payload `{kind, run_id, reconciled:false}`.
+  It is the durable, indexable record (paired with a structured WARN log) that a
+  loop-state inconsistency was detected and surfaced for operator action; the
+  monitor mutates nothing on this class. Matches the `dispatch_watchdog_elapsed` /
+  `children_settled` precedent. Listed here only so a future reader grepping the
+  audit categories doesn't mistake it for a comment surface.
 
 ## Routing
 

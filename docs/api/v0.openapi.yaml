@@ -789,7 +789,23 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Unauthorized:
-      description: Authentication missing or invalid.
+      description: |
+        Authentication missing or invalid (`error: unauthenticated`).
+        Note: a credential that fails to validate because the database
+        was unreachable surfaces as `503 service_unavailable` at the
+        auth boundary, NOT as 401 — a 401 here means the credential is
+        absent or genuinely bad on a healthy database (#764).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: |
+        A dependency required to serve the request was unavailable.
+        At the auth boundary (`error: service_unavailable`, message
+        `database unavailable; retry shortly`) this means the database
+        could not be reached to validate the presented credential —
+        distinct from a bad credential (401) on a healthy database
+        (#764). Transient; retry with backoff.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -1179,6 +1195,7 @@ paths:
                         type: array
                         items: { $ref: '#/components/schemas/Run' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
     post:
       operationId: createRun
       summary: Create a workflow run
@@ -1327,6 +1344,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /v0/runs/{run_id}:
     get:

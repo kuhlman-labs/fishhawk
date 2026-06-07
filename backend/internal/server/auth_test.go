@@ -540,7 +540,7 @@ func TestBearerAuth_SessionCookieResolvesIdentity(t *testing.T) {
 	})
 
 	var captured Identity
-	h := bearerAuth(nil, nil, repo)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := newServer(t, newFakeRepo()).bearerAuth(nil, nil, repo)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -569,7 +569,7 @@ func TestBearerAuth_RevokedSessionFallsBackToAnonymous(t *testing.T) {
 	}
 
 	var captured Identity
-	h := bearerAuth(nil, nil, repo)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := newServer(t, newFakeRepo()).bearerAuth(nil, nil, repo)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -583,7 +583,7 @@ func TestBearerAuth_RevokedSessionFallsBackToAnonymous(t *testing.T) {
 
 func TestBearerAuth_AuthRepoNil_AnonymousOnCookie(t *testing.T) {
 	var captured Identity
-	h := bearerAuth(nil, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := newServer(t, newFakeRepo()).bearerAuth(nil, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)

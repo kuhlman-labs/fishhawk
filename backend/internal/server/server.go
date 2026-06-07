@@ -443,7 +443,7 @@ func (s *Server) buildHandler() http.Handler {
 
 	var h http.Handler = mux
 	h = s.csrf(h)
-	h = bearerAuth(s.cfg.APITokenRepo, s.cfg.MCPTokenRepo, s.cfg.AuthRepo)(h)
+	h = s.bearerAuth(s.cfg.APITokenRepo, s.cfg.MCPTokenRepo, s.cfg.AuthRepo)(h)
 	h = logging(s.cfg.Logger)(h)
 	h = requestID(h)
 	h = recovery(s.cfg.Logger)(h)
