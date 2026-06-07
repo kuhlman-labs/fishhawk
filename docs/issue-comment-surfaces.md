@@ -283,6 +283,20 @@ Notes:
   monitor mutates nothing on this class. Matches the `dispatch_watchdog_elapsed` /
   `children_settled` precedent. Listed here only so a future reader grepping the
   audit categories doesn't mistake it for a comment surface.
+- The pull-request open-failure audit kind — `pull_request_failed` (#742) — is an
+  **internal, audit-only kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it; it has no Notifier method.
+  `server/pullrequest.go::failPullRequestStage` writes it via
+  `AuditRepo.AppendChained` with category `pull_request_failed` when the runner
+  reports `{outcome:"failed"}` to `POST /v0/runs/{run_id}/pull-request` — the
+  commit/push/PR-open step failed after the trace gate left the implement stage in
+  `running`. The actor is the request's `actorKind`/`actorSubject` (`system`, or
+  operator on the bearer path) and the payload is `{run_id, stage_id, category,
+  reason, auth_method}`. It pins the runner's failure category (C retryable via
+  `failed → pending`, B parks for re-scope) and reason into the chain so the run
+  never reaches `review:awaiting_approval` with a null PR. Listed here only so a
+  future reader grepping the audit categories doesn't mistake it for a comment
+  surface.
 
 ## Routing
 
