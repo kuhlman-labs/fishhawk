@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -2765,4 +2766,325 @@ func TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope(t *testing.T) {
 			t.Errorf("plan-missing run must keep empty scope (git add -A fallback), got %#v", resp.ScopeFiles)
 		}
 	})
+}
+
+// makeApproveWithScopeFilesEntry builds an approval_submitted audit entry with
+// decision=approve carrying the structured add_scope_files slice (#824) that
+// loadApprovalAddScopeFiles reads back.
+func makeApproveWithScopeFilesEntry(runID uuid.UUID, addScopeFiles []string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"decision":        "approve",
+		"add_scope_files": addScopeFiles,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
+}
+
+// TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope crosses the full
+// #824 seam: persisted approval_submitted.add_scope_files ->
+// resolveApprovalAddScopeFiles -> mergeStructuredScopeFiles ->
+// promptResponse.ScopeFiles. An approved plan declares one scope file; the
+// structured add_scope_files names three the prose fold cannot reach — a
+// DIRECTORY (trailing slash), an extensionless ROOT file (go.work), and a
+// slash-path with a dotted name — and all four must surface on the rendered
+// implement-prompt scope. Subtests pin the empty-scope guard and decomposition-
+// parent inheritance.
+func TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+	structured := []string{
+		"backend/internal/agenteval/testdata/corpus/newcase/", // directory
+		"go.work",                  // extensionless repo-root file
+		"docs/spec/standard_v1.md", // slash-path with a dotted name
+	}
+
+	t.Run("structured paths folded into declared scope", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		planStageID := uuid.New()
+		implStageID := uuid.New()
+
+		p := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "scoped plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+			},
+		}
+		planBytes, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       planStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {makeApproveWithScopeFilesEntry(runID, structured)},
+			}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got := make(map[string]bool, len(resp.ScopeFiles))
+		for _, f := range resp.ScopeFiles {
+			got[f.Path] = true
+		}
+		for _, want := range append([]string{plannedFile}, structured...) {
+			if !got[want] {
+				t.Errorf("resp.ScopeFiles missing %q; got %#v", want, resp.ScopeFiles)
+			}
+		}
+	})
+
+	t.Run("plan-missing run is not augmented", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		implStageID := uuid.New()
+
+		// No plan artifact → empty scope. The structured fold must keep it
+		// empty so the runner's git add -A fallback isn't silently narrowed.
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {}}
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {makeApproveWithScopeFilesEntry(runID, structured)},
+			}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.ScopeFiles != nil {
+			t.Errorf("plan-missing run must keep empty scope, got %#v", resp.ScopeFiles)
+		}
+	})
+
+	t.Run("decomposed child inherits parent add_scope_files", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		parentRunID := uuid.New()
+		childRunID := uuid.New()
+		parentPlanStageID := uuid.New()
+		childStageID := uuid.New()
+
+		// Parent plan declares a scope file so the child's resolved scope is
+		// non-empty (the fold guard requires it) — the child matches no
+		// sub-plan, so it falls back to the parent's top-level scope.
+		parentPlan := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "parent plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+			},
+		}
+		planBytes, err := json.Marshal(parentPlan)
+		if err != nil {
+			t.Fatalf("marshal parent plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       parentPlanStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			parentRunID: {{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+		rr.getRuns[childRunID] = &run.Run{
+			ID:             childRunID,
+			Repo:           "o/r",
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerCLI,
+			ParentRunID:    &parentRunID,
+			DecomposedFrom: &parentRunID,
+		}
+		rr.getStages[childStageID] = &run.Stage{ID: childStageID, RunID: childRunID, Type: run.StageTypeImplement}
+
+		priv, _ := sf.issue(t, childRunID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			// add_scope_files is keyed to the PARENT run; the child has no
+			// gate of its own, so resolveApprovalAddScopeFiles must walk up.
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				parentRunID: {makeApproveWithScopeFilesEntry(parentRunID, structured)},
+			}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, childRunID, childStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got := make(map[string]bool, len(resp.ScopeFiles))
+		for _, f := range resp.ScopeFiles {
+			got[f.Path] = true
+		}
+		for _, want := range structured {
+			if !got[want] {
+				t.Errorf("child resp.ScopeFiles missing inherited %q; got %#v", want, resp.ScopeFiles)
+			}
+		}
+	})
+}
+
+// TestAddScopeFiles_DoesNotBypassForbiddenPathsGate is the #824 security
+// assertion (added at approval): folding a path into the implement scope via
+// add_scope_files must NOT let it slip past the forbidden_paths policy gate.
+// The two layers are independent by construction — the structured fold only
+// shapes promptResponse.ScopeFiles (the runner's staging set), while the
+// category-B gate is policy.Evaluate(diff, constraints), which reads the
+// PRODUCED diff and the spec's forbidden_paths and has no scope.files input at
+// all. This test pins both halves: (1) the fold genuinely stages the forbidden
+// path into scope, and (2) the same path in the produced diff is still a
+// forbidden_paths violation, so it fails category-B regardless of the fold.
+func TestAddScopeFiles_DoesNotBypassForbiddenPathsGate(t *testing.T) {
+	const forbidden = ".github/workflows/x.yml"
+
+	// (1) The structured fold stages the forbidden path into scope.
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeApproveWithScopeFilesEntry(runID, []string{forbidden})},
+		}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	folded := false
+	for _, f := range resp.ScopeFiles {
+		if f.Path == forbidden {
+			folded = true
+		}
+	}
+	if !folded {
+		t.Fatalf("precondition: add_scope_files did not fold %q into scope; got %#v", forbidden, resp.ScopeFiles)
+	}
+
+	// (2) The produced diff touching that same path still violates the
+	// forbidden_paths gate — the fold gave it no special pass.
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: forbidden, Status: policy.StatusAdded}}}
+	constraints := policy.Constraints{ForbiddenPaths: []string{".github/**"}}
+	violations := policy.Evaluate(diff, constraints)
+	if len(violations) == 0 {
+		t.Fatalf("forbidden_paths gate did not fire on folded path %q — fold must NOT bypass the gate", forbidden)
+	}
+	if violations[0].Constraint != "forbidden_paths" {
+		t.Errorf("violation = %q, want forbidden_paths", violations[0].Constraint)
+	}
 }

@@ -213,6 +213,29 @@ func (s *Server) mergeConditionScopeFiles(ctx context.Context, scopeFiles []scop
 		return scopeFiles
 	}
 	paths := extractScopePathsFromConditions(*conditions)
+	return s.foldScopePaths(ctx, scopeFiles, paths, "approval-condition")
+}
+
+// mergeStructuredScopeFiles folds the authoritative add_scope_files paths a
+// reviewer named at approval time (#824) into the implement stage's effective
+// scope set. Unlike mergeConditionScopeFiles it takes the structured slice
+// directly (no regex scrape), so it stages directories (trailing slash),
+// extensionless/repo-root files, and described-not-spelled paths the prose
+// fold cannot reach. It shares the same empty-scope guard: an otherwise-empty
+// scope stays empty so the runner's `git add -A` fallback isn't narrowed.
+func (s *Server) mergeStructuredScopeFiles(ctx context.Context, scopeFiles []scopeFile, paths []string) []scopeFile {
+	if len(scopeFiles) == 0 || len(paths) == 0 {
+		return scopeFiles
+	}
+	return s.foldScopePaths(ctx, scopeFiles, paths, "approval-add-scope-files")
+}
+
+// foldScopePaths appends paths not already present (compared by .Path) to the
+// scope set with Operation=modify, dedups, and info-logs the additions. It is
+// the shared body behind mergeConditionScopeFiles (#730 prose fold) and
+// mergeStructuredScopeFiles (#824 structured fold). Callers own the
+// empty-scope and empty-paths guards.
+func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, paths []string, source string) []scopeFile {
 	if len(paths) == 0 {
 		return scopeFiles
 	}
@@ -231,7 +254,8 @@ func (s *Server) mergeConditionScopeFiles(ctx context.Context, scopeFiles []scop
 	}
 	if len(added) > 0 {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"prompt: folded approval-condition files into implement scope",
+			"prompt: folded files into implement scope",
+			slog.String("source", source),
 			slog.Int("count", len(added)),
 			slog.String("paths", strings.Join(added, ",")),
 		)
@@ -366,6 +390,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		// Fold the authoritative add_scope_files paths a reviewer named at
+		// approval time into the effective scope set (#824). This is the
+		// structured, lossless replacement for the #730 prose scrape: it
+		// stages directories, extensionless/repo-root files, and
+		// described-not-spelled paths the regex misses. Applied first
+		// (authoritative), then the #730 prose fold runs as a fallback —
+		// both dedup by path and both no-op on an empty scope (keeps the
+		// runner's git add -A fallback).
+		scopeFiles = s.mergeStructuredScopeFiles(r.Context(), scopeFiles, s.resolveApprovalAddScopeFiles(r.Context(), runRow))
 		// Fold files named by the approval conditions into the effective
 		// scope set so a condition-authorized edit ships as a declared
 		// path rather than benign scope_drift (#730). No-op when scope is
@@ -554,6 +587,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		// Fold the authoritative add_scope_files paths a reviewer named at
+		// approval time into the effective scope set (#824). This is the
+		// structured, lossless replacement for the #730 prose scrape: it
+		// stages directories, extensionless/repo-root files, and
+		// described-not-spelled paths the regex misses. Applied first
+		// (authoritative), then the #730 prose fold runs as a fallback —
+		// both dedup by path and both no-op on an empty scope (keeps the
+		// runner's git add -A fallback).
+		scopeFiles = s.mergeStructuredScopeFiles(r.Context(), scopeFiles, s.resolveApprovalAddScopeFiles(r.Context(), runRow))
 		// Fold files named by the approval conditions into the effective
 		// scope set so a condition-authorized edit ships as a declared
 		// path rather than benign scope_drift (#730). No-op when scope is
@@ -1675,4 +1717,64 @@ func (s *Server) resolveApprovalConditions(ctx context.Context, runRow *run.Run)
 		)
 	}
 	return cond
+}
+
+// loadApprovalAddScopeFiles scans the run's approval_submitted audit entries
+// (newest-first) for the first entry where decision=="approve" and returns its
+// structured add_scope_files slice (#824). Returns nil when none is found.
+// Best-effort: WARN-logs and returns nil on any error.
+func (s *Server) loadApprovalAddScopeFiles(ctx context.Context, runID uuid.UUID) []string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list approval_submitted for add_scope_files failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Decision      string   `json:"decision"`
+			AddScopeFiles []string `json:"add_scope_files"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Decision == "approve" && len(payload.AddScopeFiles) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded structured add_scope_files for implement scope",
+				slog.String("run_id", runID.String()),
+				slog.Int("count", len(payload.AddScopeFiles)),
+			)
+			return payload.AddScopeFiles
+		}
+	}
+	return nil
+}
+
+// resolveApprovalAddScopeFiles returns the structured add_scope_files paths
+// for an implement-stage prompt, resolving across the decomposition fan-out
+// boundary (#824, mirroring resolveApprovalConditions / #677). It reads the
+// run's own approval_submitted entries first; for a decomposed child with no
+// gate of its own that yields nil, so it falls back to the PARENT run's paths
+// so folded paths reach implement-only decomposed children.
+func (s *Server) resolveApprovalAddScopeFiles(ctx context.Context, runRow *run.Run) []string {
+	if paths := s.loadApprovalAddScopeFiles(ctx, runRow.ID); len(paths) > 0 {
+		return paths
+	}
+	if runRow.DecomposedFrom == nil {
+		return nil
+	}
+	paths := s.loadApprovalAddScopeFiles(ctx, *runRow.DecomposedFrom)
+	if len(paths) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: inherited add_scope_files from decomposition parent",
+			slog.String("child_run_id", runRow.ID.String()),
+			slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+		)
+	}
+	return paths
 }

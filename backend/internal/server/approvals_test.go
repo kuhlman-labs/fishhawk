@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1022,6 +1023,55 @@ func TestSubmitApproval_UnknownField(t *testing.T) {
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve","extra":true}`)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 on unknown field", w.Code)
+	}
+}
+
+// TestSubmitApproval_AddScopeFiles_RecordedInAuditPayload pins the #824
+// persistence seam: an approve carrying the structured add_scope_files slice
+// (including a directory and an extensionless root file) records those exact
+// paths under the `add_scope_files` key of the approval_submitted audit
+// payload, where the prompt builder reads them back. The DisallowUnknownFields
+// decoder accepting the field is implicitly proven by the 200; an adjacent
+// unknown field still 400s (TestSubmitApproval_UnknownField).
+func TestSubmitApproval_AddScopeFiles_RecordedInAuditPayload(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/internal/agenteval/testdata/corpus/newcase/","go.work","backend/cmd/fishhawk-mcp/README.md"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	raw, ok := payload["add_scope_files"].([]any)
+	if !ok {
+		t.Fatalf("add_scope_files missing or not an array: %v", payload["add_scope_files"])
+	}
+	got := make([]string, len(raw))
+	for i, v := range raw {
+		got[i] = v.(string)
+	}
+	want := []string{"backend/internal/agenteval/testdata/corpus/newcase/", "go.work", "backend/cmd/fishhawk-mcp/README.md"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("add_scope_files = %v, want %v", got, want)
+	}
+}
+
+// TestSubmitApproval_AddScopeFiles_OmittedWhenEmpty confirms the key is absent
+// when no paths are supplied (omitempty on the wire, and the handler only
+// records on a non-empty slice) so the old loader is undisturbed.
+func TestSubmitApproval_AddScopeFiles_OmittedWhenEmpty(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"lgtm"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["add_scope_files"]; ok {
+		t.Errorf("add_scope_files should be absent when not supplied: %v", payload)
 	}
 }
 

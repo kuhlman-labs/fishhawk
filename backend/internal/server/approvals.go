@@ -39,6 +39,16 @@ type approvalRequest struct {
 	// DisallowUnknownFields decode accepts it; SPA/CLI callers omit it
 	// (omitempty) and are unaffected.
 	ApproverGithubLogin string `json:"approver_github_login,omitempty"`
+	// AddScopeFiles is an explicit, authoritative list of repo-relative
+	// paths to fold into the implement stage's effective scope.files on
+	// approve (#824). It replaces the brittle regex-scrape of the free-text
+	// reason (#730), which silently misses directories, extensionless or
+	// repo-root files, and described-but-not-spelled paths. A trailing
+	// slash marks a directory whose created files stage under it. Recorded
+	// on the approval audit payload and consumed by the prompt builder;
+	// the #730 prose fold remains as a fallback. Declared here so the
+	// DisallowUnknownFields decode accepts it; callers omit it (omitempty).
+	AddScopeFiles []string `json:"add_scope_files,omitempty"`
 }
 
 // handleSubmitApproval implements POST /v0/stages/{stage_id}/approvals.
@@ -189,7 +199,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin)
+		s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles)
 
 		// Hand off to the orchestrator on both approve AND reject
 		// — approve dispatches the next stage; reject walks the
@@ -415,7 +425,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // `approver` field is left as the token subject so the audit row keeps
 // the true acting identity — the resolved login never overwrites
 // provenance.
-func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string) {
+func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string) {
 	systemKind := audit.ActorKind("user")
 	auditPayload := map[string]any{
 		"stage_id": stage.ID.String(),
@@ -434,6 +444,12 @@ func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *appr
 	}
 	if app.Decision == approval.DecisionApprove && comment != "" {
 		auditPayload["comment"] = comment
+	}
+	// Structured scope amendment (#824): record the authoritative paths to
+	// fold into the implement scope. Only on approve with a non-empty slice;
+	// the prompt builder reads this back via loadApprovalAddScopeFiles.
+	if app.Decision == approval.DecisionApprove && len(addScopeFiles) > 0 {
+		auditPayload["add_scope_files"] = addScopeFiles
 	}
 	payload, _ := json.Marshal(auditPayload)
 
