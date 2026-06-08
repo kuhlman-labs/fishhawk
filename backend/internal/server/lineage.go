@@ -79,15 +79,47 @@ func (s *Server) verifyBranchLineage(ctx context.Context, runID uuid.UUID,
 		return true
 	}
 
+	// The #858 report-boundary check seeds the ledger with the current
+	// reported head (first-report bootstrap) and compares the same head.
+	// On a confirmed foreign commit, fail the stage category-B.
+	offendingSHA, checked := s.detectForeignCommitOnBranch(ctx, runRow,
+		*runRow.InstallationID, repo, headSHA, headSHA, prNumber)
+	if checked && offendingSHA != "" {
+		s.recordForeignCommitViolation(ctx, runID, stage, offendingSHA, headSHA)
+		return false
+	}
+	return true
+}
+
+// detectForeignCommitOnBranch is the side-effect-free detection core
+// shared by the #858 report-boundary check (verifyBranchLineage) and the
+// out-of-band merge-resolution re-check (ReverifyBranchLineage). It
+// resolves the run's PR base ref, builds the reported-head ledger seeded
+// from ledgerSeedSHA, compares baseRef...compareHead, and returns the
+// first commit not attributable to the ledger.
+//
+// It performs NO writes (no FailStage, no audit, no notify) — purely
+// detection. Returns (sha, true) on the first foreign commit; ("", true)
+// when every commit is attributable; ("", false) on EVERY fail-open path
+// (unresolvable anchor, incomplete ledger, CompareCommits error) so a
+// transient GitHub failure never produces a false verdict.
+//
+// ledgerSeedSHA is the critical out-of-band knob (see
+// buildReportedHeadLedger): the report-boundary caller seeds with the
+// current head; the merge-resolution caller seeds with "" so the live
+// branch tip is not auto-whitelisted into the set it is checked against.
+func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Run,
+	installationID int64, repo githubclient.RepoRef, compareHead, ledgerSeedSHA string,
+	prNumber int) (offendingSHA string, checked bool) {
 	// Resolve the compare anchor defensively (ADR-035 binding condition):
 	// the run's real PR base ref, never a hardcoded branch name and never
 	// the laundering-prone reported base_sha. Unconfirmed → fail open.
-	baseRef := s.resolveLineageBaseRef(ctx, runRow, *runRow.InstallationID, repo, prNumber)
+	baseRef := s.resolveLineageBaseRef(ctx, runRow, installationID, repo, prNumber)
 	if baseRef == "" {
-		return true
+		return "", false
 	}
 
-	ledger, complete := s.buildReportedHeadLedger(ctx, runID, headSHA)
+	ledger, complete := s.buildReportedHeadLedger(ctx, runRow.ID, ledgerSeedSHA)
 	if !complete {
 		// Could not build the COMPLETE set of this run's legitimate head
 		// SHAs (an audit read failed). Enforcing against a partial ledger
@@ -101,29 +133,153 @@ func (s *Server) verifyBranchLineage(ctx context.Context, runID uuid.UUID,
 		// not.
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage: reported-head ledger incomplete (audit read failed); skipping check",
-			slog.String("run_id", runID.String()),
-			slog.String("head_sha", headSHA))
-		return true
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("head_sha", compareHead))
+		return "", false
 	}
 
-	commits, err := s.cfg.GitHub.CompareCommits(ctx, *runRow.InstallationID, repo, baseRef, headSHA)
+	commits, err := s.cfg.GitHub.CompareCommits(ctx, installationID, repo, baseRef, compareHead)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage: compare commits failed; skipping check",
-			slog.String("run_id", runID.String()),
+			slog.String("run_id", runRow.ID.String()),
 			slog.String("base_ref", baseRef),
-			slog.String("head_sha", headSHA),
+			slog.String("head_sha", compareHead),
 			slog.String("error", err.Error()))
-		return true
+		return "", false
 	}
 
 	for _, sha := range commits {
 		if _, member := ledger[sha]; !member {
-			s.recordForeignCommitViolation(ctx, runID, stage, sha, headSHA)
-			return false
+			return sha, true
 		}
 	}
-	return true
+	return "", true
+}
+
+// ReverifyBranchLineage is the detect-only out-of-band re-check that runs
+// at MERGE RESOLUTION (ADR-035 second line of defense, #862, beyond
+// #858's report boundary). It re-verifies that the run branch's live tip
+// carries no foreign commit before the merge reconciler marks the run
+// succeeded.
+//
+// It mirrors verifyBranchLineage's prelude (same nil guards / fail-open
+// posture), resolves the PR's live head SHA, and runs the shared detection
+// core with ledgerSeedSHA="" so the current tip is NOT auto-whitelisted.
+// On a confirmed foreign commit it emits the shared foreign_commit_on_branch
+// invariant audit + a lineage_violation notify and returns clean=false —
+// but does NOT FailStage (there is no producing stage at merge time;
+// remediation is #867). Every fail-open path returns clean=true so a clean
+// run is never wrongly refused.
+//
+// The emit is idempotent: a contaminated merged run is left PARKED at the
+// review gate (the reconciler skips the resolve, not fails it), so the
+// merge reconciler re-polls it every tick and calls this method again. To
+// avoid audit/notify spam, a foreign_commit_on_branch entry already
+// recorded for this run with the SAME offending+head SHA suppresses the
+// re-emit and re-notify while still returning clean=false. A genuinely new
+// (different) foreign commit still emits.
+//
+// Honest limitation: this observes a merge GitHub has ALREADY performed,
+// so it refuses to mark the run succeeded and flags loudly rather than
+// physically blocking the GitHub-side merge. The pre-merge open-PR window
+// is covered by the periodic sweep (#868).
+func (s *Server) ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prNumber int) (clean bool) {
+	if s.cfg.GitHub == nil || s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return true
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch lineage reverify: load run failed; skipping check",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return true
+	}
+	if runRow.InstallationID == nil {
+		return true
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch lineage reverify: unparseable repo; skipping check",
+			slog.String("run_id", runID.String()),
+			slog.String("repo", runRow.Repo),
+			slog.String("error", err.Error()))
+		return true
+	}
+
+	if prNumber <= 0 {
+		prNumber = parsePRNumberFromURL(runRow.PullRequestURL)
+	}
+	if prNumber <= 0 {
+		return true
+	}
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, *runRow.InstallationID, repo, prNumber)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch lineage reverify: resolve PR head failed; skipping check",
+			slog.String("run_id", runID.String()),
+			slog.Int("pr_number", prNumber),
+			slog.String("error", err.Error()))
+		return true
+	}
+	headSHA := pr.HeadSHA
+	if headSHA == "" {
+		return true
+	}
+
+	offendingSHA, checked := s.detectForeignCommitOnBranch(ctx, runRow,
+		*runRow.InstallationID, repo, headSHA, "", prNumber)
+	if !checked || offendingSHA == "" {
+		// Fail open or clean — either way the merge may resolve.
+		return true
+	}
+
+	// Detect-only on a hit: emit the shared invariant + notify, but leave
+	// the run parked (the reconciler refuses the resolve on clean=false).
+	// Suppress a duplicate emit/notify when this exact contamination is
+	// already on record, so the per-tick re-poll doesn't spam.
+	if s.foreignCommitAlreadyRecorded(ctx, runID, offendingSHA, headSHA) {
+		return false
+	}
+	s.emitForeignCommitInvariant(ctx, runID, nil, offendingSHA, headSHA)
+	s.notifyStatusUpdate(ctx, runID, "lineage_violation")
+	return false
+}
+
+// foreignCommitAlreadyRecorded reports whether a foreign_commit_on_branch
+// invariant entry with this exact offending+head SHA pair is already on
+// the run's chain — the idempotency guard for the re-polled merge-resolution
+// re-check. It fails open (returns false → proceed with emit) on a read
+// error: a duplicate emit is preferable to suppressing a genuine new
+// violation.
+func (s *Server) foreignCommitAlreadyRecorded(ctx context.Context, runID uuid.UUID,
+	offendingSHA, headSHA string) bool {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, invariantmonitor.CategoryInvariantViolation)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch lineage reverify: dedup read failed; proceeding with emit",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	for _, e := range entries {
+		var payload struct {
+			Kind         string `json:"kind"`
+			OffendingSHA string `json:"offending_sha"`
+			HeadSHA      string `json:"head_sha"`
+		}
+		if json.Unmarshal(e.Payload, &payload) != nil {
+			continue
+		}
+		if payload.Kind == invariantmonitor.KindForeignCommitOnBranch &&
+			payload.OffendingSHA == offendingSHA && payload.HeadSHA == headSHA {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveLineageBaseRef resolves the run's PR base ref to anchor the
@@ -167,9 +323,16 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 
 // buildReportedHeadLedger collects the set of head SHAs this run has
 // reported across its pull_request_opened / child_pushed / fixup_pushed
-// audit entries, plus the current report's headSHA (the first-report
-// bootstrap — the PR-open report itself may not yet be in the chain
-// when the guard runs).
+// audit entries, plus an explicit ledgerSeedSHA bootstrap (when
+// non-empty).
+//
+// The seed is the CRITICAL out-of-band subtlety. The #858 report-boundary
+// caller passes the current reported head (the first-report bootstrap —
+// the PR-open report itself may not yet be in the chain when the guard
+// runs) so a legitimate not-yet-audited PR-open head isn't false-flagged.
+// The out-of-band merge-resolution caller passes "" so the current branch
+// tip is NOT auto-whitelisted into the ledger it is being checked against;
+// otherwise a foreign tip would whitelist itself and defeat the check.
 //
 // It returns complete=false if a read error on ANY ledger category
 // prevented building the full set. The caller MUST fail open on an
@@ -177,8 +340,11 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 // ledger missing a legitimate prior-push head would false-flag that
 // commit as foreign on a multi-push run. complete=true means every
 // category was read successfully and the ledger is authoritative.
-func (s *Server) buildReportedHeadLedger(ctx context.Context, runID uuid.UUID, headSHA string) (ledger map[string]struct{}, complete bool) {
-	ledger = map[string]struct{}{headSHA: {}}
+func (s *Server) buildReportedHeadLedger(ctx context.Context, runID uuid.UUID, ledgerSeedSHA string) (ledger map[string]struct{}, complete bool) {
+	ledger = map[string]struct{}{}
+	if ledgerSeedSHA != "" {
+		ledger[ledgerSeedSHA] = struct{}{}
+	}
 	complete = true
 	for _, cat := range lineageLedgerCategories {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
@@ -225,17 +391,36 @@ func (s *Server) recordForeignCommitViolation(ctx context.Context, runID uuid.UU
 	}
 
 	stageID := stage.ID
+	s.emitForeignCommitInvariant(ctx, runID, &stageID, offendingSHA, headSHA)
+	s.notifyStatusUpdate(ctx, runID, "lineage_violation")
+}
+
+// emitForeignCommitInvariant is the single shared writer for the
+// foreign_commit_on_branch invariant audit entry. Both the #858
+// stage-failing path (recordForeignCommitViolation, stageID non-nil) and
+// the detect-only merge-resolution path (ReverifyBranchLineage,
+// stageID=nil — no producing stage at merge time) route through here, so
+// the {kind, run_id, stage_id, offending_sha, head_sha} attribution is
+// defined ONCE, not duplicated. A nil stageID is tolerated: the payload
+// stage_id is emptied and the audit row's StageID is nil. Best-effort:
+// an append failure WARNs and is swallowed so it can't mask the verdict.
+func (s *Server) emitForeignCommitInvariant(ctx context.Context, runID uuid.UUID,
+	stageID *uuid.UUID, offendingSHA, headSHA string) {
+	stageIDStr := ""
+	if stageID != nil {
+		stageIDStr = stageID.String()
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"kind":          invariantmonitor.KindForeignCommitOnBranch,
 		"run_id":        runID.String(),
-		"stage_id":      stageID.String(),
+		"stage_id":      stageIDStr,
 		"offending_sha": offendingSHA,
 		"head_sha":      headSHA,
 	})
 	systemKind := audit.ActorSystem
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
-		StageID:   &stageID,
+		StageID:   stageID,
 		Timestamp: time.Now().UTC(),
 		Category:  invariantmonitor.CategoryInvariantViolation,
 		ActorKind: &systemKind,
@@ -244,7 +429,7 @@ func (s *Server) recordForeignCommitViolation(ctx context.Context, runID uuid.UU
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage: append invariant_violation audit entry failed",
 			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
+			slog.String("stage_id", stageIDStr),
 			slog.String("error", err.Error()))
 	}
 
@@ -252,10 +437,8 @@ func (s *Server) recordForeignCommitViolation(ctx context.Context, runID uuid.UU
 		"branch lineage: foreign commit on run branch",
 		slog.String("kind", invariantmonitor.KindForeignCommitOnBranch),
 		slog.String("run_id", runID.String()),
-		slog.String("stage_id", stageID.String()),
+		slog.String("stage_id", stageIDStr),
 		slog.String("offending_sha", offendingSHA))
-
-	s.notifyStatusUpdate(ctx, runID, "lineage_violation")
 }
 
 // parsePRNumberFromURL extracts the integer PR number from a GitHub PR

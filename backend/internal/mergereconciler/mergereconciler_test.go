@@ -155,6 +155,96 @@ func TestTick_SLALessReviewStage_Merged_Resolves(t *testing.T) {
 	}
 }
 
+// stubReverifier records ReverifyBranchLineage calls and returns a canned
+// clean verdict, modeling the server-side merge-resolution lineage re-check.
+type stubReverifier struct {
+	clean bool
+	calls []int // pr numbers it was consulted on
+}
+
+func (s *stubReverifier) ReverifyBranchLineage(_ context.Context, _ uuid.UUID, prNumber int) bool {
+	s.calls = append(s.calls, prNumber)
+	return s.clean
+}
+
+// TestTick_Merged_ReverifierNotClean_SkipsResolve is the cross-package seam
+// test (#862): on a verified merge, a non-clean lineage verdict must SUPPRESS
+// the succeeded-resolve and leave the run parked/flagged. The Ticker→reverifier
+// boundary is what's exercised — a per-package unit would pass while this
+// wiring breaks.
+func TestTick_Merged_ReverifierNotClean_SkipsResolve(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	rev := &stubReverifier{clean: false}
+	tk := newTicker(repo, pg, res)
+	tk.LineageReverifier = rev
+	tk.Tick(context.Background())
+
+	if len(rev.calls) != 1 || rev.calls[0] != 42 {
+		t.Errorf("reverifier calls = %v, want [42]", rev.calls)
+	}
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (contaminated merge must not resolve succeeded)", len(res.calls))
+	}
+}
+
+// TestTick_Merged_ReverifierClean_Resolves: a clean verdict falls through to
+// the existing succeeded-resolve exactly as today.
+func TestTick_Merged_ReverifierClean_Resolves(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	rev := &stubReverifier{clean: true}
+	tk := newTicker(repo, pg, res)
+	tk.LineageReverifier = rev
+	tk.Tick(context.Background())
+
+	if len(rev.calls) != 1 {
+		t.Errorf("reverifier calls = %d, want 1", len(rev.calls))
+	}
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Errorf("resolve calls = %+v, want one merged=true resolve", res.calls)
+	}
+}
+
+// TestTick_Merged_NilReverifier_Resolves: a nil reverifier preserves today's
+// behavior byte-for-byte — the merge resolves with no re-check.
+func TestTick_Merged_NilReverifier_Resolves(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := newTicker(repo, pg, res) // LineageReverifier left nil
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Errorf("resolve calls = %+v, want one merged=true resolve (nil reverifier = today's behavior)", res.calls)
+	}
+}
+
+// TestTick_ClosedUnmerged_ReverifierNotConsulted: the cancelled (closed,
+// !merged) branch lands nothing, so the lineage re-check must NOT run.
+func TestTick_ClosedUnmerged_ReverifierNotConsulted(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: false}}
+	res := &stubResolver{}
+	rev := &stubReverifier{clean: false}
+	tk := newTicker(repo, pg, res)
+	tk.LineageReverifier = rev
+	tk.Tick(context.Background())
+
+	if len(rev.calls) != 0 {
+		t.Errorf("reverifier consulted on a closed-unmerged PR: %v", rev.calls)
+	}
+	if len(res.calls) != 1 || res.calls[0].merged {
+		t.Errorf("resolve calls = %+v, want one cancelled (merged=false) resolve", res.calls)
+	}
+}
+
 func TestTick_ClosedUnmerged_ResolvesCancelled(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
