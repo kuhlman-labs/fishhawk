@@ -720,13 +720,23 @@ func runServe(args []string, logSink io.Writer) int {
 				Logger:    logger,
 				Interval:  *invariantMonitorInterval,
 			}
+			// Lineage sweep (ADR-035, #868): re-verify open-PR running
+			// runs for a foreign commit pushed between report boundaries.
+			// Wired only when a GitHub client is present — the sweep is a
+			// no-op without one (ReverifyBranchLineage fail-opens on a nil
+			// GitHub client), so leaving Lineage nil keeps the intent
+			// explicit. Mirrors the merge reconciler's GitHub-nil guard.
+			if cfg.GitHub != nil {
+				ticker.Lineage = srv
+			}
 			go func() {
 				if err := ticker.Run(ctx); err != nil {
 					logger.Error("invariant monitor exited with error", slog.String("error", err.Error()))
 				}
 			}()
 			logger.Info("invariant monitor started",
-				slog.Duration("interval", *invariantMonitorInterval))
+				slog.Duration("interval", *invariantMonitorInterval),
+				slog.Bool("lineage_sweep", cfg.GitHub != nil))
 		}
 	}
 
