@@ -1125,6 +1125,106 @@ func TestCommitAndPush_FreshFetchBase_StashPopConflict(t *testing.T) {
 	}
 }
 
+// TestCommitAndPush_RebaseFromRemote_StashPopConflict pins the #866 hardened
+// pop-conflict path for the decomposed-child shared-branch route, which routes
+// through the SAME popStash helper as FreshFetchBase. The shared branch advances
+// on the remote (another writer changes a line) while the agent's uncommitted
+// edit changes the same line divergently, so reapplying the stash onto the
+// freshly-fetched branch tip conflicts. It asserts the same contract: (a) the
+// error is ErrBaseRebaseConflict; (b) the stash entry survives; (c) the working
+// tree is clean with no unmerged paths after the reset --hard abort; (d) the
+// remote branch was NOT advanced by a child-B push (no push on a conflicted pop).
+func TestCommitAndPush_RebaseFromRemote_StashPopConflict(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-shared866"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("base line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+
+	p := &Pusher{}
+
+	// Child A establishes the shared branch on the bare remote with shared.txt
+	// still at "base line" (the dirty change is an unrelated file).
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:           repo,
+		Branch:            branch,
+		CommitMessage:     "child A",
+		RemoteURL:         bare,
+		UpdateTrackingRef: true,
+	}); err != nil {
+		t.Fatalf("child A CommitAndPush: %v", err)
+	}
+
+	// Another writer advances the shared branch on the remote, changing the
+	// shared line. The local checkout is reset back so the advance only exists
+	// on the remote tip (the RebaseFromRemote fetch pulls it in).
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("remote-advanced line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "remote advances shared line")
+	mustGit(t, repo, "push", "origin", branch)
+	remoteTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "reset", "--hard", "HEAD~1")
+
+	// The agent's uncommitted divergent edit to the SAME line.
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("agent-edited line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:          repo,
+		Branch:           branch,
+		CommitMessage:    "child B",
+		RemoteURL:        bare,
+		RebaseFromRemote: true,
+	})
+
+	// (a) The error is the dedicated rebase-conflict sentinel.
+	if !errors.Is(err, ErrBaseRebaseConflict) {
+		t.Fatalf("CommitAndPush error = %v, want ErrBaseRebaseConflict", err)
+	}
+
+	// (b) The stash entry survives the conflicted pop — recoverable.
+	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
+		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
+	}
+
+	// (c) The working tree is clean with no unmerged paths after reset --hard.
+	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
+		t.Errorf("ls-files --unmerged not empty after abort: %q", unmerged)
+	}
+	if status := mustGitOut(t, repo, "status", "--porcelain"); strings.Contains(status, "UU") {
+		t.Errorf("working tree has conflict markers (UU) after abort: %q", status)
+	}
+
+	// (d) The remote shared branch was NOT advanced by a child-B push — its tip
+	// is unchanged from the other writer's commit.
+	if got := mustGitOut(t, repo, "--git-dir="+bare, "rev-parse", branch); got != remoteTip {
+		t.Errorf("remote branch tip = %q, want unchanged %q (no push on conflicted pop)", got, remoteTip)
+	}
+}
+
 // isAncestor reports whether maybeAncestor is an ancestor of ref via
 // `git merge-base --is-ancestor` (exit 0 = ancestor, exit 1 = not).
 func isAncestor(t *testing.T, dir, maybeAncestor, ref string) bool {

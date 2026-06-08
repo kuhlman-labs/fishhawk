@@ -552,9 +552,12 @@ func (p *Pusher) popStash(ctx context.Context, repoDir string) error {
 	if popErr == nil {
 		return nil
 	}
-	unmerged, err := p.runOut(ctx, repoDir, "ls-files", "--unmerged")
-	if err != nil {
-		return fmt.Errorf("gitops: stash pop: %w", popErr)
+	unmerged, lsErr := p.runOut(ctx, repoDir, "ls-files", "--unmerged")
+	if lsErr != nil {
+		// Conflict detection itself failed (corrupt git state, permission
+		// error). Fall back to the generic fail-loud wrap, but surface the
+		// detection error too so the unusual failure mode isn't obscured.
+		return fmt.Errorf("gitops: stash pop (conflict detection via ls-files failed: %v): %w", lsErr, popErr)
 	}
 	if strings.TrimSpace(unmerged) == "" {
 		// Not a merge conflict — some other stash-pop failure. Preserve the
