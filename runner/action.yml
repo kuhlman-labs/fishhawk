@@ -34,6 +34,10 @@ inputs:
   stage:
     description: 'Stage ID within the workflow (e.g. plan, implement, review).'
     required: true
+  agent:
+    description: 'Coding-agent provider to invoke (claude-code|codex). Defaults to claude-code. codex is a deferred placeholder until its adapter lands.'
+    required: false
+    default: 'claude-code'
   prompt-file:
     description: 'Path to a UTF-8 file containing the prompt. When unset, the runner exits 0 without invoking the agent.'
     required: false
@@ -134,6 +138,7 @@ runs:
           --backend-url "${{ inputs.backend-url }}" \
           --workflow "${{ inputs.workflow }}" \
           --stage "${{ inputs.stage }}" \
+          --agent "${{ inputs.agent }}" \
           --prompt-file "${{ inputs.prompt-file }}" \
           --working-dir "${{ inputs.working-dir }}" \
           --max-tokens "${{ inputs.max-tokens }}" \
