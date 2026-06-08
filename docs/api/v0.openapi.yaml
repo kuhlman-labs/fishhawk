@@ -464,7 +464,7 @@ components:
           example: 3
         outcome:
           type: string
-          enum: [failed, pushed, fixup_pushed]
+          enum: [failed, pushed, fixup_pushed, fixup_no_changes]
           description: |
             Present only on the non-success variants. `failed` (#742)
             reports a commit/push/PR-open failure (PR fields absent;
@@ -474,7 +474,10 @@ components:
             `pr_number`/`pr_url`/`title` absent). `fixup_pushed` (#794) reports
             a fix-up re-dispatch's successful push onto the EXISTING PR branch
             (no new PR; `branch` + `head_sha` + `base_sha` required,
-            `pr_number`/`pr_url`/`title` absent).
+            `pr_number`/`pr_url`/`title` absent). `fixup_no_changes` (#856)
+            reports a fix-up re-dispatch that produced NO changes (no new commit
+            landed; `branch` + `base_sha` required, `head_sha` omitted because
+            the branch tip is unchanged, `pr_number`/`pr_url`/`title` absent).
         category:
           type: string
           enum: [B, C]
@@ -543,6 +546,21 @@ components:
         outcome: { type: string, enum: [fixup_pushed] }
         branch: { type: string }
         head_sha: { type: string }
+
+    PullRequestFixupNoChangesResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/pull-request` for the fix-up
+        no-changes variant (`outcome: fixup_no_changes`, #856): a fix-up
+        re-dispatch produced no changes (no new commit landed on the EXISTING PR
+        branch) and the fix-up implement stage transitioned terminally,
+        re-parking the review gate. No PR artifact is created and no `head_sha`
+        is echoed — the branch tip is unchanged.
+      required: [stage_id, outcome, branch]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        outcome: { type: string, enum: [fixup_no_changes] }
+        branch: { type: string }
 
     PlanUploadResponse:
       type: object
@@ -2964,7 +2982,10 @@ paths:
               terminally (#771), or
             - the fix-up push variant (`outcome: fixup_pushed`) was accepted
               and the fix-up implement stage was transitioned terminally
-              (#794).
+              (#794), or
+            - the fix-up no-changes variant (`outcome: fixup_no_changes`) was
+              accepted and the fix-up implement stage was transitioned
+              terminally, re-parking the review gate (#856).
           content:
             application/json:
               schema:
@@ -2973,6 +2994,7 @@ paths:
                   - $ref: '#/components/schemas/PullRequestFailureResponse'
                   - $ref: '#/components/schemas/PullRequestChildPushResponse'
                   - $ref: '#/components/schemas/PullRequestFixupPushResponse'
+                  - $ref: '#/components/schemas/PullRequestFixupNoChangesResponse'
         '400':
           description: |
             Body missing required fields (`code: pull_request_invalid`)

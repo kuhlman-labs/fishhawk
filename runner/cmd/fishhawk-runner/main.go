@@ -2658,9 +2658,43 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			`{"event":"implement_no_changes","run_id":%q,"stage_id":%q,"base_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, cap.BaseSHA,
 		)
-		// No PR to open; no artifact to ship. The stage still
-		// counts as succeeded — the agent decided no edits were
-		// needed. Reviewer will see the empty trace + this log.
+		// Fix-up no-changes (#856): a fix-up re-dispatch (push_fixup gate) that
+		// produces no changes must NOT `return nil` — the trace handler left the
+		// fix-up stage in `running`, so without an authoritative report the stage
+		// hangs in running until the SLA watchdog reaps it, stranding the review
+		// stage in pending. Report a dedicated "fixup_no_changes" outcome so the
+		// backend drives the fix-up stage terminal and re-parks the review gate,
+		// mirroring the fixup_pushed path minus the (absent) new commit. No
+		// HeadSHA — no commit landed; branch + base_sha pin the unchanged tip. A
+		// report error is category-C (network) and is surfaced so the failure
+		// path reports it.
+		if isFixup {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"implement_fixup_no_changes","run_id":%q,"stage_id":%q,"branch":%q,"base_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, branch, cap.BaseSHA,
+			)
+			if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+				RunID:             cfg.runID,
+				StageID:           cfg.stageID,
+				PrivateKey:        issued.PrivateKey,
+				Outcome:           "fixup_no_changes",
+				Branch:            branch,
+				BaseSHA:           cap.BaseSHA,
+				FilesChangedCount: 0,
+			}); err != nil {
+				return fmt.Errorf("report fix-up no-changes: %w", err)
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"implement_fixup_no_changes_reported","run_id":%q,"stage_id":%q,"branch":%q,"base_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, branch, cap.BaseSHA,
+			)
+			return nil
+		}
+		// Non-fix-up no-changes (first implement pass, no forward gate): no PR to
+		// open; no artifact to ship. The stage still counts as succeeded — the
+		// agent decided no edits were needed. Reviewer will see the empty trace +
+		// this log. That path's stage was never left in running by a forward
+		// gate, so `return nil` remains correct.
 		return nil
 	}
 

@@ -296,6 +296,21 @@ Notes:
   `notifyStatusUpdate` hook, not this audit kind). Mirrors the sibling `child_pushed`
   (#771). Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
+- The fix-up no-changes audit kind — `fixup_no_changes` (#856) — is an **internal,
+  system-actor audit kind, not an issue-comment surface**. Nothing in `issuecomment`
+  posts it; it has no Notifier method.
+  `server/pullrequest.go::succeedFixupNoChangesStage` writes it once
+  (idempotency-guarded **stage-keyed**, since no commit landed and there is no
+  `head_sha` to dedup on) when a fix-up re-dispatch reports
+  `{outcome:"fixup_no_changes"}` after producing no changes on the EXISTING PR
+  branch, with a `system` (or operator, on the bearer path) actor and payload
+  `{run_id, stage_id, branch, base_sha, files_changed_count, auth_method}` (no
+  `head_sha` — the branch tip is unchanged). It drives the fix-up stage's terminal
+  transition and re-parks the review gate but posts nothing to the issue thread (the
+  existing PR's sticky status comment is refreshed via the separate
+  `notifyStatusUpdate` hook, not this audit kind). Mirrors the sibling `fixup_pushed`
+  (#794) minus the new commit. Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
 - The self-consistency invariant kind — `invariant_violation` (#764) — is an
   **internal, system-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method.

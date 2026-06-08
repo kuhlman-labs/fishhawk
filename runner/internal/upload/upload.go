@@ -660,6 +660,15 @@ type ShipPullRequestArgs struct {
 	// "files_changed_count":...} so the backend drives the fix-up stage's
 	// terminal transition its push_fixup trace gate left in `running`.
 	//
+	// When Outcome is "fixup_no_changes", this is a fix-up re-dispatch that
+	// produced NO changes (#856): the fix-up pass committed nothing, so no new
+	// commit landed on the PR branch, but the push_fixup trace gate still left
+	// the fix-up stage in `running`. ShipPullRequest signs and ships
+	// {"outcome":"fixup_no_changes","branch":...,"base_sha":...,
+	// "files_changed_count":0} (no head_sha — the branch tip is unchanged) so
+	// the backend drives the fix-up stage's terminal transition and re-parks the
+	// review gate, instead of hanging until the SLA watchdog reaps it.
+	//
 	// When Outcome is empty the success Body path (a real PR artifact) is
 	// used unchanged.
 	Outcome  string
@@ -742,11 +751,14 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
 		}
 		body = marshalled
-	case "pushed", "fixup_pushed":
-		// Child-push (#771) / fix-up-push (#794) success report: build the push
-		// body from the pushed commit details rather than the (absent) PR
-		// artifact. Both outcomes share the same wire shape (branch + SHAs +
-		// diff size); only the outcome discriminator differs.
+	case "pushed", "fixup_pushed", "fixup_no_changes":
+		// Child-push (#771) / fix-up-push (#794) / fix-up no-changes (#856)
+		// success report: build the push body from the pushed commit details
+		// rather than the (absent) PR artifact. All three outcomes share the
+		// same wire shape (branch + SHAs + diff size); only the outcome
+		// discriminator differs. For "fixup_no_changes" no new commit landed, so
+		// HeadSHA is empty and FilesChangedCount is 0 — branch + base_sha pin the
+		// unchanged tip for the audit entry.
 		marshalled, err := json.Marshal(pullRequestChildPushBody{
 			Outcome:           args.Outcome,
 			Branch:            args.Branch,
