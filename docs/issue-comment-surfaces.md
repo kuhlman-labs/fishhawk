@@ -69,6 +69,20 @@ Notes:
   `{stage_id, configured_agents, landed_terminal, started_at,
   elapsed_seconds}`. It exists so a reviewer that dies emitting no terminal
   verdict can never strand the gate, and so the degrade is auditable.
+- The implement-review / merge completion-gate backstop audit kind —
+  `implement_review_backstop_elapsed` (ADR-036 / #876), written by the
+  merge-resolution path
+  (`server/pullrequest_review_events.go::checkImplementReviewSettled`) when a
+  merge is allowed to resolve the review stage to `succeeded` because the hard
+  backstop (`ReviewBudget.Cap` × configured agents, measured from the earliest
+  `implement_review_started`) elapsed before the configured agent implement
+  reviews all reached a terminal state — is an **internal, degrade-record audit
+  kind, not an issue-comment surface**. Nothing in `issuecomment` posts it to
+  the issue thread. Payload: `{stage_id, configured_agents, landed_terminal,
+  started_at, elapsed_seconds}`. It is the merge-gate twin of
+  `plan_review_backstop_elapsed`: it exists so a reviewer that dies emitting no
+  terminal verdict can never strand a merge resolution, and so the degrade is
+  auditable.
 - The plan-gate scope pre-check audit kind — `plan_scope_precheck` (#658),
   written by the plan upload handler (`server/scope_precheck.go::runScopePrecheck`)
   immediately after `plan_generated` and before plan review — is an **internal,

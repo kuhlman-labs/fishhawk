@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // mergeReconcilerActor is the audit ActorSubject recorded when the
@@ -194,6 +195,33 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 	}
 
 	if merged {
+		// ADR-036 (#876) implement-review / merge completion gate. When
+		// the run has a review stage AND a configured agent implement
+		// review (ADR-027) is still in-flight, refuse to resolve the
+		// merge to succeeded: leave the review stage parked in
+		// awaiting_approval so the merge reconciler re-polls and routes
+		// back through here once the review settles (or the backstop
+		// elapses). Composes with the #862 lineage re-check already on
+		// the tick path — both must pass for the stage to resolve.
+		//
+		// The gate is placed BEFORE writePRMergedAudit deliberately: it
+		// DEFERS the pr_merged audit row from merge-observation time to
+		// resolution time so a held run does not write a duplicate
+		// pr_merged row on every reconciler re-poll tick. This is a
+		// behavioral change from the prior audit-first contract — a
+		// GitHub-merged run that is held by this gate has NO pr_merged
+		// row until the re-poll clears the gate. The backstop guarantees
+		// the run always eventually resolves, so pr_merged is always
+		// eventually recorded.
+		if reviewStage != nil && !s.checkImplementReviewSettled(ctx, target, reviewStage) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"pull_request merged: held pending implement review; review stage left parked",
+				slog.String("pr_url", meta.prURL),
+				slog.String("run_id", target.ID.String()),
+				slog.String("stage_id", reviewStage.ID.String()),
+			)
+			return
+		}
 		// Audit row first — if the transition fails (state-machine
 		// reject) we still want the merge recorded.
 		s.writePRMergedAudit(ctx, target.ID, stageID, meta)
@@ -502,6 +530,125 @@ func (s *Server) writePRMergedAudit(ctx context.Context, runID uuid.UUID, stageI
 			"pull_request.closed: pr_merged audit append failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
+	}
+}
+
+// checkImplementReviewSettled enforces the ADR-036 (#876) implement-review /
+// merge completion gate, the internal-resolution mirror of
+// checkPlanReviewSettled (approvals.go). It returns true to allow the merge to
+// resolve the review stage to succeeded, false to hold the run parked for the
+// merge reconciler to re-poll. Unlike the plan-gate handler it writes no HTTP
+// response — this is the webhook/poll resolution path, not a request handler.
+//
+// Posture mirrors checkPlanReviewSettled: every read failure fails OPEN
+// (WARN-log, return true) so a transient backend hiccup can never strand a
+// merge that GitHub already performed. The gate holds only when ALL of:
+//   - the run's IMPLEMENT stage declares reviewers.agent > 0, AND
+//   - at least one implement_review_started entry exists (dispatched), AND
+//   - fewer than reviewers.agent TERMINAL review entries
+//     (implement_reviewed | implement_review_failed | implement_review_skipped)
+//     have landed, AND
+//   - the elapsed time since the earliest implement_review_started is within
+//     the backstop bound.
+//
+// ANY terminal review kind counts toward the unblock, so a budget-killed
+// reviewer (trace.go emits a terminal implement_review_failed on timeout)
+// never strands the gate. The backstop is the belt for a reviewer that dies
+// emitting NO terminal entry: past the bound the merge is ALLOWED to resolve
+// and an implement_review_backstop_elapsed audit entry records the degrade.
+// The backstop emits exactly once — once it returns true the resolve completes
+// the run and the reconciler stops re-polling, so no idempotency guard is
+// needed.
+func (s *Server) checkImplementReviewSettled(ctx context.Context, target *run.Run, reviewStage *run.Stage) bool {
+	reviewersCfg := s.resolveStageReviewers(ctx, target, spec.StageTypeImplement)
+	if reviewersCfg == nil || reviewersCfg.Agent == 0 {
+		// No agent reviewer configured — byte-for-byte the pre-ADR-036
+		// merge resolution (routine_change / check-gate auto-merge flow).
+		return true
+	}
+
+	started, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, target.ID, "implement_review_started")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement-review gate: list implement_review_started failed",
+			slog.String("run_id", target.ID.String()),
+			slog.String("stage_id", reviewStage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+	if len(started) == 0 {
+		// Configured but never dispatched — nothing to wait for.
+		return true
+	}
+
+	terminalCount := 0
+	for _, cat := range []string{"implement_reviewed", "implement_review_failed", "implement_review_skipped"} {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, target.ID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement-review gate: list terminal review entries failed",
+				slog.String("run_id", target.ID.String()),
+				slog.String("stage_id", reviewStage.ID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()),
+			)
+			return true
+		}
+		terminalCount += len(entries)
+	}
+	if terminalCount >= reviewersCfg.Agent {
+		// Every configured agent review reached a terminal state.
+		return true
+	}
+
+	// Backstop: anchor on the earliest implement_review_started timestamp.
+	// Past the bound, a reviewer that died emitting nothing can never strand
+	// the merge resolution. Reuses planReviewBackstop (approvals.go) so the
+	// bound cannot diverge from the plan gate's.
+	earliest := started[0].Timestamp
+	for _, e := range started {
+		if e.Timestamp.Before(earliest) {
+			earliest = e.Timestamp
+		}
+	}
+	bound := s.planReviewBackstop(reviewersCfg.Agent)
+	if elapsed := time.Now().UTC().Sub(earliest); elapsed > bound {
+		s.appendImplementReviewBackstopElapsed(ctx, reviewStage, reviewersCfg.Agent, terminalCount, earliest, elapsed)
+		return true
+	}
+
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "implement-review gate: holding merge resolution; review in-flight",
+		slog.String("run_id", target.ID.String()),
+		slog.String("stage_id", reviewStage.ID.String()),
+		slog.Int("configured_agents", reviewersCfg.Agent),
+		slog.Int("landed_terminal", terminalCount),
+	)
+	return false
+}
+
+// appendImplementReviewBackstopElapsed records the ADR-036 backstop degrade:
+// the implement-review completion gate allowed a merge to resolve because the
+// hard bound elapsed before the configured agent reviews all reached a
+// terminal state. Best-effort — a logged audit failure never holds the merge.
+// Mirrors appendPlanReviewBackstopElapsed (approvals.go).
+func (s *Server) appendImplementReviewBackstopElapsed(ctx context.Context, stage *run.Stage, configuredAgents, landedTerminal int, startedAt time.Time, elapsed time.Duration) {
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":          stage.ID.String(),
+		"configured_agents": configuredAgents,
+		"landed_terminal":   landedTerminal,
+		"started_at":        startedAt.Format(time.RFC3339Nano),
+		"elapsed_seconds":   int(elapsed.Seconds()),
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     stage.RunID,
+		StageID:   &stage.ID,
+		Timestamp: time.Now().UTC(),
+		Category:  "implement_review_backstop_elapsed",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.Error("audit append failed for implement_review_backstop_elapsed",
+			"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
 	}
 }
 
