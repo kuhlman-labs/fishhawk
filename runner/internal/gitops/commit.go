@@ -157,6 +157,26 @@ type CommitAndPushArgs struct {
 	// and restored afterwards.
 	RebaseFromRemote bool
 
+	// FreshFetchBase, when non-empty AND RebaseFromRemote is false,
+	// names the authoritative base branch (e.g. "main") the new run
+	// branch must be cut from via a fresh fetch of origin/<base>
+	// instead of the ambient local HEAD. It is the standalone
+	// single-writer analogue of the decomposed-child RebaseFromRemote
+	// fetch path: it reuses the same stash -> fetch -> checkout -B
+	// FETCH_HEAD -> stash pop machinery so the agent's uncommitted
+	// edits survive while only the base changes. It exists to prevent
+	// a foreign commit another writer made in the same shared local
+	// checkout (the #797 shape) from riding in as the run branch base.
+	// On the FreshFetchBase path the recorded BaseSHA is re-captured
+	// from the freshly-fetched tip, so the value the backend records as
+	// the run's fork point (artifact base_sha) is the trustworthy
+	// authoritative ref. This brings the local runner to the base
+	// isolation GitHub Actions' actions/checkout already provides.
+	// Empty (the default) keeps the unchanged `checkout -b` path, so
+	// the decomposed-child and fix-up callers are unaffected (ADR-035,
+	// #861).
+	FreshFetchBase string
+
 	// UpdateTrackingRef, when true, sets the local remote-tracking ref
 	// refs/remotes/<remote>/<branch> to the pushed HEAD after a
 	// successful push, so subsequent same-clone reads (decomposition
@@ -299,6 +319,46 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		if err := p.run(ctx, args.RepoDir, "stash", "pop"); err != nil {
 			return nil, fmt.Errorf("gitops: stash pop: %w", err)
 		}
+	} else if args.FreshFetchBase != "" {
+		// Standalone single-writer path (#861, ADR-035 prevention): cut the
+		// run branch from a freshly-fetched authoritative base instead of the
+		// ambient local HEAD, so a foreign commit another writer made in the
+		// same shared checkout (the #797 shape) cannot become the branch base.
+		// Mirrors the RebaseFromRemote machinery above: authenticate the fetch
+		// over RemoteURL (sidestepping a broken ambient origin, #772), stash
+		// the agent's uncommitted scope edits, fetch the base tip into
+		// FETCH_HEAD, cut the branch from that fetched tip, then reapply the
+		// edits onto the clean base. A stash-pop conflict (agent edited lines
+		// the base advanced past) surfaces as a non-zero git exit returned as a
+		// stage failure with no push, never a silent bad tree.
+		if err := p.configureExtraheader(ctx, args.RepoDir, args.RemoteURL, args.PushToken); err != nil {
+			return nil, err
+		}
+		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
+			return nil, fmt.Errorf("gitops: stash: %w", err)
+		}
+		// Fetch the authoritative base branch tip into FETCH_HEAD. A URL fetch
+		// does not create a refs/remotes tracking ref, so the checkout
+		// references FETCH_HEAD explicitly.
+		if err := p.run(ctx, args.RepoDir, "fetch", args.RemoteURL, args.FreshFetchBase); err != nil {
+			return nil, fmt.Errorf("gitops: fetch %s: %w", args.FreshFetchBase, err)
+		}
+		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
+			return nil, fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)
+		}
+		if err := p.run(ctx, args.RepoDir, "stash", "pop"); err != nil {
+			return nil, fmt.Errorf("gitops: stash pop: %w", err)
+		}
+		// Re-capture baseSHA from the freshly-fetched tip (now HEAD) so the
+		// recorded fork point reflects the trustworthy authoritative ref rather
+		// than the stale ambient HEAD captured before the fetch. Scoped to this
+		// path only — the RebaseFromRemote and plain checkout -b paths keep
+		// their BaseSHA semantics unchanged.
+		fetchedBase, err := p.runOut(ctx, args.RepoDir, "rev-parse", "HEAD")
+		if err != nil {
+			return nil, fmt.Errorf("gitops: rev-parse fetched base: %w", err)
+		}
+		baseSHA = strings.TrimSpace(fetchedBase)
 	} else {
 		if err := p.run(ctx, args.RepoDir, "checkout", "-b", args.Branch); err != nil {
 			return nil, fmt.Errorf("gitops: checkout -b %s: %w", args.Branch, err)
