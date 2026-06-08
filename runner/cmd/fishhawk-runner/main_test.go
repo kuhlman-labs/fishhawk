@@ -3568,6 +3568,59 @@ func TestRun_ImplementStage_CreatedOutOfScope_CategoryB(t *testing.T) {
 	}
 }
 
+// TestRun_ImplementStage_BaseRebaseConflict_CategoryB is the #866 analogue: when
+// the open-PR push path returns gitops.ErrBaseRebaseConflict (the fresh-fetch
+// base path could not reapply the agent's stashed edits onto the diverged
+// authoritative base), the implement stage must surface FAILED with category B
+// and report the failure via the /pull-request path (outcome=failed /
+// category=B, no PR artifact body), exercising the gitops-sentinel ->
+// FailureCategory classification seam.
+func TestRun_ImplementStage_BaseRebaseConflict_CategoryB(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: gitops.ErrBaseRebaseConflict}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B on base-rebase-conflict failure, got:\n%s", stderr.String())
+	}
+	// The push failed before any PR could be opened — no fresh PR for a failed push.
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not be called after a failed base-rebase push")
+	}
+	// The gated open-PR stage transitions via the /pull-request FAILURE report.
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after a base-rebase gate failure")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Errorf("failure report = {outcome:%q, category:%q}, want {failed, B}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
+	}
+	if len(fu.gotPRArgs.Body) != 0 {
+		t.Errorf("failure report must not carry a PR artifact body, got %d bytes", len(fu.gotPRArgs.Body))
+	}
+}
+
 // captureImplementVerifyCommit runs the implement upload flow with a fake
 // pusher pointed at repo and returns the verifyCommit closure the runner wires
 // into CommitAndPush, so the created-out-of-scope gate logic (#818, generalized

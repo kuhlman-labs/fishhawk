@@ -80,6 +80,20 @@ var ErrFixupCreatedOutOfScope = fmt.Errorf("%w (fix-up)", ErrCreatedOutOfScope)
 // category-B failure (wrong-shaped output → re-scope/re-plan).
 var ErrCommittedTestsFailed = errors.New("gitops: committed tree tests failed")
 
+// ErrBaseRebaseConflict is the sentinel returned when reapplying the agent's
+// stashed working-tree edits onto a freshly-fetched authoritative base fails
+// with a merge conflict — the agent edited lines the base advanced past, so the
+// `git stash pop` onto the clean fetched base conflicts (#866, ADR-035
+// follow-up). It is returned BEFORE any push (origin untouched), after the
+// conflicted pop is aborted with `git reset --hard` (working tree reset to the
+// clean fetched base; the stash entry is left in the stash list and recoverable
+// via `git stash list`). The runner classifies it category-B (re-base/re-plan).
+// Only a real pop CONFLICT trips this; an unrelated stash-pop failure keeps the
+// prior generic git-error wrap. Recovery is a clean abort, not auto-resolution —
+// auto-merging divergent edits would risk shipping an unreviewed (silent-bad)
+// tree, the exact class the fail-loud path avoids.
+var ErrBaseRebaseConflict = errors.New("gitops: stash pop conflicted reapplying agent edits onto fetched base")
+
 // DefaultAuthorName + DefaultAuthorEmail are the dev/CLI fallback bot
 // identity used ONLY when the caller doesn't override — i.e. runs with no
 // resolvable GitHub App (local-runner, CLI, dev). For App-backed runs the
@@ -316,8 +330,8 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
 			return nil, fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)
 		}
-		if err := p.run(ctx, args.RepoDir, "stash", "pop"); err != nil {
-			return nil, fmt.Errorf("gitops: stash pop: %w", err)
+		if err := p.popStash(ctx, args.RepoDir); err != nil {
+			return nil, err
 		}
 	} else if args.FreshFetchBase != "" {
 		// Standalone single-writer path (#861, ADR-035 prevention): cut the
@@ -329,8 +343,9 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// the agent's uncommitted scope edits, fetch the base tip into
 		// FETCH_HEAD, cut the branch from that fetched tip, then reapply the
 		// edits onto the clean base. A stash-pop conflict (agent edited lines
-		// the base advanced past) surfaces as a non-zero git exit returned as a
-		// stage failure with no push, never a silent bad tree.
+		// the base advanced past) is detected specifically by popStash and
+		// surfaces as ErrBaseRebaseConflict (category-B) after a clean
+		// reset --hard abort, with no push and never a silent bad tree.
 		if err := p.configureExtraheader(ctx, args.RepoDir, args.RemoteURL, args.PushToken); err != nil {
 			return nil, err
 		}
@@ -346,8 +361,8 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
 			return nil, fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)
 		}
-		if err := p.run(ctx, args.RepoDir, "stash", "pop"); err != nil {
-			return nil, fmt.Errorf("gitops: stash pop: %w", err)
+		if err := p.popStash(ctx, args.RepoDir); err != nil {
+			return nil, err
 		}
 		// Re-capture baseSHA from the freshly-fetched tip (now HEAD) so the
 		// recorded fork point reflects the trustworthy authoritative ref rather
@@ -520,6 +535,39 @@ func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []s
 		}
 	}
 	return drift, nil
+}
+
+// popStash reapplies the stashed agent edits onto the freshly-checked-out base
+// via `git stash pop`. On success it returns nil. On a non-zero pop it probes
+// for a real merge conflict with `git ls-files --unmerged` (a pop CONFLICT
+// leaves unmerged index entries at stages 1/2/3; a non-conflict failure does
+// not). When conflicted it aborts the half-applied pop with `git reset --hard`
+// — restoring the working tree to the clean fetched base (HEAD) without touching
+// the stash stack, so the stashed edits stay recoverable via `git stash list`
+// (a pop conflict does not drop the stash) — and returns ErrBaseRebaseConflict.
+// A non-conflict pop failure returns the original wrapped git error unchanged,
+// preserving today's generic fail-loud behavior for that case.
+func (p *Pusher) popStash(ctx context.Context, repoDir string) error {
+	popErr := p.run(ctx, repoDir, "stash", "pop")
+	if popErr == nil {
+		return nil
+	}
+	unmerged, err := p.runOut(ctx, repoDir, "ls-files", "--unmerged")
+	if err != nil {
+		return fmt.Errorf("gitops: stash pop: %w", popErr)
+	}
+	if strings.TrimSpace(unmerged) == "" {
+		// Not a merge conflict — some other stash-pop failure. Preserve the
+		// prior generic behavior.
+		return fmt.Errorf("gitops: stash pop: %w", popErr)
+	}
+	// Real pop conflict: abort the half-applied pop so the working tree returns
+	// to the clean fetched base; the stash entry is left intact and recoverable.
+	if err := p.run(ctx, repoDir, "reset", "--hard"); err != nil {
+		return fmt.Errorf("gitops: reset --hard after conflicted stash pop: %w", err)
+	}
+	return fmt.Errorf("%w: working tree reset to fetched base, stashed edits preserved (git stash list) — re-base the run or replan: %v",
+		ErrBaseRebaseConflict, popErr)
 }
 
 // hasDirPrefix reports whether path lies under any of the trailing-slash

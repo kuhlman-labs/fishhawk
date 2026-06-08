@@ -1035,6 +1035,96 @@ func TestCommitAndPush_FreshFetchBase_CutsFromFetchedTipNotAmbientHEAD(t *testin
 	}
 }
 
+// TestCommitAndPush_FreshFetchBase_StashPopConflict drives the #866 hardened
+// pop-conflict path end-to-end against a real bare remote. origin/main advances
+// a line that the agent's uncommitted working-tree edit ALSO changes
+// (divergent edit to the same line), so reapplying the stashed edit onto the
+// freshly-fetched base conflicts. It asserts: (a) the error is
+// ErrBaseRebaseConflict; (b) the stash entry survives; (c) the working tree is
+// clean with no unmerged paths after the reset --hard abort; (d) nothing was
+// pushed to the bare remote.
+func TestCommitAndPush_FreshFetchBase_StashPopConflict(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-866/stage-x"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("base line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+
+	// Bare remote with main at the initial tip.
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	// origin/main advances the shared line, then the local checkout is reset
+	// back to the initial commit so the advance only exists on the remote tip
+	// (the fresh fetch will pull it in). This mirrors the authoritative base
+	// moving ahead of the ambient checkout.
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("remote-advanced line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "remote advances shared line")
+	mustGit(t, repo, "push", "origin", "main")
+	mustGit(t, repo, "reset", "--hard", "HEAD~1")
+
+	// The agent's uncommitted edit to the SAME line — divergent from the remote
+	// advance, so reapplying it onto the fetched tip conflicts.
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("agent-edited line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "agent stage commit",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+	})
+
+	// (a) The error is the dedicated rebase-conflict sentinel.
+	if !errors.Is(err, ErrBaseRebaseConflict) {
+		t.Fatalf("CommitAndPush error = %v, want ErrBaseRebaseConflict", err)
+	}
+
+	// (b) The stash entry survives the conflicted pop — recoverable.
+	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
+		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
+	}
+
+	// (c) The working tree is clean with no unmerged paths after reset --hard.
+	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
+		t.Errorf("ls-files --unmerged not empty after abort: %q", unmerged)
+	}
+	if status := mustGitOut(t, repo, "status", "--porcelain"); strings.Contains(status, "UU") {
+		t.Errorf("working tree has conflict markers (UU) after abort: %q", status)
+	}
+
+	// (d) Nothing was pushed — the run branch does not exist on the bare remote.
+	out, lsErr := exec.Command("git", "--git-dir="+bare, "ls-remote", bare, branch).Output()
+	if lsErr != nil {
+		t.Fatalf("ls-remote: %v", lsErr)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("run branch %q was pushed to the bare remote on a conflicted pop: %q", branch, string(out))
+	}
+}
+
 // isAncestor reports whether maybeAncestor is an ancestor of ref via
 // `git merge-base --is-ancestor` (exit 0 = ancestor, exit 1 = not).
 func isAncestor(t *testing.T, dir, maybeAncestor, ref string) bool {
