@@ -305,19 +305,57 @@ func TestExtractDiff_EmptyDiff(t *testing.T) {
 	}
 }
 
-func TestExtractDiff_FirstDiffEventWins(t *testing.T) {
-	// If for some reason multiple git_diff events appear (shouldn't,
-	// but defense in depth), the first one is what the backend uses.
+func TestExtractDiff_LastDiffEventWins(t *testing.T) {
+	// When two git_diff events appear, the LAST is authoritative (#870): the
+	// runner re-emits a fresh scope-only diff after a verify-fix reinvoke, and
+	// that reconciled diff is the committed tree the PR ships. Assert both the
+	// file set AND the patch come from the last event, not the stale first.
+	first, err := json.Marshal(gitDiffPayload{
+		Kind: "name_status", BaseRef: "origin/main",
+		Files:    []gitDiffEntry{{Path: "a.go", Status: "M"}},
+		NumFiles: 1,
+		Patch:    "diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-old\n+stale\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := json.Marshal(gitDiffPayload{
+		Kind: "name_status", BaseRef: "origin/main",
+		Files:    []gitDiffEntry{{Path: "b.go", Status: "M"}, {Path: "c.go", Status: "A"}},
+		NumFiles: 2,
+		Patch:    "diff --git a/b.go b/b.go\n@@ -1 +1 @@\n-old\n+reconciled\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []Line{
+		{Seq: 1, Kind: EventKindGitDiff, Data: first},
+		{Seq: 2, Kind: EventKindGitDiff, Data: last},
+	}
+	got, err := ExtractDiff(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractDiff: %v", err)
+	}
+	if len(got.ChangedFiles) != 2 || got.ChangedFiles[0].Path != "b.go" || got.ChangedFiles[1].Path != "c.go" {
+		t.Errorf("expected the LAST event's file set, got %+v", got.ChangedFiles)
+	}
+	if got.Patch != "diff --git a/b.go b/b.go\n@@ -1 +1 @@\n-old\n+reconciled\n" {
+		t.Errorf("expected the LAST event's patch, got %q", got.Patch)
+	}
+}
+
+func TestExtractDiff_SingleEventBackCompat(t *testing.T) {
+	// Every bundle without a reconciling reinvoke carries exactly one git_diff,
+	// so last == first — last-write-wins must be identical to the old behavior.
 	lines := []Line{
 		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
-		makeDiffLine(t, "origin/main", [2]string{"b.go", "M"}),
 	}
 	got, err := ExtractDiff(packLines(t, lines))
 	if err != nil {
 		t.Fatalf("ExtractDiff: %v", err)
 	}
 	if len(got.ChangedFiles) != 1 || got.ChangedFiles[0].Path != "a.go" {
-		t.Errorf("expected first event to win, got %+v", got)
+		t.Errorf("single-event bundle = %+v, want one file a.go", got.ChangedFiles)
 	}
 }
 

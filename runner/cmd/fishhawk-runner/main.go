@@ -552,18 +552,35 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// agent invocations are capped at max_iterations with no multiplicative
 	// compounding (DECISION c2). It is placed BEFORE EmitStage so the span's
 	// token/model counts include the fix-loop invocations' cost (ADR-030).
+	reinvoked := false
 	if res.OK && stageType == "implement" && !cfg.noPR &&
 		cfg.verifyCmd != "" && cfg.verifyMaxIterations > 0 {
 		// A POST-commit reset failure (#816) is fatal: the throwaway commit is
 		// still on HEAD, so the stage must NOT proceed to the real push. Demote
 		// to category-B (park for re-scope/re-plan; no self-retry), mirroring
 		// runVerifyGateCommitted's treatment of its post-commit reset failure.
-		if ferr := runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink); ferr != nil {
+		var ferr error
+		reinvoked, ferr = runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink)
+		if ferr != nil {
 			res.OK = false
 			res.FailureCategory = "B"
 			res.FailureReason = ferr.Error()
 			invokeErr = ferr
 		}
+	}
+
+	// Re-emit a fresh scope-only git_diff event when the verify-fix loop actually
+	// reinvoked the agent (#870). computeAndEmitDiff emitted the FIRST git_diff
+	// before the loop, from the pre-reconcile tree; a reinvoke rewrites in-scope
+	// files, so that diff is stale. Re-emitting the reconciled scope-only diff
+	// here — and ExtractDiff's last-write-wins on the backend — keeps the implement
+	// review and policy re-eval bound to the committed scope-only tree the PR ships.
+	// Gated strictly on reinvoked, so the no-reinvoke path and the maxIterations==0
+	// single-shot gate (#802) still emit exactly one git_diff. checkBaseRef must be
+	// set too — it is the same condition that gated computeAndEmitDiff's original
+	// git_diff above, so without it there is no first event to supersede.
+	if res.OK && stageType == "implement" && !cfg.noPR && reinvoked && cfg.checkBaseRef != "" {
+		res.Events = append(res.Events, reemitScopedGitDiff(cfg, logSink)...)
 	}
 
 	// Committed-tree single-shot verify gate (#802). On the implement push
@@ -1292,6 +1309,65 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	return d, events, nil
 }
 
+// reemitScopedGitDiff recomputes the scope-only git_diff from the reconciled
+// committed tree after a verify-fix loop reinvoked the agent (#870), returning a
+// single git_diff event to append AFTER computeAndEmitDiff's original. It mirrors
+// computeAndEmitDiff's diff-producing core but deliberately does NOT re-emit the
+// scope_drift / constraint policy_events: scope is unchanged across the reinvoke,
+// so the original drift list (and the constraint evaluation that already ran)
+// remains authoritative — re-emitting only the git_diff keeps drift and policy
+// accounting untouched while making the reconciled diff last-write-wins.
+//
+// Re-emit is best-effort: on any infra error (stage / name-status / nothing to
+// re-stage) it logs a degradation line and returns nil. The original git_diff
+// stays in the bundle as a graceful fallback, and the stage is never failed on a
+// re-emit error — the load-bearing gate already passed inside the loop.
+func reemitScopedGitDiff(cfg config, logSink io.Writer) []agent.Event {
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
+
+	// Re-stage the reconciled in-scope tree. The verify-fix loop's final
+	// `git reset --soft` preserves the index, but re-staging is deterministic and
+	// matches computeAndEmitDiff. Drift is discarded — already reported above.
+	if paths := scopePaths(cfg.scopeFiles); len(paths) > 0 {
+		if _, err := (&gitops.Pusher{}).StageScoped(context.Background(), repoDir, paths); err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"git_diff_reemit_skipped","stage_id":%q,"detail":%q}`+"\n",
+				cfg.stageID, fmt.Sprintf("stage scoped: %v", err))
+			return nil
+		}
+	} else {
+		addCmd := exec.CommandContext(context.Background(), "git", "add", "-A")
+		addCmd.Dir = repoDir
+		if out, err := addCmd.CombinedOutput(); err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"git_diff_reemit_skipped","stage_id":%q,"detail":%q}`+"\n",
+				cfg.stageID, fmt.Sprintf("git add -A: %v: %s", err, strings.TrimSpace(string(out))))
+			return nil
+		}
+	}
+
+	runner := &gitdiff.Runner{}
+	d, err := runner.Run(context.Background(), baseRef, repoDir)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"git_diff_reemit_skipped","stage_id":%q,"detail":%q}`+"\n",
+			cfg.stageID, fmt.Sprintf("name-status: %v", err))
+		return nil
+	}
+	patch, truncated, perr := runner.RunPatch(context.Background(), baseRef, repoDir)
+	if perr != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"git_diff_patch_failed","base_ref":%q,"detail":%q}`+"\n",
+			baseRef, perr.Error())
+		patch, truncated = "", false
+	}
+	return []agent.Event{makeGitDiffEvent(baseRef, d, patch, truncated)}
+}
+
 // enforceConstraints reads the constraints config and evaluates
 // it against the pre-computed diff. Returns one or more policy_event
 // events for the bundle plus a non-nil error iff any constraint
@@ -1592,7 +1668,12 @@ const maxFixInvokeInfraRetries = 2
 // audit trace and an honest cost (every other invoker.Invoke site replaces
 // res wholesale; here append is the correct handling). A verify_summary event
 // is appended once the loop settles, carrying the verdict + iteration count.
-func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) error {
+// runVerifyFixLoop returns reinvoked=true when it performed at least one agent
+// fix re-invocation (#870). The caller uses that signal to re-emit a fresh
+// scope-only git_diff event after the loop, so the implement review and policy
+// re-eval evaluate the reconciled committed tree rather than the pre-reconcile
+// diff computeAndEmitDiff emitted before the loop ran.
+func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) (bool, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
@@ -1605,6 +1686,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 
 	var (
 		passed      bool
+		reinvoked   bool
 		attempts    int
 		lastOutput  string
 		lastIterErr error // non-nil only on a PRE-commit infra failure → non-blocking skip
@@ -1677,6 +1759,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		// Re-invoke the agent in-place with a fix prompt embedding the captured
 		// verify output. The agent edits the same repoDir working tree; the
 		// next iteration re-commits scope-only onto the same base.
+		reinvoked = true
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_fix_reinvoke","run_id":%q,"stage_id":%q,"iteration":%d}`+"\n",
 			cfg.runID, cfg.stageID, iter+1)
@@ -1764,7 +1847,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		// A POST-commit reset failure left HEAD on the throwaway commit (#816).
 		// Abort the stage hard — the call site demotes to category-B so the real
 		// push never stacks the real commit on top of the throwaway WIP commit.
-		return fatalErr
+		return reinvoked, fatalErr
 	}
 
 	if lastIterErr != nil {
@@ -1775,7 +1858,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_fix_skipped","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, lastIterErr.Error())
-		return nil
+		return reinvoked, nil
 	}
 
 	if !passed {
@@ -1784,7 +1867,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		res.FailureReason = fmt.Sprintf("verify command %q still failing after %d iteration(s):\n%s",
 			cfg.verifyCmd, attempts, lastOutput)
 	}
-	return nil
+	return reinvoked, nil
 }
 
 // runVerifyGateCommitted is the single-shot committed-tree verify gate (#802):

@@ -4253,6 +4253,178 @@ func TestRun_VerifyFixLoop_FailThenPass_CommittedTree(t *testing.T) {
 	assertVerifySummary(t, events, "passed", 2, 2)
 }
 
+// gitDiffPatches returns the `patch` text of every git_diff event in the
+// bundle, in emission order. Used to assert the runner re-emits a reconciled
+// scope-only git_diff after a verify-fix reinvoke (#870).
+func gitDiffPatches(t *testing.T, events []bundle.Line) []string {
+	t.Helper()
+	var patches []string
+	for _, ev := range events {
+		if ev.Kind != "git_diff" {
+			continue
+		}
+		var p struct {
+			Patch string `json:"patch"`
+		}
+		if err := json.Unmarshal(ev.Data, &p); err != nil {
+			t.Fatalf("git_diff payload unmarshal: %v (%s)", err, ev.Data)
+		}
+		patches = append(patches, p.Patch)
+	}
+	return patches
+}
+
+// TestRun_VerifyFixLoop_ReemitsReconciledGitDiff is the #870 cross-boundary
+// proof: a verify-fix loop that reinvokes the agent rewrites an in-scope file,
+// so the git_diff computeAndEmitDiff emitted BEFORE the loop is stale. The
+// runner must re-emit a fresh scope-only git_diff AFTER the loop, and that
+// last event must reflect the reconciled committed tree (the fix), so the
+// backend's last-write-wins ExtractDiff feeds the implement review and policy
+// re-eval the diff the PR actually ships. Mirrors the FailThenPass setup but
+// passes --check-base-ref so the git_diff events are emitted.
+func TestRun_VerifyFixLoop_ReemitsReconciledGitDiff(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	baseSHA := gitHead(t, repo)
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	mustWrite(t, regPath, regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			if idx == 1 {
+				mustWrite(t, regPath, regGetFixed)
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 2,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	args := append(verifyFixRunArgs(repo, bundlePath), "--check-base-ref", baseSHA)
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	patches := gitDiffPatches(t, readBundleEvents(t, bundlePath))
+	if len(patches) != 2 {
+		t.Fatalf("git_diff event count = %d, want 2 (original + reconciled re-emit)", len(patches))
+	}
+	// The pre-reconcile diff carries the buggy reg.go (no seeding init); the
+	// reconciled re-emit carries the fix. Last-write-wins makes the latter
+	// authoritative for the implement review and policy re-eval.
+	const fixMarker = `registry["x"] = 42`
+	if strings.Contains(patches[0], fixMarker) {
+		t.Errorf("first git_diff must be the PRE-reconcile (buggy) diff, but it carries the fix:\n%s", patches[0])
+	}
+	if !strings.Contains(patches[len(patches)-1], fixMarker) {
+		t.Errorf("last git_diff must be the reconciled diff carrying the fix %q:\n%s", fixMarker, patches[len(patches)-1])
+	}
+}
+
+// TestRun_VerifyFixLoop_PassFirstIteration_SingleGitDiff: a loop whose first
+// committed-tree verify PASSES never reinvokes, so the runner must NOT re-emit
+// a second git_diff — exactly one (computeAndEmitDiff's original) is in the
+// bundle. Guards the strict reinvoked gate (#870).
+func TestRun_VerifyFixLoop_PassFirstIteration_SingleGitDiff(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	baseSHA := gitHead(t, repo)
+	// reg.go is correct on the committed scope-only tree from the start, so
+	// iteration 0 passes and the loop never reinvokes.
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 2,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	args := append(verifyFixRunArgs(repo, bundlePath), "--check-base-ref", baseSHA)
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if n := len(gitDiffPatches(t, readBundleEvents(t, bundlePath))); n != 1 {
+		t.Fatalf("git_diff event count = %d, want 1 (no reinvoke → no re-emit)", n)
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (no fix reinvoke)", invoker.callIdx)
+	}
+}
+
+// TestRun_VerifyGateCommitted_SingleShot_SingleGitDiff: the maxIterations==0
+// single-shot committed gate (#802) has no fix loop, so it never reinvokes and
+// must leave exactly one git_diff (computeAndEmitDiff's original) in the bundle.
+func TestRun_VerifyGateCommitted_SingleShot_SingleGitDiff(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	baseSHA := gitHead(t, repo)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 0,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	args := append(verifyFixRunArgs(repo, bundlePath), "--check-base-ref", baseSHA)
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if n := len(gitDiffPatches(t, readBundleEvents(t, bundlePath))); n != 1 {
+		t.Fatalf("git_diff event count = %d, want 1 (single-shot gate, no re-emit)", n)
+	}
+}
+
 // TestRun_VerifyFixLoop_Exhaustion_TerminalNoRetry is the both-enabled
 // non-compounding proof (#651, DECISION c2): with agent_self_retry on AND a
 // verify-fix budget, an agent that never fixes the failure must demote the
@@ -4497,6 +4669,69 @@ func TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip(t *testing.T
 		t.Errorf("verify_summary event count = %d, want exactly 1", summaries)
 	}
 	assertVerifySummary(t, events, "skipped", 1, 1)
+}
+
+// TestRun_VerifyFixLoop_InfraExhaustedReinvoke_ReemitsIdenticalDiff is the #870
+// advisory-review binding-condition test for the infra-retry-exhausted reinvoke
+// path: the loop set reinvoked=true (it reached the reinvoke block) but every
+// fix-Invoke errored, so it exits via the non-blocking skip with res.OK still
+// true. The post-loop gate (res.OK && implement && !noPR && reinvoked &&
+// checkBaseRef) therefore still calls reemitScopedGitDiff. This path is HARMLESS
+// and intentional: the failed agent never rewrote the tree, so StageScoped
+// produces an identical scope-only diff and last-write-wins == first-write-wins.
+// Asserting the re-emitted diff equals the original pins that — a future refactor
+// can't silently change re-emit behavior on the infra-exhausted path.
+func TestRun_VerifyFixLoop_InfraExhaustedReinvoke_ReemitsIdenticalDiff(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	baseSHA := gitHead(t, repo)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{
+		cannedSeq: []agent.Result{
+			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		},
+		errSeq: []error{nil, agent.ErrAgentFailed}, // every fix re-invoke errors
+	}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 1,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	args := append(verifyFixRunArgs(repo, bundlePath), "--check-base-ref", baseSHA)
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK (non-blocking skip):\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "verify_fix_skipped") {
+		t.Fatalf("expected verify_fix_skipped non-blocking skip:\n%s", stderr.String())
+	}
+
+	patches := gitDiffPatches(t, readBundleEvents(t, bundlePath))
+	if len(patches) != 2 {
+		t.Fatalf("git_diff event count = %d, want 2 (original + infra-exhausted re-emit)", len(patches))
+	}
+	// The agent never rewrote the tree, so the re-emit is byte-identical to the
+	// original — last-write-wins is a harmless no-op on this path.
+	if patches[0] != patches[1] {
+		t.Errorf("infra-exhausted re-emit must equal the original diff (tree unchanged):\nfirst:\n%s\nlast:\n%s", patches[0], patches[1])
+	}
 }
 
 // TestRun_VerifyGateCommitted_DriftExcludedFailureBlocks is the #802
@@ -4752,7 +4987,7 @@ func TestRunVerifyFixLoop_PostCommitResetFailureFatal(t *testing.T) {
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	_, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
 	if err == nil {
 		t.Fatal("a post-commit reset failure must be FATAL (hard error), not a non-blocking skip")
 	}
