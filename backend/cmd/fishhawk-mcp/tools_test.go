@@ -1899,6 +1899,75 @@ func TestGetRunStatus_HappyPath_BundlesThreeReads(t *testing.T) {
 	}
 }
 
+// TestGetRunStatus_StageWaitStatus_PropagatesEndToEnd drives the full
+// getRunStatus handler against the fake backend to cover the cross-layer seam
+// (#879/#880, cf. #618): backend Stage.State -> stageWaitStatusFor derivation
+// -> tool output rendering, as one flow. A running implement stage propagates
+// status=="running" + poll_interval_seconds==30; a terminal (succeeded) plan
+// stage omits the interval.
+func TestGetRunStatus_StageWaitStatus_PropagatesEndToEnd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.New().String(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.New().String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running"},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+
+	if out.PlanStageWaitStatus == nil {
+		t.Fatal("PlanStageWaitStatus is nil")
+	}
+	if out.PlanStageWaitStatus.Status != "succeeded" {
+		t.Errorf("plan status = %q, want succeeded", out.PlanStageWaitStatus.Status)
+	}
+	if out.PlanStageWaitStatus.PollIntervalSeconds != 0 {
+		t.Errorf("plan poll_interval_seconds = %d, want 0 (terminal omits it)", out.PlanStageWaitStatus.PollIntervalSeconds)
+	}
+
+	if out.ImplementStageWaitStatus == nil {
+		t.Fatal("ImplementStageWaitStatus is nil")
+	}
+	if out.ImplementStageWaitStatus.Status != "running" {
+		t.Errorf("implement status = %q, want running", out.ImplementStageWaitStatus.Status)
+	}
+	if out.ImplementStageWaitStatus.PollIntervalSeconds != 30 {
+		t.Errorf("implement poll_interval_seconds = %d, want 30", out.ImplementStageWaitStatus.PollIntervalSeconds)
+	}
+}
+
+// TestGetRunStatus_StageWaitStatus_RunTerminalBackstop asserts the ADR-036
+// (#874) backstop propagates through the handler: a running stage under a
+// terminal run keeps 'running' but drops the poll interval.
+func TestGetRunStatus_StageWaitStatus_RunTerminalBackstop(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "failed"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.New().String(), RunID: runID.String(), Sequence: 1, Type: "implement", State: "running"},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementStageWaitStatus == nil {
+		t.Fatal("ImplementStageWaitStatus is nil")
+	}
+	if out.ImplementStageWaitStatus.Status != "running" {
+		t.Errorf("status = %q, want running", out.ImplementStageWaitStatus.Status)
+	}
+	if out.ImplementStageWaitStatus.PollIntervalSeconds != 0 {
+		t.Errorf("poll_interval_seconds = %d, want 0 (run terminal -> backstop drops it)", out.ImplementStageWaitStatus.PollIntervalSeconds)
+	}
+}
+
 func TestGetRunStatus_StagesReSortedBySequence(t *testing.T) {
 	// Defensive sort: even if the backend ever stops ordering by
 	// sequence, the agent still sees the pipeline in order.

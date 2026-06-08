@@ -825,6 +825,43 @@ func TestRunStage_GitHubRepoAutoDetectFails_WithPushErrors(t *testing.T) {
 	}
 }
 
+// TestRunStage_PopulatesStageWaitStatus asserts RunStageOutput.StageWaitStatus
+// is populated from the post-run stage fetch (#879/#880): a synchronous return
+// on a succeeded stage records the terminal status on the handle and omits the
+// poll interval.
+func TestRunStage_PopulatesStageWaitStatus(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "exit 0")
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStage(fb, runID, stageID, "succeeded")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:         runID.String(),
+		StageID:       stageID.String(),
+		Workflow:      "w",
+		Stage:         "plan",
+		PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.StageWaitStatus == nil {
+		t.Fatal("StageWaitStatus is nil; expected it populated from the post-run fetch")
+	}
+	if out.StageWaitStatus.Stage != "plan" {
+		t.Errorf("StageWaitStatus.Stage = %q, want plan", out.StageWaitStatus.Stage)
+	}
+	if out.StageWaitStatus.Status != "succeeded" {
+		t.Errorf("StageWaitStatus.Status = %q, want succeeded", out.StageWaitStatus.Status)
+	}
+	if out.StageWaitStatus.PollIntervalSeconds != 0 {
+		t.Errorf("StageWaitStatus.PollIntervalSeconds = %d, want 0 (terminal stage omits it)", out.StageWaitStatus.PollIntervalSeconds)
+	}
+}
+
 // --- JSONL accumulation ---
 
 func TestRunStage_JSONLAccumulation_OrderPreserved(t *testing.T) {
