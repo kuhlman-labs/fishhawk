@@ -942,16 +942,19 @@ func succeedFixupPushViaBackend(t *testing.T, ctx context.Context, fx *e2eFixtur
 	}
 }
 
-// TestE2E_Fixup_ReviewActionHintSurfacesAndSuppresses drives the
-// review-action-hint seam end to end (#777): the audit-persistence →
-// hint-compute → MCP-response layers in one test (cf. #618), which the
+// TestE2E_Fixup_ReviewActionHintSurfacesAndOverride drives the
+// review-action-hint + operator-override seam end to end (#777, #860): the
+// audit-persistence → hint-compute → MCP-response and the MCP-input → HTTP →
+// run-state-machine → audit layers in one test (cf. #618), which the
 // per-function units can't express. An implement-review approve_with_concerns
 // verdict in Postgres must surface as review_action_hint on
-// fishhawk_get_run_status; once a fix-up pass spends the bounded budget, the
-// hint must suppress. The suppression assertion is the only guard against a
-// silently-wrong RemainingFixupBudget if the mirrored maxFixupPasses const
-// drifts from the backend's enforced bound.
-func TestE2E_Fixup_ReviewActionHintSurfacesAndSuppresses(t *testing.T) {
+// fishhawk_get_run_status; once a fix-up pass spends the NORMAL budget the
+// hint must NOT suppress (direction D) but report OverrideAvailable=true; the
+// operator override (force_additional_pass=true) must be admitted and audited
+// as forced; and at the hard ceiling fishhawk_fixup_stage must return the
+// distinct fixup_ceiling_reached error. The ceiling assertion is the guard
+// against a silently-drifted fixupCeiling mirror.
+func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -995,21 +998,38 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndSuppresses(t *testing.T) {
 		t.Errorf("review_action_hint.message should point at fishhawk_fixup_stage; got %q", hint.Message)
 	}
 
-	// 4. Spend the bounded fix-up budget via the real fix-up tool — one
-	// stage_fixup_triggered entry lands in Postgres.
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name: "fishhawk_fixup_stage",
-		Arguments: map[string]any{
+	// callFixup drives one fix-up through the real MCP binary; force toggles
+	// the bounded operator override (#860). Re-parks the stage at the gate
+	// first so only the budget/ceiling decision gates the pass.
+	callFixup := func(force bool) *mcp.CallToolResult {
+		t.Helper()
+		// A prior fix-up leaves the stage in pending; re-park it at the gate
+		// so only the budget/ceiling decision gates the pass. On the first
+		// call the stage is already at the gate, so skip the (invalid) walk.
+		if cur, err := fx.runRepo.GetStage(ctx, stage.ID); err != nil {
+			t.Fatalf("GetStage: %v", err)
+		} else if cur.State != runpkg.StageStateAwaitingApproval {
+			parkAtGate(t, ctx, fx.runRepo, stage.ID)
+		}
+		args := map[string]any{
 			"stage_id": stage.ID.String(),
 			"concerns": []int{0},
 			"reason":   "address the scope concern",
-		},
-	})
-	if err != nil {
-		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+		}
+		if force {
+			args["force_additional_pass"] = true
+		}
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_fixup_stage", Arguments: args})
+		if err != nil {
+			t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+		}
+		return res
 	}
-	if result.IsError {
-		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+
+	// 4. Spend the NORMAL fix-up budget via the real fix-up tool — one
+	// stage_fixup_triggered entry lands in Postgres.
+	if res := callFixup(false); res.IsError {
+		t.Fatalf("first fix-up returned error: %s", toolContentString(t, res))
 	}
 	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
 	if err != nil {
@@ -1019,10 +1039,56 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndSuppresses(t *testing.T) {
 		t.Fatalf("stage_fixup_triggered entries = %d, want exactly 1", len(entries))
 	}
 
-	// 5. The hint is now suppressed — the single budget unit is spent. This
-	// is the guard against a drifting maxFixupPasses mirror.
-	if hint := getReviewActionHint(t, ctx, session, fx.runID); hint != nil {
-		t.Errorf("review_action_hint should suppress after one fix-up pass; got %+v", hint)
+	// 5. Direction D: the re-review lands a fresh concern AFTER the fix-up.
+	// With the normal budget spent but the hard ceiling still open, the hint
+	// must NOT suppress — it surfaces the exhaustion with OverrideAvailable.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "the re-review still sees drift"})
+	hint = getReviewActionHint(t, ctx, session, fx.runID)
+	if hint == nil {
+		t.Fatalf("review_action_hint suppressed after budget spent; want it to surface with the override option (direction D)")
+	}
+	if hint.RemainingFixupBudget != 0 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d, want 0 (budget spent)", hint.RemainingFixupBudget)
+	}
+	if !hint.OverrideAvailable {
+		t.Errorf("review_action_hint.override_available = false, want true (below the hard ceiling)")
+	}
+
+	// 6. The operator override admits ONE pass beyond the budget, audited as
+	// forced (#860).
+	if res := callFixup(true); res.IsError {
+		t.Fatalf("forced fix-up returned error: %s", toolContentString(t, res))
+	}
+	entries, err = auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory (post-override): %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 2 after the override", len(entries))
+	}
+	var forcedPayload struct {
+		Forced bool `json:"forced"`
+	}
+	if err := json.Unmarshal(entries[len(entries)-1].Payload, &forcedPayload); err != nil {
+		t.Fatalf("unmarshal forced payload: %v", err)
+	}
+	if !forcedPayload.Forced {
+		t.Errorf("override fix-up audit forced = false, want true")
+	}
+
+	// 7. A third (forced) pass consumes the hard ceiling (3 total), then the
+	// next attempt is refused with the DISTINCT fixup_ceiling_reached error —
+	// the guard against a drifted fixupCeiling mirror.
+	if res := callFixup(true); res.IsError {
+		t.Fatalf("third fix-up returned error: %s", toolContentString(t, res))
+	}
+	ceil := callFixup(true)
+	if !ceil.IsError {
+		t.Fatalf("fix-up at the ceiling unexpectedly succeeded; want fixup_ceiling_reached")
+	}
+	if body := toolContentString(t, ceil); !strings.Contains(body, "fixup_ceiling_reached") {
+		t.Errorf("ceiling fix-up error missing fixup_ceiling_reached code: %s", body)
 	}
 }
 
@@ -1031,6 +1097,7 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndSuppresses(t *testing.T) {
 type reviewActionHint struct {
 	Concerns             int    `json:"concerns"`
 	RemainingFixupBudget int    `json:"remaining_fixup_budget"`
+	OverrideAvailable    bool   `json:"override_available"`
 	Message              string `json:"message"`
 }
 

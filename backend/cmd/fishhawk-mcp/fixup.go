@@ -21,6 +21,8 @@ type FixupStageInput struct {
 	Reason   string `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the stage_fixup_triggered audit entry"`
 	// AllowCreate declares net-new files this fix-up will create (#823).
 	AllowCreate []string `json:"allow_create,omitempty" jsonschema:"optional repo-relative paths the fix-up will CREATE; folded into the effective scope.files for THIS pass only (bounded, explicit, operator-authorized) so the runner stages them instead of failing category-B created-out-of-scope. Any created file NOT declared here still fails category-B."`
+	// ForceAdditionalPass is the bounded operator override (#860).
+	ForceAdditionalPass bool `json:"force_additional_pass,omitempty" jsonschema:"bounded operator override: set true to grant ONE fix-up pass BEYOND the normal budget when it is already spent (you got fixup_budget_exhausted) but a concern still needs the agent. Hard-capped at 3 total passes per stage; the forced pass is audited (forced flag + your reason). At the ceiling the tool returns fixup_ceiling_reached and the override no longer helps. Default false."`
 }
 
 // FixupStageOutput surfaces the re-opened Stage row. A successful fix-up
@@ -28,8 +30,9 @@ type FixupStageInput struct {
 // advances it to dispatched before the response returns, re-firing
 // workflow_dispatch). Refusals — empty concerns, an out-of-range index,
 // no recorded approve_with_concerns verdict, the bounded pass count
-// already spent, or a cross-run token — surface as a tool error carrying
-// the backend's error code (e.g. fixup_budget_exhausted).
+// already spent, the hard ceiling reached, or a cross-run token — surface
+// as a tool error carrying the backend's error code (e.g.
+// fixup_budget_exhausted or fixup_ceiling_reached).
 type FixupStageOutput struct {
 	Stage Stage `json:"stage"`
 }
@@ -97,13 +100,23 @@ Inputs:
     file NOT declared here still fails category-B (the #818 fail-loud
     contract is preserved). Entries must be repo-relative (no absolute
     paths, no '..'); a bad entry returns validation_failed.
+  - force_additional_pass : bounded operator override (#860). When the
+    NORMAL budget is spent (you got fixup_budget_exhausted) but a concern
+    still needs the agent, set this true to grant ONE pass beyond the
+    budget. Hard-capped at 3 total passes per stage; the forced pass is
+    audited (a 'forced' flag plus your reason on the stage_fixup_triggered
+    entry). Default false.
 
-Bounded + operator-gated: the bound defaults to ONE pass per stage. The
-budget is the number of remaining passes (max − fix-ups already
+Bounded + operator-gated: the NORMAL bound defaults to ONE pass per stage.
+The budget is the number of remaining passes (max − fix-ups already
 triggered, observable on the stage_fixup_triggered audit entry's
-remaining_budget field). A second attempt once the bound is spent returns
-a fixup_budget_exhausted tool error. A run-bound token may fix up only its
-own run's stages. The operator still owns the merge.
+remaining_budget field). A second attempt once the budget is spent returns
+fixup_budget_exhausted — but the operator may grant ONE more pass with
+force_additional_pass=true, hard-capped at 3 TOTAL passes per stage. Once
+that hard ceiling is reached the tool returns the DISTINCT
+fixup_ceiling_reached error (the override no longer helps — file a
+follow-up and merge, or start a fresh run). A run-bound token may fix up
+only its own run's stages. The operator still owns the merge.
 
 Returns the re-opened Stage row (pending → dispatched) on success.
 Returns a tool error on:
@@ -113,7 +126,11 @@ Returns a tool error on:
   - stage_not_found (404)
   - fixup_not_applicable (no recorded approve_with_concerns verdict, or
     the stage is not at the gate / its review gate already resolved, 422)
-  - fixup_budget_exhausted (the bounded pass count is spent, 422)
+  - fixup_budget_exhausted (the NORMAL bounded pass count is spent, 422;
+    one more pass is available via force_additional_pass=true)
+  - fixup_ceiling_reached (the hard ceiling of 3 total passes is reached,
+    422; a hard stop — the override cannot push past it. File a follow-up
+    and merge, or start a fresh run)
 `),
 	}, resolver.fixupStage)
 }
@@ -129,7 +146,7 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	if len(in.Concerns) == 0 {
 		return nil, FixupStageOutput{}, fmt.Errorf("concerns must select at least one recorded implement-review concern")
 	}
-	fixed, err := r.api.FixupStage(ctx, stageID, in.Concerns, in.Reason, in.AllowCreate)
+	fixed, err := r.api.FixupStage(ctx, stageID, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass)
 	if err != nil {
 		return nil, FixupStageOutput{}, fmt.Errorf("fixup stage: %w", err)
 	}

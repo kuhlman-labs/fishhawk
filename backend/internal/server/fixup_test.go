@@ -327,6 +327,106 @@ func TestFixupStage_SecondPassRefused(t *testing.T) {
 	}
 }
 
+// reparkFixupStage models the re-review landing the stage on
+// awaiting_approval again, so the only thing gating the next pass is the
+// budget/ceiling decision — not the state machine.
+func reparkFixupStage(repo *approvalRunRepo, stageID uuid.UUID) {
+	repo.mu.Lock()
+	repo.stages[stageID].State = run.StageStateAwaitingApproval
+	repo.mu.Unlock()
+}
+
+func TestFixupStage_ForceAdditionalPassGrantsForcedPass(t *testing.T) {
+	// The normal budget (1) is spent after one pass; force_additional_pass
+	// grants one more, audited as forced (#860).
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	// Pass 1: normal, spends the budget.
+	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}}); w.Code != http.StatusOK {
+		t.Fatalf("first fixup status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	reparkFixupStage(repo, stage.ID)
+
+	// Pass 2: budget spent, but the override grants it.
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, Reason: "one more pass", ForceAdditionalPass: true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("forced fixup status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// The latest stage_fixup_triggered entry records the forced override.
+	var last *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryStageFixupTriggered {
+			last = &au.appended[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("no stage_fixup_triggered entry appended")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(last.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["forced"] != true {
+		t.Errorf("forced = %v, want true", payload["forced"])
+	}
+	if payload["hard_ceiling"].(float64) != float64(defaultFixupCeiling) {
+		t.Errorf("hard_ceiling = %v, want %d", payload["hard_ceiling"], defaultFixupCeiling)
+	}
+	if reason, _ := payload["admissibility_reason"].(string); !strings.Contains(reason, "operator-forced override") {
+		t.Errorf("admissibility_reason = %q, want it to note the operator-forced override", reason)
+	}
+}
+
+func TestFixupStage_CeilingReachedReturns422(t *testing.T) {
+	// Drive the stage to the hard ceiling (3 total passes) and assert the
+	// next attempt is refused with the DISTINCT fixup_ceiling_reached code,
+	// not fixup_budget_exhausted (#860).
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	// Pass 1 (normal) + passes 2 and 3 (forced) consume the ceiling.
+	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}}); w.Code != http.StatusOK {
+		t.Fatalf("pass 1 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	for i := 2; i <= 3; i++ {
+		reparkFixupStage(repo, stage.ID)
+		if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true}); w.Code != http.StatusOK {
+			t.Fatalf("pass %d status = %d, want 200:\n%s", i, w.Code, w.Body.String())
+		}
+	}
+
+	// 4th attempt: at the ceiling, even forced, refused with the distinct code.
+	reparkFixupStage(repo, stage.ID)
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("ceiling status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
+		t.Errorf("body missing fixup_ceiling_reached code: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
+		t.Errorf("body should carry the distinct ceiling code, not budget_exhausted: %s", w.Body.String())
+	}
+	// Exactly three fix-up entries — the refused pass wrote none.
+	n := 0
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			n++
+		}
+	}
+	if n != 3 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 3", n)
+	}
+}
+
 func TestFixupStage_NoConcernsSelectedReturns400(t *testing.T) {
 	s, repo, au := fixupServer(t)
 	stage := seedImplementGateStage(repo)

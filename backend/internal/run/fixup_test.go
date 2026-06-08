@@ -46,6 +46,7 @@ func TestFixupStage_ReopensAwaitingApprovalToPending(t *testing.T) {
 	dec, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
 		PriorPassCount: 0,
 		MaxPasses:      1,
+		HardCeiling:    3,
 	})
 	if err != nil {
 		t.Fatalf("FixupStage: %v", err)
@@ -66,7 +67,7 @@ func TestFixupStage_RefusesNonImplementStage(t *testing.T) {
 	stage := newStage(run.StageStateAwaitingApproval)
 	repo := newMemRepo(stage)
 
-	_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{MaxPasses: 1})
+	_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
 	if !errors.Is(err, run.ErrFixupNotApplicable) {
 		t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
 	}
@@ -77,7 +78,7 @@ func TestFixupStage_RefusesWrongState(t *testing.T) {
 	// not a fix-up candidate.
 	repo, stage := implementStage(t, run.StageStateRunning)
 
-	_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{MaxPasses: 1})
+	_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
 	if !errors.Is(err, run.ErrFixupNotApplicable) {
 		t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
 	}
@@ -95,6 +96,7 @@ func TestFixupStage_RefusesWhenBudgetExhausted(t *testing.T) {
 	_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
 		PriorPassCount: 1,
 		MaxPasses:      1,
+		HardCeiling:    3,
 	})
 	if !errors.Is(err, run.ErrFixupBudgetExhausted) {
 		t.Fatalf("err = %v, want ErrFixupBudgetExhausted", err)
@@ -112,7 +114,7 @@ func TestFixupStage_ReopensSucceededWithOpenReviewGate(t *testing.T) {
 	repo, impl, review := implementWithReview(t, run.StageStateSucceeded, run.StageStateAwaitingApproval)
 	ctx := context.Background()
 
-	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1})
+	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
 	if err != nil {
 		t.Fatalf("FixupStage: %v", err)
 	}
@@ -144,7 +146,7 @@ func TestFixupStage_RefusesSucceededWhenReviewAlreadyResolved(t *testing.T) {
 	repo, impl, review := implementWithReview(t, run.StageStateSucceeded, run.StageStateSucceeded)
 	ctx := context.Background()
 
-	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1})
+	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
 	if !errors.Is(err, run.ErrFixupNotApplicable) {
 		t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
 	}
@@ -161,7 +163,7 @@ func TestFixupStage_RefusesSucceededWhenNoReviewStage(t *testing.T) {
 	repo, stage := implementStage(t, run.StageStateSucceeded)
 	ctx := context.Background()
 
-	_, err := run.FixupStage(ctx, repo, stage.ID, run.FixupOptions{MaxPasses: 1})
+	_, err := run.FixupStage(ctx, repo, stage.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
 	if !errors.Is(err, run.ErrFixupNotApplicable) {
 		t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
 	}
@@ -177,7 +179,7 @@ func TestFixupStage_ReparkFailureLeavesImplementSucceeded(t *testing.T) {
 	repo.failTransition(review.ID, errors.New("re-park boom"))
 	ctx := context.Background()
 
-	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1})
+	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
 	if err == nil {
 		t.Fatal("FixupStage returned nil error on re-park failure")
 	}
@@ -201,7 +203,7 @@ func TestFixupStage_ImplementReopenFailureLeavesReviewReparked(t *testing.T) {
 	repo.failTransition(impl.ID, errors.New("re-open boom"))
 	ctx := context.Background()
 
-	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1})
+	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
 	if err == nil {
 		t.Fatal("FixupStage returned nil error on implement re-open failure")
 	}
@@ -344,11 +346,82 @@ func TestFixupStage_RemainingBudgetWithHigherBound(t *testing.T) {
 	dec, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
 		PriorPassCount: 1,
 		MaxPasses:      3,
+		HardCeiling:    3,
 	})
 	if err != nil {
 		t.Fatalf("FixupStage: %v", err)
 	}
 	if dec.RemainingBudget != 1 {
 		t.Errorf("RemainingBudget = %d, want 1 (3 - 2 used)", dec.RemainingBudget)
+	}
+}
+
+func TestFixupStage_ForceAdditionalPassGrantsPassPastBudget(t *testing.T) {
+	// The normal budget (1) is spent, but the operator override grants one
+	// pass beyond it, still under the hard ceiling of 3.
+	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
+
+	dec, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
+		PriorPassCount:      1,
+		MaxPasses:           1,
+		HardCeiling:         3,
+		ForceAdditionalPass: true,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage with override: %v", err)
+	}
+	if !dec.Forced {
+		t.Errorf("Forced = false, want true (override carried it past the normal budget)")
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-fixup state = %q, want pending", dec.Stage.State)
+	}
+	// RemainingBudget reflects the NORMAL budget only, so a forced pass
+	// reports 0.
+	if dec.RemainingBudget != 0 {
+		t.Errorf("RemainingBudget = %d, want 0 (forced pass past the normal budget)", dec.RemainingBudget)
+	}
+}
+
+func TestFixupStage_HardCeilingWinsEvenWhenForced(t *testing.T) {
+	// At the hard ceiling the override can NOT push past — the ceiling is
+	// the absolute stop, surfaced as the distinct ErrFixupCeilingReached.
+	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
+
+	_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
+		PriorPassCount:      3,
+		MaxPasses:           1,
+		HardCeiling:         3,
+		ForceAdditionalPass: true,
+	})
+	if !errors.Is(err, run.ErrFixupCeilingReached) {
+		t.Fatalf("err = %v, want ErrFixupCeilingReached", err)
+	}
+	if errors.Is(err, run.ErrFixupBudgetExhausted) {
+		t.Errorf("err = %v, want the distinct ceiling error, not budget_exhausted", err)
+	}
+	// The stage must NOT have been re-opened — the ceiling is checked
+	// before any transition.
+	cur, _ := repo.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingApproval {
+		t.Errorf("state = %q, want unchanged (awaiting_approval)", cur.State)
+	}
+}
+
+func TestFixupStage_NotForcedAtBudgetStillBudgetExhausted(t *testing.T) {
+	// Default (no override) at the normal budget still refuses with
+	// budget_exhausted, not the ceiling error — the ceiling has headroom.
+	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
+
+	_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
+		PriorPassCount: 1,
+		MaxPasses:      1,
+		HardCeiling:    3,
+	})
+	if !errors.Is(err, run.ErrFixupBudgetExhausted) {
+		t.Fatalf("err = %v, want ErrFixupBudgetExhausted", err)
+	}
+	if errors.Is(err, run.ErrFixupCeilingReached) {
+		t.Errorf("err = %v, want budget_exhausted, not the ceiling error", err)
 	}
 }
