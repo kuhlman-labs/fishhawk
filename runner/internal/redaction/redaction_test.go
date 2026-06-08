@@ -57,6 +57,46 @@ func TestDefaultPatterns_PositiveCases(t *testing.T) {
 	}
 }
 
+// TestDefaultPatterns_CodexOpenAIKeySurfaces asserts the OpenAI key
+// patterns already in DefaultPatterns fire on the surfaces the codex
+// adapter (#840) introduces: the OPENAI_API_KEY it forwards to the child
+// and any key that leaks back into a Codex JSONL trace event. Both the
+// classic `sk-…` and the project `sk-proj-…` forms must be scrubbed
+// before the redacted bundle ships. No new pattern is required — this is
+// coverage on the new surface so a future key-format drift fails loudly
+// rather than silently leaking.
+func TestDefaultPatterns_CodexOpenAIKeySurfaces(t *testing.T) {
+	apiKey := "sk-" + strings.Repeat("B", 48)
+	projKey := "sk-proj-" + strings.Repeat("C", 50)
+	cases := []struct {
+		name    string
+		pattern string
+		line    string
+	}{
+		{
+			name:    "env_surface_classic",
+			pattern: "openai-api-key",
+			line:    `{"type":"env","key":"OPENAI_API_KEY","value":"` + apiKey + `"}`,
+		},
+		{
+			name:    "trace_event_project_key",
+			pattern: "openai-project-key",
+			line:    `{"type":"item.completed","item":{"type":"agent_message","text":"key is ` + projKey + `"}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, hits := redaction.RedactDefault([]byte(tc.line))
+			if findHit(hits, tc.pattern) == 0 {
+				t.Errorf("expected pattern %q to fire on codex surface; hits = %+v", tc.pattern, hits)
+			}
+			if bytes.Contains(out, []byte(apiKey)) || bytes.Contains(out, []byte(projKey)) {
+				t.Errorf("redacted output still contains an OpenAI key: %s", out)
+			}
+		})
+	}
+}
+
 // TestDefaultPatterns_NegativeCases checks for false positives on
 // strings that look secret-shaped but shouldn't match. If we
 // accidentally redact ordinary text, that's a regression.

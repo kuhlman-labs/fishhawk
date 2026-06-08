@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -39,10 +38,36 @@ func TestSelectInvoker_ClaudeCode(t *testing.T) {
 
 // TestSelectInvoker_Codex asserts the codex routing contract: selection
 // succeeds with a non-nil invoker and no error (a recognized provider),
-// and its Invoke returns the deferred not-implemented agent error. This
-// guards the placeholder against being collapsed into the unknown-agent
-// fail-fast branch when the real adapter (#840) is wired.
+// routing through the newCodexInvoker seam with the key forwarded. This
+// is now the REAL codex adapter (#840), no longer a not-implemented
+// placeholder; it must still be distinct from the unknown-agent
+// fail-fast branch.
 func TestSelectInvoker_Codex(t *testing.T) {
+	sentinel := &fakeInvoker{}
+	orig := newCodexInvoker
+	var gotKey string
+	newCodexInvoker = func(apiKey string) agent.Invoker {
+		gotKey = apiKey
+		return sentinel
+	}
+	t.Cleanup(func() { newCodexInvoker = orig })
+
+	inv, err := selectInvoker("codex", "openai-secret")
+	if err != nil {
+		t.Fatalf("selectInvoker(codex) error = %v, want nil", err)
+	}
+	if inv != agent.Invoker(sentinel) {
+		t.Error("selectInvoker(codex) did not route through newCodexInvoker seam")
+	}
+	if gotKey != "openai-secret" {
+		t.Errorf("selectInvoker(codex) forwarded key = %q, want openai-secret", gotKey)
+	}
+}
+
+// TestSelectInvoker_CodexDefault asserts the default newCodexInvoker seam
+// constructs the real codex adapter (a non-nil invoker), guarding against
+// a regression back to a nil / placeholder branch.
+func TestSelectInvoker_CodexDefault(t *testing.T) {
 	inv, err := selectInvoker("codex", "key")
 	if err != nil {
 		t.Fatalf("selectInvoker(codex) error = %v, want nil", err)
@@ -50,18 +75,23 @@ func TestSelectInvoker_Codex(t *testing.T) {
 	if inv == nil {
 		t.Fatal("selectInvoker(codex) returned nil invoker")
 	}
-	res, ierr := inv.Invoke(context.Background(), agent.Invocation{})
-	if ierr == nil {
-		t.Fatal("codex placeholder Invoke returned nil error, want not-implemented")
+}
+
+// TestAPIKeyForAgent pins the per-provider key sourcing: codex reads
+// OPENAI_API_KEY, everything else (including the claude-code default and
+// an unknown id) reads ANTHROPIC_API_KEY.
+func TestAPIKeyForAgent(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "anthropic-key")
+	t.Setenv("OPENAI_API_KEY", "openai-key")
+
+	if got := apiKeyForAgent("codex"); got != "openai-key" {
+		t.Errorf("apiKeyForAgent(codex) = %q, want openai-key", got)
 	}
-	if !errors.Is(ierr, agent.ErrAgentFailed) {
-		t.Errorf("codex placeholder Invoke error = %v, want wrapping ErrAgentFailed", ierr)
+	if got := apiKeyForAgent("claude-code"); got != "anthropic-key" {
+		t.Errorf("apiKeyForAgent(claude-code) = %q, want anthropic-key", got)
 	}
-	if res.OK {
-		t.Error("codex placeholder Result.OK = true, want false")
-	}
-	if res.FailureCategory != "A" {
-		t.Errorf("codex placeholder FailureCategory = %q, want A", res.FailureCategory)
+	if got := apiKeyForAgent("unknown"); got != "anthropic-key" {
+		t.Errorf("apiKeyForAgent(unknown) = %q, want anthropic-key (fallback)", got)
 	}
 }
 
