@@ -114,6 +114,17 @@ This makes a previously invisible boundary crossing (the #601 class) visible in 
 - **Residual gap.** It catches writes through the Write/Edit **tools** only. **Bash-mediated writes** (shell `>` redirects) are NOT visible to it. Closing that gap, and confining writes rather than merely surfacing them, is the OS-sandbox ADR's domain.
 - Containment is resolved against the target's deepest **existing** ancestor (the common case is a brand-new file that doesn't exist yet) and canonicalises symlinks first, so e.g. macOS's `/tmp` → `/private/tmp` symlink does not cause false positives.
 
+### OTel trace export (#649 / #679)
+
+`internal/otelemit` emits one OpenTelemetry GenAI trace per stage invocation. Emission is **gated by `OTEL_EXPORTER_OTLP_ENDPOINT`**: when unset (the default), `Bootstrap` returns a disabled Emitter whose methods are no-ops, so the implement loop is completely unaffected. When set, an OTLP/HTTP exporter (`otlptracehttp`) POSTs spans to `{endpoint}/v1/traces`, honouring the standard `OTEL_EXPORTER_OTLP_*` env vars.
+
+Span shape (one trace per run, stitched under the deterministic `otelemit.TraceIDFromRunID` trace id across the separate per-stage runner processes):
+
+- `stage <name>` — parent span; attrs `fishhawk.run_id`, `fishhawk.stage`. Span status records the stage outcome (Ok / Error).
+- `chat <model>` — child model-call span; GenAI-semconv attrs `gen_ai.system=anthropic`, `gen_ai.operation.name=chat`, `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens`, optional `gen_ai.request.temperature`; plus `fishhawk.*` cost/repro attrs `cost.usd`, `cost.estimated`, `cost.priced`, `pricing.as_of`, `latency_ms`, `repro.temperature_available`.
+
+To view traces locally, start the opt-in Jaeger all-in-one (`docker compose --profile otel up -d`), set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`, and open the Jaeger UI at http://localhost:16686. **Caveat**: the collector must be reachable from where the runner actually executes — under the standard dogfood loop the runner runs on a GitHub-hosted CI runner where `localhost:4318` is the CI host's loopback, so end-to-end local viewing requires invoking `fishhawk-runner` locally (see "Local invocation" above). Full span-attribute reference and the GHA-export deferral are in `docs/ARCHITECTURE.md` §10 ("Local OTLP trace collector").
+
 ## Releases
 
 The release workflow at `.github/workflows/runner-release.yml` triggers on tags matching `runner/v*`. To cut a release:
