@@ -86,6 +86,9 @@ type fakeGitHub struct {
 	createPullRequestStatus int
 	createPullRequestBody   string
 
+	closePullRequestStatus int
+	closePullRequestBody   string
+
 	listPullsStatus int
 	listPullsBody   string
 
@@ -138,6 +141,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		getPullRequestBody:        `{"number":42,"node_id":"PR_kwDOABcDEf","state":"open","merged":false,"head":{"sha":"abc123"}}`,
 		createPullRequestStatus:   http.StatusCreated,
 		createPullRequestBody:     `{"number":99,"node_id":"PR_kwDOABcZ99","state":"open","html_url":"https://github.com/x/y/pull/99","head":{"sha":"def456"}}`,
+		closePullRequestStatus:    http.StatusOK,
+		closePullRequestBody:      `{"number":42,"node_id":"PR_kwDOABcDEf","state":"closed","head":{"sha":"abc123"}}`,
 		listPullsStatus:           http.StatusOK,
 		listPullsBody:             `[]`,
 		graphqlStatus:             http.StatusOK,
@@ -308,6 +313,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.createPullRequestStatus)
 			if fg.createPullRequestBody != "" {
 				_, _ = io.WriteString(w, fg.createPullRequestBody)
+			}
+		})
+
+	mux.HandleFunc("PATCH /repos/{owner}/{repo}/pulls/{number}",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.closePullRequestStatus)
+			if fg.closePullRequestBody != "" {
+				_, _ = io.WriteString(w, fg.closePullRequestBody)
 			}
 		})
 
@@ -1770,6 +1785,67 @@ func TestCreatePullRequest_ValidationErrors(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
 		})
+	}
+}
+
+func TestClosePullRequest_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.ClosePullRequest(context.Background(), 42,
+		RepoRef{Owner: "o", Name: "r"}, 7); err != nil {
+		t.Fatalf("ClosePullRequest: %v", err)
+	}
+	if fg.gotMethod != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/o/r/pulls/7" {
+		t.Errorf("path = %q, want /repos/o/r/pulls/7", fg.gotPath)
+	}
+	if fg.gotContentType != "application/json" {
+		t.Errorf("content-type = %q", fg.gotContentType)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["state"] != "closed" {
+		t.Errorf("state = %q, want closed", body["state"])
+	}
+}
+
+func TestClosePullRequest_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		number    int
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "r"}, 1, "owner and name"},
+		{"missing name", RepoRef{Owner: "o"}, 1, "owner and name"},
+		{"zero number", RepoRef{Owner: "o", Name: "r"}, 0, "pr number must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := c.ClosePullRequest(context.Background(), 1, tc.repo, tc.number)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestClosePullRequest_GitHubError(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.closePullRequestStatus = http.StatusForbidden
+	fg.closePullRequestBody = `{"message":"Resource not accessible by integration"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.ClosePullRequest(context.Background(), 1,
+		RepoRef{Owner: "o", Name: "r"}, 7)
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
 	}
 }
 

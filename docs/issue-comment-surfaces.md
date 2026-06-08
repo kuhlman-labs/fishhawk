@@ -337,6 +337,30 @@ Notes:
   never reaches `review:awaiting_approval` with a null PR. Listed here only so a
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
+- The gating-reject PR-close audit kind — `pull_request_closed_after_review_reject`
+  (#877) — is an **audit kind, not a triggering-issue comment surface**, but it
+  DOES post a best-effort comment to the closed PR thread (not via the
+  `issuecomment` package — directly via `githubclient.CreateIssueComment`, which
+  GitHub routes through the issues endpoint a PR shares). A gating agent
+  implement-review (human==0) reject fails the implement stage category-B
+  synchronously during the raw-trace upload, BEFORE the runner — which has no view
+  of that verdict — opens its PR and POSTs to
+  `POST /v0/runs/{run_id}/pull-request`. By then the stage is terminally failed,
+  so the PR artifact + `pull_request_opened` audit stay honestly recorded but the
+  change will never merge, leaving a dangling open PR.
+  `server/pullrequest.go::closePRAfterGatingReject` detects that exact state
+  (implement + `failed` + category-B + the `implement_review_rejected` reason
+  prefix, the same const the trace failure site stamps), posts the short
+  explanatory PR comment, closes the PR via `githubclient.ClosePullRequest`
+  (`PATCH .../pulls/{number}` state=closed), then writes this audit entry with a
+  `system` actor and payload `{run_id, stage_id, artifact_id, pr_number, pr_url,
+  failure_reason}`. The whole step is fail-open: GitHub unconfigured, a nil
+  installation id, an unparseable repo, or a close error WARNs and skips (the
+  stage is already failed — a failed close must never 500 the handler), and the
+  audit entry is written only after a successful close. Closing a PR leaves its
+  head branch intact (branch cleanup is out of scope). Listed here so a future
+  reader grepping the audit categories understands both its close-comment side
+  effect and that it is NOT a triggering-issue surface.
 - The run-branch lineage violation kind — `foreign_commit_on_branch` (ADR-035,
   #858) — is an **internal, audit-only kind, not an issue-comment surface**.
   Nothing in `issuecomment` posts it; it has no Notifier method. It is written

@@ -40,6 +40,20 @@ import (
 // runaway agent.
 const maxTraceBundleBytes = 64 * 1024 * 1024
 
+// implementReviewGatingRejectReason is the category-B failure reason
+// stamped on an implement stage when a gating agent implement-review
+// (human==0) returns a reject verdict during the raw-trace upload
+// (advanceStageAfterTrace). It is hoisted to a const so the
+// /pull-request handler's dangling-PR-close detection (#877) keys off
+// the same source of truth and cannot drift from the failure site.
+const implementReviewGatingRejectReason = "implement_review_rejected: agent review verdict reject under gating authority"
+
+// implementReviewGatingRejectPrefix is the stable prefix of
+// implementReviewGatingRejectReason. handleShipPullRequest matches a
+// failed stage's FailureReason on this prefix to recognize an
+// already-failed gating reject and close the just-opened PR (#877).
+const implementReviewGatingRejectPrefix = "implement_review_rejected"
+
 // traceUploadResponse is the 202 body in docs/api/v0.openapi.yaml
 // for `POST /v0/runs/{run_id}/trace`. Returns the (run, stage,
 // variant, content_hash) tuple so the runner can confirm the
@@ -457,7 +471,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			}
 			if s.runImplementReviews(r.Context(), runID, stageID, diff, scopeDrift, headSHA) {
 				cat := run.FailureB
-				reason := "implement_review_rejected: agent review verdict reject under gating authority"
+				reason := implementReviewGatingRejectReason
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
 					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 						"trace upload: transition to failed-B after implement-review gating reject failed",

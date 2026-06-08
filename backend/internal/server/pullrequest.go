@@ -407,6 +407,37 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	// Dangling-PR close on a gating implement-review reject (#877). The
+	// gating agent implement-review runs synchronously during the raw-trace
+	// upload (advanceStageAfterTrace) and fails the implement stage
+	// category-B BEFORE the runner — which has no view of that verdict —
+	// opens its PR and POSTs here. By now the stage is terminally failed, so
+	// the PR artifact + pull_request_opened audit + URL backfill above stay
+	// honestly recorded but advanceImplementStageAfterPR below is a no-op
+	// (the stage is not running), leaving the rejected change with an open
+	// PR that will never merge. Detect that exact already-failed state
+	// (implement + failed + category-B + the gating-reject reason prefix,
+	// the same source of truth as the trace.go failure site) and close the
+	// just-opened PR. Other category-B sources (lineage, spec-config, policy)
+	// don't carry this prefix and are correctly excluded. Return the success
+	// response without falling through to the lineage/advance path — the
+	// stage is already failed, so there is nothing to advance.
+	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateFailed &&
+		stage.FailureCategory != nil && *stage.FailureCategory == run.FailureB &&
+		stage.FailureReason != nil && strings.HasPrefix(*stage.FailureReason, implementReviewGatingRejectPrefix) {
+		s.closePRAfterGatingReject(r, runID, stage, &pr, created.ID)
+		s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
+			ID:          created.ID,
+			StageID:     created.StageID,
+			ContentHash: created.ContentHash,
+			PRNumber:    pr.PRNumber,
+			PRURL:       pr.PRURL,
+			HeadSHA:     pr.HeadSHA,
+			Idempotent:  false,
+		})
+		return
+	}
+
 	// Branch lineage guard (ADR-035, #858). Before opening the clean
 	// review gate, verify every commit on the run branch is attributable
 	// to this run's own reported head SHAs. A foreign commit (#797) fails
@@ -930,4 +961,113 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 		Outcome:  "failed",
 		Category: pr.Category,
 	})
+}
+
+// closePRAfterGatingReject closes the dangling PR the runner just opened
+// for an implement stage that a gating implement-review reject already
+// failed category-B (#877). The PR artifact + pull_request_opened audit
+// are intentionally left in place by the caller (the honest record that a
+// PR was momentarily opened); this best-effort step closes the PR on
+// GitHub so a rejected change isn't left with an open PR that will never
+// merge, posts a short explanatory comment, and writes a
+// pull_request_closed_after_review_reject audit entry.
+//
+// Fail-open throughout: GitHub unconfigured, a nil InstallationID, an
+// unparseable repo, or a close error all WARN and return — the stage is
+// already failed, so a failed close must never 500 the handler.
+func (s *Server) closePRAfterGatingReject(r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, artifactID uuid.UUID) {
+	ctx := r.Context()
+	reason := ""
+	if stage.FailureReason != nil {
+		reason = *stage.FailureReason
+	}
+
+	if s.cfg.GitHub == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gating-reject PR close: GitHub client not configured; skipping close",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.Int("pr_number", pr.PRNumber))
+		return
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gating-reject PR close: load run failed; skipping close",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if runRow.InstallationID == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gating-reject PR close: run has no installation id; skipping close",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.Int("pr_number", pr.PRNumber))
+		return
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gating-reject PR close: unparseable repo; skipping close",
+			slog.String("run_id", runID.String()),
+			slog.String("repo", runRow.Repo),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	// Best-effort explanatory comment first, so the close has context in the
+	// thread even if a reader only sees the closed PR. PR comments use the
+	// issues endpoint. A failure here WARNs and never blocks the close.
+	comment := fmt.Sprintf(
+		"Fishhawk closed this pull request: the implement stage was rejected by a gating agent review before the PR opened, so the change will not merge.\n\nReason: %s",
+		reason)
+	if _, cerr := s.cfg.GitHub.CreateIssueComment(ctx, *runRow.InstallationID, repo, pr.PRNumber, comment); cerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gating-reject PR close: post explanatory comment failed; proceeding to close",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.Int("pr_number", pr.PRNumber),
+			slog.String("error", cerr.Error()))
+	}
+
+	if cerr := s.cfg.GitHub.ClosePullRequest(ctx, *runRow.InstallationID, repo, pr.PRNumber); cerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gating-reject PR close: close pull request failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.Int("pr_number", pr.PRNumber),
+			slog.String("error", cerr.Error()))
+		// Fall through: still record the audit attempt below? No — the close
+		// did not happen, so do not claim it. Return without the audit entry.
+		return
+	}
+
+	stageID := stage.ID
+	systemActor := audit.ActorKind("system")
+	auditPayload, _ := json.Marshal(map[string]any{
+		"run_id":         runID.String(),
+		"stage_id":       stageID.String(),
+		"artifact_id":    artifactID.String(),
+		"pr_number":      pr.PRNumber,
+		"pr_url":         pr.PRURL,
+		"failure_reason": reason,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "pull_request_closed_after_review_reject",
+		ActorKind: &systemActor,
+		Payload:   auditPayload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gating-reject PR close: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
 }

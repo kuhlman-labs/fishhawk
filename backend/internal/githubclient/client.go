@@ -971,6 +971,56 @@ func (c *Client) CreatePullRequest(ctx context.Context, installationID int64,
 	}, nil
 }
 
+// ClosePullRequest closes an open pull request (#877). It is the
+// remediation surface for a gating implement-review reject: the review
+// fails the implement stage category-B during the raw-trace upload, but
+// the runner independently opens a PR before learning the stage failed,
+// leaving a dangling PR for a change that will never merge. The
+// /pull-request handler calls this to close it.
+//
+//	PATCH /repos/{owner}/{repo}/pulls/{number}
+//	{ "state": "closed" }
+//
+// This is the same endpoint GitHub documents for updating a pull request
+// ("Update a pull request"); setting state=closed closes it without
+// merging. Mirrors the ForceUpdateRef PATCH pattern. Returns ErrNotFound
+// when the repo/PR isn't visible to the installation, ErrForbidden on
+// auth issues, ErrValidation when GitHub rejects the update. Closing a PR
+// leaves its head branch intact.
+func (c *Client) ClosePullRequest(ctx context.Context, installationID int64,
+	repo RepoRef, number int) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return errors.New("githubclient: pr number must be > 0")
+	}
+
+	raw, err := json.Marshal(map[string]string{"state": "closed"})
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal close pr: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/pulls/" + url.PathEscape(fmt.Sprintf("%d", number)))
+	req, err := c.buildRequest(ctx, http.MethodPatch, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: close pr: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return classifyStatus("close pr", resp)
+}
+
 // ListOpenPullRequestsByHead returns the open PRs whose head matches the
 // given branch and whose base matches the given base ref (#714). Used by
 // the orchestrator's consolidated-PR path to recover the existing PR's
