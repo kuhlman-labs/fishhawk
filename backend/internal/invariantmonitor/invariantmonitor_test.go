@@ -123,10 +123,15 @@ func (f *fakeLineageVerifier) callCount() int {
 }
 
 // fakeAudit embeds audit.BaseFake and records every AppendChained call.
+// It also serves the recorded entries back through ListForRunByCategory so
+// the invariant-2 dedup helper exercises the write->read seam (BaseFake's
+// default returns nil,nil, which would defeat the dedup). listErr, when
+// set, makes ListForRunByCategory fail to exercise the fail-open path.
 type fakeAudit struct {
 	audit.BaseFake
 	mu      sync.Mutex
 	entries []audit.ChainAppendParams
+	listErr error
 }
 
 func (f *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
@@ -134,6 +139,21 @@ func (f *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 	defer f.mu.Unlock()
 	f.entries = append(f.entries, p)
 	return &audit.Entry{}, nil
+}
+
+func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var out []*audit.Entry
+	for _, e := range f.entries {
+		if e.RunID == runID && e.Category == category {
+			out = append(out, &audit.Entry{Payload: e.Payload})
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeAudit) violations() int {
@@ -221,6 +241,40 @@ func TestTick_Invariant2_FlagsPRRunWithNullPR(t *testing.T) {
 	}
 	if aud.entries[0].RunID != r.ID {
 		t.Errorf("violation RunID = %s, want %s", aud.entries[0].RunID, r.ID)
+	}
+}
+
+// TestTick_Invariant2_SuppressesRepeatEmission drives Tick twice over the
+// same persisting parked-PR-null run: the first tick emits, the second is
+// suppressed by the audit-log dedup, so exactly one violation is recorded
+// (#838).
+func TestTick_Invariant2_SuppressesRepeatEmission(t *testing.T) {
+	r, stages := reviewRun(specPR, nil)
+	runs := &fakeRuns{runs: []*run.Run{r}, stages: map[uuid.UUID][]*run.Stage{r.ID: stages}}
+	aud := &fakeAudit{}
+	tk := newTicker(t, runs, aud, nil)
+
+	tk.Tick(context.Background())
+	tk.Tick(context.Background())
+
+	if got := aud.violations(); got != 1 {
+		t.Fatalf("invariant_violation count = %d, want 1 (repeat emission must be suppressed)", got)
+	}
+}
+
+// TestTick_Invariant2_FailsOpenOnDedupReadError confirms a
+// ListForRunByCategory read error does not suppress the violation: the
+// dedup fails open so a genuine violation is still emitted (#838).
+func TestTick_Invariant2_FailsOpenOnDedupReadError(t *testing.T) {
+	r, stages := reviewRun(specPR, nil)
+	runs := &fakeRuns{runs: []*run.Run{r}, stages: map[uuid.UUID][]*run.Stage{r.ID: stages}}
+	aud := &fakeAudit{listErr: context.DeadlineExceeded}
+	tk := newTicker(t, runs, aud, nil)
+
+	tk.Tick(context.Background())
+
+	if got := aud.violations(); got != 1 {
+		t.Fatalf("invariant_violation count = %d, want 1 (dedup must fail open on a read error)", got)
 	}
 }
 

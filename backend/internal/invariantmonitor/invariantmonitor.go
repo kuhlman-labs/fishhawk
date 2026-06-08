@@ -16,7 +16,14 @@
 //     surface-only class: a push-and-open-pr run parked at its review
 //     gate with no PR URL can never auto-resolve (the missing PR is
 //     the unrecoverable fact — #742), so the ticker detects, audits,
-//     and logs it for operator action and mutates nothing.
+//     and logs it for operator action and mutates nothing. Repeat
+//     emissions for the same persisting violation are suppressed by an
+//     audit-log dedup keyed on (run_id, kind) (#838): the surface-only
+//     fact is recorded once on first detection rather than re-emitted
+//     (WARN + audit entry) every tick. The dedup queries the audit log
+//     rather than an in-process set so suppression survives a restart,
+//     and fails open on a read error so a genuine new violation is
+//     never silently suppressed.
 //
 // Invariant 2 fires ONLY for runs whose workflow actually opens a PR.
 // A null PR is the LEGITIMATE normal state for a workflow whose review
@@ -313,6 +320,14 @@ func (t *Ticker) checkReviewPRInvariant(ctx context.Context, logger *slog.Logger
 		return
 	}
 
+	// Suppress-until-resolved (#838): a persisting surface-only violation
+	// never auto-resolves, so a fresh WARN + audit entry every tick would
+	// flood both streams. Emit only on first detection — skip when this
+	// run already has an invariant-2 entry on record.
+	if t.reviewPRInvariantAlreadyRecorded(ctx, logger, r.ID) {
+		return
+	}
+
 	now := time.Now().UTC()
 	if t.Now != nil {
 		now = t.Now().UTC()
@@ -341,6 +356,37 @@ func (t *Ticker) checkReviewPRInvariant(ctx context.Context, logger *slog.Logger
 			slog.String("run_id", r.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// reviewPRInvariantAlreadyRecorded reports whether the run already has an
+// invariant-2 (review_awaiting_approval_null_pr) entry on its audit chain
+// — the idempotency guard for the per-tick re-detection of a persisting
+// surface-only violation (#838). It mirrors server/lineage.go's
+// foreignCommitAlreadyRecorded: querying the audit log (not an in-process
+// set) so suppression survives a fishhawkd restart. It fails open (returns
+// false → proceed with emit) on a read error: a duplicate emit is
+// preferable to silently suppressing a genuine violation.
+func (t *Ticker) reviewPRInvariantAlreadyRecorded(ctx context.Context, logger *slog.Logger, runID uuid.UUID) bool {
+	entries, err := t.Audit.ListForRunByCategory(ctx, runID, CategoryInvariantViolation)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn,
+			"invariantmonitor: dedup read failed; proceeding with emit",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	for _, e := range entries {
+		var payload struct {
+			Kind string `json:"kind"`
+		}
+		if json.Unmarshal(e.Payload, &payload) != nil {
+			continue
+		}
+		if payload.Kind == KindReviewAwaitingApprovalNullPR {
+			return true
+		}
+	}
+	return false
 }
 
 // runIntendsPR reports whether the run's workflow opens a pull request
