@@ -39,6 +39,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -70,6 +72,17 @@ const KindForeignCommitOnBranch = "foreign_commit_on_branch"
 // set is tiny; this only bounds memory if it ever grows.
 const listRunsPageSize = 100
 
+// LineageVerifier re-checks a single open-PR run's branch lineage and
+// flags a foreign commit (the shared foreign_commit_on_branch invariant
+// + notify) when one rode the branch since the last report boundary.
+// clean=false means a foreign commit was found; the verdict needs no
+// monitor-side handling — the verifier emits/notifies/dedups itself.
+// Satisfied by *server.Server (ReverifyBranchLineage), the SAME method
+// the merge reconciler's LineageReverifier uses (ADR-035, #862).
+type LineageVerifier interface {
+	ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prNumber int) (clean bool)
+}
+
 // Ticker periodically asserts the loop's self-consistency invariants.
 // Run() blocks until ctx is done; for production wiring start it on
 // its own goroutine via the server config.
@@ -85,6 +98,12 @@ type Ticker struct {
 	// orchestrator.ReconcileStuckRuns. Optional; nil skips invariant 1
 	// (invariant 2 still runs).
 	Reconcile func(ctx context.Context) (int, error)
+
+	// Lineage runs the periodic run-branch lineage sweep (ADR-035, #868)
+	// over open-PR running runs after the invariant-2 sweep. Wired to
+	// *server.Server (ReverifyBranchLineage). OPTIONAL; nil disables the
+	// lineage sweep entirely (invariants 1 and 2 still run).
+	Lineage LineageVerifier
 
 	// Logger receives the WARN lines for detected violations and the
 	// best-effort per-run error logs. nil → slog.Default().
@@ -127,8 +146,9 @@ func (t *Ticker) Run(ctx context.Context) error {
 	}
 }
 
-// Tick performs one pass: reconcile invariant 1, then sweep running
-// runs for invariant-2 violations. Exposed for deterministic tests.
+// Tick performs one pass: reconcile invariant 1, sweep running runs for
+// invariant-2 violations, then (when Lineage is wired) run the open-PR
+// run-branch lineage sweep. Exposed for deterministic tests.
 func (t *Ticker) Tick(ctx context.Context) {
 	logger := t.logger()
 
@@ -171,6 +191,91 @@ func (t *Ticker) Tick(ctx context.Context) {
 			break
 		}
 		offset += len(runs)
+	}
+
+	// Lineage sweep (ADR-035, #868): re-verify open-PR running runs for a
+	// foreign commit pushed onto the branch between report boundaries.
+	// Runs AFTER the invariant-2 sweep; nil verifier disables it entirely.
+	if t.Lineage != nil {
+		t.sweepLineage(ctx, logger)
+	}
+}
+
+// sweepLineage pages StateRunning runs and re-verifies each open-PR run's
+// branch lineage via t.Lineage. Best-effort: it never returns an error and
+// never aborts on a single run. Runs with a nil/empty PullRequestURL are
+// skipped with zero GitHub cost (ReverifyBranchLineage would fail-open with
+// no compare call anyway — this just avoids the load round-trip). Per-run
+// calls are paced on a ctx-cancellable timer derived from Interval so the
+// GitHub call volume stays bounded across the interval and the sweep yields
+// promptly on shutdown. The bool verdict needs no handling: the verifier
+// emits the foreign_commit_on_branch invariant + notify (and dedups repeat
+// hits) itself (#862); the monitor is flag-only here (#867 owns remediation).
+func (t *Ticker) sweepLineage(ctx context.Context, logger *slog.Logger) {
+	pace := t.lineagePace()
+	offset := 0
+	for {
+		runs, err := t.Runs.ListRuns(ctx, run.ListRunsFilter{
+			State:  string(run.StateRunning),
+			Limit:  listRunsPageSize,
+			Offset: offset,
+		})
+		if err != nil {
+			logger.LogAttrs(ctx, slog.LevelWarn, "invariantmonitor: lineage sweep list runs failed",
+				slog.String("error", err.Error()))
+			return
+		}
+		if len(runs) == 0 {
+			break
+		}
+		for _, r := range runs {
+			if ctx.Err() != nil {
+				return
+			}
+			// Zero-cost bound: a run with no tracked PR has nothing to
+			// re-verify (no-PR / closed runs), so skip before any pacing
+			// or GitHub round-trip.
+			if r.PullRequestURL == nil || *r.PullRequestURL == "" {
+				continue
+			}
+			if !paceOrCancel(ctx, pace) {
+				return
+			}
+			// prNumber 0 → the server resolves the number from the run's
+			// tracked pull_request_url and fail-opens when unresolvable.
+			t.Lineage.ReverifyBranchLineage(ctx, r.ID, 0)
+		}
+		if len(runs) < listRunsPageSize {
+			break
+		}
+		offset += len(runs)
+	}
+}
+
+// lineagePace spreads the per-run GitHub-bound calls across the tick
+// interval: a full page costs roughly one interval. Zero (no wait) when
+// Interval is unset — matching the merge reconciler's no-cooldown posture
+// and keeping deterministic tests fast.
+func (t *Ticker) lineagePace() time.Duration {
+	if t.Interval <= 0 {
+		return 0
+	}
+	return t.Interval / listRunsPageSize
+}
+
+// paceOrCancel waits up to d (or returns immediately when d<=0), yielding
+// false if ctx is cancelled during the wait so the caller aborts promptly.
+func paceOrCancel(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

@@ -47,6 +47,28 @@ workflows:
           human: true
 `
 
+// callLog records an ordered sequence of named events across fakes so a
+// test can assert that the invariant-2 sweep precedes the lineage sweep.
+type callLog struct {
+	mu  sync.Mutex
+	seq []string
+}
+
+func (c *callLog) record(s string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seq = append(c.seq, s)
+}
+
+func (c *callLog) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.seq...)
+}
+
 // fakeRuns embeds run.BaseFake and serves a fixed run set + per-run
 // stage lists.
 type fakeRuns struct {
@@ -55,6 +77,7 @@ type fakeRuns struct {
 	stages     map[uuid.UUID][]*run.Stage
 	listErr    error
 	stagesCall int
+	log        *callLog // optional ordering recorder
 }
 
 func (f *fakeRuns) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run, error) {
@@ -66,7 +89,37 @@ func (f *fakeRuns) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run
 
 func (f *fakeRuns) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*run.Stage, error) {
 	f.stagesCall++
+	f.log.record("stages")
 	return f.stages[id], nil
+}
+
+// fakeLineageVerifier records each ReverifyBranchLineage call and returns
+// a configurable verdict. clean defaults to false (a hit) to prove a
+// flagged run never short-circuits the rest of the sweep.
+type fakeLineageVerifier struct {
+	mu    sync.Mutex
+	calls []lineageCall
+	clean bool
+	log   *callLog // optional ordering recorder
+}
+
+type lineageCall struct {
+	runID    uuid.UUID
+	prNumber int
+}
+
+func (f *fakeLineageVerifier) ReverifyBranchLineage(_ context.Context, runID uuid.UUID, prNumber int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, lineageCall{runID: runID, prNumber: prNumber})
+	f.log.record("lineage")
+	return f.clean
+}
+
+func (f *fakeLineageVerifier) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
 }
 
 // fakeAudit embeds audit.BaseFake and records every AppendChained call.
@@ -309,5 +362,174 @@ func TestTick_Invariant2_SilentWhenNoReviewStage(t *testing.T) {
 
 	if got := aud.violations(); got != 0 {
 		t.Fatalf("invariant_violation count = %d, want 0 (no parked review)", got)
+	}
+}
+
+// runningRun builds a StateRunning run with the given PR URL and a
+// non-PR-intending spec so it does not also trip the invariant-2 path.
+func runningRun(prURL *string) *run.Run {
+	return &run.Run{
+		ID:             uuid.New(),
+		WorkflowID:     workflowKey(specNoPR),
+		WorkflowSpec:   []byte(specNoPR),
+		PullRequestURL: prURL,
+		State:          run.StateRunning,
+	}
+}
+
+// TestSweepLineage_OpenPRRunReverified is case (a): an open-PR running run
+// triggers exactly one ReverifyBranchLineage call with prNumber 0.
+func TestSweepLineage_OpenPRRunReverified(t *testing.T) {
+	r := runningRun(strptr("https://github.com/o/r/pull/7"))
+	runs := &fakeRuns{runs: []*run.Run{r}, stages: map[uuid.UUID][]*run.Stage{}}
+	aud := &fakeAudit{}
+	lin := &fakeLineageVerifier{clean: true}
+	tk := newTicker(t, runs, aud, nil)
+	tk.Lineage = lin
+
+	tk.Tick(context.Background())
+
+	if got := lin.callCount(); got != 1 {
+		t.Fatalf("ReverifyBranchLineage called %d times, want 1", got)
+	}
+	if lin.calls[0].runID != r.ID {
+		t.Errorf("reverify runID = %s, want %s", lin.calls[0].runID, r.ID)
+	}
+	if lin.calls[0].prNumber != 0 {
+		t.Errorf("reverify prNumber = %d, want 0 (server resolves from pull_request_url)", lin.calls[0].prNumber)
+	}
+}
+
+// TestSweepLineage_SkipsNullOrEmptyPR is case (b): a running run with a
+// nil OR empty PullRequestURL is the GitHub-usage bound — ZERO calls.
+func TestSweepLineage_SkipsNullOrEmptyPR(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		prURL *string
+	}{
+		{"nil PR", nil},
+		{"empty PR", strptr("")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runningRun(tc.prURL)
+			runs := &fakeRuns{runs: []*run.Run{r}, stages: map[uuid.UUID][]*run.Stage{}}
+			aud := &fakeAudit{}
+			lin := &fakeLineageVerifier{clean: true}
+			tk := newTicker(t, runs, aud, nil)
+			tk.Lineage = lin
+
+			tk.Tick(context.Background())
+
+			if got := lin.callCount(); got != 0 {
+				t.Fatalf("ReverifyBranchLineage called %d times, want 0 (no-PR run is the bound)", got)
+			}
+		})
+	}
+}
+
+// TestSweepLineage_NilVerifierNoPanic is case (c): a nil Lineage field runs
+// Tick without panic and without affecting invariants 1 and 2.
+func TestSweepLineage_NilVerifierNoPanic(t *testing.T) {
+	r, stages := reviewRun(specPR, nil) // trips invariant 2
+	runs := &fakeRuns{runs: []*run.Run{r}, stages: map[uuid.UUID][]*run.Stage{r.ID: stages}}
+	aud := &fakeAudit{}
+	var reconciled int
+	tk := newTicker(t, runs, aud, func(context.Context) (int, error) { reconciled++; return 0, nil })
+	// tk.Lineage intentionally left nil.
+
+	tk.Tick(context.Background())
+
+	if reconciled != 1 {
+		t.Errorf("reconcile ran %d times, want 1 (invariant 1 unaffected by nil Lineage)", reconciled)
+	}
+	if got := aud.violations(); got != 1 {
+		t.Errorf("invariant_violation count = %d, want 1 (invariant 2 unaffected by nil Lineage)", got)
+	}
+}
+
+// TestSweepLineage_AllRunsPacedNoShortCircuit is case (d): multiple open-PR
+// runs in one page each get exactly one call, and a clean=false verdict on
+// any run does not abort the sweep (every run is still visited).
+func TestSweepLineage_AllRunsPacedNoShortCircuit(t *testing.T) {
+	r1 := runningRun(strptr("https://github.com/o/r/pull/1"))
+	r2 := runningRun(strptr("https://github.com/o/r/pull/2"))
+	r3 := runningRun(strptr("https://github.com/o/r/pull/3"))
+	runs := &fakeRuns{runs: []*run.Run{r1, r2, r3}, stages: map[uuid.UUID][]*run.Stage{}}
+	aud := &fakeAudit{}
+	lin := &fakeLineageVerifier{clean: false} // every run "hits" — must not short-circuit
+	tk := newTicker(t, runs, aud, nil)        // Interval 0 → zero pace, fast
+	tk.Lineage = lin
+
+	tk.Tick(context.Background())
+
+	if got := lin.callCount(); got != 3 {
+		t.Fatalf("ReverifyBranchLineage called %d times, want 3 (no short-circuit on a hit)", got)
+	}
+	seen := map[uuid.UUID]bool{}
+	for _, c := range lin.calls {
+		seen[c.runID] = true
+	}
+	for _, r := range []*run.Run{r1, r2, r3} {
+		if !seen[r.ID] {
+			t.Errorf("run %s was not reverified", r.ID)
+		}
+	}
+}
+
+// TestSweepLineage_RunsAfterInvariant2 is case (e): within a single Tick the
+// lineage sweep runs strictly AFTER the invariant-2 sweep. Run A (PR-intending,
+// null PR) trips invariant 2 (records "stages"); run B (open PR, non-intending)
+// trips the lineage sweep (records "lineage"). The recorded order proves the
+// sequencing.
+func TestSweepLineage_RunsAfterInvariant2(t *testing.T) {
+	log := &callLog{}
+	rA, stagesA := reviewRun(specPR, nil)                     // invariant-2 candidate
+	rB := runningRun(strptr("https://github.com/o/r/pull/9")) // lineage candidate
+	runs := &fakeRuns{
+		runs:   []*run.Run{rA, rB},
+		stages: map[uuid.UUID][]*run.Stage{rA.ID: stagesA},
+		log:    log,
+	}
+	aud := &fakeAudit{}
+	lin := &fakeLineageVerifier{clean: true, log: log}
+	tk := newTicker(t, runs, aud, nil)
+	tk.Lineage = lin
+
+	tk.Tick(context.Background())
+
+	seq := log.snapshot()
+	if len(seq) != 2 || seq[0] != "stages" || seq[1] != "lineage" {
+		t.Fatalf("event order = %v, want [stages lineage] (lineage sweep must follow invariant 2)", seq)
+	}
+}
+
+// TestSweepLineage_YieldsOnCancel exercises the paced ctx-cancellable timer:
+// with a real (non-zero) interval and an already-cancelled context, the sweep
+// returns promptly without making any reverify call.
+func TestSweepLineage_YieldsOnCancel(t *testing.T) {
+	r := runningRun(strptr("https://github.com/o/r/pull/5"))
+	runs := &fakeRuns{runs: []*run.Run{r}, stages: map[uuid.UUID][]*run.Stage{}}
+	aud := &fakeAudit{}
+	lin := &fakeLineageVerifier{clean: true}
+	tk := newTicker(t, runs, aud, nil)
+	tk.Interval = time.Hour // non-zero → pacing engaged
+	tk.Lineage = lin
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		tk.sweepLineage(ctx, tk.logger())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweepLineage did not yield promptly on a cancelled context")
+	}
+
+	if got := lin.callCount(); got != 0 {
+		t.Errorf("ReverifyBranchLineage called %d times, want 0 (cancelled before the paced call)", got)
 	}
 }
