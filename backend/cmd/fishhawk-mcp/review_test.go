@@ -622,8 +622,65 @@ func TestAwaitReview_RunTerminalBackstop(t *testing.T) {
 	if out.Status != "pending" {
 		t.Errorf("Status = %q, want pending (backstop preserves the in-flight review status)", out.Status)
 	}
-	if !strings.Contains(out.Message, "terminal") {
-		t.Errorf("backstop message should explain the run is terminal: %q", out.Message)
+	// Assert a fragment UNIQUE to the backstop arm. "terminal" alone also
+	// appears in awaitPendingTimeoutOutput's "no terminal audit entry yet", so
+	// it would pass on the deadline path too and fail to distinguish backstop
+	// from a 600s timeout (caught only by a test-suite hang, not a clean
+	// assertion). "can no longer progress" appears only on the backstop arm.
+	if !strings.Contains(out.Message, "can no longer progress") {
+		t.Errorf("backstop message should explain the review can no longer progress: %q", out.Message)
+	}
+}
+
+// TestAwaitReview_RunTerminalBackstop_InLoop pins the IN-LOOP arm of the
+// ADR-036 #874 backstop, distinct from TestAwaitReview_RunTerminalBackstop
+// (which seeds the run terminal before the call, so only the pre-loop check
+// fires and the loop never runs). Here the run is non-terminal at call time —
+// the pre-loop backstop sees "running" and the poll loop IS entered — then it
+// transitions to terminal mid-loop. The second awaitRunTerminalBackstop call,
+// inside the select, must resolve the wait. A regression in that in-loop arm
+// is invisible to the pre-loop test.
+func TestAwaitReview_RunTerminalBackstop_InLoop(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// Non-terminal at call time: the pre-loop backstop observes "running", so
+	// the loop is entered. The review stays pending throughout.
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running"}
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "gating")
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	// reviewStatusFor issues exactly one started-category query per pass: pass
+	// #1 is the fast path (run still "running"); pass #2 is the first poll
+	// tick. Flip the run to terminal on the 2nd started query so the
+	// transition lands AFTER the pre-loop backstop check has already passed —
+	// guaranteeing the IN-LOOP arm (not the pre-loop check) is what resolves
+	// the wait. reviewFlip runs under fb.mu, the same lock the GetRun handler
+	// takes, so mutating getRunByID here is race-free.
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == "implement_review_started" && startedQueries.Add(1) == 2 {
+			fb.getRunByID[runID] = Run{ID: runID.String(), State: "failed"}
+		}
+	}
+
+	// Large timeout: if the in-loop backstop did NOT fire the test would hang
+	// on the deadline, so a prompt return is itself proof the in-loop arm
+	// resolved it.
+	_, out, err := r.awaitReview(context.Background(), nil, AwaitReviewInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "pending" {
+		t.Errorf("Status = %q, want pending (backstop preserves the in-flight review status)", out.Status)
+	}
+	if !strings.Contains(out.Message, "can no longer progress") {
+		t.Errorf("in-loop backstop message should explain the review can no longer progress: %q", out.Message)
 	}
 }
 
