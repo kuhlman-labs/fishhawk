@@ -273,11 +273,22 @@ func ExtractTiming(bundleBytes []byte) (startedAt, endedAt time.Time, ok bool) {
 // one. A bundle without a git_diff event isn't an error — the
 // backend's policy re-eval path treats that as "no diff to
 // evaluate; skip re-eval, proceed to awaiting_approval."
+//
+// Invariant: the authoritative git_diff is the LAST one emitted. The
+// runner re-emits a fresh scope-only git_diff after a verify-fix loop
+// reinvokes the agent (#870), so the later event reflects the reconciled
+// committed scope-only tree the PR ships — the diff both the implement
+// review and policy re-eval must see. Single-event bundles (every bundle
+// without a reconciling reinvoke) are unaffected: last == first.
 func ExtractDiff(bundleBytes []byte) (policy.Diff, error) {
 	lines, err := ReadEvents(bundleBytes)
 	if err != nil {
 		return policy.Diff{}, err
 	}
+	var (
+		out   policy.Diff
+		found bool
+	)
 	for _, line := range lines {
 		if line.Kind != EventKindGitDiff {
 			continue
@@ -286,7 +297,7 @@ func ExtractDiff(bundleBytes []byte) (policy.Diff, error) {
 		if err := json.Unmarshal(line.Data, &payload); err != nil {
 			return policy.Diff{}, fmt.Errorf("bundle: parse git_diff payload: %w", err)
 		}
-		out := policy.Diff{
+		d := policy.Diff{
 			ChangedFiles: make([]policy.ChangedFile, 0, len(payload.Files)),
 			// Additive content for the implement-review prompt only;
 			// the policy engine never reads Patch. Empty when the
@@ -295,14 +306,18 @@ func ExtractDiff(bundleBytes []byte) (policy.Diff, error) {
 			Patch: payload.Patch,
 		}
 		for _, f := range payload.Files {
-			out.ChangedFiles = append(out.ChangedFiles, policy.ChangedFile{
+			d.ChangedFiles = append(d.ChangedFiles, policy.ChangedFile{
 				Path:   f.Path,
 				Status: policy.Status(f.Status),
 			})
 		}
-		return out, nil
+		out = d
+		found = true
 	}
-	return policy.Diff{}, ErrNoDiffEvent
+	if !found {
+		return policy.Diff{}, ErrNoDiffEvent
+	}
+	return out, nil
 }
 
 // ExtractScopeDrift returns the `undeclared` path list carried in the

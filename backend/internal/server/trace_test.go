@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -2227,5 +2228,83 @@ func TestShipTrace_RunBudgetTripwire_UnderCeilingProceeds(t *testing.T) {
 	}
 	if gotStage.State != run.StageStateAwaitingApproval {
 		t.Errorf("stage.State = %q, want %q (normal advance under ceiling)", gotStage.State, run.StageStateAwaitingApproval)
+	}
+}
+
+// implementBundleTwoGitDiffs builds an implement trace bundle carrying TWO
+// git_diff events in emission order — a stale PRE-reconcile diff followed by the
+// runner's reconciled scope-only re-emit (#870). It models the wire a verify-fix
+// reinvoke produces, so the test can prove the backend reads the LAST event.
+func implementBundleTwoGitDiffs(t *testing.T, staleFiles, reconciledFiles []map[string]string, stalePatch, reconciledPatch string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	writeLine := func(seq int, kind string, payload any) {
+		data, _ := json.Marshal(payload)
+		line, _ := json.Marshal(map[string]any{"seq": seq, "kind": kind, "data": json.RawMessage(data)})
+		raw.Write(line)
+		raw.WriteByte('\n')
+	}
+	writeLine(1, "manifest", map[string]any{"bundle_schema": "v1"})
+	writeLine(2, "git_diff", map[string]any{
+		"kind": "name_status", "base_ref": "origin/main",
+		"files": staleFiles, "num_files": len(staleFiles), "patch": stalePatch,
+	})
+	writeLine(3, "git_diff", map[string]any{
+		"kind": "name_status", "base_ref": "origin/main",
+		"files": reconciledFiles, "num_files": len(reconciledFiles), "patch": reconciledPatch,
+	})
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+// TestShipTrace_ImplementReview_ReconciledGitDiffWins is the #870 end-to-end
+// seam test: a raw implement bundle carrying a PRE-reconcile git_diff followed
+// by the runner's reconciled scope-only re-emit must drive the implement review
+// off the LAST (reconciled) event. It closes the runner->bundle->ExtractDiff->
+// review seam — proving last-write-wins ExtractDiff feeds the reviewer prompt
+// the diff the PR actually ships, not the stale first one (#618: per-layer units
+// miss this boundary).
+func TestShipTrace_ImplementReview_ReconciledGitDiffWins(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	stalePatch := "diff --git a/backend/internal/foo/foo.go b/backend/internal/foo/foo.go\n" +
+		"@@ -1,2 +1,2 @@\n-old impl\n+STALE pre-reconcile impl\n"
+	reconciledPatch := "diff --git a/backend/internal/foo/foo.go b/backend/internal/foo/foo.go\n" +
+		"@@ -1,2 +1,2 @@\n-old impl\n+RECONCILED scope-only impl\n"
+	bundleBytes := implementBundleTwoGitDiffs(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}, {"path": "backend/internal/foo/stale.go", "status": "A"}},
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}},
+		stalePatch, reconciledPatch)
+
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	// The reconciled patch (last git_diff) must reach the reviewer; the stale
+	// first patch and its drift-only file must NOT.
+	if !strings.Contains(got, "+RECONCILED scope-only impl") {
+		t.Errorf("reviewer prompt missing the reconciled patch (last git_diff):\n%s", got)
+	}
+	if strings.Contains(got, "STALE pre-reconcile impl") {
+		t.Errorf("reviewer prompt carries the STALE first patch — last-write-wins broken:\n%s", got)
+	}
+	if strings.Contains(got, "backend/internal/foo/stale.go") {
+		t.Errorf("reviewer prompt carries the stale file set, not the reconciled one:\n%s", got)
 	}
 }
