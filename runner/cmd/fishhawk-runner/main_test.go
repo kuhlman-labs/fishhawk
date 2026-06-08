@@ -3348,6 +3348,68 @@ func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
 	}
 }
 
+// TestRun_ImplementStage_Fixup_NoChanges_ReportsFixupNoChanges is the #856 fix:
+// a fix-up re-dispatch that produces NO changes must NOT bare-return (the
+// push_fixup trace gate left the stage in `running`, so a bare return hangs it
+// until the SLA watchdog reaps it). It must report {outcome:"fixup_no_changes",
+// branch, base_sha} — no HeadSHA, no PR artifact body — so the backend drives
+// the fix-up stage terminal and re-parks the review gate.
+func TestRun_ImplementStage_Fixup_NoChanges_ReportsFixupNoChanges(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	existingBranch := "fishhawk/run-11111111/stage-22222222"
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:     "22222222-3333-4444-5555-666666666666",
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: existingBranch,
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR should not be called for a no-changes fix-up")
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (fixup_no_changes report) must be called — a no-changes fix-up must not bare-return (#856)")
+	}
+	if fu.gotPRArgs.Outcome != "fixup_no_changes" {
+		t.Errorf("report outcome = %q, want %q", fu.gotPRArgs.Outcome, "fixup_no_changes")
+	}
+	if fu.gotPRArgs.Branch != existingBranch {
+		t.Errorf("report branch = %q, want %q", fu.gotPRArgs.Branch, existingBranch)
+	}
+	if fu.gotPRArgs.HeadSHA != "" {
+		t.Errorf("report head_sha = %q, want empty (no commit landed)", fu.gotPRArgs.HeadSHA)
+	}
+	if len(fu.gotPRArgs.Body) != 0 {
+		t.Errorf("report must not carry a PR artifact body, got %d bytes", len(fu.gotPRArgs.Body))
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
+		t.Errorf("missing implement_fixup_no_changes log line:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes_reported"`) {
+		t.Errorf("missing implement_fixup_no_changes_reported log line:\n%s", stderr.String())
+	}
+}
+
 // TestRun_ImplementStage_FixupPushFailure_ReportsFailed is the #794 analogue
 // of the decomposed-child push-failure test: when a fix-up re-dispatch's
 // commit/push fails (e.g. the #728 compile gate blocks a drift-incomplete tree

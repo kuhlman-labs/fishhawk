@@ -688,6 +688,134 @@ func TestShipPullRequest_FixupPushOutcome_RejectsMissingCoords(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_FixupNoChangesOutcome_DrivesTerminal is the #856 fix: a
+// fix-up re-dispatch that produces NO changes reports
+// {outcome:"fixup_no_changes", branch, base_sha} (no head_sha — nothing
+// landed). That report must drive the gated fix-up implement stage's terminal
+// transition (running → awaiting_approval, the re-park seam #856 strands) and
+// record a fixup_no_changes audit entry — WITHOUT creating a PR artifact or
+// backfilling pull_request_url (the PR already exists, its tip is unchanged).
+// This crosses the wire-decode → handler → run state-machine → orchestrator
+// layers in one exercise, the seam a per-layer unit test would miss (cf. #618).
+func TestShipPullRequest_FixupNoChangesOutcome_DrivesTerminal(t *testing.T) {
+	s, sf, ar, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_no_changes",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"base_sha":            "base-def",
+		"files_changed_count": 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval (fixup_no_changes body must drive the gated terminal re-park)", got.State)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 (no PR artifact for a no-changes fix-up)", len(ar.all))
+	}
+	gotRun, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.PullRequestURL != nil {
+		t.Errorf("run.PullRequestURL = %q, want nil (no-changes fix-up touches no PR)", *gotRun.PullRequestURL)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, e := range au.appended {
+		if e.Category == "fixup_no_changes" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no fixup_no_changes audit entry recorded")
+	}
+}
+
+// TestShipPullRequest_FixupNoChangesOutcome_IsIdempotent pins the #856 guard:
+// since no commit landed there is no head_sha to key on, so the guard is
+// STAGE-keyed — a runner retry or duplicate delivery of the no-changes report
+// must NOT append a second fixup_no_changes audit entry for the same stage.
+func TestShipPullRequest_FixupNoChangesOutcome_IsIdempotent(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_no_changes",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"base_sha":            "base-def",
+		"files_changed_count": 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("delivery %d: status = %d, want 200:\n%s", i, w.Code, w.Body.String())
+		}
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var n int
+	for _, e := range au.appended {
+		if e.Category == "fixup_no_changes" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("fixup_no_changes audit entries after duplicate = %d, want 1 (stage-keyed guard must suppress the retry)", n)
+	}
+}
+
+// TestShipPullRequest_FixupNoChangesOutcome_RejectsMissingCoords pins the #856
+// validation: the fixup_no_changes variant requires branch + base_sha (no PR
+// was opened and no commit landed, so those are the only record of the
+// unchanged tip). head_sha is intentionally absent — supplying it is not
+// required, and omitting branch or base_sha is a malformed body.
+func TestShipPullRequest_FixupNoChangesOutcome_RejectsMissingCoords(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	for _, body := range []string{
+		`{"outcome":"fixup_no_changes","base_sha":"b"}`, // missing branch
+		`{"outcome":"fixup_no_changes","branch":"br"}`,  // missing base_sha
+		`{"outcome":"fixup_no_changes"}`,                // missing both
+	} {
+		w := shipPRRequest(t, s, runID, stageID, priv, []byte(body), "")
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400:\n%s", body, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "pull_request_invalid") {
+			t.Errorf("body %s: missing pull_request_invalid:\n%s", body, w.Body.String())
+		}
+	}
+}
+
 // TestShipPullRequest_FailureOutcome_InvalidCategory_400 pins the failure-
 // variant validation: an unknown category is a malformed body (#742).
 func TestShipPullRequest_FailureOutcome_InvalidCategory_400(t *testing.T) {

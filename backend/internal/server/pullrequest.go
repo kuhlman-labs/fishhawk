@@ -61,6 +61,14 @@ type pullRequestBody struct {
 	// commit. The handler drives the fix-up stage's terminal transition its
 	// push_fixup trace gate left in `running` without creating a PR artifact.
 	//
+	// When Outcome=="fixup_no_changes" the body is a fix-up re-dispatch that
+	// produced NO changes (#856): the fix-up pass committed nothing, so no new
+	// commit landed on the EXISTING PR branch (head_sha is absent — the branch
+	// tip is unchanged). branch/base_sha pin the unchanged tip. The handler
+	// drives the fix-up stage's terminal transition its push_fixup trace gate
+	// left in `running` and re-parks the review gate, without creating a PR
+	// artifact — otherwise the stage hangs in `running` until the SLA watchdog.
+	//
 	// On the success body Outcome is empty and the PR fields are required.
 	// These are declared directly on the struct (with omitempty) so the
 	// handler's DisallowUnknownFields decoder accepts ALL shapes without a
@@ -118,8 +126,21 @@ func (p *pullRequestBody) validate() error {
 		}
 		return nil
 	}
+	// Fix-up no-changes variant (#856): a fix-up re-dispatch produced no
+	// changes, so no new commit landed on the EXISTING PR branch. No
+	// pr_number/pr_url and no head_sha (the branch tip is unchanged); require
+	// branch + base_sha so the audit entry pins the unchanged tip.
+	if p.Outcome == "fixup_no_changes" {
+		switch {
+		case p.Branch == "":
+			return errors.New("branch is required for a fixup_no_changes outcome")
+		case p.BaseSHA == "":
+			return errors.New("base_sha is required for a fixup_no_changes outcome")
+		}
+		return nil
+	}
 	if p.Outcome != "" {
-		return fmt.Errorf("outcome must be \"failed\", \"pushed\", or \"fixup_pushed\" when set, got %q", p.Outcome)
+		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", or \"fixup_no_changes\" when set, got %q", p.Outcome)
 	}
 	switch {
 	case p.PRNumber <= 0:
@@ -293,6 +314,17 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// pull_request_url backfill — the PR already exists and tracks this branch.
 	if pr.Outcome == "fixup_pushed" {
 		s.succeedFixupPushStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		return
+	}
+
+	// Fix-up no-changes variant (#856): a fix-up re-dispatch produced no changes,
+	// so no new commit landed on the EXISTING PR branch. Drive the fix-up stage's
+	// terminal transition its push_fixup trace gate left in `running`, re-park the
+	// review gate, write a fixup_no_changes audit entry, and respond 200. No PR
+	// artifact and no pull_request_url backfill — the PR already exists and its
+	// branch tip is unchanged.
+	if pr.Outcome == "fixup_no_changes" {
+		s.succeedFixupNoChangesStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
 		return
 	}
 
@@ -687,6 +719,110 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 		Branch:  pr.Branch,
 		HeadSHA: pr.HeadSHA,
 	})
+}
+
+// pullRequestFixupNoChangesResponse is the 200 body for the fix-up no-changes
+// variant (#856): a fix-up re-dispatch produced no changes and the fix-up stage
+// transitioned terminally. No head_sha — the branch tip is unchanged.
+type pullRequestFixupNoChangesResponse struct {
+	StageID uuid.UUID `json:"stage_id"`
+	Outcome string    `json:"outcome"`
+	Branch  string    `json:"branch"`
+}
+
+// succeedFixupNoChangesStage handles the fix-up no-changes variant (#856): a
+// fix-up re-dispatch produced no changes (the fix-up pass committed nothing)
+// after the trace gate left the fix-up implement stage in `running`. It drives
+// the running → terminal transition via advanceImplementStageAfterPR (which
+// re-parks the review gate pending → awaiting_approval), writes a
+// fixup_no_changes audit entry, fires the sticky status comment, and responds
+// 200. No PR artifact, no pull_request_url backfill — the PR already exists and
+// its branch tip is unchanged. Without this the stage hangs in `running` until
+// the SLA watchdog reaps it, stranding the review stage in `pending`.
+//
+// This mirrors succeedFixupPushStage minus the head-keyed dedup and the
+// verifyBranchLineage guard. Both are skipped DELIBERATELY: no new commit
+// landed, so there is no head_sha to key on (the idempotency guard is therefore
+// stage-keyed) and the branch tip is unchanged from the last vouched head (the
+// pull_request_opened or a prior fixup_pushed audit entry already vouched it).
+// A foreign commit on the branch is still caught by the next real push's lineage
+// guard and the merge gate (ADR-036). This is a documented trade-off, not a
+// verified claim; a reviewer can challenge it here.
+func (s *Server) succeedFixupNoChangesStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	stageID := stage.ID
+
+	// Stage-keyed idempotency: a runner retry after a 5xx — or a duplicate
+	// delivery — must not append a second fixup_no_changes audit entry or fire a
+	// redundant status-comment update. Unlike the fixup_pushed path there is no
+	// head_sha to key on (no commit landed), so dedup on the existence of ANY
+	// prior fixup_no_changes audit entry for this stage. Guard first, before
+	// advance/audit/notify. Fail-open on a read error: WARN and fall through so a
+	// transient failure never drops a legitimate report.
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, "fixup_no_changes"); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"fix-up no-changes report: list fixup_no_changes audit entries failed; proceeding without idempotency guard",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	} else if auditEntryForStage(entries, stageID) {
+		s.writeJSON(w, r, http.StatusOK, pullRequestFixupNoChangesResponse{
+			StageID: stageID,
+			Outcome: "fixup_no_changes",
+			Branch:  pr.Branch,
+		})
+		return
+	}
+
+	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+		s.advanceImplementStageAfterPR(r, runID, stage)
+	}
+
+	auditPayload, _ := json.Marshal(map[string]any{
+		"run_id":              runID.String(),
+		"stage_id":            stageID.String(),
+		"branch":              pr.Branch,
+		"base_sha":            pr.BaseSHA,
+		"files_changed_count": pr.FilesChangedCount,
+		"auth_method":         authMethod,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "fixup_no_changes",
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      auditPayload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"fix-up no-changes report: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	s.notifyStatusUpdate(r.Context(), runID, "fixup_no_changes")
+
+	s.writeJSON(w, r, http.StatusOK, pullRequestFixupNoChangesResponse{
+		StageID: stageID,
+		Outcome: "fixup_no_changes",
+		Branch:  pr.Branch,
+	})
+}
+
+// auditEntryForStage reports whether any of the entries belongs to the given
+// stage. It is the stage-keyed idempotency primitive for outcomes that carry no
+// head_sha to dedup on (fixup_no_changes, #856) — a single prior entry for the
+// stage means the report already landed. Entries are sequence-ascending per
+// ListForRunByCategory's contract; nil/mismatched StageIDs are skipped.
+func auditEntryForStage(entries []*audit.Entry, stageID uuid.UUID) bool {
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			return true
+		}
+	}
+	return false
 }
 
 // childPushAlreadyRecorded reports whether a child_pushed audit entry for the
