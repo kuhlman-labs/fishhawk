@@ -1621,6 +1621,21 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	login, warn := resolveApproverGithubLogin()
 	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles)
 	if err != nil {
+		// ADR-036 (#875): the backend refuses the approve while a
+		// configured agent plan review is still in-flight. Surface this
+		// as a typed, operator-actionable poll-until-landed message
+		// rather than a generic wrap. Do NOT auto-retry here — the
+		// operator loop polls fishhawk_get_plan / fishhawk_await_review
+		// and re-invokes this tool once the review reaches a terminal
+		// state.
+		var ae *apiError
+		if errors.As(err, &ae) && ae.Code == "agent_review_pending" {
+			landed, _ := ae.Details["landed_terminal"].(float64)
+			configured, _ := ae.Details["configured_agents"].(float64)
+			return nil, ApprovePlanOutput{}, fmt.Errorf(
+				"agent_review_pending: %d of %d configured plan reviews have landed; the agent plan review is still in-flight. Poll fishhawk_get_plan or fishhawk_await_review until the plan review reaches a terminal state (complete/skipped/failed), then retry fishhawk_approve_plan",
+				int(landed), int(configured))
+		}
 		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
 	return approverLoginWarning(warn), ApprovePlanOutput{Stage: *updated, StageID: updated.ID}, nil

@@ -2367,6 +2367,24 @@ paths:
               includes the run's `pull_request_url` when stamped so
               the caller knows where the merge gate lives. Plan-
               stage approvals continue to use this endpoint.
+            - `agent_review_pending` — ADR-036 / #875: the target is
+              a plan stage whose workflow declares `reviewers.agent`
+              > 0, a plan review was dispatched
+              (`plan_review_started` present), and fewer than the
+              configured agent count of TERMINAL review verdicts
+              (`plan_reviewed` / `plan_review_failed` /
+              `plan_review_skipped`) have landed. The approval is
+              refused before any row is recorded — poll until the
+              review reaches a terminal state, then retry; the retry
+              is idempotent. `details` includes `stage_id`,
+              `configured_agents`, and `landed_terminal`. A hard
+              backstop (`ReviewBudget.Cap` × configured agents,
+              measured from the earliest `plan_review_started`)
+              allows the approval once elapsed even if no terminal
+              verdict landed, recording a
+              `plan_review_backstop_elapsed` audit entry — so a
+              reviewer that dies emitting nothing can never strand
+              the gate.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -252,6 +252,13 @@ type approvalRequest struct {
 //     live on GitHub per ADR-018; not relevant for the MCP plan-
 //     approval tools but the wrapper surfaces the code if a future
 //     caller reaches this method with a review-stage id)
+//   - 409 agent_review_pending (ADR-036: a configured agent plan
+//     review is still in-flight; retryable once the review reaches
+//     any terminal state — plan_reviewed / plan_review_failed /
+//     plan_review_skipped. details carry configured_agents +
+//     landed_terminal)
+//   - 422 plan_violates_budget (plan predicted runtime exceeds the
+//     implement-stage budget; decompose or --override-budget)
 func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string) (*Stage, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:            decision,

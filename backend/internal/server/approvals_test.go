@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -1620,5 +1621,265 @@ func TestSubmitApproval_Reject_DecomposeComment_SetsRejectReason(t *testing.T) {
 	}
 	if !foundSubmitted {
 		t.Errorf("expected approval_submitted audit entry, got %+v", au.appended)
+	}
+}
+
+// --- ADR-036 (#875): plan-approval completion gate -------------------------
+
+// specPlanReviewers builds a feature_change workflow whose plan stage declares
+// the given reviewers.agent / reviewers.human counts. agent>0 is what arms the
+// completion gate; human distinguishes advisory (human>0) from gating (==0).
+func specPlanReviewers(agent, human int) []byte {
+	return []byte(fmt.Sprintf(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: %d
+          human: %d
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`, agent, human))
+}
+
+// newPlanReviewGateServer wires the REAL approval handler against an
+// orchestratorRepo whose seeded run carries workflowSpec, plus an auditFake
+// that replays seeded + appended entries by category (the count read the gate
+// performs). Returns the plan stage parked at awaiting_approval.
+func newPlanReviewGateServer(t *testing.T, workflowSpec []byte) (*Server, *orchestratorRepo, *auditFake, *run.Stage) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	ar := newFakeApprovalRepo()
+	au := newAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = workflowSpec
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingApproval)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: ar,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+	})
+	return s, rr, au, planStage
+}
+
+// seedReviewAudit appends a review-lifecycle audit entry directly to the fake's
+// seeded history so the gate's ListForRunByCategory count reads it back.
+func seedReviewAudit(au *auditFake, runID uuid.UUID, category string, ts time.Time) {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:     &rid,
+		Category:  category,
+		Timestamp: ts,
+	})
+}
+
+func TestSubmitApproval_PlanReviewGate_InFlight_Refused(t *testing.T) {
+	// Advisory reviewers (agent:1, human:1): a plan_review_started entry is
+	// present but no terminal verdict has landed → refuse with 409
+	// agent_review_pending, no approval row, no stage transition.
+	s, rr, au, stage := newPlanReviewGateServer(t, specPlanReviewers(1, 1))
+	seedReviewAudit(au, stage.RunID, "plan_review_started", time.Now().UTC())
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"agent_review_pending"`) {
+		t.Errorf("error code missing: %s", body)
+	}
+	if !strings.Contains(body, `"landed_terminal":0`) || !strings.Contains(body, `"configured_agents":1`) {
+		t.Errorf("body missing landed/configured detail: %s", body)
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval (refused before submit)", stage.State)
+	}
+	// Refused before ApprovalRepo.Submit: no approval_submitted audit row.
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" {
+			t.Errorf("unexpected approval_submitted audit on a refused approval")
+		}
+	}
+	if len(rr.runs) == 0 { // sanity: run still present
+		t.Fatal("run vanished")
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_TerminalUnblocks(t *testing.T) {
+	// Each terminal review kind independently satisfies the gate (agent:1):
+	// once one terminal entry of any kind lands, the approve proceeds.
+	for _, terminal := range []string{"plan_reviewed", "plan_review_failed", "plan_review_skipped"} {
+		t.Run(terminal, func(t *testing.T) {
+			s, _, au, stage := newPlanReviewGateServer(t, specPlanReviewers(1, 1))
+			now := time.Now().UTC()
+			seedReviewAudit(au, stage.RunID, "plan_review_started", now)
+			seedReviewAudit(au, stage.RunID, terminal, now)
+
+			w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if stage.State != run.StageStateSucceeded {
+				t.Errorf("stage.State = %q, want succeeded", stage.State)
+			}
+		})
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_MixedTerminalKinds_Unblock(t *testing.T) {
+	// Two configured agents (agent:2): a plan_reviewed + a plan_review_failed
+	// sum to the configured count and unblock the approval.
+	s, _, au, stage := newPlanReviewGateServer(t, specPlanReviewers(2, 1))
+	now := time.Now().UTC()
+	seedReviewAudit(au, stage.RunID, "plan_review_started", now)
+	seedReviewAudit(au, stage.RunID, "plan_reviewed", now)
+	seedReviewAudit(au, stage.RunID, "plan_review_failed", now)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_TwoAgents_OneLanded_StillRefused(t *testing.T) {
+	// agent:2 with only ONE terminal entry landed → still in-flight, refuse.
+	s, _, au, stage := newPlanReviewGateServer(t, specPlanReviewers(2, 1))
+	now := time.Now().UTC()
+	seedReviewAudit(au, stage.RunID, "plan_review_started", now)
+	seedReviewAudit(au, stage.RunID, "plan_reviewed", now)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"landed_terminal":1`) {
+		t.Errorf("body should report landed_terminal=1: %s", w.Body.String())
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_Backstop_AllowsAndLogs(t *testing.T) {
+	// A reviewer that died emitting NO terminal entry: only a plan_review_started
+	// entry exists, aged past the backstop bound (Cap × agentCount). The gate
+	// allows the approval AND records a plan_review_backstop_elapsed degrade.
+	s, _, au, stage := newPlanReviewGateServer(t, specPlanReviewers(1, 1))
+	// Small Cap so the bound is tiny; the started entry is aged well past it.
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 10 * time.Millisecond, Cap: 50 * time.Millisecond}
+	seedReviewAudit(au, stage.RunID, "plan_review_started", time.Now().UTC().Add(-time.Second))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (backstop elapsed):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+	var foundBackstop bool
+	for _, e := range au.appended {
+		if e.Category == "plan_review_backstop_elapsed" {
+			foundBackstop = true
+			var payload map[string]any
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				t.Fatalf("unmarshal backstop payload: %v", err)
+			}
+			if payload["configured_agents"] != float64(1) || payload["landed_terminal"] != float64(0) {
+				t.Errorf("backstop payload counts = %v", payload)
+			}
+		}
+	}
+	if !foundBackstop {
+		t.Errorf("expected plan_review_backstop_elapsed audit entry, got %+v", au.appended)
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_NoAgentReviewer_PassThrough(t *testing.T) {
+	// agent:0 → the completion gate never arms; a stray plan_review_started
+	// entry does not block. Byte-for-byte the pre-ADR-036 approve path.
+	s, _, au, stage := newPlanReviewGateServer(t, specPlanReviewers(0, 1))
+	seedReviewAudit(au, stage.RunID, "plan_review_started", time.Now().UTC())
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no agent reviewer):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_NotDispatched_PassThrough(t *testing.T) {
+	// agent:1 but NO plan_review_started entry → the review was configured but
+	// never dispatched; nothing to wait for, the approve proceeds.
+	s, _, _, stage := newPlanReviewGateServer(t, specPlanReviewers(1, 1))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (not dispatched):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_GatingReviewers_Unaffected(t *testing.T) {
+	// Gating reviewers (agent:1, human:0): the gate treats gating identically
+	// to advisory — a landed terminal verdict unblocks the approve. The
+	// completion gate adds no human>0 special-case, so a properly-sequenced
+	// gating run (review lands, then approve) flows through unchanged.
+	s, _, au, stage := newPlanReviewGateServer(t, specPlanReviewers(1, 0))
+	now := time.Now().UTC()
+	seedReviewAudit(au, stage.RunID, "plan_review_started", now)
+	seedReviewAudit(au, stage.RunID, "plan_reviewed", now)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (gating, review landed):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+}
+
+// TestSubmitApproval_PlanReviewGate_IdempotentRetryAfterLanding pins the
+// load-bearing pre-Submit placement (plan risk #1): an approve refused while
+// in-flight inserts NO approval row, so the SAME subject's retry once a
+// terminal verdict lands flows normally through Submit → advanceStage and the
+// stage reaches succeeded. A post-Submit gate would have inserted a row on the
+// first refused attempt, stranding the retry on Inserted=false.
+func TestSubmitApproval_PlanReviewGate_IdempotentRetryAfterLanding(t *testing.T) {
+	s, _, au, stage := newPlanReviewGateServer(t, specPlanReviewers(1, 1))
+	now := time.Now().UTC()
+	seedReviewAudit(au, stage.RunID, "plan_review_started", now)
+
+	// First attempt: in-flight → refused.
+	if w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`); w.Code != http.StatusConflict {
+		t.Fatalf("first attempt status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+
+	// Terminal verdict lands; the same subject retries.
+	seedReviewAudit(au, stage.RunID, "plan_reviewed", now)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded after retry", stage.State)
 	}
 }

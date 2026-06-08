@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -147,6 +148,19 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// before role resolution lands. See E4.4 (#50).
 	if !s.checkApproverAuthorization(w, r, stage, subject) {
 		return
+	}
+
+	// ADR-036 (#875): refuse a plan-stage approve while a configured
+	// agent plan review is still in-flight. Placed BEFORE
+	// ApprovalRepo.Submit (not in the res.Inserted block) so a refused
+	// approval inserts no row — a retry once the review lands flows
+	// normally through Submit → advanceStage. A post-Submit gate would
+	// strand the stage on the idempotent-first-wins retry (Submit would
+	// return Inserted=false and skip the advance block).
+	if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
+		if !s.checkPlanReviewSettled(w, r, stage) {
+			return
+		}
 	}
 
 	// ADR-017 (#249, #253): the approval handler no longer gates on
@@ -613,4 +627,147 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 			"timeout_source":    timeoutSource,
 		})
 	return false
+}
+
+// checkPlanReviewSettled enforces the ADR-036 (#875) plan-approval
+// completion gate: it refuses a plan-stage approve while a configured agent
+// plan review is still in-flight. Returns true to proceed; writes a typed
+// 409 agent_review_pending and returns false to refuse.
+//
+// Posture mirrors checkPlanBudget / checkApproverAuthorization: every read
+// failure fails OPEN (WARN-log, return true) so a transient backend hiccup
+// can never brick the approval gate. The gate fires only when ALL of:
+//   - the run's plan stage declares reviewers.agent > 0, AND
+//   - at least one plan_review_started entry exists (the review was
+//     dispatched), AND
+//   - fewer than reviewers.agent TERMINAL review entries
+//     (plan_reviewed | plan_review_failed | plan_review_skipped) have
+//     landed, AND
+//   - the elapsed time since the earliest plan_review_started is within
+//     the backstop bound.
+//
+// ANY terminal review kind counts toward the unblock, so a timed-out
+// reviewer (the #747 budget kill emits a terminal plan_review_failed) never
+// strands the gate. The backstop is the belt for a reviewer that dies
+// emitting NO terminal entry at all: past the bound, approval is ALLOWED and
+// a plan_review_backstop_elapsed audit entry records the degrade.
+func (s *Server) checkPlanReviewSettled(w http.ResponseWriter, r *http.Request, stage *run.Stage) bool {
+	ctx := r.Context()
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan-review gate: get run failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+
+	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypePlan)
+	if reviewersCfg == nil || reviewersCfg.Agent == 0 {
+		// No agent reviewer configured — byte-for-byte the pre-ADR-036
+		// approve path (gating reviewers with human==0 included: the
+		// gate is keyed on a present plan_review_started entry, not on
+		// the authority class).
+		return true
+	}
+
+	started, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, stage.RunID, "plan_review_started")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan-review gate: list plan_review_started failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+	if len(started) == 0 {
+		// Configured but not dispatched — nothing to wait for.
+		return true
+	}
+
+	terminalCount := 0
+	for _, cat := range []string{"plan_reviewed", "plan_review_failed", "plan_review_skipped"} {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, stage.RunID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan-review gate: list terminal review entries failed",
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()),
+			)
+			return true
+		}
+		terminalCount += len(entries)
+	}
+	if terminalCount >= reviewersCfg.Agent {
+		// Every configured agent review reached a terminal state.
+		return true
+	}
+
+	// Backstop: the earliest plan_review_started timestamp anchors the
+	// hard deadline. Past it, a reviewer that died emitting nothing can
+	// never strand the gate.
+	earliest := started[0].Timestamp
+	for _, e := range started {
+		if e.Timestamp.Before(earliest) {
+			earliest = e.Timestamp
+		}
+	}
+	bound := s.planReviewBackstop(reviewersCfg.Agent)
+	if elapsed := time.Now().UTC().Sub(earliest); elapsed > bound {
+		s.appendPlanReviewBackstopElapsed(ctx, stage, reviewersCfg.Agent, terminalCount, earliest, elapsed)
+		return true
+	}
+
+	s.writeError(w, r, http.StatusConflict, "agent_review_pending",
+		"a configured agent plan review is still in-flight; poll fishhawk_get_plan / fishhawk_await_review until the review reaches a terminal state, then retry the approval",
+		map[string]any{
+			"stage_id":          stage.ID.String(),
+			"configured_agents": reviewersCfg.Agent,
+			"landed_terminal":   terminalCount,
+		})
+	return false
+}
+
+// planReviewBackstop computes the hard max-wait bound for the plan-review
+// completion gate (ADR-036). It is ReviewBudget.Cap (the #747 worst-case
+// per-invocation ceiling) multiplied by the configured agent count, because
+// the per-reviewer loop runs invocations serially under advisory authority —
+// two reviewers each legitimately near Cap must not trip a false degrade.
+// Falls back to planreview.DefaultReviewBudget.Cap when Cap is unset so the
+// helper is correct even when the Server is constructed outside New (which
+// already defaults a zero-value ReviewBudget).
+func (s *Server) planReviewBackstop(agentCount int) time.Duration {
+	capDur := s.cfg.ReviewBudget.Cap
+	if capDur <= 0 {
+		capDur = planreview.DefaultReviewBudget.Cap
+	}
+	if agentCount < 1 {
+		agentCount = 1
+	}
+	return capDur * time.Duration(agentCount)
+}
+
+// appendPlanReviewBackstopElapsed records the ADR-036 backstop degrade: the
+// plan-review completion gate allowed an approval because the hard bound
+// elapsed before the configured agent reviews all reached a terminal state.
+// Best-effort — a logged audit failure never unwinds the approval.
+func (s *Server) appendPlanReviewBackstopElapsed(ctx context.Context, stage *run.Stage, configuredAgents, landedTerminal int, startedAt time.Time, elapsed time.Duration) {
+	systemKind := audit.ActorKind("system")
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":          stage.ID.String(),
+		"configured_agents": configuredAgents,
+		"landed_terminal":   landedTerminal,
+		"started_at":        startedAt.Format(time.RFC3339Nano),
+		"elapsed_seconds":   int(elapsed.Seconds()),
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     stage.RunID,
+		StageID:   &stage.ID,
+		Timestamp: time.Now().UTC(),
+		Category:  "plan_review_backstop_elapsed",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.Error("audit append failed for plan_review_backstop_elapsed",
+			"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+	}
 }
