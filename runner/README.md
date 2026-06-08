@@ -35,6 +35,7 @@ E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation har
 | `backend-url` | yes | Fishhawk backend URL the runner ships its trace bundle to. |
 | `workflow` | yes | Workflow ID matching a key under `workflows:` in `.fishhawk/workflows.yaml`. |
 | `stage` | yes | Stage ID within the workflow (e.g. `plan`, `implement`, `review`). |
+| `agent` | no | Coding-agent provider to invoke (`claude-code`\|`codex`). Defaults to `claude-code`, preserving the historical Claude-only behavior. `codex` is a recognized but deferred placeholder (its adapter lands separately); any other value fails the stage category-A before the agent is invoked. The selected id is stamped into the trace bundle manifest's `agent` field. |
 | `prompt-file` | no | Path to a file containing the constructed prompt. When unset the runner exits 0 without invoking the agent — useful for exercising the dispatch path before E5.2+ are wired upstream. |
 | `working-dir` | no | Agent working directory; defaults to the runner's CWD. |
 | `max-tokens` | no | Hard cap on agent tokens (input + output); 0 means no cap. |

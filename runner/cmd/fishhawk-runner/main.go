@@ -373,7 +373,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
-	invoker := newInvoker(os.Getenv("ANTHROPIC_API_KEY"))
+	invoker, selErr := selectInvoker(cfg.agent, os.Getenv("ANTHROPIC_API_KEY"))
+	if selErr != nil {
+		// Category-A runner/agent failure: the requested provider maps to
+		// no known invoker. Fail fast BEFORE any agent is invoked.
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"runner_failed","reason":"agent_select","detail":%q}`+"\n", selErr.Error())
+		return exitFailure
+	}
 
 	// selfRetryBudget is the number of additional in-process retries the
 	// runner may attempt before giving up. Clamped to 0 when negative
@@ -704,7 +711,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		manifestRaw := bundle.PackInputs{
 			RunID:   cfg.runID,
 			StageID: bundleStageID(cfg),
-			Agent:   "claude-code",
+			Agent:   cfg.agent,
 			// Carry the resolved model id + token split to the manifest
 			// so the backend prices the run from this signed record
 			// (authoritative cost), not from a runner-emitted span.

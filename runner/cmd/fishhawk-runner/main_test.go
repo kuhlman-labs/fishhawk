@@ -619,6 +619,100 @@ func TestRun_PromptWithBundleOut_WritesGzipFile(t *testing.T) {
 	}
 }
 
+// TestRun_AgentFlagStampsBundleManifest crosses the flag-parse ->
+// selectInvoker -> bundle-manifest stamp seam (#839): it drives run()
+// with --agent (and the no-flag default) and asserts the produced
+// bundle manifest stamps the selected id. The no-flag case proves the
+// claude-code default is preserved end-to-end.
+func TestRun_AgentFlagStampsBundleManifest(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		agentArgs []string
+		wantAgent string
+	}{
+		{name: "default", agentArgs: nil, wantAgent: "claude-code"},
+		{name: "explicit-claude", agentArgs: []string{"--agent", "claude-code"}, wantAgent: "claude-code"},
+		{name: "explicit-codex", agentArgs: []string{"--agent", "codex"}, wantAgent: "codex"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			promptPath := filepath.Join(dir, "prompt.txt")
+			bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+			if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			// Fake both provider seams so codex routing doesn't hit the
+			// not-implemented placeholder — we only care that the selected
+			// id reaches the manifest, not the agent's behavior.
+			fake := &fakeInvoker{canned: agent.Result{OK: true}}
+			withFakeInvoker(t, fake)
+			origCodex := newCodexInvoker
+			newCodexInvoker = func(string) agent.Invoker { return fake }
+			t.Cleanup(func() { newCodexInvoker = origCodex })
+
+			args := []string{
+				"--run-id", "11111111-2222-3333-4444-555555555555",
+				"--backend-url", "https://api.fishhawk.test",
+				"--workflow", "feature_change",
+				"--stage", "plan",
+				"--prompt-file", promptPath,
+				"--bundle-out", bundlePath,
+			}
+			args = append(args, tc.agentArgs...)
+
+			var stderr strings.Builder
+			if got := run(args, &stderr); got != exitOK {
+				t.Fatalf("run = %d, want %d:\n%s", got, exitOK, stderr.String())
+			}
+			data, err := os.ReadFile(bundlePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, _, _, err := openBundleForTest(data)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			if manifest.Agent != tc.wantAgent {
+				t.Errorf("manifest.Agent = %q, want %q", manifest.Agent, tc.wantAgent)
+			}
+		})
+	}
+}
+
+// TestRun_UnknownAgentFailsBeforeInvocation asserts an unrecognized
+// --agent value exits category-A (exitFailure) without ever invoking
+// the agent.
+func TestRun_UnknownAgentFailsBeforeInvocation(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change",
+		"--stage", "plan",
+		"--prompt-file", promptPath,
+		"--agent", "nope",
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want %d:\n%s", got, exitFailure, stderr.String())
+	}
+	if fake.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0 (fail-fast before invocation)", fake.callIdx)
+	}
+	if !strings.Contains(stderr.String(), `"reason":"agent_select"`) {
+		t.Errorf("missing agent_select failure line: %s", stderr.String())
+	}
+}
+
 func TestRun_BundleWriteFailureSurfacesAsExitFailure(t *testing.T) {
 	dir := t.TempDir()
 	promptPath := filepath.Join(dir, "prompt.txt")

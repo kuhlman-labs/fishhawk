@@ -24,6 +24,16 @@ type config struct {
 	workflow   string
 	stage      string
 
+	// agent selects the coding-agent provider the runner invokes
+	// (E22.X / #839). Maps 1:1 onto an agent.Invoker via
+	// selectInvoker: "claude-code" (default) wires the existing
+	// claudecode adapter; "codex" wires a deferred placeholder; any
+	// other value fails fast as a category-A runner/agent error. The
+	// default preserves the historical Claude-only behavior for
+	// invocations that omit the flag. The selected id is also stamped
+	// into the trace bundle manifest's Agent field.
+	agent string
+
 	promptFile      string
 	workingDir      string
 	maxTokens       int
@@ -120,6 +130,8 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 	fs.StringVar(&cfg.workflow, "workflow", "", "workflow ID matching .fishhawk/workflows.yaml")
 	fs.StringVar(&cfg.stage, "stage", "", "stage ID within the workflow")
 
+	fs.StringVar(&cfg.agent, "agent", "claude-code",
+		"coding-agent provider to invoke (claude-code|codex); defaults to claude-code")
 	fs.StringVar(&cfg.promptFile, "prompt-file", "",
 		"path to a UTF-8 file containing the prompt; when empty the runner exits 0 without invoking the agent")
 	fs.StringVar(&cfg.workingDir, "working-dir", "",
