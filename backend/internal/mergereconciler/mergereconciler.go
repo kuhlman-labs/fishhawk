@@ -70,6 +70,19 @@ type Resolver interface {
 	ResolveReviewFromPollState(ctx context.Context, runID uuid.UUID, merged bool, prURL string) error
 }
 
+// LineageReverifier re-checks a merged run branch's lineage at merge
+// resolution (ADR-035 second line of defense, #862) before the gate is
+// resolved succeeded. clean=false means a foreign commit rode the merged
+// branch — the run is left parked/flagged rather than landing as
+// succeeded. Satisfied by *server.Server (ReverifyBranchLineage).
+//
+// OPTIONAL — unlike Runs/PRGetter/Resolver this is not required by Run().
+// A nil reverifier preserves the pre-#862 behavior (resolve every verified
+// merge with no re-check).
+type LineageReverifier interface {
+	ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prNumber int) (clean bool)
+}
+
 // Ticker scans review stages parked in awaiting_approval and resolves
 // any whose PR has reached a terminal merge state. Run() blocks until
 // ctx is done.
@@ -87,6 +100,13 @@ type Ticker struct {
 	// Resolver resolves the review stage through the shared
 	// webhook+poll path. Required.
 	Resolver Resolver
+
+	// LineageReverifier re-checks a verified merge's run-branch lineage
+	// before the succeeded-resolve (ADR-035, #862). OPTIONAL: nil
+	// preserves today's behavior (no re-check). A non-clean verdict on a
+	// merged PR leaves the run parked/flagged for #867 instead of
+	// resolving it succeeded.
+	LineageReverifier LineageReverifier
 
 	// Logger receives structured warnings about transient errors.
 	// nil → slog.Default().
@@ -211,6 +231,22 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 
 	switch {
 	case pr.Merged:
+		// ADR-035 second line of defense (#862): before marking the run
+		// succeeded, re-check the merged branch's lineage. A foreign commit
+		// riding the merged branch (the #797 shape that #858 guards at the
+		// report boundary) must NOT land as a succeeded run. This observes a
+		// merge GitHub already performed, so it refuses the resolve and
+		// leaves the run parked/flagged for #867 rather than physically
+		// blocking the merge. Optional/nil-safe: a nil reverifier or a clean
+		// verdict falls through to the existing resolve.
+		if t.LineageReverifier != nil &&
+			!t.LineageReverifier.ReverifyBranchLineage(ctx, s.RunID, number) {
+			logger.LogAttrs(ctx, slog.LevelWarn,
+				"mergereconciler: merged run carries a foreign commit; left parked/flagged (not resolved succeeded)",
+				slog.String("run_id", s.RunID.String()),
+				slog.String("pr_url", prURL))
+			return
+		}
 		t.resolve(ctx, logger, s.RunID, true, prURL)
 	case pr.State == "closed" && !pr.Merged:
 		t.resolve(ctx, logger, s.RunID, false, prURL)

@@ -664,11 +664,12 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Warn("--enable-merge-reconciler set but GitHub client unconfigured (no app id?); ticker not started")
 		default:
 			ticker := &mergereconciler.Ticker{
-				Runs:     cfg.RunRepo,
-				PRGetter: cfg.GitHub,
-				Resolver: srv,
-				Logger:   logger,
-				Interval: *mergeReconcilerInterval,
+				Runs:              cfg.RunRepo,
+				PRGetter:          cfg.GitHub,
+				Resolver:          srv,
+				LineageReverifier: srv,
+				Logger:            logger,
+				Interval:          *mergeReconcilerInterval,
 			}
 			go func() {
 				if err := ticker.Run(ctx); err != nil {
