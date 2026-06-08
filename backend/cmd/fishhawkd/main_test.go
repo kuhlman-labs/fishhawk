@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 )
 
@@ -249,4 +252,57 @@ func TestPlanReviewTimeoutBelowDefault(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResolvePlanReviewer exercises the serve.go selection seam (#844): the flag
+// values pick which adapter implements server.PlanReviewer. A per-package unit
+// on the codex adapter alone would pass while this wiring branch is wrong, so
+// the seam is asserted here end-to-end against the resolved interface value.
+func TestResolvePlanReviewer(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("codex flag selects the codex adapter", func(t *testing.T) {
+		got := resolvePlanReviewer(planReviewerOptions{
+			enableCodexReviewer:  true,
+			codexBinary:          "codex",
+			openAIAPIKey:         "sk-test",
+			planReviewMaxRetries: 1,
+			planReviewTimeout:    300 * time.Second,
+		}, logger)
+		if got == nil {
+			t.Fatal("PlanReviewer = nil, want the codex adapter")
+		}
+		if _, ok := got.(*codex.Reviewer); !ok {
+			t.Errorf("PlanReviewer = %T, want *codex.Reviewer", got)
+		}
+	})
+
+	t.Run("default path selects no reviewer (nil)", func(t *testing.T) {
+		got := resolvePlanReviewer(planReviewerOptions{}, logger)
+		if got != nil {
+			t.Errorf("PlanReviewer = %T, want nil when no adapter flag is set", got)
+		}
+	})
+
+	t.Run("anthropic key wins over the codex flag", func(t *testing.T) {
+		got := resolvePlanReviewer(planReviewerOptions{
+			anthropicAPIKey:     "sk-ant",
+			planReviewModel:     "claude-sonnet-4-6",
+			enableCodexReviewer: true,
+		}, logger)
+		if _, ok := got.(*anthropic.Reviewer); !ok {
+			t.Errorf("PlanReviewer = %T, want *anthropic.Reviewer (anthropic is top precedence)", got)
+		}
+	})
+
+	t.Run("local-claude wins over the codex flag", func(t *testing.T) {
+		got := resolvePlanReviewer(planReviewerOptions{
+			enableLocalClaudeReviewer: true,
+			localClaudeBinary:         "claude",
+			enableCodexReviewer:       true,
+		}, logger)
+		if _, ok := got.(*claudecode.Reviewer); !ok {
+			t.Errorf("PlanReviewer = %T, want *claudecode.Reviewer (claudecode outranks codex)", got)
+		}
+	})
 }
