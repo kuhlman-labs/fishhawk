@@ -706,6 +706,22 @@ func TestHelperProcessCodex(t *testing.T) {
 //
 // The sentinel key value is deliberately NOT an `sk-…` shape so the
 // redacted --bundle-out variant we read back doesn't scrub it.
+// envWithout returns a copy of env with every "KEY=value" entry whose key
+// is `key` removed. Used by the cross-boundary codex test to strip
+// OPENAI_API_KEY from the faked child's seeded env so the only path that
+// can deliver it is the adapter's own append (see the call site).
+func envWithout(env []string, key string) []string {
+	prefix := key + "="
+	out := env[:0:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 func TestRun_CodexForwardsOpenAIKeyEndToEnd(t *testing.T) {
 	const sentinel = "openai-sentinel-keyvalue"
 	t.Setenv("OPENAI_API_KEY", sentinel)
@@ -715,7 +731,18 @@ func TestRun_CodexForwardsOpenAIKeyEndToEnd(t *testing.T) {
 		c := codex.New(apiKey)
 		c.Cmd = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			cc := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcessCodex")
-			cc.Env = append(os.Environ(), "GO_HELPER_PROCESS_CODEX=1")
+			// Seed the child's env from the host env MINUS OPENAI_API_KEY,
+			// plus the helper-process gate. Stripping the sentinel here is
+			// what makes the env-forwarding assertion load-bearing: the
+			// adapter only re-seeds os.Environ() when cmd.Env is nil, so by
+			// pre-setting a non-nil env without OPENAI_API_KEY the ONLY path
+			// for the sentinel to reach the child is the cross-boundary seam
+			// under test — host-env -> apiKeyForAgent -> codex.New ->
+			// adapter cmd.Env append. Were OPENAI_API_KEY left in (as
+			// os.Environ() carries it via the t.Setenv above), the child
+			// would echo it even if a bug made apiKeyForAgent return "" and
+			// the adapter skipped its append, silently passing the test.
+			cc.Env = append(envWithout(os.Environ(), "OPENAI_API_KEY"), "GO_HELPER_PROCESS_CODEX=1")
 			return cc
 		}
 		return c
