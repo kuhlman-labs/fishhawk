@@ -40,8 +40,6 @@ jobs:
               - 'frontend/**'
               - 'package.json'
               - 'pnpm-lock.yaml'
-              - 'package-lock.json'
-              - 'yarn.lock'
               - '.eslintrc*'
               - 'eslint.config.*'
               - '.prettierrc*'
