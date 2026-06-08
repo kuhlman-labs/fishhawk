@@ -669,6 +669,17 @@ type GetRunStatusOutput struct {
 	// block over the same poll.
 	PlanReviewStatus      *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped, failed. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to reach a terminal review status. 'pending' means a review was dispatched but no verdict has landed yet — re-poll on the advertised poll_interval_seconds (fishhawk_await_review is an optional convenience block over the same poll); 'failed' means the reviewer errored or timed out (terminal)"`
 	ImplementReviewStatus *ReviewStatus `json:"implement_review_status,omitempty" jsonschema:"review lifecycle for the implement stage: status is one of none, pending, complete, skipped, failed. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to reach a terminal review status. 'pending' means a review was dispatched but no verdict has landed yet — re-poll on the advertised poll_interval_seconds (fishhawk_await_review is an optional convenience block over the same poll); 'failed' means the reviewer errored or timed out (terminal)"`
+	// PlanStageWaitStatus / ImplementStageWaitStatus summarize each stage's
+	// EXECUTION lifecycle (#879/#880, ADR-037): pending|running|succeeded|
+	// failed|cancelled derived from the stage row. Re-polling this tool is the
+	// AUTHORITATIVE way to await a stage's terminal status; while the status is
+	// non-terminal each StageWaitStatus carries a server-suggested
+	// poll_interval_seconds cadence (30s, dropped once the run itself is
+	// terminal per the ADR-036 #874 backstop). Distinct from the *ReviewStatus
+	// pair above, which tracks a stage's REVIEW rather than its execution.
+	// Omitted (nil) when no stage of that type exists in the run.
+	PlanStageWaitStatus      *StageWaitStatus `json:"plan_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the plan stage: status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence. Omitted when no plan stage exists"`
+	ImplementStageWaitStatus *StageWaitStatus `json:"implement_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the implement stage: status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence. Omitted when no implement stage exists"`
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
@@ -704,6 +715,19 @@ Returns the Run row (state, workflow, trigger, PR URL when stamped),
 the full ordered stage list (each stage's id / type / state /
 executor / timing / failure category if any), and the N most-recent
 audit entries time-descending (default 5; capped at 50).
+
+Also returns plan_stage_wait_status + implement_stage_wait_status — each a
+StageWaitStatus whose status is one of
+pending/running/succeeded/failed/cancelled, derived from the durable
+(run_id, stage_id) handle. Re-polling this tool is the AUTHORITATIVE way to
+await a stage's terminal status: while the status is non-terminal
+(pending/running) the StageWaitStatus carries a server-suggested
+poll_interval_seconds (30s) — re-call get_run_status on that cadence until
+the status goes terminal. (The interval is dropped once the run itself is
+terminal, so the wait never strands.) fishhawk_run_stage's
+synchronous-with-progress call is the negotiated fallback for clients that
+prefer to block; a future native MCP Tasks (invocationMode:async) mode is
+deferred (ADR-033 transport + MCP Tasks GA).
 
 Also returns plan_review_status + implement_review_status — each a
 ReviewStatus whose status is one of none/pending/complete/skipped/failed.
@@ -789,15 +813,23 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, implementReviewStatus)
 	}
 
+	// Stage-execution wait status (#879/#880, ADR-037), derived from the
+	// stages slice already fetched above and the run row's state — no extra
+	// round-trip. nil when no stage of that type exists in the run.
+	planStageWaitStatus := stageWaitStatusFor(stages, "plan", runRow.State)
+	implementStageWaitStatus := stageWaitStatusFor(stages, "implement", runRow.State)
+
 	return nil, GetRunStatusOutput{
-		Run:                   *runRow,
-		Stages:                stages,
-		RecentAudit:           recent,
-		ImplementReviews:      implementReviews,
-		PlanReviewStatus:      planReviewStatus,
-		ImplementReviewStatus: implementReviewStatus,
-		Budget:                budgetStatus,
-		ReviewActionHint:      reviewActionHint,
+		Run:                      *runRow,
+		Stages:                   stages,
+		RecentAudit:              recent,
+		ImplementReviews:         implementReviews,
+		PlanReviewStatus:         planReviewStatus,
+		ImplementReviewStatus:    implementReviewStatus,
+		PlanStageWaitStatus:      planStageWaitStatus,
+		ImplementStageWaitStatus: implementStageWaitStatus,
+		Budget:                   budgetStatus,
+		ReviewActionHint:         reviewActionHint,
 	}, nil
 }
 

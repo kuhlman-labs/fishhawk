@@ -138,6 +138,16 @@ type RunStageOutput struct {
 	AuditPointer *AuditPointer `json:"audit_pointer,omitempty" jsonschema:"most-recent audit entry for this run with its entry hash; nil on any fetch failure"`
 	RunURL       string        `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
 
+	// StageWaitStatus records the stage-execution wait contract on the durable
+	// (run_id, stage_id) handle (#879/#880, ADR-037), derived from the same
+	// post-run stage fetch that populates StageState — no extra round-trip. On
+	// a normal synchronous return the stage is already terminal, so the field
+	// records the terminal outcome (succeeded/failed/cancelled) and omits
+	// poll_interval_seconds; the non-terminal + poll-interval path is meaningful
+	// via fishhawk_get_run_status (and the future native-async mode). Omitted
+	// when the post-run stage fetch failed.
+	StageWaitStatus *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"stage-execution wait status on the durable (run_id, stage_id) handle: status is one of pending, running, succeeded, failed, cancelled. On a synchronous return the stage is normally already terminal (interval omitted); poll fishhawk_get_run_status on the advertised poll_interval_seconds to await a non-terminal stage. Omitted when the post-run stage fetch failed"`
+
 	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed) from the runner_completed event; empty when the runner never reported one"`
 	Turns          int    `json:"turns,omitempty" jsonschema:"agent turn count from the last stage_progress heartbeat"`
 	TokensUsed     int    `json:"tokens_used,omitempty" jsonschema:"tokens consumed; from runner_completed when present, else the last heartbeat's running total"`
@@ -207,6 +217,19 @@ Drive one stage of a run to completion. Use this after fishhawk_start_run
 to execute each stage in turn — it spawns the fishhawk-runner binary on
 the operator's host.
 
+Wait contract (ADR-037 #879/#880): (run_id, stage_id) is the DURABLE handle
+for a stage's execution. The blessed, AUTHORITATIVE way to await stage
+completion is to poll fishhawk_get_run_status and re-call it on the
+poll_interval_seconds (30s) it advertises on
+plan_stage_wait_status / implement_stage_wait_status while the status is
+non-terminal. This synchronous-with-progress call is the NEGOTIATED FALLBACK
+for clients that prefer to block (or for short stages): it runs the stage to
+completion and returns the terminal outcome, also surfacing stage_wait_status
+on the handle. A future native MCP Tasks (invocationMode:async) mode — gated
+on ADR-033 transport + MCP Tasks leaving experimental — will let this call
+return a handle immediately and poll to terminal; that mode is NOT available
+today.
+
 Mirrors the CLI's "fishhawk runner start" verb. Pair with
 fishhawk_start_run + fishhawk_approve_plan for the full
 agent-driven local-runner loop:
@@ -267,6 +290,12 @@ unavailable):
                       per-run audit API endpoint. nil when the
                       best-effort fetch fails.
   - run_url         — direct link to the run-detail view in the SPA.
+  - stage_wait_status — the stage-execution wait status on the durable
+                      (run_id, stage_id) handle: status is one of
+                      pending/running/succeeded/failed/cancelled. On a
+                      synchronous return the stage is normally already
+                      terminal (poll_interval_seconds omitted); poll
+                      fishhawk_get_run_status to await a non-terminal stage.
 
 Cancellation: cancelling the tool call sends SIGTERM (then SIGKILL
 after a 30s grace) to the runner. Graceful cleanup requires the
@@ -533,6 +562,18 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 			fmt.Sprintf("post-run stage fetch failed: %v", fetchErr))
 	}
 
+	// Stage-execution wait status (#879/#880, ADR-037) on the durable
+	// (run_id, stage_id) handle, derived from the post-run stage fetch above —
+	// no extra round-trip. On a normal synchronous return the stage is already
+	// terminal, so the interval is omitted and the field records the terminal
+	// outcome; nil when the fetch failed (stageState empty). The run state is
+	// not fetched here (the synchronous return implies a settled stage), so the
+	// ADR-036 backstop is a no-op — pass "" for runState.
+	var stageWaitStatus *StageWaitStatus
+	if stageState != "" {
+		stageWaitStatus = classifyStageWaitStatus(in.Stage, stageState, "")
+	}
+
 	// Populate DiffSummary: gate on the git_diff runner event being
 	// present so plan stages (which never emit git_diff) always yield
 	// nil, and failed implement stages that didn't commit also yield nil.
@@ -616,6 +657,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		DiffSummary:      diffSummary,
 		AuditPointer:     auditPointer,
 		RunURL:           runURL,
+		StageWaitStatus:  stageWaitStatus,
 		Outcome:          summary.Outcome,
 		Turns:            summary.Turns,
 		TokensUsed:       summary.TokensUsed,
