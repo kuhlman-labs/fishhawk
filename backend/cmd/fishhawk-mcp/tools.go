@@ -295,11 +295,14 @@ type GetPlanOutput struct {
 	ResolvedVia string       `json:"resolved_via,omitempty" jsonschema:"'self' when the plan came from the requested run; 'parent:<run_id>' when the parent-walk resolved it for a CI-retry chain"`
 	Reviews     []PlanReview `json:"reviews,omitempty" jsonschema:"plan-review agent verdicts; populated when reviewers.agent>0 is configured on the stage (ADR-027). A verdict of 'skipped' with a reason marks an agent layer that was configured but not wired on the backend"`
 	// PlanReviewStatus is the review lifecycle summary for the plan stage
-	// (#600): none|pending|complete|skipped derived from the audit trail.
-	// 'pending' (a review was dispatched but no verdict landed) is the
-	// state Reviews[] alone cannot express — use fishhawk_await_review to
-	// block until it resolves.
-	PlanReviewStatus *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped, failed. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review; 'failed' means the reviewer errored or timed out (terminal)"`
+	// (#600): none|pending|complete|skipped|failed derived from the audit
+	// trail. Re-polling fishhawk_get_run_status is the authoritative path to
+	// a terminal status (#879); on 'pending' the ReviewStatus carries a
+	// server-suggested poll_interval_seconds. 'pending' (a review was
+	// dispatched but no verdict landed) is the state Reviews[] alone cannot
+	// express — fishhawk_await_review is an optional convenience block over
+	// the poll.
+	PlanReviewStatus *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped, failed. Re-polling fishhawk_get_run_status is the authoritative way to reach a terminal status. 'pending' means a review was dispatched but no verdict has landed yet — re-poll on the advertised poll_interval_seconds (fishhawk_await_review is an optional convenience block); 'failed' means the reviewer errored or timed out (terminal)"`
 	// ScopePrecheck surfaces the plan-gate scope/constraint pre-check
 	// (#658): scope.files evaluated against the implement stage's
 	// forbidden_paths/allowed_paths/max_files_changed before approval.
@@ -657,12 +660,15 @@ type GetRunStatusOutput struct {
 	// reason marks a configured agent layer that was not wired.
 	ImplementReviews []PlanReview `json:"implement_reviews,omitempty" jsonschema:"implement-review agent verdicts; populated when reviewers.agent>0 is configured on the implement stage (ADR-027). A {category:'scope'} concern flags scope.files drift (flag-only, never an auto-reject). A verdict of 'skipped' with a reason marks an agent layer that was configured but not wired on the backend"`
 	// PlanReviewStatus / ImplementReviewStatus summarize each stage's review
-	// lifecycle (#600): none|pending|complete|skipped derived from the audit
-	// trail. 'pending' (a review was dispatched but no verdict landed yet) is
-	// the state the Reviews slices alone cannot express; wait on it with
-	// fishhawk_await_review.
-	PlanReviewStatus      *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped, failed. 'pending' means a review was dispatched but no verdict has landed yet; 'failed' means the reviewer errored or timed out (terminal)"`
-	ImplementReviewStatus *ReviewStatus `json:"implement_review_status,omitempty" jsonschema:"review lifecycle for the implement stage: status is one of none, pending, complete, skipped, failed. 'pending' means a review was dispatched but no verdict has landed yet — wait on it with fishhawk_await_review; 'failed' means the reviewer errored or timed out (terminal)"`
+	// lifecycle (#600): none|pending|complete|skipped|failed derived from the
+	// audit trail. Re-polling this tool is the AUTHORITATIVE way to reach a
+	// terminal review status (#879); on 'pending' each ReviewStatus carries a
+	// server-suggested poll_interval_seconds cadence. 'pending' (a review was
+	// dispatched but no verdict landed yet) is the state the Reviews slices
+	// alone cannot express; fishhawk_await_review is an optional convenience
+	// block over the same poll.
+	PlanReviewStatus      *ReviewStatus `json:"plan_review_status,omitempty" jsonschema:"review lifecycle for the plan stage: status is one of none, pending, complete, skipped, failed. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to reach a terminal review status. 'pending' means a review was dispatched but no verdict has landed yet — re-poll on the advertised poll_interval_seconds (fishhawk_await_review is an optional convenience block over the same poll); 'failed' means the reviewer errored or timed out (terminal)"`
+	ImplementReviewStatus *ReviewStatus `json:"implement_review_status,omitempty" jsonschema:"review lifecycle for the implement stage: status is one of none, pending, complete, skipped, failed. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to reach a terminal review status. 'pending' means a review was dispatched but no verdict has landed yet — re-poll on the advertised poll_interval_seconds (fishhawk_await_review is an optional convenience block over the same poll); 'failed' means the reviewer errored or timed out (terminal)"`
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
@@ -698,6 +704,14 @@ Returns the Run row (state, workflow, trigger, PR URL when stamped),
 the full ordered stage list (each stage's id / type / state /
 executor / timing / failure category if any), and the N most-recent
 audit entries time-descending (default 5; capped at 50).
+
+Also returns plan_review_status + implement_review_status — each a
+ReviewStatus whose status is one of none/pending/complete/skipped/failed.
+Re-polling this tool is the AUTHORITATIVE way to reach a terminal review
+status: on "pending" the ReviewStatus carries a server-suggested
+poll_interval_seconds — re-call get_run_status on that cadence until the
+status goes terminal. fishhawk_await_review is an OPTIONAL convenience that
+blocks that poll for you; it is not the primary mechanism.
 
 Also returns implement_reviews[]: implement-review agent verdicts
 (ADR-027) when reviewers.agent>0 is configured on the implement stage.

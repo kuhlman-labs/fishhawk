@@ -32,10 +32,19 @@ import (
 //
 // Reviews is populated for the complete + skipped + failed states and empty
 // for none + pending.
+//
+// PollIntervalSeconds is a server-suggested poll cadence (#879): it is
+// populated ONLY on the 'pending' status — the one state where a polling
+// agent should keep calling fishhawk_get_run_status until a terminal status
+// lands — and omitted (zero) on every terminal/none status. Polling
+// get_run_status on this cadence is the authoritative way to reach a
+// terminal review status; fishhawk_await_review is an optional convenience
+// block over the same poll.
 type ReviewStatus struct {
-	Stage   string       `json:"stage" jsonschema:"the reviewed stage type: 'plan' or 'implement'"`
-	Status  string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed"`
-	Reviews []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed; empty for none/pending"`
+	Stage               string       `json:"stage" jsonschema:"the reviewed stage type: 'plan' or 'implement'"`
+	Status              string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed"`
+	Reviews             []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed; empty for none/pending"`
+	PollIntervalSeconds int          `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for re-polling fishhawk_get_run_status while status=pending; present only on pending, omitted on terminal/none. Poll get_run_status on this cadence as the authoritative path to a terminal status"`
 }
 
 // reviewCategories names the three audit categories that describe a stage's
@@ -250,7 +259,9 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 		return nil, err
 	}
 	if started {
-		return &ReviewStatus{Stage: stage, Status: "pending"}, nil
+		// 'pending' is the one state where a polling agent should keep
+		// calling — advertise the server-suggested poll cadence (#879).
+		return &ReviewStatus{Stage: stage, Status: "pending", PollIntervalSeconds: suggestedReviewPollIntervalSeconds}, nil
 	}
 
 	return &ReviewStatus{Stage: stage, Status: "none"}, nil
@@ -262,11 +273,24 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 // wall-clock sleeps.
 const defaultReviewPollInterval = 3 * time.Second
 
-// awaitReviewTimeout bounds. Default 120s matches the backend's plan-
-// review budget order-of-magnitude; the 600s cap keeps a runaway input
-// from holding the MCP session open indefinitely.
+// suggestedReviewPollIntervalSeconds is the server-suggested cadence a
+// polling agent should use to re-poll fishhawk_get_run_status while a
+// review is 'pending' (#879). Advertised on ReviewStatus.PollIntervalSeconds
+// (pending only) and on the await tool's pending-after-timeout output so a
+// resuming caller stops guessing sleep durations.
+const suggestedReviewPollIntervalSeconds = 15
+
+// awaitReviewTimeout bounds. The default is sized to the measured review
+// latency (#878): real reviews complete in 3.5–4.5min (4m33s=273s worst
+// case across the four cited runs) and the reviewer's own budget
+// (FISHHAWKD_PLAN_REVIEW_TIMEOUT) is 300s, so a 360s default exceeds both —
+// leaving ~60s headroom for a terminal *_review_failed entry to land within
+// the await window. The 600s cap keeps a runaway input from holding the MCP
+// session open indefinitely. poll-the-handle (fishhawk_get_run_status) is
+// the blessed authoritative path; await is a best-effort, idempotent,
+// resumable convenience over it (#879).
 const (
-	awaitReviewTimeoutDefault = 120
+	awaitReviewTimeoutDefault = 360
 	awaitReviewTimeoutMax     = 600
 )
 
@@ -274,7 +298,7 @@ const (
 type AwaitReviewInput struct {
 	RunID          string `json:"run_id" jsonschema:"the Fishhawk run UUID"`
 	Stage          string `json:"stage" jsonschema:"which review to wait on: 'plan' or 'implement'"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'pending' (default 120, capped at 600)"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'pending' (default 360, capped at 600). On timeout the call returns pending + poll_interval_seconds; re-call to resume the wait"`
 }
 
 // AwaitReviewOutput is the fishhawk_await_review response. Status mirrors
@@ -288,10 +312,16 @@ type AwaitReviewOutput struct {
 	Reviews       []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed"`
 	WaitedSeconds float64      `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
 	Message       string       `json:"message,omitempty" jsonschema:"actionable explanation when status=pending after the timeout"`
+	// PollIntervalSeconds carries the server-suggested poll cadence (#879)
+	// on a pending-after-timeout result so a resuming/idempotent re-caller
+	// (or an agent switching to fishhawk_get_run_status polling) uses the
+	// server cadence rather than guessing. Omitted on a terminal result.
+	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for the resumable re-call or for switching to fishhawk_get_run_status polling; present only on a pending-after-timeout result"`
 }
 
 // clampAwaitTimeout applies the default + cap. Non-positive falls back to
-// the default; values over the cap clamp down.
+// the default (360s — sized to the measured 3.5–4.5min review latency and
+// the 300s reviewer budget, #878); values over the cap (600s) clamp down.
 func clampAwaitTimeout(n int) int {
 	if n <= 0 {
 		return awaitReviewTimeoutDefault
@@ -312,35 +342,85 @@ func registerAwaitReview(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_await_review",
 		Description: strings.TrimSpace(`
-Block until a stage's agent review reaches a terminal state. Use this
-when fishhawk_get_run_status or fishhawk_run_stage reports a review
-status of "pending" and you need the verdict before acting (e.g. deciding
-on fishhawk_fixup_stage) — the block-until-terminal companion to those
-snapshot tools.
+OPTIONAL convenience block over polling. fishhawk_get_run_status is the
+AUTHORITATIVE source of truth for a review's terminal status — reach for it
+FIRST and re-poll on the poll_interval_seconds it advertises while a review
+is "pending". This tool just blocks that poll for you when you would rather
+wait synchronously than loop yourself.
 
-The ergonomic replacement for curl-polling /v0/runs/{id}/audit for a
-plan_reviewed / implement_reviewed entry. Resolves the review_status from
-the audit trail and:
+Resolves the review_status from the audit trail and:
 
   - Returns immediately when the review is already "complete", "skipped",
     "failed", or "none" (no review configured).
   - On "pending" (a review was dispatched but no terminal entry has landed)
-    polls the audit endpoint until a terminal entry lands or the timeout
-    elapses.
+    polls the audit endpoint until a terminal entry lands, the run itself
+    reaches a terminal state (the review can no longer progress — it never
+    strands, ADR-036 #874), or the timeout elapses.
+
+Idempotent / resumable: a timeout returns status "pending" plus
+poll_interval_seconds; the wait holds nothing — re-call to resume it, or
+switch to fishhawk_get_run_status polling. Because the default is a long
+(360s) synchronous call with no progress keep-alive, a client/transport
+per-call timeout may still cut it short; that is fine here precisely because
+poll-the-handle is the blessed primary path and a cut-short await is a
+no-op you can re-issue.
 
 Inputs:
   - run_id          (required) — Fishhawk run UUID.
   - stage           (required) — "plan" or "implement".
-  - timeout_seconds — default 120, capped at 600.
+  - timeout_seconds — default 360, capped at 600.
 
-Response: {stage, status, reviews[], waited_seconds, message}. A "failed"
-status is a definite terminal state: the reviewer errored or timed out (e.g.
-it hit FISHHAWKD_PLAN_REVIEW_TIMEOUT) and a terminal *_review_failed audit
-entry was written — reviews[] carries the failure reason. A "pending" status
-after the timeout means the review is genuinely STILL RUNNING (no terminal
-entry yet); re-wait or check the fishhawkd logs.
+Response: {stage, status, reviews[], waited_seconds, message,
+poll_interval_seconds}. A "failed" status is a definite terminal state: the
+reviewer errored or timed out (e.g. it hit FISHHAWKD_PLAN_REVIEW_TIMEOUT)
+and a terminal *_review_failed audit entry was written — reviews[] carries
+the failure reason. A "pending" status after the timeout means the review is
+genuinely STILL RUNNING (no terminal entry yet); re-call to resume, switch
+to fishhawk_get_run_status polling on poll_interval_seconds, or check the
+fishhawkd logs.
 `),
 	}, resolver.awaitReview)
+}
+
+// runStateIsTerminal reports whether a run's state is one past which a
+// review can no longer make progress (ADR-036 #874). The terminal set —
+// succeeded / failed / cancelled — is compared INLINE here against the
+// fishhawk-mcp-local Run.State string (client.go); the backend's run.State
+// type and its IsTerminal() method are deliberately NOT imported, as they
+// are not available in this package.
+func runStateIsTerminal(state string) bool {
+	switch state {
+	case "succeeded", "failed", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+// awaitRunTerminalBackstop resolves the wait when the run itself has reached
+// a terminal state while the review is still pending (ADR-036 #874): the
+// review can never land a verdict, so holding the session open to the
+// deadline would strand the caller. Returns (output, true) to resolve the
+// wait; (zero, false) to keep polling. Best-effort — a GetRun error or a
+// non-terminal run leaves the normal poll/timeout path in charge.
+func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.UUID, stage string, st *ReviewStatus, start time.Time) (AwaitReviewOutput, bool) {
+	runRow, err := r.api.GetRun(ctx, runID)
+	if err != nil || runRow == nil {
+		return AwaitReviewOutput{}, false
+	}
+	if !runStateIsTerminal(runRow.State) {
+		return AwaitReviewOutput{}, false
+	}
+	return AwaitReviewOutput{
+		Stage:         stage,
+		Status:        st.Status,
+		Reviews:       st.Reviews,
+		WaitedSeconds: time.Since(start).Seconds(),
+		Message: fmt.Sprintf("%s review is still %q, but run %s has reached terminal state %q — "+
+			"the review can no longer progress, so the wait resolved instead of holding the "+
+			"session open. Poll fishhawk_get_run_status for the final run state.",
+			stage, st.Status, runID, runRow.State),
+	}, true
 }
 
 // awaitReview is the tool handler.
@@ -364,7 +444,14 @@ func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, i
 		return nil, r.awaitTerminalOutput(in.Stage, st, start), nil
 	}
 
-	// Pending: poll until a terminal entry lands or the deadline fires.
+	// Pending: poll until a terminal entry lands, the run itself goes
+	// terminal (the ADR-036 #874 non-stranding backstop), or the deadline
+	// fires. Check the run-terminal backstop once before the loop so a run
+	// that is already terminal at call time resolves without a poll tick.
+	if out, done := r.awaitRunTerminalBackstop(ctx, runID, in.Stage, st, start); done {
+		return nil, out, nil
+	}
+
 	interval := r.reviewPollInterval
 	if interval <= 0 {
 		interval = defaultReviewPollInterval
@@ -392,6 +479,12 @@ func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, i
 			if st.Status != "pending" {
 				return nil, r.awaitTerminalOutput(in.Stage, st, start), nil
 			}
+			// Still pending: the review hasn't landed a verdict. If the run
+			// itself has gone terminal the review never will — resolve now
+			// rather than spinning to the deadline (ADR-036 #874).
+			if out, done := r.awaitRunTerminalBackstop(pollCtx, runID, in.Stage, st, start); done {
+				return nil, out, nil
+			}
 		}
 	}
 }
@@ -407,20 +500,24 @@ func (*runResolver) awaitTerminalOutput(stage string, st *ReviewStatus, start ti
 	}
 }
 
-// awaitPendingTimeoutOutput builds the actionable pending-after-timeout
-// response. Since #664 a reviewer that errors or times out writes a terminal
-// *_review_failed entry that resolves to a definite 'failed' status, so a
-// lingering 'pending' now means the review is genuinely still in flight —
-// the message points the operator at that distinction rather than framing
-// the timeout as an ambiguous silent failure.
+// awaitPendingTimeoutOutput builds the resumable pending-after-timeout
+// response (#879). The wait holds no state, so a timeout is a documented,
+// idempotent checkpoint — not an error: the message frames the re-call (or a
+// switch to fishhawk_get_run_status polling) as the next step and carries
+// the server-suggested poll cadence. Since #664 a reviewer that errors or
+// times out writes a terminal *_review_failed entry that resolves to a
+// definite 'failed' status, so a lingering 'pending' still means the review
+// is genuinely in flight.
 func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time) AwaitReviewOutput {
 	return AwaitReviewOutput{
-		Stage:         stage,
-		Status:        "pending",
-		WaitedSeconds: time.Since(start).Seconds(),
-		Message: fmt.Sprintf("%s review still pending after %ds: the review is genuinely still running — no terminal "+
-			"audit entry has landed yet. A reviewer that errored or timed out (e.g. hit FISHHAWKD_PLAN_REVIEW_TIMEOUT) "+
-			"would have resolved to a definite 'failed' status instead. Re-wait, or check the fishhawkd logs if this "+
-			"persists.", stage, timeout),
+		Stage:               stage,
+		Status:              "pending",
+		WaitedSeconds:       time.Since(start).Seconds(),
+		PollIntervalSeconds: suggestedReviewPollIntervalSeconds,
+		Message: fmt.Sprintf("%s review still pending after %ds — the review is genuinely still running (no terminal "+
+			"audit entry yet; a reviewer that errored or hit FISHHAWKD_PLAN_REVIEW_TIMEOUT would have resolved to a "+
+			"definite 'failed' status). The wait holds nothing: re-call fishhawk_await_review to resume it, or poll "+
+			"fishhawk_get_run_status every %ds (the authoritative path). Check the fishhawkd logs if this persists.",
+			stage, timeout, suggestedReviewPollIntervalSeconds),
 	}
 }
