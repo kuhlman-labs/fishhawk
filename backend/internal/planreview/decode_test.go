@@ -83,6 +83,64 @@ func TestDecodeVerdict_MalformedReturnsOriginalError(t *testing.T) {
 	}
 }
 
+// TestDecodeVerdict_JSONFencedDecodes covers the originating bug (#889): a
+// verdict wrapped in a ```json … ``` markdown fence (as reviewer models
+// commonly emit) decodes to the same ReviewVerdict as the unfenced form,
+// rather than failing strict decode on the leading backtick.
+func TestDecodeVerdict_JSONFencedDecodes(t *testing.T) {
+	const inner = `{"verdict":"approve","free_form":"looks good"}`
+	raw := []byte("```json\n" + inner + "\n```")
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.Verdict != VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, VerdictApprove)
+	}
+	if verdict.FreeForm != "looks good" {
+		t.Errorf("FreeForm = %q, want %q", verdict.FreeForm, "looks good")
+	}
+}
+
+// TestDecodeVerdict_BareFencedDecodes covers a verdict wrapped in a bare ```
+// fence with no info string; it must decode identically to the unfenced form.
+func TestDecodeVerdict_BareFencedDecodes(t *testing.T) {
+	const inner = `{"verdict":"reject","free_form":"missing tests"}`
+	raw := []byte("```\n" + inner + "\n```")
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.Verdict != VerdictReject {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, VerdictReject)
+	}
+	if verdict.FreeForm != "missing tests" {
+		t.Errorf("FreeForm = %q, want %q", verdict.FreeForm, "missing tests")
+	}
+}
+
+// TestDecodeVerdict_FencedWithIllegalEscape asserts the fence-strip pre-step
+// and the escape-repair retry compose: a fenced verdict whose body ALSO
+// contains an illegal `\-` escape still round-trips after de-fencing, via the
+// sanitize retry.
+func TestDecodeVerdict_FencedWithIllegalEscape(t *testing.T) {
+	const regex = `ghs_[A-Za-z0-9_.\-]{36,}`
+	raw := []byte("```json\n" + `{"verdict":"reject","free_form":"redact ` + regex + `"}` + "\n```")
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.Verdict != VerdictReject {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, VerdictReject)
+	}
+	if !strings.Contains(verdict.FreeForm, regex) {
+		t.Errorf("FreeForm = %q, want it to contain the regex %q verbatim", verdict.FreeForm, regex)
+	}
+}
+
 // TestDecodeVerdict_UnicodeEscapeSurvivesSanitizer exercises the sanitizer's
 // `\uXXXX` branch (decode.go), which the strict-path round-trip test does not
 // reach. The input fails the strict decode (a lone `\-`), forcing the

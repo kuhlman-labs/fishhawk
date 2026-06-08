@@ -1,16 +1,28 @@
 package planreview
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 // DecodeVerdict unmarshals a model-emitted verdict body into a ReviewVerdict,
-// tolerating the common class of invalid-JSON backslash escapes that models
-// produce when they quote code in the verdict body — e.g. a regex like
+// tolerating two common classes of model output that strict JSON rejects.
+//
+// First, it strips a surrounding markdown code fence (```json … ``` or a bare
+// ``` … ```) via stripCodeFence — reviewer models routinely wrap their JSON in
+// a fence, and the leading backtick fails strict decode before any escape
+// repair can run. Stripping is conservative: it only acts when the trimmed
+// body actually starts with a triple-backtick fence, leaving unfenced input
+// byte-for-byte unchanged.
+//
+// Second, it tolerates the common class of invalid-JSON backslash escapes that
+// models produce when they quote code in the verdict body — e.g. a regex like
 // `ghs_[A-Za-z0-9_.\-]{36,}` or a path/identifier escape (`\-`, `\d`, `\w`,
 // `\.`) that is valid in Go/regex but is NOT a legal JSON string escape.
 //
-// It first attempts a strict json.Unmarshal, preserving today's behavior for
-// well-formed output. Only on failure does it run sanitizeEscapes and retry.
-// The helper is intentionally conservative:
+// After de-fencing it attempts a strict json.Unmarshal, preserving today's
+// behavior for well-formed output. Only on failure does it run sanitizeEscapes
+// and retry. The escape repair is intentionally conservative:
 //   - It never alters an already-valid escape: `\"`, `\\`, `\/`, `\b`, `\f`,
 //     `\n`, `\r`, `\t`, and `\uXXXX` (four hex digits) are consumed intact, so
 //     well-formed verdicts round-trip through the strict path untouched.
@@ -18,6 +30,8 @@ import "encoding/json"
 //     fails, the ORIGINAL strict-decode error is returned unchanged so
 //     genuinely-malformed output keeps its precise diagnostic.
 func DecodeVerdict(raw []byte) (ReviewVerdict, error) {
+	raw = stripCodeFence(raw)
+
 	var verdict ReviewVerdict
 	strictErr := json.Unmarshal(raw, &verdict)
 	if strictErr == nil {
@@ -32,6 +46,46 @@ func DecodeVerdict(raw []byte) (ReviewVerdict, error) {
 		return ReviewVerdict{}, strictErr
 	}
 	return repaired, nil
+}
+
+// stripCodeFence removes a surrounding markdown code fence from a model-emitted
+// verdict body, returning the inner content. Reviewer models commonly wrap
+// their JSON in a fence (```json … ``` or a bare ``` … ```), whose leading
+// backtick fails strict JSON decode before any escape repair can run.
+//
+// It is deliberately conservative: it only acts when the whitespace-trimmed
+// input actually begins with a triple-backtick fence. Anything else — most
+// importantly a well-formed JSON object whose string values merely contain
+// backticks — is returned unchanged. The opening fence line (including an
+// optional info string like `json`) and a trailing ``` line are dropped; the
+// body between them is returned verbatim.
+func stripCodeFence(raw []byte) []byte {
+	trimmed := bytes.TrimSpace(raw)
+	if !bytes.HasPrefix(trimmed, []byte("```")) {
+		return raw
+	}
+
+	// Drop the opening fence line (the ``` plus any info string such as
+	// `json`, up to and including the first newline).
+	rest := trimmed[3:]
+	if nl := bytes.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[nl+1:]
+	} else {
+		// No newline after the opener — there is no fenced body to extract.
+		return raw
+	}
+
+	// Drop a trailing ``` fence, tolerating trailing whitespace after it.
+	body := bytes.TrimRight(rest, " \t\r\n")
+	if idx := bytes.LastIndex(body, []byte("```")); idx >= 0 {
+		body = body[:idx]
+	} else {
+		// Opening fence with no closing fence — not a well-formed surrounding
+		// fence, so leave the original input untouched.
+		return raw
+	}
+
+	return body
 }
 
 // sanitizeEscapes rewrites every backslash that does NOT introduce a legal JSON
