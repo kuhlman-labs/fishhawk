@@ -54,6 +54,36 @@ services:
       timeout: 3s
       retries: 10
 
+  jaeger:
+    # Opt-in local OTLP collector for inspecting the runner's #649
+    # GenAI trace spans end-to-end (#679). Gated behind the `otel`
+    # profile so it does NOT start under the default `docker compose
+    # up -d` — the default loop and scripts/dev's pg/minio-only
+    # preflight are unaffected. Start it explicitly with:
+    #   docker compose --profile otel up -d
+    # then point the runner at it via OTEL_EXPORTER_OTLP_ENDPOINT and
+    # view the per-run trace tree at http://localhost:16686.
+    #
+    # Pinned to an immutable tag per CLAUDE.md's image-pinning rule; a
+    # floating tag could change ports/behaviour under us. OTLP is on by
+    # default since v1.35, but COLLECTOR_OTLP_ENABLED is set defensively
+    # so older tags still accept it.
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: fishhawk-jaeger
+    restart: unless-stopped
+    profiles: ["otel"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4318:4318"    # OTLP HTTP receiver (the runner's otlptracehttp target)
+      - "4317:4317"    # OTLP gRPC receiver
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:16686"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   fishhawk-postgres-data:
   fishhawk-minio-data:

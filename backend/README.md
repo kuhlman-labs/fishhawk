@@ -79,6 +79,27 @@ Optional flags:
 
 - **Per-run budget tripwire** (`server.Config.MaxRunUSD` / `MaxRunTokens`, default `0` = disabled) — the whole-run safety rail of ADR-030 (#653): a global operator backstop that HALTS a single run once its cumulative estimated cost reaches the configured ceiling, independent of the per-workflow periodic budgets. `MaxRunUSD` is enforced against the run's rolled `cost_usd_total` (#649); `MaxRunTokens` against the run's cumulative input+output tokens. On breach the trace upload handler cancels the run (terminal state `cancelled`, non-retryable — a protective stop, not a work failure), writes a `run_budget_exceeded` audit entry naming the breached dimension + figures, and dispatches no further stage. A non-positive ceiling disables that dimension, so the default deployment is unaffected. **Note:** this slice ships the config + enforcement + cross-layer test; the CLI flag / `FISHHAWKD_MAX_RUN_USD` env wiring in `cmd/fishhawkd/serve.go` is a deferred follow-up (out of this child run's scope), so today the ceilings are set programmatically on `server.Config`.
 
+### Inspecting OTel trace spans locally (#649 / #679)
+
+The runner emits a per-run OpenTelemetry GenAI trace — a `stage <name>` span with a `chat <model>` child carrying token counts, estimated cost, and reproducibility attrs (span shape detailed in `docs/ARCHITECTURE.md` §10, "Local OTLP trace collector"). Emission is a no-op unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so the default loop is unaffected.
+
+To view a run's trace tree end-to-end against a local collector:
+
+```sh
+# 1. Start the opt-in Jaeger all-in-one (the `otel` compose profile —
+#    it does NOT start under the default `docker compose up -d`).
+docker compose --profile otel up -d
+
+# 2. Point the runner at it (no-op when unset).
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+
+# 3. Run a stage, then open the Jaeger UI and select service
+#    `fishhawk-runner` to see the per-run trace.
+open http://localhost:16686
+```
+
+**Execution-locality caveat**: the collector must be reachable from wherever the runner *actually* executes. The standard dogfood loop dispatches the runner to a GitHub-hosted CI runner (`.github/workflows/fishhawk.yml`, `runs-on: ubuntu-latest`), where `localhost:4318` is the CI host's loopback — not this machine. End-to-end local viewing therefore requires the runner to run on a host that can reach the collector: invoke `fishhawk-runner` locally (see `runner/README.md` "Local invocation") with the endpoint set. Exporting from the GHA job is deferred human-led `.github/workflows/**` work.
+
 ### Bootstrapping API tokens
 
 `/v0/tokens` requires an authenticated identity to mint a new token (a chicken-and-egg). For the first token, use the CLI:
