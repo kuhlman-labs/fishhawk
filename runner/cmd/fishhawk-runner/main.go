@@ -874,12 +874,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// gate (#818, generalized to the open-PR push by #825) catching a
 				// stage that created net-new out-of-scope files (silently stripped →
 				// misleadingly-green partial); it matches both the open-PR and the
-				// fix-up (ErrFixupCreatedOutOfScope) wrapped errors. Everything else
+				// fix-up (ErrFixupCreatedOutOfScope) wrapped errors.
+				// ErrBaseRebaseConflict is the fresh-fetch base path (#866,
+				// ADR-035) failing because the run branched from a base that
+				// diverged from the agent's edits, so reapplying them onto the
+				// clean fetched base conflicts (re-base/re-plan). Everything else
 				// (network, git, GitHub API) is category-C infra.
 				if errors.Is(err, upload.ErrPullRequestInvalid) ||
 					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
 					errors.Is(err, gitops.ErrCommittedTestsFailed) ||
-					errors.Is(err, gitops.ErrCreatedOutOfScope) {
+					errors.Is(err, gitops.ErrCreatedOutOfScope) ||
+					errors.Is(err, gitops.ErrBaseRebaseConflict) {
 					res.FailureCategory = "B"
 				} else {
 					res.FailureCategory = "C"
