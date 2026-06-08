@@ -18,9 +18,22 @@ var ErrFixupNotApplicable = errors.New("fixup not applicable")
 // ErrFixupBudgetExhausted is returned by FixupStage when the stage has
 // already consumed its bounded fix-up passes. The bound is operator-
 // configured (default 1) and never an unbounded auto-loop; once it is
-// hit, a fresh run (or an operator hand-edit) is the next step.
-// Handlers map this to a 422 Unprocessable Entity.
+// hit, the operator may grant ONE bounded override pass
+// (FixupOptions.ForceAdditionalPass) up to the hard ceiling, or a fresh
+// run (or an operator hand-edit) is the next step. Handlers map this to a
+// 422 Unprocessable Entity.
 var ErrFixupBudgetExhausted = errors.New("fixup budget exhausted")
+
+// ErrFixupCeilingReached is returned by FixupStage when the stage has
+// consumed the absolute hard ceiling of fix-up passes
+// (FixupOptions.HardCeiling). It is the hard stop the operator override
+// (ForceAdditionalPass) can never push past — distinct from
+// ErrFixupBudgetExhausted, which only signals the NORMAL budget is spent
+// (one more pass is still available via the override). Once the ceiling
+// is reached the only paths forward are merge-with-follow-up or a fresh
+// run. Handlers map this to a 422 Unprocessable Entity, placed BEFORE the
+// budget-exhausted arm so the distinct error is not masked.
+var ErrFixupCeilingReached = errors.New("fixup ceiling reached")
 
 // FixupOptions modulates FixupStage's bounded-pass decision. The
 // caller supplies the prior-pass count and the configured maximum;
@@ -33,10 +46,28 @@ type FixupOptions struct {
 	// is no dedicated column), so the bound holds across restarts.
 	PriorPassCount int
 
-	// MaxPasses is the configured upper bound on fix-up passes for the
-	// stage (default 1). FixupStage refuses with ErrFixupBudgetExhausted
-	// when PriorPassCount >= MaxPasses.
+	// MaxPasses is the configured NORMAL upper bound on fix-up passes for
+	// the stage (default 1). FixupStage refuses with ErrFixupBudgetExhausted
+	// when PriorPassCount >= MaxPasses and the operator has not set
+	// ForceAdditionalPass.
 	MaxPasses int
+
+	// ForceAdditionalPass is the bounded operator override (#860): when
+	// true, FixupStage admits ONE pass beyond MaxPasses, still capped by
+	// HardCeiling. It models the operator deliberately granting an extra
+	// fix-up pass to resolve a concern surfaced by a re-review rather than
+	// hand-editing the PR branch. The admitted pass is marked
+	// FixupDecision.Forced so the handler can audit it.
+	ForceAdditionalPass bool
+
+	// HardCeiling is the absolute cap on total fix-up passes per stage,
+	// supplied by the caller (mirroring how MaxPasses is injected). It
+	// ALWAYS wins — even with ForceAdditionalPass set: when
+	// PriorPassCount >= HardCeiling FixupStage refuses with
+	// ErrFixupCeilingReached before touching any stage. A zero/unset
+	// HardCeiling means no override headroom (the ceiling check fires at
+	// PriorPassCount >= 0), so callers that want the override MUST set it.
+	HardCeiling int
 }
 
 // FixupDecision summarizes what FixupStage did, for the audit trail
@@ -61,8 +92,17 @@ type FixupDecision struct {
 
 	// RemainingBudget is MaxPasses minus the pass count *after* this
 	// re-open (never negative). The handler surfaces it in the audit
-	// receipt and the MCP tool reports it as the remaining budget.
+	// receipt and the MCP tool reports it as the remaining budget. It
+	// reflects the NORMAL budget only, so a forced override pass (which
+	// runs past MaxPasses) reports 0 here.
 	RemainingBudget int
+
+	// Forced is true when this pass was admitted ONLY because the operator
+	// set ForceAdditionalPass — i.e. the normal budget was already spent
+	// (PriorPassCount >= MaxPasses) but the hard ceiling had headroom. The
+	// handler records it on the audit entry so the forced override is
+	// durably attributable.
+	Forced bool
 }
 
 // FixupStage re-opens an implement stage parked at (or held open by) the
@@ -84,9 +124,16 @@ type FixupDecision struct {
 //     merged); refused once the review stage has merged/succeeded or
 //     when the run has no review stage at all.
 //
-// When opts.PriorPassCount >= opts.MaxPasses the bound is already
-// spent and FixupStage refuses with ErrFixupBudgetExhausted before
-// touching any stage — fix-up is never an unbounded auto-loop.
+// The bound decision (checked before any stage is touched — fix-up is
+// never an unbounded auto-loop) is, in order:
+//
+//   - PriorPassCount >= HardCeiling -> ErrFixupCeilingReached. The hard
+//     stop ALWAYS wins, even when ForceAdditionalPass is set.
+//   - else PriorPassCount >= MaxPasses && !ForceAdditionalPass ->
+//     ErrFixupBudgetExhausted. The normal budget is spent and no override
+//     was requested (the unchanged default behaviour).
+//   - otherwise admit, marking the decision Forced when the override
+//     carried it past the normal budget (PriorPassCount >= MaxPasses).
 //
 // On success the implement stage moves to pending via the existing
 // TransitionStage repo verb (the fix-up edge is admitted by
@@ -139,10 +186,23 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 			ErrFixupNotApplicable, stage.State)
 	}
 
-	if opts.PriorPassCount >= opts.MaxPasses {
+	// The hard ceiling ALWAYS wins, even when the operator forced an
+	// additional pass — it is the absolute stop the override cannot push
+	// past (#860).
+	if opts.PriorPassCount >= opts.HardCeiling {
+		return nil, fmt.Errorf("%w: %d of %d fix-up passes already used (hard ceiling)",
+			ErrFixupCeilingReached, opts.PriorPassCount, opts.HardCeiling)
+	}
+	// The normal budget is spent and no override was requested — unchanged
+	// default behaviour.
+	if opts.PriorPassCount >= opts.MaxPasses && !opts.ForceAdditionalPass {
 		return nil, fmt.Errorf("%w: %d of %d fix-up passes already used",
 			ErrFixupBudgetExhausted, opts.PriorPassCount, opts.MaxPasses)
 	}
+	// Admitted. The pass is forced only when the override carried it past
+	// the normal budget (the ceiling check above already guaranteed
+	// headroom).
+	forced := opts.PriorPassCount >= opts.MaxPasses
 
 	priorState := stage.State
 
@@ -172,6 +232,7 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 		Stage:           updated,
 		ReparkedReview:  reviewToRepark,
 		RemainingBudget: remaining,
+		Forced:          forced,
 	}, nil
 }
 

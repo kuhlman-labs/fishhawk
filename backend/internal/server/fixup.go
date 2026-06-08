@@ -48,6 +48,15 @@ const CategoryStageFixupRecovered = "stage_fixup_recovered"
 // out of scope for the trigger surface).
 const defaultMaxFixupPasses = 1
 
+// defaultFixupCeiling is the absolute hard cap on total fix-up passes a
+// single implement stage may consume, INCLUDING any operator-forced
+// override pass (#860). The normal budget is defaultMaxFixupPasses (1);
+// once spent, an operator may grant ONE additional pass via
+// force_additional_pass, but never past this ceiling. At the ceiling the
+// handler refuses with the distinct fixup_ceiling_reached error (a hard
+// stop: merge-with-follow-up or a fresh run), not fixup_budget_exhausted.
+const defaultFixupCeiling = 3
+
 // fixupRequest is the JSON body of POST /v0/stages/{stage_id}/fixup.
 // Concerns selects which recorded implement-review concerns (by their
 // index in the stage's resolved concern set) to route back to the
@@ -61,6 +70,12 @@ type fixupRequest struct {
 	Concerns    []int    `json:"concerns"`
 	Reason      string   `json:"reason"`
 	AllowCreate []string `json:"allow_create"`
+	// ForceAdditionalPass is the bounded operator override (#860): when
+	// true it grants ONE fix-up pass beyond the normal budget
+	// (defaultMaxFixupPasses), hard-capped at defaultFixupCeiling total
+	// passes per stage. The forced pass is audited (a `forced` flag plus
+	// the operator reason). Default false preserves the prior behaviour.
+	ForceAdditionalPass bool `json:"force_additional_pass"`
 }
 
 // validateAllowCreate normalizes and validates the fix-up allow-create
@@ -238,14 +253,23 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dec, err := run.FixupStage(r.Context(), s.cfg.RunRepo, stageID, run.FixupOptions{
-		PriorPassCount: priorPasses,
-		MaxPasses:      defaultMaxFixupPasses,
+		PriorPassCount:      priorPasses,
+		MaxPasses:           defaultMaxFixupPasses,
+		ForceAdditionalPass: reqBody.ForceAdditionalPass,
+		HardCeiling:         defaultFixupCeiling,
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, run.ErrNotFound):
 			s.writeError(w, r, http.StatusNotFound, "stage_not_found",
 				"no stage with that id", nil)
+			return
+		case errors.Is(err, run.ErrFixupCeilingReached):
+			// Placed BEFORE the budget-exhausted arm so the distinct
+			// hard-stop error is not masked (the override cannot push past
+			// this — #860).
+			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_ceiling_reached",
+				err.Error(), map[string]any{"ceiling": defaultFixupCeiling, "used": priorPasses})
 			return
 		case errors.Is(err, run.ErrFixupBudgetExhausted):
 			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_budget_exhausted",
@@ -379,18 +403,26 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 	actorKind := audit.ActorUser
 
 	passOrdinal := priorPasses + 1
+	admissibilityReason := fmt.Sprintf("fix-up pass %d of %d; %d concern(s) routed back; via %s",
+		passOrdinal, defaultMaxFixupPasses, len(selected), fixupScopeUsed(id))
+	if dec.Forced {
+		// Durably record that this pass ran past the normal budget only
+		// because the operator forced it (#860).
+		admissibilityReason += "; operator-forced override"
+	}
 	fields := map[string]any{
-		"stage_id":         dec.Stage.ID.String(),
-		"prior_state":      string(dec.PriorState),
-		"selected_indices": indices,
-		"concerns":         selected,
-		"reason":           reason,
-		"allow_create":     allowCreate,
-		"pass_ordinal":     passOrdinal,
-		"max_passes":       defaultMaxFixupPasses,
-		"remaining_budget": dec.RemainingBudget,
-		"admissibility_reason": fmt.Sprintf("fix-up pass %d of %d; %d concern(s) routed back; via %s",
-			passOrdinal, defaultMaxFixupPasses, len(selected), fixupScopeUsed(id)),
+		"stage_id":             dec.Stage.ID.String(),
+		"prior_state":          string(dec.PriorState),
+		"selected_indices":     indices,
+		"concerns":             selected,
+		"reason":               reason,
+		"allow_create":         allowCreate,
+		"pass_ordinal":         passOrdinal,
+		"max_passes":           defaultMaxFixupPasses,
+		"hard_ceiling":         defaultFixupCeiling,
+		"remaining_budget":     dec.RemainingBudget,
+		"forced":               dec.Forced,
+		"admissibility_reason": admissibilityReason,
 	}
 	// push_and_open_pr flow (#780): record the review stage re-parked
 	// alongside the implement re-open, so the audit trail captures the
@@ -429,9 +461,11 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 // The recovery signal is the durable stage_fixup_triggered audit entry:
 // a fix-up re-opens an implement stage from a HEALTHY gate, so the only
 // way the stage is `failed` AFTER such an entry exists is a re-dispatch
-// failure. With defaultMaxFixupPasses==1 at most one such entry exists
-// per stage, so {entry present + stage failed} unambiguously identifies
-// the fix-up re-dispatch failure (not an earlier unrelated failure).
+// failure. With the bounded budget plus operator-forced override (#860)
+// up to defaultFixupCeiling such entries may exist per stage; the loop
+// below keeps the LAST (most-recent) one via append order, so {an entry
+// present + stage failed} still unambiguously identifies the latest
+// fix-up re-dispatch failure (not an earlier unrelated failure).
 //
 // Best-effort and self-contained: it owns the recovery transition, the
 // audit emission, and the status-comment refresh; a failure in any step

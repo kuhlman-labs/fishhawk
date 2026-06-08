@@ -306,6 +306,10 @@ type fixupRequest struct {
 	// folded into the effective scope.files for that pass only. omitempty:
 	// the common fix-up omits it and stays unaffected.
 	AllowCreate []string `json:"allow_create,omitempty"`
+	// ForceAdditionalPass is the bounded operator override (#860): grant ONE
+	// fix-up pass beyond the normal budget, hard-capped at 3 total passes.
+	// omitempty: the common fix-up omits it and stays on the default budget.
+	ForceAdditionalPass bool `json:"force_additional_pass,omitempty"`
 }
 
 // FixupStage routes one or more advisory implement-review concerns back
@@ -324,14 +328,20 @@ type fixupRequest struct {
 //   - 404 stage_not_found
 //   - 422 fixup_not_applicable (no recorded approve_with_concerns verdict,
 //     or the stage is not at the gate / its review gate already resolved)
-//   - 422 fixup_budget_exhausted (the bounded pass count is spent;
-//     details carry max_passes + used)
+//   - 422 fixup_budget_exhausted (the NORMAL bounded pass count is spent;
+//     details carry max_passes + used — one more pass is still available
+//     via forceAdditionalPass below)
+//   - 422 fixup_ceiling_reached (the hard ceiling of 3 total passes is
+//     reached; the override cannot push past it — merge-with-follow-up or a
+//     fresh run; details carry ceiling + used)
 //
 // allowCreate declares net-new files this pass will create (#823), folded
 // into the effective scope.files for that dispatch only; an invalid entry
 // (absolute / containing "..") surfaces 400 validation_failed.
-func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concerns []int, reason string, allowCreate []string) (*Stage, error) {
-	body, err := json.Marshal(fixupRequest{Concerns: concerns, Reason: reason, AllowCreate: allowCreate})
+// forceAdditionalPass is the bounded operator override (#860): grant ONE
+// pass beyond the normal budget, hard-capped at 3 total passes.
+func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool) (*Stage, error) {
+	body, err := json.Marshal(fixupRequest{Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass})
 	if err != nil {
 		return nil, fmt.Errorf("marshal fixup: %w", err)
 	}

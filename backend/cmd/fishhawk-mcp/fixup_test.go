@@ -81,6 +81,55 @@ func TestFixupStage_AllowCreate_ThreadsIntoBody(t *testing.T) {
 	}
 }
 
+func TestFixupStage_ForceAdditionalPass_ThreadsIntoBody(t *testing.T) {
+	// force_additional_pass (#860) must reach the backend request body so
+	// the bounded operator override is honoured server-side.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.fixupResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "pending",
+	}
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:             stageID.String(),
+		Concerns:            []int{0},
+		Reason:              "grant one more pass",
+		ForceAdditionalPass: true,
+	})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if !fb.fixupBody.ForceAdditionalPass {
+		t.Errorf("body force_additional_pass = false, want true (threaded override)")
+	}
+}
+
+func TestFixupStage_CeilingReached_PropagatesAs422(t *testing.T) {
+	// At the hard ceiling the backend returns 422 with the DISTINCT code
+	// fixup_ceiling_reached (#860). The MCP tool propagates it as a tool
+	// error so the operator sees the hard stop, not budget_exhausted.
+	fb, srv := newFakeBackend(t)
+	fb.fixupStatus = http.StatusUnprocessableEntity
+	fb.fixupErrBody = `{"error":{"code":"fixup_ceiling_reached","message":"fix-up ceiling reached","details":{"ceiling":3,"used":3}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:  uuid.NewString(),
+		Concerns: []int{0},
+	})
+	if err == nil {
+		t.Fatal("expected error from backend 422; got nil")
+	}
+	if !strings.Contains(err.Error(), "fixup_ceiling_reached") {
+		t.Errorf("err = %v, want fixup_ceiling_reached", err)
+	}
+}
+
 func TestFixupStage_InvalidUUID_FailsLocally(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)

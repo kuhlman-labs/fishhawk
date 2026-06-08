@@ -2572,12 +2572,17 @@ paths:
         rebase-from-remote shared-branch path), and UPDATES the existing PR
         rather than opening a new one.
 
-        **Bounded + operator-gated.** The bound defaults to ONE pass per
-        stage, enforced server-side by counting prior `stage_fixup_triggered`
-        audit entries (there is no dedicated column). Once the bound is spent,
-        a further attempt returns 422 (`fixup_budget_exhausted`); a fresh run
-        or an operator hand-edit is the next step. The operator still owns the
-        merge.
+        **Bounded + operator-gated.** The NORMAL bound defaults to ONE pass
+        per stage, enforced server-side by counting prior
+        `stage_fixup_triggered` audit entries (there is no dedicated column).
+        Once that budget is spent a further attempt returns 422
+        (`fixup_budget_exhausted`) — but the operator may grant ONE additional
+        pass by setting `force_additional_pass: true`, hard-capped at **3
+        total passes** per stage (#860). A forced pass is audited (a `forced`
+        flag plus the operator `reason` on the `stage_fixup_triggered` entry).
+        Once the hard ceiling is reached, even a forced attempt returns the
+        DISTINCT 422 (`fixup_ceiling_reached`) — a hard stop: merge with a
+        follow-up, or start a fresh run. The operator still owns the merge.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -2627,6 +2632,19 @@ paths:
                     Entries must be repo-relative: an absolute path or one
                     containing `..` is rejected (400 `validation_failed`,
                     `field: allow_create`).
+                force_additional_pass:
+                  type: boolean
+                  default: false
+                  description: |
+                    Bounded operator override (#860). When the NORMAL fix-up
+                    budget is already spent (`fixup_budget_exhausted`) but a
+                    concern still needs the agent, set this `true` to grant ONE
+                    pass beyond the budget. Hard-capped at **3 total passes**
+                    per stage; the forced pass is audited (a `forced` flag plus
+                    `reason` on the `stage_fixup_triggered` entry). At the hard
+                    ceiling even a forced attempt returns 422
+                    (`fixup_ceiling_reached`). Default `false` preserves the
+                    prior single-pass behaviour.
       responses:
         '200':
           description: Stage re-opened for the fix-up pass; refreshed Stage row in body.
@@ -2655,11 +2673,15 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '422':
           description: |
-            Fix-up not applicable. Either the stage is the wrong type/state
+            Fix-up not applicable. One of: the stage is the wrong type/state
             or carries no recorded `approve_with_concerns` concerns
-            (`fixup_not_applicable`), or the bounded pass count is already
-            spent (`fixup_budget_exhausted`). Body's `message` explains the
-            specific reason.
+            (`fixup_not_applicable`); the NORMAL bounded pass count is already
+            spent and no override was requested (`fixup_budget_exhausted` —
+            one more pass is available via `force_additional_pass: true`); or
+            the hard ceiling of 3 total passes is reached and the override can
+            no longer help (`fixup_ceiling_reached`, distinct from
+            `fixup_budget_exhausted`). Body's `message` explains the specific
+            reason.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
