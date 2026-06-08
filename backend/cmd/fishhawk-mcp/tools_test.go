@@ -3224,6 +3224,76 @@ func TestApprovePlan_BackendStateMachineRefusal_PropagatesAsToolError(t *testing
 	}
 }
 
+// TestApprovePlan_AgentReviewPending_SurfacesPollUntilLanded pins the ADR-036
+// (#875) consumer boundary: when the backend refuses the approve with a 409
+// agent_review_pending (a configured agent plan review still in-flight), the
+// tool surfaces a typed, operator-actionable poll-until-landed message that
+// carries the landed/configured counts from the error details — not a generic
+// wrap — and does NOT auto-retry.
+func TestApprovePlan_AgentReviewPending_SurfacesPollUntilLanded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.approvalsStatus = http.StatusConflict
+	fb.approvalsErrBody = `{"error":{"code":"agent_review_pending","message":"a configured agent plan review is still in-flight","details":{"stage_id":"x","configured_agents":2,"landed_terminal":1}}}`
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+	withFakeGhMissing(t)
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected error from backend 409 agent_review_pending")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "agent_review_pending") {
+		t.Errorf("err = %v, want agent_review_pending code", err)
+	}
+	// Carries the landed/configured counts from the details.
+	if !strings.Contains(msg, "1 of 2") {
+		t.Errorf("err = %v, want '1 of 2' landed/configured counts", err)
+	}
+	// Operator-actionable: points at the poll-until-terminal verbs and retry.
+	if !strings.Contains(msg, "fishhawk_get_plan") || !strings.Contains(msg, "retry") {
+		t.Errorf("err = %v, want poll-until-landed guidance", err)
+	}
+	// No auto-retry inside the tool: exactly one approvals call.
+	if fb.approvalsCalledByID[stageID] != 1 {
+		t.Errorf("approvals call count = %d, want 1 (no auto-retry)", fb.approvalsCalledByID[stageID])
+	}
+}
+
+// TestApprovePlan_AgentReviewPending_DegradesWhenDetailsAbsent covers the
+// display edge flagged in the #875 implement review: when the backend's 409
+// agent_review_pending carries no details (or unparseable counts), the tool
+// must NOT print a misleading "0 of 0 landed" — it drops the count phrase but
+// keeps the poll-until-landed guidance and the typed code.
+func TestApprovePlan_AgentReviewPending_DegradesWhenDetailsAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.approvalsStatus = http.StatusConflict
+	// No details object at all — the degraded path.
+	fb.approvalsErrBody = `{"error":{"code":"agent_review_pending","message":"a configured agent plan review is still in-flight"}}`
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGhMissing(t)
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected error from backend 409 agent_review_pending")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "agent_review_pending") {
+		t.Errorf("err = %v, want agent_review_pending code", err)
+	}
+	// Must NOT claim a bogus "0 of 0" count when details are missing.
+	if strings.Contains(msg, "0 of 0") {
+		t.Errorf("err = %v, must not print misleading '0 of 0' count", err)
+	}
+	// Still operator-actionable: poll verbs + retry guidance present.
+	if !strings.Contains(msg, "fishhawk_get_plan") || !strings.Contains(msg, "retry") {
+		t.Errorf("err = %v, want poll-until-landed guidance", err)
+	}
+}
+
 func TestRejectPlan_NoReason_PassesEmptyComment(t *testing.T) {
 	// Reason is recommended on reject (CLI warns when missing) but
 	// the MCP tool doesn't enforce — the audit log records the

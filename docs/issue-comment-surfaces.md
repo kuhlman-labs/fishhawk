@@ -58,6 +58,17 @@ Notes:
   `failed` resolution). Listed here only so a
   future reader grepping for `*_reviewed` doesn't mistake them for a comment
   surface.
+- The plan-approval completion-gate backstop audit kind —
+  `plan_review_backstop_elapsed` (ADR-036 / #875), written by the approval
+  handler (`server/approvals.go::checkPlanReviewSettled`) when a plan-stage
+  approve is allowed because the hard backstop (`ReviewBudget.Cap` ×
+  configured agents, measured from the earliest `plan_review_started`)
+  elapsed before the configured agent reviews all reached a terminal state —
+  is an **internal, degrade-record audit kind, not an issue-comment
+  surface**. Nothing in `issuecomment` posts it to the issue thread. Payload:
+  `{stage_id, configured_agents, landed_terminal, started_at,
+  elapsed_seconds}`. It exists so a reviewer that dies emitting no terminal
+  verdict can never strand the gate, and so the degrade is auditable.
 - The plan-gate scope pre-check audit kind — `plan_scope_precheck` (#658),
   written by the plan upload handler (`server/scope_precheck.go::runScopePrecheck`)
   immediately after `plan_generated` and before plan review — is an **internal,
