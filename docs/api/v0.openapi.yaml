@@ -1441,6 +1441,133 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/reset-branch:
+    post:
+      operationId: resetRunBranch
+      summary: Force-reset a run branch off a foreign on-top commit
+      description: |
+        Operator-gated, audited ADR-035 remediation (#867) for a foreign
+        commit pushed **ON TOP** of a run's own commits on the open PR
+        branch — the post-prevention (#861/#865) residual vector. Rewinds
+        the run/PR branch back to its **last run-authored HEAD** (the newest
+        commit attributable to this run's reported-head ledger), dropping
+        the on-top foreign commit, then re-parks the review gate so CI + the
+        merge reconciler re-evaluate the rewound head.
+
+        Mechanism: resolves the PR base ref + live head from GitHub, builds
+        the run's reported-head ledger (seeded `""` so the foreign tip is
+        not self-whitelisted), runs the `base...head` compare, and computes
+        the last run-authored HEAD. It then force-updates (`PATCH .../git/
+        refs/heads/{branch}` with `force:true`) the PR head ref to that SHA,
+        re-parks the run's review stage, writes a `branch_reset` audit entry,
+        and refreshes the sticky status comment.
+
+        **Destructive — safety invariants (all BINDING):**
+
+        - **Operator-gated.** `confirm` MUST be `true`; a missing/false
+          confirm is refused 400 (`confirmation_required`). Never silent/auto.
+        - **On-top only.** Proceeds only when EVERY foreign commit sits
+          strictly above the reset target. A foreign ancestor/interleaved
+          commit cannot be dropped by a reset (the run's commits sit on it)
+          and is refused 422 (`reset_out_of_scope`) — prevention owns it.
+        - **Fail-closed.** Unlike the detect path (which fails open so a
+          transient GitHub failure never blocks a clean run), the
+          destructive action REFUSES on ANY uncertainty — unresolvable base
+          ref, incomplete ledger, compare error, no identifiable
+          run-authored HEAD — with 422 (`reset_not_determinable`), never a
+          force-update.
+        - **Lease re-check.** Immediately before the force-update the live
+          PR head is re-read; if it changed since classification (concurrent
+          push) the reset aborts 422 (`reset_not_determinable`). The REST
+          refs API has no compare-and-swap, so this narrows but does not
+          eliminate the TOCTOU window.
+
+        The dropped commit stays recoverable from the remote reflog / the
+        foreign pusher's own branch (recorded in the audit `recovery_note`).
+
+        **Authorization.** Requires `write:runs`. A run-bound MCP token
+        (subject `mcp:run:<uuid>`) may reset ONLY its own run's branch;
+        another run's branch is refused 403 (`cross_run_reset`).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        description: |
+          Confirms the destructive force-rewind and carries an optional
+          operator rationale.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirm]
+              properties:
+                confirm:
+                  type: boolean
+                  description: |
+                    MUST be `true` to proceed — the reset force-rewinds the
+                    PR head ref and is destructive. A missing/false value is
+                    refused 400 (`confirmation_required`).
+                reason:
+                  type: string
+                  description: |
+                    Optional operator rationale, recorded on the
+                    `branch_reset` audit entry.
+      responses:
+        '200':
+          description: Branch rewound; rewind summary in body.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  pr_number: { type: integer }
+                  branch: { type: string }
+                  dropped_offending_sha: { type: string, description: 'The foreign on-top commit that was dropped.' }
+                  reset_to_sha: { type: string, description: 'The last run-authored HEAD the branch was rewound to.' }
+                  prior_head_sha: { type: string, description: 'The branch tip before the rewind.' }
+                  reparked_review_stage_id: { type: string, description: 'The re-parked review stage id; omitted on the commit-yourself shape.' }
+                  recovery_note: { type: string }
+        '400':
+          description: |
+            Malformed body or `confirm` not `true`. Body's `error` is
+            `validation_failed` or `confirmation_required`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) bearer token lacks `write:runs` scope —
+            body `error` is `insufficient_scope`; (2) an mcp run-bound token
+            (subject `mcp:run:<uuid>`) targeting another run's branch — body
+            `error` is `cross_run_reset`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            Reset refused. One of: `reset_out_of_scope` (the foreign commit
+            is an ancestor/interleaved, not strictly on top — prevention
+            owns it); `reset_not_applicable` (the tip is already the last
+            run-authored HEAD; nothing on top to drop); or
+            `reset_not_determinable` (fail-closed: the lineage could not be
+            classified with certainty, or the lease re-check found a
+            concurrent push). Body's `message` explains the specific reason.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            The GitHub force-update of the PR head ref failed
+            (`reset_force_update_failed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/stages:
     get:
       operationId: listRunStages

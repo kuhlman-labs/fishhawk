@@ -157,6 +157,88 @@ func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Ru
 	return "", true
 }
 
+// resolveLastRunAuthoredHead is the side-effect-free classifier behind
+// the ADR-035 reset remediation (#867). It resolves the run's PR base
+// ref, builds the reported-head ledger seeded "" (so the foreign tip is
+// NOT self-whitelisted), runs CompareCommits(baseRef, headSHA) for the
+// ordered (merge-base, head] commit list, and walks it to find:
+//
+//   - lastAuthoredSHA: the NEWEST commit that is a ledger member — the
+//     last run-authored HEAD, the SHA a reset rewinds the branch to;
+//   - offendingSHA: the FIRST (lowest) foreign (non-ledger) commit;
+//   - isOnTop: true iff EVERY foreign commit sits strictly ABOVE the
+//     newest ledger member (foreign sits on top). False on the
+//     ancestor/interleaved shape (a foreign commit at-or-below a ledger
+//     member), which a reset cannot drop — prevention (#861/#865) owns
+//     that, so the handler refuses reset_out_of_scope.
+//
+// FAIL-CLOSED for the destructive action: unlike detectForeignCommitOnBranch
+// (which fails OPEN so a transient GitHub failure never blocks a clean
+// run), this returns ok=false on EVERY uncertainty — unresolvable base
+// ref, incomplete ledger, CompareCommits error, or no identifiable
+// run-authored HEAD — so an uncertain classification can never drive a
+// force-update. The handler maps ok=false to reset_not_determinable.
+func (s *Server) resolveLastRunAuthoredHead(ctx context.Context, runRow *run.Run,
+	installationID int64, repo githubclient.RepoRef, headSHA string, prNumber int) (lastAuthoredSHA, offendingSHA string, isOnTop, ok bool) {
+	baseRef := s.resolveLineageBaseRef(ctx, runRow, installationID, repo, prNumber)
+	if baseRef == "" {
+		return "", "", false, false
+	}
+
+	ledger, complete := s.buildReportedHeadLedger(ctx, runRow.ID, "")
+	if !complete {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch reset: reported-head ledger incomplete; refusing (fail-closed)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("head_sha", headSHA))
+		return "", "", false, false
+	}
+
+	commits, err := s.cfg.GitHub.CompareCommits(ctx, installationID, repo, baseRef, headSHA)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch reset: compare commits failed; refusing (fail-closed)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("base_ref", baseRef),
+			slog.String("head_sha", headSHA),
+			slog.String("error", err.Error()))
+		return "", "", false, false
+	}
+
+	// Commits are ordered (merge-base, head] oldest→newest. lastMemberIdx
+	// is the newest ledger member; firstForeignIdx is the lowest foreign.
+	lastMemberIdx, firstForeignIdx := -1, -1
+	for i, sha := range commits {
+		if _, member := ledger[sha]; member {
+			lastMemberIdx = i
+		} else if firstForeignIdx == -1 {
+			firstForeignIdx = i
+		}
+	}
+
+	if lastMemberIdx == -1 {
+		// No commit on the branch is attributable to this run — there is
+		// no run-authored HEAD to rewind to. Fail closed.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch reset: no run-authored commit on branch; refusing (fail-closed)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("head_sha", headSHA))
+		return "", "", false, false
+	}
+
+	lastAuthoredSHA = commits[lastMemberIdx]
+	if firstForeignIdx >= 0 {
+		offendingSHA = commits[firstForeignIdx]
+	}
+	// firstForeignIdx is the LOWEST foreign index, so firstForeign >
+	// lastMember ⟺ every foreign commit is strictly above the newest
+	// ledger member. No foreign at all (firstForeignIdx == -1) is "on
+	// top" trivially (the handler then sees lastAuthoredSHA == headSHA
+	// and returns reset_not_applicable).
+	isOnTop = firstForeignIdx == -1 || firstForeignIdx > lastMemberIdx
+	return lastAuthoredSHA, offendingSHA, isOnTop, true
+}
+
 // ReverifyBranchLineage is the detect-only out-of-band re-check that runs
 // at MERGE RESOLUTION (ADR-035 second line of defense, #862, beyond
 // #858's report boundary). It re-verifies that the run branch's live tip

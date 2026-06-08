@@ -335,6 +335,57 @@ func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concerns []int
 	return &s, nil
 }
 
+// resetBranchRequest mirrors the backend's
+// `POST /v0/runs/{run_id}/reset-branch` body
+// (`backend/internal/server/reset_branch.go::resetBranchRequest`).
+// Confirm MUST be true — the reset is destructive (force-rewinds the PR
+// head ref), so the backend refuses a missing/false confirm with 400.
+type resetBranchRequest struct {
+	Reason  string `json:"reason,omitempty"`
+	Confirm bool   `json:"confirm"`
+}
+
+// ResetBranchResult mirrors the backend's reset-branch 200 body: the
+// summary of a successful rewind. Surfaced back to the operator so the
+// dropped commit + recovery path are visible.
+type ResetBranchResult struct {
+	RunID                 string `json:"run_id"`
+	PRNumber              int    `json:"pr_number"`
+	Branch                string `json:"branch"`
+	DroppedOffendingSHA   string `json:"dropped_offending_sha"`
+	ResetToSHA            string `json:"reset_to_sha"`
+	PriorHeadSHA          string `json:"prior_head_sha"`
+	ReparkedReviewStageID string `json:"reparked_review_stage_id,omitempty"`
+	RecoveryNote          string `json:"recovery_note"`
+}
+
+// ResetRunBranch force-rewinds a run/PR branch back to its last
+// run-authored HEAD, dropping a foreign commit pushed ON TOP of the run's
+// commits (ADR-035 remediation, #867), via
+// `POST /v0/runs/{run_id}/reset-branch`. Destructive + operator-gated:
+// confirm is always sent true (the tool layer requires the operator's
+// confirm). 4xx/5xx surfaces:
+//   - 400 confirmation_required (confirm not true)
+//   - 403 cross_run_reset (a run-bound token reaching another run's branch)
+//   - 404 run_not_found
+//   - 422 reset_out_of_scope (the foreign commit is an ancestor, not on
+//     top — owned by prevention #861/#865)
+//   - 422 reset_not_applicable (the tip is already the last run-authored
+//     HEAD; nothing on top to drop)
+//   - 422 reset_not_determinable (fail-closed: the lineage could not be
+//     classified with certainty, or the lease re-check failed)
+func (c *apiClient) ResetRunBranch(ctx context.Context, runID uuid.UUID, reason string) (*ResetBranchResult, error) {
+	body, err := json.Marshal(resetBranchRequest{Reason: reason, Confirm: true})
+	if err != nil {
+		return nil, fmt.Errorf("marshal reset-branch: %w", err)
+	}
+	var res ResetBranchResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/reset-branch", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // CancelRun transitions a run to the cancelled state via
 // `POST /v0/runs/{run_id}/cancel`. Idempotent: cancelling an already-
 // cancelled run returns 200 with the same body. 4xx surfaces:

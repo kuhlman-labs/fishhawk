@@ -309,6 +309,20 @@ Notes:
   comment (`notifyStatusUpdate`), but the audit kind itself posts nothing.
   Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
+- The run-branch reset kind — `branch_reset` (ADR-035, #867) — is an
+  **internal, audit-only kind, not its own issue-comment surface**. Nothing in
+  `issuecomment` posts it; it has no Notifier method. It is written under its
+  own category `branch_reset` by an **operator** actor:
+  `server/reset_branch.go::handleResetRunBranch` calls `AuditRepo.AppendChained`
+  after it force-rewinds a run/PR branch back to its last run-authored HEAD,
+  dropping a foreign commit pushed on top. The payload is `{run_id, pr_number,
+  branch, dropped_offending_sha, reset_to_sha, prior_head_sha, reason,
+  recovery_note}` (plus `reparked_review_stage_id` when a review stage was
+  re-parked). The handler DOES refresh the sticky status comment afterward
+  (`notifyStatusUpdate(runID, "branch_reset")` → the `status_update` surface in
+  the table above, same comment id, edits in place), but the `branch_reset`
+  audit kind itself posts nothing. Listed here so a future reader grepping the
+  audit categories doesn't mistake it for a comment surface.
 
 ## Routing
 

@@ -803,9 +803,9 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// description, not a target — the #778 density guard wants dense, not
 	// padded, prose.
 	const minDescriptionLen = 80
-	// The registered tool set is the 15 fishhawk_* tools swept in #778. Bump
+	// The registered tool set is the 16 fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 15
+	const wantToolCount = 16
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
