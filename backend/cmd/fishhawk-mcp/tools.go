@@ -1631,10 +1631,20 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 		var ae *apiError
 		if errors.As(err, &ae) && ae.Code == "agent_review_pending" {
 			landed, _ := ae.Details["landed_terminal"].(float64)
-			configured, _ := ae.Details["configured_agents"].(float64)
+			configured, configuredOK := ae.Details["configured_agents"].(float64)
+			// Lead with the landed/configured counts when the backend
+			// supplied them; degrade to a count-free message when the
+			// details are absent or malformed so we never print a
+			// misleading "0 of 0 landed". The poll-until-landed guidance
+			// is identical in both branches.
+			countPhrase := "the agent plan review is still in-flight"
+			if configuredOK && configured > 0 {
+				countPhrase = fmt.Sprintf("%d of %d configured plan reviews have landed; the agent plan review is still in-flight",
+					int(landed), int(configured))
+			}
 			return nil, ApprovePlanOutput{}, fmt.Errorf(
-				"agent_review_pending: %d of %d configured plan reviews have landed; the agent plan review is still in-flight. Poll fishhawk_get_plan or fishhawk_await_review until the plan review reaches a terminal state (complete/skipped/failed), then retry fishhawk_approve_plan",
-				int(landed), int(configured))
+				"agent_review_pending: %s. Poll fishhawk_get_plan or fishhawk_await_review until the plan review reaches a terminal state (complete/skipped/failed), then retry fishhawk_approve_plan",
+				countPhrase)
 		}
 		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}

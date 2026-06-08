@@ -1883,3 +1883,79 @@ func TestSubmitApproval_PlanReviewGate_IdempotentRetryAfterLanding(t *testing.T)
 		t.Errorf("stage.State = %q, want succeeded after retry", stage.State)
 	}
 }
+
+// The three tests below pin the fail-OPEN posture of checkPlanReviewSettled's
+// error branches (the #875 implement-review gap): every read failure WARN-logs
+// and returns true so a transient backend hiccup can never brick the approval
+// gate. Each asserts the approve proceeds (200, stage succeeded) despite the
+// injected read error, mirroring checkPlanBudget / checkApproverAuthorization.
+
+func TestSubmitApproval_PlanReviewGate_GetRunError_FailsOpen(t *testing.T) {
+	// GetRun fails (run row gone) → the gate cannot resolve reviewers, so it
+	// fails open and the approve proceeds rather than stranding on a transient
+	// read error.
+	s, rr, _, stage := newPlanReviewGateServer(t, specPlanReviewers(1, 1))
+	rr.mu.Lock()
+	delete(rr.runs, stage.RunID) // GetRun now returns run.ErrNotFound
+	rr.mu.Unlock()
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (GetRun failure fails open):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_StartedListError_FailsOpen(t *testing.T) {
+	// The plan_review_started count read fails → fail open, approve proceeds.
+	s, _, au, stage := newPlanReviewGateServer(t, specPlanReviewers(1, 1))
+	au.listByCategoryErr = errors.New("audit read boom")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (started-list failure fails open):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+}
+
+func TestSubmitApproval_PlanReviewGate_TerminalListError_FailsOpen(t *testing.T) {
+	// plan_review_started reads fine (review dispatched), but the terminal-
+	// category count read fails → fail open, approve proceeds. A categoryErrAudit
+	// fails ONLY the terminal categories so the started read still returns the
+	// seeded dispatch entry, isolating the terminal-list branch.
+	rr := newOrchestratorRepo()
+	ar := newFakeApprovalRepo()
+	au := &categoryErrAudit{
+		auditFake: newAuditFake(),
+		errFor: map[string]error{
+			"plan_reviewed":       errors.New("terminal read boom"),
+			"plan_review_failed":  errors.New("terminal read boom"),
+			"plan_review_skipped": errors.New("terminal read boom"),
+		},
+	}
+	o := &orchestrator.Orchestrator{Runs: rr}
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specPlanReviewers(1, 1)
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingApproval)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: ar,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+	})
+	seedReviewAudit(au.auditFake, stage.RunID, "plan_review_started", time.Now().UTC())
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (terminal-list failure fails open):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+}
