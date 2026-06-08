@@ -41,6 +41,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerListAudit(srv, resolver)
 	registerStartRun(srv, resolver)
 	registerCancelRun(srv, resolver)
+	registerResetRunBranch(srv, resolver)
 	registerRetryStage(srv, resolver)
 	registerFixupStage(srv, resolver)
 	registerApprovePlan(srv, resolver)
@@ -1330,6 +1331,92 @@ func (r *runResolver) cancelRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return nil, CancelRunOutput{}, fmt.Errorf("cancel run: %w", err)
 	}
 	return nil, CancelRunOutput{Run: *cancelled}, nil
+}
+
+// ResetRunBranchInput is the fishhawk_reset_run_branch tool's input
+// schema (ADR-035 remediation, #867). Mirrors
+// `POST /v0/runs/{run_id}/reset-branch`. Confirm MUST be true — the reset
+// is destructive (it force-rewinds the PR head ref), so it is never
+// silent/auto.
+type ResetRunBranchInput struct {
+	RunID   string `json:"run_id" jsonschema:"the Fishhawk run UUID whose branch is being reset; resolved like the other run-keyed verbs"`
+	Reason  string `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the branch_reset audit entry"`
+	Confirm bool   `json:"confirm" jsonschema:"MUST be true to proceed — this is a destructive force-rewind of the PR head ref; a missing/false confirm is refused"`
+}
+
+// ResetRunBranchOutput surfaces the rewind summary: the dropped on-top
+// commit, the reset target (last run-authored HEAD), the prior head, and
+// the recovery note (the dropped commit stays recoverable via the remote
+// reflog).
+type ResetRunBranchOutput struct {
+	Result ResetBranchResult `json:"result"`
+}
+
+// registerResetRunBranch wires the fishhawk_reset_run_branch tool
+// (ADR-035 remediation, #867).
+//
+// Auth: write tool. Operator-side fhk_* tokens with `write:runs` scope
+// succeed; a run-bound MCP token may reset ONLY its own run's branch.
+func registerResetRunBranch(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_reset_run_branch",
+		Description: strings.TrimSpace(`
+DESTRUCTIVE, operator-gated remediation: force-rewind a run/PR branch back
+to its last run-authored HEAD, dropping a foreign commit pushed ON TOP of
+the run's own commits (the ADR-035 post-prevention residual vector).
+
+Use this only when a foreign writer pushed a commit on top of the run's
+commits on the open PR branch and you want to drop it. The reset:
+
+  - force-updates the PR head ref back to the newest commit attributable
+    to this run (the last run-authored HEAD);
+  - re-parks the review gate so CI + the merge reconciler re-evaluate the
+    rewound head;
+  - records a branch_reset audit entry. The dropped commit stays
+    recoverable from the remote reflog / the foreign pusher's own branch.
+
+Safety: the reset is REFUSED unless the foreign commit sits STRICTLY ON
+TOP. A foreign ancestor/interleaved commit is out of scope (a reset can't
+drop it — that is prevention's job) and returns reset_out_of_scope. The
+classification is FAIL-CLOSED: any uncertainty returns reset_not_
+determinable rather than force-updating.
+
+Inputs:
+  - run_id  : the run whose branch to reset.
+  - reason  : optional operator note, recorded on the audit entry.
+  - confirm : MUST be true. The force-rewind is destructive, so a
+    missing/false confirm is refused (confirmation_required).
+
+Returns the rewind summary (dropped_offending_sha, reset_to_sha,
+prior_head_sha, recovery_note) on success. Returns a tool error on:
+  - invalid UUID (caught before the HTTP hop)
+  - confirmation_required (confirm not true, 400)
+  - cross_run_reset (a run-bound token reaching another run's branch, 403)
+  - run_not_found (404)
+  - reset_out_of_scope (the foreign commit is an ancestor, not on top, 422)
+  - reset_not_applicable (no foreign commit on top to drop, 422)
+  - reset_not_determinable (fail-closed: lineage not classifiable / lease
+    re-check failed, 422)
+`),
+	}, resolver.resetRunBranch)
+}
+
+// resetRunBranch is the tool handler. The on-top/ancestor classification,
+// fail-closed posture, lease re-check, and subject-binding all live
+// server-side in server/reset_branch.go.
+func (r *runResolver) resetRunBranch(ctx context.Context, _ *mcp.CallToolRequest, in ResetRunBranchInput) (*mcp.CallToolResult, ResetRunBranchOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, ResetRunBranchOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+	if !in.Confirm {
+		return nil, ResetRunBranchOutput{}, fmt.Errorf("confirm must be true: fishhawk_reset_run_branch force-rewinds the PR head ref and is destructive")
+	}
+	res, err := r.api.ResetRunBranch(ctx, runID, in.Reason)
+	if err != nil {
+		return nil, ResetRunBranchOutput{}, fmt.Errorf("reset run branch: %w", err)
+	}
+	return nil, ResetRunBranchOutput{Result: *res}, nil
 }
 
 // RetryStageInput is the fishhawk_retry_stage tool's input schema

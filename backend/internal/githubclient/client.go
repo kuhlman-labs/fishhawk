@@ -675,6 +675,10 @@ type PullRequest struct {
 	// targets, so a contaminated branch commit cannot launder it the
 	// way a runner-reported base_sha can.
 	BaseRef string
+	// HeadRef is the PR's source branch name (the `head.ref` field) —
+	// the run branch. The ADR-035 reset remediation (#867) force-updates
+	// THIS ref to rewind a foreign on-top commit off the run branch.
+	HeadRef string
 	// Number and HTMLURL are populated by CreatePullRequest and
 	// ListOpenPullRequestsByHead (the consolidated-PR path, #714).
 	// GetPullRequest leaves them zero/empty — its callers only need
@@ -727,6 +731,7 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
 		Merged bool   `json:"merged"`
 		Head   struct {
 			SHA string `json:"sha"`
+			Ref string `json:"ref"`
 		} `json:"head"`
 		Base struct {
 			Ref string `json:"ref"`
@@ -744,6 +749,7 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
 		State:   body.State,
 		Merged:  body.Merged,
 		BaseRef: body.Base.Ref,
+		HeadRef: body.Head.Ref,
 	}, nil
 }
 
@@ -806,6 +812,65 @@ func (c *Client) CompareCommits(ctx context.Context, installationID int64,
 		shas = append(shas, cm.SHA)
 	}
 	return shas, nil
+}
+
+// ForceUpdateRef force-updates a branch ref to point at newSHA — the
+// destructive remediation primitive for ADR-035 (#867). It rewinds the
+// run/PR head branch back to its last run-authored commit, dropping a
+// foreign commit pushed ON TOP of the run's own commits.
+//
+//	PATCH /repos/{owner}/{repo}/git/refs/heads/{branch}
+//	{ "sha": "<newSHA>", "force": true }
+//
+// force:true is required because the move is a REWIND (newSHA is an
+// ancestor of the current tip, not a fast-forward descendant); GitHub
+// rejects a non-fast-forward ref update without it. The REST refs API
+// exposes NO expected-sha precondition (no compare-and-swap / the
+// --force-with-lease analog), so the lease check is the CALLER's
+// responsibility: re-read the live head and confirm it still equals the
+// classified SHA immediately before calling this, narrowing (never
+// eliminating) the TOCTOU window against a concurrent push.
+//
+// Returns ErrNotFound when the repo/branch isn't visible to the
+// installation, ErrForbidden on auth issues, ErrValidation when GitHub
+// rejects the update (422 — e.g. the SHA doesn't exist on the repo). The
+// dropped commit stays recoverable from the remote reflog / the foreign
+// pusher's own branch.
+func (c *Client) ForceUpdateRef(ctx context.Context, installationID int64,
+	repo RepoRef, branch, newSHA string) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if branch == "" {
+		return errors.New("githubclient: branch is required")
+	}
+	if newSHA == "" {
+		return errors.New("githubclient: newSHA is required")
+	}
+
+	raw, err := json.Marshal(map[string]any{"sha": newSHA, "force": true})
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal force-update ref: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/git/refs/heads/" + escapePath(branch))
+	req, err := c.buildRequest(ctx, http.MethodPatch, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: force-update ref: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return classifyStatus("force-update ref", resp)
 }
 
 // CreatePullRequest opens a pull request from head into base (#714 /
