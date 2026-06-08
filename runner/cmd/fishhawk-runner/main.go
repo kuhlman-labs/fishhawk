@@ -2493,6 +2493,10 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		isDecomposed bool
 		isSubsequent bool
 		isFixup      bool
+		// freshFetchBase, when non-empty, makes CommitAndPush cut the run
+		// branch from a freshly-fetched origin/<base> instead of ambient HEAD
+		// (ADR-035 prevention, #861). Set only in the standalone default case.
+		freshFetchBase string
 	)
 	switch {
 	case cfg.fixup:
@@ -2510,6 +2514,10 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		isSubsequent = remoteBranchExists(ctx, repoDir, branch)
 	default:
 		branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
+		// Standalone single-writer run: cut the branch from the freshly-
+		// fetched authoritative base so a foreign ambient-HEAD commit (#797)
+		// can't become the recorded fork point (ADR-035 prevention, #861).
+		freshFetchBase = baseRef
 	}
 	if isFixup && branch == "" {
 		return errors.New("upload: fix-up pass requires a non-empty existing PR branch (fixup_branch)")
@@ -2610,6 +2618,15 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		PushToken:        token,
 		ForceWithLease:   isDecomposed,
 		RebaseFromRemote: isSubsequent,
+		// Cut a standalone run branch from a freshly-fetched authoritative
+		// base (origin/<baseRef>) rather than the ambient local HEAD, so a
+		// foreign commit another writer made in the same shared checkout (the
+		// #797 shape) cannot become the run branch base (ADR-035 prevention,
+		// #861). Set ONLY for the standalone `default:` routing case — the
+		// fix-up and decomposed-child paths keep their existing branch
+		// machinery (RebaseFromRemote / checkout -b from a controlled base).
+		// Empty for those callers keeps the unchanged checkout -b path.
+		FreshFetchBase: freshFetchBase,
 		// Materialize refs/remotes/origin/<shared-branch> to the pushed HEAD
 		// after a decomposed-child URL push (#770). Only decomposed children
 		// share a branch across runs in one clone, so scope it to them; this

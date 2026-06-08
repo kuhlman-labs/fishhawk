@@ -934,6 +934,116 @@ func TestCommitAndPush_RebaseFromRemote_FetchesViaRemoteURL(t *testing.T) {
 	}
 }
 
+// TestCommitAndPush_FreshFetchBase_CutsFromFetchedTipNotAmbientHEAD pins #861
+// (ADR-035 prevention): a standalone run branch must be cut from the freshly-
+// FETCHED authoritative base (origin/main), NOT the ambient local HEAD, so a
+// foreign commit another writer made in the same shared checkout (the #797
+// shape) cannot ride in as the run branch base. The test advances the local
+// ambient HEAD with a foreign commit that is NEVER pushed to the bare remote,
+// writes an agent working-tree edit, then calls CommitAndPush with
+// FreshFetchBase="main". It asserts: (a) the foreign commit is NOT an ancestor
+// of the run-branch HEAD; (b) the run branch's parent and result.BaseSHA both
+// equal the fetched origin/main tip (not the foreign ambient HEAD); (c) the
+// agent edit is present in the committed tree (stash/pop preserved it across
+// the base reset).
+func TestCommitAndPush_FreshFetchBase_CutsFromFetchedTipNotAmbientHEAD(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-861/stage-x"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+
+	// Establish the bare remote with main at the authoritative tip and push it.
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+	authoritativeTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	// A FOREIGN writer advances the local ambient HEAD with a commit that is
+	// NEVER pushed to the bare remote — the 509a62c analogue from #797. On the
+	// old code (checkout -b from ambient HEAD) this commit would become the run
+	// branch base.
+	if err := os.WriteFile(filepath.Join(repo, "foreign.txt"), []byte("foreign\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "foreign writer commit (never pushed)")
+	foreignSHA := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	// The agent's uncommitted working-tree edit, which must survive the base
+	// reset via stash/pop.
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "agent stage commit",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush (FreshFetchBase): %v", err)
+	}
+
+	// (a) The foreign ambient-HEAD commit must NOT be an ancestor of the run
+	// branch HEAD — it was laundered out by cutting from the fetched base.
+	if isAncestor(t, repo, foreignSHA, "HEAD") {
+		t.Errorf("foreign commit %s is an ancestor of run-branch HEAD; it leaked into the branch base", foreignSHA)
+	}
+
+	// (b) The run branch's first parent and result.BaseSHA both equal the
+	// fetched origin/main tip, not the foreign ambient HEAD.
+	parent := mustGitOut(t, repo, "rev-parse", "HEAD^")
+	if parent != authoritativeTip {
+		t.Errorf("run branch parent = %q, want fetched origin/main tip %q", parent, authoritativeTip)
+	}
+	if res.BaseSHA != authoritativeTip {
+		t.Errorf("result.BaseSHA = %q, want fetched origin/main tip %q", res.BaseSHA, authoritativeTip)
+	}
+	if res.BaseSHA == foreignSHA {
+		t.Errorf("result.BaseSHA = foreign ambient HEAD %q; must be the fetched tip", foreignSHA)
+	}
+
+	// (c) The agent edit is present in the committed tree (stash/pop preserved
+	// it across the checkout -B FETCH_HEAD base reset).
+	tree := mustGitOut(t, repo, "ls-tree", "--name-only", "-r", "HEAD")
+	if !strings.Contains(tree, "agent.txt") {
+		t.Errorf("committed tree missing agent edit agent.txt; got %q", tree)
+	}
+	// And the foreign file is NOT in the tree (it was never on the fetched base
+	// and the agent didn't create it).
+	if strings.Contains(tree, "foreign.txt") {
+		t.Errorf("committed tree unexpectedly contains foreign.txt; got %q", tree)
+	}
+}
+
+// isAncestor reports whether maybeAncestor is an ancestor of ref via
+// `git merge-base --is-ancestor` (exit 0 = ancestor, exit 1 = not).
+func isAncestor(t *testing.T, dir, maybeAncestor, ref string) bool {
+	t.Helper()
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", maybeAncestor, ref)
+	cmd.Dir = dir
+	return cmd.Run() == nil
+}
+
 // TestConfigureExtraheader_SetsCredentialForHTTPS covers the credential-
 // configuration path the #772 fetch test cannot reach: that test passes a bare
 // filesystem path as RemoteURL, so configureExtraheader no-ops on the
