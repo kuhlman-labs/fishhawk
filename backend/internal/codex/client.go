@@ -197,14 +197,16 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
 	// Seed with os.Environ() when the Cmd builder left env nil (production), so
 	// the operator's existing OPENAI_API_KEY / ChatGPT-login auth and PATH are
-	// inherited. Then layer the configured API key on top: a duplicate key's
-	// LAST value wins in os/exec, so an explicit cfg.APIKey overrides any
-	// inherited one. An empty cfg.APIKey is skipped, leaving the inherited env.
+	// inherited. Then layer the configured API key on top. A subprocess's
+	// os.Getenv returns the FIRST matching entry, so a plain append would be
+	// shadowed by any inherited OPENAI_API_KEY — strip existing entries from the
+	// seed before appending the configured one so cfg.APIKey actually wins. An
+	// empty cfg.APIKey is skipped, leaving the inherited env untouched.
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
 	if c.cfg.APIKey != "" {
-		cmd.Env = append(cmd.Env, "OPENAI_API_KEY="+c.cfg.APIKey)
+		cmd.Env = appendEnvOverride(cmd.Env, "OPENAI_API_KEY", c.cfg.APIKey)
 	}
 	// Capture stderr into our own buffer. Because cmd.Stderr is non-nil,
 	// cmd.Output() no longer populates exitErr.Stderr — diagnostics are read
@@ -306,6 +308,22 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 
 // stderrSuffix formats captured child stderr as a trailing ": <text>" clause
 // for a diagnostic error, or the empty string when nothing was captured.
+// appendEnvOverride returns env with every existing "key=" entry removed and a
+// single "key=value" appended. A subprocess resolves a variable to the FIRST
+// matching entry, so a plain append would be shadowed by an inherited value;
+// stripping first guarantees the override actually takes effect.
+func appendEnvOverride(env []string, key, value string) []string {
+	prefix := key + "="
+	out := env[:0:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, prefix+value)
+}
+
 func stderrSuffix(stderrText string) string {
 	if stderrText == "" {
 		return ""
