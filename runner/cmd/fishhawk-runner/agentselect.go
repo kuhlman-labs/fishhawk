@@ -1,12 +1,29 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/codex"
 )
+
+// apiKeyForAgent resolves the host env var carrying the agent's API key,
+// keyed by provider id. claude-code reads ANTHROPIC_API_KEY (the
+// historical default, unchanged); codex reads OPENAI_API_KEY. An
+// unknown id falls back to ANTHROPIC_API_KEY — harmless, since
+// selectInvoker rejects it before the key is used. The customer supplies
+// the key via GitHub Secrets (MVP_SPEC §5.3); the selected adapter
+// forwards it to the child as the provider's expected env var.
+func apiKeyForAgent(agentID string) string {
+	switch agentID {
+	case "codex":
+		return os.Getenv("OPENAI_API_KEY")
+	default:
+		return os.Getenv("ANTHROPIC_API_KEY")
+	}
+}
 
 // errUnknownAgent is the sentinel a caller switches on when the
 // requested agent id matches no known provider. selectInvoker wraps it
@@ -14,35 +31,18 @@ import (
 // runner/agent failure and exits before any agent is invoked.
 var errUnknownAgent = errors.New("agent: unknown provider")
 
-// newCodexInvoker is the seam for the codex provider. It returns a
-// minimal placeholder whose Invoke fails not-implemented; the real
-// codex adapter (tracked separately, #840) replaces this branch. Kept
-// as a var so a future adapter can be wired in one place and tests can
-// assert routing without standing up the real binary.
-var newCodexInvoker = func(_ string) agent.Invoker {
-	return codexPlaceholder{}
-}
-
-// codexPlaceholder is the deferred codex provider. Selection succeeds
-// (selectInvoker returns it with no error), but Invoke returns a
-// category-A not-implemented agent error until the real adapter lands.
-// This keeps codex a recognized provider — distinct from an unknown id
-// that fails fast at selection — so #840 can drop in the concrete
-// adapter without touching the selector's routing contract.
-type codexPlaceholder struct{}
-
-func (codexPlaceholder) Invoke(_ context.Context, _ agent.Invocation) (agent.Result, error) {
-	return agent.Result{
-		OK:              false,
-		FailureCategory: "A",
-		FailureReason:   "codex agent provider not implemented",
-	}, fmt.Errorf("%w: codex provider not implemented", agent.ErrAgentFailed)
+// newCodexInvoker is the seam for the codex provider, wiring the real
+// codex adapter (#840). Kept as a var so the adapter is constructed in
+// one place and tests can swap it for a fake (e.g. redirecting to a
+// fake-binary seam) without standing up the real `codex` binary.
+var newCodexInvoker = func(apiKey string) agent.Invoker {
+	return codex.New(apiKey)
 }
 
 // selectInvoker maps an agent id to a concrete agent.Invoker.
 //
-//	claude-code → the existing claudecode adapter (via the newInvoker seam)
-//	codex       → a deferred placeholder (via the newCodexInvoker seam)
+//	claude-code → the claudecode adapter (via the newInvoker seam)
+//	codex       → the codex adapter (via the newCodexInvoker seam)
 //	(anything)  → errUnknownAgent wrapping the offending id
 //
 // The default agent id is claude-code (set on the --agent flag), so an

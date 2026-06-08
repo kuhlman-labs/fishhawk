@@ -373,7 +373,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
-	invoker, selErr := selectInvoker(cfg.agent, os.Getenv("ANTHROPIC_API_KEY"))
+	invoker, selErr := selectInvoker(cfg.agent, apiKeyForAgent(cfg.agent))
 	if selErr != nil {
 		// Category-A runner/agent failure: the requested provider maps to
 		// no known invoker. Fail fast BEFORE any agent is invoked.

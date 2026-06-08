@@ -35,7 +35,7 @@ inputs:
     description: 'Stage ID within the workflow (e.g. plan, implement, review).'
     required: true
   agent:
-    description: 'Coding-agent provider to invoke (claude-code|codex). Defaults to claude-code. codex is a deferred placeholder until its adapter lands.'
+    description: 'Coding-agent provider to invoke (claude-code|codex). Defaults to claude-code. Both adapters are implemented; codex spawns the Codex CLI in non-interactive exec mode.'
     required: false
     default: 'claude-code'
   prompt-file:
@@ -56,6 +56,10 @@ inputs:
     default: '15m'
   anthropic-api-key:
     description: 'API key forwarded to Claude Code as ANTHROPIC_API_KEY. Customers populate this from a GitHub Secret.'
+    required: false
+    default: ''
+  openai-api-key:
+    description: 'API key forwarded to the Codex CLI as OPENAI_API_KEY when agent=codex. Customers populate this from a GitHub Secret. Unused when agent=claude-code.'
     required: false
     default: ''
   bundle-out:
@@ -122,16 +126,28 @@ runs:
         node-version: '22'
 
     - name: Install Claude Code CLI
+      if: ${{ inputs.agent == 'claude-code' }}
       shell: bash
       run: |
         npm install -g @anthropic-ai/claude-code
         claude --version
+
+    # The Codex CLI is the OpenAI-distributed `codex` binary the codex
+    # adapter (codex.go) invokes by name. Installed only when selected.
+    # v0 pulls latest; pinning is a v1+ concern.
+    - name: Install Codex CLI
+      if: ${{ inputs.agent == 'codex' }}
+      shell: bash
+      run: |
+        npm install -g @openai/codex
+        codex --version
 
     - name: Run fishhawk-runner
       shell: bash
       working-directory: ${{ github.action_path }}
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
       run: |
         go run ./cmd/fishhawk-runner \
           --run-id "${{ inputs.run-id }}" \

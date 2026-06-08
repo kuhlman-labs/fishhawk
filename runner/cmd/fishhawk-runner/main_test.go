@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/codex"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
@@ -677,6 +678,81 @@ func TestRun_AgentFlagStampsBundleManifest(t *testing.T) {
 				t.Errorf("manifest.Agent = %q, want %q", manifest.Agent, tc.wantAgent)
 			}
 		})
+	}
+}
+
+// TestHelperProcessCodex pretends to be the `codex` binary for the
+// cross-boundary test below: it echoes the OPENAI_API_KEY it received in
+// its env as a codex JSONL event, then a clean turn.completed. Gated on
+// GO_HELPER_PROCESS_CODEX so it is a no-op under a normal test run.
+func TestHelperProcessCodex(t *testing.T) {
+	if os.Getenv("GO_HELPER_PROCESS_CODEX") != "1" {
+		return
+	}
+	defer os.Exit(0)
+	fmt.Printf(`{"type":"agent_env","key":"OPENAI_API_KEY","value":%q}`+"\n",
+		os.Getenv("OPENAI_API_KEY"))
+	fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`)
+}
+
+// TestRun_CodexForwardsOpenAIKeyEndToEnd is the cross-boundary assertion
+// (cf. #618): it drives run() with --agent codex through the REAL codex
+// adapter (only the child binary is faked, via the newCodexInvoker seam),
+// and asserts OPENAI_API_KEY flows host-env -> apiKeyForAgent ->
+// selectInvoker -> codex.New -> child-process env. The per-package codex
+// echo_env test covers the adapter->child env composition for all three
+// forwarded vars (OPENAI_API_KEY + the FISHHAWK_* MCP vars); this test
+// adds the selection-layer half that no per-package unit exercises.
+//
+// The sentinel key value is deliberately NOT an `sk-…` shape so the
+// redacted --bundle-out variant we read back doesn't scrub it.
+func TestRun_CodexForwardsOpenAIKeyEndToEnd(t *testing.T) {
+	const sentinel = "openai-sentinel-keyvalue"
+	t.Setenv("OPENAI_API_KEY", sentinel)
+
+	origCodex := newCodexInvoker
+	newCodexInvoker = func(apiKey string) agent.Invoker {
+		c := codex.New(apiKey)
+		c.Cmd = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			cc := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcessCodex")
+			cc.Env = append(os.Environ(), "GO_HELPER_PROCESS_CODEX=1")
+			return cc
+		}
+		return c
+	}
+	t.Cleanup(func() { newCodexInvoker = origCodex })
+
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change",
+		"--stage", "plan",
+		"--prompt-file", promptPath,
+		"--bundle-out", bundlePath,
+		"--agent", "codex",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want %d:\n%s", got, exitOK, stderr.String())
+	}
+
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, err := gunzip(data)
+	if err != nil {
+		t.Fatalf("gunzip: %v", err)
+	}
+	if !strings.Contains(string(text), sentinel) {
+		t.Errorf("bundle missing forwarded OPENAI_API_KEY value %q; the key did not reach the child env:\n%s", sentinel, text)
 	}
 }
 
