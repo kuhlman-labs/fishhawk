@@ -667,6 +667,137 @@ func TestReverifyBranchLineage_FailOpen(t *testing.T) {
 			t.Error("compare error emitted an audit")
 		}
 	})
+
+	t.Run("get run error", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "main", commitsByBase: map[string][]string{"main": {head}}}
+		gh := newReverifyGitHubClient(t, stub, head)
+		runRow := &run.Run{ID: runID, Repo: "x/y", InstallationID: instID(99), PullRequestURL: &prURL}
+		s, _, au, rr := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+		rr.runErr = errors.New("load run boom")
+		if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+			t.Error("get run error should fail open clean")
+		}
+		if foreignViolationCount(au) != 0 {
+			t.Error("get run error emitted an audit")
+		}
+	})
+
+	t.Run("unparseable repo", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "main", commitsByBase: map[string][]string{"main": {head}}}
+		gh := newReverifyGitHubClient(t, stub, head)
+		runRow := &run.Run{ID: runID, Repo: "noslash", InstallationID: instID(99), PullRequestURL: &prURL}
+		s, _, au, _ := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+		if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+			t.Error("unparseable repo should fail open clean")
+		}
+		if foreignViolationCount(au) != 0 {
+			t.Error("unparseable repo emitted an audit")
+		}
+	})
+
+	t.Run("get pull request error", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "main", prStatus: http.StatusInternalServerError,
+			commitsByBase: map[string][]string{"main": {head}}}
+		gh := newReverifyGitHubClient(t, stub, head)
+		runRow := &run.Run{ID: runID, Repo: "x/y", InstallationID: instID(99), PullRequestURL: &prURL}
+		s, _, au, _ := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+		if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+			t.Error("get pull request error should fail open clean")
+		}
+		if foreignViolationCount(au) != 0 {
+			t.Error("get pull request error emitted an audit")
+		}
+	})
+
+	t.Run("no pr number and no pr url", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "main", commitsByBase: map[string][]string{"main": {head}}}
+		gh := newReverifyGitHubClient(t, stub, head)
+		// prNumber=0 and PullRequestURL nil => no anchor; fail open before
+		// any GitHub call.
+		runRow := &run.Run{ID: runID, Repo: "x/y", InstallationID: instID(99)}
+		s, _, au, _ := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+		if clean := s.ReverifyBranchLineage(context.Background(), runID, 0); !clean {
+			t.Error("missing pr number/url should fail open clean")
+		}
+		if foreignViolationCount(au) != 0 {
+			t.Error("missing pr number/url emitted an audit")
+		}
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		if stub.prCalled || stub.compareCalled {
+			t.Error("missing pr number/url made a GitHub call; expected early fail-open")
+		}
+	})
+}
+
+// categoryErrAudit wraps auditFake to fail ListForRunByCategory for the
+// named categories while leaving every other category readable (the embedded
+// fake answers them). This lets a test fail JUST the merge-resolution dedup
+// read of invariant_violation (#862) without also breaking the lineage-ledger
+// category reads — the plain auditFake's listByCategoryErr fails all reads.
+// AppendChained/seeded still flow through the embedded fake, so
+// foreignViolationCount(au) observes the emit.
+type categoryErrAudit struct {
+	*auditFake
+	errFor map[string]error
+}
+
+func (c *categoryErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if err := c.errFor[category]; err != nil {
+		return nil, err
+	}
+	return c.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestReverifyBranchLineage_DedupReadErrorProceedsToEmit covers the
+// foreignCommitAlreadyRecorded read-error fail-open: when the dedup read of
+// the invariant_violation category fails, the guard cannot prove the
+// contamination is already on record, so it proceeds with the emit (a
+// duplicate emit is preferable to suppressing a genuine violation). The
+// lineage-ledger reads still succeed (only the invariant_violation category
+// read fails), so detection reaches the dedup check rather than failing open
+// at the ledger. A matching prior entry is seeded that WOULD dedup if the
+// read succeeded — proving the emit is driven by the read error, not absence.
+func TestReverifyBranchLineage_DedupReadErrorProceedsToEmit(t *testing.T) {
+	runID := uuid.New()
+	const head = "1111111111111111111111111111111111111111" // foreign live tip, not in ledger
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {head}},
+	}
+	gh := newReverifyGitHubClient(t, stub, head)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	stage := &run.Stage{ID: uuid.New(), RunID: runID}
+	s, _, au, _ := newLineageServer(t, gh, runRow, stage)
+	// A matching prior violation that would dedup the emit IF the read
+	// succeeded — so a non-emit here could only mean the read worked.
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: invariantmonitor.CategoryInvariantViolation,
+		Payload: json.RawMessage(fmt.Sprintf(
+			`{"kind":%q,"offending_sha":%q,"head_sha":%q}`,
+			invariantmonitor.KindForeignCommitOnBranch, head, head)),
+	})
+	// Fail ONLY the dedup read; leave the lineage-ledger categories readable
+	// so detection completes and reaches foreignCommitAlreadyRecorded. The
+	// wrapper delegates every other category to au, so AppendChained + seeded
+	// still flow through au and foreignViolationCount(au) sees the emit.
+	s.cfg.AuditRepo = &categoryErrAudit{
+		auditFake: au,
+		errFor: map[string]error{
+			invariantmonitor.CategoryInvariantViolation: errors.New("dedup read boom"),
+		},
+	}
+
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); clean {
+		t.Fatal("expected clean=false for a foreign tip")
+	}
+	if got := foreignViolationCount(au); got != 1 {
+		t.Fatalf("dedup read-error path: audit count = %d, want 1 (proceed-with-emit)", got)
+	}
 }
 
 // TestReverifyBranchLineage_Idempotent is the binding-condition test: two
@@ -707,8 +838,8 @@ func TestReverifyBranchLineage_Idempotent(t *testing.T) {
 	stub.mu.Lock()
 	stub.baseRef = "main"
 	stub.commitsByBase = map[string][]string{"main": {head2}}
-	stub.mu.Unlock()
 	stub.headSHA = head2
+	stub.mu.Unlock()
 	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); clean {
 		t.Fatal("different-SHA call: expected clean=false")
 	}
