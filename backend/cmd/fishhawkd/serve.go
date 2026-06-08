@@ -25,6 +25,7 @@ import (
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -65,6 +66,98 @@ const defaultPlanReviewTimeout = 300 * time.Second
 // capturing startup logs (#664).
 func planReviewTimeoutBelowDefault(configured time.Duration) bool {
 	return configured < defaultPlanReviewTimeout
+}
+
+// planReviewerOptions carries the resolved flag/env values that select and
+// configure the plan-review adapter. Grouping them lets resolvePlanReviewer be
+// a pure function the selection-seam test can drive without booting a server.
+type planReviewerOptions struct {
+	anthropicAPIKey           string
+	planReviewModel           string
+	enableLocalClaudeReviewer bool
+	localClaudeBinary         string
+	localClaudeModel          string
+	enableCodexReviewer       bool
+	codexBinary               string
+	codexModel                string
+	openAIAPIKey              string
+	planReviewMaxTokens       int
+	planReviewMaxRetries      int
+	planReviewTimeout         time.Duration
+}
+
+// resolvePlanReviewer selects the plan-review adapter from opts and logs which
+// one is active at startup. Selection precedence (v0-minimal, deployment-level
+// opt-in flags — no `reviewers` spec field):
+//
+//  1. opts.anthropicAPIKey set → anthropic.Reviewer (production SDK adapter, #572).
+//  2. else opts.enableLocalClaudeReviewer → claudecode.Reviewer (local-mode
+//     subprocess adapter, #575): reuses the operator's existing `claude` auth.
+//  3. else opts.enableCodexReviewer → codex.Reviewer (Codex subprocess adapter,
+//     #844): the 'Claude main, Codex reviewer' topology.
+//  4. else nil — review invocations are skipped regardless of the spec's
+//     reviewers.agent value (#574 / ADR-027).
+//
+// It returns a literal nil interface in the default case (never a typed-nil), so
+// the server's `cfg.PlanReviewer == nil` guard stays correct.
+func resolvePlanReviewer(opts planReviewerOptions, logger *slog.Logger) server.PlanReviewer {
+	switch {
+	case opts.anthropicAPIKey != "":
+		logger.Info("plan review agent configured",
+			slog.String("adapter", "anthropic"),
+			slog.String("model", opts.planReviewModel),
+			slog.Int("max_tokens", opts.planReviewMaxTokens),
+			slog.Duration("timeout", opts.planReviewTimeout))
+		return anthropic.NewReviewer(anthropic.Config{
+			APIKey:    opts.anthropicAPIKey,
+			Model:     opts.planReviewModel,
+			MaxTokens: opts.planReviewMaxTokens,
+			Timeout:   opts.planReviewTimeout,
+		})
+	case opts.enableLocalClaudeReviewer:
+		reviewer := claudecode.NewReviewer(claudecode.Config{
+			Binary:    opts.localClaudeBinary,
+			Model:     opts.localClaudeModel,
+			MaxTokens: opts.planReviewMaxTokens,
+			Timeout:   opts.planReviewTimeout,
+		})
+		// Apply the env-resolved retry budget past NewClient's zero->1
+		// normalisation: an explicit 0 means retry disabled (single attempt),
+		// which the constructor alone cannot express.
+		reviewer.SetMaxRetries(opts.planReviewMaxRetries)
+		logger.Info("plan review agent configured",
+			slog.String("adapter", "claudecode"),
+			slog.String("binary", opts.localClaudeBinary),
+			slog.String("model", opts.localClaudeModel),
+			slog.Int("max_tokens", opts.planReviewMaxTokens),
+			slog.Int("max_retries", opts.planReviewMaxRetries),
+			slog.Duration("timeout", opts.planReviewTimeout))
+		return reviewer
+	case opts.enableCodexReviewer:
+		reviewer := codex.NewReviewer(codex.Config{
+			Binary:    opts.codexBinary,
+			APIKey:    opts.openAIAPIKey,
+			Model:     opts.codexModel,
+			MaxTokens: opts.planReviewMaxTokens,
+			Timeout:   opts.planReviewTimeout,
+		})
+		reviewer.SetMaxRetries(opts.planReviewMaxRetries)
+		logger.Info("plan review agent configured",
+			slog.String("adapter", "codex"),
+			slog.String("binary", opts.codexBinary),
+			slog.String("model", opts.codexModel),
+			slog.Int("max_tokens", opts.planReviewMaxTokens),
+			slog.Int("max_retries", opts.planReviewMaxRetries),
+			slog.Duration("timeout", opts.planReviewTimeout))
+		return reviewer
+	default:
+		// #574 / ADR-027: tightened from the plain "gateless" warning so the
+		// operator can predict what a workflow declaring reviewers.agent > 0
+		// will do with no reviewer wired — fail dispatch up front in gating
+		// mode, skip with an audit trail in advisory mode.
+		logger.Warn("plan-review agent not configured (set FISHHAWKD_ANTHROPIC_API_KEY, or FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER for local mode, to enable); any workflow declaring reviewers.agent > 0 will fail dispatch in gating mode and skip with a plan_review_skipped audit entry in advisory mode")
+		return nil
+	}
 }
 
 // resolveBudgetLocation resolves an IANA timezone name to a
@@ -187,14 +280,26 @@ func runServe(args []string, logSink io.Writer) int {
 	localClaudeModel := fs.String("local-claude-model",
 		envOr("FISHHAWKD_LOCAL_CLAUDE_MODEL", "claude-sonnet-4-6"),
 		"model the local-mode `claude` CLI uses for plan review; used only when --enable-local-claude-reviewer is set")
+	enableCodexReviewer := fs.Bool("enable-codex-reviewer",
+		envOr("FISHHAWKD_ENABLE_CODEX_REVIEWER", "false") == "true",
+		"opt-in Codex plan review: spawn the `codex` CLI as a subprocess for advisory review. Lower precedence than --anthropic-api-key and --enable-local-claude-reviewer. Off by default")
+	codexBinary := fs.String("codex-reviewer-binary",
+		envOr("FISHHAWKD_CODEX_BINARY", "codex"),
+		"executable name or path for the Codex reviewer CLI; used only when --enable-codex-reviewer is set")
+	codexModel := fs.String("codex-reviewer-model",
+		envOr("FISHHAWKD_CODEX_MODEL", ""),
+		"model identifier recorded for Codex reviewer invocations (the self-review guard compares it to the plan's GeneratedBy.Model); used only when --enable-codex-reviewer is set")
+	openAIAPIKey := fs.String("openai-api-key",
+		envOr("FISHHAWKD_OPENAI_API_KEY", ""),
+		"OpenAI API key forwarded as OPENAI_API_KEY to the Codex reviewer subprocess; empty is fine when Codex is authenticated via a ChatGPT login on the host")
 	planReviewMaxTokens := fs.Int("plan-review-max-tokens",
 		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_TOKENS", 4096),
 		"maximum tokens for plan-review agent responses")
 	planReviewMaxRetries := fs.Int("plan-review-max-retries",
 		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_RETRIES", 1),
-		"in-adapter retry budget for the local-mode `claude` reviewer's transient-crash class (#620); "+
+		"in-adapter retry budget for the subprocess reviewers' transient-crash class (#620); "+
 			"counts retries not attempts (N => N+1 attempts), 0 disables retry (single attempt), unset defaults to 1. "+
-			"Used only by the claudecode adapter — the anthropic SDK adapter has no retry field")
+			"Used by the claudecode and codex adapters — the anthropic SDK adapter has no retry field")
 	planReviewTimeout := fs.Duration("plan-review-timeout",
 		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", defaultPlanReviewTimeout),
 		"FLOOR of the size-aware review budget (#747): the minimum per-invocation bound for "+
@@ -258,54 +363,22 @@ func runServe(args []string, logSink io.Writer) int {
 
 	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget}
 
-	// Plan-review agent wiring. Selection precedence (each branch logs which
-	// adapter is active at startup):
-	//   1. --anthropic-api-key set → anthropic.Reviewer (production SDK adapter, #572).
-	//   2. else --enable-local-claude-reviewer → claudecode.Reviewer (local-mode
-	//      subprocess adapter, #575): reuses the operator's existing `claude`
-	//      CLI auth, no API key needed.
-	//   3. else PlanReviewer stays nil and review invocations are skipped
-	//      regardless of the spec's reviewers.agent value.
-	switch {
-	case *anthropicAPIKey != "":
-		cfg.PlanReviewer = anthropic.NewReviewer(anthropic.Config{
-			APIKey:    *anthropicAPIKey,
-			Model:     *planReviewModel,
-			MaxTokens: *planReviewMaxTokens,
-			Timeout:   *planReviewTimeout,
-		})
-		logger.Info("plan review agent configured",
-			slog.String("adapter", "anthropic"),
-			slog.String("model", *planReviewModel),
-			slog.Int("max_tokens", *planReviewMaxTokens),
-			slog.Duration("timeout", *planReviewTimeout))
-	case *enableLocalClaudeReviewer:
-		reviewer := claudecode.NewReviewer(claudecode.Config{
-			Binary:    *localClaudeBinary,
-			Model:     *localClaudeModel,
-			MaxTokens: *planReviewMaxTokens,
-			Timeout:   *planReviewTimeout,
-		})
-		// Apply the env-resolved retry budget past NewClient's zero->1
-		// normalisation: an explicit 0 means retry disabled (single
-		// attempt), which the constructor alone cannot express.
-		reviewer.SetMaxRetries(*planReviewMaxRetries)
-		cfg.PlanReviewer = reviewer
-		logger.Info("plan review agent configured",
-			slog.String("adapter", "claudecode"),
-			slog.String("binary", *localClaudeBinary),
-			slog.String("model", *localClaudeModel),
-			slog.Int("max_tokens", *planReviewMaxTokens),
-			slog.Int("max_retries", *planReviewMaxRetries),
-			slog.Duration("timeout", *planReviewTimeout))
-	default:
-		// #574 / ADR-027: tightened from the plain "gateless" warning so
-		// the operator can predict what a workflow declaring
-		// reviewers.agent > 0 will do with no reviewer wired — fail
-		// dispatch up front in gating mode, skip with an audit trail in
-		// advisory mode.
-		logger.Warn("plan-review agent not configured (set FISHHAWKD_ANTHROPIC_API_KEY, or FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER for local mode, to enable); any workflow declaring reviewers.agent > 0 will fail dispatch in gating mode and skip with a plan_review_skipped audit entry in advisory mode")
-	}
+	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
+	// (which adapter the flags pick) is unit-testable without booting a server.
+	cfg.PlanReviewer = resolvePlanReviewer(planReviewerOptions{
+		anthropicAPIKey:           *anthropicAPIKey,
+		planReviewModel:           *planReviewModel,
+		enableLocalClaudeReviewer: *enableLocalClaudeReviewer,
+		localClaudeBinary:         *localClaudeBinary,
+		localClaudeModel:          *localClaudeModel,
+		enableCodexReviewer:       *enableCodexReviewer,
+		codexBinary:               *codexBinary,
+		codexModel:                *codexModel,
+		openAIAPIKey:              *openAIAPIKey,
+		planReviewMaxTokens:       *planReviewMaxTokens,
+		planReviewMaxRetries:      *planReviewMaxRetries,
+		planReviewTimeout:         *planReviewTimeout,
+	}, logger)
 
 	// Wire the run repository when a DB URL is supplied. Without
 	// one the server still boots — /healthz works and any
