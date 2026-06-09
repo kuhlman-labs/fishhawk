@@ -6156,6 +6156,111 @@ func TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater(t *tes
 	}
 }
 
+// TestVerifyGate_StripsRunnerCredsFromSubprocess is the ADR-029 #650 item 4
+// seam test for the working-tree verify gate (#618 cross-boundary rule): it
+// plants a sentinel runner secret in the process env, drives the REAL
+// runVerifyGate exec site with an env-printing verifyCmd, and asserts the
+// sentinel is absent from the captured subprocess output while PATH survives.
+// A correct sanitizeEnv with a call site that forgot `cmd.Env =` would leak
+// here — a unit test on sanitizeEnv alone would pass while the seam leaks.
+func TestVerifyGate_StripsRunnerCredsFromSubprocess(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	const canary = "leak-canary-verifygate"
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", canary)
+
+	ev, err := runVerifyGate(context.Background(), config{verifyCmd: "env"}, io.Discard)
+	if err != nil {
+		t.Fatalf("env should exit 0, got %v\npayload: %s", err, ev.Payload)
+	}
+	out := string(ev.Payload)
+	if strings.Contains(out, canary) {
+		t.Errorf("runVerifyGate leaked the runner secret into the gate subprocess env:\n%s", out)
+	}
+	if !strings.Contains(out, "PATH=") {
+		t.Errorf("PATH must be preserved in the gate env; payload:\n%s", out)
+	}
+}
+
+// TestVerifyCommittedTree_StripsRunnerCredsFromSubprocess is the structural
+// twin of TestVerifyGate_StripsRunnerCredsFromSubprocess for the committed-tree
+// verify exec site (runVerifyCommittedTree): the same canary-absent seam
+// assertion, so a forgotten `cmd.Env =` at THAT site also fails the suite.
+func TestVerifyCommittedTree_StripsRunnerCredsFromSubprocess(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	const canary = "leak-canary-committedtree"
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", canary)
+
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "f.txt"), "seed\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "seed commit")
+	head := gitHead(t, repo)
+
+	_, out, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute)
+	if strings.Contains(out, canary) {
+		t.Errorf("runVerifyCommittedTree leaked the runner secret into the gate subprocess env:\n%s", out)
+	}
+	if !strings.Contains(out, "PATH=") {
+		t.Errorf("PATH must be preserved in the gate env; output:\n%s", out)
+	}
+}
+
+// TestVerifyCommittedTreeCompiles_GateSubprocessEnvStripped covers the
+// go-toolchain gate exec sites (go work edit / go vet / go test inside
+// verifyCommittedTreeCompiles). It plants a sentinel runner secret, then
+// commits a probe test that FAILS if `go test` can see FISHHAWK_GITHUB_TOKEN.
+// With the token stripped from the gate env the probe passes and the gate
+// returns nil; a forgotten `cmd.Env =` at the testCmd site would let the probe
+// see the token, fail, and red-line the gate — so this seam test catches a
+// leak at the committed-tree compile/test sites.
+func TestVerifyCommittedTreeCompiles_GateSubprocessEnvStripped(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	const canary = "leak-canary-committedcompile"
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", canary)
+
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "probe.go"),
+		"package mod\n\nfunc Noop() {}\n")
+	// The probe test fails iff the gate subprocess inherited the runner token.
+	mustWrite(t, filepath.Join(repo, "mod", "probe_test.go"),
+		"package mod\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\n"+
+			"func TestNoRunnerToken(t *testing.T) {\n"+
+			"\tif v := os.Getenv(\"FISHHAWK_GITHUB_TOKEN\"); v != \"\" {\n"+
+			"\t\tt.Fatalf(\"gate subprocess saw runner token: %q\", v)\n\t}\n}\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "env-leak probe")
+	head := gitHead(t, repo)
+
+	var log bytes.Buffer
+	// Non-empty drift so the gate runs past the no-drift fast path; scope names
+	// the touched package so the test phase actually runs probe_test.go.
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head,
+		[]string{"README.md"}, []string{"mod/probe.go", "mod/probe_test.go"}, &log)
+	if err != nil {
+		t.Fatalf("gate must pass with the runner token stripped from the gate env, got %v\nlog: %s", err, log.String())
+	}
+	if strings.Contains(log.String(), canary) {
+		t.Errorf("canary leaked into gate output:\n%s", log.String())
+	}
+}
+
 // TestVerifyCommittedTreeTests_DriftExcludedFailureBlocks is the #800/#780
 // proof: a committed tree that COMPILES (go vet passes) but has a FAILING
 // test in a touched package because a helper file was excluded as scope

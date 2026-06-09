@@ -1586,6 +1586,10 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 	defer childCancel()
 
 	cmd := exec.CommandContext(childCtx, "sh", "-c", cfg.verifyCmd)
+	// Strip runner credentials from the gate subprocess env (ADR-029 #650
+	// item 4): the verify command runs agent-authored code, so it must not
+	// see the installation token / API keys / MCP token.
+	cmd.Env = sanitizedGateEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
@@ -2022,6 +2026,9 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	defer childCancel()
 	cmd := exec.CommandContext(childCtx, "sh", "-c", verifyCmd)
 	cmd.Dir = wt
+	// Strip runner credentials from the gate subprocess env (ADR-029 #650
+	// item 4): the committed-tree verify command runs agent-authored code.
+	cmd.Env = sanitizedGateEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
@@ -2335,6 +2342,9 @@ func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, d
 	// Enumerate the workspace modules from the committed go.work.
 	workCmd := exec.CommandContext(ctx, "go", "work", "edit", "-json")
 	workCmd.Dir = wt
+	// Gate subprocess running on the committed agent tree — strip runner
+	// credentials from its env (ADR-029 #650 item 4).
+	workCmd.Env = sanitizedGateEnv()
 	workOut, err := workCmd.Output()
 	if err != nil {
 		// `go` missing (exec start error) or `go work edit` failure — infra,
@@ -2358,6 +2368,7 @@ func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, d
 	for _, m := range workspace.Use {
 		vetCmd := exec.CommandContext(ctx, "go", "vet", "./...")
 		vetCmd.Dir = filepath.Join(wt, m.DiskPath)
+		vetCmd.Env = sanitizedGateEnv()
 		out, verr := vetCmd.CombinedOutput()
 		if verr == nil {
 			continue
@@ -2406,6 +2417,7 @@ func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, d
 		}
 		testCmd := exec.CommandContext(ctx, "go", append([]string{"test"}, pkgArgs...)...)
 		testCmd.Dir = filepath.Join(wt, m.DiskPath)
+		testCmd.Env = sanitizedGateEnv()
 		out, terr := testCmd.CombinedOutput()
 		if terr == nil {
 			continue
