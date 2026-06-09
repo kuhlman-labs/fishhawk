@@ -778,6 +778,40 @@ func TestBuild_Plan_ScopeFilesShapeGuidance(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_CouplingDiscoveryChecklist(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 950,
+		IssueTitle:  "Plan a coupled change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Coupling-discovery checklist",
+		"SAME package",
+		"registry, count, or enum",
+		"docs/api/v0.openapi.yaml",
+		"docs/api/v0.md",
+		"README.md",
+		"callers' tests",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing coupling-discovery guidance %q\n---\n%s", w, got)
+		}
+	}
+
+	// The checklist is plan-stage only — it must not bleed into the implement prompt.
+	impl, err := Build("implement", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build implement: %v", err)
+	}
+	if strings.Contains(impl, "Coupling-discovery checklist") {
+		t.Errorf("coupling-discovery checklist must not render in the implement prompt:\n%s", impl)
+	}
+}
+
 func TestBuild_Plan_ContainsIncrementalVerification(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		Source:      "github_issue",
