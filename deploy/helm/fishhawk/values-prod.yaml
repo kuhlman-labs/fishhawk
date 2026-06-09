@@ -32,3 +32,22 @@ config:
   # to override the derived value (e.g. a separate SPA origin for externalUrl).
   externalUrl: ""
   oauthCallbackUrl: ""
+
+# Split topology for horizontal scale-out (commented; allInOne is the default).
+# Uncomment to run a multi-replica API tier plus a single-replica worker tier.
+# The api pods run no background workers (every FISHHAWKD_ENABLE_* is forced off)
+# and dedup webhook deliveries via the Postgres store, so they scale safely; the
+# `-worker` Deployment stays at one replica (the worker singleton invariant,
+# #851). Enable the worker toggles you need under `workers:` — they take effect
+# only on the worker pod.
+# deployment:
+#   mode: split
+#   api:
+#     replicaCount: 3
+# workers:
+#   slaTimer: true
+#   dispatchWatchdog: true
+#   reactionPoller: true
+#   mergeReconciler: true
+#   childCompletionSweeper: true
+#   invariantMonitor: true

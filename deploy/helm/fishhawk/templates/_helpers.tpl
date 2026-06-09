@@ -29,23 +29,39 @@ Chart name and version, as used by the chart label.
 {{- end -}}
 
 {{/*
-Common labels.
+Common labels. Accepts either the chart root context (`.`) — the back-compat
+call shape, byte-identical to the pre-split output — or a dict
+`(dict "root" $ "role" R)` so split-mode Deployments stamp an
+`app.kubernetes.io/component` label (threaded through fishhawk.selectorLabels).
 */}}
 {{- define "fishhawk.labels" -}}
-helm.sh/chart: {{ include "fishhawk.chart" . }}
+{{- $root := . -}}
+{{- if hasKey . "root" -}}{{- $root = .root -}}{{- end -}}
+helm.sh/chart: {{ include "fishhawk.chart" $root }}
 {{ include "fishhawk.selectorLabels" . }}
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- if $root.Chart.AppVersion }}
+app.kubernetes.io/version: {{ $root.Chart.AppVersion | quote }}
 {{- end }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/managed-by: {{ $root.Release.Service }}
 {{- end -}}
 
 {{/*
-Selector labels.
+Selector labels. Accepts either the chart root context (`.`) — emitting the bare
+two-label set (byte-identical to the allInOne / pre-split call sites) — or a dict
+`(dict "root" $ "role" R)` where a non-empty role (api|worker) adds an
+`app.kubernetes.io/component: <role>` label. The component label lets the split-
+mode Service select only the api pods, excluding the worker pod from its
+endpoints.
 */}}
 {{- define "fishhawk.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "fishhawk.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+{{- $root := . -}}
+{{- $role := "" -}}
+{{- if hasKey . "root" -}}{{- $root = .root -}}{{- $role = .role -}}{{- end -}}
+app.kubernetes.io/name: {{ include "fishhawk.name" $root }}
+app.kubernetes.io/instance: {{ $root.Release.Name }}
+{{- if $role }}
+app.kubernetes.io/component: {{ $role }}
+{{- end }}
 {{- end -}}
 
 {{/*
@@ -120,4 +136,127 @@ any profile. The message names the offending toggle and the override required.
 {{- if and (eq .Values.secrets.mode "externalSecrets") (not .Values.secrets.externalSecrets.secretStoreRef.name) -}}
 {{- fail "secrets.mode=externalSecrets requires secrets.externalSecrets.secretStoreRef.name to be set (the SecretStore/ClusterSecretStore the ExternalSecret reads from)." -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+Topology guard (#851). `include`d once from deployment.yaml (the allInOne
+Deployment), so it runs on every allInOne render. Calls `fail` when
+deployment.mode=allInOne is combined with replicaCount>1 AND any worker toggle is
+on — that would run duplicate background-worker singletons (SLA timer, dispatch
+watchdog, reaction poller, merge reconciler, child-completion sweeper, invariant
+monitor), racing the timers/reconcilers. The message names an offending toggle
+and the two safe ways out (split mode, or replicaCount=1). NOTE: this guard has
+no split-mode include site — deployment.yaml does not render in split mode, so a
+future split-mode render-time guard must be wired into deployment-worker.yaml /
+deployment-api.yaml instead (see the comment in deployment-worker.yaml).
+*/}}
+{{- define "fishhawk.validateTopology" -}}
+{{- if eq .Values.deployment.mode "allInOne" -}}
+{{- if gt (int .Values.replicaCount) 1 -}}
+{{- $offending := "" -}}
+{{- range $k, $v := .Values.workers -}}
+{{- if and $v (not $offending) -}}{{- $offending = printf "workers.%s" $k -}}{{- end -}}
+{{- end -}}
+{{- if $offending -}}
+{{- fail (printf "deployment.mode=allInOne with replicaCount=%d and an enabled worker toggle (%s) would run duplicate background-worker singletons and race the timers/reconcilers. Either set deployment.mode=split to scale the API tier (workers stay on a single -worker Deployment), or keep replicaCount=1." (int .Values.replicaCount) $offending) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+fishhawkd pod spec — the single source of truth for the pod template shared by
+the allInOne Deployment (role "all"), the split-mode `-api` Deployment (role
+"api"), and the split-mode `-worker` Deployment (role "worker"). Invoke with a
+dict `(dict "root" $ "role" R)`; the chart root is threaded explicitly via the
+`root` key rather than relying on `.`. The only role-dependent output is the
+FISHHAWKD_ENABLE_* worker env: role "api" forces every toggle to "false" (the api
+tier runs no background workers); roles "all" and "worker" honor .Values.workers.*.
+*/}}
+{{- define "fishhawk.fishhawkdPodSpec" -}}
+{{- $root := .root -}}
+{{- $role := .role -}}
+containers:
+  - name: fishhawkd
+    image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag | default $root.Chart.AppVersion }}"
+    imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+    ports:
+      - name: http
+        containerPort: 8080
+        protocol: TCP
+    envFrom:
+      # Non-secret FISHHAWKD_* env.
+      - configMapRef:
+          name: {{ include "fishhawk.fullname" $root }}-config
+      # Sensitive FISHHAWKD_* env (DB URL, API keys, OAuth secret, webhook
+      # secret, AWS creds). Name resolved by fishhawk.secretName across all
+      # three secrets modes (#849); optional:false means the pod fails loud
+      # if it's absent. The GitHub App private key lives in the SAME Secret
+      # under a dotted key, which envFrom skips — it is mounted as a file
+      # (see volumes/volumeMounts below), never injected as env.
+      - secretRef:
+          name: {{ include "fishhawk.secretName" $root }}
+    env:
+      {{- if $root.Values.postgres.enabled }}
+      # In-cluster Postgres (postgres.enabled). A container-level env entry
+      # overrides the same key arriving via the existingSecret envFrom, so
+      # this URL is authoritative for the local stack without editing the
+      # secret. sslmode=disable matches the plaintext in-cluster Service.
+      - name: FISHHAWKD_DATABASE_URL
+        value: "postgres://{{ $root.Values.postgres.auth.user }}:{{ $root.Values.postgres.auth.password }}@{{ include "fishhawk.fullname" $root }}-postgres:{{ $root.Values.postgres.service.port }}/{{ $root.Values.postgres.auth.database }}?sslmode=disable"
+      {{- end }}
+      # Background-worker enable toggles → FISHHAWKD_ENABLE_*. Role "api" forces
+      # every toggle off (workers run only on the allInOne pod or the -worker
+      # Deployment); roles "all" and "worker" honor .Values.workers.*.
+      - name: FISHHAWKD_ENABLE_SLA_TIMER
+        value: {{ if eq $role "api" }}"false"{{ else }}{{ $root.Values.workers.slaTimer | quote }}{{ end }}
+      - name: FISHHAWKD_ENABLE_DISPATCH_WATCHDOG
+        value: {{ if eq $role "api" }}"false"{{ else }}{{ $root.Values.workers.dispatchWatchdog | quote }}{{ end }}
+      - name: FISHHAWKD_ENABLE_REACTION_POLLER
+        value: {{ if eq $role "api" }}"false"{{ else }}{{ $root.Values.workers.reactionPoller | quote }}{{ end }}
+      - name: FISHHAWKD_ENABLE_MERGE_RECONCILER
+        value: {{ if eq $role "api" }}"false"{{ else }}{{ $root.Values.workers.mergeReconciler | quote }}{{ end }}
+      - name: FISHHAWKD_ENABLE_CHILD_COMPLETION_SWEEPER
+        value: {{ if eq $role "api" }}"false"{{ else }}{{ $root.Values.workers.childCompletionSweeper | quote }}{{ end }}
+      - name: FISHHAWKD_ENABLE_INVARIANT_MONITOR
+        value: {{ if eq $role "api" }}"false"{{ else }}{{ $root.Values.workers.invariantMonitor | quote }}{{ end }}
+    livenessProbe:
+      httpGet:
+        path: {{ $root.Values.probes.liveness.path }}
+        port: http
+      initialDelaySeconds: {{ $root.Values.probes.liveness.initialDelaySeconds }}
+      periodSeconds: {{ $root.Values.probes.liveness.periodSeconds }}
+      timeoutSeconds: {{ $root.Values.probes.liveness.timeoutSeconds }}
+      failureThreshold: {{ $root.Values.probes.liveness.failureThreshold }}
+    readinessProbe:
+      httpGet:
+        path: {{ $root.Values.probes.readiness.path }}
+        port: http
+      initialDelaySeconds: {{ $root.Values.probes.readiness.initialDelaySeconds }}
+      periodSeconds: {{ $root.Values.probes.readiness.periodSeconds }}
+      timeoutSeconds: {{ $root.Values.probes.readiness.timeoutSeconds }}
+      failureThreshold: {{ $root.Values.probes.readiness.failureThreshold }}
+    resources:
+      {{- toYaml $root.Values.resources | nindent 6 }}
+    {{- if $root.Values.secrets.githubApp.privateKeyFile.enabled }}
+    volumeMounts:
+      # GitHub App private key, projected read-only as a single file from
+      # the Secret (fishhawk.secretName). subPath mounts just the file, so
+      # the rest of the directory is untouched.
+      - name: github-app-private-key
+        mountPath: {{ $root.Values.secrets.githubApp.privateKeyFile.mountPath | quote }}
+        subPath: {{ $root.Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
+        readOnly: true
+    {{- end }}
+{{- if $root.Values.secrets.githubApp.privateKeyFile.enabled }}
+volumes:
+  - name: github-app-private-key
+    secret:
+      secretName: {{ include "fishhawk.secretName" $root }}
+      items:
+        # Project ONLY the PEM key to the mount path's basename. The dotted
+        # secretKey is skipped by envFrom but surfaced here as a file.
+        - key: {{ $root.Values.secrets.githubApp.privateKeyFile.secretKey | quote }}
+          path: {{ $root.Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
+{{- end }}
 {{- end -}}

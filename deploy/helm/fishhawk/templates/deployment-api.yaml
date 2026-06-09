@@ -1,0 +1,29 @@
+{{- if eq .Values.deployment.mode "split" -}}
+{{/*
+Split-mode API tier. Horizontally scalable (deployment.api.replicaCount): every
+FISHHAWKD_ENABLE_* is forced off (role "api"), so these pods serve HTTP + the
+GitHub webhook receiver only. Webhook delivery dedup is shared across replicas
+via the Postgres store whenever FISHHAWKD_DATABASE_URL is set (serve.go), so
+multi-replica is safe. The Service selects only these pods (component=api). The
+secret guard lives here too: deployment.yaml (which carries validateSecrets) does
+not render in split mode, so it must run on a template that does.
+*/}}
+{{- include "fishhawk.validateSecrets" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-api
+  labels:
+    {{- include "fishhawk.labels" (dict "root" . "role" "api") | nindent 4 }}
+spec:
+  replicas: {{ .Values.deployment.api.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "fishhawk.selectorLabels" (dict "root" . "role" "api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fishhawk.selectorLabels" (dict "root" . "role" "api") | nindent 8 }}
+    spec:
+      {{- include "fishhawk.fishhawkdPodSpec" (dict "root" . "role" "api") | nindent 6 }}
+{{- end -}}

@@ -1,4 +1,6 @@
+{{- if eq .Values.deployment.mode "allInOne" -}}
 {{- include "fishhawk.validateSecrets" . -}}
+{{- include "fishhawk.validateTopology" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,84 +17,5 @@ spec:
       labels:
         {{- include "fishhawk.selectorLabels" . | nindent 8 }}
     spec:
-      containers:
-        - name: fishhawkd
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-            - name: http
-              containerPort: 8080
-              protocol: TCP
-          envFrom:
-            # Non-secret FISHHAWKD_* env.
-            - configMapRef:
-                name: {{ include "fishhawk.fullname" . }}-config
-            # Sensitive FISHHAWKD_* env (DB URL, API keys, OAuth secret, webhook
-            # secret, AWS creds). Name resolved by fishhawk.secretName across all
-            # three secrets modes (#849); optional:false means the pod fails loud
-            # if it's absent. The GitHub App private key lives in the SAME Secret
-            # under a dotted key, which envFrom skips — it is mounted as a file
-            # (see volumes/volumeMounts below), never injected as env.
-            - secretRef:
-                name: {{ include "fishhawk.secretName" . }}
-          env:
-            {{- if .Values.postgres.enabled }}
-            # In-cluster Postgres (postgres.enabled). A container-level env entry
-            # overrides the same key arriving via the existingSecret envFrom, so
-            # this URL is authoritative for the local stack without editing the
-            # secret. sslmode=disable matches the plaintext in-cluster Service.
-            - name: FISHHAWKD_DATABASE_URL
-              value: "postgres://{{ .Values.postgres.auth.user }}:{{ .Values.postgres.auth.password }}@{{ include "fishhawk.fullname" . }}-postgres:{{ .Values.postgres.service.port }}/{{ .Values.postgres.auth.database }}?sslmode=disable"
-            {{- end }}
-            # Background-worker enable toggles → FISHHAWKD_ENABLE_*.
-            - name: FISHHAWKD_ENABLE_SLA_TIMER
-              value: {{ .Values.workers.slaTimer | quote }}
-            - name: FISHHAWKD_ENABLE_DISPATCH_WATCHDOG
-              value: {{ .Values.workers.dispatchWatchdog | quote }}
-            - name: FISHHAWKD_ENABLE_REACTION_POLLER
-              value: {{ .Values.workers.reactionPoller | quote }}
-            - name: FISHHAWKD_ENABLE_MERGE_RECONCILER
-              value: {{ .Values.workers.mergeReconciler | quote }}
-            - name: FISHHAWKD_ENABLE_CHILD_COMPLETION_SWEEPER
-              value: {{ .Values.workers.childCompletionSweeper | quote }}
-            - name: FISHHAWKD_ENABLE_INVARIANT_MONITOR
-              value: {{ .Values.workers.invariantMonitor | quote }}
-          livenessProbe:
-            httpGet:
-              path: {{ .Values.probes.liveness.path }}
-              port: http
-            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
-            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
-            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
-            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
-          readinessProbe:
-            httpGet:
-              path: {{ .Values.probes.readiness.path }}
-              port: http
-            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
-            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
-            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
-            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
-          resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
-          volumeMounts:
-            # GitHub App private key, projected read-only as a single file from
-            # the Secret (fishhawk.secretName). subPath mounts just the file, so
-            # the rest of the directory is untouched.
-            - name: github-app-private-key
-              mountPath: {{ .Values.secrets.githubApp.privateKeyFile.mountPath | quote }}
-              subPath: {{ .Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
-              readOnly: true
-          {{- end }}
-      {{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
-      volumes:
-        - name: github-app-private-key
-          secret:
-            secretName: {{ include "fishhawk.secretName" . }}
-            items:
-              # Project ONLY the PEM key to the mount path's basename. The dotted
-              # secretKey is skipped by envFrom but surfaced here as a file.
-              - key: {{ .Values.secrets.githubApp.privateKeyFile.secretKey | quote }}
-                path: {{ .Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
-      {{- end }}
+      {{- include "fishhawk.fishhawkdPodSpec" (dict "root" . "role" "all") | nindent 6 }}
+{{- end -}}
