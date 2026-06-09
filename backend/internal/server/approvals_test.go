@@ -753,7 +753,20 @@ func (r *orchestratorRepo) GetRunByIdempotencyKey(context.Context, string, strin
 func (r *orchestratorRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.stagesByRunID[runID], nil
+	// Return shallow copies under the lock, mirroring the postgres repo's
+	// per-query struct isolation: a caller that reads a returned stage's
+	// fields (e.g. auditcomplete.Compute's mid-flight State check, now
+	// reachable from the detached advisory implement-review goroutine via
+	// recomputeAndPublishAuditComplete) must not share the live pointer a
+	// concurrent TransitionStage mutates. Live identity stays available via
+	// GetStage for the seedStage-pointer reads the tests assert on.
+	src := r.stagesByRunID[runID]
+	out := make([]*run.Stage, len(src))
+	for i, st := range src {
+		cp := *st
+		out[i] = &cp
+	}
+	return out, nil
 }
 
 func (r *orchestratorRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {

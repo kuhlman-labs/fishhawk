@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -582,7 +583,7 @@ func (s *Server) checkImplementReviewSettled(ctx context.Context, target *run.Ru
 	}
 
 	terminalCount := 0
-	for _, cat := range []string{"implement_reviewed", "implement_review_failed", "implement_review_skipped"} {
+	for _, cat := range auditcomplete.TerminalImplementReviewCategories {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, target.ID, cat)
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement-review gate: list terminal review entries failed",
@@ -595,34 +596,40 @@ func (s *Server) checkImplementReviewSettled(ctx context.Context, target *run.Ru
 		}
 		terminalCount += len(entries)
 	}
-	if terminalCount >= reviewersCfg.Agent {
-		// Every configured agent review reached a terminal state.
-		return true
-	}
 
-	// Backstop: anchor on the earliest implement_review_started timestamp.
-	// Past the bound, a reviewer that died emitting nothing can never strand
-	// the merge resolution. Reuses planReviewBackstop (approvals.go) so the
-	// bound cannot diverge from the plan gate's.
-	earliest := started[0].Timestamp
-	for _, e := range started {
-		if e.Timestamp.Before(earliest) {
-			earliest = e.Timestamp
+	// Delegate the present/in-flight decision to auditcomplete.ReviewPresent
+	// (#947) — the single source of truth shared with the audit-complete
+	// pre-merge presence gate so the two can never diverge. The backstop
+	// (reused planReviewBackstop, approvals.go) belts a reviewer that died
+	// emitting no terminal entry; ReviewPresent reports backstopElapsed
+	// exactly when the merge is allowed BECAUSE the bound elapsed, so the
+	// degrade audit emits exactly once.
+	now := time.Now().UTC()
+	present, backstopElapsed := auditcomplete.ReviewPresent(auditcomplete.ReviewPresenceInputs{
+		ReviewersAgent: reviewersCfg.Agent,
+		Started:        started,
+		TerminalCount:  terminalCount,
+		Backstop:       s.planReviewBackstop(reviewersCfg.Agent),
+		Now:            now,
+	})
+	if backstopElapsed {
+		earliest := started[0].Timestamp
+		for _, e := range started {
+			if e.Timestamp.Before(earliest) {
+				earliest = e.Timestamp
+			}
 		}
+		s.appendImplementReviewBackstopElapsed(ctx, reviewStage, reviewersCfg.Agent, terminalCount, earliest, now.Sub(earliest))
 	}
-	bound := s.planReviewBackstop(reviewersCfg.Agent)
-	if elapsed := time.Now().UTC().Sub(earliest); elapsed > bound {
-		s.appendImplementReviewBackstopElapsed(ctx, reviewStage, reviewersCfg.Agent, terminalCount, earliest, elapsed)
-		return true
+	if !present {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "implement-review gate: holding merge resolution; review in-flight",
+			slog.String("run_id", target.ID.String()),
+			slog.String("stage_id", reviewStage.ID.String()),
+			slog.Int("configured_agents", reviewersCfg.Agent),
+			slog.Int("landed_terminal", terminalCount),
+		)
 	}
-
-	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "implement-review gate: holding merge resolution; review in-flight",
-		slog.String("run_id", target.ID.String()),
-		slog.String("stage_id", reviewStage.ID.String()),
-		slog.Int("configured_agents", reviewersCfg.Agent),
-		slog.Int("landed_terminal", terminalCount),
-	)
-	return false
+	return present
 }
 
 // appendImplementReviewBackstopElapsed records the ADR-036 backstop degrade:

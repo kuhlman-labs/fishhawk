@@ -2280,6 +2280,17 @@ func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid
 			hasRejection = true
 		}
 	}
+
+	// The implement review has now written its terminal entries
+	// (implement_reviewed / implement_review_failed). Re-derive and
+	// republish fishhawk_audit_complete so the #947 review-pending presence
+	// gate flips green automatically once the advisory review lands — GitHub
+	// re-evaluates branch protection on the Check Run conclusion update, so
+	// the merge clears with no operator action. Best-effort: never affects
+	// the review loop's return (a publish failure recomputes on the next SPA
+	// visit or PR webhook).
+	s.recomputeAndPublishAuditComplete(ctx, runID)
+
 	return hasRejection
 }
 

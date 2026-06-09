@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
@@ -340,6 +341,197 @@ func TestCompute_Rule5_NilPRHead_SkipsCleanly(t *testing.T) {
 	}
 	if state != stagecheck.StatePass {
 		t.Errorf("state = %s want pass (nil PRHead skips rule 5); missing=%+v", state, missing)
+	}
+}
+
+// --- Rule 6 (review-pending presence gate, #947) ---
+
+func TestReviewPresent(t *testing.T) {
+	base := time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC)
+	started := func(ts ...time.Time) []*audit.Entry {
+		out := make([]*audit.Entry, 0, len(ts))
+		for _, t := range ts {
+			out = append(out, &audit.Entry{Timestamp: t})
+		}
+		return out
+	}
+	cases := []struct {
+		name         string
+		in           auditcomplete.ReviewPresenceInputs
+		wantPresent  bool
+		wantBackstop bool
+	}{
+		{
+			name:        "no agent reviewer configured",
+			in:          auditcomplete.ReviewPresenceInputs{ReviewersAgent: 0, Started: started(base), TerminalCount: 0, Backstop: time.Hour, Now: base},
+			wantPresent: true,
+		},
+		{
+			name:        "configured but never dispatched",
+			in:          auditcomplete.ReviewPresenceInputs{ReviewersAgent: 1, Started: nil, TerminalCount: 0, Backstop: time.Hour, Now: base},
+			wantPresent: true,
+		},
+		{
+			name:        "terminal count meets configured agents",
+			in:          auditcomplete.ReviewPresenceInputs{ReviewersAgent: 2, Started: started(base), TerminalCount: 2, Backstop: time.Hour, Now: base.Add(time.Minute)},
+			wantPresent: true,
+		},
+		{
+			name:        "dispatched, no terminal, within backstop -> in-flight",
+			in:          auditcomplete.ReviewPresenceInputs{ReviewersAgent: 1, Started: started(base), TerminalCount: 0, Backstop: time.Hour, Now: base.Add(30 * time.Minute)},
+			wantPresent: false,
+		},
+		{
+			name:         "dispatched, no terminal, past backstop -> present + degrade",
+			in:           auditcomplete.ReviewPresenceInputs{ReviewersAgent: 1, Started: started(base), TerminalCount: 0, Backstop: time.Hour, Now: base.Add(2 * time.Hour)},
+			wantPresent:  true,
+			wantBackstop: true,
+		},
+		{
+			name:         "backstop anchors on EARLIEST dispatch",
+			in:           auditcomplete.ReviewPresenceInputs{ReviewersAgent: 2, Started: started(base.Add(90*time.Minute), base), TerminalCount: 1, Backstop: time.Hour, Now: base.Add(80 * time.Minute)},
+			wantPresent:  true,
+			wantBackstop: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			present, backstop := auditcomplete.ReviewPresent(tc.in)
+			if present != tc.wantPresent {
+				t.Errorf("present = %v want %v", present, tc.wantPresent)
+			}
+			if backstop != tc.wantBackstop {
+				t.Errorf("backstopElapsed = %v want %v", backstop, tc.wantBackstop)
+			}
+		})
+	}
+}
+
+// reviewPendingSetup extends happyPath with a run row carrying a configured
+// implement-stage reviewers.agent count, and returns the implement stage's
+// dispatch timestamp anchor used to drive the backstop branch deterministically.
+func reviewPendingSetup(t *testing.T, agent int) (uuid.UUID, *fakeRuns, *fakeArtifacts, *fakeAudit) {
+	t.Helper()
+	runID, runs, arts, ar := happyPath(t)
+	// happyPath leaves runs.runs nil; seed a row so GetRun returns a real
+	// run for the ImplementReviewers closure (its content is irrelevant —
+	// the test closure ignores it and returns a fixed config).
+	runs.runs = map[uuid.UUID]*run.Run{runID: {ID: runID}}
+	return runID, runs, arts, ar
+}
+
+// reviewDeps wires the rule-6 closures onto a base Deps. now==zero leaves
+// Deps.Now nil (defaults to time.Now); a non-zero now injects a fixed clock.
+func reviewDeps(r *fakeRuns, a *fakeArtifacts, au *fakeAudit, agent int, backstop time.Duration, now time.Time) auditcomplete.Deps {
+	d := deps(r, a, au)
+	d.ImplementReviewers = func(*run.Run) *spec.ReviewersConfig { return &spec.ReviewersConfig{Agent: agent} }
+	d.ReviewBackstop = func(int) time.Duration { return backstop }
+	if !now.IsZero() {
+		fixed := now
+		d.Now = func() time.Time { return fixed }
+	}
+	return d
+}
+
+// dispatchTime mirrors the fakeAudit timestamp formula so tests can anchor an
+// injected clock relative to the implement_review_started entry.
+func dispatchTime(seq int) time.Time {
+	return time.Date(2026, 5, 7, 12, 0, seq, 0, time.UTC)
+}
+
+func TestCompute_Rule6_PendingWhenReviewDispatchedNotLanded(t *testing.T) {
+	runID, runs, arts, ar := reviewPendingSetup(t, 1)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "implement_review_started", nil) // seq 5
+	// Within backstop: clock just after dispatch.
+	d := reviewDeps(runs, arts, ar, 1, time.Hour, dispatchTime(5).Add(time.Minute))
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (review_pending is the only miss); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingReviewPending) {
+		t.Fatalf("missing did not include review_pending: %+v", missing)
+	}
+}
+
+func TestCompute_Rule6_ClearsWhenTerminalReached(t *testing.T) {
+	runID, runs, arts, ar := reviewPendingSetup(t, 1)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "implement_review_started", nil)
+	ar.appendChained(t, runID, &implID, "implement_reviewed", nil)
+	d := reviewDeps(runs, arts, ar, 1, time.Hour, dispatchTime(5).Add(time.Minute))
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass once review lands; missing=%+v", state, missing)
+	}
+}
+
+func TestCompute_Rule6_ApproveWithConcernsClears(t *testing.T) {
+	// ADR-027 posture: a non-blocking terminal verdict (approve_with_concerns)
+	// still counts as PRESENT — the presence gate is not the advisory gate.
+	runID, runs, arts, ar := reviewPendingSetup(t, 1)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "implement_review_started", nil)
+	payload, _ := json.Marshal(map[string]any{"verdict": "approve_with_concerns", "concerns": []any{map[string]any{"category": "scope"}}})
+	ar.appendChained(t, runID, &implID, "implement_reviewed", payload)
+	d := reviewDeps(runs, arts, ar, 1, time.Hour, dispatchTime(5).Add(time.Minute))
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (approve_with_concerns is terminal -> present); missing=%+v", state, missing)
+	}
+}
+
+func TestCompute_Rule6_BackstopDemotesStuckReview(t *testing.T) {
+	// A reviewer that died emitting no terminal entry must not wedge the gate
+	// forever: past the backstop the review is treated as present.
+	runID, runs, arts, ar := reviewPendingSetup(t, 1)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "implement_review_started", nil)
+	d := reviewDeps(runs, arts, ar, 1, time.Hour, dispatchTime(5).Add(2*time.Hour))
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (backstop elapsed -> present); missing=%+v", state, missing)
+	}
+}
+
+func TestCompute_Rule6_NeverDispatchedSkips(t *testing.T) {
+	// reviewers.agent>0 configured but no implement_review_started -> nothing
+	// to wait on; the rule is inert and the rest of the audit passes.
+	runID, runs, arts, ar := reviewPendingSetup(t, 1)
+	d := reviewDeps(runs, arts, ar, 1, time.Hour, time.Time{})
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (never dispatched); missing=%+v", state, missing)
+	}
+}
+
+func TestCompute_Rule6_NilClosuresSkip(t *testing.T) {
+	// Dev / test posture: ImplementReviewers / ReviewBackstop unwired -> the
+	// rule is skipped even with a dispatched-but-unlanded review present.
+	runID, runs, arts, ar := reviewPendingSetup(t, 1)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "implement_review_started", nil)
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (nil closures skip rule 6); missing=%+v", state, missing)
 	}
 }
 

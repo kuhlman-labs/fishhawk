@@ -62,6 +62,25 @@ type ReviewActionHint struct {
 	Message              string `json:"message" jsonschema:"one-line advisory pointer at the next action: route concerns back with fishhawk_fixup_stage vs approving to merge (below budget), the operator override vs merge-with-follow-up (budget spent, below ceiling), or merge-with-follow-up vs a fresh run (at the ceiling); display-only, never gates the run"`
 }
 
+// implementReviewMergeHint returns a display-only merge-readiness warning for
+// the local loop when the implement-stage agent review has been dispatched but
+// has not yet landed (#947 local-loop parity). It mirrors the backend's
+// review-pending presence gate (auditcomplete rule 6): while the implement
+// ReviewStatus is "pending", the required fishhawk_audit_complete check is held
+// pending on the SAME condition, so the PR is not safe to merge/resolve yet —
+// the check flips green automatically once the verdict lands. Returns "" (no
+// hint) for any non-pending status.
+//
+// Display-only, NEVER gates: there is no MCP merge tool; the operator merges on
+// GitHub where branch protection enforces the held check. The wording is kept
+// consistent with the backend presence gate.
+func implementReviewMergeHint(implementStatus *ReviewStatus) string {
+	if implementStatus == nil || implementStatus.Status != "pending" {
+		return ""
+	}
+	return "the implement-stage agent review has not landed yet — the PR is NOT safe to merge or resolve. The required fishhawk_audit_complete check is held pending on this review and flips green automatically once the verdict lands. Re-poll fishhawk_get_run_status on the advertised poll_interval_seconds until implement_review_status is terminal."
+}
+
 // reviewActionHintFor computes the display-only review-action hint for a run's
 // implement stage from audit data (#777, #860). It returns nil (no hint) when:
 //

@@ -696,6 +696,15 @@ type GetRunStatusOutput struct {
 	// gates the run (mirrors the periodic-budget block). Not surfaced on
 	// fishhawk_start_run: no implement review exists at run start.
 	ReviewActionHint *ReviewActionHint `json:"review_action_hint,omitempty" jsonschema:"display-only next-action pointer when an implement review returned unresolved approve_with_concerns concerns and the fix-up budget is not spent; points at fishhawk_fixup_stage vs approving to merge. Omitted when there is nothing to act on. Never gates the run"`
+	// ImplementReviewMergeHint is a display-only merge-readiness warning (#947
+	// local-loop parity) surfaced while the implement-stage agent review is
+	// 'pending' (dispatched, no terminal verdict). It mirrors the backend's
+	// review-pending presence gate: the required fishhawk_audit_complete check
+	// is held pending on the same condition, so the PR is not safe to merge or
+	// resolve yet — the check flips green automatically once the verdict lands.
+	// Omitted once the implement review reaches a terminal status. Display-only,
+	// never gates the run (no MCP merge tool; the operator merges on GitHub).
+	ImplementReviewMergeHint string `json:"implement_review_merge_hint,omitempty" jsonschema:"display-only merge-readiness warning while the implement-stage agent review is pending (dispatched but no verdict yet): the PR is NOT safe to merge/resolve because the required fishhawk_audit_complete check is held pending on this review (it flips green automatically once the verdict lands). Omitted once the implement review is terminal. Never gates the run"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -754,6 +763,13 @@ is not yet spent: a one-line pointer at fishhawk_fixup_stage (route the
 concerns back to the agent) vs approving to merge, with the concern
 count and remaining fix-up budget. Display-only — never gates the run;
 omitted when there is nothing to act on or the budget is exhausted.
+
+Also returns implement_review_merge_hint while the implement-stage agent
+review is still pending (dispatched, no verdict yet): a display-only
+warning that the PR is NOT safe to merge/resolve because the required
+fishhawk_audit_complete check is held pending on that review (#947). It
+flips green automatically once the verdict lands; omitted once the
+implement review is terminal. Never gates the run.
 `),
 	}, resolver.getRunStatus)
 }
@@ -833,6 +849,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		ImplementStageWaitStatus: implementStageWaitStatus,
 		Budget:                   budgetStatus,
 		ReviewActionHint:         reviewActionHint,
+		ImplementReviewMergeHint: implementReviewMergeHint(implementReviewStatus),
 	}, nil
 }
 

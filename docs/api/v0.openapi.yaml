@@ -2285,6 +2285,7 @@ paths:
                                   - chain_unrecoverable
                                   - foreign_commit
                                   - head_fetch_failed
+                                  - review_pending
                               detail:
                                 type: string
         '400': { $ref: '#/components/responses/BadRequest' }
