@@ -1,0 +1,92 @@
+# Default values for the fishhawk chart.
+# Override per-environment with `-f my-values.yaml` (see values-local.yaml for a
+# localhost-flavored example).
+
+image:
+  # Published fishhawkd image built by backend/Dockerfile (#168) and pushed by
+  # backend-release.yml. Do not build it here — the chart only references it.
+  repository: ghcr.io/kuhlman-labs/fishhawkd
+  # Image tag. Empty falls back to .Chart.AppVersion (the `main` rolling tag).
+  # Pin to an immutable `sha-<short>` or `vX.Y.Z` tag for real deploys.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Number of fishhawkd replicas. The worker singletons (#851) are not yet
+# leader-elected, so keep this at 1 while any worker toggle below is true.
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  # Service port; targets the container's :8080 listener.
+  port: 8080
+
+# Pod resource requests/limits. Tune per cluster capacity.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Liveness + readiness both hit GET /healthz on the container's :8080 listener
+# (fishhawkd --addr defaults to :8080; serve.go).
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+# Non-secret FISHHAWKD_* environment, rendered into a ConfigMap. Empty values
+# are omitted so unset keys stay unset (matching fishhawkd's ignore-if-unset
+# semantics). Secret env (DB URL, API keys, OAuth secret, webhook secret, AWS
+# creds, GitHub App private key) is supplied by the Secret object (#849),
+# referenced via existingSecret below.
+config:
+  # Listen address. fishhawkd defaults to :8080; the probes/Service assume 8080.
+  addr: ":8080"
+  # Trace storage (S3 / MinIO). Bucket empty disables /v0/runs/{id}/trace.
+  s3Region: "us-east-1"
+  s3Endpoint: ""
+  s3Bucket: ""
+  # SPA root used for GitHub Check Run back-links (#231). Empty disables the
+  # publish-to-GitHub path cleanly.
+  externalUrl: ""
+  # OAuth sign-in redirect URLs (non-secret halves; client secret is in #849).
+  oauthCallbackUrl: ""
+  oauthRedirectAfterLogin: "/"
+  # Runner OIDC verification. Empty audience accepts unauthenticated callers
+  # (v0 self-execution posture).
+  oidcAudience: ""
+  oidcJwksUrl: ""
+  # GitHub App id (the private key is a secret, supplied by #849).
+  githubAppId: ""
+  # Plan-review model (ADR-027).
+  planReviewModel: "claude-sonnet-4-6"
+  # IANA timezone for daily budget rollover.
+  budgetTimezone: "UTC"
+
+# Background-worker enable toggles → FISHHAWKD_ENABLE_*. All default false so a
+# fresh deploy doesn't race the timers. Keep replicaCount at 1 when enabling any
+# of these (singleton leader-election is deferred to #851).
+workers:
+  slaTimer: false
+  dispatchWatchdog: false
+  reactionPoller: false
+  mergeReconciler: false
+  childCompletionSweeper: false
+  invariantMonitor: false
+
+# Name of the pre-existing Secret carrying sensitive FISHHAWKD_* env. The Secret
+# object itself is owned by #849; this chart only references it (envFrom
+# secretRef, optional:false — the pod fails loud if it's absent, the intended
+# pre-#849 state).
+existingSecret: fishhawk-secrets

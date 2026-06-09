@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-config
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+data:
+  # Non-secret FISHHAWKD_* env. Empty values are omitted so unset keys stay
+  # unset (matching fishhawkd's ignore-if-unset semantics).
+  {{- with .Values.config.addr }}
+  FISHHAWKD_ADDR: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.s3Region }}
+  FISHHAWKD_S3_REGION: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.s3Endpoint }}
+  FISHHAWKD_S3_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.s3Bucket }}
+  FISHHAWKD_S3_BUCKET: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.externalUrl }}
+  FISHHAWKD_EXTERNAL_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.oauthCallbackUrl }}
+  FISHHAWKD_OAUTH_CALLBACK_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.oauthRedirectAfterLogin }}
+  FISHHAWKD_OAUTH_REDIRECT_AFTER_LOGIN: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.oidcAudience }}
+  FISHHAWKD_OIDC_AUDIENCE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.oidcJwksUrl }}
+  FISHHAWKD_OIDC_JWKS_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.githubAppId }}
+  FISHHAWKD_GITHUB_APP_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.planReviewModel }}
+  FISHHAWKD_PLAN_REVIEW_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.budgetTimezone }}
+  FISHHAWKD_BUDGET_TIMEZONE: {{ . | quote }}
+  {{- end }}
