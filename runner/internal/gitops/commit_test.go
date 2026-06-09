@@ -1125,6 +1125,109 @@ func TestCommitAndPush_FreshFetchBase_StashPopConflict(t *testing.T) {
 	}
 }
 
+// TestCommitAndPush_FreshFetchBase_LsFilesProbeFailure drives the #893 double-
+// failure branch of popStash: `git stash pop` fails AND the subsequent
+// `git ls-files --unmerged` conflict-detection probe also fails. The pop is made
+// to conflict by the same divergent-edit setup as the conflict test, but a
+// Pusher.Cmd override rewrites ONLY the `ls-files --unmerged` invocation to an
+// unknown flag so it exits non-zero (lsErr != nil) while every other git call
+// runs normally against the real repo. It asserts: (a) the error is non-nil and
+// surfaces both the pop failure and the ls-files detection failure, but is NOT
+// ErrBaseRebaseConflict (the conflict was never confirmed); (b) the best-effort
+// reset --hard ran — no unmerged entries and no UU markers remain; (c) nothing
+// was pushed to the bare remote.
+func TestCommitAndPush_FreshFetchBase_LsFilesProbeFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-893/stage-x"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("base line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	// origin/main advances the shared line; the local checkout is reset back so
+	// the advance only exists on the remote tip (the fresh fetch pulls it in).
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("remote-advanced line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "remote advances shared line")
+	mustGit(t, repo, "push", "origin", "main")
+	mustGit(t, repo, "reset", "--hard", "HEAD~1")
+
+	// The agent's uncommitted divergent edit to the SAME line, so reapplying the
+	// stash onto the fetched tip conflicts.
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("agent-edited line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cmd override: delegate to real git for everything EXCEPT the
+	// `ls-files --unmerged` conflict-detection probe, which is rewritten to an
+	// unknown flag so it exits non-zero (lsErr != nil) — forcing the
+	// double-failure branch while reset --hard still runs against the real repo.
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			if len(args) >= 2 && args[0] == "ls-files" && args[1] == "--unmerged" {
+				return exec.CommandContext(ctx, name, "ls-files", "--fishhawk-no-such-flag")
+			}
+			return exec.CommandContext(ctx, name, args...)
+		},
+	}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "agent stage commit",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+	})
+
+	// (a) Non-nil error that surfaces the pop failure and the ls-files detection
+	// failure, but NOT ErrBaseRebaseConflict (conflict never confirmed).
+	if err == nil {
+		t.Fatal("CommitAndPush error = nil, want non-nil double-failure error")
+	}
+	if errors.Is(err, ErrBaseRebaseConflict) {
+		t.Errorf("CommitAndPush error = %v, must NOT be ErrBaseRebaseConflict (conflict unconfirmed)", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "ls-files") || !strings.Contains(msg, "stash pop") {
+		t.Errorf("error %q must surface both the stash pop failure and the ls-files detection failure", msg)
+	}
+
+	// (b) The best-effort reset --hard ran — the tree is clean.
+	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
+		t.Errorf("ls-files --unmerged not empty after reset: %q", unmerged)
+	}
+	if status := mustGitOut(t, repo, "status", "--porcelain"); strings.Contains(status, "UU") {
+		t.Errorf("working tree has conflict markers (UU) after reset: %q", status)
+	}
+
+	// (c) Nothing was pushed — the run branch does not exist on the bare remote.
+	out, lsErr := exec.Command("git", "--git-dir="+bare, "ls-remote", bare, branch).Output()
+	if lsErr != nil {
+		t.Fatalf("ls-remote: %v", lsErr)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("run branch %q was pushed to the bare remote on a double-failure pop: %q", branch, string(out))
+	}
+}
+
 // TestCommitAndPush_RebaseFromRemote_StashPopConflict pins the #866 hardened
 // pop-conflict path for the decomposed-child shared-branch route, which routes
 // through the SAME popStash helper as FreshFetchBase. The shared branch advances
