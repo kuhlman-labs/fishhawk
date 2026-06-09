@@ -135,7 +135,8 @@ When a stage's `reviewers.agent > 0` is configured in the workflow spec, the bac
 | `FISHHAWKD_LOCAL_CLAUDE_MODEL` | `claude-sonnet-4-6` | Model the local-mode `claude` CLI uses for review |
 | `FISHHAWKD_ENABLE_CODEX_REVIEWER` | `false` | Opt-in Codex subprocess adapter (#844); lower precedence than the API key and the local-claude flag |
 | `FISHHAWKD_CODEX_BINARY` | `codex` | Executable name/path for the Codex reviewer CLI |
-| `FISHHAWKD_CODEX_MODEL` | `` (empty) | Model identifier recorded for Codex reviews; compared to the plan's `GeneratedBy.Model` by the self-review guard |
+| `FISHHAWKD_CODEX_MODEL` | `` (empty) | Model the Codex reviewer runs, passed as `codex exec --model`; also the model identifier recorded for Codex reviews and compared to the plan's `GeneratedBy.Model` by the self-review guard (the two now match). Empty omits the flag and inherits the host `~/.codex` config |
+| `FISHHAWKD_CODEX_REASONING_EFFORT` | `` (empty) | Reasoning effort for the Codex reviewer, passed as `-c model_reasoning_effort=<effort>` (e.g. low/medium/high); empty omits the override and inherits the host `~/.codex` config |
 | `FISHHAWKD_OPENAI_API_KEY` | `` (empty) | OpenAI key forwarded as `OPENAI_API_KEY` to the Codex subprocess; empty is fine when Codex is authenticated via a ChatGPT login on the host |
 
 **Local-mode wire-up** (`backend/internal/claudecode/`, #575). The local-mode adapter is the dogfood sibling of `anthropic.Reviewer`: instead of provisioning an API key, it spawns the operator's existing `claude` CLI as a subprocess (`claude --print --output-format json --model <model> -p <prompt>`), inheriting `os.Environ()` so the operator's subscription auth or already-present `ANTHROPIC_API_KEY` is reused with zero new plumbing. It decodes the CLI's single JSON envelope, reads the `result` field, and validates the verdict against the same closed set (`approve` / `approve_with_concerns` / `reject`) as the SDK adapter.

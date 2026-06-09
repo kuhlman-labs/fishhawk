@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -414,6 +415,81 @@ func TestInference_EmptyAPIKeyNotAnError(t *testing.T) {
 	_, _, _, err := c.Inference(context.Background(), "review")
 	if err != nil {
 		t.Fatalf("Inference with empty APIKey must not error: %v", err)
+	}
+}
+
+// TestInference_ArgvModelAndEffort asserts the config→argv boundary: Model and
+// ReasoningEffort are appended as `--model <m>` / `-c model_reasoning_effort=<e>`
+// only when set, both placed BEFORE the prompt positional (pinned by the exact
+// argv comparison), and an all-empty config yields exactly the base argv — the
+// inherit-host-default regression guard. The returned model label must equal
+// the configured (argv) model, so label and reality match.
+func TestInference_ArgvModelAndEffort(t *testing.T) {
+	const prompt = "review"
+	tests := []struct {
+		name     string
+		model    string
+		effort   string
+		wantArgv []string
+	}{
+		{
+			name:   "model and effort set",
+			model:  "gpt-5.5",
+			effort: "medium",
+			wantArgv: []string{
+				"exec", "--json", "--skip-git-repo-check",
+				"--model", "gpt-5.5",
+				"-c", "model_reasoning_effort=medium",
+				prompt,
+			},
+		},
+		{
+			name:  "model set only",
+			model: "gpt-5.5",
+			wantArgv: []string{
+				"exec", "--json", "--skip-git-repo-check",
+				"--model", "gpt-5.5",
+				prompt,
+			},
+		},
+		{
+			name:   "effort set only",
+			effort: "high",
+			wantArgv: []string{
+				"exec", "--json", "--skip-git-repo-check",
+				"-c", "model_reasoning_effort=high",
+				prompt,
+			},
+		},
+		{
+			name:     "both empty inherits host default",
+			wantArgv: []string{"exec", "--json", "--skip-git-repo-check", prompt},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.Model = tt.model
+			cfg.ReasoningEffort = tt.effort
+			c := NewClient(cfg)
+			var captured []string
+			build := helperCommand("happy")
+			c.Cmd = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				captured = append([]string(nil), args...)
+				return build(ctx, name, args...)
+			}
+
+			_, model, _, err := c.Inference(context.Background(), prompt)
+			if err != nil {
+				t.Fatalf("Inference: %v", err)
+			}
+			if !slices.Equal(captured, tt.wantArgv) {
+				t.Errorf("argv = %q, want %q", captured, tt.wantArgv)
+			}
+			if model != tt.model {
+				t.Errorf("model label = %q, want the configured model %q", model, tt.model)
+			}
+		})
 	}
 }
 
