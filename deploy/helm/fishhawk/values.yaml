@@ -85,6 +85,67 @@ workers:
   childCompletionSweeper: false
   invariantMonitor: false
 
+# Optional in-cluster Postgres 16, gated by postgres.enabled. Default false so
+# the prod baseline points fishhawkd at an external managed database via the
+# existingSecret's FISHHAWKD_DATABASE_URL. Turned on by values-local.yaml for a
+# self-contained Docker-Desktop stack. Mirrors docker-compose.yml
+# (postgres:16-alpine, fishhawk/fishhawk/fishhawk). When enabled, the fishhawkd
+# Deployment gets an explicit FISHHAWKD_DATABASE_URL env (overriding the secret)
+# pointing at the in-cluster Service.
+postgres:
+  enabled: false
+  image: postgres:16-alpine
+  pullPolicy: IfNotPresent
+  auth:
+    user: fishhawk
+    password: fishhawk
+    database: fishhawk
+  service:
+    port: 5432
+  persistence:
+    size: 1Gi
+    # Empty uses the cluster default StorageClass (e.g. Docker Desktop's
+    # hostpath, which provisions ReadWriteOnce volumes).
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# Optional in-cluster MinIO (S3-compatible trace store), gated by minio.enabled.
+# Default false so the prod baseline points at external S3. Mirrors
+# docker-compose.yml (minio RELEASE.2025-01-20T14-49-07Z, path-style). When
+# enabled, set config.s3Endpoint/s3Bucket to the in-cluster Service (see
+# values-local.yaml). createBucket runs a post-install/upgrade Job that creates
+# the bucket via mc.
+minio:
+  enabled: false
+  image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+  # mc client image for the bucket-bootstrap Job. Pinned to the same release as
+  # the server image (mc and the server are co-versioned) per CLAUDE.md's
+  # run-time image-pinning rule.
+  mcImage: minio/mc:RELEASE.2025-01-20T14-49-07Z
+  pullPolicy: IfNotPresent
+  rootUser: fishhawk
+  rootPassword: fishhawk-dev-secret
+  apiPort: 9000
+  consolePort: 9001
+  bucket: fishhawk-traces
+  createBucket: true
+  persistence:
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
 # Name of the pre-existing Secret carrying sensitive FISHHAWKD_* env. The Secret
 # object itself is owned by #849; this chart only references it (envFrom
 # secretRef, optional:false — the pod fails loud if it's absent, the intended

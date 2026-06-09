@@ -21,7 +21,9 @@ resources:
 config:
   addr: ":8080"
   s3Region: "us-east-1"
-  s3Endpoint: "http://minio:9000"
+  # Points at the in-cluster MinIO Service below. Assumes `helm install fishhawk`
+  # so fishhawk.fullname renders to `fishhawk` (release name contains chart name).
+  s3Endpoint: "http://fishhawk-minio:9000"
   s3Bucket: "fishhawk-traces"
   externalUrl: "http://localhost:5173"
   oauthCallbackUrl: "http://localhost:8080/v0/auth/github/callback"
@@ -39,5 +41,14 @@ workers:
   mergeReconciler: false
   childCompletionSweeper: false
   invariantMonitor: false
+
+# Self-contained local stack: in-cluster Postgres + MinIO. fishhawkd's
+# FISHHAWKD_DATABASE_URL is overridden by the Deployment to target the in-cluster
+# postgres Service; config.s3Endpoint above points at the in-cluster minio.
+postgres:
+  enabled: true
+
+minio:
+  enabled: true
 
 existingSecret: fishhawk-secrets

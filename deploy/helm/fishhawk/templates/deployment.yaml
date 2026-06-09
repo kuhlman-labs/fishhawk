@@ -32,6 +32,14 @@ spec:
             - secretRef:
                 name: {{ .Values.existingSecret }}
           env:
+            {{- if .Values.postgres.enabled }}
+            # In-cluster Postgres (postgres.enabled). A container-level env entry
+            # overrides the same key arriving via the existingSecret envFrom, so
+            # this URL is authoritative for the local stack without editing the
+            # secret. sslmode=disable matches the plaintext in-cluster Service.
+            - name: FISHHAWKD_DATABASE_URL
+              value: "postgres://{{ .Values.postgres.auth.user }}:{{ .Values.postgres.auth.password }}@{{ include "fishhawk.fullname" . }}-postgres:{{ .Values.postgres.service.port }}/{{ .Values.postgres.auth.database }}?sslmode=disable"
+            {{- end }}
             # Background-worker enable toggles → FISHHAWKD_ENABLE_*.
             - name: FISHHAWKD_ENABLE_SLA_TIMER
               value: {{ .Values.workers.slaTimer | quote }}
