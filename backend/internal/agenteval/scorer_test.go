@@ -106,6 +106,50 @@ func TestEvidenceBeforeEdit(t *testing.T) {
 	}
 }
 
+// TestDeriveOutcome pins all three outcome branches over hand-built
+// bundle.Line inputs, independently of the fixture-replay TestScore: a
+// manifest with AgentFailed=true → agent_failed; a git_diff event →
+// diff_produced; and a no-fail/no-diff bundle → no_diff (the branch the
+// no-diff-noop corpus case also exercises).
+func TestDeriveOutcome(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []bundle.Line
+		want  string
+	}{
+		{
+			name: "agent-failed",
+			lines: []bundle.Line{
+				{Seq: 1, Kind: bundle.EventKindManifest, Data: json.RawMessage(`{"agent_failed":true}`)},
+			},
+			want: OutcomeAgentFailed,
+		},
+		{
+			name: "diff-produced",
+			lines: []bundle.Line{
+				{Seq: 1, Kind: bundle.EventKindManifest, Data: json.RawMessage(`{"agent_failed":false}`)},
+				{Seq: 2, Kind: bundle.EventKindGitDiff, Data: json.RawMessage(`{"num_files":1}`)},
+			},
+			want: OutcomeDiffProduced,
+		},
+		{
+			name: "no-diff",
+			lines: []bundle.Line{
+				{Seq: 1, Kind: bundle.EventKindManifest, Data: json.RawMessage(`{"agent_failed":false}`)},
+				{Seq: 2, Kind: KindAssistant, Data: json.RawMessage(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}`)},
+			},
+			want: OutcomeNoDiff,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deriveOutcome(tc.lines); got != tc.want {
+				t.Errorf("deriveOutcome(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 // readTraceLines parses a plain (non-gzip) .jsonl fixture into
 // []bundle.Line, one Line per non-blank line.
 func readTraceLines(t *testing.T, path string) []bundle.Line {
