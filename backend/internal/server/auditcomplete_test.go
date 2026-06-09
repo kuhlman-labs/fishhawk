@@ -189,16 +189,57 @@ func (f *auditCompleteAuditFake) Append(context.Context, audit.AppendParams) (*a
 	return nil, errFakeNotImplemented
 }
 
-// AppendChained is called by writeApprovalAudit on a successful
-// approve. Record-and-return is enough; the entry shape isn't
-// asserted here.
-
 func (f *auditCompleteAuditFake) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
 	return nil, nil
 }
+
+// AppendChained chain-appends a runtime entry the same way the test helper
+// appendChained does (compute the canonical hash, link prev → entry within
+// the run). Recording rather than discarding lets a Compute run AFTER a
+// handler/loop wrote an entry (e.g. runImplementReviewLoop's implement_reviewed
+// settling the #947 review-pending gate) observe that entry and keep
+// verifyChain green — without this the no-op recorder hid runtime writes.
 func (f *auditCompleteAuditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	payload := p.Payload
+	if payload == nil {
+		payload = json.RawMessage(`{}`)
+	}
+	var prev *string
+	if n := len(f.entries); n > 0 {
+		ph := f.entries[n-1].EntryHash
+		prev = &ph
+	}
 	rid := p.RunID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
+	hash, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID:        &rid,
+		StageID:      p.StageID,
+		Timestamp:    p.Timestamp,
+		Category:     p.Category,
+		ActorKind:    p.ActorKind,
+		ActorSubject: p.ActorSubject,
+		Payload:      payload,
+		PrevHash:     prev,
+	})
+	if err != nil {
+		return nil, err
+	}
+	e := &audit.Entry{
+		ID:           uuid.New(),
+		Sequence:     int64(len(f.entries) + 1),
+		RunID:        &rid,
+		StageID:      p.StageID,
+		Timestamp:    p.Timestamp,
+		Category:     p.Category,
+		ActorKind:    p.ActorKind,
+		ActorSubject: p.ActorSubject,
+		Payload:      payload,
+		PrevHash:     prev,
+		EntryHash:    hash,
+	}
+	f.entries = append(f.entries, e)
+	return e, nil
 }
 
 func (f *auditCompleteAuditFake) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {

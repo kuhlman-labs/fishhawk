@@ -20,13 +20,18 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/pricing"
 )
@@ -2306,5 +2311,128 @@ func TestShipTrace_ImplementReview_ReconciledGitDiffWins(t *testing.T) {
 	}
 	if strings.Contains(got, "backend/internal/foo/stale.go") {
 		t.Errorf("reviewer prompt carries the stale file set, not the reconciled one:\n%s", got)
+	}
+}
+
+// TestImplementReviewLoop_RepublishesAuditCompleteWhenReviewLands is the #947
+// cross-boundary seam test spanning the auditcomplete domain rule, the server
+// audit-repo + spec wiring (s.auditCompleteDeps), and the trace.go republish.
+// It proves the seam end-to-end, not just the per-layer units:
+//
+//   - BEFORE: a configured agent implement-review (spec reviewers.agent=1) is
+//     dispatched (implement_review_started) but no verdict has landed, so
+//     auditcomplete.Compute returns StatePending with review_pending — the
+//     pre-merge presence gate holds even though every OTHER rule passes.
+//   - runImplementReviewLoop runs the reviewer, writes implement_reviewed, and
+//     (the wiring under test) calls recomputeAndPublishAuditComplete.
+//   - AFTER: Compute flips to StatePass, and the republished GitHub check run
+//     carries a success conclusion — the required check clears with no operator
+//     action once the advisory review lands.
+func TestImplementReviewLoop_RepublishesAuditCompleteWhenReviewLands(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	runRow.InstallationID = ptrInt64(99)
+	runRow.Repo = "kuhlman-labs/example"
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specImplementAdvisoryReviewers
+
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	planStage.Type = run.StageTypePlan
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateSucceeded)
+	implStage.Type = run.StageTypeImplement
+	rev := rr.seedStage(runRow.ID, 2, run.StageStateAwaitingApproval)
+	rev.Type = run.StageTypeReview
+	rev.Gate = &run.Gate{Kind: run.GateKindApproval}
+
+	au := newAuditCompleteAuditFake()
+	au.appendTrace(t, runRow.ID, planStage.ID, "raw")
+	au.appendTrace(t, runRow.ID, planStage.ID, "redacted")
+	au.appendTrace(t, runRow.ID, implStage.ID, "raw")
+	au.appendTrace(t, runRow.ID, implStage.ID, "redacted")
+	// Review dispatched, no terminal verdict yet — the only outstanding gap.
+	// Use a recent timestamp so the dispatch is WITHIN the backstop bound (the
+	// fixed-ts test helper would land it decades back and trip backstop-elapsed).
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runRow.ID,
+		StageID:   &implStage.ID,
+		Timestamp: time.Now().UTC(),
+		Category:  "implement_review_started",
+	}); err != nil {
+		t.Fatalf("seed implement_review_started: %v", err)
+	}
+
+	arts := newFakeArtifactRepo()
+	seedPlanArtifact(arts, planStage.ID)
+	arts.all = append(arts.all, &artifact.Artifact{
+		ID: uuid.New(), StageID: implStage.ID,
+		Kind:    artifact.KindPullRequest,
+		Content: pullRequestArtifactBody("abc12345"),
+	})
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	gh := newPublisherFakeGitHub()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr,
+		AuditRepo: au, ArtifactRepo: arts,
+		StageCheckRepo: newFakeStageCheckRepo(),
+		PlanReviewer:   reviewer,
+		ExternalURL:    "https://app.fishhawk.example.com",
+	})
+	s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: rr, Artifacts: arts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	// BEFORE: the dispatched-but-unlanded review holds the audit pending.
+	state, missing, err := auditcomplete.Compute(context.Background(), runRow.ID, s.auditCompleteDeps())
+	if err != nil {
+		t.Fatalf("Compute(before): %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("before: state = %s want pending; missing=%+v", state, missing)
+	}
+	var hasReviewPending bool
+	for _, m := range missing {
+		if m.Kind == auditcomplete.MissingReviewPending {
+			hasReviewPending = true
+		}
+	}
+	if !hasReviewPending {
+		t.Fatalf("before: missing did not include review_pending: %+v", missing)
+	}
+
+	// Exercise the review loop: writes implement_reviewed AND republishes.
+	s.runImplementReviewLoop(context.Background(), runRow.ID, implStage.ID, 1,
+		planreview.AuthorityAdvisory, "review prompt", "")
+
+	// (a) an implement_reviewed terminal entry was written.
+	reviewed, err := au.ListForRunByCategory(context.Background(), runRow.ID, "implement_reviewed")
+	if err != nil {
+		t.Fatalf("list implement_reviewed: %v", err)
+	}
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1", len(reviewed))
+	}
+
+	// AFTER: the audit-complete state flips to pass once the review lands.
+	state, missing, err = auditcomplete.Compute(context.Background(), runRow.ID, s.auditCompleteDeps())
+	if err != nil {
+		t.Fatalf("Compute(after): %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("after: state = %s want pass; missing=%+v", state, missing)
+	}
+
+	// (b) recomputeAndPublishAuditComplete republished a PASSING check run.
+	calls := gh.calls()
+	if len(calls) == 0 {
+		t.Fatal("expected a republished audit-complete check run after the review landed")
+	}
+	last := calls[len(calls)-1]
+	if last.params.Conclusion != githubclient.CheckRunConclusionSuccess {
+		t.Errorf("republished conclusion = %q want success", last.params.Conclusion)
 	}
 }

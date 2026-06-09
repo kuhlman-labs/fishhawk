@@ -20,7 +20,12 @@
 //   - State=fail with a non-empty `missing` list → audit story is
 //     broken, gate refuses approval, reviewer sees what to fix.
 //   - State=pending → some non-review stages haven't terminated
-//     yet, so we can't say "done"; the reviewer waits.
+//     yet, OR the only gaps are pending-flavored: a live PR-HEAD
+//     fetch failure (head_fetch_failed) or a dispatched agent
+//     implement-review that hasn't landed yet (review_pending, the
+//     #947 pre-merge presence gate). We can't say "done"; the
+//     reviewer waits and branch protection re-evaluates on the next
+//     publish.
 //   - State=pass → every load-bearing artifact + audit entry is
 //     present and the chain verifies.
 package auditcomplete
@@ -31,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -38,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
@@ -54,7 +61,28 @@ const (
 	MissingChainBroken   MissingKind = "chain_unrecoverable" // chain read or hash recomputation errored
 	MissingForeignCommit MissingKind = "foreign_commit"      // PR HEAD on GitHub isn't a Fishhawk-recorded head_sha (#282)
 	MissingHeadFetchFail MissingKind = "head_fetch_failed"   // couldn't read PR HEAD from GitHub; result is pending, not fail (#282)
+	// MissingReviewPending marks a configured agent implement-review (ADR-027)
+	// that has not yet reached a terminal verdict (#947). Pending-flavored
+	// like head_fetch_failed: a not-yet-landed review is "wait", not "broken",
+	// so when it is the ONLY missing item the overall state is pending, not
+	// fail. The pre-merge presence gate — fishhawk_audit_complete cannot go
+	// green while a dispatched agent review is still in-flight. ADR-027's
+	// advisory verdict stays non-blocking: ANY terminal kind clears this.
+	MissingReviewPending MissingKind = "review_pending"
 )
+
+// TerminalImplementReviewCategories is the set of audit categories that count
+// as a settled agent implement-review verdict (#947 / ADR-027). ANY of them
+// clears the review_pending presence gate — a budget-killed reviewer
+// (implement_review_failed) or an unwired layer (implement_review_skipped)
+// is as terminal as a landed implement_reviewed. Shared single-source by the
+// audit-complete rule (Compute) and the ADR-036 merge-resolution hold
+// (server.checkImplementReviewSettled) so the two cannot diverge.
+var TerminalImplementReviewCategories = []string{
+	"implement_reviewed",
+	"implement_review_failed",
+	"implement_review_skipped",
+}
 
 // MissingItem points at a specific gap. Detail is human-readable;
 // callers that want to render structured info (per-stage breakdown,
@@ -79,6 +107,81 @@ type Deps struct {
 	// check" rather than failing it. Production wires a closure
 	// around `githubclient.Client.GetPullRequest`.
 	PRHead PRHeadFetcher
+	// ImplementReviewers resolves the run's IMPLEMENT-stage
+	// reviewers.agent count from its workflow spec (#947 rule 6).
+	// Production wires server.resolveStageReviewers so spec parsing
+	// stays single-sourced and auditcomplete never imports server
+	// logic. Nil (dev / test posture) skips the review-pending rule
+	// cleanly, mirroring the nil-PRHead pattern. Returning nil for a
+	// run with no implement stage / no reviewers also skips.
+	ImplementReviewers func(runRow *run.Run) *spec.ReviewersConfig
+	// ReviewBackstop returns the hard max-wait for the configured
+	// agent count, after which a stuck (never-terminal) review is
+	// treated as present so the gate cannot wedge forever (#947).
+	// Production wires server.planReviewBackstop, the same bound the
+	// ADR-036 merge-resolution hold uses. Nil skips the rule.
+	ReviewBackstop func(agentCount int) time.Duration
+	// Now is the clock the review-pending rule reads for the backstop
+	// comparison. Nil defaults to time.Now; tests inject a fixed time
+	// to drive the backstop-elapsed branch deterministically.
+	Now func() time.Time
+}
+
+// ReviewPresenceInputs is the already-fetched data ReviewPresent decides
+// over. Both the audit-complete review-pending rule and the ADR-036 merge-
+// resolution hold pass this so the "is the agent implement-review present?"
+// decision has exactly one implementation.
+type ReviewPresenceInputs struct {
+	// ReviewersAgent is the configured implement-stage reviewers.agent count.
+	ReviewersAgent int
+	// Started is the run's implement_review_started audit entries (dispatch
+	// markers). Empty means the review was never dispatched.
+	Started []*audit.Entry
+	// TerminalCount is the number of settled review entries across
+	// TerminalImplementReviewCategories.
+	TerminalCount int
+	// Backstop is the hard max-wait anchored on the earliest Started entry.
+	Backstop time.Duration
+	// Now is the comparison clock for the backstop.
+	Now time.Time
+}
+
+// ReviewPresent decides whether a configured agent implement-review is
+// "present" — i.e. settled enough that a merge / audit-complete must not be
+// held on it (#947, single source of truth for the presence gate). It
+// returns present=true when:
+//
+//   - no agent reviewer is configured (ReviewersAgent==0), OR
+//   - the review was never dispatched (len(Started)==0), OR
+//   - every configured agent review reached a terminal verdict
+//     (TerminalCount>=ReviewersAgent), OR
+//   - the earliest dispatch is older than Backstop — a reviewer that died
+//     emitting no terminal entry must not wedge the gate forever. Only this
+//     last case reports backstopElapsed=true, so the caller emits the
+//     degrade audit exactly once.
+//
+// present=false (review still genuinely in-flight) is the only case that
+// holds the gate. backstopElapsed is meaningful only alongside present=true.
+func ReviewPresent(in ReviewPresenceInputs) (present, backstopElapsed bool) {
+	if in.ReviewersAgent == 0 {
+		return true, false
+	}
+	if len(in.Started) == 0 {
+		return true, false
+	}
+	if in.TerminalCount >= in.ReviewersAgent {
+		return true, false
+	}
+	earliest := in.Started[0].Timestamp
+	for _, e := range in.Started {
+		if e.Timestamp.Before(earliest) {
+			earliest = e.Timestamp
+		}
+	}
+	if in.Now.Sub(earliest) > in.Backstop {
+		return true, true
+	}
+	return false, false
 }
 
 // PRHeadFetcher is the signature for the live-HEAD callback. Errors
@@ -212,20 +315,99 @@ func Compute(ctx context.Context, runID uuid.UUID, deps Deps) (stagecheck.State,
 	//     mustn't break the audit gate.
 	rule5(ctx, deps, runID, &missing)
 
-	// Decide overall state. A `head_fetch_failed` item is
-	// pending-flavored — if it's the ONLY thing in the missing
-	// list, the audit isn't broken, we just couldn't verify the
-	// drift rule against a live source. State stays pending so
-	// branch protection re-evaluates on a successful follow-up
-	// publish rather than tripping a misleading red.
+	// Rule 6: a configured agent implement-review (ADR-027) must have
+	// reached a terminal verdict before the audit can go green (#947).
+	// This is the PRE-merge presence gate — fishhawk_audit_complete is a
+	// required check, so holding it pending blocks the merge until the
+	// dispatched review lands (then auto-republishes green). Pending-
+	// flavored like head_fetch_failed: a not-yet-landed review is "wait",
+	// not "broken". Skipped cleanly when the resolver closures aren't wired
+	// (dev / test) or no agent reviewer is configured.
+	if implementStage != nil {
+		item, err := reviewPendingRule(ctx, deps, runID, implementStage)
+		if err != nil {
+			return stagecheck.StatePending, nil, fmt.Errorf("auditcomplete: review pending: %w", err)
+		}
+		if item != nil {
+			missing = append(missing, *item)
+		}
+	}
+
+	// Decide overall state. A `head_fetch_failed` or `review_pending` item
+	// is pending-flavored — if the missing list holds ONLY such items, the
+	// audit isn't broken: we either couldn't verify the drift rule against
+	// a live source, or a dispatched agent review simply hasn't landed yet.
+	// State stays pending so branch protection re-evaluates on a successful
+	// follow-up publish rather than tripping a misleading red.
 	switch {
 	case len(missing) == 0:
 		return stagecheck.StatePass, nil, nil
-	case onlyHeadFetchFailures(missing):
+	case onlyPendingFlavored(missing):
 		return stagecheck.StatePending, missing, nil
 	default:
 		return stagecheck.StateFail, missing, nil
 	}
+}
+
+// reviewPendingRule implements Compute's rule 6 (#947): hold the audit
+// pending while a configured agent implement-review is dispatched but not
+// yet terminal. Returns a non-nil MissingItem when the review is still
+// in-flight, nil when present (none configured, never dispatched, all
+// terminal, or backstop elapsed). The decision delegates to ReviewPresent
+// so it cannot diverge from the ADR-036 merge-resolution hold. Read failures
+// surface as a transient error the caller retries — matching the other rules'
+// I/O posture (the merge gate fails OPEN; this read endpoint fails to a retry).
+func reviewPendingRule(ctx context.Context, deps Deps, runID uuid.UUID, implementStage *run.Stage) (*MissingItem, error) {
+	if deps.ImplementReviewers == nil || deps.ReviewBackstop == nil {
+		return nil, nil
+	}
+	runRow, err := deps.Runs.GetRun(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("get run %s: %w", shortID(runID), err)
+	}
+	cfg := deps.ImplementReviewers(runRow)
+	if cfg == nil || cfg.Agent == 0 {
+		return nil, nil
+	}
+
+	started, err := deps.Audit.ListForRunByCategory(ctx, runID, "implement_review_started")
+	if err != nil {
+		return nil, fmt.Errorf("list implement_review_started: %w", err)
+	}
+	if len(started) == 0 {
+		// Configured but never dispatched — nothing to wait on.
+		return nil, nil
+	}
+
+	terminalCount := 0
+	for _, cat := range TerminalImplementReviewCategories {
+		entries, err := deps.Audit.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			return nil, fmt.Errorf("list %s: %w", cat, err)
+		}
+		terminalCount += len(entries)
+	}
+
+	now := time.Now().UTC()
+	if deps.Now != nil {
+		now = deps.Now()
+	}
+	present, _ := ReviewPresent(ReviewPresenceInputs{
+		ReviewersAgent: cfg.Agent,
+		Started:        started,
+		TerminalCount:  terminalCount,
+		Backstop:       deps.ReviewBackstop(cfg.Agent),
+		Now:            now,
+	})
+	if present {
+		return nil, nil
+	}
+	return &MissingItem{
+		Kind: MissingReviewPending,
+		Detail: fmt.Sprintf(
+			"implement stage %s: %d/%d configured agent implement-review(s) settled; review has not landed yet",
+			shortID(implementStage.ID), terminalCount, cfg.Agent),
+	}, nil
 }
 
 // rule5 implements the foreign-commit detection. Appends missing
@@ -417,13 +599,15 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-// onlyHeadFetchFailures returns true when every entry in `missing`
-// is a `head_fetch_failed` row. Used to demote the overall state
-// from fail to pending — a fetch failure isn't an audit gap, just
-// "we don't know."
-func onlyHeadFetchFailures(missing []MissingItem) bool {
+// onlyPendingFlavored returns true when every entry in `missing` is a
+// pending-flavored row — `head_fetch_failed` (we couldn't read the live
+// PR HEAD) or `review_pending` (a dispatched agent review hasn't landed
+// yet). Used to demote the overall state from fail to pending: neither is
+// an audit GAP, just "wait / we don't know." A mix with any hard gap
+// (plan_missing, trace_missing, foreign_commit, …) still fails.
+func onlyPendingFlavored(missing []MissingItem) bool {
 	for _, m := range missing {
-		if m.Kind != MissingHeadFetchFail {
+		if m.Kind != MissingHeadFetchFail && m.Kind != MissingReviewPending {
 			return false
 		}
 	}

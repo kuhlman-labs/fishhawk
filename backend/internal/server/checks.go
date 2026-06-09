@@ -12,6 +12,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
@@ -114,17 +115,7 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 	// can show "fail because: plan missing, redacted trace missing
 	// on stage X" without a secondary call.
 	if stage.Type == run.StageTypeReview && s.cfg.ArtifactRepo != nil && s.cfg.AuditRepo != nil {
-		state, missing, err := auditcomplete.Compute(r.Context(), stage.RunID, auditcomplete.Deps{
-			Runs:      s.cfg.RunRepo,
-			Artifacts: s.cfg.ArtifactRepo,
-			Audit:     s.cfg.AuditRepo,
-			// Live HEAD lookup for the foreign-commit rule (#282).
-			// Nil-safe: when GitHub isn't wired (dev / CLI runs),
-			// Compute treats `nil PRHead` as "skip the drift rule"
-			// rather than failing — the rest of the audit still
-			// evaluates.
-			PRHead: s.prHeadFetcher(),
-		})
+		state, missing, err := auditcomplete.Compute(r.Context(), stage.RunID, s.auditCompleteDeps())
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"derive audit-complete state failed",
@@ -192,6 +183,62 @@ func toStageCheckResponse(c *stagecheck.Check) stageCheckResponse {
 		GitHubCheckRunID: c.GitHubCheckRunID,
 		Timestamp:        c.Timestamp,
 	}
+}
+
+// auditCompleteDeps builds the auditcomplete.Deps with every closure the
+// Compute rules need (#229 / #282 / #947). Centralized so the four
+// closures — PRHead (foreign-commit rule 5), ImplementReviewers +
+// ReviewBackstop + Now (review-pending rule 6) — cannot be forgotten at one
+// of the multiple Compute call sites (the checks read endpoint, the
+// synchronize republish, the post-review republish). Each closure is
+// nil-tolerant inside Compute, so a dev/test Server without GitHub or a
+// workflow spec degrades cleanly to the rules it can evaluate.
+func (s *Server) auditCompleteDeps() auditcomplete.Deps {
+	return auditcomplete.Deps{
+		Runs:      s.cfg.RunRepo,
+		Artifacts: s.cfg.ArtifactRepo,
+		Audit:     s.cfg.AuditRepo,
+		// Live HEAD lookup for the foreign-commit rule (#282).
+		// Nil-safe: when GitHub isn't wired (dev / CLI runs), Compute
+		// treats `nil PRHead` as "skip the drift rule" rather than
+		// failing — the rest of the audit still evaluates.
+		PRHead: s.prHeadFetcher(),
+		// Implement-stage reviewers.agent resolution for the review-
+		// pending presence gate (#947). Reuses resolveStageReviewers so
+		// spec parsing stays single-sourced; nil result (no spec / no
+		// implement stage / no agent reviewer) skips the rule cleanly.
+		ImplementReviewers: func(runRow *run.Run) *spec.ReviewersConfig {
+			return s.resolveStageReviewers(context.Background(), runRow, spec.StageTypeImplement)
+		},
+		// Same hard max-wait the ADR-036 merge-resolution hold uses, so
+		// a stuck review can't wedge the audit gate any longer than it
+		// wedges the merge.
+		ReviewBackstop: s.planReviewBackstop,
+	}
+}
+
+// recomputeAndPublishAuditComplete re-derives the audit-complete state for a
+// run and republishes it as the fishhawk_audit_complete Check Run (#947).
+// Extracted from republishOnSynchronize so the post-implement-review path
+// (runImplementReviewLoop, trace.go) can flip the required check green the
+// moment the advisory review lands — GitHub re-evaluates branch protection
+// when the Check Run conclusion updates, so the merge gate clears with no
+// operator action. Best-effort: a compute or publish failure logs and
+// returns; the canonical state is recomputed again on the next SPA visit or
+// PR webhook.
+func (s *Server) recomputeAndPublishAuditComplete(ctx context.Context, runID uuid.UUID) {
+	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
+		return
+	}
+	state, missing, err := auditcomplete.Compute(ctx, runID, s.auditCompleteDeps())
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"audit-complete recompute failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	s.publishAuditCheck(ctx, runID, state, missing)
 }
 
 // prHeadFetcher returns the closure auditcomplete.Compute calls

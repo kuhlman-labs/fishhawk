@@ -218,3 +218,38 @@ func TestReviewActionHintFor_LatestRoundOnly(t *testing.T) {
 		t.Errorf("OverrideAvailable = false, want true (budget spent, below ceiling)")
 	}
 }
+
+// TestImplementReviewMergeHint covers the #947 local-loop parity hint: a
+// display-only merge-readiness warning surfaced ONLY while the implement-stage
+// agent review is pending (dispatched, no verdict). It mirrors the backend's
+// review-pending presence gate; once the review reaches any terminal status
+// the hint is empty (the required fishhawk_audit_complete check flips green).
+func TestImplementReviewMergeHint(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   *ReviewStatus
+		wantHint bool
+	}{
+		{"nil status -> no hint", nil, false},
+		{"none -> no hint", &ReviewStatus{Stage: "implement", Status: "none"}, false},
+		{"pending -> hint", &ReviewStatus{Stage: "implement", Status: "pending"}, true},
+		{"complete -> no hint", &ReviewStatus{Stage: "implement", Status: "complete"}, false},
+		{"skipped -> no hint", &ReviewStatus{Stage: "implement", Status: "skipped"}, false},
+		{"failed -> no hint", &ReviewStatus{Stage: "implement", Status: "failed"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := implementReviewMergeHint(tc.status)
+			if tc.wantHint {
+				if got == "" {
+					t.Fatalf("expected a merge-readiness hint, got empty")
+				}
+				if !strings.Contains(got, "not") || !strings.Contains(got, "fishhawk_audit_complete") {
+					t.Errorf("hint should warn the PR is not safe to merge and name the held check: %q", got)
+				}
+			} else if got != "" {
+				t.Errorf("expected no hint for status %v, got %q", tc.status, got)
+			}
+		})
+	}
+}

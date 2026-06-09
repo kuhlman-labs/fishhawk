@@ -72,12 +72,7 @@ func (s *Server) republishOnSynchronize(ctx context.Context, raw []byte) {
 	// without special-casing here.
 	target := runs[0]
 
-	state, missing, err := auditcomplete.Compute(ctx, target.ID, auditcomplete.Deps{
-		Runs:      s.cfg.RunRepo,
-		Artifacts: s.cfg.ArtifactRepo,
-		Audit:     s.cfg.AuditRepo,
-		PRHead:    s.prHeadFetcher(),
-	})
+	state, missing, err := auditcomplete.Compute(ctx, target.ID, s.auditCompleteDeps())
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"pull_request.synchronize: compute failed",
