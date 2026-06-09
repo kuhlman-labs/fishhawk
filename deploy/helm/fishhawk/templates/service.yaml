@@ -1,3 +1,4 @@
+{{- include "fishhawk.validateMode" . -}}
 apiVersion: v1
 kind: Service
 metadata:

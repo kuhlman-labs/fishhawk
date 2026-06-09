@@ -165,6 +165,23 @@ deployment-api.yaml instead (see the comment in deployment-worker.yaml).
 {{- end -}}
 
 {{/*
+Topology-mode guard (#910). `include`d once from service.yaml — the only template
+that renders in EVERY topology mode (allInOne and split both emit a Service; its
+document is not wrapped in a top-level mode `if`). Calls `fail` when
+deployment.mode is neither "allInOne" nor "split": such a value makes all three
+Deployment templates skip their `if eq` guards, silently rendering a chart with a
+Service + ConfigMap but zero Deployments — a confusing no-op install. The
+deployment*.yaml templates can't host this guard because they themselves don't
+render on an unrecognized mode. The message names the bad value and the two valid
+choices.
+*/}}
+{{- define "fishhawk.validateMode" -}}
+{{- if not (or (eq .Values.deployment.mode "allInOne") (eq .Values.deployment.mode "split")) -}}
+{{- fail (printf "deployment.mode=%q is not recognized: set it to \"allInOne\" (default) or \"split\"." .Values.deployment.mode) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 fishhawkd pod spec — the single source of truth for the pod template shared by
 the allInOne Deployment (role "all"), the split-mode `-api` Deployment (role
 "api"), and the split-mode `-worker` Deployment (role "worker"). Invoke with a
