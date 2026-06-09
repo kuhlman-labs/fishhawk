@@ -50,9 +50,12 @@ spec:
             # Non-secret FISHHAWKD_* env (same ConfigMap as the serve Deployment).
             - configMapRef:
                 name: {{ include "fishhawk.fullname" . }}-config
-            # Sensitive FISHHAWKD_* env incl. FISHHAWKD_DATABASE_URL (#849).
+            # Sensitive FISHHAWKD_* env incl. FISHHAWKD_DATABASE_URL. Name
+            # resolved by fishhawk.secretName so the migrate Job and serve
+            # resolve the IDENTICAL Secret across all three modes (#849). The
+            # migrate Job needs only DATABASE_URL, so no PEM file volume here.
             - secretRef:
-                name: {{ .Values.existingSecret }}
+                name: {{ include "fishhawk.secretName" . }}
           {{- if .Values.postgres.enabled }}
           env:
             # In-cluster Postgres (postgres.enabled). A container-level env entry

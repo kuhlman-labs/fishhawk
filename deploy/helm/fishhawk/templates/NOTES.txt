@@ -1,0 +1,53 @@
+fishhawkd has been deployed as release {{ .Release.Name }} (profile: {{ .Values.profile }}).
+
+Secret mode: {{ .Values.secrets.mode }}
+Secret name: {{ include "fishhawk.secretName" . }}
+
+{{- if eq .Values.secrets.mode "chartManaged" }}
+
+  ╔══════════════════════════════════════════════════════════════════════╗
+  ║  DEV-ONLY: secrets.mode=chartManaged renders plaintext secrets into    ║
+  ║  the release. NEVER use this for production. For a real cluster, set    ║
+  ║  secrets.mode=existing (pre-created Secret) or externalSecrets (ESO).   ║
+  ╚══════════════════════════════════════════════════════════════════════╝
+{{- end }}
+
+{{- if and (ne .Values.profile "local") (eq .Values.secrets.mode "chartManaged") }}
+  (This combination should not have rendered — fishhawk.validateSecrets would
+   have failed the install. If you see this, the guard was bypassed.)
+{{- end }}
+
+{{- if or (eq .Values.secrets.mode "existing") (eq .Values.secrets.mode "externalSecrets") }}
+
+The Secret "{{ include "fishhawk.secretName" . }}" must provide these keys
+({{ if eq .Values.secrets.mode "existing" }}pre-create it{{ else }}map them in the backing SecretStore{{ end }}):
+
+  Env keys (delivered via envFrom):
+    - FISHHAWKD_DATABASE_URL
+    - FISHHAWKD_GITHUB_WEBHOOK_SECRET
+    - FISHHAWKD_OAUTH_CLIENT_SECRET
+    - FISHHAWKD_ANTHROPIC_API_KEY
+    - AWS_ACCESS_KEY_ID
+    - AWS_SECRET_ACCESS_KEY
+{{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
+
+  File key (mounted at {{ .Values.secrets.githubApp.privateKeyFile.mountPath }}, NOT an env var):
+    - {{ .Values.secrets.githubApp.privateKeyFile.secretKey }}  (GitHub App private key PEM)
+
+  UPGRADE MIGRATION (#849): the file key above is NEWLY required by this chart
+  version. The PEM was not chart-managed before #849, so a Secret created for an
+  earlier release will NOT have it. Kubernetes refuses to start the pod if the
+  key is absent (the mount is not optional). Before upgrading, either:
+    - add "{{ .Values.secrets.githubApp.privateKeyFile.secretKey }}" to the existing Secret with your GitHub App PEM, or
+    - if you have no GitHub App integration (or manage the key outside
+      Kubernetes), opt out with --set secrets.githubApp.privateKeyFile.enabled=false
+      to drop the volume + mount entirely.
+{{- end }}
+{{- end }}
+
+{{- if and (eq .Values.profile "local") (or (and .Values.postgres.enabled (eq .Values.postgres.auth.password "fishhawk")) (and .Values.minio.enabled (eq .Values.minio.rootPassword "fishhawk-dev-secret"))) }}
+
+NOTE: in-cluster Postgres/MinIO are using well-known DEFAULT credentials
+(permitted by profile: local). These are NOT secret — do not expose this
+deployment outside your dev machine.
+{{- end }}

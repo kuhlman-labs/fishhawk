@@ -47,3 +47,45 @@ Selector labels.
 app.kubernetes.io/name: {{ include "fishhawk.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
+
+{{/*
+Secret name — the single source of truth the Deployment + migrate Job reference
+across all three secrets modes (no template duplication). `existing` reads the
+operator-supplied existingSecret; `chartManaged` and `externalSecrets` both use
+the chart-owned `<fullname>-secrets` name (chartManaged renders that Secret;
+externalSecrets has ESO materialize a Secret of the same name via its target).
+*/}}
+{{- define "fishhawk.secretName" -}}
+{{- if eq .Values.secrets.mode "existing" -}}
+{{- .Values.existingSecret -}}
+{{- else -}}
+{{- printf "%s-secrets" (include "fishhawk.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Deploy-time guard (#847 carry-over). `include`d once from the Deployment so every
+render runs it. Calls `fail` when a dev-only convenience is active outside the
+`local` profile:
+  - secrets.mode == chartManaged (the chart would bake plaintext secrets);
+  - in-cluster Postgres with the well-known default password `fishhawk`;
+  - in-cluster MinIO with the well-known default rootPassword `fishhawk-dev-secret`.
+Independently, `externalSecrets` mode requires a non-empty secretStoreRef.name in
+any profile. The message names the offending toggle and the override required.
+*/}}
+{{- define "fishhawk.validateSecrets" -}}
+{{- if ne .Values.profile "local" -}}
+{{- if eq .Values.secrets.mode "chartManaged" -}}
+{{- fail "secrets.mode=chartManaged renders plaintext secrets into the chart and is DEV-ONLY: set profile=local to acknowledge, or switch to secrets.mode=existing/externalSecrets for prod." -}}
+{{- end -}}
+{{- if and .Values.postgres.enabled (eq .Values.postgres.auth.password "fishhawk") -}}
+{{- fail "postgres.enabled with the default password 'fishhawk' is DEV-ONLY: set profile=local to acknowledge, or override postgres.auth.password for a real deploy." -}}
+{{- end -}}
+{{- if and .Values.minio.enabled (eq .Values.minio.rootPassword "fishhawk-dev-secret") -}}
+{{- fail "minio.enabled with the default rootPassword 'fishhawk-dev-secret' is DEV-ONLY: set profile=local to acknowledge, or override minio.rootPassword for a real deploy." -}}
+{{- end -}}
+{{- end -}}
+{{- if and (eq .Values.secrets.mode "externalSecrets") (not .Values.secrets.externalSecrets.secretStoreRef.name) -}}
+{{- fail "secrets.mode=externalSecrets requires secrets.externalSecrets.secretStoreRef.name to be set (the SecretStore/ClusterSecretStore the ExternalSecret reads from)." -}}
+{{- end -}}
+{{- end -}}

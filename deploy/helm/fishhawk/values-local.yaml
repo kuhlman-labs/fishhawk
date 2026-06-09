@@ -1,8 +1,13 @@
 # Local-development override layer for the fishhawk chart.
 # Renders cleanly standalone: `helm template fishhawk . -f values-local.yaml`.
 # Localhost-flavored endpoints + lower resource asks; placeholders fill any
-# render-time-needed fields. Not for cluster use as-is — the secret values still
-# come from the existingSecret object (#849).
+# render-time-needed fields. Not for cluster use as-is — secrets.mode is
+# chartManaged with dev placeholders (#849), permitted only by profile: local.
+
+# Local profile: acknowledges the dev-only conveniences (chart-managed Secret +
+# in-cluster Postgres/MinIO default credentials) so fishhawk.validateSecrets
+# permits them. A real cluster MUST keep profile: prod (values.yaml default).
+profile: local
 
 image:
   tag: "main"
@@ -51,4 +56,27 @@ postgres:
 minio:
   enabled: true
 
-existingSecret: fishhawk-secrets
+# Chart-managed Secret with dev placeholders so the chart renders standalone
+# (no out-of-band Secret needed). DEV-ONLY — never copy these to a prod values
+# file. existingSecret (values.yaml) is intentionally NOT set here: chartManaged
+# supersedes it via fishhawk.secretName, so the chart owns `<fullname>-secrets`.
+secrets:
+  mode: chartManaged
+  values:
+    # Targets the in-cluster Postgres Service. Matches the Deployment's
+    # postgres.enabled override, kept here so chartManaged renders a complete
+    # Secret even though the Deployment env wins at runtime.
+    databaseUrl: "postgres://fishhawk:fishhawk@fishhawk-postgres:5432/fishhawk?sslmode=disable"
+    githubWebhookSecret: "dev-webhook-secret"
+    oauthClientSecret: "dev-oauth-client-secret"
+    anthropicApiKey: "dev-anthropic-key"
+    # Equal to minio.rootUser / minio.rootPassword so fishhawkd reaches the
+    # in-cluster MinIO bucket (trace storage).
+    awsAccessKeyId: "fishhawk"
+    awsSecretAccessKey: "fishhawk-dev-secret"
+    # Placeholder PEM so the private-key file volume renders + mounts. Not a
+    # usable key — replace for any real GitHub App integration.
+    githubAppPrivateKey: |
+      -----BEGIN RSA PRIVATE KEY-----
+      DEV-PLACEHOLDER-NOT-A-REAL-KEY
+      -----END RSA PRIVATE KEY-----
