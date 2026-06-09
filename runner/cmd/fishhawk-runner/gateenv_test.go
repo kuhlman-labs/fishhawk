@@ -83,6 +83,61 @@ func TestSanitizeEnv_EdgeCases(t *testing.T) {
 	}
 }
 
+// TestSanitizeEnv_RedactsGoproxyUserinfo asserts that embedded URL userinfo is
+// stripped from credentialed GO* values (notably GOPROXY) before they reach
+// gate code, while non-credentialed forms (off, direct, bare host, no-userinfo
+// URL) and the proxy host/path survive byte-identical.
+func TestSanitizeEnv_RedactsGoproxyUserinfo(t *testing.T) {
+	base := []string{
+		// Single credentialed proxy — userinfo redacted, host/path kept.
+		"GOPROXY=https://user:tok@proxy.example.com",
+		// Comma-separated list — each credentialed entry redacted, the
+		// uncredentialed 'direct' fall-through untouched, order/separators kept.
+		"GOSUMDB=https://u:p@sum.example.com,direct",
+		// '|'-separated list — same, with the alternate separator preserved.
+		"GONOSUMCHECK=https://a:b@one.example.com|https://two.example.com",
+		// No userinfo — must be byte-identical.
+		"GOPRIVATE=https://proxy.example.com/path",
+		// Non-URL GO* forms — must be byte-identical.
+		"GO111MODULE=on",
+		"GOFLAGS=-mod=mod",
+		// Allow-listed non-GO var — never run through the transform.
+		"PATH=/usr/bin:/bin",
+	}
+	got := sanitizeEnv(base)
+	gotMap := envSliceToMap(t, got)
+
+	want := map[string]string{
+		"GOPROXY":      "https://proxy.example.com",
+		"GOSUMDB":      "https://sum.example.com,direct",
+		"GONOSUMCHECK": "https://one.example.com|https://two.example.com",
+		"GOPRIVATE":    "https://proxy.example.com/path",
+		"GO111MODULE":  "on",
+		"GOFLAGS":      "-mod=mod",
+		"PATH":         "/usr/bin:/bin",
+	}
+	for k, v := range want {
+		if gotMap[k] != v {
+			t.Errorf("%s = %q, want %q", k, gotMap[k], v)
+		}
+	}
+}
+
+// TestSanitizeEnv_RedactsMixedSeparatorGoproxy exercises a GOPROXY list that
+// mixes both fall-through separators (',' and '|') alongside a bare 'direct'
+// entry: each credentialed entry must be redacted, the uncredentialed/'direct'
+// entries untouched, and BOTH separators plus the entry order preserved exactly.
+func TestSanitizeEnv_RedactsMixedSeparatorGoproxy(t *testing.T) {
+	const in = "GOPROXY=https://u:p@a.example.com,https://b.example.com|direct"
+	const want = "https://a.example.com,https://b.example.com|direct"
+
+	got := sanitizeEnv([]string{in})
+	gotMap := envSliceToMap(t, got)
+	if gotMap["GOPROXY"] != want {
+		t.Errorf("GOPROXY = %q, want %q", gotMap["GOPROXY"], want)
+	}
+}
+
 // TestSanitizedGateEnv_StripsLiveSecret is a thin check that the public
 // entrypoint reads the live process env and drops a planted secret while
 // keeping PATH.
