@@ -28,6 +28,38 @@ service:
   # Service port; targets the container's :8080 listener.
   port: 8080
 
+# Optional Ingress + TLS (cert-manager), gated by ingress.enabled. Default false
+# so the new template is inert for existing installs — local uses
+# port-forward/NodePort (values-local.yaml keeps this off). See values-prod.yaml
+# for a worked prod posture. When enabled, ingress.host is REQUIRED (the render
+# fails loud otherwise). When config.externalUrl / config.oauthCallbackUrl are
+# left empty AND the ingress is enabled, they are DERIVED from ingress.host
+# (scheme https when tls.enabled, else http); explicit config values override.
+ingress:
+  enabled: false
+  # IngressClass to bind (e.g. nginx). Empty omits ingressClassName so the
+  # cluster's default IngressClass applies.
+  className: ""
+  # External hostname (e.g. app.fishhawk.example). Required when enabled.
+  host: ""
+  # HTTP path + pathType for the single rule. pathType is always emitted
+  # (networking.k8s.io/v1 requires it on each path).
+  path: "/"
+  pathType: "Prefix"
+  # Extra annotations merged onto the Ingress. The cert-manager cluster-issuer
+  # annotation is added automatically when tls.enabled + tls.clusterIssuer set.
+  annotations: {}
+  tls:
+    # When true, emit a tls block for ingress.host and (with clusterIssuer set)
+    # the cert-manager.io/cluster-issuer annotation. cert-manager — not this
+    # chart — provisions the named Secret from the referenced ClusterIssuer.
+    enabled: false
+    # ClusterIssuer cert-manager reads to mint the certificate. When set, renders
+    # the cert-manager.io/cluster-issuer annotation. Empty skips the annotation.
+    clusterIssuer: ""
+    # TLS Secret name cert-manager populates. Empty defaults to <fullname>-tls.
+    secretName: ""
+
 # Pod resource requests/limits. Tune per cluster capacity.
 resources:
   requests:
@@ -66,9 +98,13 @@ config:
   s3Endpoint: ""
   s3Bucket: ""
   # SPA root used for GitHub Check Run back-links (#231). Empty disables the
-  # publish-to-GitHub path cleanly.
+  # publish-to-GitHub path cleanly. When ingress.enabled, an empty value is
+  # DERIVED from ingress.host (https when ingress.tls.enabled, else http); an
+  # explicit value here overrides the derivation.
   externalUrl: ""
   # OAuth sign-in redirect URLs (non-secret halves; client secret is in #849).
+  # When ingress.enabled, an empty oauthCallbackUrl is DERIVED as
+  # <scheme>://<ingress.host>/v0/auth/github/callback; an explicit value wins.
   oauthCallbackUrl: ""
   oauthRedirectAfterLogin: "/"
   # Runner OIDC verification. Empty audience accepts unauthenticated callers

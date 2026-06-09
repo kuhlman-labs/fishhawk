@@ -15,6 +15,12 @@ image:
 
 replicaCount: 1
 
+# Local reaches fishhawkd via `kubectl port-forward` / NodePort, not an Ingress.
+# Keep it off so config.externalUrl/oauthCallbackUrl below are used verbatim (no
+# ingress-host derivation).
+ingress:
+  enabled: false
+
 resources:
   requests:
     cpu: 50m

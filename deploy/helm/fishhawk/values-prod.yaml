@@ -1,0 +1,34 @@
+# Production-posture override layer for the fishhawk chart.
+# Renders standalone: `helm template fishhawk . -f values-prod.yaml`.
+# Demonstrates the prod ingress + cert-manager TLS posture. Operators MUST
+# substitute their real host/IngressClass/ClusterIssuer and supply real secrets
+# (this file leaves secrets at the `existing` default — pre-create the Secret).
+# Not copy-paste-deployable as-is: the host/issuer below are examples.
+
+# Stays prod (values.yaml default): no dev-only conveniences, real secrets.
+profile: prod
+
+image:
+  # Pin to an immutable sha-<short> or vX.Y.Z tag for a real deploy — do not run
+  # the rolling `main` tag in production.
+  tag: ""
+
+# Public ingress + cert-manager TLS. config.externalUrl / config.oauthCallbackUrl
+# below are left empty so they DERIVE from ingress.host (https, since tls is on):
+#   FISHHAWKD_EXTERNAL_URL        = https://app.fishhawk.example
+#   FISHHAWKD_OAUTH_CALLBACK_URL  = https://app.fishhawk.example/v0/auth/github/callback
+ingress:
+  enabled: true
+  className: nginx
+  host: app.fishhawk.example
+  tls:
+    enabled: true
+    # ClusterIssuer cert-manager uses to mint the cert. cert-manager (not this
+    # chart) provisions the TLS Secret; the ClusterIssuer must already exist.
+    clusterIssuer: letsencrypt-prod
+
+config:
+  # Left empty on purpose — derived from ingress.host above. Set explicitly only
+  # to override the derived value (e.g. a separate SPA origin for externalUrl).
+  externalUrl: ""
+  oauthCallbackUrl: ""

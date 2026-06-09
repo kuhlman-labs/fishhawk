@@ -19,10 +19,10 @@ data:
   {{- with .Values.config.s3Bucket }}
   FISHHAWKD_S3_BUCKET: {{ . | quote }}
   {{- end }}
-  {{- with .Values.config.externalUrl }}
+  {{- with (include "fishhawk.externalUrl" .) }}
   FISHHAWKD_EXTERNAL_URL: {{ . | quote }}
   {{- end }}
-  {{- with .Values.config.oauthCallbackUrl }}
+  {{- with (include "fishhawk.oauthCallbackUrl" .) }}
   FISHHAWKD_OAUTH_CALLBACK_URL: {{ . | quote }}
   {{- end }}
   {{- with .Values.config.oauthRedirectAfterLogin }}

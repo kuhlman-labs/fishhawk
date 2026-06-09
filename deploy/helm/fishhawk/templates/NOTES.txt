@@ -45,6 +45,20 @@ The Secret "{{ include "fishhawk.secretName" . }}" must provide these keys
 {{- end }}
 {{- end }}
 
+{{- if .Values.ingress.enabled }}
+
+Ingress is enabled for host: {{ .Values.ingress.host }}
+{{- with (include "fishhawk.externalUrl" .) }}
+  Resolved external URL: {{ . }}
+{{- end }}
+{{- if .Values.ingress.tls.enabled }}
+  TLS: requested via cert-manager (Secret "{{ .Values.ingress.tls.secretName | default (printf "%s-tls" (include "fishhawk.fullname" .)) }}").
+       cert-manager — NOT this chart — provisions that Secret from the
+       {{ if .Values.ingress.tls.clusterIssuer }}ClusterIssuer "{{ .Values.ingress.tls.clusterIssuer }}"{{ else }}cluster-issuer annotation{{ end }}.
+       The ClusterIssuer + cert-manager must already be installed in the cluster.
+{{- end }}
+{{- end }}
+
 {{- if and (eq .Values.profile "local") (or (and .Values.postgres.enabled (eq .Values.postgres.auth.password "fishhawk")) (and .Values.minio.enabled (eq .Values.minio.rootPassword "fishhawk-dev-secret"))) }}
 
 NOTE: in-cluster Postgres/MinIO are using well-known DEFAULT credentials
