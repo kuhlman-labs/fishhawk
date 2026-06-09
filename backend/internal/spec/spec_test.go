@@ -952,6 +952,117 @@ workflows:
 	}
 }
 
+func TestParse_Reviewers_AgentsList_Heterogeneous(t *testing.T) {
+	// #955: the heterogeneous agents list parses with per-reviewer
+	// provider+model, and AgentCount() returns its length.
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+          human: 1
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	rv := s.Workflows["trivial"].Stages[0].Reviewers
+	if rv == nil {
+		t.Fatal("Reviewers should be non-nil")
+	}
+	if len(rv.Agents) != 2 {
+		t.Fatalf("Reviewers.Agents len = %d, want 2", len(rv.Agents))
+	}
+	if rv.Agents[0].Provider != "anthropic" || rv.Agents[0].Model != "claude-opus-4-8" {
+		t.Errorf("Agents[0] = %+v, want {anthropic claude-opus-4-8}", rv.Agents[0])
+	}
+	if rv.Agents[1].Provider != "codex" || rv.Agents[1].Model != "" {
+		t.Errorf("Agents[1] = %+v, want {codex} with empty model (provider default)", rv.Agents[1])
+	}
+	if got := rv.AgentCount(); got != 2 {
+		t.Errorf("AgentCount() = %d, want 2 (len(Agents))", got)
+	}
+}
+
+func TestParse_Reviewers_AgentsList_SupersedesBareCount(t *testing.T) {
+	// #955 supersession rule: when both `agents` and the bare `agent`
+	// integer are present, the list wins — AgentCount() == len(Agents).
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agent: 5
+          agents:
+            - provider: claudecode
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	rv := s.Workflows["trivial"].Stages[0].Reviewers
+	if rv.Agent != 5 {
+		t.Errorf("Reviewers.Agent = %d, want 5 (bare count still parsed)", rv.Agent)
+	}
+	if got := rv.AgentCount(); got != 1 {
+		t.Errorf("AgentCount() = %d, want 1 (agents list supersedes the bare count)", got)
+	}
+}
+
+func TestParse_Reviewers_AgentsList_UnknownProvider_Rejected(t *testing.T) {
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: banana
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for unknown provider", err)
+	}
+}
+
+func TestReviewersConfig_AgentCount_CountFormUnchanged(t *testing.T) {
+	// Back-compat: without an agents list, AgentCount is the bare count.
+	if got := (spec.ReviewersConfig{Agent: 3}).AgentCount(); got != 3 {
+		t.Errorf("AgentCount() = %d, want 3", got)
+	}
+	if got := (spec.ReviewersConfig{}).AgentCount(); got != 0 {
+		t.Errorf("AgentCount() zero-value = %d, want 0", got)
+	}
+}
+
 func TestParse_Reviewers_NegativeAgent_Rejected(t *testing.T) {
 	yml := []byte(`
 version: "0.3"

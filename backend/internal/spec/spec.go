@@ -179,9 +179,35 @@ const DefaultMaxRetries = 1
 //
 // A nil pointer on Stage.Reviewers means the field was absent in the spec;
 // callers should treat nil as {Human:1} to preserve pre-ADR-027 behavior.
+//
+// Agents (#955) declares heterogeneous reviewers — one entry per
+// invocation, each naming its provider (and optionally model). When the
+// list is present and non-empty it supersedes the bare Agent count;
+// AgentCount is the single source of truth for the effective count and
+// must be used wherever authority or invocation counts are derived.
 type ReviewersConfig struct {
-	Agent int `json:"agent,omitempty" yaml:"agent,omitempty"`
-	Human int `json:"human,omitempty" yaml:"human,omitempty"`
+	Agent  int             `json:"agent,omitempty" yaml:"agent,omitempty"`
+	Agents []AgentReviewer `json:"agents,omitempty" yaml:"agents,omitempty"`
+	Human  int             `json:"human,omitempty" yaml:"human,omitempty"`
+}
+
+// AgentReviewer is one declared reviewer in the heterogeneous `agents`
+// list (#955). Provider is the adapter name (anthropic | claudecode |
+// codex — closed set enforced by the schema); Model optionally overrides
+// the provider's deployment-configured default model.
+type AgentReviewer struct {
+	Provider string `json:"provider" yaml:"provider"`
+	Model    string `json:"model,omitempty" yaml:"model,omitempty"`
+}
+
+// AgentCount returns the effective number of agent reviewers: len(Agents)
+// when the heterogeneous list is present and non-empty (it supersedes the
+// bare count), else Agent.
+func (r ReviewersConfig) AgentCount() int {
+	if len(r.Agents) > 0 {
+		return len(r.Agents)
+	}
+	return r.Agent
 }
 
 // Stage is one unit of work in a workflow. The closed set of types

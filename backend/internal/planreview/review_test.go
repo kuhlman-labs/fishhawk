@@ -38,6 +38,34 @@ func TestResolveAuthority_GatelessZero(t *testing.T) {
 	}
 }
 
+// TestResolveAuthority_AgentsList pins that the heterogeneous agents list
+// (#955) feeds the ADR-027 decision table through AgentCount(): the list's
+// length is the effective agent count for all three modes, and it
+// supersedes the bare agent integer.
+func TestResolveAuthority_AgentsList(t *testing.T) {
+	agents := []spec.AgentReviewer{
+		{Provider: "anthropic", Model: "claude-opus-4-8"},
+		{Provider: "codex"},
+	}
+	cases := []struct {
+		name string
+		r    spec.ReviewersConfig
+		want planreview.AuthorityMode
+	}{
+		{"gating: agents list, human 0", spec.ReviewersConfig{Agents: agents}, planreview.AuthorityGating},
+		{"advisory: agents list, human 1", spec.ReviewersConfig{Agents: agents, Human: 1}, planreview.AuthorityAdvisory},
+		{"gateless: no list, agent 0, human 1", spec.ReviewersConfig{Human: 1}, planreview.AuthorityGateless},
+		{"gating: list supersedes agent 0", spec.ReviewersConfig{Agent: 0, Agents: agents[:1]}, planreview.AuthorityGating},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planreview.ResolveAuthority(tc.r); got != tc.want {
+				t.Errorf("ResolveAuthority(%+v) = %q, want %q", tc.r, got, tc.want)
+			}
+		})
+	}
+}
+
 // --- Verdict JSON round-trip ---
 
 func TestReviewVerdict_JSONRoundTrip_Approve(t *testing.T) {

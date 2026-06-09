@@ -114,12 +114,16 @@ When a stage's `reviewers.agent > 0` is configured in the workflow spec, the bac
 
 **Production wiring** (`backend/internal/anthropic/`, wired in `backend/cmd/fishhawkd/serve.go`):
 
-`serve.go` selects a `cfg.PlanReviewer` by a four-way precedence (resolved by the pure `resolvePlanReviewer` helper so the selection seam is unit-testable; each branch logs which adapter is active at startup):
+`serve.go` wires `cfg.PlanReviewers`, a `server.ReviewerSet` (resolved by the pure `resolvePlanReviewers` helper so the wiring seam is unit-testable; every configured adapter logs at startup). Since #955 ALL configured backends are concurrently available — the set replaces the old single precedence-selected `cfg.PlanReviewer`:
 
-1. **`FISHHAWKD_ANTHROPIC_API_KEY` set** → `anthropic.NewReviewer` (production SDK adapter, #572). Wins over everything below.
-2. **else `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER=true`** → `claudecode.NewReviewer` (local-mode subprocess adapter, #575). See **Local-mode wire-up** below.
-3. **else `FISHHAWKD_ENABLE_CODEX_REVIEWER=true`** → `codex.NewReviewer` (Codex subprocess adapter, #844). See **Codex reviewer wire-up** below.
-4. **else** → `cfg.PlanReviewer` stays nil; review invocations are skipped (the #574 degradation below).
+- **`ReviewerSet.Default()`** serves the bare `reviewers.agent: N` count form by the historical four-way precedence (unchanged behavior — the default adapter is invoked N times):
+  1. **`FISHHAWKD_ANTHROPIC_API_KEY` set** → `anthropic.NewReviewer` (production SDK adapter, #572). Wins over everything below.
+  2. **else `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER=true`** → `claudecode.NewReviewer` (local-mode subprocess adapter, #575). See **Local-mode wire-up** below.
+  3. **else `FISHHAWKD_ENABLE_CODEX_REVIEWER=true`** → `codex.NewReviewer` (Codex subprocess adapter, #844). See **Codex reviewer wire-up** below.
+  4. **else** → `Default()` returns nil; review invocations are skipped (the #574 degradation below).
+- **`ReviewerSet.For(provider, model)`** resolves one entry of the heterogeneous `reviewers.agents` list (#955, see `docs/spec/workflow-v0.md` § Plan reviewers) to its adapter, constructed with the spec-requested model (empty → that provider's deployment default model; codex reasoning effort stays deployment-level). Adapters are stateless config-struct wrappers (`NewReviewer` does no I/O), so per-resolve construction is cheap. An unconfigured provider errors: gating stages fail dispatch up front at run create, advisory stages degrade per-reviewer with a `plan_review_failed` / `implement_review_failed` entry carrying the resolve error while the loop continues.
+
+The review loops (`runPlanReviewLoop` / `runImplementReviewLoop`) iterate a resolved `[]reviewerInvocation` (one per declared reviewer) instead of repeating a single adapter; per-invocation audit entries, reviewer-cost recording, and the per-invocation self-review guard are unchanged. The effective agent count everywhere (authority table, skip/started payloads) is `spec.ReviewersConfig.AgentCount()` — `len(agents)` when the list is present, else the bare `agent` integer.
 
 | Env var | Default | Purpose |
 |---|---|---|

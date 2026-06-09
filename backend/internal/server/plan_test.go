@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -438,6 +439,39 @@ func (f *fakePlanReviewer) Review(_ context.Context, promptText string) (*planre
 	return f.verdict, f.model, nil
 }
 
+// singleReviewerSet wraps one PlanReviewer as a ReviewerSet for tests:
+// Default() returns the wrapped reviewer (possibly nil) and For resolves
+// every provider to it — the count-form equivalent of the pre-#955
+// Config.PlanReviewer field.
+type singleReviewerSet struct{ reviewer PlanReviewer }
+
+func (s singleReviewerSet) Default() PlanReviewer { return s.reviewer }
+
+func (s singleReviewerSet) For(provider, _ string) (PlanReviewer, error) {
+	if s.reviewer == nil {
+		return nil, fmt.Errorf("reviewer provider %q is not configured", provider)
+	}
+	return s.reviewer, nil
+}
+
+// fakeReviewerSet maps provider names to fake adapters for heterogeneous
+// reviewers.agents tests (#955). def is the Default() adapter (may be
+// nil); For errors for providers absent from the map.
+type fakeReviewerSet struct {
+	def       PlanReviewer
+	providers map[string]PlanReviewer
+}
+
+func (s fakeReviewerSet) Default() PlanReviewer { return s.def }
+
+func (s fakeReviewerSet) For(provider, _ string) (PlanReviewer, error) {
+	r, ok := s.providers[provider]
+	if !ok {
+		return nil, fmt.Errorf("reviewer provider %q is not configured", provider)
+	}
+	return r, nil
+}
+
 // blockingPlanReviewer blocks each Review call until release is closed,
 // so async-dispatch tests can assert ordering deterministically without
 // sleeps. started carries a value the first time Review is entered, so a
@@ -552,12 +586,12 @@ func newPlanServerWithReviewer(t *testing.T, runID, stageID uuid.UUID, reviewer 
 		WorkflowSpec: workflowSpec,
 	}
 	s := New(Config{
-		Addr:         "127.0.0.1:0",
-		SigningRepo:  sf,
-		ArtifactRepo: ar,
-		AuditRepo:    au,
-		RunRepo:      rr,
-		PlanReviewer: reviewer,
+		Addr:          "127.0.0.1:0",
+		SigningRepo:   sf,
+		ArtifactRepo:  ar,
+		AuditRepo:     au,
+		RunRepo:       rr,
+		PlanReviewers: singleReviewerSet{reviewer},
 	})
 	return s, sf, ar, au, rr
 }
@@ -1595,5 +1629,365 @@ func TestShipPlan_ReviewAgents_GatingReject_FromAwaitingApproval(t *testing.T) {
 	}
 	if !found {
 		t.Error("gating reject from awaiting_approval did not transition the stage to failed-B")
+	}
+}
+
+// --- heterogeneous review agents (#955) ---
+
+// specHeterogeneousPlanReviewers builds a plan-stage spec declaring the
+// #955 heterogeneous agents list (anthropic + codex with explicit models)
+// and the given human count (0 → gating, >0 → advisory).
+func specHeterogeneousPlanReviewers(human int) []byte {
+	return fmt.Appendf(nil, `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+          human: %d
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`, human)
+}
+
+// newPlanServerWithReviewerSet mirrors newPlanServerWithReviewer for tests
+// that need full ReviewerSet control (heterogeneous providers, unresolvable
+// providers). logger may be nil (Config defaults it).
+func newPlanServerWithReviewerSet(t *testing.T, runID, stageID uuid.UUID, set ReviewerSet, workflowSpec []byte, logger *slog.Logger) (*Server, *signingFake, *fakeArtifactRepo, *auditFake, *promptRunRepo) {
+	t.Helper()
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID}
+	rr.getRuns[runID] = &run.Run{
+		ID:           runID,
+		Repo:         "kuhlman-labs/example",
+		WorkflowID:   "feature_change",
+		WorkflowSpec: workflowSpec,
+	}
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		SigningRepo:   sf,
+		ArtifactRepo:  ar,
+		AuditRepo:     au,
+		RunRepo:       rr,
+		PlanReviewers: set,
+		Logger:        logger,
+	})
+	return s, sf, ar, au, rr
+}
+
+// collectPlanReviewed decodes every plan_reviewed entry in the audit fake.
+func collectPlanReviewed(t *testing.T, au *auditFake) []planreview.PlanReviewedPayload {
+	t.Helper()
+	var out []planreview.PlanReviewedPayload
+	for _, e := range au.appended {
+		if e.Category != "plan_reviewed" {
+			continue
+		}
+		var p planreview.PlanReviewedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_reviewed payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestShipPlan_ReviewAgents_Heterogeneous_CrossBoundary is the #955
+// cross-boundary integration test for the plan loop: a real workflow-spec
+// YAML declaring two heterogeneous agent reviewers ships through
+// spec.ParseBytes → resolveStageReviewers → resolveReviewerInvocations →
+// runPlanReviewLoop → audit repo, and produces exactly two plan_reviewed
+// entries with the two distinct ReviewerModel values plus two reviewer-cost
+// recordings. It fails if any seam (schema property name, struct tag,
+// AgentCount supersession, For() mapping, audit payload) breaks while
+// per-layer units pass.
+func TestShipPlan_ReviewAgents_Heterogeneous_CrossBoundary(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	anthropicFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	codexFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5.5",
+	}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": anthropicFake,
+		"codex":     codexFake,
+	}, def: anthropicFake}
+	s, sf, _, au, rr := newPlanServerWithReviewerSet(t, runID, stageID, set, specHeterogeneousPlanReviewers(0), nil)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// Each declared provider's adapter was invoked exactly once.
+	anthropicFake.mu.Lock()
+	codexFake.mu.Lock()
+	if len(anthropicFake.calls) != 1 || len(codexFake.calls) != 1 {
+		t.Errorf("adapter calls = anthropic:%d codex:%d, want 1 each",
+			len(anthropicFake.calls), len(codexFake.calls))
+	}
+	codexFake.mu.Unlock()
+	anthropicFake.mu.Unlock()
+
+	reviewed := collectPlanReviewed(t, au)
+	if len(reviewed) != 2 {
+		t.Fatalf("plan_reviewed entries = %d, want 2", len(reviewed))
+	}
+	models := map[string]bool{}
+	for _, p := range reviewed {
+		models[p.ReviewerModel] = true
+		if p.Authority != planreview.AuthorityGating {
+			t.Errorf("authority = %q, want gating (agents list, human 0)", p.Authority)
+		}
+	}
+	if !models["claude-opus-4-8"] || !models["gpt-5.5"] {
+		t.Errorf("reviewer models = %v, want both claude-opus-4-8 and gpt-5.5", models)
+	}
+
+	// Two reviewer-cost recordings (#681), one per invocation.
+	costs := 0
+	for _, e := range au.appended {
+		if e.Category == "cost_recorded" && strings.Contains(string(e.Payload), `"source":"plan_review"`) {
+			costs++
+		}
+	}
+	if costs != 2 {
+		t.Errorf("plan_review cost_recorded entries = %d, want 2", costs)
+	}
+
+	// The started proxy reports the effective count, len(agents) == 2.
+	for _, e := range au.appended {
+		if e.Category != "plan_review_started" {
+			continue
+		}
+		var p planreview.ReviewStartedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_review_started payload: %v", err)
+		}
+		if p.ConfiguredAgents != 2 {
+			t.Errorf("started configured_agents = %d, want 2 (len(agents))", p.ConfiguredAgents)
+		}
+	}
+
+	// Both approved — gating must not fail the stage.
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("stage failed despite both heterogeneous reviewers approving")
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_Heterogeneous_GatingRejectBlocks pins that a
+// single heterogeneous reviewer's reject under gating authority still
+// fails the stage category-B (#955 preserves ADR-027 semantics).
+func TestShipPlan_ReviewAgents_Heterogeneous_GatingRejectBlocks(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	approve := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	reject := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "gpt-5.5",
+	}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": approve,
+		"codex":     reject,
+	}, def: approve}
+	s, sf, _, _, rr := newPlanServerWithReviewerSet(t, runID, stageID, set, specHeterogeneousPlanReviewers(0), nil)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	var failed bool
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Error("gating reject from a heterogeneous reviewer must transition the stage to failed-B")
+	}
+}
+
+// TestShipPlan_ReviewAgents_CountForm_InvokesDefaultTwice pins #955
+// back-compat: a bare `agent: 2` count with no agents list invokes the
+// set's Default() adapter twice and never resolves through For() — the
+// fakeReviewerSet's empty provider map errors on any For() call, so a
+// regression that routes the count form through For() fails loudly here.
+func TestShipPlan_ReviewAgents_CountForm_InvokesDefaultTwice(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	def := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	set := fakeReviewerSet{def: def}
+	spec := []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 2
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+	s, sf, _, au, _ := newPlanServerWithReviewerSet(t, runID, stageID, set, spec, nil)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	def.mu.Lock()
+	calls := len(def.calls)
+	def.mu.Unlock()
+	if calls != 2 {
+		t.Errorf("default adapter calls = %d, want 2", calls)
+	}
+	if reviewed := collectPlanReviewed(t, au); len(reviewed) != 2 {
+		t.Errorf("plan_reviewed entries = %d, want 2", len(reviewed))
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_review_failed" {
+			t.Errorf("unexpected plan_review_failed entry — count form must not resolve via For(): %s", e.Payload)
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_Heterogeneous_SelfReviewPerReviewer pins that
+// the ADR-027 self-review guard applies per-invocation: with two
+// heterogeneous reviewers where only reviewer #1's model matches the plan
+// author's model (planfixture.Valid() → claude-opus-4-7), exactly one WARN
+// fires and BOTH verdicts are still recorded.
+func TestShipPlan_ReviewAgents_Heterogeneous_SelfReviewPerReviewer(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	selfReviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7", // matches the fixture's generated_by.model
+	}
+	other := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5.5",
+	}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": selfReviewer,
+		"codex":     other,
+	}, def: selfReviewer}
+	var logBuf bytes.Buffer
+	logMu := &syncWriter{w: &logBuf}
+	logger := slog.New(slog.NewTextHandler(logMu, nil))
+	s, sf, _, au, _ := newPlanServerWithReviewerSet(t, runID, stageID, set, specHeterogeneousPlanReviewers(0), logger)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (self-review is warn-only):\n%s", w.Code, w.Body.String())
+	}
+
+	if reviewed := collectPlanReviewed(t, au); len(reviewed) != 2 {
+		t.Errorf("plan_reviewed entries = %d, want 2 (self-review must not drop a verdict)", len(reviewed))
+	}
+	if got := strings.Count(logMu.String(), "self-review detected"); got != 1 {
+		t.Errorf("self-review WARN count = %d, want exactly 1 (only reviewer #1 matches the author model)", got)
+	}
+}
+
+// syncWriter serializes writes for a logger shared across goroutines.
+type syncWriter struct {
+	mu sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+func (s *syncWriter) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.String()
+}
+
+// TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Advisory
+// pins the #955 degradation path: in advisory mode, an agents-list entry
+// whose provider is not configured emits a plan_review_failed entry with
+// the resolve error, the loop continues to the resolvable reviewer, and
+// the stage is never failed.
+func TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Advisory(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	anthropicFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	// codex deliberately absent from the set → For("codex") errors.
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": anthropicFake,
+	}, def: anthropicFake}
+	s, sf, _, au, rr := newPlanServerWithReviewerSet(t, runID, stageID, set, specHeterogeneousPlanReviewers(1), nil)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// Advisory review runs detached (#584); drain before asserting.
+	s.waitBackgroundReviews()
+
+	if reviewed := collectPlanReviewed(t, au); len(reviewed) != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1 (the resolvable anthropic reviewer)", len(reviewed))
+	}
+	var failedEntries []planreview.ReviewFailedPayload
+	for _, e := range au.appended {
+		if e.Category != "plan_review_failed" {
+			continue
+		}
+		var p planreview.ReviewFailedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_review_failed payload: %v", err)
+		}
+		failedEntries = append(failedEntries, p)
+	}
+	if len(failedEntries) != 1 {
+		t.Fatalf("plan_review_failed entries = %d, want 1 (the unresolvable codex reviewer)", len(failedEntries))
+	}
+	if !strings.Contains(failedEntries[0].Reason, "not configured") {
+		t.Errorf("failed reason = %q, want the resolve error", failedEntries[0].Reason)
+	}
+	if failedEntries[0].Timeout {
+		t.Error("resolve failure must not set the timeout discriminator")
+	}
+
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("advisory resolve failure must not fail the stage")
+		}
 	}
 }

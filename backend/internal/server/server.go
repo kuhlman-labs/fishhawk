@@ -194,12 +194,15 @@ type Config struct {
 	// loop but NOT safe for production.
 	RoleResolver *role.Resolver
 
-	// PlanReviewer invokes review agents for plan artifacts when the
-	// stage's workflow spec declares reviewers.agent > 0. Nil disables
-	// agent-driven plan review regardless of the spec config (gateless
-	// behaviour). Production wires an Anthropic SDK client; tests
-	// inject a fake via this field.
-	PlanReviewer PlanReviewer
+	// PlanReviewers resolves the review-agent adapters invoked when a
+	// stage's workflow spec declares agent review (ADR-027 / #955).
+	// Default() is the precedence-selected adapter the bare `agent: N`
+	// count form repeats; For(provider, model) resolves one entry of the
+	// heterogeneous `agents` list. A nil set — or a set whose Default()
+	// returns nil — means no reviewer backend is configured: agent review
+	// degrades to the *_review_skipped path regardless of the spec config.
+	// Production wires the serve.go adapter set; tests inject a stub.
+	PlanReviewers ReviewerSet
 
 	// ReviewBudget is the size-aware per-invocation timeout policy for plan-
 	// and implement-review agent calls (#747). The server applies
