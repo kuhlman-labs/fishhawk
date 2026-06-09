@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"strings"
 )
@@ -50,6 +51,16 @@ var gateEnvAllowExact = map[string]struct{}{
 // (GOPATH/GOCACHE/GOMODCACHE/GOPROXY/GOFLAGS/GOTOOLCHAIN/…), every CGO_* var,
 // and every LC_* locale var. Preserving the whole GO* prefix avoids turning a
 // real compile/test failure into an infra-skip from a missing toolchain var.
+//
+// GO* values can be URL-valued (notably GOPROXY/GOSUMDB), and an operator may
+// embed userinfo credentials in that URL (scheme://user:pass@host). Those
+// credentials would otherwise be visible to the agent-authored code the gates
+// execute, re-opening the #940 gap that #931's allow-list preserved. Before a
+// GO* value reaches gate code, sanitizeEnv runs it through redactGoEnvUserinfo,
+// which strips embedded userinfo from each credentialed URL entry while keeping
+// the proxy host/path so dependency resolution still works. Non-URL GO* forms
+// (off, direct, bare host, GOFLAGS, GOPATH, GO111MODULE, …) pass through
+// byte-identical.
 var gateEnvAllowPrefix = []string{"GO", "CGO_", "LC_"}
 
 // gateEnvDeny is the explicit known-secret denylist (belt-and-suspenders on top
@@ -86,10 +97,53 @@ func sanitizeEnv(base []string) []string {
 			continue
 		}
 		if gateEnvAllowed(key) {
+			if strings.HasPrefix(key, "GO") {
+				// Redact embedded URL userinfo (e.g. credentials in a GOPROXY
+				// URL) before it reaches gate code; non-URL values are
+				// unchanged, so kv is reconstructed byte-identical in that case.
+				out = append(out, key+"="+redactGoEnvUserinfo(kv[eq+1:]))
+				continue
+			}
 			out = append(out, kv)
 		}
 	}
 	return out
+}
+
+// redactGoEnvUserinfo strips embedded URL userinfo from a GO* env value. The
+// value may be a list of proxy entries separated by ',' (fall through on
+// 404/410) or '|' (fall through on any error) per the GOPROXY protocol
+// (https://go.dev/ref/mod#goproxy-protocol); both separators and the entry
+// order are preserved exactly. Each entry is redacted independently and the
+// transform is pure/deterministic so the gate env stays replay-stable.
+func redactGoEnvUserinfo(value string) string {
+	var b strings.Builder
+	start := 0
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; c == ',' || c == '|' {
+			b.WriteString(redactURLEntryUserinfo(value[start:i]))
+			b.WriteByte(c)
+			start = i + 1
+		}
+	}
+	b.WriteString(redactURLEntryUserinfo(value[start:]))
+	return b.String()
+}
+
+// redactURLEntryUserinfo returns entry with any embedded URL userinfo removed.
+// It rewrites only entries that parse as a credentialed URL — one with both a
+// scheme AND non-nil userinfo. net/url.Parse populates URL.User only when the
+// entry has a scheme, so non-URL forms (off, direct, a bare 'user:pass@host'
+// with no scheme, or a parse error) have User==nil and pass through verbatim.
+// Setting URL.User=nil drops the userinfo and its '@', yielding
+// 'scheme://host/path' (https://pkg.go.dev/net/url#URL.String).
+func redactURLEntryUserinfo(entry string) string {
+	u, err := url.Parse(entry)
+	if err != nil || u.Scheme == "" || u.User == nil {
+		return entry
+	}
+	u.User = nil
+	return u.String()
 }
 
 // gateEnvAllowed reports whether key is on the allow-list (exact match or an
