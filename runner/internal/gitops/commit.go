@@ -547,6 +547,15 @@ func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []s
 // (a pop conflict does not drop the stash) — and returns ErrBaseRebaseConflict.
 // A non-conflict pop failure returns the original wrapped git error unchanged,
 // preserving today's generic fail-loud behavior for that case.
+//
+// If conflict detection ITSELF fails (the `git ls-files --unmerged` probe errors
+// — corrupt git state, permission error), popStash still attempts a best-effort
+// `git reset --hard` before returning so the clean-abort guarantee holds even
+// when the conflict cannot be confirmed: a partially-applied conflicted pop must
+// not be left in the working tree (#893). The reset's own failure is tolerated
+// and annotated rather than masking the primary pop failure; the branch returns a
+// non-nil fail-loud error in every sub-case (no push), and is NOT
+// ErrBaseRebaseConflict because the conflict was never confirmed.
 func (p *Pusher) popStash(ctx context.Context, repoDir string) error {
 	popErr := p.run(ctx, repoDir, "stash", "pop")
 	if popErr == nil {
@@ -555,9 +564,17 @@ func (p *Pusher) popStash(ctx context.Context, repoDir string) error {
 	unmerged, lsErr := p.runOut(ctx, repoDir, "ls-files", "--unmerged")
 	if lsErr != nil {
 		// Conflict detection itself failed (corrupt git state, permission
-		// error). Fall back to the generic fail-loud wrap, but surface the
-		// detection error too so the unusual failure mode isn't obscured.
-		return fmt.Errorf("gitops: stash pop (conflict detection via ls-files failed: %v): %w", lsErr, popErr)
+		// error). The pop may have partially applied, so attempt a best-effort
+		// `git reset --hard` to honour the clean-abort invariant even though the
+		// conflict could not be confirmed (#893). Tolerate and annotate the
+		// reset's own failure rather than masking the primary pop failure: a
+		// failed reset leaves the tree for manual recovery but is surfaced
+		// explicitly. The branch returns a non-nil fail-loud error in every
+		// case — no push — and is NOT ErrBaseRebaseConflict (conflict unconfirmed).
+		if resetErr := p.run(ctx, repoDir, "reset", "--hard"); resetErr != nil {
+			return fmt.Errorf("gitops: stash pop (conflict detection via ls-files failed: %v; best-effort reset --hard also failed: %v): %w", lsErr, resetErr, popErr)
+		}
+		return fmt.Errorf("gitops: stash pop (conflict detection via ls-files failed: %v; working tree reset to fetched base): %w", lsErr, popErr)
 	}
 	if strings.TrimSpace(unmerged) == "" {
 		// Not a merge conflict — some other stash-pop failure. Preserve the
