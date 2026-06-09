@@ -1,9 +1,46 @@
 package main
 
 import (
+	"io"
 	"strings"
 	"testing"
 )
+
+func TestParseFlags_DefaultsToStdio(t *testing.T) {
+	tf, err := parseFlags([]string{"fishhawk-mcp"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if tf.transport != transportStdio {
+		t.Errorf("transport = %q, want %q", tf.transport, transportStdio)
+	}
+	if tf.addr != defaultHTTPAddr {
+		t.Errorf("addr = %q, want %q", tf.addr, defaultHTTPAddr)
+	}
+}
+
+func TestParseFlags_HTTPTransport(t *testing.T) {
+	tf, err := parseFlags([]string{"fishhawk-mcp", "--transport", "http", "--addr", "127.0.0.1:9000"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if tf.transport != transportHTTP {
+		t.Errorf("transport = %q, want %q", tf.transport, transportHTTP)
+	}
+	if tf.addr != "127.0.0.1:9000" {
+		t.Errorf("addr = %q, want 127.0.0.1:9000", tf.addr)
+	}
+}
+
+func TestParseFlags_RejectsUnknownTransport(t *testing.T) {
+	_, err := parseFlags([]string{"fishhawk-mcp", "--transport", "grpc"}, io.Discard)
+	if err == nil {
+		t.Fatal("expected an error for an unknown --transport value")
+	}
+	if !strings.Contains(err.Error(), "grpc") {
+		t.Errorf("error should name the offending value; got %q", err.Error())
+	}
+}
 
 func TestLoadConfig_HappyPath(t *testing.T) {
 	env := map[string]string{

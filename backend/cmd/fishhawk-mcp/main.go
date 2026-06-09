@@ -37,6 +37,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -50,6 +51,19 @@ const (
 	exitFailure = 1
 )
 
+// Transport selection. stdio is the default and keeps every existing
+// per-client subprocess consumer (Claude Code, Codex) unchanged; http
+// is the opt-in loopback-only streamable-HTTP transport (#927).
+const (
+	transportStdio = "stdio"
+	transportHTTP  = "http"
+
+	// defaultHTTPAddr is loopback by default so a bare --transport http
+	// never exposes the endpoint off-host. Overridable via --addr; a
+	// non-loopback value is rejected before binding (validateLoopbackAddr).
+	defaultHTTPAddr = "127.0.0.1:8765"
+)
+
 // serverName and serverVersion identify this binary on the MCP
 // handshake. Bumped manually as the tool surface evolves; tied to
 // the Fishhawk release line rather than the protocol spec version.
@@ -59,28 +73,77 @@ const (
 )
 
 func main() {
-	os.Exit(run(context.Background(), os.Stderr))
+	os.Exit(run(context.Background(), os.Args, os.Stderr))
 }
 
-// run is the testable entry point. Validates env, builds the MCP
-// server, and blocks on the stdio transport until the client
-// disconnects. Errors during the loop terminate the process with
-// exitFailure — MCP clients restart their server processes, so a
-// graceful exit on transport failure is correct.
-func run(ctx context.Context, stderr io.Writer) int {
+// transportFlags captures the parsed CLI flags governing the transport.
+// Flags govern transport selection; env (loadConfig) still governs the
+// backend URL + token.
+type transportFlags struct {
+	transport string
+	addr      string
+}
+
+// parseFlags parses the transport-selection flags from args[1:] (args
+// is os.Args, so args[0] is the program name). An unknown --transport
+// value is rejected with a precise error.
+func parseFlags(args []string, stderr io.Writer) (transportFlags, error) {
+	fs := flag.NewFlagSet("fishhawk-mcp", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var tf transportFlags
+	fs.StringVar(&tf.transport, "transport", transportStdio, "transport to serve on: stdio|http (http is loopback-only, opt-in — #927)")
+	fs.StringVar(&tf.addr, "addr", defaultHTTPAddr, "host:port for --transport http; loopback-only, ignored for stdio")
+	if err := fs.Parse(args[1:]); err != nil {
+		return transportFlags{}, err
+	}
+	switch tf.transport {
+	case transportStdio, transportHTTP:
+	default:
+		return transportFlags{}, fmt.Errorf("unknown --transport %q: want stdio or http", tf.transport)
+	}
+	return tf, nil
+}
+
+// run is the testable entry point. Parses flags, validates env, builds
+// the MCP server, and blocks on the selected transport until the client
+// disconnects (stdio) or ctx is cancelled (http). Errors terminate the
+// process with exitFailure — MCP clients restart their server
+// processes, so a graceful exit on transport failure is correct.
+func run(ctx context.Context, args []string, stderr io.Writer) int {
+	tf, err := parseFlags(args, stderr)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)
+		return exitFailure
+	}
 	cfg, err := loadConfig(os.Getenv)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)
 		return exitFailure
 	}
-	srv := buildServer(cfg)
-	registerTools(srv, &runResolver{
-		api:    newAPIClient(cfg),
-		getenv: os.Getenv,
-	})
-	if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil {
-		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: transport error: %v\n", err)
-		return exitFailure
+
+	// newServer builds a fully-registered server; the stdio path uses one
+	// instance, the http path calls it per session. Tool registration is
+	// identical across both transports.
+	newServer := func() *mcp.Server {
+		srv := buildServer(cfg)
+		registerTools(srv, &runResolver{
+			api:    newAPIClient(cfg),
+			getenv: os.Getenv,
+		})
+		return srv
+	}
+
+	switch tf.transport {
+	case transportHTTP:
+		if err := serveHTTP(ctx, tf.addr, cfg.apiToken, newServer); err != nil {
+			_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: transport error: %v\n", err)
+			return exitFailure
+		}
+	default:
+		if err := newServer().Run(ctx, &mcp.StdioTransport{}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: transport error: %v\n", err)
+			return exitFailure
+		}
 	}
 	return exitOK
 }
