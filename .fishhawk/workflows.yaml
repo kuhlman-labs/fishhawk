@@ -51,12 +51,19 @@ workflows:
         type: plan
         executor:
           agent: claude-code
-        # Advisory plan review (ADR-027): an agent reviewer surfaces a
-        # verdict before the human gate; agent>0 + human>0 → advisory, so
-        # the founder approval below stays authoritative. Exercised locally
-        # via the claudecode.Reviewer subprocess (#575).
+        # Advisory plan review (ADR-027): agent reviewers surface verdicts
+        # before the human gate; effective agent count >0 + human>0 →
+        # advisory, so the founder approval below stays authoritative.
+        # Heterogeneous topology (#955): Claude (claudecode subprocess,
+        # #575) and Codex (codex CLI, #844) review concurrently. Codex
+        # reasoning effort stays the deployment-level knob
+        # FISHHAWKD_CODEX_REASONING_EFFORT.
         reviewers:
-          agent: 1
+          agents:
+            - provider: claudecode
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
           human: 1
         inputs:
           - source: github_issue
@@ -98,14 +105,20 @@ workflows:
             command: "scripts/test"
             timeout: "12m"
             max_iterations: 1
-        # Advisory implement-review (ADR-027 impl 2/2, #561): an agent
-        # reviewer reads the diff against the approved plan and surfaces a
-        # verdict (incl. scope-drift flag). agent>0 + human>0 → advisory, so
-        # it never blocks; the review stage's founder approval stays the gate.
-        # Runs async server-side post-#584; verdict lands ~60-90s after the
-        # implement trace upload (poll the audit / get_run_status).
+        # Advisory implement-review (ADR-027 impl 2/2, #561): agent
+        # reviewers read the diff against the approved plan and surface
+        # verdicts (incl. scope-drift flag). Effective agent count >0 +
+        # human>0 → advisory, so it never blocks; the review stage's
+        # founder approval stays the gate. Runs async server-side
+        # post-#584; verdicts land ~60-90s+ after the implement trace
+        # upload (poll the audit / get_run_status). Heterogeneous
+        # topology (#955): same Claude+Codex pair as the plan stage.
         reviewers:
-          agent: 1
+          agents:
+            - provider: claudecode
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
           human: 1
         inputs:
           - artifact: plan
