@@ -151,9 +151,13 @@ runs:
     - name: Run fishhawk-runner
       shell: bash
       working-directory: ${{ github.action_path }}
+      # Export only the key the selected agent consumes: ANTHROPIC_API_KEY
+      # for claude-code, OPENAI_API_KEY for codex. Forwarding the unused
+      # provider's key would needlessly widen the secret surface inside the
+      # runner subprocess; the conditional collapses the other to ''.
       env:
-        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
-        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        ANTHROPIC_API_KEY: ${{ inputs.agent == 'claude-code' && inputs.anthropic-api-key || '' }}
+        OPENAI_API_KEY: ${{ inputs.agent == 'codex' && inputs.openai-api-key || '' }}
       run: |
         go run ./cmd/fishhawk-runner \
           --run-id "${{ inputs.run-id }}" \

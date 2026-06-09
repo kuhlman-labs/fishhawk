@@ -35,7 +35,11 @@ on:
         required: true
         type: string
       stage:
-        description: 'Stage executor ref (e.g. claude-code) — informational'
+        # The backend dispatcher sends the stage's executor ref here
+        # (run.Stage.ExecutorRef, e.g. claude-code or codex). It is the
+        # agent-provider identifier and is forwarded to the runner action's
+        # `agent` input below to select which CLI is installed/invoked.
+        description: 'Stage executor ref / agent provider (claude-code|codex)'
         required: false
         type: string
         default: claude-code
@@ -125,7 +129,16 @@ jobs:
           backend-url: ${{ vars.FISHHAWK_BACKEND_URL || 'http://localhost:8080' }}
           workflow: ${{ inputs.workflow_id }}
           stage: ${{ inputs.stage }}
+          # agent: the executor ref carried by the `stage` dispatch input
+          # selects the provider CLI. The action installs Claude Code for
+          # claude-code and Codex for codex, and exports only that
+          # provider's API key. Defaults to claude-code, so existing
+          # dispatches keep working with only ANTHROPIC_API_KEY set.
+          agent: ${{ inputs.stage }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # openai-api-key: consumed only when agent=codex. Unset/empty for
+          # Claude dispatches, so OPENAI_API_KEY is not a new required secret.
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           github-token: ${{ steps.fishhawk-auth.outputs.token }}
           # fetch-prompt: runner pulls the constructed prompt from
           # GET /v0/stages/{stage-id}/prompt and writes it to a
