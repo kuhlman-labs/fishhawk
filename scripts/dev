@@ -551,7 +551,17 @@ cmd_k8s_up() {
     --set image.pullPolicy=IfNotPresent
 
   print "waiting for rollout..."
-  kubectl rollout status deployment/fishhawk --timeout=120s
+  # Catch the rollout failure ourselves: a stuck/CrashLoopBackOff pod makes
+  # `kubectl rollout status` exit non-zero, which would otherwise trip set -e
+  # and abort before any diagnostics ran. Tail pods + logs to stderr first so
+  # the rollout leg honors the same fail-loud contract as the /healthz leg.
+  if ! kubectl rollout status deployment/fishhawk --timeout=120s; then
+    print -u2 "error: deployment/fishhawk rollout did not complete within 120s"
+    print -u2 "recent pod state + logs:"
+    kubectl get pods >&2 || true
+    kubectl logs deploy/fishhawk --tail=20 >&2 || true
+    exit 1
+  fi
 
   # Port-forward in the background; track its pid in a named file (mirrors
   # PID_FILE) so cmd_k8s_down kills exactly this process, never an unrelated
@@ -591,10 +601,18 @@ cmd_k8s_down() {
     rm -f "$K8S_PF_PID_FILE"
   fi
 
-  if helm uninstall fishhawk 2>/dev/null; then
+  # Only an absent release is a no-op. Capture stderr so a genuine failure
+  # (unreachable cluster, bad kubeconfig, permission denied) is surfaced and
+  # exits non-zero, never misreported as a harmless 'nothing to uninstall'.
+  local uninstall_out
+  if uninstall_out="$(helm uninstall fishhawk 2>&1)"; then
     print "helm release fishhawk uninstalled"
-  else
+  elif print -r -- "$uninstall_out" | grep -qi 'not found'; then
     print "helm release fishhawk not found (nothing to uninstall)"
+  else
+    print -u2 "error: helm uninstall fishhawk failed:"
+    print -u2 -- "$uninstall_out"
+    exit 1
   fi
 }
 
