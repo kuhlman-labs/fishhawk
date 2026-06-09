@@ -1,0 +1,48 @@
+{{- if and .Values.minio.enabled .Values.minio.createBucket }}
+# Bucket-bootstrap Job: creates the trace bucket in the in-cluster MinIO after
+# install/upgrade. The mc image is pinned to the same release as the server
+# (co-versioned) per CLAUDE.md's run-time image-pinning rule. The command retries
+# `mc alias set` against the Service until MinIO is accepting connections, then
+# `mc mb --ignore-existing` so re-runs are idempotent.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-minio-bucket
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-bucket
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "fishhawk.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: minio-bucket
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: {{ .Values.minio.mcImage | quote }}
+          imagePullPolicy: {{ .Values.minio.pullPolicy }}
+          env:
+            - name: MINIO_ROOT_USER
+              value: {{ .Values.minio.rootUser | quote }}
+            - name: MINIO_ROOT_PASSWORD
+              value: {{ .Values.minio.rootPassword | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              endpoint="http://{{ include "fishhawk.fullname" . }}-minio:{{ .Values.minio.apiPort }}"
+              echo "waiting for MinIO at $endpoint"
+              until mc alias set fishhawk "$endpoint" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do
+                echo "MinIO not ready yet; retrying in 2s"
+                sleep 2
+              done
+              mc mb --ignore-existing fishhawk/{{ .Values.minio.bucket }}
+              echo "bucket {{ .Values.minio.bucket }} ready"
+{{- end }}
