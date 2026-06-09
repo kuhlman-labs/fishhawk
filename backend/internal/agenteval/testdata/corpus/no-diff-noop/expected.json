@@ -1,0 +1,10 @@
+{
+  "outcome": "no_diff",
+  "tool_sequence": ["Read", "Grep"],
+  "tool_calls": 2,
+  "unnecessary_retries": 0,
+  "loop_detected": false,
+  "evidence_before_edit": true,
+  "out_of_tree_writes": [],
+  "scope_drift_paths": []
+}
