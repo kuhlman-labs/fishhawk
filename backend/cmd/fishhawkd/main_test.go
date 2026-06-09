@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -363,6 +366,45 @@ func TestResolvePlanReviewers(t *testing.T) {
 		}
 		if a == b {
 			t.Error("For() returned the same instance for two resolves; want independent per-resolve construction")
+		}
+	})
+
+	t.Run("For threads the spec model into the constructed adapter", func(t *testing.T) {
+		// The model-override contract, not just per-resolve allocation,
+		// observed behaviorally: claudecode's Review returns the configured
+		// model verbatim (its CLI envelope does not echo the model), so a
+		// stub binary makes the model that reached the constructed adapter
+		// visible without a model accessor on the adapter types.
+		stub := filepath.Join(t.TempDir(), "claude-stub")
+		envelope := `{"type":"result","subtype":"success","is_error":false,` +
+			`"result":"{\"verdict\":\"approve\"}","usage":{"input_tokens":1,"output_tokens":1}}`
+		if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s' '"+envelope+"'\n"), 0o755); err != nil {
+			t.Fatalf("write stub binary: %v", err)
+		}
+		set := resolvePlanReviewers(planReviewerOptions{
+			enableLocalClaudeReviewer: true,
+			localClaudeBinary:         stub,
+			localClaudeModel:          "claude-sonnet-4-6",
+		}, logger)
+
+		overridden, err := set.For("claudecode", "claude-opus-4-8")
+		if err != nil {
+			t.Fatalf("For(claudecode, opus): %v", err)
+		}
+		if _, model, err := overridden.Review(context.Background(), "review prompt"); err != nil {
+			t.Fatalf("Review via overridden adapter: %v", err)
+		} else if model != "claude-opus-4-8" {
+			t.Errorf("overridden adapter model = %q, want claude-opus-4-8 (spec model must reach the instance)", model)
+		}
+
+		fallback, err := set.For("claudecode", "")
+		if err != nil {
+			t.Fatalf("For(claudecode, default): %v", err)
+		}
+		if _, model, err := fallback.Review(context.Background(), "review prompt"); err != nil {
+			t.Fatalf("Review via default-model adapter: %v", err)
+		} else if model != "claude-sonnet-4-6" {
+			t.Errorf("default-model adapter model = %q, want claude-sonnet-4-6 (localClaudeModel fallback)", model)
 		}
 	})
 }

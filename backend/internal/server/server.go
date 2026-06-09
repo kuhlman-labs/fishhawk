@@ -204,6 +204,16 @@ type Config struct {
 	// Production wires the serve.go adapter set; tests inject a stub.
 	PlanReviewers ReviewerSet
 
+	// PlanReviewer is the single-reviewer convenience form of PlanReviewers,
+	// the shape this config had before the #955 ReviewerSet: when
+	// PlanReviewers is nil and PlanReviewer is non-nil, New wraps it into a
+	// set whose Default() is this reviewer. The wrapped set's For() always
+	// errors — a heterogeneous `agents` list needs a real ReviewerSet — so
+	// spec-declared providers degrade via the *_review_failed path rather
+	// than silently routing every provider to one adapter. Ignored when
+	// PlanReviewers is set.
+	PlanReviewer PlanReviewer
+
 	// ReviewBudget is the size-aware per-invocation timeout policy for plan-
 	// and implement-review agent calls (#747). The server applies
 	// ReviewBudget.Budget(len(promptText)) as a context deadline at each
@@ -328,10 +338,25 @@ type Server struct {
 	appIdentityGetterOverride appIdentityGetter
 }
 
+// soleReviewerSet adapts the Config.PlanReviewer single-reviewer convenience
+// form into a ReviewerSet. For() deliberately errors: the single-reviewer
+// form predates per-provider resolution, and mapping every declared provider
+// to one adapter would silently misroute a heterogeneous `agents` list.
+type soleReviewerSet struct{ reviewer PlanReviewer }
+
+func (s soleReviewerSet) Default() PlanReviewer { return s.reviewer }
+
+func (soleReviewerSet) For(provider, _ string) (PlanReviewer, error) {
+	return nil, fmt.Errorf("reviewer provider %q is not resolvable from the single-reviewer configuration: wire Config.PlanReviewers", provider)
+}
+
 // New builds a Server. It does not start listening; call Start.
 func New(cfg Config) *Server {
 	if cfg.Addr == "" {
 		cfg.Addr = ":8080"
+	}
+	if cfg.PlanReviewers == nil && cfg.PlanReviewer != nil {
+		cfg.PlanReviewers = soleReviewerSet{reviewer: cfg.PlanReviewer}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()

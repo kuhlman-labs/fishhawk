@@ -2144,14 +2144,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runImplementReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the caller can fail the stage as
 	// category-B before the terminal transition.
-	return s.runImplementReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
 }
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
@@ -2200,7 +2200,7 @@ func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run
 	return amended
 }
 
-// runImplementReviewLoop runs the per-reviewer implement-review loop
+// runImplementReviewInvocations runs the per-reviewer implement-review loop
 // shared by the synchronous (gating) and detached (advisory) dispatch
 // paths. For each resolved invocation it calls its reviewer's Review, logs
 // WARN on self-review (reviewer model == authorModel), and appends one
@@ -2208,7 +2208,7 @@ func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run
 // is reject. It performs no stage transition — the gating caller owns the
 // failed-B transition so the advance-blocking edge stays on the
 // synchronous path only.
-func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string) bool {
+func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
 	budget := s.cfg.ReviewBudget.Budget(len(promptText))

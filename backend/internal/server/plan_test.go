@@ -1991,3 +1991,67 @@ func TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Advisory(t *te
 		}
 	}
 }
+
+// TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Gating is the
+// gating analog of the advisory degradation test: when one of two declared
+// gating reviewers cannot be resolved (config drift on an in-flight run — the
+// runs.go dispatch pre-check blocks fresh gating runs from entering this
+// state), the resolve failure emits exactly one plan_review_failed entry,
+// leaves hasRejection untouched, and the resolvable reviewer's approve
+// verdict still governs: the stage advances rather than failing.
+func TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Gating(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	anthropicFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	// codex deliberately absent from the set → For("codex") errors.
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": anthropicFake,
+	}, def: anthropicFake}
+	s, sf, _, au, rr := newPlanServerWithReviewerSet(t, runID, stageID, set, specHeterogeneousPlanReviewers(0), nil)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewed := collectPlanReviewed(t, au)
+	if len(reviewed) != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1 (the resolvable anthropic reviewer)", len(reviewed))
+	}
+	if reviewed[0].ReviewerModel != "claude-opus-4-8" || reviewed[0].Authority != planreview.AuthorityGating {
+		t.Errorf("reviewed entry = model %q authority %q, want claude-opus-4-8 / gating",
+			reviewed[0].ReviewerModel, reviewed[0].Authority)
+	}
+
+	var failedEntries []planreview.ReviewFailedPayload
+	for _, e := range au.appended {
+		if e.Category != "plan_review_failed" {
+			continue
+		}
+		var p planreview.ReviewFailedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_review_failed payload: %v", err)
+		}
+		failedEntries = append(failedEntries, p)
+	}
+	if len(failedEntries) != 1 {
+		t.Fatalf("plan_review_failed entries = %d, want 1 (the unresolvable codex reviewer)", len(failedEntries))
+	}
+	if !strings.Contains(failedEntries[0].Reason, "not configured") {
+		t.Errorf("failed reason = %q, want the resolve error", failedEntries[0].Reason)
+	}
+	if failedEntries[0].Authority != planreview.AuthorityGating {
+		t.Errorf("failed authority = %q, want gating", failedEntries[0].Authority)
+	}
+
+	// A resolve failure must not count as a rejection: with the resolvable
+	// reviewer approving, the gating stage must never transition to failed.
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("gating resolve failure must not fail the stage when the resolvable reviewer approves")
+		}
+	}
+}
