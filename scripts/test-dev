@@ -161,6 +161,23 @@ else
 fi
 unset FISHHAWKD_ADDR
 
+# 7b. _k8s_image_ref / _k8s_healthz_url: pure k8s bring-up helpers, no cluster.
+if [[ "$(_k8s_image_ref)" == "ghcr.io/kuhlman-labs/fishhawkd:dev-local" ]]; then
+  pass "_k8s_image_ref returns the local dev-local image tag"
+else
+  fail "_k8s_image_ref should return ghcr.io/kuhlman-labs/fishhawkd:dev-local (got: $(_k8s_image_ref))"
+fi
+if [[ "$(_k8s_healthz_url)" == "http://localhost:8080/healthz" ]]; then
+  pass "_k8s_healthz_url defaults to port 8080"
+else
+  fail "_k8s_healthz_url should default to 8080 (got: $(_k8s_healthz_url))"
+fi
+if [[ "$(_k8s_healthz_url 9090)" == "http://localhost:9090/healthz" ]]; then
+  pass "_k8s_healthz_url respects an explicit forwarded port"
+else
+  fail "_k8s_healthz_url should honor port 9090 (got: $(_k8s_healthz_url 9090))"
+fi
+
 # 8. _await_healthz: returns non-zero quickly for an already-exited pid (the
 # spawn-then-die early-exit path) without needing a live server.
 ( exit 0 ) &
@@ -189,6 +206,26 @@ if print -r -- "$up_body" | grep -q 'exit 1'; then
   pass "cmd_up exits non-zero on a failed readiness gate"
 else
   fail "cmd_up should exit 1 on readiness-gate failure"
+fi
+
+# 9b. cmd_k8s_up readiness gate: like cmd_up, the body must poll _await_healthz,
+# tail the pod logs, and exit 1 on failure so a future edit can't silently drop
+# the fail-loud guarantee of the Docker-Desktop bring-up.
+k8s_up_body="$(typeset -f cmd_k8s_up)"
+if print -r -- "$k8s_up_body" | grep -q '_await_healthz'; then
+  pass "cmd_k8s_up gates the bring-up on _await_healthz"
+else
+  fail "cmd_k8s_up should call _await_healthz after the port-forward"
+fi
+if print -r -- "$k8s_up_body" | grep -q 'kubectl logs'; then
+  pass "cmd_k8s_up tails pod logs on a failed readiness gate"
+else
+  fail "cmd_k8s_up should tail kubectl logs on readiness-gate failure"
+fi
+if print -r -- "$k8s_up_body" | grep -q 'exit 1'; then
+  pass "cmd_k8s_up exits non-zero on a failed readiness gate"
+else
+  fail "cmd_k8s_up should exit 1 on readiness-gate failure"
 fi
 
 # 10. ZERR diagnostic trap (#631): installed, reports the ERROR-SITE file:line

@@ -38,6 +38,14 @@ down: ## Stop the local stack (preserves volumes).
 nuke: ## Stop the local stack AND drop volumes (destroys data).
 	docker compose down -v
 
+.PHONY: k8s-up
+k8s-up: ## Build the image + helm-install the chart on Docker-Desktop k8s, gate on /healthz.
+	scripts/dev k8s
+
+.PHONY: k8s-down
+k8s-down: ## Tear down the local k8s deployment (port-forward + helm uninstall).
+	scripts/dev k8s-down
+
 .PHONY: minio-init
 minio-init: ## Create the MinIO trace bucket on the local stack (idempotent).
 	@docker compose exec -T minio mc alias set local http://localhost:9000 fishhawk fishhawk-dev-secret >/dev/null

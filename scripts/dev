@@ -4,6 +4,7 @@ set -euo pipefail
 
 REPO_ROOT="${0:A:h:h}"
 PID_FILE="${REPO_ROOT}/.fishhawk/dev.pid"
+K8S_PF_PID_FILE="${REPO_ROOT}/.fishhawk/k8s-pf.pid"
 LOG_DIR="${REPO_ROOT}/logs"
 LOG_FILE="${LOG_DIR}/fishhawkd.log"
 BIN="${REPO_ROOT}/bin/fishhawkd"
@@ -63,6 +64,24 @@ _healthz_url() {
   local addr="${FISHHAWKD_ADDR:-:8080}"
   local port="${addr##*:}"
   if [[ -z "$port" || "$port" == "$addr" ]]; then port=8080; fi
+  print "http://localhost:${port}/healthz"
+}
+
+# Local image tag the Docker-Desktop Kubernetes bring-up builds and the chart is
+# pointed at via `--set image.tag=dev-local`. Docker Desktop's k8s shares the host
+# Docker daemon image store, so a locally built image under this tag is resolvable
+# in-cluster with pullPolicy: IfNotPresent — no registry push / kind load needed.
+# Pure (no git/cluster), so scripts/test-dev can assert the tag directly.
+_k8s_image_ref() {
+  print "ghcr.io/kuhlman-labs/fishhawkd:dev-local"
+}
+
+# Health endpoint reached through the k8s port-forward. The forward maps a host
+# port (arg 1, default 8080) to the in-cluster fishhawkd Service, so the URL is
+# always localhost-flavored regardless of the cluster topology. Mirrors
+# _healthz_url so the readiness gate stays correct if the forwarded port changes.
+_k8s_healthz_url() {
+  local port="${1:-8080}"
   print "http://localhost:${port}/healthz"
 }
 
@@ -508,8 +527,79 @@ cmd_post_merge() {
   cmd_reload "$@"
 }
 
+# Local Kubernetes bring-up against Docker Desktop's cluster. Builds the
+# fishhawkd image into the host Docker daemon (which Docker-Desktop k8s shares,
+# so no registry push / kind load), helm-installs the chart with values-local
+# overriding the image to the local build, waits for the rollout, then opens a
+# port-forward and gates on /healthz — the authoritative readiness signal
+# (rollout status can report available before the post-install migrate Job
+# finishes; fishhawkd only answers healthy after its own startup completes).
+# Fails loud (kubectl logs + pods tail, non-zero exit) on a stuck rollout or a
+# /healthz timeout, mirroring cmd_up's readiness-gate contract. This is the
+# operator smoke test for the chart — not exercised in CI (no cluster).
+cmd_k8s_up() {
+  print "k8s: starting"
+  local pf_port=8080
+
+  print "building image $(_k8s_image_ref)..."
+  (cd "${REPO_ROOT}" && docker build -t "$(_k8s_image_ref)" -f backend/Dockerfile .)
+
+  print "helm upgrade --install fishhawk..."
+  helm upgrade --install fishhawk "${REPO_ROOT}/deploy/helm/fishhawk" \
+    -f "${REPO_ROOT}/deploy/helm/fishhawk/values-local.yaml" \
+    --set image.tag=dev-local \
+    --set image.pullPolicy=IfNotPresent
+
+  print "waiting for rollout..."
+  kubectl rollout status deployment/fishhawk --timeout=120s
+
+  # Port-forward in the background; track its pid in a named file (mirrors
+  # PID_FILE) so cmd_k8s_down kills exactly this process, never an unrelated
+  # forward. The forward stays in the foreground for its lifetime, so the
+  # _await_healthz `kill -0` check fails fast if it dies mid-poll.
+  mkdir -p "${REPO_ROOT}/.fishhawk"
+  kubectl port-forward "svc/fishhawk" "${pf_port}:8080" >/dev/null 2>&1 &
+  local pf_pid=$!
+  disown
+  print "$pf_pid" > "$K8S_PF_PID_FILE"
+
+  if ! _await_healthz "$pf_pid" "$(_k8s_healthz_url "$pf_port")" 60; then
+    print -u2 "error: fishhawkd did not become healthy within 60s"
+    print -u2 "recent pod state + logs:"
+    kubectl get pods >&2 || true
+    kubectl logs deploy/fishhawk --tail=20 >&2 || true
+    kill "$pf_pid" 2>/dev/null || true
+    rm -f "$K8S_PF_PID_FILE"
+    exit 1
+  fi
+
+  print "fishhawkd reachable at $(_k8s_healthz_url "$pf_port") (port-forward pid ${pf_pid})"
+}
+
+# Tear down the local k8s deployment: kill the tracked port-forward, then
+# helm-uninstall the release. Both steps are idempotent — a missing pid file or
+# an already-uninstalled release ('release: not found') is a no-op — so a double
+# teardown is harmless.
+cmd_k8s_down() {
+  if [[ -f "$K8S_PF_PID_FILE" ]]; then
+    local pf_pid
+    pf_pid="$(cat "$K8S_PF_PID_FILE")"
+    if kill -0 "$pf_pid" 2>/dev/null; then
+      kill "$pf_pid" 2>/dev/null || true
+      print "port-forward stopped (pid ${pf_pid})"
+    fi
+    rm -f "$K8S_PF_PID_FILE"
+  fi
+
+  if helm uninstall fishhawk 2>/dev/null; then
+    print "helm release fishhawk uninstalled"
+  else
+    print "helm release fishhawk not found (nothing to uninstall)"
+  fi
+}
+
 _usage() {
-  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|down>"
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|k8s|k8s-down|down>"
   print -u2 ""
   print -u2 "  post-merge runs the full per-PR post-merge walk: git pull --ff-only,"
   print -u2 "  scripts/cleanup-merged, an optional issue-closed check (<issue>), then"
@@ -517,6 +607,10 @@ _usage() {
   print -u2 ""
   print -u2 "  reload is the down-then-up stack primitive post-merge composes; plain up"
   print -u2 "  no-ops when fishhawkd is already running and so never rebuilds."
+  print -u2 ""
+  print -u2 "  k8s builds the fishhawkd image, helm-installs the chart with values-local"
+  print -u2 "  against the Docker-Desktop cluster, and gates on /healthz; k8s-down kills"
+  print -u2 "  the port-forward and helm-uninstalls. See docs/deploy/kubernetes.md."
   print -u2 ""
   print -u2 "binary activation after a rebuild:"
   print -u2 "  fishhawkd        rebuilt + restarted by up/reload"
@@ -531,6 +625,8 @@ if [[ -z "${DEV_LIB_ONLY:-}" ]]; then
     up)         cmd_up "${@:2}" ;;
     reload)     cmd_reload "${@:2}" ;;
     post-merge) cmd_post_merge "${@:2}" ;;
+    k8s)        cmd_k8s_up "${@:2}" ;;
+    k8s-down)   cmd_k8s_down ;;
     down)       cmd_down ;;
     *)          _usage; exit 1 ;;
   esac
