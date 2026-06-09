@@ -1092,6 +1092,238 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
 	}
 }
 
+// TestE2E_Fixup_AwaitReviewWaitsForReReviewOfFixupHead drives the #894 seam
+// end to end: fishhawk_await_review (and the get_run_status
+// implement_review_status it shares) must NOT report the PRE-fix-up review as
+// 'complete' once a fix-up re-opens the implement stage — it must wait for the
+// re-review of the fix-up head. This crosses the HTTP audit endpoint →
+// reviewStatusFor fix-up-boundary derivation → fishhawk_await_review /
+// get_run_status seam (cf. #618), and is MANDATORY because the fix anchors on
+// the real Postgres audit store's monotonic per-run Sequence: a fix-up entry
+// written after the round-1 verdict always carries a HIGHER sequence, so the
+// flooring drops the stale verdict. An in-process fake assigns sequences by
+// append order and cannot fully vouch for that property.
+//
+// Flow: implement stage at the gate, round-1 implement_review_started +
+// implement_reviewed(approve_with_concerns) in Postgres → a real
+// fishhawk_fixup_stage call (writes stage_fixup_triggered at a higher
+// sequence) → assert get_run_status.implement_review_status == 'pending' and
+// fishhawk_await_review blocks to its timeout returning 'pending' (NOT an
+// instant stale 'complete') → land a round-2 implement_reviewed(approve) →
+// assert it resolves 'complete' carrying ONLY the round-2 verdict.
+func TestE2E_Fixup_AwaitReviewWaitsForReReviewOfFixupHead(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+
+	// 1. Implement stage parked at the review gate (a valid fix-up candidate).
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	// 2. Round 1: a review was dispatched (started proxy) and landed an
+	// approve_with_concerns verdict. The started entry is what keeps the
+	// post-fix-up status 'pending' (unfloored) rather than 'none'.
+	seedImplementReviewStarted(t, ctx, auditRepo, fx.runID, stage.ID)
+	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "round-1 stale concern"})
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+
+	// Sanity: before any fix-up the implement review reads 'complete' with the
+	// round-1 verdict — the pre-fix-up state the bug would wrongly preserve.
+	if st := getImplementReviewStatus(t, ctx, session, fx.runID); st == nil || st.Status != "complete" {
+		t.Fatalf("pre-fix-up implement_review_status = %+v, want complete", st)
+	}
+
+	// 3. Trigger a real fix-up through the MCP binary. This writes a
+	// stage_fixup_triggered audit entry whose Postgres-assigned Sequence is
+	// strictly higher than the round-1 implement_reviewed — the boundary the
+	// fix floors the terminal-verdict reads to.
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": stage.ID.String(),
+			"concerns": []int{0},
+			"reason":   "route the round-1 concern back onto the branch",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, res))
+	}
+
+	// 4. get_run_status.implement_review_status now reads 'pending' — the
+	// stale round-1 verdict is floored out and the re-review of the fix-up
+	// head has not landed. Before the fix this read 'complete'.
+	st := getImplementReviewStatus(t, ctx, session, fx.runID)
+	if st == nil || st.Status != "pending" {
+		t.Fatalf("post-fix-up implement_review_status = %+v, want pending (the stale verdict must not read complete)", st)
+	}
+	if len(st.Reviews) != 0 {
+		t.Errorf("post-fix-up reviews = %+v, want empty while the re-review is in flight", st.Reviews)
+	}
+
+	// 5. fishhawk_await_review must BLOCK to its timeout and return 'pending'
+	// rather than resolving instantly with the stale 'complete'. A short
+	// timeout keeps the test fast; the assertion is that it waited ~timeout
+	// (did not short-circuit) AND returned pending.
+	const awaitTimeout = 2
+	awaitStart := time.Now()
+	awaitOut := callAwaitReview(t, ctx, session, fx.runID, awaitTimeout)
+	elapsed := time.Since(awaitStart)
+	if awaitOut.Status != "pending" {
+		t.Fatalf("await_review status = %q, want pending (must not return the stale complete)", awaitOut.Status)
+	}
+	if elapsed < time.Duration(awaitTimeout)*time.Second/2 {
+		t.Errorf("await_review returned after %s — it short-circuited instead of blocking on pending", elapsed)
+	}
+
+	// 6. Round 2: the re-review of the fix-up head lands a clean approve at a
+	// sequence above the fix-up boundary.
+	seedImplementReviewVerdict(t, ctx, auditRepo, fx.runID, stage.ID, planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent",
+		Authority:    planreview.AuthorityAdvisory,
+		Verdict:      planreview.VerdictApprove,
+	})
+
+	// 7. The status now resolves 'complete' carrying ONLY the round-2 verdict.
+	st = getImplementReviewStatus(t, ctx, session, fx.runID)
+	if st == nil || st.Status != "complete" {
+		t.Fatalf("post-re-review implement_review_status = %+v, want complete", st)
+	}
+	if len(st.Reviews) != 1 {
+		t.Fatalf("post-re-review reviews = %+v, want only the round-2 verdict", st.Reviews)
+	}
+	if st.Reviews[0].Verdict != "approve" {
+		t.Errorf("post-re-review verdict = %q, want approve (round-2); the round-1 approve_with_concerns must be floored out", st.Reviews[0].Verdict)
+	}
+
+	// And await_review now returns 'complete' immediately with the round-2 verdict.
+	finalOut := callAwaitReview(t, ctx, session, fx.runID, awaitTimeout)
+	if finalOut.Status != "complete" {
+		t.Errorf("final await_review status = %q, want complete", finalOut.Status)
+	}
+	if len(finalOut.Reviews) != 1 || finalOut.Reviews[0].Verdict != "approve" {
+		t.Errorf("final await_review reviews = %+v, want only the round-2 approve verdict", finalOut.Reviews)
+	}
+}
+
+// implementReviewStatus mirrors the MCP server's ReviewStatus output shape so
+// the integration test can decode it off the get_run_status / await_review
+// responses.
+type implementReviewStatus struct {
+	Stage   string `json:"stage"`
+	Status  string `json:"status"`
+	Reviews []struct {
+		Verdict string `json:"verdict"`
+	} `json:"reviews"`
+}
+
+// getImplementReviewStatus calls fishhawk_get_run_status and returns the
+// decoded implement_review_status (nil when absent).
+func getImplementReviewStatus(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) *implementReviewStatus {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_run_status",
+		Arguments: map[string]any{"run_id": runID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_get_run_status: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("get_run_status tool returned error: %s", toolContentString(t, result))
+	}
+	var out struct {
+		ImplementReviewStatus *implementReviewStatus `json:"implement_review_status"`
+	}
+	decodeStructured(t, result, &out)
+	return out.ImplementReviewStatus
+}
+
+// callAwaitReview calls fishhawk_await_review for the implement stage with the
+// given timeout and returns the decoded output.
+func callAwaitReview(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID, timeoutSeconds int) implementReviewStatus {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_await_review",
+		Arguments: map[string]any{
+			"run_id":          runID.String(),
+			"stage":           "implement",
+			"timeout_seconds": timeoutSeconds,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_await_review: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("await_review tool returned error: %s", toolContentString(t, result))
+	}
+	var out implementReviewStatus
+	decodeStructured(t, result, &out)
+	return out
+}
+
+// seedImplementReviewStarted records an implement_review_started audit entry —
+// the #600 proxy that keeps a not-yet-terminal review reading 'pending'
+// (unfloored across the fix-up boundary, #894).
+func seedImplementReviewStarted(t *testing.T, ctx context.Context, repo audit.Repository, runID, stageID uuid.UUID) {
+	t.Helper()
+	payload, err := json.Marshal(planreview.ReviewStartedPayload{
+		ConfiguredAgents: 1,
+		Authority:        planreview.AuthorityAdvisory,
+	})
+	if err != nil {
+		t.Fatalf("marshal implement_review_started payload: %v", err)
+	}
+	kind := audit.ActorKind("agent")
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "implement_review_started",
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("AppendChained implement_review_started: %v", err)
+	}
+}
+
+// seedImplementReviewVerdict records an implement_reviewed audit entry with an
+// arbitrary verdict payload — used to land the round-2 re-review of the fix-up
+// head at a sequence above the fix-up boundary.
+func seedImplementReviewVerdict(t *testing.T, ctx context.Context, repo audit.Repository, runID, stageID uuid.UUID, p planreview.ImplementReviewedPayload) {
+	t.Helper()
+	payload, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal implement_reviewed payload: %v", err)
+	}
+	kind := audit.ActorKind("agent")
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "implement_reviewed",
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("AppendChained implement_reviewed (round 2): %v", err)
+	}
+}
+
 // reviewActionHint mirrors the MCP server's ReviewActionHint output shape so
 // the integration test can decode it off the get_run_status response.
 type reviewActionHint struct {

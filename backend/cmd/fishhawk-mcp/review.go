@@ -94,7 +94,15 @@ const reviewAuditQueryLimit = 50
 // is not a reason to fail the whole fetch. Returns nil when no entries
 // exist. Shared by loadPlanReviews, loadImplementReviews, and
 // reviewStatusFor so the decode lives in one place.
-func (r *runResolver) decodeReviewVerdicts(ctx context.Context, runID uuid.UUID, category string) ([]PlanReview, error) {
+//
+// sinceSeq is a fix-up-boundary floor (#894): entries whose audit
+// Sequence is <= sinceSeq are dropped before decoding, so a stale
+// pre-fix-up verdict is not counted after a fix-up re-opens the stage.
+// Callers that want every entry (the plan-reviews / implement_reviews
+// listing surfaces) pass sinceSeq == 0; since real and fake audit
+// sequences are >= 1, a 0 floor is a no-op and the listing semantics are
+// unchanged. Only reviewStatusFor passes a non-zero floor.
+func (r *runResolver) decodeReviewVerdicts(ctx context.Context, runID uuid.UUID, category string, sinceSeq int64) ([]PlanReview, error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: category,
 		Limit:    reviewAuditQueryLimit,
@@ -104,6 +112,9 @@ func (r *runResolver) decodeReviewVerdicts(ctx context.Context, runID uuid.UUID,
 	}
 	var reviews []PlanReview
 	for _, e := range entries {
+		if e.Sequence <= sinceSeq {
+			continue
+		}
 		if e.Payload == nil {
 			continue
 		}
@@ -124,7 +135,12 @@ func (r *runResolver) decodeReviewVerdicts(ctx context.Context, runID uuid.UUID,
 // synthesizes a PlanReview with verdict "skipped" for each entry (#574).
 // Each surfaces the recorded reason/authority so an agent can tell a
 // degraded gate from a real verdict without a separate audit query.
-func (r *runResolver) decodeSkippedReviews(ctx context.Context, runID uuid.UUID, category string) ([]PlanReview, error) {
+//
+// sinceSeq is the same fix-up-boundary floor as decodeReviewVerdicts
+// (#894): entries with Sequence <= sinceSeq are dropped. The listing
+// surfaces pass 0 (no-op); only reviewStatusFor floors to the latest
+// fix-up.
+func (r *runResolver) decodeSkippedReviews(ctx context.Context, runID uuid.UUID, category string, sinceSeq int64) ([]PlanReview, error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: category,
 		Limit:    reviewAuditQueryLimit,
@@ -134,6 +150,9 @@ func (r *runResolver) decodeSkippedReviews(ctx context.Context, runID uuid.UUID,
 	}
 	var reviews []PlanReview
 	for _, e := range entries {
+		if e.Sequence <= sinceSeq {
+			continue
+		}
 		if e.Payload == nil {
 			continue
 		}
@@ -164,7 +183,11 @@ func (r *runResolver) decodeSkippedReviews(ctx context.Context, runID uuid.UUID,
 // out; surfacing it as a definite verdict lets an agent distinguish a real
 // failure from a still-running review (which stays 'pending'). Mirrors
 // decodeSkippedReviews — same reason/authority projection.
-func (r *runResolver) decodeFailedReviews(ctx context.Context, runID uuid.UUID, category string) ([]PlanReview, error) {
+//
+// sinceSeq is the same fix-up-boundary floor as decodeReviewVerdicts
+// (#894): entries with Sequence <= sinceSeq are dropped, so a pre-fix-up
+// failure is not treated as the current round's terminal state.
+func (r *runResolver) decodeFailedReviews(ctx context.Context, runID uuid.UUID, category string, sinceSeq int64) ([]PlanReview, error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: category,
 		Limit:    reviewAuditQueryLimit,
@@ -174,6 +197,9 @@ func (r *runResolver) decodeFailedReviews(ctx context.Context, runID uuid.UUID, 
 	}
 	var reviews []PlanReview
 	for _, e := range entries {
+		if e.Sequence <= sinceSeq {
+			continue
+		}
 		if e.Payload == nil {
 			continue
 		}
@@ -216,7 +242,7 @@ func (r *runResolver) hasAuditCategory(ctx context.Context, runID uuid.UUID, cat
 }
 
 // reviewStatusFor derives the ReviewStatus for one stage from the audit
-// trail (#600, #664). Precedence: a terminal *_reviewed entry wins
+// trail (#600, #664, #894). Precedence: a terminal *_reviewed entry wins
 // (=> complete, with decoded verdicts); else a *_review_skipped entry
 // (=> skipped); else a terminal *_review_failed entry (=> failed, with the
 // synthesized failure reason); else a *_review_started entry (=> pending);
@@ -224,13 +250,38 @@ func (r *runResolver) hasAuditCategory(ctx context.Context, runID uuid.UUID, cat
 // through to an ambiguous 'pending' — a reviewer that errored or timed out
 // now writes a terminal entry, so the await/status surface reports a
 // definite 'failed' instead of a still-waiting 'pending'.
+//
+// Fix-up boundary (#894): the three TERMINAL-verdict reads (reviewed /
+// skipped / failed) are floored to entries that landed AFTER the latest
+// stage_fixup_triggered audit sequence, so once a fix-up re-opens the
+// implement stage the stale pre-fix-up verdict no longer reads as terminal.
+// The *_review_started proxy check stays UNFLOORED on purpose: the round-1
+// started entry (at a sequence below the fix-up boundary) is still present,
+// so 'started exists' remains true and the precedence falls through to
+// 'pending' in the window between the fix-up and the re-review's terminal
+// entry — which is exactly what fishhawk_await_review must report while the
+// re-review of the fix-up head is in flight, the analogous sibling to the
+// #870 stale-input fix. sinceSeq is 0 for the plan stage (plan stages never
+// fix-up, so the extra audit query is skipped) and for an implement stage
+// with no prior fix-up; a 0 floor is a no-op (sequences are >= 1), so both
+// the plan path and the no-fix-up implement path are byte-for-byte unchanged.
 func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stage string) (*ReviewStatus, error) {
 	cats, err := categoriesForStage(stage)
 	if err != nil {
 		return nil, err
 	}
 
-	reviewed, err := r.decodeReviewVerdicts(ctx, runID, cats.reviewed)
+	// Only the implement stage can be re-opened by a fix-up; for the plan
+	// stage keep sinceSeq at 0 and avoid the extra audit query.
+	var sinceSeq int64
+	if stage == "implement" {
+		sinceSeq, err = r.latestImplementFixupSeq(ctx, runID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	reviewed, err := r.decodeReviewVerdicts(ctx, runID, cats.reviewed, sinceSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +289,7 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 		return &ReviewStatus{Stage: stage, Status: "complete", Reviews: reviewed}, nil
 	}
 
-	skipped, err := r.decodeSkippedReviews(ctx, runID, cats.skipped)
+	skipped, err := r.decodeSkippedReviews(ctx, runID, cats.skipped, sinceSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +297,7 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 		return &ReviewStatus{Stage: stage, Status: "skipped", Reviews: skipped}, nil
 	}
 
-	failed, err := r.decodeFailedReviews(ctx, runID, cats.failed)
+	failed, err := r.decodeFailedReviews(ctx, runID, cats.failed, sinceSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +316,32 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 	}
 
 	return &ReviewStatus{Stage: stage, Status: "none"}, nil
+}
+
+// latestImplementFixupSeq returns the MAX audit Sequence among the run's
+// stage_fixup_triggered entries (0 when none exist), the fix-up boundary
+// reviewStatusFor floors the implement stage's terminal-verdict reads to
+// (#894). It is RUN-scoped, not stage-scoped, to match reviewStatusFor's
+// existing run-scoped audit reads (decodeReviewVerdicts filters by
+// runID+category only, with no stage_id); a decomposition run with multiple
+// implement stages is out of scope here and unchanged from today's
+// run-scoped behavior. Reuses categoryStageFixupTriggered from
+// review_action_hint.go.
+func (r *runResolver) latestImplementFixupSeq(ctx context.Context, runID uuid.UUID) (int64, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryStageFixupTriggered,
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return 0, err
+	}
+	var latestSeq int64
+	for _, e := range entries {
+		if e.Sequence > latestSeq {
+			latestSeq = e.Sequence
+		}
+	}
+	return latestSeq, nil
 }
 
 // defaultReviewPollInterval is the fallback poll cadence for
