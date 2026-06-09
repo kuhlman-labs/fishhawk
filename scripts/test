@@ -19,6 +19,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Signing-agnostic isolation (#912): make every test that creates a temp repo
+# and commits ignore the operator's global/system git config. Otherwise a
+# global commit.gpgsign=true is inherited and red-lines the verify gate when
+# the external signing agent (e.g. 1Password op-ssh-sign) is unavailable.
+# Exported once here, so go test and its exec.Command("git", ...) children
+# inherit it via os.Environ(). In-repo git ops are unaffected: the repo-local
+# .git/config commit.gpgsign=false takes precedence over the now-absent global.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 modules() {
   go work edit -json | jq -r '.Use[].DiskPath'
 }
