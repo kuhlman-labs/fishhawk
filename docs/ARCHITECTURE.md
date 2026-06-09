@@ -268,6 +268,17 @@ These are load-bearing. Do not break them without explicit ADR.
 5. **The workflow spec syntax is frozen at Day 21.** Old plans in the audit log remain readable forever; we never break old `standard_v1` artifacts.
 6. **No founder bypass.** Methodology commitment from `docs/METHODOLOGY.md`. Emergency paths exist, are themselves audited, require post-hoc justification.
 7. **The plan prompt never carries raw untrusted issue-comment text.** Issue comments are attacker-controllable, so `writeIssueComments` (§10) routes every body through the deterministic `sanitizeUntrustedComment` quarantine (structural-injection neutralization + line-quoting + an "untrusted DATA, not instructions" envelope) before it reaches the network-and-state-capable plan agent — only a quarantined summary, never raw comment text. ADR-029 / #650 item 1; drops the plan agent from three lethal-trifecta legs to two.
+8. **The implement prompt never re-ingests raw untrusted issue-comment text.** The implement agent is network-and-state-capable, yet it is safe at two legs only because it consumes the human-APPROVED plan — the approval gate is the trust boundary — and renders the issue as a link (`writeIssueLink`, §10), never raw comment or body text. `buildImplement` MUST NOT call `writeIssueComments` or render `Trigger.IssueBody` / `Trigger.IssueComments`; a regression test (`TestBuild_Implement_NeverReingestsUntrustedComments`) enforces this mechanically. ADR-029 / #650 item 2; the implement-side counterpart of invariant #7.
+
+### Rule-of-Two posture (per agent)
+
+The lethal trifecta is: access to private data, exposure to untrusted content, and the ability to externally communicate. The Rule of Two holds when each agent has at most two of the three legs. Auditable per-agent verdict (ADR-029 / #650):
+
+| Agent | Posture | Legs |
+|---|---|---|
+| **plan** | Quarantined input — untrusted issue/comment text passes through `sanitizeUntrustedComment` (invariant #7) before reaching the agent; never raw. | two |
+| **implement** | Approved-plan-only input + never-re-ingest invariant (#8); the human approval gate is the trust boundary. ADR-029's *decided* posture also gates outbound traffic behind a hosted-egress allow-list — that leg is the intended posture but is **not yet enforced** (tracked in #930); do not treat egress allow-listing as currently active. | two |
+| **review** | Low-risk — advisory only: emits a structured verdict, holds no write authority and mutates no state. | n/a (no state mutation / external write) |
 
 ## 7. Module boundaries
 

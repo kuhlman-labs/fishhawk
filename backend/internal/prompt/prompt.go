@@ -282,6 +282,21 @@ func Build(stageType string, t Trigger) (string, error) {
 	}
 }
 
+// buildImplement renders the implement-stage prompt.
+//
+// Never-re-ingest invariant (ADR-029 / #650 item 2; ARCHITECTURE.md §6
+// invariant #8): the implement agent is network-and-state-capable, so its
+// prompt MUST render only TRUSTED inputs — the human-APPROVED plan
+// (writeApprovedPlan), operator-authored approval conditions and fix-up
+// concerns, and parent-plan-derived scope constraints — plus an issue LINK
+// via writeIssueLink. It MUST NOT call writeIssueComments or render
+// Trigger.IssueBody / Trigger.IssueComments: raw issue-comment and issue-body
+// text is attacker-controllable and must never reach this agent. The human
+// approval gate is the trust boundary that keeps the implement agent safe at
+// two lethal-trifecta legs; the plan agent's quarantine (invariant #7) is the
+// upstream half of the same posture. TestBuild_Implement_NeverReingestsUntrusted
+// Comments enforces this contract mechanically — it fails the moment this path
+// starts ingesting raw untrusted comment or body text.
 func buildImplement(t Trigger) string {
 	var b strings.Builder
 	b.WriteString("You are implementing a change in the repository ")
