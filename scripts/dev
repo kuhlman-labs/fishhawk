@@ -5,6 +5,7 @@ set -euo pipefail
 REPO_ROOT="${0:A:h:h}"
 PID_FILE="${REPO_ROOT}/.fishhawk/dev.pid"
 K8S_PF_PID_FILE="${REPO_ROOT}/.fishhawk/k8s-pf.pid"
+K8S_JAEGER_PF_PID_FILE="${REPO_ROOT}/.fishhawk/k8s-jaeger-pf.pid"
 LOG_DIR="${REPO_ROOT}/logs"
 LOG_FILE="${LOG_DIR}/fishhawkd.log"
 BIN="${REPO_ROOT}/bin/fishhawkd"
@@ -537,6 +538,9 @@ cmd_post_merge() {
 # Fails loud (kubectl logs + pods tail, non-zero exit) on a stuck rollout or a
 # /healthz timeout, mirroring cmd_up's readiness-gate contract. This is the
 # operator smoke test for the chart — not exercised in CI (no cluster).
+# After fishhawkd is healthy, if the dev-only in-cluster Jaeger is present
+# (values-local enables it), also opens a forward for its UI (16686) + OTLP HTTP
+# (4318) so the host-spawned runner can emit spans to localhost:4318.
 cmd_k8s_up() {
   print "k8s: starting"
   local pf_port=8080
@@ -584,6 +588,23 @@ cmd_k8s_up() {
   fi
 
   print "fishhawkd reachable at $(_k8s_healthz_url "$pf_port") (port-forward pid ${pf_pid})"
+
+  # Jaeger trace-collector forward (dev-only; values-local enables jaeger). The
+  # spans come from fishhawk-runner, which fishhawk-mcp spawns on THIS host
+  # (inheriting its env) — not in-cluster — so the runner reaches the in-cluster
+  # collector at localhost:4318 through this forward, and the UI is at
+  # localhost:16686 over the same forward. One kubectl process forwards both
+  # ports; its pid is tracked in K8S_JAEGER_PF_PID_FILE so k8s-down kills exactly
+  # this forward. Guarded on the Service existing so a jaeger-disabled override
+  # is a clean skip.
+  if kubectl get svc fishhawk-jaeger >/dev/null 2>&1; then
+    kubectl port-forward "svc/fishhawk-jaeger" 16686:16686 4318:4318 >/dev/null 2>&1 &
+    local jaeger_pf_pid=$!
+    disown
+    print "$jaeger_pf_pid" > "$K8S_JAEGER_PF_PID_FILE"
+    print "jaeger UI at http://localhost:16686, OTLP HTTP at http://localhost:4318 (port-forward pid ${jaeger_pf_pid})"
+    print "  to capture runner spans, set OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 on this host (unset = no-op)"
+  fi
 }
 
 # Tear down the local k8s deployment: kill the tracked port-forward, then
@@ -599,6 +620,17 @@ cmd_k8s_down() {
       print "port-forward stopped (pid ${pf_pid})"
     fi
     rm -f "$K8S_PF_PID_FILE"
+  fi
+
+  # Tear down the jaeger forward too (only present when jaeger was enabled).
+  if [[ -f "$K8S_JAEGER_PF_PID_FILE" ]]; then
+    local jaeger_pf_pid
+    jaeger_pf_pid="$(cat "$K8S_JAEGER_PF_PID_FILE")"
+    if kill -0 "$jaeger_pf_pid" 2>/dev/null; then
+      kill "$jaeger_pf_pid" 2>/dev/null || true
+      print "jaeger port-forward stopped (pid ${jaeger_pf_pid})"
+    fi
+    rm -f "$K8S_JAEGER_PF_PID_FILE"
   fi
 
   # Only an absent release is a no-op. Capture stderr so a genuine failure

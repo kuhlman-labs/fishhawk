@@ -236,6 +236,19 @@ if print -r -- "$k8s_up_body" | grep -q 'if ! kubectl rollout status'; then
 else
   fail "cmd_k8s_up should wrap kubectl rollout status in an 'if !' failure guard"
 fi
+# The jaeger trace-collector forward (dev-only) must be Service-guarded so a
+# jaeger-disabled override is a clean skip, and its pid tracked in its own file
+# so k8s-down can kill exactly that forward.
+if print -r -- "$k8s_up_body" | grep -q 'kubectl get svc fishhawk-jaeger'; then
+  pass "cmd_k8s_up guards the jaeger forward on the Service existing"
+else
+  fail "cmd_k8s_up should guard the jaeger port-forward on 'kubectl get svc fishhawk-jaeger'"
+fi
+if print -r -- "$k8s_up_body" | grep -q 'K8S_JAEGER_PF_PID_FILE'; then
+  pass "cmd_k8s_up tracks the jaeger forward pid in K8S_JAEGER_PF_PID_FILE"
+else
+  fail "cmd_k8s_up should record the jaeger forward pid in K8S_JAEGER_PF_PID_FILE"
+fi
 
 # 9c. cmd_k8s_down teardown: a genuine helm error must not be swallowed and
 # misreported as 'nothing to uninstall'. Only an absent release ('not found')
@@ -250,6 +263,12 @@ if print -r -- "$k8s_down_body" | grep -q 'exit 1'; then
   pass "cmd_k8s_down exits non-zero on a genuine helm uninstall failure"
 else
   fail "cmd_k8s_down should exit 1 on a non-'not found' helm error"
+fi
+# The jaeger forward (when present) must be torn down alongside the fishhawkd one.
+if print -r -- "$k8s_down_body" | grep -q 'K8S_JAEGER_PF_PID_FILE'; then
+  pass "cmd_k8s_down kills the tracked jaeger port-forward"
+else
+  fail "cmd_k8s_down should kill the jaeger forward via K8S_JAEGER_PF_PID_FILE"
 fi
 
 # 10. ZERR diagnostic trap (#631): installed, reports the ERROR-SITE file:line

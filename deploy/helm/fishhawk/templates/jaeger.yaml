@@ -1,0 +1,95 @@
+{{- if .Values.jaeger.enabled }}
+# Optional in-cluster Jaeger all-in-one (jaeger.enabled): the local OTLP trace
+# collector for inspecting the runner's #649 GenAI trace spans end-to-end (#679),
+# the k8s analog of the opt-in `otel` compose profile in docker-compose.yml.
+# DEV / DOGFOODING ONLY — it is an ephemeral, unauthenticated all-in-one with
+# in-memory span storage (no PVC; spans are lost on restart, which is fine for
+# local inspection). fishhawk.validateSecrets fails the render outside
+# profile: local, so this never reaches a prod cluster.
+#
+# Execution-locality note: fishhawkd does NOT emit these spans — the
+# fishhawk-runner does, and under the dogfood loop the runner is spawned by
+# fishhawk-mcp on the OPERATOR'S host (inheriting that process's env), not
+# in-cluster. So the runner reaches this collector at localhost:4318 through the
+# port-forward `scripts/dev k8s` opens, with OTEL_EXPORTER_OTLP_ENDPOINT set on
+# the host; the Jaeger UI is viewed at localhost:16686 over the same forward.
+# Single-replica Deployment + ClusterIP Service exposing the Jaeger UI
+# ({{ .Values.jaeger.uiPort }}), OTLP HTTP ({{ .Values.jaeger.otlpHttpPort }},
+# the runner's otlptracehttp target), and OTLP gRPC ({{ .Values.jaeger.otlpGrpcPort }}).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-jaeger
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jaeger
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "fishhawk.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: jaeger
+  template:
+    metadata:
+      labels:
+        {{- include "fishhawk.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: {{ .Values.jaeger.image | quote }}
+          imagePullPolicy: {{ .Values.jaeger.pullPolicy }}
+          env:
+            # OTLP is on by default since v1.35, but set defensively so an older
+            # pinned tag still accepts it (mirrors docker-compose.yml).
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          ports:
+            - name: ui
+              containerPort: 16686
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: ui
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.jaeger.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-jaeger
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jaeger
+spec:
+  type: ClusterIP
+  ports:
+    - name: ui
+      port: {{ .Values.jaeger.uiPort }}
+      targetPort: ui
+      protocol: TCP
+    - name: otlp-http
+      port: {{ .Values.jaeger.otlpHttpPort }}
+      targetPort: otlp-http
+      protocol: TCP
+    - name: otlp-grpc
+      port: {{ .Values.jaeger.otlpGrpcPort }}
+      targetPort: otlp-grpc
+      protocol: TCP
+  selector:
+    {{- include "fishhawk.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: jaeger
+{{- end }}
