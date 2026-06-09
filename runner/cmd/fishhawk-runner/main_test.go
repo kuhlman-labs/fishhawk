@@ -3791,6 +3791,74 @@ func installRestoreSpy(t *testing.T, origRef string) (gotRef *string, calls *int
 	return gotRef, calls
 }
 
+// TestRun_ImplementStage_CapturesHeadBeforeAgentInvoke is the #941 fix: the
+// restore target must be the ref the operator started on, captured BEFORE the
+// agent is invoked — not HEAD re-read at upload time, after an agent that ran
+// `git checkout -b` mid-stage could have moved HEAD onto its own branch. The
+// fake captureHead returns "operator-main" until the invoker runs, then
+// "agent-branch"; the fake invoker's onInvoke flips the sentinel. Because the
+// real capture now happens before invocation, restoreHead must receive
+// "operator-main" — the agent-moved ref can never become the restore target.
+// Under the old capture-at-upload ordering captureHead would have run after the
+// invoke and returned "agent-branch", failing this assertion.
+func TestRun_ImplementStage_CapturesHeadBeforeAgentInvoke(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	// Shared sentinel: false until the agent has been invoked. captureHead
+	// reads it to decide which ref the operator's HEAD "points at".
+	agentInvoked := false
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			// The agent moves HEAD onto its own branch mid-stage.
+			agentInvoked = true
+		},
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	// captureHead returns the pre-agent ref until the invoker runs, then the
+	// agent's branch. Install AFTER withFakeGitOps so these override its no-op
+	// stubs. restoreHead records the ref it was handed.
+	gotRef := new(string)
+	origCap, origRes := captureHead, restoreHead
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		if agentInvoked {
+			return "agent-branch", false, nil
+		}
+		return "operator-main", false, nil
+	}
+	restoreHead = func(_ context.Context, _, ref string) error {
+		*gotRef = ref
+		return nil
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if *gotRef != "operator-main" {
+		t.Errorf("restoreHead ref = %q, want %q (HEAD must be captured BEFORE the agent invoke, so an agent-moved branch can't become the restore target)", *gotRef, "operator-main")
+	}
+}
+
 // TestRun_ImplementStage_Fixup_NoChanges_ReportsFixupNoChanges is the #856 fix:
 // a fix-up re-dispatch that produces NO changes must NOT bare-return (the
 // push_fixup trace gate left the stage in `running`, so a bare return hangs it
