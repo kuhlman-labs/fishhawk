@@ -3,7 +3,7 @@
 > **Status:** Draft v0.1
 > **Last revised:** 2026-04-30
 
-Fishhawk is the workflow and governance layer for agent-driven software development. Fishhawk is also built that way. This document explains what that means in practice and what readers can expect to see in this repository over time.
+Fishhawk is the governed, auditable workflow for agent-driven software development. Fishhawk is also built that way. This document explains what that means in practice and what readers can expect to see in this repository over time.
 
 This is a methodology commitment, not a marketing line. The honest version of "built by AI" is *specific* and *verifiable*. The commitments below are the form that takes here.
 

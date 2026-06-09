@@ -11,7 +11,7 @@
 
 ## 1. The product, in one sentence
 
-Fishhawk is the workflow and governance layer for agent-driven software development. It gives engineering teams an opinionated, auditable process for how AI agents plan, implement, and ship changes — without locking them into any specific agent, tracker, or stack.
+Fishhawk is the governed, auditable workflow for agent-driven software development. It gives engineering teams an opinionated, auditable process for how AI agents plan, implement, and ship changes — without locking them into any specific agent, tracker, or stack.
 
 ## 2. The name
 
@@ -49,7 +49,7 @@ FISH-hawk. The two syllables get roughly equal stress. Slight elision is natural
 
 ### What Fishhawk is
 
-The opinionated workflow and governance layer for engineering teams using AI coding agents. The product where teams encode their process for how AI does work, enforce that process automatically, and prove afterward what was done and why.
+The opinionated, governed workflow for engineering teams using AI coding agents. The product where teams encode their process for how AI does work, enforce that process automatically, and prove afterward what was done and why.
 
 ### What Fishhawk is not
 
@@ -143,7 +143,7 @@ Fishhawk speaks to senior engineers who have seen tools come and go. Treat them 
 ### Voice examples
 
 **Landing page hero — good:**
-> The workflow and governance layer for AI-driven software development. Agents do the work. Your team approves the work. Fishhawk holds the record.
+> The governed, auditable workflow for AI-driven software development. Agents do the work. Your team approves the work. Fishhawk holds the record.
 
 **Landing page hero — bad:**
 > Fishhawk empowers enterprise engineering teams to harness the power of AI agents with industry-leading governance, observability, and compliance.
