@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -190,4 +191,28 @@ func MakePayload(v any) json.RawMessage {
 		panic("agent: payload marshal: " + err.Error())
 	}
 	return b
+}
+
+// AppendEnvOverride returns env with every existing "key=" entry removed
+// and a single "key=value" appended. A subprocess resolves a variable to
+// the FIRST matching "NAME=..." entry in its environment, so a plain
+// append onto os.Environ() would be silently shadowed by an inherited
+// same-named value; stripping the prior entries first guarantees the
+// override actually takes effect (#899). Mirrors the reference helper in
+// backend/internal/codex (#898); shared here by both runner adapters
+// (codex, claudecode) so the strip-then-append logic lives in one place.
+//
+// The result is built into a fresh slice (env[:0:0]) so the caller's
+// backing array is never aliased or mutated — callers pass cmd.Env, which
+// they continue to read after the call.
+func AppendEnvOverride(env []string, key, value string) []string {
+	prefix := key + "="
+	out := env[:0:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, prefix+value)
 }

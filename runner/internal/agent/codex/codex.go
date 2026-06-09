@@ -182,22 +182,31 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 	// inherit our env", so seed with os.Environ() in that case to keep
 	// PATH, HOME, etc. for the agent process. Identical ordering to the
 	// claudecode adapter so the Fishhawk MCP server stays reachable.
+	//
+	// A subprocess resolves a variable to the FIRST matching entry, so a
+	// plain append would be shadowed by any inherited OPENAI_API_KEY —
+	// strip existing entries from the seed before appending the configured
+	// one so i.APIKey actually wins (#899). An empty i.APIKey is skipped,
+	// leaving the inherited env untouched.
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
 	if i.APIKey != "" {
-		cmd.Env = append(cmd.Env, "OPENAI_API_KEY="+i.APIKey)
+		cmd.Env = agent.AppendEnvOverride(cmd.Env, "OPENAI_API_KEY", i.APIKey)
 	}
 	// Layer Invocation.Env on top so per-run secrets (FISHHAWK_API_TOKEN,
 	// FISHHAWK_BACKEND_URL, etc. set by the runner per E19.8 / #348) reach
 	// the agent process. The agent's MCP server reads these to authenticate
 	// against the Fishhawk backend; missing them is fine — MCP awareness is
-	// best-effort per ADR-021.
+	// best-effort per ADR-021. Route each through AppendEnvOverride too so a
+	// per-run value deterministically overrides any inherited same-named
+	// host var (making Invocation.Env's "later keys win" contract true,
+	// not first-match-wins).
 	for k, v := range inv.Env {
 		if k == "" {
 			continue
 		}
-		cmd.Env = append(cmd.Env, k+"="+v)
+		cmd.Env = agent.AppendEnvOverride(cmd.Env, k, v)
 	}
 
 	stdout, err := cmd.StdoutPipe()

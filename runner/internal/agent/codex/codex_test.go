@@ -385,6 +385,63 @@ func TestInvoke_ForwardsEnv(t *testing.T) {
 	}
 }
 
+// TestInvoke_ForwardedEnvOverridesInherited proves the env-override fix
+// (#899) end to end: the Cmd builder pre-seeds CONFLICTING inherited
+// values for both OPENAI_API_KEY (the APIKey field) and FISHHAWK_API_TOKEN
+// (an Invocation.Env key) onto cmd.Env, and the echo_env child must still
+// observe the CONFIGURED values — exercising the os.Environ() seed ->
+// AppendEnvOverride -> child os.Getenv path the subprocess resolves
+// first-match-wins. Without the strip-then-append, the inherited entries
+// would shadow both.
+func TestInvoke_ForwardedEnvOverridesInherited(t *testing.T) {
+	inv := &Invoker{
+		APIKey: "sk-configured-wins",
+		Cmd: func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+			// Pre-seed cmd.Env (non-nil so the adapter skips its os.Environ
+			// seed) with conflicting inherited values placed BEFORE the
+			// adapter layers the configured ones on top.
+			c.Env = append(os.Environ(),
+				"GO_HELPER_PROCESS=1",
+				"HELPER_MODE=echo_env",
+				"OPENAI_API_KEY=inherited-wrong-value",
+				"FISHHAWK_API_TOKEN=inherited-wrong-token",
+			)
+			return c
+		},
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		Env: map[string]string{"FISHHAWK_API_TOKEN": "fhm_configured_wins"},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false: %s", res.FailureReason)
+	}
+	got := map[string]string{}
+	for _, ev := range res.Events {
+		if ev.Kind != "env" {
+			continue
+		}
+		var e struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(ev.Payload, &e); err != nil {
+			t.Fatalf("env event not JSON: %v: %s", err, ev.Payload)
+		}
+		got[e.Key] = e.Value
+	}
+	if got["OPENAI_API_KEY"] != "sk-configured-wins" {
+		t.Errorf("OPENAI_API_KEY = %q, want sk-configured-wins (configured must override inherited)", got["OPENAI_API_KEY"])
+	}
+	if got["FISHHAWK_API_TOKEN"] != "fhm_configured_wins" {
+		t.Errorf("FISHHAWK_API_TOKEN = %q, want fhm_configured_wins (per-run Env must override inherited)", got["FISHHAWK_API_TOKEN"])
+	}
+}
+
 func TestInvoke_StartsWithInvocationStart(t *testing.T) {
 	inv := &Invoker{Cmd: helperCommand("happy"), Now: frozenNow()}
 	res, _ := inv.Invoke(context.Background(), agent.Invocation{
