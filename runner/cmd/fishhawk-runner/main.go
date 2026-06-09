@@ -2590,7 +2590,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		isFixup      bool
 		// freshFetchBase, when non-empty, makes CommitAndPush cut the run
 		// branch from a freshly-fetched origin/<base> instead of ambient HEAD
-		// (ADR-035 prevention, #861). Set only in the standalone default case.
+		// (ADR-035 prevention, #861). Set in the standalone default case and on
+		// the decomposed-first-child case that creates the shared branch (#865).
 		freshFetchBase string
 	)
 	switch {
@@ -2607,6 +2608,14 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		isDecomposed = true
 		branch = "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
 		isSubsequent = remoteBranchExists(ctx, repoDir, branch)
+		if !isSubsequent {
+			// First child creates the shared decomposition branch: cut it from
+			// the freshly-fetched authoritative base so a foreign ambient-HEAD
+			// commit (#797) can't become the recorded fork point (ADR-035
+			// prevention, #865). Subsequent children leave this empty and rebase
+			// the existing shared branch from the remote instead.
+			freshFetchBase = baseRef
+		}
 	default:
 		branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
 		// Standalone single-writer run: cut the branch from the freshly-
