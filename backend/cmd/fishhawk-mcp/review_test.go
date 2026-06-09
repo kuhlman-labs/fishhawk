@@ -745,6 +745,149 @@ func TestAwaitReview_PendingTimeout_CarriesHint_AndIdempotent(t *testing.T) {
 	}
 }
 
+// seedRunFixupTriggeredAudit appends a RUN-scoped stage_fixup_triggered
+// audit entry (no StageID) — the fix-up boundary reviewStatusFor floors the
+// implement stage's terminal-verdict reads to (#894). It mirrors the
+// stage-keyed seedFixupTriggeredAudit in review_action_hint_test.go, but
+// leaves StageID nil because latestImplementFixupSeq reads run-scoped (it
+// takes the MAX Sequence across the run's entries regardless of stage). The
+// entry's Sequence lands after every previously seeded entry, so a fix-up
+// seeded after a round-1 implement_reviewed correctly floors that verdict out.
+func seedRunFixupTriggeredAudit(fb *fakeBackend, runID uuid.UUID) {
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: categoryStageFixupTriggered,
+	})
+	fb.mu.Unlock()
+}
+
+// --- fix-up-boundary flooring (#894) ---
+
+// TestReviewStatusFor_Implement_PendingAfterFixup is the #894 regression:
+// after a fix-up re-opens the implement stage, the stale round-1
+// implement_reviewed verdict must NOT read as terminal 'complete'. The
+// terminal-verdict reads are floored to entries after the latest
+// stage_fixup_triggered, but the round-1 *_review_started proxy stays
+// unfloored, so with no re-review yet the status resolves to 'pending' — the
+// in-flight re-review window. Before the fix this returned 'complete' with
+// the stale verdict, instantly resolving fishhawk_await_review.
+func TestReviewStatusFor_Implement_PendingAfterFixup(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// Round 1: a review was dispatched and landed an approve_with_concerns
+	// verdict, then a fix-up was triggered to route the concerns back.
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+	seedImplementReviewAudit(fb, runID, withConcerns(2))
+	seedRunFixupTriggeredAudit(fb, runID)
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want pending (the stale pre-fix-up verdict must not read complete)", st.Status)
+	}
+	if len(st.Reviews) != 0 {
+		t.Errorf("Reviews = %+v, want empty while the re-review is in flight", st.Reviews)
+	}
+}
+
+// TestReviewStatusFor_Implement_CompleteWithRound2Verdict pins that once the
+// re-review of the fix-up head lands, the status resolves to 'complete'
+// carrying ONLY the round-2 verdict — the floored-out round-1 verdict does
+// not leak into Reviews.
+func TestReviewStatusFor_Implement_CompleteWithRound2Verdict(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+	seedImplementReviewAudit(fb, runID, withConcerns(2)) // round 1: stale
+	seedRunFixupTriggeredAudit(fb, runID)
+	// Round 2: the re-review of the fix-up head lands a clean approve.
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Fatalf("Status = %q, want complete once the re-review lands", st.Status)
+	}
+	if len(st.Reviews) != 1 {
+		t.Fatalf("Reviews = %+v, want only the round-2 verdict", st.Reviews)
+	}
+	if st.Reviews[0].Verdict != "approve" {
+		t.Errorf("Reviews[0].Verdict = %q, want approve (round-2); the round-1 approve_with_concerns must be floored out", st.Reviews[0].Verdict)
+	}
+}
+
+// TestReviewStatusFor_Plan_FloorExempt confirms the fix-up floor applies ONLY
+// to the implement stage: a plan stage with a landed verdict resolves to
+// 'complete' even when an unrelated stage_fixup_triggered entry (a sequence
+// above the plan verdict) exists. The plan path passes sinceSeq=0, so the
+// behavior is byte-for-byte unchanged from today.
+func TestReviewStatusFor_Plan_FloorExempt(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	seedRunFixupTriggeredAudit(fb, runID) // unrelated, higher sequence
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Errorf("Status = %q, want complete (the fix-up floor must not touch the plan stage)", st.Status)
+	}
+}
+
+// TestReviewStatusFor_Implement_SkippedOrFailedAfterFixup confirms the floor
+// applies to all three terminal reads: a round-1 implement_reviewed is
+// floored out, and a post-fix-up skipped / failed re-review resolves to the
+// matching terminal status rather than the stale 'complete'.
+func TestReviewStatusFor_Implement_SkippedOrFailedAfterFixup(t *testing.T) {
+	t.Run("skipped", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "gating")
+		seedImplementReviewAudit(fb, runID, withConcerns(1)) // round 1: stale
+		seedRunFixupTriggeredAudit(fb, runID)
+		seedReviewSkippedAudit(fb, runID, "implement_review_skipped", "reviewer_not_configured", "gating")
+		r := newResolver(srv, nil)
+
+		st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+		if err != nil {
+			t.Fatalf("reviewStatusFor: %v", err)
+		}
+		if st.Status != "skipped" {
+			t.Errorf("Status = %q, want skipped (round-1 verdict floored out)", st.Status)
+		}
+	})
+	t.Run("failed", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "gating")
+		seedImplementReviewAudit(fb, runID, withConcerns(1)) // round 1: stale
+		seedRunFixupTriggeredAudit(fb, runID)
+		seedReviewFailedAudit(fb, runID, "implement_review_failed",
+			"review timed out", "claude-sonnet-4-6", "gating")
+		r := newResolver(srv, nil)
+
+		st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+		if err != nil {
+			t.Fatalf("reviewStatusFor: %v", err)
+		}
+		if st.Status != "failed" {
+			t.Errorf("Status = %q, want failed (round-1 verdict floored out)", st.Status)
+		}
+	})
+}
+
 // TestRegisterTools_RegistersAwaitReview is a smoke test that the new tool
 // registers without panicking and the SDK accepts its output schema (the
 // harness rejects unrepresentable types, so this also exercises ReviewStatus

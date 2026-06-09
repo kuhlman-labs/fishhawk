@@ -538,7 +538,10 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 // with a corrupt payload is not a reason to fail the whole plan
 // fetch. Returns nil when no plan_reviewed entries exist.
 func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]PlanReview, error) {
-	reviews, err := r.decodeReviewVerdicts(ctx, runID, "plan_reviewed")
+	// sinceSeq=0: this listing surface is not fix-up-scoped — it returns
+	// every recorded verdict. Only reviewStatusFor floors to the latest
+	// fix-up (#894).
+	reviews, err := r.decodeReviewVerdicts(ctx, runID, "plan_reviewed", 0)
 	if err != nil {
 		return nil, err
 	}
@@ -548,7 +551,7 @@ func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]P
 	// surfaces as a synthesized PlanReview with verdict "skipped" so
 	// an agent reading the response can tell a degraded gate from a
 	// real verdict without a separate audit query.
-	skipped, err := r.decodeSkippedReviews(ctx, runID, "plan_review_skipped")
+	skipped, err := r.decodeSkippedReviews(ctx, runID, "plan_review_skipped", 0)
 	if err != nil {
 		return nil, err
 	}
@@ -857,11 +860,14 @@ func stageIDOfType(stages []Stage, stageType string) (uuid.UUID, bool) {
 // degraded gate is distinguishable from a real verdict. Returns nil when
 // no implement-review entries exist.
 func (r *runResolver) loadImplementReviews(ctx context.Context, runID uuid.UUID) ([]PlanReview, error) {
-	reviews, err := r.decodeReviewVerdicts(ctx, runID, "implement_reviewed")
+	// sinceSeq=0: this listing surface returns every recorded verdict
+	// across all fix-up rounds; only reviewStatusFor floors to the latest
+	// fix-up (#894).
+	reviews, err := r.decodeReviewVerdicts(ctx, runID, "implement_reviewed", 0)
 	if err != nil {
 		return nil, err
 	}
-	skipped, err := r.decodeSkippedReviews(ctx, runID, "implement_review_skipped")
+	skipped, err := r.decodeSkippedReviews(ctx, runID, "implement_review_skipped", 0)
 	if err != nil {
 		return nil, err
 	}
