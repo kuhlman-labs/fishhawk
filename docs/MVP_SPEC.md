@@ -11,7 +11,7 @@
 
 Coding agents are now capable enough that the bottleneck has shifted from "can the agent write the code" to "can the business trust what the agent did, prove it, and reproduce the process across a team." No one is selling that as a first-class product.
 
-Fishhawk is the **governance and workflow layer that sits above coding agents**. It is agent-agnostic, tool-agnostic, and opinionated about *process*. It is not a coding agent. It is the layer that turns a collection of agent invocations into a governed, auditable, organizational workflow.
+Fishhawk is the **governed, auditable workflow that sits above coding agents**. It is agent-agnostic, tool-agnostic, and opinionated about *process*. It is not a coding agent. It is the layer that turns a collection of agent invocations into a governed, auditable, organizational workflow.
 
 ### What Fishhawk is
 
@@ -50,7 +50,7 @@ The future of software development is **humans setting direction and approving o
 
 ## 3. Positioning
 
-> Fishhawk is the workflow and governance layer for agent-driven software development. We give engineering teams an opinionated, auditable process for how AI agents plan, implement, and ship changes — without locking you into any specific agent, tracker, or stack.
+> Fishhawk is the governed, auditable workflow for agent-driven software development. We give engineering teams an opinionated, auditable process for how AI agents plan, implement, and ship changes — without locking you into any specific agent, tracker, or stack.
 
 **Differentiation against incumbents:**
 

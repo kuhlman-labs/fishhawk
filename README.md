@@ -1,6 +1,6 @@
 # fishhawk
 
-The workflow and governance layer for agent-driven software development.
+The governed, auditable workflow for agent-driven software development.
 
 Agents do the work. Your team approves the work. Fishhawk holds the record.
 

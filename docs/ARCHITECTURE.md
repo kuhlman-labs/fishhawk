@@ -6,7 +6,7 @@
 
 ## 1. System summary
 
-Fishhawk is a **governance and workflow layer for agent-driven software changes**. A customer commits a YAML workflow spec to their repo, triggers it (issue label, CLI, UI), and the system runs the agent on their CI under typed constraints, captures a signed trace, and gates each stage on human approval. The product surface is the workflow execution and audit history; the agent itself is pluggable.
+Fishhawk is **a governed, auditable workflow layer for agent-driven software changes**. A customer commits a YAML workflow spec to their repo, triggers it (issue label, CLI, UI), and the system runs the agent on their CI under typed constraints, captures a signed trace, and gates each stage on human approval. The product surface is the workflow execution and audit history; the agent itself is pluggable.
 
 See `docs/MVP_SPEC.md` §1–§4 for product framing, primitives, and customer-side spec syntax.
 

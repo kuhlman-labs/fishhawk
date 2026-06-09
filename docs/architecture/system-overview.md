@@ -2,7 +2,7 @@
 
 > Executive-level architecture. For the technical realization, see [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md).
 
-**Fishhawk is a governance layer for agent-driven software changes.** Teams commit a workflow spec to their repo; Fishhawk runs the coding agent under typed constraints, captures a signed audit trail, and gates every stage on human approval.
+**Fishhawk is the governed, auditable workflow for agent-driven software changes.** Teams commit a workflow spec to their repo; Fishhawk runs the coding agent under typed constraints, captures a signed audit trail, and gates every stage on human approval.
 
 ---
 
