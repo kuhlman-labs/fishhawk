@@ -34,9 +34,12 @@ func startContainer(t *testing.T) *pgxpool.Pool {
 		tcpostgres.WithUsername("fishhawk"),
 		tcpostgres.WithPassword("fishhawk"),
 		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
+			wait.ForAll(
+				wait.ForLog("database system is ready to accept connections").
+					WithOccurrence(2).
+					WithStartupTimeout(60*time.Second),
+				wait.ForListeningPort("5432/tcp"),
+			),
 		),
 	)
 	if err != nil {
