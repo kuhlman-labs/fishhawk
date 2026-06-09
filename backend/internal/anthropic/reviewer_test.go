@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,12 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
+
+// malformedVerdict is structurally-malformed verdict JSON: a missing comma
+// between members (`"approve" "concerns"`), the #901 class strict-then-repair
+// planreview.DecodeVerdict cannot rescue. The SDK envelope carrying it as the
+// content text is valid JSON; only the nested verdict body is malformed.
+const malformedVerdict = `{"verdict":"approve" "concerns":[]}`
 
 // fakeAnthropicResp is the minimal Anthropic Messages API response envelope.
 type fakeAnthropicResp struct {
@@ -201,6 +208,68 @@ func TestReviewer_InvalidEscapeRegexDecodes(t *testing.T) {
 	}
 	if !strings.Contains(verdict.FreeForm, `ghs_[A-Za-z0-9_.\-]{36,}`) {
 		t.Errorf("FreeForm = %q, want it to contain the regex verbatim", verdict.FreeForm)
+	}
+}
+
+// TestReviewer_FlakyDecodeRetries drives the #901 decode-retry through the SDK
+// backend: request 1 returns a 200 whose verdict body is structurally-malformed
+// JSON; request 2 returns a valid approve verdict. The Reviewer-layer
+// decode-retry must re-roll the Messages call and decode the second response.
+// Exactly 2 inbound HTTP requests prove (a) the decode-retry re-rolled and (b)
+// the anthropic SDK did NOT itself retry the malformed 200 (its built-in retry
+// covers only 408/409/429/5xx + connection errors) — a SDK retry would push the
+// count above 2, and no re-roll at all would leave it at 1 with a decode error.
+func TestReviewer_FlakyDecodeRetries(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_ = json.NewEncoder(w).Encode(okResp(malformedVerdict))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(okResp(`{"verdict":"approve"}`))
+	}))
+	defer srv.Close()
+
+	// NewReviewer defaults the decode-retry budget to 1 → 2 rolls allowed.
+	reviewer := NewReviewer(testConfig(), option.WithBaseURL(srv.URL))
+	verdict, _, err := reviewer.Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, planreview.VerdictApprove)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("inbound HTTP requests = %d, want exactly 2 (one malformed roll + one recovery; the SDK must not retry a malformed 200)", got)
+	}
+}
+
+// TestReviewer_PersistentBadJSONExhausts asserts a Messages endpoint that returns
+// a structurally-malformed 200 on every roll terminates as a "decode verdict
+// JSON" error after the bounded budget — SetMaxRetries(1) => exactly 2 inbound
+// requests (the ADR-036 backstop: no unbounded re-roll).
+func TestReviewer_PersistentBadJSONExhausts(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(okResp(malformedVerdict))
+	}))
+	defer srv.Close()
+
+	reviewer := NewReviewer(testConfig(), option.WithBaseURL(srv.URL))
+	reviewer.SetMaxRetries(1)
+	_, _, err := reviewer.Review(context.Background(), "review this plan")
+	if err == nil {
+		t.Fatal("expected a terminal decode error from a persistently-malformed reviewer, got nil")
+	}
+	if !strings.Contains(err.Error(), "decode verdict JSON") {
+		t.Errorf("error = %q, want a 'decode verdict JSON' terminal error", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("inbound HTTP requests = %d, want exactly 2 (SetMaxRetries(1) => 2 rolls)", got)
 	}
 }
 

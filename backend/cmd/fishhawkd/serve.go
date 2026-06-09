@@ -103,17 +103,24 @@ type planReviewerOptions struct {
 func resolvePlanReviewer(opts planReviewerOptions, logger *slog.Logger) server.PlanReviewer {
 	switch {
 	case opts.anthropicAPIKey != "":
-		logger.Info("plan review agent configured",
-			slog.String("adapter", "anthropic"),
-			slog.String("model", opts.planReviewModel),
-			slog.Int("max_tokens", opts.planReviewMaxTokens),
-			slog.Duration("timeout", opts.planReviewTimeout))
-		return anthropic.NewReviewer(anthropic.Config{
+		reviewer := anthropic.NewReviewer(anthropic.Config{
 			APIKey:    opts.anthropicAPIKey,
 			Model:     opts.planReviewModel,
 			MaxTokens: opts.planReviewMaxTokens,
 			Timeout:   opts.planReviewTimeout,
 		})
+		// Apply the env-resolved decode-retry budget (#901): a 200-response
+		// carrying structurally-malformed verdict JSON re-rolls the Messages
+		// call, bounded by the same FISHHAWKD_PLAN_REVIEW_MAX_RETRIES value the
+		// subprocess adapters use.
+		reviewer.SetMaxRetries(opts.planReviewMaxRetries)
+		logger.Info("plan review agent configured",
+			slog.String("adapter", "anthropic"),
+			slog.String("model", opts.planReviewModel),
+			slog.Int("max_tokens", opts.planReviewMaxTokens),
+			slog.Int("max_retries", opts.planReviewMaxRetries),
+			slog.Duration("timeout", opts.planReviewTimeout))
+		return reviewer
 	case opts.enableLocalClaudeReviewer:
 		reviewer := claudecode.NewReviewer(claudecode.Config{
 			Binary:    opts.localClaudeBinary,
@@ -297,9 +304,10 @@ func runServe(args []string, logSink io.Writer) int {
 		"maximum tokens for plan-review agent responses")
 	planReviewMaxRetries := fs.Int("plan-review-max-retries",
 		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_RETRIES", 1),
-		"in-adapter retry budget for the subprocess reviewers' transient-crash class (#620); "+
+		"retry budget for the reviewers' transient-crash (#620) and structurally-malformed-verdict decode (#901) classes; "+
 			"counts retries not attempts (N => N+1 attempts), 0 disables retry (single attempt), unset defaults to 1. "+
-			"Used by the claudecode and codex adapters — the anthropic SDK adapter has no retry field")
+			"Honoured by all three reviewer adapters (claudecode, codex, anthropic): the subprocess adapters apply it to "+
+			"both the crash-retry and the decode re-roll; the anthropic SDK adapter applies it to the decode re-roll via SetMaxRetries")
 	planReviewTimeout := fs.Duration("plan-review-timeout",
 		envOrDuration("FISHHAWKD_PLAN_REVIEW_TIMEOUT", defaultPlanReviewTimeout),
 		"FLOOR of the size-aware review budget (#747): the minimum per-invocation bound for "+

@@ -286,12 +286,19 @@ func TestResolvePlanReviewer(t *testing.T) {
 
 	t.Run("anthropic key wins over the codex flag", func(t *testing.T) {
 		got := resolvePlanReviewer(planReviewerOptions{
-			anthropicAPIKey:     "sk-ant",
-			planReviewModel:     "claude-sonnet-4-6",
-			enableCodexReviewer: true,
+			anthropicAPIKey:      "sk-ant",
+			planReviewModel:      "claude-sonnet-4-6",
+			enableCodexReviewer:  true,
+			planReviewMaxRetries: 3,
 		}, logger)
-		if _, ok := got.(*anthropic.Reviewer); !ok {
-			t.Errorf("PlanReviewer = %T, want *anthropic.Reviewer (anthropic is top precedence)", got)
+		reviewer, ok := got.(*anthropic.Reviewer)
+		if !ok {
+			t.Fatalf("PlanReviewer = %T, want *anthropic.Reviewer (anthropic is top precedence)", got)
+		}
+		// #901: the env-resolved retry budget must reach the anthropic decode
+		// re-roll via SetMaxRetries, mirroring the codex/claudecode forwarding.
+		if n := reviewer.MaxDecodeRetries(); n != 3 {
+			t.Errorf("anthropic decode-retry budget = %d, want 3 (planReviewMaxRetries forwarded)", n)
 		}
 	})
 

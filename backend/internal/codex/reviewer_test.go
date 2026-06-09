@@ -153,6 +153,48 @@ func TestReviewer_SetMaxRetriesClampsNegative(t *testing.T) {
 	}
 }
 
+// TestReviewer_FlakyDecodeRetries asserts a first-roll structurally-malformed
+// verdict body re-rolls the reviewer and the second roll's valid approve verdict
+// is returned (#901), in exactly two attempts.
+func TestReviewer_FlakyDecodeRetries(t *testing.T) {
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.client.Cmd = flakyDecodeHelperCommand(&attempts)
+
+	verdict, _, err := r.Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, planreview.VerdictApprove)
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (one malformed roll + one recovery)", attempts)
+	}
+}
+
+// TestReviewer_PersistentBadJSONExhausts asserts a reviewer that emits a
+// structurally-malformed verdict on every roll terminates as a "decode verdict
+// JSON" error after the bounded budget — SetMaxRetries(1) => exactly 2 attempts
+// (the ADR-036 backstop: no unbounded re-roll).
+func TestReviewer_PersistentBadJSONExhausts(t *testing.T) {
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.SetMaxRetries(1)
+	r.client.Cmd = countingHelperCommand("flaky_decode_bad", &attempts)
+
+	_, _, err := r.Review(context.Background(), "review this plan")
+	if err == nil {
+		t.Fatal("expected a terminal decode error from a persistently-malformed reviewer, got nil")
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (SetMaxRetries(1) => 2 rolls)", attempts)
+	}
+	if !strings.Contains(err.Error(), "decode verdict JSON") {
+		t.Errorf("error = %q, want a 'decode verdict JSON' terminal error", err)
+	}
+}
+
 // TestReviewer_ImplementsPlanReviewer is a compile-time assertion that *Reviewer
 // satisfies the server.PlanReviewer contract (Review signature). A drift in the
 // interface would fail to compile here rather than at the serve.go wiring.

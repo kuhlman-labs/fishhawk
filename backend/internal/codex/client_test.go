@@ -66,6 +66,13 @@ func TestHelperProcess(t *testing.T) {
 	case "bad_verdict":
 		// Valid agent_message JSON, but verdict outside the closed set.
 		fmt.Println(`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"verdict\":\"maybe\"}"}}`)
+	case "flaky_decode_bad":
+		// An agent_message whose text is structurally-malformed verdict JSON — a
+		// missing comma between members (`"approve" "concerns"`), the #901 class
+		// strict-then-repair planreview.DecodeVerdict cannot rescue. The JSONL
+		// line itself is valid; only the nested verdict body is malformed.
+		fmt.Println(`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"verdict\":\"approve\" \"concerns\":[]}"}}`)
+		fmt.Println(usageLine)
 	case "fenced_escape_regex":
 		// The #739/#889 path: the agent_message text is a fenced verdict whose
 		// free_form quotes a regex with a lone `\-`. The fence-strip + escape
@@ -145,6 +152,23 @@ func flakyHelperCommand(attempts *int) func(ctx context.Context, name string, ar
 		mode := "happy"
 		if *attempts == 1 {
 			mode = "killed"
+		}
+		return helperCommand(mode)(ctx, name, args...)
+	}
+}
+
+// flakyDecodeHelperCommand runs the `flaky_decode_bad` mode (a structurally-
+// malformed verdict body) on the first attempt and `happy` on every later
+// attempt. It drives the #901 decode-retry: a malformed roll must re-roll the
+// reviewer for fresh sampling. It lives here (the file owning the TestHelperProcess
+// fake-binary harness) so reviewer_test.go can reference it without a scope-drift
+// compile break.
+func flakyDecodeHelperCommand(attempts *int) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		*attempts++
+		mode := "happy"
+		if *attempts == 1 {
+			mode = "flaky_decode_bad"
 		}
 		return helperCommand(mode)(ctx, name, args...)
 	}
