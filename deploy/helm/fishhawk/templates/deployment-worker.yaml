@@ -1,0 +1,39 @@
+{{- if eq .Values.deployment.mode "split" -}}
+{{/*
+Split-mode worker tier. Owns the background-worker singletons (role "worker"
+honors .Values.workers.*). The workers (SLA timer, dispatch watchdog, reaction
+poller, merge reconciler, child-completion sweeper, invariant monitor) are NOT
+yet multi-instance-safe — two copies would race the timers/reconcilers — so this
+Deployment is pinned to a single replica. The replica count is intentionally
+hardcoded (no values knob) so it cannot be scaled past 1 by accident: a knob the
+chart silently ignored would be worse than none. Lifting the cap requires leader
+election (deferred — #851); when that lands, replicas becomes a configurable
+worker.replicaCount.
+
+NOTE for future authors: split-mode templates have NO fishhawk.validateTopology
+include site — deployment.yaml carries that guard but does not render in split
+mode. Any future split-mode render-time guard must be wired in HERE (or in
+deployment-api.yaml), not in deployment.yaml.
+
+This Deployment is deliberately excluded from the Service (component=worker, while
+the Service selects component=api); its probes hit the pod directly.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-worker
+  labels:
+    {{- include "fishhawk.labels" (dict "root" . "role" "worker") | nindent 4 }}
+spec:
+  # Worker singleton invariant: fixed at 1 until leader election (#851).
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "fishhawk.selectorLabels" (dict "root" . "role" "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fishhawk.selectorLabels" (dict "root" . "role" "worker") | nindent 8 }}
+    spec:
+      {{- include "fishhawk.fishhawkdPodSpec" (dict "root" . "role" "worker") | nindent 6 }}
+{{- end -}}

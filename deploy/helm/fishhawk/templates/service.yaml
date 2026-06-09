@@ -12,4 +12,11 @@ spec:
       targetPort: http
       protocol: TCP
   selector:
+    {{- if eq .Values.deployment.mode "split" }}
+    # Split mode: route HTTP + webhook traffic only to the api pods (which dedup
+    # webhook deliveries via the Postgres store). The single -worker pod
+    # (component=worker) is deliberately excluded from the Service endpoints.
+    {{- include "fishhawk.selectorLabels" (dict "root" . "role" "api") | nindent 4 }}
+    {{- else }}
     {{- include "fishhawk.selectorLabels" . | nindent 4 }}
+    {{- end }}

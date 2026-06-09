@@ -19,8 +19,39 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
-# Number of fishhawkd replicas. The worker singletons (#851) are not yet
-# leader-elected, so keep this at 1 while any worker toggle below is true.
+# Topology mode — how the fishhawkd workload is split across Deployments.
+#   allInOne (default) — one Deployment, replicaCount pods, with the background
+#                        workers co-located. Safe out of the box; an existing
+#                        install upgrades in place (the Deployment keeps its
+#                        name/labels). Scaling past 1 replica with a worker
+#                        toggle on is rejected by fishhawk.validateTopology,
+#                        because the worker singletons (#851) are not yet
+#                        leader-elected and would race the timers/reconcilers.
+#   split              — a horizontally-scalable `-api` Deployment
+#                        (deployment.api.replicaCount pods, every
+#                        FISHHAWKD_ENABLE_* forced off) plus a single-replica
+#                        `-worker` Deployment that owns the worker singletons.
+#                        The Service routes only to the api pods. This is the
+#                        way to scale fishhawkd horizontally while workers run.
+deployment:
+  mode: allInOne
+  api:
+    # API-tier replica count — used ONLY in split mode (ignored in allInOne).
+    # The api pods run no background workers, so they scale horizontally;
+    # webhook delivery dedup is shared across replicas via the Postgres store
+    # (serve.go) whenever FISHHAWKD_DATABASE_URL is set, so this is safe > 1.
+    replicaCount: 2
+  # NOTE: the worker Deployment's replica count is intentionally NOT a knob — it
+  # is hardcoded to 1 in deployment-worker.yaml (the worker singleton invariant)
+  # until leader election lands (#851), to avoid exposing a silently-ignored
+  # setting that could be raised past 1 and race the timers.
+
+# Number of fishhawkd replicas in allInOne mode (ignored in split mode, where
+# deployment.api.replicaCount drives the api tier). The worker singletons (#851)
+# are not yet leader-elected, so in allInOne this MUST stay 1 while any worker
+# toggle below is true — fishhawk.validateTopology fails the render otherwise. To
+# scale fishhawkd horizontally with workers on, set deployment.mode=split instead
+# of raising this.
 replicaCount: 1
 
 service:
@@ -119,8 +150,13 @@ config:
   budgetTimezone: "UTC"
 
 # Background-worker enable toggles → FISHHAWKD_ENABLE_*. All default false so a
-# fresh deploy doesn't race the timers. Keep replicaCount at 1 when enabling any
-# of these (singleton leader-election is deferred to #851).
+# fresh deploy doesn't race the timers. These workers are singletons: exactly one
+# instance may run them. In allInOne mode that means keeping replicaCount=1 while
+# any toggle is true (enforced by fishhawk.validateTopology). To run the workers
+# alongside a scaled-out API tier, use deployment.mode=split — the workers run on
+# the single-replica `-worker` Deployment while the `-api` Deployment scales
+# freely. Leader election (the future alternative to this static worker
+# singleton, which would let the workers run multi-replica) is deferred to #851.
 workers:
   slaTimer: false
   dispatchWatchdog: false
