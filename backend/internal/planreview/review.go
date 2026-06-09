@@ -101,11 +101,15 @@ const (
 //	agent>0 && human==0 → gating
 //	agent>0 && human>0  → advisory
 //	agent==0            → gateless
+//
+// The agent count is the effective count (ReviewersConfig.AgentCount):
+// a heterogeneous `agents` list (#955) supersedes the bare integer, so
+// heterogeneity changes who reviews, never the gating semantics.
 func ResolveAuthority(r spec.ReviewersConfig) AuthorityMode {
 	switch {
-	case r.Agent > 0 && r.Human == 0:
+	case r.AgentCount() > 0 && r.Human == 0:
 		return AuthorityGating
-	case r.Agent > 0 && r.Human > 0:
+	case r.AgentCount() > 0 && r.Human > 0:
 		return AuthorityAdvisory
 	default:
 		return AuthorityGateless

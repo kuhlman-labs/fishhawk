@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -254,46 +257,52 @@ func TestPlanReviewTimeoutBelowDefault(t *testing.T) {
 	}
 }
 
-// TestResolvePlanReviewer exercises the serve.go selection seam (#844): the flag
-// values pick which adapter implements server.PlanReviewer. A per-package unit
-// on the codex adapter alone would pass while this wiring branch is wrong, so
-// the seam is asserted here end-to-end against the resolved interface value.
-func TestResolvePlanReviewer(t *testing.T) {
+// TestResolvePlanReviewers exercises the serve.go reviewer-set seam
+// (#844 / #955): Default() keeps the single-adapter precedence the count
+// form depends on, while For() resolves every configured provider
+// concurrently — the topology the old single-selection resolver could not
+// express. A per-package unit on an adapter alone would pass while this
+// wiring is wrong, so the seam is asserted against the resolved set.
+func TestResolvePlanReviewers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	t.Run("codex flag selects the codex adapter", func(t *testing.T) {
-		got := resolvePlanReviewer(planReviewerOptions{
+	t.Run("codex flag selects the codex default adapter", func(t *testing.T) {
+		set := resolvePlanReviewers(planReviewerOptions{
 			enableCodexReviewer:  true,
 			codexBinary:          "codex",
 			openAIAPIKey:         "sk-test",
 			planReviewMaxRetries: 1,
 			planReviewTimeout:    300 * time.Second,
 		}, logger)
+		got := set.Default()
 		if got == nil {
-			t.Fatal("PlanReviewer = nil, want the codex adapter")
+			t.Fatal("Default() = nil, want the codex adapter")
 		}
 		if _, ok := got.(*codex.Reviewer); !ok {
-			t.Errorf("PlanReviewer = %T, want *codex.Reviewer", got)
+			t.Errorf("Default() = %T, want *codex.Reviewer", got)
 		}
 	})
 
-	t.Run("default path selects no reviewer (nil)", func(t *testing.T) {
-		got := resolvePlanReviewer(planReviewerOptions{}, logger)
-		if got != nil {
-			t.Errorf("PlanReviewer = %T, want nil when no adapter flag is set", got)
+	t.Run("no flags means no default reviewer (nil)", func(t *testing.T) {
+		set := resolvePlanReviewers(planReviewerOptions{}, logger)
+		if got := set.Default(); got != nil {
+			t.Errorf("Default() = %T, want nil when no adapter flag is set", got)
+		}
+		if _, err := set.For("anthropic", ""); err == nil {
+			t.Error("For(anthropic) on an all-empty set should error")
 		}
 	})
 
-	t.Run("anthropic key wins over the codex flag", func(t *testing.T) {
-		got := resolvePlanReviewer(planReviewerOptions{
+	t.Run("anthropic key wins default over the codex flag", func(t *testing.T) {
+		set := resolvePlanReviewers(planReviewerOptions{
 			anthropicAPIKey:      "sk-ant",
 			planReviewModel:      "claude-sonnet-4-6",
 			enableCodexReviewer:  true,
 			planReviewMaxRetries: 3,
 		}, logger)
-		reviewer, ok := got.(*anthropic.Reviewer)
+		reviewer, ok := set.Default().(*anthropic.Reviewer)
 		if !ok {
-			t.Fatalf("PlanReviewer = %T, want *anthropic.Reviewer (anthropic is top precedence)", got)
+			t.Fatalf("Default() = %T, want *anthropic.Reviewer (anthropic is top precedence)", set.Default())
 		}
 		// #901: the env-resolved retry budget must reach the anthropic decode
 		// re-roll via SetMaxRetries, mirroring the codex/claudecode forwarding.
@@ -302,14 +311,100 @@ func TestResolvePlanReviewer(t *testing.T) {
 		}
 	})
 
-	t.Run("local-claude wins over the codex flag", func(t *testing.T) {
-		got := resolvePlanReviewer(planReviewerOptions{
+	t.Run("local-claude wins default over the codex flag", func(t *testing.T) {
+		set := resolvePlanReviewers(planReviewerOptions{
 			enableLocalClaudeReviewer: true,
 			localClaudeBinary:         "claude",
 			enableCodexReviewer:       true,
 		}, logger)
-		if _, ok := got.(*claudecode.Reviewer); !ok {
-			t.Errorf("PlanReviewer = %T, want *claudecode.Reviewer (claudecode outranks codex)", got)
+		if _, ok := set.Default().(*claudecode.Reviewer); !ok {
+			t.Errorf("Default() = %T, want *claudecode.Reviewer (claudecode outranks codex)", set.Default())
+		}
+	})
+
+	t.Run("For resolves codex alongside anthropic (#955 concurrent topology)", func(t *testing.T) {
+		set := resolvePlanReviewers(planReviewerOptions{
+			anthropicAPIKey:     "sk-ant",
+			planReviewModel:     "claude-sonnet-4-6",
+			enableCodexReviewer: true,
+			codexBinary:         "codex",
+			codexModel:          "gpt-5.2-codex",
+		}, logger)
+		got, err := set.For("codex", "")
+		if err != nil {
+			t.Fatalf("For(codex) error = %v, want nil when the codex flag is set", err)
+		}
+		if _, ok := got.(*codex.Reviewer); !ok {
+			t.Errorf("For(codex) = %T, want *codex.Reviewer even though anthropic holds default precedence", got)
+		}
+	})
+
+	t.Run("For on an unconfigured provider errors and names the knob", func(t *testing.T) {
+		set := resolvePlanReviewers(planReviewerOptions{
+			anthropicAPIKey: "sk-ant",
+		}, logger)
+		if _, err := set.For("codex", ""); err == nil || !strings.Contains(err.Error(), "FISHHAWKD_ENABLE_CODEX_REVIEWER") {
+			t.Errorf("For(codex) error = %v, want unconfigured error naming FISHHAWKD_ENABLE_CODEX_REVIEWER", err)
+		}
+		if _, err := set.For("banana", ""); err == nil {
+			t.Error("For(banana) should error on an unknown provider")
+		}
+	})
+
+	t.Run("For constructs independent model-overridden instances", func(t *testing.T) {
+		set := resolvePlanReviewers(planReviewerOptions{
+			anthropicAPIKey: "sk-ant",
+			planReviewModel: "claude-sonnet-4-6",
+		}, logger)
+		a, err := set.For("anthropic", "claude-opus-4-8")
+		if err != nil {
+			t.Fatalf("For(anthropic, opus): %v", err)
+		}
+		b, err := set.For("anthropic", "")
+		if err != nil {
+			t.Fatalf("For(anthropic, default): %v", err)
+		}
+		if a == b {
+			t.Error("For() returned the same instance for two resolves; want independent per-resolve construction")
+		}
+	})
+
+	t.Run("For threads the spec model into the constructed adapter", func(t *testing.T) {
+		// The model-override contract, not just per-resolve allocation,
+		// observed behaviorally: claudecode's Review returns the configured
+		// model verbatim (its CLI envelope does not echo the model), so a
+		// stub binary makes the model that reached the constructed adapter
+		// visible without a model accessor on the adapter types.
+		stub := filepath.Join(t.TempDir(), "claude-stub")
+		envelope := `{"type":"result","subtype":"success","is_error":false,` +
+			`"result":"{\"verdict\":\"approve\"}","usage":{"input_tokens":1,"output_tokens":1}}`
+		if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s' '"+envelope+"'\n"), 0o755); err != nil {
+			t.Fatalf("write stub binary: %v", err)
+		}
+		set := resolvePlanReviewers(planReviewerOptions{
+			enableLocalClaudeReviewer: true,
+			localClaudeBinary:         stub,
+			localClaudeModel:          "claude-sonnet-4-6",
+		}, logger)
+
+		overridden, err := set.For("claudecode", "claude-opus-4-8")
+		if err != nil {
+			t.Fatalf("For(claudecode, opus): %v", err)
+		}
+		if _, model, err := overridden.Review(context.Background(), "review prompt"); err != nil {
+			t.Fatalf("Review via overridden adapter: %v", err)
+		} else if model != "claude-opus-4-8" {
+			t.Errorf("overridden adapter model = %q, want claude-opus-4-8 (spec model must reach the instance)", model)
+		}
+
+		fallback, err := set.For("claudecode", "")
+		if err != nil {
+			t.Fatalf("For(claudecode, default): %v", err)
+		}
+		if _, model, err := fallback.Review(context.Background(), "review prompt"); err != nil {
+			t.Fatalf("Review via default-model adapter: %v", err)
+		} else if model != "claude-sonnet-4-6" {
+			t.Errorf("default-model adapter model = %q, want claude-sonnet-4-6 (localClaudeModel fallback)", model)
 		}
 	})
 }

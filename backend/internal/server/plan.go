@@ -31,6 +31,73 @@ type PlanReviewer interface {
 	Review(ctx context.Context, promptText string) (verdict *planreview.ReviewVerdict, model string, err error)
 }
 
+// ReviewerSet resolves the deployment's configured review adapters (#955).
+// Default returns the precedence-selected adapter the bare `agent: N`
+// count form invokes — nil when no reviewer backend is configured at all.
+// For returns the adapter for one spec-declared heterogeneous reviewer
+// (reviewers.agents[i]), constructed with the given model override (empty
+// model falls back to the provider's deployment-configured default); it
+// errors when the provider is not configured in this deployment.
+type ReviewerSet interface {
+	Default() PlanReviewer
+	For(provider, model string) (PlanReviewer, error)
+}
+
+// defaultPlanReviewer returns the precedence-selected default adapter, or
+// nil when no reviewer set is wired or the set has no configured backend.
+// It is the ReviewerSet-era equivalent of the old `cfg.PlanReviewer == nil`
+// guard: nil means no reviewer backend exists and the *_review_skipped
+// degradation path applies.
+func (s *Server) defaultPlanReviewer() PlanReviewer {
+	if s.cfg.PlanReviewers == nil {
+		return nil
+	}
+	return s.cfg.PlanReviewers.Default()
+}
+
+// reviewerInvocation is one resolved review-agent invocation in a plan- or
+// implement-review loop. The count form repeats the default adapter with
+// empty provider/specModel; the agents form carries the declared provider
+// and model. resolveErr is non-nil when the declared provider could not be
+// resolved to a configured adapter (advisory mode, or a config change
+// between the dispatch pre-check and execution) — the loop treats that as
+// a failed invocation: emit *_review_failed, continue, hasRejection
+// untouched.
+type reviewerInvocation struct {
+	reviewer   PlanReviewer
+	provider   string
+	specModel  string
+	resolveErr error
+}
+
+// resolveReviewerInvocations maps a stage's ReviewersConfig to its
+// per-invocation reviewer list (#955). The heterogeneous agents form
+// resolves each declared {provider, model} via the ReviewerSet; the bare
+// count form repeats the precedence-selected default adapter Agent times
+// (today's behavior). Callers guard on defaultPlanReviewer() != nil first,
+// so cfg.PlanReviewers is non-nil here.
+func (s *Server) resolveReviewerInvocations(reviewersCfg *spec.ReviewersConfig) []reviewerInvocation {
+	if len(reviewersCfg.Agents) > 0 {
+		invocations := make([]reviewerInvocation, 0, len(reviewersCfg.Agents))
+		for _, a := range reviewersCfg.Agents {
+			reviewer, err := s.cfg.PlanReviewers.For(a.Provider, a.Model)
+			invocations = append(invocations, reviewerInvocation{
+				reviewer:   reviewer,
+				provider:   a.Provider,
+				specModel:  a.Model,
+				resolveErr: err,
+			})
+		}
+		return invocations
+	}
+	def := s.cfg.PlanReviewers.Default()
+	invocations := make([]reviewerInvocation, reviewersCfg.Agent)
+	for i := range invocations {
+		invocations[i] = reviewerInvocation{reviewer: def}
+	}
+	return invocations
+}
+
 // maxPlanBundleBytes caps the request body for plan upload. Plans
 // are document-shaped JSON (steps, files, scope, etc.); even verbose
 // ones rarely top a few KB. 256KB leaves an order-of-magnitude
@@ -610,7 +677,7 @@ func deref(s *string) string {
 //     runner's upload client disconnects and cancels r.Context().
 //
 // Returns false (no gating rejection) when:
-//   - PlanReviewer is nil (production default — not yet wired)
+//   - no reviewer backend is configured (nil ReviewerSet or Default() nil)
 //   - RunRepo is nil
 //   - the run's workflow spec carries no plan stage with reviewers.agent>0
 //   - authority is advisory (review runs detached, never blocks)
@@ -636,13 +703,13 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	}
 
 	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypePlan)
-	if reviewersCfg == nil || reviewersCfg.Agent == 0 {
+	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
 		return false
 	}
 
 	authority := planreview.ResolveAuthority(*reviewersCfg)
 
-	// PlanReviewer not wired but the spec requested agent review
+	// No reviewer backend wired but the spec requested agent review
 	// (#574 / ADR-027). Emit a plan_review_skipped audit entry so the
 	// degradation is auditable rather than silent, then continue: the
 	// stage advances to awaiting_approval via the trace path (in
@@ -650,11 +717,11 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// gating-mode hard block lives at the run-create endpoint
 	// (handleCreateRun); the dispatcher-driven path is not guarded
 	// there, so the entry is emitted for both authorities here.
-	if s.cfg.PlanReviewer == nil {
+	if s.defaultPlanReviewer() == nil {
 		if s.cfg.AuditRepo != nil {
 			payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
 				Reason:           "reviewer_not_configured",
-				ConfiguredAgents: reviewersCfg.Agent,
+				ConfiguredAgents: reviewersCfg.AgentCount(),
 				Authority:        authority,
 			})
 			systemKind := audit.ActorKind("system")
@@ -731,7 +798,12 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// has a lower audit sequence than reviewed under both gating
 	// (synchronous) and advisory (detached) authority. Best-effort:
 	// WARN-log and continue on append failure so dispatch is never blocked.
-	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.Agent, "")
+	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.AgentCount(), "")
+
+	// Resolve the per-invocation reviewer list (#955) up front so the
+	// detached goroutine closes over fully-resolved adapters, never the
+	// spec config or request-scoped state.
+	invocations := s.resolveReviewerInvocations(reviewersCfg)
 
 	// Detach the reviewer context from the request lifecycle (#584).
 	// context.WithoutCancel keeps the parent's values but is NOT
@@ -750,14 +822,14 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runPlanReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+			s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the failed-B transition lands before
 	// the trace handler advances the stage.
-	hasRejection := s.runPlanReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+	hasRejection := s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
 	if hasRejection {
 		cat := run.FailureB
 		reason := "plan_review_rejected: agent review verdict reject under gating authority"
@@ -852,27 +924,42 @@ func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID,
 
 // runPlanReviewLoop runs the per-reviewer plan-review loop shared by the
 // synchronous (gating) and detached (advisory) dispatch paths. For each
-// configured agent it calls PlanReviewer.Review, logs WARN on self-review
-// (reviewer model == authorModel), and appends one plan_reviewed audit
-// entry. Returns true when at least one verdict is reject. It performs no
-// stage transition — the gating caller owns the failed-B transition so
-// the advance-blocking edge stays on the synchronous path only.
+// resolved invocation it calls its reviewer's Review, logs WARN on
+// self-review (reviewer model == authorModel), and appends one
+// plan_reviewed audit entry. Returns true when at least one verdict is
+// reject. It performs no stage transition — the gating caller owns the
+// failed-B transition so the advance-blocking edge stays on the
+// synchronous path only.
 //
-// ctx is the detached review context: per-invocation errors are
-// WARN-logged and skipped so a transient reviewer failure doesn't strand
-// the loop.
-func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, agents int, authority planreview.AuthorityMode, promptText, authorModel string) bool {
+// ctx is the detached review context: per-invocation errors (including a
+// reviewer whose provider failed to resolve) are WARN-logged and skipped
+// so a transient reviewer failure doesn't strand the loop.
+func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
 	budget := s.cfg.ReviewBudget.Budget(len(promptText))
-	for i := 0; i < agents; i++ {
+	for i, inv := range invocations {
+		// An unresolvable provider (#955) is handled like a failed
+		// invocation: terminal *_review_failed entry, loop continues,
+		// hasRejection untouched.
+		if inv.resolveErr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: reviewer provider unresolved",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.Int("reviewer_index", i),
+				slog.String("provider", inv.provider),
+				slog.String("error", inv.resolveErr.Error()),
+			)
+			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, inv.specModel, inv.resolveErr.Error(), false)
+			continue
+		}
 		// Apply the size-aware per-invocation budget (#747) as a context
 		// deadline so a large diff gets proportionally more wall-clock. The
 		// claudecode adapter honours this incoming deadline instead of capping
 		// at its own cfg.Timeout. cancel() is called directly each turn (not a
 		// deferred stack) so deadlines don't accumulate across reviewers.
 		invocationCtx, cancel := context.WithTimeout(ctx, budget)
-		verdict, model, err := s.cfg.PlanReviewer.Review(invocationCtx, promptText)
+		verdict, model, err := inv.reviewer.Review(invocationCtx, promptText)
 		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err != nil {

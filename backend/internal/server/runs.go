@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -380,22 +381,27 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = parsed // parsed is reserved for future spec-driven checks
 
-	// Plan-review wiring guard (#574 / ADR-027). When the resolved
-	// spec declares an agent-gated plan review (reviewers.agent > 0,
-	// human == 0) but no PlanReviewer is wired, agent review would be
-	// silently skipped at plan-upload time — minting a run that can
-	// never satisfy its own gate. Reject at create time with a
-	// run_rejected_misconfigured audit trail rather than letting the
-	// run proceed past a gate that does not exist. Advisory mode
-	// (agent > 0, human > 0) is allowed through: the human gate
-	// remains authoritative and runPlanReviews emits a
-	// plan_review_skipped audit entry for the missing agent layer.
-	if haveStageDefs && s.cfg.PlanReviewer == nil {
+	// Plan-review wiring guard (#574 / ADR-027 / #955). When the resolved
+	// spec declares an agent-gated plan review (effective agent count > 0,
+	// human == 0) that the wired reviewer set cannot satisfy — no default
+	// adapter for the bare count form, or an agents-list entry naming an
+	// unconfigured provider — agent review would be silently degraded at
+	// plan-upload time, minting a run that can never satisfy its own gate.
+	// Reject at create time with a run_rejected_misconfigured audit trail
+	// rather than letting the run proceed past a gate that does not exist.
+	// Advisory mode (human > 0) is allowed through: the human gate remains
+	// authoritative and the review loops emit plan_review_skipped /
+	// *_review_failed audit entries for the missing agent layer.
+	if haveStageDefs {
 		for _, st := range workflowDef.Stages {
 			if st.Type != spec.StageTypePlan || st.Reviewers == nil {
 				continue
 			}
 			if planreview.ResolveAuthority(*st.Reviewers) != planreview.AuthorityGating {
+				continue
+			}
+			problem := s.gatingReviewerProblem(st.Reviewers)
+			if problem == "" {
 				continue
 			}
 			if s.cfg.AuditRepo != nil {
@@ -404,7 +410,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 					"stage":             st.ID,
 					"workflow_id":       req.WorkflowID,
 					"repo":              req.Repo,
-					"configured_agents": st.Reviewers.Agent,
+					"configured_agents": st.Reviewers.AgentCount(),
 				})
 				systemKind := audit.ActorKind("system")
 				if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(r.Context(), audit.GlobalChainAppendParams{
@@ -417,8 +423,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 						"repo", req.Repo, "workflow_id", req.WorkflowID, "error", aerr.Error())
 				}
 			}
-			s.writeError(w, r, http.StatusBadRequest, "plan_reviewer_unconfigured",
-				"workflow declares agent-gated plan review (reviewers.agent > 0, human == 0) but fishhawkd has no PlanReviewer wired; set FISHHAWKD_ANTHROPIC_API_KEY or remove reviewers.agent", nil)
+			s.writeError(w, r, http.StatusBadRequest, "plan_reviewer_unconfigured", problem, nil)
 			return
 		}
 	}
@@ -800,4 +805,44 @@ func (s *Server) handlePostStatusComment(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.WriteHeader(http.StatusCreated)
+}
+
+// gatingReviewerProblem reports why a gating reviewers config cannot be
+// satisfied by the wired reviewer set (#574 / #955): the bare count form
+// with no default adapter, or an agents-list entry naming a provider that
+// does not resolve. Empty string means every declared reviewer is
+// dispatchable. Used by handleCreateRun's run-create fail-fast; advisory
+// stages keep the skip-with-audit degradation path instead.
+func (s *Server) gatingReviewerProblem(reviewers *spec.ReviewersConfig) string {
+	if len(reviewers.Agents) > 0 {
+		if s.cfg.PlanReviewers == nil {
+			return "workflow declares agent-gated review with a reviewers.agents list but fishhawkd has no reviewer set wired; set FISHHAWKD_ANTHROPIC_API_KEY, FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER, or remove reviewers.agents"
+		}
+		for _, a := range reviewers.Agents {
+			if _, err := s.cfg.PlanReviewers.For(a.Provider, a.Model); err != nil {
+				return fmt.Sprintf("workflow declares agent-gated review naming reviewer provider %q but it does not resolve (%s); enable it (%s) or remove the reviewers.agents entry",
+					a.Provider, err.Error(), reviewerProviderEnvKnob(a.Provider))
+			}
+		}
+		return ""
+	}
+	if s.defaultPlanReviewer() == nil {
+		return "workflow declares agent-gated plan review (reviewers.agent > 0, human == 0) but fishhawkd has no PlanReviewer wired; set FISHHAWKD_ANTHROPIC_API_KEY or remove reviewers.agent"
+	}
+	return ""
+}
+
+// reviewerProviderEnvKnob names the deployment env knob that enables a
+// given reviewer provider, for fail-fast error messages.
+func reviewerProviderEnvKnob(provider string) string {
+	switch provider {
+	case "anthropic":
+		return "FISHHAWKD_ANTHROPIC_API_KEY"
+	case "claudecode":
+		return "FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER"
+	case "codex":
+		return "FISHHAWKD_ENABLE_CODEX_REVIEWER"
+	default:
+		return "FISHHAWKD_ANTHROPIC_API_KEY / FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER / FISHHAWKD_ENABLE_CODEX_REVIEWER"
+	}
 }

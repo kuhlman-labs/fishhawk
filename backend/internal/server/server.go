@@ -194,11 +194,24 @@ type Config struct {
 	// loop but NOT safe for production.
 	RoleResolver *role.Resolver
 
-	// PlanReviewer invokes review agents for plan artifacts when the
-	// stage's workflow spec declares reviewers.agent > 0. Nil disables
-	// agent-driven plan review regardless of the spec config (gateless
-	// behaviour). Production wires an Anthropic SDK client; tests
-	// inject a fake via this field.
+	// PlanReviewers resolves the review-agent adapters invoked when a
+	// stage's workflow spec declares agent review (ADR-027 / #955).
+	// Default() is the precedence-selected adapter the bare `agent: N`
+	// count form repeats; For(provider, model) resolves one entry of the
+	// heterogeneous `agents` list. A nil set — or a set whose Default()
+	// returns nil — means no reviewer backend is configured: agent review
+	// degrades to the *_review_skipped path regardless of the spec config.
+	// Production wires the serve.go adapter set; tests inject a stub.
+	PlanReviewers ReviewerSet
+
+	// PlanReviewer is the single-reviewer convenience form of PlanReviewers,
+	// the shape this config had before the #955 ReviewerSet: when
+	// PlanReviewers is nil and PlanReviewer is non-nil, New wraps it into a
+	// set whose Default() is this reviewer. The wrapped set's For() always
+	// errors — a heterogeneous `agents` list needs a real ReviewerSet — so
+	// spec-declared providers degrade via the *_review_failed path rather
+	// than silently routing every provider to one adapter. Ignored when
+	// PlanReviewers is set.
 	PlanReviewer PlanReviewer
 
 	// ReviewBudget is the size-aware per-invocation timeout policy for plan-
@@ -325,10 +338,25 @@ type Server struct {
 	appIdentityGetterOverride appIdentityGetter
 }
 
+// soleReviewerSet adapts the Config.PlanReviewer single-reviewer convenience
+// form into a ReviewerSet. For() deliberately errors: the single-reviewer
+// form predates per-provider resolution, and mapping every declared provider
+// to one adapter would silently misroute a heterogeneous `agents` list.
+type soleReviewerSet struct{ reviewer PlanReviewer }
+
+func (s soleReviewerSet) Default() PlanReviewer { return s.reviewer }
+
+func (soleReviewerSet) For(provider, _ string) (PlanReviewer, error) {
+	return nil, fmt.Errorf("reviewer provider %q is not resolvable from the single-reviewer configuration: wire Config.PlanReviewers", provider)
+}
+
 // New builds a Server. It does not start listening; call Start.
 func New(cfg Config) *Server {
 	if cfg.Addr == "" {
 		cfg.Addr = ":8080"
+	}
+	if cfg.PlanReviewers == nil && cfg.PlanReviewer != nil {
+		cfg.PlanReviewers = soleReviewerSet{reviewer: cfg.PlanReviewer}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()

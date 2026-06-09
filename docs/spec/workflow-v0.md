@@ -93,13 +93,30 @@ executor:
 
 ### Plan reviewers
 
-An optional block on `plan` stages that controls how many agent and/or human reviewers must weigh in before the stage advances to `awaiting_approval` (ADR-027). The block may be placed on any stage type but only has runtime effect on `plan` stages.
+An optional block on `plan` stages that controls how many agent and/or human reviewers must weigh in before the stage advances to `awaiting_approval` (ADR-027). The block may be placed on any stage type but only has runtime effect on `plan` and `implement` stages (the implement-review loop reuses the same config and authority semantics).
 
 ```yaml
 reviewers:
   agent: 1  # integer >= 0; 0 means no agent review (default)
   human: 0  # integer >= 0; 0 means no human approval gate (default)
 ```
+
+**Heterogeneous agent reviewers (`agents`, #955):** instead of the bare `agent` count, a stage may declare one reviewer per list entry, each with its own provider and (optionally) model:
+
+```yaml
+reviewers:
+  agents:
+    - provider: anthropic        # anthropic | claudecode | codex
+      model: claude-opus-4-8     # optional; empty → provider's deployment default
+    - provider: codex
+      model: gpt-5.5
+  human: 1
+```
+
+- **Supersession rule:** when `agents` is present and non-empty it supersedes the bare `agent` integer — the effective agent count is `len(agents)` (`spec.ReviewersConfig.AgentCount()`). The integer form remains valid and unchanged for back-compat: `agent: N` invokes the deployment's precedence-selected default adapter N times.
+- **Authority is count-derived (ADR-027 unchanged):** the authority table below reads the *effective* count, so heterogeneity changes **who** reviews, not gating semantics. `agents` + `human: 0` is gating; `agents` + `human: 1` is advisory.
+- **Provider resolution:** each provider must be configured in the deployment (`FISHHAWKD_ANTHROPIC_API_KEY` / `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` / `FISHHAWKD_ENABLE_CODEX_REVIEWER`). A **gating** stage naming an unconfigured provider fails dispatch up front at run create (`plan_reviewer_unconfigured`). In **advisory** mode an unresolvable provider degrades per-reviewer: a `plan_review_failed` / `implement_review_failed` audit entry carries the resolve error and the loop continues with the remaining reviewers.
+- The self-review guard runs per-invocation against each reviewer's returned model; codex reasoning effort stays a deployment-level knob (the spec carries provider + model only).
 
 **Authority modes** (resolved by `planreview.ResolveAuthority`):
 
@@ -315,7 +332,10 @@ Per-workflow auto-retry policy (#276 / E16). When a required CI check fails on t
 | Stage `type`                | `plan` \| `implement` \| `review`                                            | closed set                                                                                          |
 | Executor                    | `agent: <string>` xor `human: true`                                          | mutually exclusive                                                                                  |
 | `executor.agent_self_retry` | `true` \| `false` (default `false`)                                          | agent branch only; schema error on human executor                                                   |
-| `reviewers.agent`           | integer `>= 0` (default `0`)                                                 | absent block → nil → backend defaults to `{human:1}`                                               |
+| `reviewers.agent`           | integer `>= 0` (default `0`)                                                 | absent block → nil → backend defaults to `{human:1}`; superseded by a non-empty `reviewers.agents` |
+| `reviewers.agents`          | array of `{provider, model?}`, `minItems: 1`                                 | heterogeneous reviewers (#955); when present, effective agent count = `len(agents)`                |
+| `reviewers.agents[].provider` | `anthropic` \| `claudecode` \| `codex`                                     | must be configured in the deployment; gating + unresolvable provider fails dispatch up front       |
+| `reviewers.agents[].model`  | string (optional)                                                            | empty → the provider's deployment-configured default model                                         |
 | `reviewers.human`           | integer `>= 0` (default `0`)                                                 | absent block → nil → backend defaults to `{human:1}`                                               |
 | Input `source`              | `github_issue` \| `pull_request`                                             | v0; v0.x adds Linear/Jira                                                                           |
 | Artifact                    | `plan` \| `pull_request`                                                     | closed set                                                                                          |

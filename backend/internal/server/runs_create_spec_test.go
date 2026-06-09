@@ -368,6 +368,111 @@ func TestCreateRun_AdvisoryReview_NilReviewer_Allowed(t *testing.T) {
 	}
 }
 
+// heterogeneousGatingSpecYAML carries a plan stage requesting agent-gated
+// review via the #955 heterogeneous agents list (anthropic + codex,
+// human==0) — every declared provider must resolve at create time.
+const heterogeneousGatingSpecYAML = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+
+// TestCreateRun_GatingReview_AgentsList_UnresolvableProvider_Rejected
+// verifies the #955 extension of the #574 fail-fast: a gating agents list
+// naming a provider the wired ReviewerSet cannot resolve is rejected at
+// create time with 400 + plan_reviewer_unconfigured naming the provider,
+// and a run_rejected_misconfigured global-chain entry is written.
+func TestCreateRun_GatingReview_AgentsList_UnresolvableProvider_Rejected(t *testing.T) {
+	repo := newFakeRepo()
+	au := newAuditFake()
+	// Only anthropic is configured; the spec also names codex.
+	def := &fakePlanReviewer{model: "claude-opus-4-8"}
+	set := fakeReviewerSet{def: def, providers: map[string]PlanReviewer{"anthropic": def}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, PlanReviewers: set})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  heterogeneousGatingSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_reviewer_unconfigured"`) {
+		t.Errorf("body missing plan_reviewer_unconfigured code: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `codex`) {
+		t.Errorf("error must name the unresolvable provider: %s", w.Body.String())
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("expected zero runs created, got %d", len(repo.runs))
+	}
+	var found bool
+	for _, e := range au.globalAppended {
+		if e.Category == "run_rejected_misconfigured" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no run_rejected_misconfigured global-chain audit entry written: %#v", au.globalAppended)
+	}
+}
+
+// TestCreateRun_GatingReview_AgentsList_AllResolvable_Allowed verifies the
+// happy path of the #955 pre-check: when every declared provider resolves,
+// the gating agents list passes the create-time guard.
+func TestCreateRun_GatingReview_AgentsList_AllResolvable_Allowed(t *testing.T) {
+	repo := newFakeRepo()
+	au := newAuditFake()
+	def := &fakePlanReviewer{model: "claude-opus-4-8"}
+	set := fakeReviewerSet{def: def, providers: map[string]PlanReviewer{
+		"anthropic": def,
+		"codex":     &fakePlanReviewer{model: "gpt-5.5"},
+	}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, PlanReviewers: set})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  heterogeneousGatingSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (all providers resolvable):\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.globalAppended {
+		if e.Category == "run_rejected_misconfigured" {
+			t.Errorf("resolvable agents list must not emit run_rejected_misconfigured")
+		}
+	}
+}
+
 // --- GitHub fetch fallback for workflow_spec (#413) ---
 
 // ghTokensStub satisfies githubapp.TokenProvider for runs_test GitHub

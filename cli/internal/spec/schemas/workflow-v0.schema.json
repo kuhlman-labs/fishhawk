@@ -400,12 +400,33 @@
     "reviewers_config": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Plan-review reviewer counts for plan stages (ADR-027). Authority table: agent>0 && human==0 → gating (agent rejections block stage advancement); agent>0 && human>0 → advisory (agent verdicts surfaced, cannot block human approval); agent==0 → gateless. When the reviewers block is absent entirely, the backend defaults to {human:1} — preserving pre-ADR-027 behavior.",
+      "description": "Plan-review reviewer counts for plan stages (ADR-027). Authority table: agent>0 && human==0 → gating (agent rejections block stage advancement); agent>0 && human>0 → advisory (agent verdicts surfaced, cannot block human approval); agent==0 → gateless. The effective agent count is len(agents) when the `agents` list is present and non-empty, else the bare `agent` integer. When the reviewers block is absent entirely, the backend defaults to {human:1} — preserving pre-ADR-027 behavior.",
       "properties": {
         "agent": {
           "type": "integer",
           "minimum": 0,
-          "description": "Number of agent reviewers to invoke after the plan artifact is validated. 0 (default) means no agent review."
+          "description": "Number of agent reviewers to invoke after the plan artifact is validated. 0 (default) means no agent review. Superseded by `agents` when that list is present and non-empty; each invocation then uses the deployment's precedence-selected default adapter."
+        },
+        "agents": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Heterogeneous agent reviewers (#955): one entry per reviewer invocation, each naming its provider and optionally its model. When present and non-empty this list supersedes the bare `agent` integer count — the effective agent count for the ADR-027 authority table is len(agents). Authority semantics are unchanged: heterogeneity changes WHO reviews, not gating semantics.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider"],
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": ["anthropic", "claudecode", "codex"],
+                "description": "Reviewer adapter to invoke. Must be configured in the deployment (FISHHAWKD_ANTHROPIC_API_KEY / FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER / FISHHAWKD_ENABLE_CODEX_REVIEWER); a gating stage naming an unconfigured provider fails dispatch up front."
+              },
+              "model": {
+                "type": "string",
+                "description": "Model identifier passed to the adapter. Empty/absent falls back to the provider's deployment-configured default model."
+              }
+            }
+          }
         },
         "human": {
           "type": "integer",

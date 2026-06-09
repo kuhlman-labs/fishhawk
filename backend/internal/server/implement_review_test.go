@@ -11,12 +11,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
+
+// runImplementReviewLoop is the count-form test entry retained for callers
+// written against the pre-#955 signature (an agent count instead of resolved
+// invocations — today TestImplementReviewLoop_RepublishesAuditCompleteWhenReviewLands
+// in trace_test.go). It expands the bare count into default-reviewer
+// invocations exactly as resolveReviewerInvocations does for the count form,
+// then delegates to runImplementReviewInvocations.
+func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid.UUID, agents int, authority planreview.AuthorityMode, promptText, authorModel string) bool {
+	invocations := make([]reviewerInvocation, agents)
+	for i := range invocations {
+		invocations[i] = reviewerInvocation{reviewer: s.defaultPlanReviewer()}
+	}
+	return s.runImplementReviewInvocations(ctx, runID, stageID, invocations, authority, promptText, authorModel)
+}
 
 // Implement-stage workflow specs with reviewers config. The implement
 // stage carries no constraints so the trace handler's policy re-eval
@@ -72,6 +88,15 @@ func newImplementReviewServer(t *testing.T, reviewer PlanReviewer, workflowSpec 
 	*Server, *signingFake, *auditFake, *orchestratorRepo, *run.Run, *run.Stage,
 ) {
 	t.Helper()
+	return newImplementReviewServerWithSet(t, singleReviewerSet{reviewer}, workflowSpec)
+}
+
+// newImplementReviewServerWithSet is the ReviewerSet-injecting variant of
+// newImplementReviewServer for heterogeneous reviewers.agents tests (#955).
+func newImplementReviewServerWithSet(t *testing.T, set ReviewerSet, workflowSpec []byte) (
+	*Server, *signingFake, *auditFake, *orchestratorRepo, *run.Run, *run.Stage,
+) {
+	t.Helper()
 	rr := newOrchestratorRepo()
 	art := newFakeArtifactRepo()
 	sf := newSigningFake()
@@ -101,13 +126,13 @@ func newImplementReviewServer(t *testing.T, reviewer PlanReviewer, workflowSpec 
 	implStage.RequiresApproval = true
 
 	s := New(Config{
-		Addr:         "127.0.0.1:0",
-		SigningRepo:  sf,
-		TraceStore:   ts,
-		AuditRepo:    au,
-		RunRepo:      rr,
-		ArtifactRepo: art,
-		PlanReviewer: reviewer,
+		Addr:          "127.0.0.1:0",
+		SigningRepo:   sf,
+		TraceStore:    ts,
+		AuditRepo:     au,
+		RunRepo:       rr,
+		ArtifactRepo:  art,
+		PlanReviewers: set,
 	})
 	return s, sf, au, rr, runRow, implStage
 }
@@ -936,5 +961,185 @@ func TestShipTrace_ImplementReview_Advisory_ContextDetached(t *testing.T) {
 
 	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
 		t.Errorf("implement_reviewed entries = %d, want 1 — detached review must survive parent-context cancel", n)
+	}
+}
+
+// specImplementHeterogeneousGating declares the #955 heterogeneous agents
+// list on the implement stage (human 0 → gating, so the review loop runs
+// synchronously inside the trace upload).
+var specImplementHeterogeneousGating = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+          human: 0
+`)
+
+// TestShipTrace_ImplementReview_Heterogeneous_CrossBoundary is the #955
+// cross-boundary integration test for the implement loop: a real workflow
+// spec declaring two heterogeneous agent reviewers drives the trace-upload
+// path end-to-end and produces exactly two implement_reviewed entries with
+// the two distinct ReviewerModel values, two reviewer-cost recordings, and
+// a started proxy reporting the effective count len(agents)==2.
+func TestShipTrace_ImplementReview_Heterogeneous_CrossBoundary(t *testing.T) {
+	anthropicFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	codexFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5.5",
+	}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": anthropicFake,
+		"codex":     codexFake,
+	}, def: anthropicFake}
+	s, sf, au, _, runRow, implStage := newImplementReviewServerWithSet(t, set, specImplementHeterogeneousGating)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	anthropicFake.mu.Lock()
+	codexFake.mu.Lock()
+	if len(anthropicFake.calls) != 1 || len(codexFake.calls) != 1 {
+		t.Errorf("adapter calls = anthropic:%d codex:%d, want 1 each",
+			len(anthropicFake.calls), len(codexFake.calls))
+	}
+	codexFake.mu.Unlock()
+	anthropicFake.mu.Unlock()
+
+	var reviewed []planreview.ImplementReviewedPayload
+	costs := 0
+	for _, e := range au.appended {
+		switch e.Category {
+		case "implement_reviewed":
+			var p planreview.ImplementReviewedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode implement_reviewed payload: %v", err)
+			}
+			reviewed = append(reviewed, p)
+		case "cost_recorded":
+			if strings.Contains(string(e.Payload), `"source":"implement_review"`) {
+				costs++
+			}
+		case "implement_review_started":
+			var p planreview.ReviewStartedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode implement_review_started payload: %v", err)
+			}
+			if p.ConfiguredAgents != 2 {
+				t.Errorf("started configured_agents = %d, want 2 (len(agents))", p.ConfiguredAgents)
+			}
+		}
+	}
+	if len(reviewed) != 2 {
+		t.Fatalf("implement_reviewed entries = %d, want 2", len(reviewed))
+	}
+	models := map[string]bool{}
+	for _, p := range reviewed {
+		models[p.ReviewerModel] = true
+		if p.Authority != planreview.AuthorityGating {
+			t.Errorf("authority = %q, want gating (agents list, human 0)", p.Authority)
+		}
+	}
+	if !models["claude-opus-4-8"] || !models["gpt-5.5"] {
+		t.Errorf("reviewer models = %v, want both claude-opus-4-8 and gpt-5.5", models)
+	}
+	if costs != 2 {
+		t.Errorf("implement_review cost_recorded entries = %d, want 2", costs)
+	}
+}
+
+// TestShipTrace_ImplementReview_Heterogeneous_UnresolvableProvider_Gating
+// pins the implement-loop analog of the plan-side gating degradation test:
+// one of two declared gating reviewers is unconfigured (config drift on an
+// in-flight run — fresh gating runs are blocked at dispatch by the runs.go
+// pre-check). The resolve failure emits exactly one implement_review_failed
+// entry, leaves hasRejection untouched, and the resolvable reviewer's
+// approve verdict still governs: the stage must not fail.
+func TestShipTrace_ImplementReview_Heterogeneous_UnresolvableProvider_Gating(t *testing.T) {
+	anthropicFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	// codex deliberately absent from the set → For("codex") errors.
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": anthropicFake,
+	}, def: anthropicFake}
+	s, sf, au, _, runRow, implStage := newImplementReviewServerWithSet(t, set, specImplementHeterogeneousGating)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	var reviewed []planreview.ImplementReviewedPayload
+	var failedEntries []planreview.ReviewFailedPayload
+	au.mu.Lock()
+	for _, e := range au.appended {
+		switch e.Category {
+		case "implement_reviewed":
+			var p planreview.ImplementReviewedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				au.mu.Unlock()
+				t.Fatalf("decode implement_reviewed payload: %v", err)
+			}
+			reviewed = append(reviewed, p)
+		case "implement_review_failed":
+			var p planreview.ReviewFailedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				au.mu.Unlock()
+				t.Fatalf("decode implement_review_failed payload: %v", err)
+			}
+			failedEntries = append(failedEntries, p)
+		}
+	}
+	au.mu.Unlock()
+
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1 (the resolvable anthropic reviewer)", len(reviewed))
+	}
+	if reviewed[0].ReviewerModel != "claude-opus-4-8" || reviewed[0].Authority != planreview.AuthorityGating {
+		t.Errorf("reviewed entry = model %q authority %q, want claude-opus-4-8 / gating",
+			reviewed[0].ReviewerModel, reviewed[0].Authority)
+	}
+	if len(failedEntries) != 1 {
+		t.Fatalf("implement_review_failed entries = %d, want 1 (the unresolvable codex reviewer)", len(failedEntries))
+	}
+	if !strings.Contains(failedEntries[0].Reason, "not configured") {
+		t.Errorf("failed reason = %q, want the resolve error", failedEntries[0].Reason)
+	}
+	if failedEntries[0].Authority != planreview.AuthorityGating {
+		t.Errorf("failed authority = %q, want gating", failedEntries[0].Authority)
+	}
+
+	// A resolve failure must not count as a rejection: the resolvable
+	// reviewer approved, so the gating implement stage must not fail.
+	if implStage.State == run.StageStateFailed {
+		t.Errorf("gating resolve failure must not fail the stage; state = %q", implStage.State)
 	}
 }

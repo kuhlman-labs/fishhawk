@@ -1970,7 +1970,8 @@ func (s *Server) sumRunTokens(ctx context.Context, runID uuid.UUID) int64 {
 // Returns false (no gating block) when:
 //   - RunRepo is nil
 //   - the workflow spec carries no implement stage with reviewers.agent>0
-//   - PlanReviewer is nil (emits implement_review_skipped, then proceeds)
+//   - no reviewer backend is configured (emits implement_review_skipped,
+//     then proceeds)
 //   - no approved plan is available
 //   - authority is advisory (review runs detached, never blocks)
 //   - all review agents approve (or approve_with_concerns)
@@ -1992,21 +1993,21 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	}
 
 	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
-	if reviewersCfg == nil || reviewersCfg.Agent == 0 {
+	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
 		return false
 	}
 
 	authority := planreview.ResolveAuthority(*reviewersCfg)
 
-	// PlanReviewer not wired but the spec requested agent review.
+	// No reviewer backend wired but the spec requested agent review.
 	// Emit implement_review_skipped so the degradation is auditable,
 	// then proceed (in advisory mode the human gate remains
 	// authoritative). Mirrors runPlanReviews.
-	if s.cfg.PlanReviewer == nil {
+	if s.defaultPlanReviewer() == nil {
 		if s.cfg.AuditRepo != nil {
 			payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
 				Reason:           "reviewer_not_configured",
-				ConfiguredAgents: reviewersCfg.Agent,
+				ConfiguredAgents: reviewersCfg.AgentCount(),
 				Authority:        authority,
 			})
 			systemKind := audit.ActorKind("system")
@@ -2123,7 +2124,12 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// under both authorities — the MCP review_status proxy reads it to tell
 	// 'configured + running' (pending) from 'none configured'. Mirrors the
 	// plan path (runPlanReviews). Best-effort: never blocks dispatch.
-	s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.Agent, headSHA)
+	s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount(), headSHA)
+
+	// Resolve the per-invocation reviewer list (#955) up front so the
+	// detached goroutine closes over fully-resolved adapters, never the
+	// spec config or request-scoped state.
+	invocations := s.resolveReviewerInvocations(reviewersCfg)
 
 	// Detach the reviewer context from the request lifecycle (#584); see
 	// runPlanReviews for the rationale. The goroutine / loop closes over
@@ -2138,14 +2144,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runImplementReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the caller can fail the stage as
 	// category-B before the terminal transition.
-	return s.runImplementReviewLoop(reviewCtx, runID, stageID, reviewersCfg.Agent, authority, promptText, authorModel)
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
 }
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
@@ -2194,26 +2200,40 @@ func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run
 	return amended
 }
 
-// runImplementReviewLoop runs the per-reviewer implement-review loop
+// runImplementReviewInvocations runs the per-reviewer implement-review loop
 // shared by the synchronous (gating) and detached (advisory) dispatch
-// paths. For each configured agent it calls PlanReviewer.Review, logs
+// paths. For each resolved invocation it calls its reviewer's Review, logs
 // WARN on self-review (reviewer model == authorModel), and appends one
 // implement_reviewed audit entry. Returns true when at least one verdict
 // is reject. It performs no stage transition — the gating caller owns the
 // failed-B transition so the advance-blocking edge stays on the
 // synchronous path only.
-func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid.UUID, agents int, authority planreview.AuthorityMode, promptText, authorModel string) bool {
+func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
 	budget := s.cfg.ReviewBudget.Budget(len(promptText))
-	for i := 0; i < agents; i++ {
+	for i, inv := range invocations {
+		// An unresolvable provider (#955) is handled like a failed
+		// invocation: terminal *_review_failed entry, loop continues,
+		// hasRejection untouched.
+		if inv.resolveErr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: reviewer provider unresolved",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.Int("reviewer_index", i),
+				slog.String("provider", inv.provider),
+				slog.String("error", inv.resolveErr.Error()),
+			)
+			s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, inv.specModel, inv.resolveErr.Error(), false)
+			continue
+		}
 		// Apply the size-aware per-invocation budget (#747) as a context
 		// deadline. Implement-review inputs (the diff) are larger than plan
 		// review, so the size-aware formula naturally grants a larger budget
 		// here with no separate per-stage default. cancel() per turn so
 		// deadlines don't accumulate across reviewers.
 		invocationCtx, cancel := context.WithTimeout(ctx, budget)
-		verdict, model, err := s.cfg.PlanReviewer.Review(invocationCtx, promptText)
+		verdict, model, err := inv.reviewer.Review(invocationCtx, promptText)
 		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err != nil {
