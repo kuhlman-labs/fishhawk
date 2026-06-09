@@ -208,6 +208,12 @@ secrets:
   # (FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE = mountPath).
   githubApp:
     privateKeyFile:
+      # enabled adds the PEM volume + readOnly mount. UPGRADE CAVEAT (#849): with
+      # `existing`/`externalSecrets` mode the referenced Secret MUST carry the
+      # `secretKey` below — a pre-#849 Secret won't, and Kubernetes refuses to
+      # start the pod when a non-optional Secret-key mount is missing. Operators
+      # with no GitHub App integration (or who manage the key outside Kubernetes)
+      # should set this to false to drop the volume + mount.
       enabled: true
       secretKey: "github-app-private-key.pem"
       mountPath: "/etc/fishhawk/github-app-private-key.pem"

@@ -33,6 +33,15 @@ The Secret "{{ include "fishhawk.secretName" . }}" must provide these keys
 
   File key (mounted at {{ .Values.secrets.githubApp.privateKeyFile.mountPath }}, NOT an env var):
     - {{ .Values.secrets.githubApp.privateKeyFile.secretKey }}  (GitHub App private key PEM)
+
+  UPGRADE MIGRATION (#849): the file key above is NEWLY required by this chart
+  version. The PEM was not chart-managed before #849, so a Secret created for an
+  earlier release will NOT have it. Kubernetes refuses to start the pod if the
+  key is absent (the mount is not optional). Before upgrading, either:
+    - add "{{ .Values.secrets.githubApp.privateKeyFile.secretKey }}" to the existing Secret with your GitHub App PEM, or
+    - if you have no GitHub App integration (or manage the key outside
+      Kubernetes), opt out with --set secrets.githubApp.privateKeyFile.enabled=false
+      to drop the volume + mount entirely.
 {{- end }}
 {{- end }}
 
