@@ -1,0 +1,67 @@
+{{- if .Values.migrate.enabled }}
+# DB-migration hook Job: runs `fishhawkd migrate up` before serve handles traffic
+# against an unmigrated DB — the k8s analog of the ECS one-shot migrate Fargate
+# task (infra/terraform/migrations.tf). Reuses the published fishhawkd image;
+# ENTRYPOINT is ["/fishhawkd"] with CMD ["serve"] (backend/Dockerfile), so
+# args:[migrate, up] overrides only the CMD and runs `/fishhawkd migrate up`,
+# matching the ECS task's command=[migrate, up]. serve does NOT auto-migrate, so
+# this Job is the sole migration path (no double-migration). The distroless image
+# has no shell, so DB-warm-up retry is handled by Job backoffLimit (a fresh pod
+# per attempt), not an inline wait loop like minio-bucket-job's mc image allowed.
+#
+# Hook phase is conditional on postgres.enabled: pre-install,pre-upgrade for the
+# external-DB baseline (the prod/ECS analog — serve never starts against an
+# unmigrated DB), post-install,post-upgrade for the in-cluster local stack
+# (Helm runs all pre-install hooks before any normal resource, so a pre-install
+# hook depending on the in-cluster Postgres would deadlock).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-migrate
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    {{- if .Values.postgres.enabled }}
+    "helm.sh/hook": post-install,post-upgrade
+    {{- else }}
+    "helm.sh/hook": pre-install,pre-upgrade
+    {{- end }}
+    "helm.sh/hook-weight": "-5"
+    # Deletes the prior Job before each release and on success, but RETAINS a
+    # failed Job so `kubectl logs` surfaces the failure (no hook-failed) — and no
+    # orphaned Jobs across upgrades.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "fishhawk.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate", "up"]
+          envFrom:
+            # Non-secret FISHHAWKD_* env (same ConfigMap as the serve Deployment).
+            - configMapRef:
+                name: {{ include "fishhawk.fullname" . }}-config
+            # Sensitive FISHHAWKD_* env incl. FISHHAWKD_DATABASE_URL (#849).
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- if .Values.postgres.enabled }}
+          env:
+            # In-cluster Postgres (postgres.enabled). A container-level env entry
+            # overrides the same key arriving via the existingSecret envFrom, so
+            # the migrate Job and serve resolve the SAME DB URL. sslmode=disable
+            # matches the plaintext in-cluster Service.
+            - name: FISHHAWKD_DATABASE_URL
+              value: "postgres://{{ .Values.postgres.auth.user }}:{{ .Values.postgres.auth.password }}@{{ include "fishhawk.fullname" . }}-postgres:{{ .Values.postgres.service.port }}/{{ .Values.postgres.auth.database }}?sslmode=disable"
+          {{- end }}
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+{{- end }}
