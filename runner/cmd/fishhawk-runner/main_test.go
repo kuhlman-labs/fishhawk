@@ -3197,6 +3197,12 @@ func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 	if fp.gotArgs.RebaseFromRemote {
 		t.Error("RebaseFromRemote = true, want false for first child (branch not yet on remote)")
 	}
+	// First child cuts the shared branch from the freshly-fetched authoritative
+	// base, not ambient HEAD, so a foreign #797 commit can't become the fork
+	// point (ADR-035, #865). implementEnv sets the base ref to "main".
+	if fp.gotArgs.FreshFetchBase != "main" {
+		t.Errorf("FreshFetchBase = %q, want %q (first child cuts from freshly-fetched base, #865)", fp.gotArgs.FreshFetchBase, "main")
+	}
 	// Compile gate (#728) is now wired on the decomposed-child path too
 	// (#766): a scope-bounded child commit is the highest-risk path for a
 	// drift-dropped non-compiling HEAD, so it must be gated, not tolerated.
@@ -3275,6 +3281,12 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	}
 	if !fp.gotArgs.RebaseFromRemote {
 		t.Error("RebaseFromRemote = false, want true for subsequent child (branch exists on remote)")
+	}
+	// Subsequent child must leave FreshFetchBase empty: RebaseFromRemote owns
+	// the routing for the existing shared branch, and the #865 fresh-fetch is
+	// only for the first child's branch creation — no regression here.
+	if fp.gotArgs.FreshFetchBase != "" {
+		t.Errorf("FreshFetchBase = %q, want empty for subsequent child (RebaseFromRemote owns routing, #865)", fp.gotArgs.FreshFetchBase)
 	}
 	// (#766): the compile gate is wired on EVERY decomposed-child commit
 	// path, not just the first child. Asserting it here too closes the gap
