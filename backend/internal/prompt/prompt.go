@@ -520,6 +520,13 @@ func buildPlan(t Trigger) string {
 	b.WriteString("  ]\n\n")
 	b.WriteString("Valid operations: create | modify | delete | rename.\n")
 	b.WriteString("\n")
+	b.WriteString("Coupling-discovery checklist: scope.files is declared before code exists, so explicitly walk these couplings rather than reasoning only about the production files you intend to edit. " +
+		"For EVERY production file you scope, also add to scope.files the files that must change as a consequence (cf. #867/#873, #947 — repeated under-scoping where the planner named production files but omitted the coupled tests and doc/API companions):\n")
+	b.WriteString("- the existing *_test.go in the SAME package as the production file — a behavior change almost always touches its same-package test;\n")
+	b.WriteString("- any test that asserts a registry, count, or enum the change touches (e.g. a wantToolCount total, a MissingKind / kind-enum exhaustiveness table) — adding or removing a member breaks the count/enum assertion even when it lives in a different file;\n")
+	b.WriteString("- the doc/API companion for the surface you change: for any HTTP API change, BOTH docs/api/v0.openapi.yaml (source of truth) AND docs/api/v0.md (human companion); a dedicated feature doc page that mirrors the surface (e.g. docs/architecture/audit-complete.md); and the component README.md when you add or change a flag, tool, or env var;\n")
+	b.WriteString("- the callers' tests when you change a function signature or an exported struct — the call sites compile-break and their tests must update with them.\n")
+	b.WriteString("\n")
 	b.WriteString("Compound-field shape rule: the following fields must be the structured shape shown in the schema — never a bare string or prose summary:\n")
 	b.WriteString("- approach: array of {\"step\": N, \"description\": \"...\"} objects\n")
 	b.WriteString("- verification: {\"test_strategy\": \"...\", \"rollback_plan\": \"...\"} object\n")
