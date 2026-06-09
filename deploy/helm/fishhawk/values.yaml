@@ -85,6 +85,29 @@ workers:
   childCompletionSweeper: false
   invariantMonitor: false
 
+# DB-migration hook Job: runs `fishhawkd migrate up` against FISHHAWKD_DATABASE_URL
+# (resolved identically to the serve Deployment) before serve accepts traffic
+# against an unmigrated DB — the k8s analog of the ECS one-shot migrate Fargate
+# task (infra/terraform/migrations.tf). The hook PHASE is derived automatically
+# from postgres.enabled (not set here): pre-install,pre-upgrade for the
+# external-DB prod baseline (postgres.enabled=false), so serve never starts
+# against an unmigrated DB; post-install,post-upgrade for the in-cluster local
+# stack (postgres.enabled=true), because Helm runs ALL pre-install hooks to
+# completion before creating any normal resource — a pre-install hook depending
+# on the in-cluster Postgres (a normal resource) would deadlock. Retry on a
+# not-yet-ready DB is handled by Job backoffLimit (a fresh pod per attempt), not
+# a shell wait loop, since the distroless fishhawkd image has no shell.
+migrate:
+  enabled: true
+  backoffLimit: 6
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
 # Optional in-cluster Postgres 16, gated by postgres.enabled. Default false so
 # the prod baseline points fishhawkd at an external managed database via the
 # existingSecret's FISHHAWKD_DATABASE_URL. Turned on by values-local.yaml for a
