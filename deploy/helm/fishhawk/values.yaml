@@ -251,6 +251,33 @@ minio:
       cpu: 500m
       memory: 512Mi
 
+# Optional in-cluster Jaeger all-in-one (the local OTLP trace collector for the
+# runner's #649 GenAI spans), gated by jaeger.enabled. Default false. DEV /
+# DOGFOODING ONLY — an ephemeral, unauthenticated collector with in-memory span
+# storage (no PVC); fishhawk.validateSecrets fails the render outside
+# profile: local, so it cannot reach prod. The k8s analog of the opt-in `otel`
+# compose profile in docker-compose.yml. Turned on by values-local.yaml.
+# fishhawkd does NOT emit spans — the host-spawned fishhawk-runner does, reaching
+# this collector at localhost:4318 via the port-forward `scripts/dev k8s` opens
+# (with OTEL_EXPORTER_OTLP_ENDPOINT set on the host); UI at localhost:16686.
+# Image pinned per CLAUDE.md's run-time image-pinning rule (kept in sync with the
+# docker-compose.yml jaeger service).
+jaeger:
+  enabled: false
+  image: jaegertracing/all-in-one:1.62.0
+  pullPolicy: IfNotPresent
+  # Service ports (container ports are fixed at the Jaeger defaults 16686/4318/4317).
+  uiPort: 16686
+  otlpHttpPort: 4318
+  otlpGrpcPort: 4317
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
 # Name of the pre-existing Secret carrying sensitive FISHHAWKD_* env, consumed by
 # `secrets.mode: existing` (the default). The pod references it via envFrom
 # secretRef (optional:false — fails loud if absent). For chartManaged /

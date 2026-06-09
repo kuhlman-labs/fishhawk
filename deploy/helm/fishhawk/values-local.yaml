@@ -62,6 +62,14 @@ postgres:
 minio:
   enabled: true
 
+# In-cluster Jaeger all-in-one (the local OTLP trace collector). DEV-ONLY; the
+# host-spawned fishhawk-runner reaches it at localhost:4318 via the port-forward
+# `scripts/dev k8s` opens, and the UI is at localhost:16686. Set
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 on this host to have the
+# runner emit spans (unset is a clean no-op).
+jaeger:
+  enabled: true
+
 # Chart-managed Secret with dev placeholders so the chart renders standalone
 # (no out-of-band Secret needed). DEV-ONLY — never copy these to a prod values
 # file. existingSecret (values.yaml) is intentionally NOT set here: chartManaged
