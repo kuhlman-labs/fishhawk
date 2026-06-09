@@ -131,7 +131,9 @@ config:
   # SPA root used for GitHub Check Run back-links (#231). Empty disables the
   # publish-to-GitHub path cleanly. When ingress.enabled, an empty value is
   # DERIVED from ingress.host (https when ingress.tls.enabled, else http); an
-  # explicit value here overrides the derivation.
+  # explicit value here overrides the derivation. The SPA frontend is hosted
+  # separately (static, out-of-cluster — the chart serves the API only) and
+  # points its API base URL at this value; see docs/deploy/kubernetes.md.
   externalUrl: ""
   # OAuth sign-in redirect URLs (non-secret halves; client secret is in #849).
   # When ingress.enabled, an empty oauthCallbackUrl is DERIVED as

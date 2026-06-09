@@ -56,6 +56,28 @@ Local uses port-forward (or a NodePort) rather than an Ingress;
 `values-local.yaml` sets `ingress.enabled: false` so `config.externalUrl` /
 `config.oauthCallbackUrl` are used verbatim.
 
+## Frontend (SPA)
+
+The SPA frontend is hosted statically out-of-cluster (GitHub Pages, a CDN, or
+object storage); the Helm chart serves the fishhawkd API only. There is no
+in-cluster nginx Deployment/Service and no second built image — the chart stays
+image-build-free, depending solely on the published `fishhawkd` image (#846).
+
+Point the static SPA's API base URL at the chart's `config.externalUrl`:
+
+- **Ingress enabled** — `config.externalUrl` is the ingress host
+  (`<scheme>://<ingress.host>`, https when `ingress.tls.enabled`, else http; the
+  #850 derivation). Set the SPA's API base to that value.
+- **Local / port-forward** — `ingress.enabled: false`, so `config.externalUrl`
+  is used verbatim. With the bring-up's forward alive, that is
+  `http://localhost:8080`.
+
+The OAuth callback host (`config.oauthCallbackUrl`) must match the SPA host so
+the sign-in redirect returns to the served origin.
+
+Serving the SPA from an in-cluster nginx Deployment is intentionally out of
+scope (decided against on #853), keeping the chart image-build-free per #846.
+
 ## Tear down
 
 ```sh
@@ -85,7 +107,9 @@ cluster MUST keep `profile: prod`.
 ## Status
 
 Ingress + cert-manager TLS (#850) and ExternalSecrets (#849) ship as prod
-foundations in the chart. Worker-singleton leader election is out of scope
+foundations in the chart. SPA serving (#853) resolved as static-out-of-cluster:
+the chart serves the API only and the SPA is hosted separately (see the
+"Frontend (SPA)" section above). Worker-singleton leader election is out of scope
 (#851): in `allInOne` mode keep `replicaCount: 1` while any worker toggle is on,
 or use `deployment.mode=split` to scale the api tier independently of the single
 worker Deployment.
