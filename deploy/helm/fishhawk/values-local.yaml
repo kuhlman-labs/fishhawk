@@ -1,0 +1,43 @@
+# Local-development override layer for the fishhawk chart.
+# Renders cleanly standalone: `helm template fishhawk . -f values-local.yaml`.
+# Localhost-flavored endpoints + lower resource asks; placeholders fill any
+# render-time-needed fields. Not for cluster use as-is — the secret values still
+# come from the existingSecret object (#849).
+
+image:
+  tag: "main"
+  pullPolicy: Always
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+config:
+  addr: ":8080"
+  s3Region: "us-east-1"
+  s3Endpoint: "http://minio:9000"
+  s3Bucket: "fishhawk-traces"
+  externalUrl: "http://localhost:5173"
+  oauthCallbackUrl: "http://localhost:8080/v0/auth/github/callback"
+  oauthRedirectAfterLogin: "http://localhost:5173/"
+  oidcAudience: "fishhawkd-local"
+  oidcJwksUrl: ""
+  githubAppId: "123456"
+  planReviewModel: "claude-sonnet-4-6"
+  budgetTimezone: "UTC"
+
+workers:
+  slaTimer: false
+  dispatchWatchdog: false
+  reactionPoller: false
+  mergeReconciler: false
+  childCompletionSweeper: false
+  invariantMonitor: false
+
+existingSecret: fishhawk-secrets

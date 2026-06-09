@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fishhawk.fullname" . }}
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "fishhawk.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fishhawk.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: fishhawkd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            # Non-secret FISHHAWKD_* env.
+            - configMapRef:
+                name: {{ include "fishhawk.fullname" . }}-config
+            # Sensitive FISHHAWKD_* env (DB URL, API keys, OAuth secret, webhook
+            # secret, AWS creds, GitHub App private key). Secret object owned by
+            # #849; optional:false means the pod fails loud if it's absent.
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          env:
+            # Background-worker enable toggles → FISHHAWKD_ENABLE_*.
+            - name: FISHHAWKD_ENABLE_SLA_TIMER
+              value: {{ .Values.workers.slaTimer | quote }}
+            - name: FISHHAWKD_ENABLE_DISPATCH_WATCHDOG
+              value: {{ .Values.workers.dispatchWatchdog | quote }}
+            - name: FISHHAWKD_ENABLE_REACTION_POLLER
+              value: {{ .Values.workers.reactionPoller | quote }}
+            - name: FISHHAWKD_ENABLE_MERGE_RECONCILER
+              value: {{ .Values.workers.mergeReconciler | quote }}
+            - name: FISHHAWKD_ENABLE_CHILD_COMPLETION_SWEEPER
+              value: {{ .Values.workers.childCompletionSweeper | quote }}
+            - name: FISHHAWKD_ENABLE_INVARIANT_MONITOR
+              value: {{ .Values.workers.invariantMonitor | quote }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
