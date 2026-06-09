@@ -64,6 +64,38 @@ externalSecrets has ESO materialize a Secret of the same name via its target).
 {{- end -}}
 
 {{/*
+External URL consumed by the ConfigMap (FISHHAWKD_EXTERNAL_URL). Explicit
+config.externalUrl always wins. Otherwise, when the ingress is enabled with a
+host, derive `https://<host>` (`http://<host>` when ingress.tls is off). When
+neither an explicit value nor an enabled ingress host exists, return empty so the
+key stays unset (ignore-if-unset semantics).
+*/}}
+{{- define "fishhawk.externalUrl" -}}
+{{- if .Values.config.externalUrl -}}
+{{- .Values.config.externalUrl -}}
+{{- else if and .Values.ingress.enabled .Values.ingress.host -}}
+{{- $scheme := ternary "https" "http" .Values.ingress.tls.enabled -}}
+{{- printf "%s://%s" $scheme .Values.ingress.host -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+OAuth callback URL consumed by the ConfigMap (FISHHAWKD_OAUTH_CALLBACK_URL).
+Explicit config.oauthCallbackUrl always wins. Otherwise, when the ingress is
+enabled with a host, derive `<scheme>://<host>/v0/auth/github/callback` — the
+path fishhawkd registers the GitHub OAuth callback handler at (serve.go). Empty
+when neither an explicit value nor an enabled ingress host exists.
+*/}}
+{{- define "fishhawk.oauthCallbackUrl" -}}
+{{- if .Values.config.oauthCallbackUrl -}}
+{{- .Values.config.oauthCallbackUrl -}}
+{{- else if and .Values.ingress.enabled .Values.ingress.host -}}
+{{- $scheme := ternary "https" "http" .Values.ingress.tls.enabled -}}
+{{- printf "%s://%s/v0/auth/github/callback" $scheme .Values.ingress.host -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Deploy-time guard (#847 carry-over). `include`d once from the Deployment so every
 render runs it. Calls `fail` when a dev-only convenience is active outside the
 `local` profile:

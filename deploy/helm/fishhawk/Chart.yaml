@@ -3,8 +3,8 @@ name: fishhawk
 description: >-
   Fishhawk control plane (fishhawkd) — the ADR-034 Kubernetes-deploy keystone
   chart. Ships the fishhawkd Deployment + Service + non-secret ConfigMap; the
-  Secret object, in-cluster Postgres/MinIO, migrations Job, ingress/TLS, and
-  worker-singleton are owned by follow-up issues #847-#851.
+  Secret object, in-cluster Postgres/MinIO, migrations Job, and Ingress + TLS
+  (cert-manager) ship here; the worker-singleton is owned by follow-up #851.
 type: application
 # Chart version: bump on chart-template changes.
 version: 0.1.0
