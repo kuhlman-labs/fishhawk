@@ -81,6 +81,12 @@ func TestBuild_Implement_FullContext(t *testing.T) {
 		// number — without it the merge wouldn't auto-close the
 		// originating issue.
 		"Closes #42",
+		// No-git-VCS instruction (#941): the agent must not run git
+		// branch/commit/checkout commands — the runner owns all version
+		// control on the shared checkout. An agent `git checkout -b`
+		// mid-stage is what stranded the operator off main.
+		"Do not run `git checkout`",
+		"runner performs all version-control operations",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

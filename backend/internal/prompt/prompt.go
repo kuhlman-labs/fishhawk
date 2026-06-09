@@ -446,6 +446,8 @@ func buildImplement(t Trigger) string {
 	}
 
 	b.WriteString("\n")
+	b.WriteString("Do not run `git checkout`, `git branch`, `git commit`, `git add`, `git push`, or any other git command that changes branches or records commits. The runner performs all version-control operations (commit, branch, push, PR) and owns the shared checkout — edit the working tree only.\n")
+	b.WriteString("\n")
 	b.WriteString("When the runner finishes, it will collect the diff, ship the trace bundle to Fishhawk, push your changes to a branch, and open the PR using the title + body you wrote.\n")
 	return b.String()
 }

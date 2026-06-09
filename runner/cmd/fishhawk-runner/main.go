@@ -407,6 +407,36 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		planValidationFailed bool
 	)
 
+	// Capture the operator's HEAD ref BEFORE the agent is invoked (#941).
+	// The implement agent shares the operator's checkout; an agent that runs
+	// `git checkout -b` mid-stage would move HEAD, and the old capture-at-
+	// upload ordering then re-read that agent-moved ref as the restore target,
+	// stranding the operator on the agent's branch. Capturing here pins the
+	// restore target to where the operator actually started. Gated on the
+	// implement stage to mirror the prior capture's effective scope (it lived
+	// on the implement push path inside openPRAndShipArtifact). A capture
+	// failure must never break the run: emit the diagnostic and skip restore.
+	var (
+		preAgentRef      string
+		preAgentDetached bool
+		preAgentCaptured bool
+	)
+	if stageType == "implement" {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		if origRef, detached, capErr := captureHead(ctx, repoDir); capErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"working_tree_capture_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, capErr.Error())
+		} else {
+			preAgentRef = origRef
+			preAgentDetached = detached
+			preAgentCaptured = true
+		}
+	}
+
 	invokeStart := time.Now()
 	for {
 		res, invokeErr = invoker.Invoke(ctx, inv)
@@ -868,7 +898,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			if err := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey); err != nil {
+			if err := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured); err != nil {
 				res.OK = false
 				// Wrong-shaped output → category-B (parks the run for
 				// re-scope/re-plan). ErrPullRequestInvalid is the backend
@@ -2496,7 +2526,7 @@ func touchedPackageArgs(diskPath string, scopeFiles []string) []string {
 // is a real workflow signal but not necessarily a failure; we emit
 // a policy_event into the trace via a follow-up bundle so the
 // approver sees "agent decided no changes were needed."
-func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -2604,36 +2634,35 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		repoDir = "."
 	}
 
-	// Working-tree restoration (#911): CommitAndPush below switches HEAD onto
-	// the run branch (checkout -b/-B), and on a CommitAndPush-side failure
+	// Working-tree restoration (#911, #941): CommitAndPush below switches HEAD
+	// onto the run branch (checkout -b/-B), and on a CommitAndPush-side failure
 	// (e.g. the #800 committed-test verify gate flaking) the tree is also left
 	// dirty. Either way the operator's checkout is stranded on the run branch,
 	// which silently breaks the next `scripts/dev post-merge` (a dirty tree
 	// refuses `git checkout main`; the run-branch HEAD is not an ancestor of
-	// the squash-merge commit so `git merge --ff-only` fails). Capture the
-	// original ref now (AFTER the cfg.noPR early return above, so --no-pr keeps
-	// its deliberate leave-the-tree-dirty-for-the-operator semantics) and
-	// install a defer that force-checks-it-out on every exit path. The defer
-	// fires at function return — AFTER the inline gitdiff filesChanged reads
-	// and ShipPullRequest reports that need the run-branch tip — so those reads
-	// are unaffected. Restore is BEST-EFFORT and LOG-ONLY: it never overrides
-	// the function's primary push success/failure outcome.
-	if origRef, detached, capErr := captureHead(ctx, repoDir); capErr != nil {
-		// A capture failure must not break the push path — skip restoration.
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"working_tree_capture_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
-			cfg.runID, cfg.stageID, capErr.Error())
-	} else {
+	// the squash-merge commit so `git merge --ff-only` fails). The restore
+	// target (preAgentRef) was captured in run() BEFORE the agent was invoked
+	// (#941) — not re-read here, where an agent that ran `git checkout -b`
+	// mid-stage could have moved HEAD onto its own branch and made that the
+	// restore target. This block sits AFTER the cfg.noPR early return above, so
+	// --no-pr keeps its deliberate leave-the-tree-dirty-for-the-operator
+	// semantics. The defer fires at function return — AFTER the inline gitdiff
+	// filesChanged reads and ShipPullRequest reports that need the run-branch
+	// tip — so those reads are unaffected. Restore is BEST-EFFORT and LOG-ONLY:
+	// it never overrides the function's primary push success/failure outcome.
+	// preAgentCaptured is false when the capture in run() failed (or was
+	// skipped); restoration is then skipped, never breaking the push path.
+	if preAgentCaptured {
 		defer func() {
-			if rerr := restoreHead(ctx, repoDir, origRef); rerr != nil {
+			if rerr := restoreHead(ctx, repoDir, preAgentRef); rerr != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"working_tree_restore_failed","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t,"detail":%q}`+"\n",
-					cfg.runID, cfg.stageID, origRef, detached, rerr.Error())
+					cfg.runID, cfg.stageID, preAgentRef, preAgentDetached, rerr.Error())
 				return
 			}
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"working_tree_restored","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t}`+"\n",
-				cfg.runID, cfg.stageID, origRef, detached)
+				cfg.runID, cfg.stageID, preAgentRef, preAgentDetached)
 		}()
 	}
 
