@@ -142,6 +142,16 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Printf(`{"type":"env","key":"ANTHROPIC_API_KEY","value":%q}`+"\n",
 			os.Getenv("ANTHROPIC_API_KEY"))
 		fmt.Println(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`)
+	case "echo_env_multi":
+		// Echo both the API-key var (from the APIKey field) and a
+		// FISHHAWK_* var (from Invocation.Env) so the override test can
+		// assert each configured value wins over a conflicting inherited
+		// one (#899). A separate mode from echo_env so the single-var
+		// TestInvoke_ForwardsAPIKey assertion stays valid.
+		for _, k := range []string{"ANTHROPIC_API_KEY", "FISHHAWK_API_TOKEN"} {
+			fmt.Printf(`{"type":"env","key":%q,"value":%q}`+"\n", k, os.Getenv(k))
+		}
+		fmt.Println(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
 		os.Exit(2)
@@ -426,6 +436,62 @@ func TestInvoke_ForwardsAPIKey(t *testing.T) {
 	}
 	if !found {
 		t.Error("no kind=env event captured")
+	}
+}
+
+// TestInvoke_ForwardedEnvOverridesInherited proves the env-override fix
+// (#899) end to end: the Cmd builder pre-seeds CONFLICTING inherited
+// values for both ANTHROPIC_API_KEY (the APIKey field) and
+// FISHHAWK_API_TOKEN (an Invocation.Env key) onto cmd.Env, and the
+// echo_env_multi child must still observe the CONFIGURED values — a
+// subprocess resolves a variable to the FIRST matching entry, so without
+// the strip-then-append both inherited entries would shadow the override.
+func TestInvoke_ForwardedEnvOverridesInherited(t *testing.T) {
+	inv := &Invoker{
+		APIKey: "sk-configured-wins",
+		Cmd: func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+			// Pre-seed cmd.Env (non-nil so the adapter skips its os.Environ
+			// seed) with conflicting inherited values placed BEFORE the
+			// adapter layers the configured ones on top.
+			c.Env = append(os.Environ(),
+				"GO_HELPER_PROCESS=1",
+				"HELPER_MODE=echo_env_multi",
+				"ANTHROPIC_API_KEY=inherited-wrong-value",
+				"FISHHAWK_API_TOKEN=inherited-wrong-token",
+			)
+			return c
+		},
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		Env: map[string]string{"FISHHAWK_API_TOKEN": "fhm_configured_wins"},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false: %s", res.FailureReason)
+	}
+	got := map[string]string{}
+	for _, ev := range res.Events {
+		if ev.Kind != "env" {
+			continue
+		}
+		var e struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(ev.Payload, &e); err != nil {
+			t.Fatalf("env event not JSON: %v: %s", err, ev.Payload)
+		}
+		got[e.Key] = e.Value
+	}
+	if got["ANTHROPIC_API_KEY"] != "sk-configured-wins" {
+		t.Errorf("ANTHROPIC_API_KEY = %q, want sk-configured-wins (configured must override inherited)", got["ANTHROPIC_API_KEY"])
+	}
+	if got["FISHHAWK_API_TOKEN"] != "fhm_configured_wins" {
+		t.Errorf("FISHHAWK_API_TOKEN = %q, want fhm_configured_wins (per-run Env must override inherited)", got["FISHHAWK_API_TOKEN"])
 	}
 }
 

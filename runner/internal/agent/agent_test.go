@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -29,6 +30,65 @@ func TestMakePayload_PanicsOnUnmarshalable(t *testing.T) {
 	}()
 	// Channels can't be marshaled — any panic is fine.
 	MakePayload(make(chan int))
+}
+
+func TestAppendEnvOverride(t *testing.T) {
+	t.Run("removes_conflicting_entry_and_appends_sole_match", func(t *testing.T) {
+		env := []string{"PATH=/bin", "OPENAI_API_KEY=inherited-wrong", "HOME=/root"}
+		got := AppendEnvOverride(env, "OPENAI_API_KEY", "configured-right")
+		want := []string{"PATH=/bin", "HOME=/root", "OPENAI_API_KEY=configured-right"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		// Exactly one entry for the key — a subprocess reads the first
+		// match, so a lingering duplicate would re-shadow the override.
+		var n int
+		for _, kv := range got {
+			if kv == "OPENAI_API_KEY=configured-right" || kv == "OPENAI_API_KEY=inherited-wrong" {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("OPENAI_API_KEY entries = %d, want exactly 1", n)
+		}
+	})
+
+	t.Run("appends_when_no_prior_entry", func(t *testing.T) {
+		env := []string{"PATH=/bin"}
+		got := AppendEnvOverride(env, "OPENAI_API_KEY", "v")
+		want := []string{"PATH=/bin", "OPENAI_API_KEY=v"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("leaves_unrelated_entries_order_stable", func(t *testing.T) {
+		// A key that is a prefix of an unrelated one must not be stripped:
+		// matching is on the full "KEY=" prefix, so FOO= leaves FOOBAR=.
+		env := []string{"A=1", "FOOBAR=keep", "B=2", "FOO=old"}
+		got := AppendEnvOverride(env, "FOO", "new")
+		want := []string{"A=1", "FOOBAR=keep", "B=2", "FOO=new"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("does_not_mutate_or_alias_input", func(t *testing.T) {
+		env := []string{"PATH=/bin", "FOO=old", "HOME=/root"}
+		orig := append([]string(nil), env...)
+		got := AppendEnvOverride(env, "FOO", "new")
+		if !reflect.DeepEqual(env, orig) {
+			t.Errorf("input slice mutated: got %q, want %q", env, orig)
+		}
+		// The result must not share backing storage with the input: writing
+		// through one must not be visible through the other.
+		if len(got) > 0 {
+			got[0] = "MUTATED=1"
+			if env[0] == "MUTATED=1" {
+				t.Error("result aliases the caller's backing array")
+			}
+		}
+	})
 }
 
 func TestErrors_AreDistinct(t *testing.T) {
