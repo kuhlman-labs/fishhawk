@@ -3669,6 +3669,106 @@ func TestRun_ImplementStage_RestoresOperatorBranch_OnCommitPushFailure(t *testin
 	}
 }
 
+// TestRun_ImplementStage_CaptureFailure_DoesNotBreakPush is the #911
+// capture-failure path: when captureHead returns an error the defer is NOT
+// installed (no original ref to restore to), but a capture failure must never
+// break the push — the stage still succeeds, restoreHead is never called, and a
+// working_tree_capture_failed event is emitted instead of working_tree_restored.
+func TestRun_ImplementStage_CaptureFailure_DoesNotBreakPush(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	// captureHead fails; restoreHead must never be reached because the defer is
+	// skipped. Install AFTER withFakeGitOps so these override its no-op stubs.
+	restoreCalls := 0
+	origCap, origRes := captureHead, restoreHead
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return "", false, errors.New("symbolic-ref failed")
+	}
+	restoreHead = func(_ context.Context, _, _ string) error { restoreCalls++; return nil }
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (a capture failure must not break the push):\n%s", got, stderr.String())
+	}
+	if restoreCalls != 0 {
+		t.Errorf("restoreHead called %d times, want 0 (no defer installed after a capture failure)", restoreCalls)
+	}
+	if !strings.Contains(stderr.String(), `"event":"working_tree_capture_failed"`) {
+		t.Errorf("missing working_tree_capture_failed log line:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("working_tree_restored must NOT be emitted when capture failed:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_RestoreFailure_PreservesOutcome is the #911
+// restore-failure path: when restoreHead itself errors, the defer must emit a
+// working_tree_restore_failed event (not working_tree_restored) and MUST NOT
+// override the function's primary success outcome — restore is best-effort and
+// log-only.
+func TestRun_ImplementStage_RestoreFailure_PreservesOutcome(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	// captureHead succeeds (defer installs); restoreHead fails. Install AFTER
+	// withFakeGitOps so these override its no-op stubs.
+	origCap, origRes := captureHead, restoreHead
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return "operator-main", false, nil
+	}
+	restoreHead = func(_ context.Context, _, _ string) error { return errors.New("checkout --force failed") }
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (a restore failure must not override the primary push outcome):\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"working_tree_restore_failed"`) {
+		t.Errorf("missing working_tree_restore_failed log line:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("working_tree_restored must NOT be emitted when restore failed:\n%s", stderr.String())
+	}
+}
+
 // installRestoreSpy swaps the #911 capture/restore seam for recording spies:
 // captureHead returns origRef, and restoreHead records the ref it was called
 // with plus a call count. Returns pointers the caller asserts on. Must be
