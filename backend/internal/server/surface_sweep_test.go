@@ -50,6 +50,9 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 		notifier       = "backend/internal/issuecomment/notifier.go"
 		pullrequest    = "backend/internal/server/pullrequest.go"
 		surfacesDoc    = "docs/issue-comment-surfaces.md"
+		mcpTools       = "backend/cmd/fishhawk-mcp/tools.go"
+		mcpToolsTest   = "backend/cmd/fishhawk-mcp/tools_test.go"
+		mcpReadme      = "backend/cmd/fishhawk-mcp/README.md"
 	)
 	tests := []struct {
 		name  string
@@ -105,6 +108,42 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 		{
 			name:  "audit emitter with surfaces doc no finding",
 			scope: []string{pullrequest, surfacesDoc},
+			want:  nil,
+		},
+		{
+			// #873/#867: tools.go alone flags BOTH coupled siblings,
+			// sorted (README.md before tools_test.go via sort.Strings).
+			name:  "mcp tools.go alone flags count test and readme",
+			scope: []string{mcpTools},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "mcp tool registration requires count test + readme",
+					TriggerPath:     mcpTools,
+					MissingSiblings: []string{mcpReadme, mcpToolsTest},
+				},
+			},
+		},
+		{
+			name:  "mcp tools.go with count test flags only missing readme",
+			scope: []string{mcpTools, mcpToolsTest},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "mcp tool registration requires count test + readme",
+					TriggerPath:     mcpTools,
+					MissingSiblings: []string{mcpReadme},
+				},
+			},
+		},
+		{
+			name:  "mcp tools.go with both siblings no finding",
+			scope: []string{mcpTools, mcpToolsTest, mcpReadme},
+			want:  nil,
+		},
+		{
+			// tools_test.go alone is not a trigger — the pattern is pinned
+			// to the registration file, so this fires nothing.
+			name:  "mcp count test alone no finding",
+			scope: []string{mcpToolsTest},
 			want:  nil,
 		},
 		{
