@@ -80,6 +80,7 @@ type planReviewerOptions struct {
 	enableCodexReviewer       bool
 	codexBinary               string
 	codexModel                string
+	codexEffort               string
 	openAIAPIKey              string
 	planReviewMaxTokens       int
 	planReviewMaxRetries      int
@@ -142,17 +143,19 @@ func resolvePlanReviewer(opts planReviewerOptions, logger *slog.Logger) server.P
 		return reviewer
 	case opts.enableCodexReviewer:
 		reviewer := codex.NewReviewer(codex.Config{
-			Binary:    opts.codexBinary,
-			APIKey:    opts.openAIAPIKey,
-			Model:     opts.codexModel,
-			MaxTokens: opts.planReviewMaxTokens,
-			Timeout:   opts.planReviewTimeout,
+			Binary:          opts.codexBinary,
+			APIKey:          opts.openAIAPIKey,
+			Model:           opts.codexModel,
+			ReasoningEffort: opts.codexEffort,
+			MaxTokens:       opts.planReviewMaxTokens,
+			Timeout:         opts.planReviewTimeout,
 		})
 		reviewer.SetMaxRetries(opts.planReviewMaxRetries)
 		logger.Info("plan review agent configured",
 			slog.String("adapter", "codex"),
 			slog.String("binary", opts.codexBinary),
 			slog.String("model", opts.codexModel),
+			slog.String("reasoning_effort", opts.codexEffort),
 			slog.Int("max_tokens", opts.planReviewMaxTokens),
 			slog.Int("max_retries", opts.planReviewMaxRetries),
 			slog.Duration("timeout", opts.planReviewTimeout))
@@ -295,7 +298,10 @@ func runServe(args []string, logSink io.Writer) int {
 		"executable name or path for the Codex reviewer CLI; used only when --enable-codex-reviewer is set")
 	codexModel := fs.String("codex-reviewer-model",
 		envOr("FISHHAWKD_CODEX_MODEL", ""),
-		"model identifier recorded for Codex reviewer invocations (the self-review guard compares it to the plan's GeneratedBy.Model); used only when --enable-codex-reviewer is set")
+		"model the Codex reviewer runs, passed to `codex exec --model`, and recorded for its invocations (the self-review guard compares it to the plan's GeneratedBy.Model); empty inherits the host ~/.codex config; used only when --enable-codex-reviewer is set")
+	codexEffort := fs.String("codex-reviewer-effort",
+		envOr("FISHHAWKD_CODEX_REASONING_EFFORT", ""),
+		"reasoning effort passed to the Codex reviewer as a model_reasoning_effort config override, e.g. low/medium/high; empty inherits the host ~/.codex config; used only when --enable-codex-reviewer is set")
 	openAIAPIKey := fs.String("openai-api-key",
 		envOr("FISHHAWKD_OPENAI_API_KEY", ""),
 		"OpenAI API key forwarded as OPENAI_API_KEY to the Codex reviewer subprocess; empty is fine when Codex is authenticated via a ChatGPT login on the host")
@@ -382,6 +388,7 @@ func runServe(args []string, logSink io.Writer) int {
 		enableCodexReviewer:       *enableCodexReviewer,
 		codexBinary:               *codexBinary,
 		codexModel:                *codexModel,
+		codexEffort:               *codexEffort,
 		openAIAPIKey:              *openAIAPIKey,
 		planReviewMaxTokens:       *planReviewMaxTokens,
 		planReviewMaxRetries:      *planReviewMaxRetries,

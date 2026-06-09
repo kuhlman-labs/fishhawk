@@ -48,10 +48,17 @@ type Config struct {
 	// adapter (runner/internal/agent/codex). Any resulting auth failure surfaces
 	// as a normal non-zero-exit error.
 	APIKey string
-	// Model is the model identifier returned verbatim as the model identifier
-	// from Inference. Codex's JSONL does not carry a model field today, so a
-	// deterministic model string keeps the server's self-review guard honest.
+	// Model is passed to the CLI as `--model <model>` AND returned verbatim as
+	// the model identifier from Inference, so the recorded label matches the
+	// model that actually ran. Codex's JSONL does not carry a model field today,
+	// so the deterministic config value keeps the server's self-review guard
+	// honest. Empty means inherit the host ~/.codex config default (no --model
+	// flag is passed).
 	Model string
+	// ReasoningEffort is passed to the CLI as a `-c
+	// model_reasoning_effort=<effort>` config override (e.g. low/medium/high).
+	// Empty means inherit the host ~/.codex config (no override is passed).
+	ReasoningEffort string
 	// MaxTokens caps the response length. Reserved for parity with the SDK and
 	// claudecode adapters; the `codex` CLI has no stable per-call max-tokens
 	// flag, so it is currently advisory only.
@@ -189,11 +196,27 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	//                           required. The inference-only review path executes
 	//                           no tools, so a real run returns cleanly without
 	//                           the executor's --dangerously-bypass flags.
+	//   --model <model>       — overrides the host ~/.codex config's model;
+	//                           appended only when cfg.Model is set, so an empty
+	//                           config inherits the host default.
+	//   -c model_reasoning_effort=<effort>
+	//                         — generic config override selecting the reasoning
+	//                           effort; appended only when cfg.ReasoningEffort is
+	//                           set. A bare value like `medium` that fails to
+	//                           parse as TOML is treated as a string literal.
+	// Both optional flags are placed BEFORE the prompt positional, matching the
+	// existing argv shape.
 	args := []string{
 		"exec", "--json",
 		"--skip-git-repo-check",
-		prompt,
 	}
+	if c.cfg.Model != "" {
+		args = append(args, "--model", c.cfg.Model)
+	}
+	if c.cfg.ReasoningEffort != "" {
+		args = append(args, "-c", "model_reasoning_effort="+c.cfg.ReasoningEffort)
+	}
+	args = append(args, prompt)
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
 	// Seed with os.Environ() when the Cmd builder left env nil (production), so
 	// the operator's existing OPENAI_API_KEY / ChatGPT-login auth and PATH are
@@ -243,6 +266,10 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		return "", "", planreview.Usage{}, false, parseErr
 	}
 
+	// cfg.Model is truthful as the model identifier: when set it was passed via
+	// --model above, and when empty the host default ran (reported as ""). If
+	// codex's JSONL ever surfaces a model field, prefer it here — the 0.137.0
+	// stream has no such field, so the config value is the only label source.
 	return verdictText, c.cfg.Model, usageOut, false, nil
 }
 
