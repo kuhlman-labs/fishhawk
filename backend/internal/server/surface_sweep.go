@@ -86,6 +86,24 @@ var surfacePatterns = []surfacePattern{
 			"docs/issue-comment-surfaces.md",
 		},
 	},
+	{
+		// #873/#867: registering or removing a fishhawk_* MCP tool in
+		// tools.go must move in lockstep with tools_test.go — whose
+		// TestToolDescriptions_ConformToHouseStyle hardcodes
+		// wantToolCount = 16 (plus the when/eligibility-leading house-style
+		// assertion) and red-lines verify if the count drifts — and with
+		// README.md, the human-facing MCP tool listing. tools.go is the
+		// trigger only (not a sibling): the pattern fires when the
+		// registration file is in scope but a coupled file is missing.
+		Name: "mcp tool registration requires count test + readme",
+		Triggers: []string{
+			"backend/cmd/fishhawk-mcp/tools.go",
+		},
+		Siblings: []string{
+			"backend/cmd/fishhawk-mcp/tools_test.go",
+			"backend/cmd/fishhawk-mcp/README.md",
+		},
+	},
 }
 
 // evaluateSurfaceSweep is the pure matcher: for each pattern, if any
