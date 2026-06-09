@@ -1221,6 +1221,9 @@ func TestBuild_PlanReview_ContainsNoPlanConstraint(t *testing.T) {
 		"suggest edits to the plan",
 		"MUST NOT",
 		"JSON only",
+		// Structural-validity reminder (#901): guards against the malformed-JSON
+		// decode failure by reminding the model to comma-separate members.
+		"The JSON must be syntactically valid",
 	}
 	for _, w := range noPlanStrings {
 		if !strings.Contains(got, w) {
@@ -1366,7 +1369,12 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// that ALSO includes criterion #7, NOT current_size + minReduction (which
 	// would make the assertion tautological). New baseline = the original
 	// pre-#606 untrimmed length (3333) PLUS the 583 bytes criterion #7 adds.
-	const preTrimBaselineLen = 3916
+	//
+	// #901 raised it again by the 83 bytes the structural-validity reminder in
+	// the JSON-only contract block adds: that sentence is in the current
+	// (trimmed) prompt AND would be in the untrimmed version, so the baseline
+	// must move with it to keep the trim-margin guard meaningful.
+	const preTrimBaselineLen = 3999
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,
@@ -1497,6 +1505,8 @@ func TestBuild_ImplementReview_FullContext(t *testing.T) {
 		// Role constraint + JSON-only contract.
 		"ROLE CONSTRAINT",
 		"single JSON object",
+		// Structural-validity reminder (#901).
+		"The JSON must be syntactically valid",
 		// The diff under review renders the changed files.
 		ImplementReviewSplitMarker,
 		"pkg/bar/foo.go",

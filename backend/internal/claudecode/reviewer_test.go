@@ -41,6 +41,12 @@ func TestHelperProcess(t *testing.T) {
 	case "bad_verdict":
 		// Valid envelope, valid JSON, but verdict outside the closed set.
 		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"maybe\"}"}`)
+	case "flaky_decode_bad":
+		// A success envelope whose result text is structurally-malformed verdict
+		// JSON — a missing comma between members (`"approve" "concerns"`), the
+		// #901 class strict-then-repair DecodeVerdict cannot rescue. The envelope
+		// itself is valid JSON; only the nested verdict body is malformed.
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\" \"concerns\":[]}"}`)
 	case "invalid_escape_regex":
 		// The #739 bug end-to-end: a success envelope whose result text is a
 		// verdict JSON that quotes a regex containing a lone `\-`. The envelope
@@ -128,6 +134,63 @@ func flakyHelperCommand(attempts *int) func(ctx context.Context, name string, ar
 			mode = "killed"
 		}
 		return helperCommand(mode)(ctx, name, args...)
+	}
+}
+
+// flakyDecodeHelperCommand returns a builder whose first attempt emits a
+// structurally-malformed verdict body (`flaky_decode_bad`) and whose every later
+// attempt emits a valid approve verdict (`happy`). It drives the #901
+// decode-retry: a malformed roll must re-roll the reviewer for fresh sampling.
+func flakyDecodeHelperCommand(attempts *int) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		*attempts++
+		mode := "happy"
+		if *attempts == 1 {
+			mode = "flaky_decode_bad"
+		}
+		return helperCommand(mode)(ctx, name, args...)
+	}
+}
+
+// TestReviewer_FlakyDecodeRetries asserts a first-roll structurally-malformed
+// verdict body re-rolls the reviewer and the second roll's valid approve verdict
+// is returned (#901), in exactly two attempts.
+func TestReviewer_FlakyDecodeRetries(t *testing.T) {
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.client.Cmd = flakyDecodeHelperCommand(&attempts)
+
+	verdict, _, err := r.Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, planreview.VerdictApprove)
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (one malformed roll + one recovery)", attempts)
+	}
+}
+
+// TestReviewer_PersistentBadJSONExhausts asserts a reviewer that emits a
+// structurally-malformed verdict on every roll terminates as a "decode verdict
+// JSON" error after the bounded budget — SetMaxRetries(1) => exactly 2 attempts
+// (the ADR-036 backstop: no unbounded re-roll).
+func TestReviewer_PersistentBadJSONExhausts(t *testing.T) {
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.SetMaxRetries(1)
+	r.client.Cmd = countingHelperCommand("flaky_decode_bad", &attempts)
+
+	_, _, err := r.Review(context.Background(), "review this plan")
+	if err == nil {
+		t.Fatal("expected a terminal decode error from a persistently-malformed reviewer, got nil")
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (SetMaxRetries(1) => 2 rolls)", attempts)
+	}
+	if !strings.Contains(err.Error(), "decode verdict JSON") {
+		t.Errorf("error = %q, want a 'decode verdict JSON' terminal error", err)
 	}
 }
 

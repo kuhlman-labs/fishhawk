@@ -49,14 +49,30 @@ func (r *Reviewer) SetMaxRetries(n int) {
 // (reusing the #739 fence-strip + invalid-escape tolerance), and validates the
 // verdict belongs to the closed set. Subprocess failure, an undecodable verdict
 // body, and an unknown verdict each map to a precise wrapped error.
+//
+// Inference + decode route through planreview.DecodeVerdictRetrying so a
+// structurally-malformed verdict body (#901) re-rolls the reviewer for fresh
+// sampling, bounded by the existing crash-retry budget (r.client.cfg.MaxRetries
+// — no new field). An inference fault is NOT re-rolled (Client.Inference already
+// applied its own crash-retry); the inferFailed flag routes it to the
+// "inference failed" wrapping while a decode failure keeps the "decode verdict
+// JSON" wrapping.
 func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.ReviewVerdict, string, error) {
-	responseText, modelName, usage, err := r.client.Inference(ctx, promptText)
-	if err != nil {
-		return nil, "", fmt.Errorf("codex: inference failed: %w", err)
+	var inferFailed bool
+	infer := func(ctx context.Context) (string, string, planreview.Usage, error) {
+		responseText, modelName, usage, err := r.client.Inference(ctx, promptText)
+		if err != nil {
+			inferFailed = true
+			return "", "", planreview.Usage{}, fmt.Errorf("codex: inference failed: %w", err)
+		}
+		return responseText, modelName, usage, nil
 	}
 
-	verdict, err := planreview.DecodeVerdict([]byte(responseText))
+	verdict, modelName, usage, err := planreview.DecodeVerdictRetrying(ctx, r.client.cfg.MaxRetries, infer)
 	if err != nil {
+		if inferFailed {
+			return nil, "", err
+		}
 		return nil, "", fmt.Errorf("codex: decode verdict JSON: %w", err)
 	}
 

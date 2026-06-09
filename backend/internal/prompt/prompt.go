@@ -601,6 +601,7 @@ func buildPlanReview(t Trigger) string {
 	b.WriteString("- Invoke any tools beyond reading repository files for context.\n\n")
 	b.WriteString("Your entire response MUST be a single JSON object conforming to the verdict schema below. " +
 		"Do not wrap it in markdown code fences, do not add prose before or after it. " +
+		"The JSON must be syntactically valid: comma-separate every member and use no trailing commas. " +
 		"A response that contains anything other than the JSON object will be rejected.\n\n")
 
 	// Plan artifact section — the primary input to the review.
@@ -689,6 +690,7 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("- Invoke any tools beyond reading repository files for context.\n\n")
 	b.WriteString("Your entire response MUST be a single JSON object conforming to the verdict schema below. " +
 		"Do not wrap it in markdown code fences, do not add prose before or after it. " +
+		"The JSON must be syntactically valid: comma-separate every member and use no trailing commas. " +
 		"A response that contains anything other than the JSON object will be rejected.\n\n")
 
 	// Diff under review — the primary input. The split marker leads this
