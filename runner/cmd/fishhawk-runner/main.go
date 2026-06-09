@@ -2171,6 +2171,18 @@ var (
 		}
 		return strings.TrimSpace(string(out)), nil
 	}
+
+	// captureHead / restoreHead are the working-tree restoration seam
+	// (#911). Production wires them to the real gitops helpers, which run
+	// `git symbolic-ref` / `git checkout --force` against the operator's
+	// checkout. They are package-level vars (not direct gitops calls) ONLY
+	// so the fake-pusher run() tests — which default repoDir to "." (the
+	// runner's own source repo) — can swap in safe no-ops via
+	// withFakeGitOps; without the seam those tests would force-checkout the
+	// real working tree and discard uncommitted work. The real helpers are
+	// exercised directly by the gitops unit tests against throwaway repos.
+	captureHead = gitops.CaptureHead
+	restoreHead = gitops.RestoreHead
 )
 
 // compileDiagnosticMarkers are substrings that positively identify a
@@ -2578,6 +2590,39 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
+	}
+
+	// Working-tree restoration (#911): CommitAndPush below switches HEAD onto
+	// the run branch (checkout -b/-B), and on a CommitAndPush-side failure
+	// (e.g. the #800 committed-test verify gate flaking) the tree is also left
+	// dirty. Either way the operator's checkout is stranded on the run branch,
+	// which silently breaks the next `scripts/dev post-merge` (a dirty tree
+	// refuses `git checkout main`; the run-branch HEAD is not an ancestor of
+	// the squash-merge commit so `git merge --ff-only` fails). Capture the
+	// original ref now (AFTER the cfg.noPR early return above, so --no-pr keeps
+	// its deliberate leave-the-tree-dirty-for-the-operator semantics) and
+	// install a defer that force-checks-it-out on every exit path. The defer
+	// fires at function return — AFTER the inline gitdiff filesChanged reads
+	// and ShipPullRequest reports that need the run-branch tip — so those reads
+	// are unaffected. Restore is BEST-EFFORT and LOG-ONLY: it never overrides
+	// the function's primary push success/failure outcome.
+	if origRef, detached, capErr := captureHead(ctx, repoDir); capErr != nil {
+		// A capture failure must not break the push path — skip restoration.
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"working_tree_capture_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, capErr.Error())
+	} else {
+		defer func() {
+			if rerr := restoreHead(ctx, repoDir, origRef); rerr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"working_tree_restore_failed","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t,"detail":%q}`+"\n",
+					cfg.runID, cfg.stageID, origRef, detached, rerr.Error())
+				return
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"working_tree_restored","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t}`+"\n",
+				cfg.runID, cfg.stageID, origRef, detached)
+		}()
 	}
 
 	// Branch routing: a fix-up pass commits onto the existing PR branch;

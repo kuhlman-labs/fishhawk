@@ -623,6 +623,54 @@ func UntrackedPaths(ctx context.Context, repoDir string, candidates []string) ([
 	return created, nil
 }
 
+// CaptureHead records the operator's current checkout position so it can be
+// restored after an implement/fix-up pass moves HEAD onto the run branch
+// (#911). It returns the short branch name on an attached HEAD, or the raw
+// commit SHA with detached=true on a detached HEAD (the hosted
+// actions/checkout shape, where the workflow checks out a SHA rather than a
+// branch). Either value is a valid restore target for `git checkout --force`.
+//
+// `git symbolic-ref --quiet --short HEAD` prints the branch short name and
+// exits 0 on an attached HEAD; on a detached HEAD it exits non-zero (with
+// --quiet suppressing the error text), which is how the detached case is
+// detected. It is a package-level function (not a *Pusher method) to mirror
+// UntrackedPaths — the caller has no *Pusher in scope.
+func CaptureHead(ctx context.Context, repoDir string) (ref string, detached bool, err error) {
+	out, serr := (&Pusher{}).runOut(ctx, repoDir, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if serr == nil {
+		if branch := strings.TrimSpace(out); branch != "" {
+			return branch, false, nil
+		}
+	}
+	// Detached HEAD (or symbolic-ref produced no name): fall back to the SHA.
+	sha, rerr := (&Pusher{}).runOut(ctx, repoDir, "rev-parse", "HEAD")
+	if rerr != nil {
+		return "", false, fmt.Errorf("gitops: capture HEAD: %w", rerr)
+	}
+	return strings.TrimSpace(sha), true, nil
+}
+
+// RestoreHead returns the operator's checkout to ref via `git checkout
+// --force` (#911). After an implement/fix-up pass the runner has switched
+// HEAD onto the run branch (via CommitAndPush's `checkout -b`/`-B`), and on a
+// failed pass the tree is also dirty (staged+unstaged tracked modifications).
+// --force is required so the switch is not refused by those modifications: it
+// discards staged and unstaged changes to TRACKED files and moves HEAD off the
+// run branch. A committed run-branch commit is NOT lost — the run branch ref
+// still points at it (and on the success path it was already pushed to
+// origin); restoring only moves HEAD off the branch.
+//
+// Untracked files are intentionally left in place: `git checkout --force` does
+// not remove them, and a `git clean` to do so would risk deleting operator
+// files the run never touched. The caller invokes this best-effort and
+// log-only — a restore failure must never override the push's primary outcome.
+func RestoreHead(ctx context.Context, repoDir, ref string) error {
+	if err := (&Pusher{}).run(ctx, repoDir, "checkout", "--force", ref); err != nil {
+		return fmt.Errorf("gitops: restore HEAD to %s: %w", ref, err)
+	}
+	return nil
+}
+
 // porcelainPath extracts the repo-relative path from one `git status
 // --porcelain` line. Returns "" for blank/short lines. For a rename
 // ("R  old -> new") it returns the destination path, which is what a

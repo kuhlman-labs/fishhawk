@@ -1225,6 +1225,99 @@ func TestCommitAndPush_RebaseFromRemote_StashPopConflict(t *testing.T) {
 	}
 }
 
+// TestCaptureHead_AttachedReturnsBranchName asserts that on a normal attached
+// HEAD, CaptureHead returns the short branch name and detached=false (#911) —
+// the restore target the runner force-checks-out after the run-branch switch.
+func TestCaptureHead_AttachedReturnsBranchName(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	ref, detached, err := CaptureHead(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("CaptureHead: %v", err)
+	}
+	if detached {
+		t.Errorf("detached = true, want false on an attached HEAD")
+	}
+	if ref != "main" {
+		t.Errorf("ref = %q, want %q", ref, "main")
+	}
+}
+
+// TestCaptureHead_DetachedReturnsSHA asserts the hosted actions/checkout shape:
+// on a detached HEAD, `git symbolic-ref` exits non-zero and CaptureHead falls
+// back to the commit SHA with detached=true (#911).
+func TestCaptureHead_DetachedReturnsSHA(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+	sha := mustGitOut(t, repo, "rev-parse", "HEAD")
+	// Detach HEAD at the current commit (the actions/checkout shape).
+	mustGit(t, repo, "checkout", "--detach", sha)
+
+	ref, detached, err := CaptureHead(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("CaptureHead: %v", err)
+	}
+	if !detached {
+		t.Errorf("detached = false, want true on a detached HEAD")
+	}
+	if ref != sha {
+		t.Errorf("ref = %q, want SHA %q", ref, sha)
+	}
+}
+
+// TestRestoreHead_SwitchesOffDirtyRunBranch is the load-bearing #911 seam:
+// from a run branch carrying staged-modified tracked files, RestoreHead
+// force-switches back to the original branch, leaves the tree CLEAN, and
+// leaves the run-branch commit reachable via its branch ref (no committed work
+// lost — HEAD just moved off the branch).
+func TestRestoreHead_SwitchesOffDirtyRunBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+	const runBranch = "fishhawk/run-x/stage-y"
+
+	// Simulate a run: switch to the run branch, commit an edit (the pushed
+	// run-branch commit), then leave a staged-modified tracked file dirty (the
+	// failed-pass tree shape).
+	mustGit(t, repo, "checkout", "-b", runBranch)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# run-branch commit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "config", "user.name", "run")
+	mustGit(t, repo, "config", "user.email", "run@example.com")
+	mustGit(t, repo, "commit", "-am", "run-branch work")
+	runCommit := mustGitOut(t, repo, "rev-parse", "HEAD")
+	// Now dirty the tree with a staged-modified tracked file — checkout would
+	// refuse this without --force.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "README.md")
+
+	if err := RestoreHead(context.Background(), repo, "main"); err != nil {
+		t.Fatalf("RestoreHead: %v", err)
+	}
+
+	// Back on the original branch.
+	if got := mustGitOut(t, repo, "symbolic-ref", "--short", "HEAD"); got != "main" {
+		t.Errorf("HEAD branch = %q, want %q", got, "main")
+	}
+	// Tree is clean — the staged-modified tracked file was discarded by --force.
+	if got := mustGitOut(t, repo, "status", "--porcelain"); got != "" {
+		t.Errorf("status --porcelain = %q, want clean", got)
+	}
+	// The run-branch commit survives: its branch ref still points at it.
+	if got := mustGitOut(t, repo, "rev-parse", runBranch); got != runCommit {
+		t.Errorf("run branch tip = %q, want preserved %q", got, runCommit)
+	}
+}
+
 // isAncestor reports whether maybeAncestor is an ancestor of ref via
 // `git merge-base --is-ancestor` (exit 0 = ancestor, exit 1 = not).
 func isAncestor(t *testing.T, dir, maybeAncestor, ref string) bool {

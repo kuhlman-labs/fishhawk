@@ -2063,12 +2063,28 @@ func (f *fakePROpener) OpenPR(_ context.Context, args gitops.OpenPRArgs) (*gitop
 func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	t.Helper()
 	origP, origO := newPusher, newPROpener
+	origCap, origRes := captureHead, restoreHead
 	newPusher = func() pusher { return fp }
 	newPROpener = func(token string) prOpener {
 		fpr.gotToken = token
 		return fpr
 	}
-	t.Cleanup(func() { newPusher = origP; newPROpener = origO })
+	// Stub the working-tree restoration seam (#911) to safe no-ops so a
+	// fake-pusher run() test — repoDir defaults to "." (the runner's own
+	// source repo) — never runs `git checkout --force` against the real
+	// working tree. captureHead returns a sentinel so the defer still
+	// installs (exercising the emit path); restoreHead does nothing. Tests
+	// that need to assert the wiring swap in recording spies AFTER this.
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return "operator-branch", false, nil
+	}
+	restoreHead = func(_ context.Context, _, _ string) error { return nil }
+	t.Cleanup(func() {
+		newPusher = origP
+		newPROpener = origO
+		captureHead = origCap
+		restoreHead = origRes
+	})
 }
 
 // implementEnv sets the env vars the implement-stage flow reads
@@ -3555,6 +3571,124 @@ func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
 	if !strings.Contains(stderr.String(), `"event":"implement_fixup_push_reported"`) {
 		t.Errorf("missing implement_fixup_push_reported log line:\n%s", stderr.String())
 	}
+}
+
+// TestRun_ImplementStage_RestoresOperatorBranch_OnSuccess is the #911
+// defer-wiring seam (success half): after a SUCCESSFUL implement push, the
+// runner must return the operator's checkout to the branch CaptureHead
+// recorded — restoreHead is invoked exactly once with the captured ref, and a
+// working_tree_restored event is emitted. The real branch-switch semantics
+// (force off a dirty run branch, leaving a clean tree + reachable commit) are
+// proven by the gitops RestoreHead unit test; this test pins the wiring in
+// openPRAndShipArtifact so a regression that drops the defer is caught.
+func TestRun_ImplementStage_RestoresOperatorBranch_OnSuccess(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	gotRef, restoreCalls := installRestoreSpy(t, "operator-main")
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if *restoreCalls != 1 {
+		t.Errorf("restoreHead called %d times, want 1 (defer must fire on the success path)", *restoreCalls)
+	}
+	if *gotRef != "operator-main" {
+		t.Errorf("restoreHead ref = %q, want %q (the captured original branch)", *gotRef, "operator-main")
+	}
+	if !strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("missing working_tree_restored log line:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_RestoresOperatorBranch_OnCommitPushFailure is the
+// #911 defer-wiring seam (failure half): when CommitAndPush fails AFTER
+// switching HEAD onto the run branch — e.g. the #800/#908 committed-test
+// verify gate flaking — the runner must STILL return the operator to their
+// original branch. The defer runs on the error return path too, so restoreHead
+// is invoked once with the captured ref even though the stage fails. This is
+// the exact #911 leftover: a failed fix-up/verify gate stranding the operator
+// on a dirty run branch.
+func TestRun_ImplementStage_RestoresOperatorBranch_OnCommitPushFailure(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	// Model the in-CommitAndPush verify-gate failure (#800) that leaves HEAD on
+	// the run branch — the #911 trigger.
+	fp := &fakePusher{err: gitops.ErrCommittedTestsFailed}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	gotRef, restoreCalls := installRestoreSpy(t, "operator-main")
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure (commit+push gate failed):\n%s", got, stderr.String())
+	}
+	if *restoreCalls != 1 {
+		t.Errorf("restoreHead called %d times, want 1 (defer must fire on the failure path too)", *restoreCalls)
+	}
+	if *gotRef != "operator-main" {
+		t.Errorf("restoreHead ref = %q, want %q (the captured original branch)", *gotRef, "operator-main")
+	}
+	if !strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("missing working_tree_restored log line on the failure path:\n%s", stderr.String())
+	}
+}
+
+// installRestoreSpy swaps the #911 capture/restore seam for recording spies:
+// captureHead returns origRef, and restoreHead records the ref it was called
+// with plus a call count. Returns pointers the caller asserts on. Must be
+// called AFTER withFakeGitOps (whose no-op stubs it overrides). Restored via
+// t.Cleanup.
+func installRestoreSpy(t *testing.T, origRef string) (gotRef *string, calls *int) {
+	t.Helper()
+	gotRef = new(string)
+	calls = new(int)
+	origCap, origRes := captureHead, restoreHead
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return origRef, false, nil
+	}
+	restoreHead = func(_ context.Context, _, ref string) error {
+		*gotRef = ref
+		*calls++
+		return nil
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+	return gotRef, calls
 }
 
 // TestRun_ImplementStage_Fixup_NoChanges_ReportsFixupNoChanges is the #856 fix:
