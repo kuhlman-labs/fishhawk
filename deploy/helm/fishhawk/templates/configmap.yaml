@@ -37,6 +37,11 @@ data:
   {{- with .Values.config.githubAppId }}
   FISHHAWKD_GITHUB_APP_ID: {{ . | quote }}
   {{- end }}
+  {{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
+  # Non-secret FILE PATH where the GitHub App private key is mounted (the PEM
+  # itself lives in the Secret, projected as a file — see the Deployment volume).
+  FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE: {{ .Values.secrets.githubApp.privateKeyFile.mountPath | quote }}
+  {{- end }}
   {{- with .Values.config.planReviewModel }}
   FISHHAWKD_PLAN_REVIEW_MODEL: {{ . | quote }}
   {{- end }}

@@ -1,3 +1,4 @@
+{{- include "fishhawk.validateSecrets" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,10 +28,13 @@ spec:
             - configMapRef:
                 name: {{ include "fishhawk.fullname" . }}-config
             # Sensitive FISHHAWKD_* env (DB URL, API keys, OAuth secret, webhook
-            # secret, AWS creds, GitHub App private key). Secret object owned by
-            # #849; optional:false means the pod fails loud if it's absent.
+            # secret, AWS creds). Name resolved by fishhawk.secretName across all
+            # three secrets modes (#849); optional:false means the pod fails loud
+            # if it's absent. The GitHub App private key lives in the SAME Secret
+            # under a dotted key, which envFrom skips — it is mounted as a file
+            # (see volumes/volumeMounts below), never injected as env.
             - secretRef:
-                name: {{ .Values.existingSecret }}
+                name: {{ include "fishhawk.secretName" . }}
           env:
             {{- if .Values.postgres.enabled }}
             # In-cluster Postgres (postgres.enabled). A container-level env entry
@@ -71,3 +75,24 @@ spec:
             failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
+          volumeMounts:
+            # GitHub App private key, projected read-only as a single file from
+            # the Secret (fishhawk.secretName). subPath mounts just the file, so
+            # the rest of the directory is untouched.
+            - name: github-app-private-key
+              mountPath: {{ .Values.secrets.githubApp.privateKeyFile.mountPath | quote }}
+              subPath: {{ .Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
+              readOnly: true
+          {{- end }}
+      {{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
+      volumes:
+        - name: github-app-private-key
+          secret:
+            secretName: {{ include "fishhawk.secretName" . }}
+            items:
+              # Project ONLY the PEM key to the mount path's basename. The dotted
+              # secretKey is skipped by envFrom but surfaced here as a file.
+              - key: {{ .Values.secrets.githubApp.privateKeyFile.secretKey | quote }}
+                path: {{ .Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
+      {{- end }}

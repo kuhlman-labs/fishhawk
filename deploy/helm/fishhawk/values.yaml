@@ -2,6 +2,14 @@
 # Override per-environment with `-f my-values.yaml` (see values-local.yaml for a
 # localhost-flavored example).
 
+# Deployment profile: `prod` (default) or `local`. This is the local-vs-prod
+# signal the Secret guard (fishhawk.validateSecrets) keys off of — dev-only
+# conveniences (a chart-managed Secret, in-cluster Postgres/MinIO default
+# credentials) are permitted ONLY when profile is `local`. values-local.yaml
+# sets profile: local. An operator copying values-local for a real cluster MUST
+# change this back to prod (and supply real secrets) or the render fails loud.
+profile: prod
+
 image:
   # Published fishhawkd image built by backend/Dockerfile (#168) and pushed by
   # backend-release.yml. Do not build it here — the chart only references it.
@@ -169,8 +177,68 @@ minio:
       cpu: 500m
       memory: 512Mi
 
-# Name of the pre-existing Secret carrying sensitive FISHHAWKD_* env. The Secret
-# object itself is owned by #849; this chart only references it (envFrom
-# secretRef, optional:false — the pod fails loud if it's absent, the intended
-# pre-#849 state).
+# Name of the pre-existing Secret carrying sensitive FISHHAWKD_* env, consumed by
+# `secrets.mode: existing` (the default). The pod references it via envFrom
+# secretRef (optional:false — fails loud if absent). For chartManaged /
+# externalSecrets modes this is ignored; the chart-owned `<fullname>-secrets`
+# name is used instead (see fishhawk.secretName).
 existingSecret: fishhawk-secrets
+
+# Secret provisioning (#849). Three converging modes, ALL consumed by the
+# fishhawkd Deployment + migrate Job through the single `fishhawk.secretName`
+# helper (no template duplication):
+#   existing        — reference a pre-created Secret (default; back-compat with
+#                     the pre-#849 posture). Resolves to `existingSecret` above.
+#   chartManaged    — the chart renders the Secret from `secrets.values` (DEV
+#                     ONLY; gated to profile: local by fishhawk.validateSecrets).
+#   externalSecrets — emit an ExternalSecret CR referencing a SecretStore so the
+#                     External Secrets Operator materializes the Secret in-cluster
+#                     (prod hook/foundation; pairs with #182, needs ESO + a
+#                     pre-provisioned SecretStore).
+# chartManaged and externalSecrets both resolve to the chart-owned name
+# `<fullname>-secrets`: chartManaged renders that Secret directly, externalSecrets
+# has ESO materialize a Secret of that name via the ExternalSecret's target.
+secrets:
+  mode: existing
+
+  # GitHub App private key, mounted as a FILE volume (never an env string). The
+  # PEM is stored under a DOTTED Secret key, which envFrom skips (not a valid env
+  # identifier), so it is consumed only via the mount. The non-secret file PATH
+  # is advertised to fishhawkd via the ConfigMap
+  # (FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE = mountPath).
+  githubApp:
+    privateKeyFile:
+      enabled: true
+      secretKey: "github-app-private-key.pem"
+      mountPath: "/etc/fishhawk/github-app-private-key.pem"
+
+  # DEV-ONLY plaintext consumed by `chartManaged` mode. All empty by default so
+  # the chart never bakes secrets unless explicitly populated (see
+  # values-local.yaml). Empty keys are omitted from the rendered Secret, so an
+  # unset value stays unset. NEVER populate these for a prod deploy.
+  values:
+    databaseUrl: ""           # FISHHAWKD_DATABASE_URL
+    githubWebhookSecret: ""   # FISHHAWKD_GITHUB_WEBHOOK_SECRET
+    oauthClientSecret: ""     # FISHHAWKD_OAUTH_CLIENT_SECRET
+    anthropicApiKey: ""       # FISHHAWKD_ANTHROPIC_API_KEY
+    awsAccessKeyId: ""        # AWS_ACCESS_KEY_ID (S3 / MinIO)
+    awsSecretAccessKey: ""    # AWS_SECRET_ACCESS_KEY (S3 / MinIO)
+    # PEM contents for the GitHub App private key (rendered under the dotted
+    # secretKey above and mounted as a file, NOT injected as env).
+    githubAppPrivateKey: ""
+
+  # `externalSecrets` mode: emit an ExternalSecret CR (no inline Secret).
+  # secretStoreRef.name MUST be set (the guard fails an empty one). apiVersion is
+  # overridable to track ESO releases. Each `data` item maps a key in the
+  # materialized Secret to a remote ref in the backing store.
+  externalSecrets:
+    apiVersion: "external-secrets.io/v1beta1"
+    secretStoreRef:
+      name: ""
+      kind: ClusterSecretStore
+    refreshInterval: "1h"
+    data: []
+    # - secretKey: FISHHAWKD_DATABASE_URL
+    #   remoteRef:
+    #     key: fishhawk/db
+    #     property: url
