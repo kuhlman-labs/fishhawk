@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -416,6 +417,24 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 				}
 			}
 		}
+		// Mirror the backend's since_sequence filter (#962): entries
+		// with Sequence strictly greater than the anchor, applied
+		// before the limit — the contract fishhawk_await_audit's
+		// sequence-anchored poll relies on.
+		if rawSince := r.URL.Query().Get("since_sequence"); rawSince != "" {
+			since, serr := strconv.ParseInt(rawSince, 10, 64)
+			if serr != nil || since < 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			filtered := make([]AuditEntry, 0, len(items))
+			for _, e := range items {
+				if e.Sequence > since {
+					filtered = append(filtered, e)
+				}
+			}
+			items = filtered
+		}
 		w.WriteHeader(fb.perRunAuditStatus)
 		_ = json.NewEncoder(w).Encode(listAuditResult{Items: items, NextCursor: next})
 	})
@@ -805,7 +824,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the 16 fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 16
+	const wantToolCount = 17
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

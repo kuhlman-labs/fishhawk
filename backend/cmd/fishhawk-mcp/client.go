@@ -569,8 +569,13 @@ type listAuditResult struct {
 type ListRunAuditFilter struct {
 	Category string
 	StageID  string
-	Limit    int
-	Cursor   string
+	// SinceSequence narrows the response to entries with sequence
+	// strictly greater than this value (#962) — the anchor the
+	// fishhawk_await_audit primitive polls from. Zero drops from the
+	// query string (the server treats 0 as a no-op anyway).
+	SinceSequence int64
+	Limit         int
+	Cursor        string
 }
 
 // ListRunAudit calls GET /v0/runs/{run_id}/audit with optional
@@ -586,6 +591,9 @@ func (c *apiClient) ListRunAudit(ctx context.Context, runID uuid.UUID, f ListRun
 	}
 	if f.StageID != "" {
 		q.Set("stage_id", f.StageID)
+	}
+	if f.SinceSequence > 0 {
+		q.Set("since_sequence", strconv.FormatInt(f.SinceSequence, 10))
 	}
 	if f.Limit > 0 {
 		q.Set("limit", strconv.Itoa(f.Limit))
