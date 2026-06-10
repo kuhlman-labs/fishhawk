@@ -68,6 +68,13 @@ func TestCommitAndPush_RealRepo_HappyPath(t *testing.T) {
 	if res.HeadSHA == res.BaseSHA {
 		t.Error("HeadSHA should differ from BaseSHA after a commit")
 	}
+	// TreeSHA is the pushed commit's tree object hash (#960).
+	if res.TreeSHA == "" {
+		t.Error("TreeSHA empty")
+	}
+	if got := mustGitOut(t, repo, "rev-parse", res.HeadSHA+"^{tree}"); got != res.TreeSHA {
+		t.Errorf("TreeSHA = %q, want rev-parse %s^{tree} = %q", res.TreeSHA, res.HeadSHA, got)
+	}
 
 	// Verify the branch landed in the bare remote.
 	out, err := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/test/branch").Output()
@@ -171,6 +178,9 @@ func TestCommitAndPush_NoChangesShortCircuits(t *testing.T) {
 	if res.HeadSHA != "" {
 		t.Errorf("HeadSHA = %q, want empty when no changes", res.HeadSHA)
 	}
+	if res.TreeSHA != "" {
+		t.Errorf("TreeSHA = %q, want empty when no changes", res.TreeSHA)
+	}
 	if res.BaseSHA == "" {
 		t.Error("BaseSHA should still be populated even on no-changes")
 	}
@@ -180,6 +190,57 @@ func TestCommitAndPush_NoChangesShortCircuits(t *testing.T) {
 	out, _ := exec.Command("git", "-C", repo, "branch", "--list", "fishhawk/should-not-be-created").Output()
 	if strings.TrimSpace(string(out)) != "" {
 		t.Errorf("branch was created on no-changes path: %q", out)
+	}
+}
+
+// TestTreeSHA_MetadataIndependent guards the verified-SHA invariant's core
+// git assumption (#960): `git rev-parse <rev>^{tree}` peels a commit to its
+// tree object hash (gitrevisions(7)), and that hash is content-addressed —
+// it depends only on the snapshot (content + modes + paths), never on commit
+// message, author, or timestamp. Two commits with identical content but
+// different metadata must yield EQUAL ^{tree} hashes (so the gates' verdict
+// transfers from the throwaway commit to the differently-authored real
+// commit), and a content change must yield a DIFFERENT hash.
+func TestTreeSHA_MetadataIndependent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "one")
+	mustGit(t, repo, "config", "user.email", "one@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("same content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "first message")
+	treeA := mustGitOut(t, repo, "rev-parse", "HEAD^{tree}")
+
+	// Same snapshot, entirely different commit metadata.
+	mustGit(t, repo, "checkout", "--orphan", "other")
+	mustGit(t, repo, "config", "user.name", "two")
+	mustGit(t, repo, "config", "user.email", "two@example.com")
+	mustGit(t, repo, "add", "-A")
+	cmd := exec.Command("git", "-C", repo, "commit", "-m", "completely different message")
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_DATE=2005-04-07T22:13:13Z",
+		"GIT_COMMITTER_DATE=2005-04-07T22:13:13Z")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("orphan commit: %v\n%s", err, out)
+	}
+	treeB := mustGitOut(t, repo, "rev-parse", "HEAD^{tree}")
+	if treeA != treeB {
+		t.Errorf("identical content must yield equal tree hashes: %q vs %q", treeA, treeB)
+	}
+
+	// A content change must move the tree hash.
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("different content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "content change")
+	if treeC := mustGitOut(t, repo, "rev-parse", "HEAD^{tree}"); treeC == treeA {
+		t.Errorf("changed content must yield a different tree hash, both %q", treeC)
 	}
 }
 

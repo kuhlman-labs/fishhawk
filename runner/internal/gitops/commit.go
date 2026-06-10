@@ -80,6 +80,20 @@ var ErrFixupCreatedOutOfScope = fmt.Errorf("%w (fix-up)", ErrCreatedOutOfScope)
 // category-B failure (wrong-shaped output → re-scope/re-plan).
 var ErrCommittedTestsFailed = errors.New("gitops: committed tree tests failed")
 
+// ErrPushedTreeNotVerified is the verified-SHA-invariant sentinel (#960):
+// a VerifyCommit hook wraps it (via fmt.Errorf("%w: ...")) and returns it
+// BEFORE the push when the staged commit's tree is NOT the tree the
+// committed-tree verify gates (#651/#802) passed against and a single strict
+// re-verify of the real committed HEAD did not explicitly pass. The gates
+// verify a throwaway scope-only commit that is reset away; the real commit
+// CommitAndPush builds later can differ (e.g. FreshFetchBase fetched a moved
+// origin/<base> between gate and push), and without this check stage_state
+// = succeeded would vouch for a pushed head no gate ever saw (run 07bce059).
+// Returned before the push, so origin stays untouched; the runner classifies
+// it category-B (artifact broken → re-scope/re-plan), symmetric with
+// ErrCommitWouldNotCompile / ErrCommittedTestsFailed.
+var ErrPushedTreeNotVerified = errors.New("gitops: pushed tree was not verified by the committed-tree gates")
+
 // ErrBaseRebaseConflict is the sentinel returned when reapplying the agent's
 // stashed working-tree edits onto a freshly-fetched authoritative base fails
 // with a merge conflict — the agent edited lines the base advanced past, so the
@@ -230,6 +244,13 @@ type CommitAndPushResult struct {
 	// HeadSHA is the new branch tip after commit. Empty when
 	// NoChanges is true.
 	HeadSHA string
+
+	// TreeSHA is the tree object hash of the pushed commit
+	// (`git rev-parse HEAD^{tree}`), the content-addressed identity of
+	// the exact snapshot that left the runner. Callers stamp it into
+	// push/PR audit events so the trail proves the gates' verified tree
+	// equals the pushed tree (#960). Empty when NoChanges is true.
+	TreeSHA string
 
 	// BaseSHA is the commit the branch was created from (i.e. HEAD
 	// of the source branch immediately before our commit).
@@ -415,6 +436,14 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 	headSHA = strings.TrimSpace(headSHA)
 
+	// Resolve the commit's tree object hash (#960) so the caller can
+	// stamp the pushed snapshot's content identity into the audit chain.
+	treeSHA, err := p.runOut(ctx, args.RepoDir, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return nil, fmt.Errorf("gitops: rev-parse new HEAD tree: %w", err)
+	}
+	treeSHA = strings.TrimSpace(treeSHA)
+
 	// Compile-gate hook (#728): verify the scope-only committed tree
 	// before any push. Runs after the commit exists (so headSHA is real
 	// and checkoutable in an isolated worktree) but before the push, so a
@@ -478,6 +507,7 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 
 	return &CommitAndPushResult{
 		HeadSHA:    headSHA,
+		TreeSHA:    treeSHA,
 		BaseSHA:    baseSHA,
 		ScopeDrift: scopeDrift,
 	}, nil
