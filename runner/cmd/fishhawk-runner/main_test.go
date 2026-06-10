@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,6 +144,13 @@ type fakeUploader struct {
 	gotMCPTokenArgs  *upload.FetchMCPTokenArgs
 	gotRetryArgs     []upload.RetryStageArgs
 
+	// Scope-amendment refresh seam (#961): amendments is what
+	// FetchScopeAmendments returns; gotAmendmentArgs records the call
+	// so tests can assert the run-bound bearer is reused.
+	amendments       []upload.ScopeAmendment
+	amendmentsErr    error
+	gotAmendmentArgs *upload.FetchScopeAmendmentsArgs
+
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
 	promptResp *upload.FetchedPrompt
@@ -271,6 +280,18 @@ func (f *fakeUploader) FetchMCPToken(_ context.Context, args upload.FetchMCPToke
 		RunID:     args.RunID,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}, nil
+}
+
+// FetchScopeAmendments stubs the #961 mid-stage refresh endpoint.
+// Returns f.amendments verbatim; records the args so tests can assert
+// the runner reused the run-bound fhm_ bearer.
+func (f *fakeUploader) FetchScopeAmendments(_ context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error) {
+	a := args
+	f.gotAmendmentArgs = &a
+	if f.amendmentsErr != nil {
+		return nil, f.amendmentsErr
+	}
+	return f.amendments, nil
 }
 
 func (f *fakeUploader) RetryStage(_ context.Context, args upload.RetryStageArgs) error {
@@ -8009,4 +8030,218 @@ func countLines(t *testing.T, path string) int {
 		t.Fatal(err)
 	}
 	return strings.Count(string(b), "\n")
+}
+
+// --- #961 mid-stage scope-amendment refresh ---
+
+func amendmentCfg(scope ...upload.ScopeFile) *config {
+	return &config{
+		runID:      "run-abc",
+		stageID:    "stage-1",
+		scopeFiles: scope,
+	}
+}
+
+func TestRefreshScopeAmendments_FoldsApprovedOnly(t *testing.T) {
+	fake := newFakeUploader(t)
+	fake.amendments = []upload.ScopeAmendment{
+		{
+			ID: "a1", Status: "approved",
+			Paths: []upload.ScopeAmendmentPath{
+				{Path: "pkg/newfile.go", Operation: "create"},
+				{Path: "pkg/extra.go", Operation: "modify"},
+				{Path: "pkg/in_scope.go", Operation: "modify"}, // already declared — dedupe
+			},
+		},
+		{ID: "a2", Status: "pending", Paths: []upload.ScopeAmendmentPath{{Path: "pkg/pending.go", Operation: "modify"}}},
+		{ID: "a3", Status: "denied", Paths: []upload.ScopeAmendmentPath{{Path: "pkg/denied.go", Operation: "modify"}}},
+	}
+	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	var log bytes.Buffer
+
+	refreshScopeAmendments(context.Background(), fake, cfg, "fhm_heldbyrunner", &log)
+
+	if fake.gotAmendmentArgs == nil {
+		t.Fatal("FetchScopeAmendments never called")
+	}
+	if fake.gotAmendmentArgs.MCPToken != "fhm_heldbyrunner" {
+		t.Errorf("bearer = %q, want the retained fhm_ token", fake.gotAmendmentArgs.MCPToken)
+	}
+	if fake.gotAmendmentArgs.RunID != "run-abc" {
+		t.Errorf("run id = %q", fake.gotAmendmentArgs.RunID)
+	}
+	counts := map[string]int{}
+	for _, f := range cfg.scopeFiles {
+		counts[f.Path]++
+	}
+	for _, want := range []string{"pkg/in_scope.go", "pkg/newfile.go", "pkg/extra.go"} {
+		if counts[want] != 1 {
+			t.Errorf("scopeFiles[%q] = %d, want exactly 1; got %+v", want, counts[want], cfg.scopeFiles)
+		}
+	}
+	for _, never := range []string{"pkg/pending.go", "pkg/denied.go"} {
+		if counts[never] != 0 {
+			t.Errorf("scopeFiles must not fold %q (undecided/denied)", never)
+		}
+	}
+	if !strings.Contains(log.String(), "scope_amendments_folded") {
+		t.Errorf("log missing scope_amendments_folded event: %s", log.String())
+	}
+}
+
+func TestRefreshScopeAmendments_NoTokenOrEmptyScopeNoOps(t *testing.T) {
+	fake := newFakeUploader(t)
+	fake.amendments = []upload.ScopeAmendment{
+		{ID: "a1", Status: "approved", Paths: []upload.ScopeAmendmentPath{{Path: "x.go", Operation: "modify"}}},
+	}
+	var log bytes.Buffer
+
+	// No token → never calls the backend.
+	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	refreshScopeAmendments(context.Background(), fake, cfg, "", &log)
+	if fake.gotAmendmentArgs != nil {
+		t.Error("refresh called the backend without a token")
+	}
+	if len(cfg.scopeFiles) != 1 {
+		t.Errorf("scope changed: %+v", cfg.scopeFiles)
+	}
+
+	// Empty scope (git add -A fallback) → never narrows.
+	cfg = amendmentCfg()
+	refreshScopeAmendments(context.Background(), fake, cfg, "fhm_held", &log)
+	if fake.gotAmendmentArgs != nil {
+		t.Error("refresh called the backend on an empty scope")
+	}
+	if len(cfg.scopeFiles) != 0 {
+		t.Errorf("empty scope was augmented: %+v", cfg.scopeFiles)
+	}
+}
+
+func TestRefreshScopeAmendments_FetchErrorKeepsScope(t *testing.T) {
+	fake := newFakeUploader(t)
+	fake.amendmentsErr = errors.New("backend unreachable")
+	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	var log bytes.Buffer
+
+	refreshScopeAmendments(context.Background(), fake, cfg, "fhm_held", &log)
+
+	if len(cfg.scopeFiles) != 1 || cfg.scopeFiles[0].Path != "pkg/in_scope.go" {
+		t.Errorf("scope changed on fetch error: %+v", cfg.scopeFiles)
+	}
+	if !strings.Contains(log.String(), "scope_amendment_refresh_failed") {
+		t.Errorf("log missing scope_amendment_refresh_failed: %s", log.String())
+	}
+}
+
+// TestScopeAmendment_RunnerEndToEnd is the runner half of the #961
+// cross-boundary activation test (#618 rule). It serves the CANONICAL
+// GET /scope-amendments wire fixture (the same shape upload_test.go's
+// canonicalScopeAmendmentsJSON and the backend's
+// scopeAmendmentListResponse pin) from an httptest backend, drives the
+// REAL upload client decode -> refreshScopeAmendments fold -> a real
+// StageScoped in a temp git repo, and asserts the created-file gate's
+// inputs: the APPROVED create is staged (absent from drift/untracked)
+// while a NON-requested net-new file still surfaces as untracked drift
+// (the #818/#825 fail-loud contract).
+func TestScopeAmendment_RunnerEndToEnd(t *testing.T) {
+	const wire = `{
+  "items": [
+    {
+      "id": "0b54f9f3-0c83-4f6e-9c6e-1a54a3b1a001",
+      "run_id": "run-abc",
+      "stage_id": "0b54f9f3-0c83-4f6e-9c6e-1a54a3b1a002",
+      "paths": [
+        {"path": "pkg/extra.go", "operation": "modify"},
+        {"path": "pkg/newfile.go", "operation": "create"}
+      ],
+      "reason": "the seam needs these",
+      "status": "approved",
+      "decision_reason": "ok",
+      "decided_by": "github:operator",
+      "requested_at": "2026-06-10T12:00:00Z",
+      "decided_at": "2026-06-10T12:01:00Z"
+    },
+    {
+      "id": "0b54f9f3-0c83-4f6e-9c6e-1a54a3b1a003",
+      "run_id": "run-abc",
+      "stage_id": "0b54f9f3-0c83-4f6e-9c6e-1a54a3b1a002",
+      "paths": [{"path": "pkg/denied.go", "operation": "modify"}],
+      "reason": "nope",
+      "status": "denied",
+      "decision_reason": "out of bounds",
+      "decided_by": "github:operator",
+      "requested_at": "2026-06-10T12:02:00Z",
+      "decided_at": "2026-06-10T12:03:00Z"
+    }
+  ]
+}`
+	var gotAuth string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, wire)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	// Temp repo: pkg/in_scope.go and pkg/extra.go tracked at base.
+	repo, runGit := compileGateRepo(t)
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "pkg", "in_scope.go"), "package pkg // v1\n")
+	mustWrite(t, filepath.Join(repo, "pkg", "extra.go"), "package pkg // extra v1\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+
+	// The "agent" edits: declared file, amendment-approved modify,
+	// amendment-approved create, and one rogue net-new file no
+	// amendment ever requested.
+	mustWrite(t, filepath.Join(repo, "pkg", "in_scope.go"), "package pkg // v2\n")
+	mustWrite(t, filepath.Join(repo, "pkg", "extra.go"), "package pkg // extra v2\n")
+	mustWrite(t, filepath.Join(repo, "pkg", "newfile.go"), "package pkg // approved create\n")
+	mustWrite(t, filepath.Join(repo, "pkg", "rogue.go"), "package pkg // never requested\n")
+
+	// Real client against the httptest backend: decode + fold.
+	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	var log bytes.Buffer
+	refreshScopeAmendments(context.Background(), upload.New(srv.URL), cfg, "fhm_heldbyrunner", &log)
+
+	if gotAuth != "Bearer fhm_heldbyrunner" {
+		t.Fatalf("Authorization = %q, want the retained fhm_ bearer", gotAuth)
+	}
+
+	// The same StageScoped call the commit phase runs, fed the folded
+	// scope exactly as openPRAndShipArtifact derives it.
+	drift, err := (&gitops.Pusher{}).StageScoped(context.Background(), repo, scopePaths(cfg.scopeFiles))
+	if err != nil {
+		t.Fatalf("StageScoped: %v", err)
+	}
+	driftSet := map[string]bool{}
+	for _, d := range drift {
+		driftSet[d] = true
+	}
+	for _, staged := range []string{"pkg/in_scope.go", "pkg/extra.go", "pkg/newfile.go"} {
+		if driftSet[staged] {
+			t.Errorf("%s must be staged (folded scope), not drift; drift = %v", staged, drift)
+		}
+	}
+	if !driftSet["pkg/rogue.go"] {
+		t.Errorf("pkg/rogue.go must remain drift (never requested); drift = %v", drift)
+	}
+
+	// The created-out-of-scope gate's exact input: untracked drift.
+	// The approved create is staged so it never reaches the gate; the
+	// rogue file does — the fail-loud contract holds.
+	created, err := gitops.UntrackedPaths(context.Background(), repo, drift)
+	if err != nil {
+		t.Fatalf("UntrackedPaths: %v", err)
+	}
+	if len(created) != 1 || created[0] != "pkg/rogue.go" {
+		t.Errorf("created gate input = %v, want exactly [pkg/rogue.go]", created)
+	}
+	if !strings.Contains(log.String(), "scope_amendments_folded") {
+		t.Errorf("log missing scope_amendments_folded: %s", log.String())
+	}
 }

@@ -2352,3 +2352,37 @@ func TestBuild_Plan_QuarantineDeterministic(t *testing.T) {
 		t.Errorf("plan prompt not byte-identical across replays")
 	}
 }
+
+// TestBuild_ScopeAmendmentSection_ImplementOnly pins the #961 agent
+// protocol: the mid-stage scope amendment request/poll section renders
+// on the implement prompt only — plan and review agents have no scope
+// contract to amend.
+func TestBuild_ScopeAmendmentSection_ImplementOnly(t *testing.T) {
+	trig := Trigger{Source: "cli", Repo: "o/r"}
+
+	impl, err := Build("implement", trig)
+	if err != nil {
+		t.Fatalf("Build(implement): %v", err)
+	}
+	for _, want := range []string{
+		"### Mid-stage scope amendments",
+		"/scope-amendments",
+		"FISHHAWK_API_TOKEN",
+		"at most 2 amendment requests",
+		"NEVER edit or create a requested file before the approval lands",
+	} {
+		if !strings.Contains(impl, want) {
+			t.Errorf("implement prompt missing %q", want)
+		}
+	}
+
+	for _, stage := range []string{"plan", "plan_review", "implement_review"} {
+		out, err := Build(stage, trig)
+		if err != nil {
+			t.Fatalf("Build(%s): %v", stage, err)
+		}
+		if strings.Contains(out, "Mid-stage scope amendments") {
+			t.Errorf("%s prompt must not carry the scope-amendment section", stage)
+		}
+	}
+}

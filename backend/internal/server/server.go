@@ -30,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -153,6 +154,12 @@ type Config struct {
 	// the anonymous identity. The bearer-auth middleware routes
 	// to apitoken or mcptoken by inspecting the prefix.
 	MCPTokenRepo mcptoken.Repository
+
+	// ScopeAmendmentRepo persists the mid-stage operator-gated
+	// scope amendment requests an implement agent files while its
+	// stage runs (E22.X / #961). Wired by the /v0/runs/{id}/
+	// scope-amendments handlers; nil leaves them returning 503.
+	ScopeAmendmentRepo scopeamendment.Repository
 
 	// AuthRepo persists users + sessions for the OAuth
 	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil

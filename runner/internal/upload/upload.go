@@ -947,6 +947,90 @@ func (c *Client) FetchMCPToken(ctx context.Context, args FetchMCPTokenArgs) (*Fe
 	}
 }
 
+// FetchScopeAmendmentsArgs collects the inputs for FetchScopeAmendments.
+// MCPToken is the run-bound fhm_ bearer FetchMCPToken returned — the
+// SAME token the agent's poll loop uses, so the backend has exactly one
+// agent-side auth path for the amendment surface (#961). No signing
+// key: the GET has no body to sign under the Ed25519 scheme.
+type FetchScopeAmendmentsArgs struct {
+	RunID    string
+	MCPToken string
+}
+
+// ScopeAmendmentPath is one requested path + operation inside a
+// ScopeAmendment. Operation is "modify" or "create".
+type ScopeAmendmentPath struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+}
+
+// ScopeAmendment is one amendment row as the backend's GET
+// /v0/runs/{run_id}/scope-amendments returns it. Status is
+// pending|approved|denied; only approved rows fold into the runner's
+// pre-commit scope refresh.
+type ScopeAmendment struct {
+	ID             string               `json:"id"`
+	RunID          string               `json:"run_id"`
+	StageID        string               `json:"stage_id"`
+	Paths          []ScopeAmendmentPath `json:"paths"`
+	Reason         string               `json:"reason"`
+	Status         string               `json:"status"`
+	DecisionReason string               `json:"decision_reason,omitempty"`
+	DecidedBy      string               `json:"decided_by,omitempty"`
+}
+
+// fetchScopeAmendmentsResponse is the GET list envelope.
+type fetchScopeAmendmentsResponse struct {
+	Items []ScopeAmendment `json:"items"`
+}
+
+// FetchScopeAmendments calls GET /v0/runs/{run_id}/scope-amendments
+// (E22.X / #961) bearing the run-bound MCP token and returns every
+// amendment for the run. The caller filters to approved rows and folds
+// their paths into the scope set BEFORE StageScoped runs, so the #960
+// verified-tree gates verify the same folded tree that is pushed.
+//
+// Single-attempt: the refresh is best-effort (ADR-021 degradation) —
+// on failure the caller proceeds with the unamended scope and the
+// #818/#825 gates still fail loud on any undeclared created file.
+func (c *Client) FetchScopeAmendments(ctx context.Context, args FetchScopeAmendmentsArgs) ([]ScopeAmendment, error) {
+	if args.RunID == "" {
+		return nil, errors.New("upload: run_id required")
+	}
+	if args.MCPToken == "" {
+		return nil, errors.New("upload: mcp token required")
+	}
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/scope-amendments",
+		c.BaseURL, url.PathEscape(args.RunID))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("upload: build scope-amendments request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+args.MCPToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upload: fetch scope amendments: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var out fetchScopeAmendmentsResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return nil, fmt.Errorf("upload: decode scope-amendments response: %w", err)
+		}
+		return out.Items, nil
+	case http.StatusNotFound:
+		return nil, ErrNotFound
+	default:
+		return nil, statusError("fetch scope amendments", resp)
+	}
+}
+
 // FetchInstallationTokenArgs collects the inputs for FetchInstallationToken.
 type FetchInstallationTokenArgs struct {
 	RunID      string

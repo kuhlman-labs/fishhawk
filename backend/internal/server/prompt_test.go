@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 )
 
 // promptRunRepo is a run.Repository fake that supports GetStage +
@@ -3285,4 +3286,183 @@ func TestAddScopeFiles_DoesNotBypassForbiddenPathsGate(t *testing.T) {
 	if violations[0].Constraint != "forbidden_paths" {
 		t.Errorf("violation = %q, want forbidden_paths", violations[0].Constraint)
 	}
+}
+
+// TestGetStagePrompt_Implement_ApprovedScopeAmendmentsFolded crosses the
+// prompt-side half of the #961 activation path: persisted scope_amendments
+// rows -> resolveApprovedScopeAmendments -> mergeApprovedScopeAmendments ->
+// promptResponse.ScopeFiles. Only APPROVED rows fold; pending and denied
+// rows confer nothing; paths already in scope dedupe by path; an empty
+// (plan-missing) scope stays empty.
+func TestGetStagePrompt_Implement_ApprovedScopeAmendmentsFolded(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+
+	seedAmendments := func(sa *fakeScopeAmendmentRepo, runID, stageID uuid.UUID) {
+		approve := func(id uuid.UUID) {
+			if _, err := sa.Decide(context.Background(), scopeamendment.DecideParams{
+				ID: id, Status: scopeamendment.StatusApproved, Reason: "ok", DecidedBy: "github:operator",
+			}); err != nil {
+				t.Fatalf("approve: %v", err)
+			}
+		}
+		// Approved: one net-new file, one modify, plus the already-
+		// declared plan file (dedupe check).
+		a, err := sa.Create(context.Background(), scopeamendment.CreateParams{
+			RunID: runID, StageID: stageID,
+			Paths: []scopeamendment.PathEntry{
+				{Path: "backend/internal/server/newfile.go", Operation: scopeamendment.OperationCreate},
+				{Path: "docs/extra.md", Operation: scopeamendment.OperationModify},
+				{Path: plannedFile, Operation: scopeamendment.OperationModify},
+			},
+			Reason: "seam",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		approve(a.ID)
+		// Pending: must NOT fold.
+		if _, err := sa.Create(context.Background(), scopeamendment.CreateParams{
+			RunID: runID, StageID: stageID,
+			Paths:  []scopeamendment.PathEntry{{Path: "pending/never.go", Operation: scopeamendment.OperationModify}},
+			Reason: "pending",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Denied: must NOT fold.
+		d, err := sa.Create(context.Background(), scopeamendment.CreateParams{
+			RunID: runID, StageID: stageID,
+			Paths:  []scopeamendment.PathEntry{{Path: "denied/never.go", Operation: scopeamendment.OperationModify}},
+			Reason: "denied",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sa.Decide(context.Background(), scopeamendment.DecideParams{
+			ID: d.ID, Status: scopeamendment.StatusDenied, Reason: "no", DecidedBy: "github:operator",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("approved paths folded, pending and denied excluded, deduped", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+		sa := newFakeScopeAmendmentRepo()
+
+		runID := uuid.New()
+		planStageID := uuid.New()
+		implStageID := uuid.New()
+
+		p := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "scoped plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+			},
+		}
+		planBytes, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       planStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		seedAmendments(sa, runID, implStageID)
+
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:               "127.0.0.1:0",
+			RunRepo:            rr,
+			SigningRepo:        sf,
+			ArtifactRepo:       art,
+			ScopeAmendmentRepo: sa,
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		counts := map[string]int{}
+		for _, f := range resp.ScopeFiles {
+			counts[f.Path]++
+		}
+		for _, want := range []string{plannedFile, "backend/internal/server/newfile.go", "docs/extra.md"} {
+			if counts[want] != 1 {
+				t.Errorf("ScopeFiles[%q] count = %d, want exactly 1; got %#v", want, counts[want], resp.ScopeFiles)
+			}
+		}
+		for _, never := range []string{"pending/never.go", "denied/never.go"} {
+			if counts[never] != 0 {
+				t.Errorf("ScopeFiles must not contain %q (undecided/denied)", never)
+			}
+		}
+	})
+
+	t.Run("plan-missing run is not augmented", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+		sa := newFakeScopeAmendmentRepo()
+
+		runID := uuid.New()
+		implStageID := uuid.New()
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {}}
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		seedAmendments(sa, runID, implStageID)
+
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:               "127.0.0.1:0",
+			RunRepo:            rr,
+			SigningRepo:        sf,
+			ArtifactRepo:       art,
+			ScopeAmendmentRepo: sa,
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.ScopeFiles != nil {
+			t.Errorf("plan-missing run must keep empty scope (git add -A fallback), got %#v", resp.ScopeFiles)
+		}
+	})
 }

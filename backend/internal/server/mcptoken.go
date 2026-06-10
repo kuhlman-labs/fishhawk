@@ -105,6 +105,15 @@ func (s *Server) handleIssueMCPToken(w http.ResponseWriter, r *http.Request) {
 	if agentSelfRetry := s.resolveAgentSelfRetry(r, runRow); agentSelfRetry {
 		scopes = append(scopes, "write:retries")
 	}
+	// Implement-stage tokens always carry write:scope-amendments
+	// (E22.X / #961) — UNCONDITIONALLY, independent of the
+	// agent_self_retry conditional above — so the implement agent
+	// can file mid-stage scope amendment requests. The scope only
+	// admits requesting: the decision endpoint requires write:stages
+	// and rejects run-bound tokens outright.
+	if s.resolveExecutingStageType(r, runRow) == run.StageTypeImplement {
+		scopes = append(scopes, "write:scope-amendments")
+	}
 
 	tok, err := s.cfg.MCPTokenRepo.Issue(r.Context(), mcptoken.IssueParams{
 		RunID:  runRow.ID,
@@ -209,6 +218,31 @@ func (s *Server) writeMCPTokenIssuedAudit(r *http.Request, runID uuid.UUID, tok 
 			slog.String("token_id", tok.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// resolveExecutingStageType returns the type of the run's currently
+// dispatched/running stage, or "" when none is resolvable. Unlike
+// resolveAgentSelfRetry it needs no workflow spec — the stage row's
+// own type is the signal — so the write:scope-amendments grant is
+// independent of spec parseability.
+func (s *Server) resolveExecutingStageType(r *http.Request, runRow *run.Run) run.StageType {
+	if s.cfg.RunRepo == nil {
+		return ""
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), runRow.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"list stages for mcp token stage type failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return ""
+	}
+	for _, st := range stages {
+		if st.State == run.StageStateDispatched || st.State == run.StageStateRunning {
+			return st.Type
+		}
+	}
+	return ""
 }
 
 // resolveAgentSelfRetry looks up the active stage for runRow and

@@ -131,6 +131,59 @@ components:
       type: string
       format: uuid
 
+    ScopeAmendment:
+      type: object
+      description: |
+        One mid-stage scope amendment request (E22.X / #961): the
+        implement agent's ask to fold specific file paths into the
+        stage's effective `scope.files` while the stage is running,
+        plus the operator's decision once made. Approved paths fold
+        into the prompt-fetch scope AND the runner's pre-commit scope
+        refresh, so the verified-tree gates verify the same folded
+        tree that is pushed (#960). Denied/pending paths confer
+        nothing; any undeclared created file still fails category-B
+        (#818/#825).
+      required: [id, run_id, stage_id, paths, reason, status, requested_at]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        run_id: { $ref: '#/components/schemas/UUID' }
+        stage_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: The executing implement stage the request hangs off.
+        paths:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [path, operation]
+            properties:
+              path:
+                type: string
+                description: |
+                  Repo-relative path. Absolute paths and `..` segments
+                  are rejected (400 `validation_failed`).
+              operation:
+                type: string
+                enum: [modify, create]
+        reason:
+          type: string
+          description: The agent's rationale for needing the paths.
+        status:
+          type: string
+          enum: [pending, approved, denied]
+        decision_reason:
+          type: string
+          description: Operator note; delivered to the agent verbatim on deny.
+        decided_by:
+          type: string
+          description: Operator subject (never a run-bound token).
+        requested_at:
+          type: string
+          format: date-time
+        decided_at:
+          type: string
+          format: date-time
+
     Run:
       type: object
       description: |
@@ -3269,6 +3322,246 @@ paths:
             The backend doesn't have the MCP token / run / signing
             repositories wired (dev backends running without the
             full set).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/scope-amendments:
+    post:
+      operationId: requestScopeAmendment
+      summary: Request a mid-stage scope amendment (implement agent)
+      description: |
+        Files an operator-gated request to fold specific file paths
+        into the executing implement stage's effective `scope.files`
+        (E22.X / #961). The agent uses this instead of editing an
+        undeclared file — the runner drops undeclared edits from the
+        commit and fails category-B on undeclared created files
+        (#818/#825).
+
+        **Auth: run-bound `fhm_` bearer ONLY**, carrying the
+        `write:scope-amendments` scope (granted unconditionally to
+        implement-stage MCP tokens at issue). The path `run_id` must
+        equal the token's run — a cross-run request is 403
+        (`cross_run_scope_amendment`). Operator tokens/sessions are
+        rejected (403 `agent_token_required`): operators decide,
+        they don't request. The run's currently-executing stage must
+        be an implement stage (409 `stage_not_implement` otherwise).
+
+        Budget: at most **2 requests per stage**, counted on rows so
+        a denied request still consumes budget (the cap bounds
+        operator interruptions, not approvals). Over budget → 422
+        `amendment_budget_exhausted` with `{max, used}` details.
+
+        The request lands as a `scope_amendment_requested` audit
+        entry on the stage (`{amendment_id, paths, reason,
+        remaining_budget}`) — the operator's `fishhawk_await_audit`
+        anchor. Delivery is poll-based: the agent polls the GET
+        until the status leaves `pending` (bounded ~5 minutes).
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paths, reason]
+              properties:
+                paths:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [path, operation]
+                    properties:
+                      path: { type: string }
+                      operation: { type: string, enum: [modify, create] }
+                reason:
+                  type: string
+                  description: Why each path must change. Required, non-empty.
+      responses:
+        '201':
+          description: Amendment request created (status `pending`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScopeAmendment' }
+        '400':
+          description: |
+            Malformed run_id, invalid paths (absolute / `..` /
+            unknown operation / empty), or empty reason.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `agent_token_required` (caller is not a run-bound token),
+            `insufficient_scope` (token lacks
+            `write:scope-amendments`), or
+            `cross_run_scope_amendment` (token bound to a different
+            run).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `stage_not_implement` — no implement stage is currently
+            executing on the run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `amendment_budget_exhausted` — the per-stage cap of 2 is
+            spent. Details carry `{max, used}`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Scope-amendment repositories not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      operationId: listScopeAmendments
+      summary: List a run's scope amendments
+      description: |
+        Returns every scope amendment for the run, oldest first
+        (E22.X / #961).
+
+        **Auth: EITHER** the run-bound `fhm_` bearer with `mcp:read`
+        — the implement agent's poll loop and the runner's pre-commit
+        refresh both reuse the token the runner fetched at stage
+        start, with the same path-`run_id` == token-run binding as
+        the POST (cross-run → 403 `cross_run_scope_amendment`) —
+        **OR** an operator bearer/session (not run-bound). Anonymous
+        callers get 401.
+      tags: [runner, runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The run's amendments, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ScopeAmendment' }
+        '400':
+          description: run_id is malformed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `insufficient_scope` (run-bound token lacks `mcp:read`)
+            or `cross_run_scope_amendment` (run-bound token reading
+            another run's amendments).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Scope-amendment repository not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision:
+    post:
+      operationId: decideScopeAmendment
+      summary: Approve or deny a scope amendment (operator)
+      description: |
+        Records the operator's decision on a pending scope amendment
+        (E22.X / #961) and appends the `scope_amendment_decided`
+        audit entry (`{amendment_id, decision, reason, decided_by}`).
+
+        **Auth: operator bearer/session ONLY** — bearer tokens
+        require `write:stages`. Run-bound `fhm_` tokens are rejected
+        outright (403 `self_decision`): the requesting agent's token
+        holds `write:scope-amendments` and must never decide its own
+        request. Implement-stage tokens are never issued
+        `write:stages`, so the run-bound rejection is defense in
+        depth.
+
+        On approve, the paths fold into the stage's effective
+        `scope.files` at the next prompt fetch AND the runner's
+        pre-commit refresh. Already-decided amendments return 409
+        (`amendment_already_decided`) — decisions are immutable.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: amendment_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approve, deny]
+                reason:
+                  type: string
+                  description: |
+                    Operator note; delivered to the agent verbatim on
+                    deny (`decision_reason`), recorded on the audit
+                    entry either way.
+      responses:
+        '200':
+          description: The decided amendment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScopeAmendment' }
+        '400':
+          description: Malformed UUIDs or decision not approve/deny.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `self_decision` (run-bound agent token) or
+            `insufficient_scope` (token lacks `write:stages`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `amendment_not_found` — unknown amendment id, or the
+            amendment belongs to a different run than the path names.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `amendment_already_decided` — decisions are immutable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Scope-amendment repositories not wired.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

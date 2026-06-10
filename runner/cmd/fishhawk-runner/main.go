@@ -84,6 +84,7 @@ type uploadClient interface {
 	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
 	FetchInstallationToken(ctx context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error)
 	FetchMCPToken(ctx context.Context, args upload.FetchMCPTokenArgs) (*upload.FetchMCPTokenResult, error)
+	FetchScopeAmendments(ctx context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error)
 	RetryStage(ctx context.Context, args upload.RetryStageArgs) error
 }
 
@@ -367,6 +368,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// fetch fails we log and continue. The agent loses Fishhawk
 	// MCP awareness but the run still produces a valid trace /
 	// plan / PR per the rest of the stage flow.
+	//
+	// mcpBearerToken retains the run-bound fhm_ bearer for the
+	// pre-commit scope-amendment refresh (E22.X / #961) — the runner
+	// reuses the SAME token the agent's poll loop holds, keeping one
+	// agent-side auth path on the amendment surface. Empty when the
+	// fetch failed or never ran; the refresh then skips and the
+	// original scope stays authoritative.
+	mcpBearerToken := ""
 	if issuedKey != nil {
 		mcpTok, err := client.FetchMCPToken(ctx, upload.FetchMCPTokenArgs{
 			RunID:      cfg.runID,
@@ -379,6 +388,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		} else {
 			inv.Env["FISHHAWK_API_TOKEN"] = mcpTok.Token
 			inv.Env["FISHHAWK_BACKEND_URL"] = cfg.backendURL
+			mcpBearerToken = mcpTok.Token
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"mcp_token_issued","run_id":%q,"token_id":%q,"expires_at":%q}`+"\n",
 				cfg.runID, mcpTok.TokenID, mcpTok.ExpiresAt.Format(time.RFC3339))
@@ -647,6 +657,21 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				cfg.runID, cfg.stageID, retryErr.Error())
 		}
 		break
+	}
+
+	// Mid-stage scope-amendment refresh (E22.X / #961). Immediately before
+	// the commit phase — and crucially BEFORE the committed-tree verify
+	// gates and every StageScoped call below — fetch the run's scope
+	// amendments with the retained fhm_ bearer and fold APPROVED paths
+	// into cfg.scopeFiles. Every downstream consumer (runVerifyFixLoop,
+	// runVerifyGateCommitted, gateScopeFiles, CommitAndPush.ScopeFiles)
+	// derives from cfg.scopeFiles, so the #960 invariant holds: the gates
+	// verify the same folded tree that is pushed, and the #818/#825
+	// created-out-of-scope gate honors approved creates while staying
+	// fail-loud for anything NOT requested. Best-effort (ADR-021): a
+	// refresh failure logs and proceeds with the unamended scope.
+	if res.OK && stageType == "implement" && !cfg.noPR {
+		refreshScopeAmendments(ctx, client, &cfg, mcpBearerToken, logSink)
 	}
 
 	// Committed-tree verify-fix loop (#651). On the implement push path,
@@ -3566,6 +3591,65 @@ func writeScopeHandoff(files []upload.ScopeFile, logSink io.Writer) {
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"scope_handoff_written","path":%q,"file_count":%d}`+"\n",
 		scopeHandoffPath, len(files))
+}
+
+// refreshScopeAmendments fetches the run's scope amendments with the
+// retained run-bound fhm_ bearer (mcpToken, from the FetchMCPToken
+// call that fed the agent's FISHHAWK_API_TOKEN env) and folds the
+// paths of every APPROVED amendment into cfg.scopeFiles, deduped by
+// path (E22.X / #961). Called once, after the agent invocation settles
+// and BEFORE any committed-tree gate or StageScoped call reads
+// cfg.scopeFiles, so the verify gates and the push see the same folded
+// tree (#960 invariant) and the #818/#825 created-out-of-scope gate
+// honors approved creates.
+//
+// No-ops when the token is absent (fetch failed / never ran) or when
+// the scope is empty — an empty scope is the `git add -A` fallback,
+// which already stages everything; folding would silently NARROW the
+// commit to just the amendment paths. Best-effort throughout: a fetch
+// failure logs scope_amendment_refresh_failed and the original scope
+// stays authoritative.
+func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *config, mcpToken string, logSink io.Writer) {
+	if client == nil || mcpToken == "" || len(cfg.scopeFiles) == 0 {
+		return
+	}
+	items, err := client.FetchScopeAmendments(ctx, upload.FetchScopeAmendmentsArgs{
+		RunID:    cfg.runID,
+		MCPToken: mcpToken,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_amendment_refresh_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, err.Error())
+		return
+	}
+	existing := make(map[string]struct{}, len(cfg.scopeFiles))
+	for _, f := range cfg.scopeFiles {
+		existing[f.Path] = struct{}{}
+	}
+	var added []string
+	for _, a := range items {
+		if a.Status != "approved" {
+			continue
+		}
+		for _, p := range a.Paths {
+			if p.Path == "" {
+				continue
+			}
+			if _, ok := existing[p.Path]; ok {
+				continue
+			}
+			existing[p.Path] = struct{}{}
+			cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile(p))
+			added = append(added, p.Path)
+		}
+	}
+	if len(added) > 0 {
+		addedJSON, _ := json.Marshal(added)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_amendments_folded","run_id":%q,"stage_id":%q,"added":%s}`+"\n",
+			cfg.runID, cfg.stageID, addedJSON)
+	}
 }
 
 // scopePaths extracts the repo-relative path list from the resolved
