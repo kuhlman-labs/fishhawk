@@ -6590,6 +6590,58 @@ func TestVerifyCommittedTreeCompiles_CompileFailureBlocks(t *testing.T) {
 	}
 }
 
+// TestVerifyCommittedTreeCompiles_UnknownFieldDiagnosticBlocks is the
+// #959 end-to-end seam: the exact misclassified run-07bce059 class — an
+// unknown-field struct-literal typecheck error in a _test.go file,
+// whose message is outside compileDiagnosticMarkers — must block via
+// goDiagnosticBlocks. It runs the real `go vet` against a broken
+// committed tree, so it pins the live `vet: file:line:col:` output
+// shape rather than a transcript assumption; if the toolchain's output
+// shape ever stops matching goDiagnosticLine, this fails.
+func TestVerifyCommittedTreeCompiles_UnknownFieldDiagnosticBlocks(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	// The committed Config lacks the Retries field the test sets — the
+	// `unknown field ... in struct literal of type ...` diagnostic, in a
+	// _test.go file so only `go vet` (not `go build`) catches it.
+	mustWrite(t, filepath.Join(repo, "mod", "config.go"),
+		"package mod\n\ntype Config struct{ Name string }\n")
+	mustWrite(t, filepath.Join(repo, "mod", "config_test.go"),
+		"package mod\n\nvar _ = Config{Retries: 3}\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "scope-only commit missing the Retries field")
+	head := gitHead(t, repo)
+
+	// Working-tree drift: add the field on disk (uncommitted), so the
+	// working tree compiles while the committed tree does not.
+	mustWrite(t, filepath.Join(repo, "mod", "config.go"),
+		"package mod\n\ntype Config struct {\n\tName    string\n\tRetries int\n}\n")
+	vet := exec.Command("go", "vet", "./...")
+	vet.Dir = filepath.Join(repo, "mod")
+	if out, err := vet.CombinedOutput(); err != nil {
+		t.Fatalf("working tree should compile, but go vet failed: %v\n%s", err, out)
+	}
+
+	var log bytes.Buffer
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"mod/config.go"}, []string{"mod/config.go"}, &log)
+	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) {
+		t.Fatalf("err = %v, want ErrCommitWouldNotCompile (unknown-field diagnostic must block, #959)\nlog: %s", err, log.String())
+	}
+	if !strings.Contains(err.Error(), "unknown field") {
+		t.Errorf("error should carry the live vet diagnostic: %v", err)
+	}
+}
+
 // TestVerifyCommittedTreeCompiles_DepResolutionFailureSkips: a `go vet`
 // non-zero exit caused by an unresolvable dependency (offline) is NOT a
 // compile/typecheck diagnostic, so it must skip (non-blocking) rather
@@ -6657,6 +6709,98 @@ func TestLooksLikeCompileError(t *testing.T) {
 			t.Errorf("looksLikeCompileError(%q) = true, want false", s)
 		}
 	}
+	// #959: messages outside the marker list but carrying a clean
+	// file:line:col diagnostic line block via the combined gate condition
+	// (looksLikeCompileError backstop OR goDiagnosticBlocks primary) — the
+	// exact diagnostic the marker allowlist missed on run 07bce059.
+	combined := []string{
+		"vet: internal/server/trace_test.go:2381:3: unknown field PlanReviewer in struct literal of type Config",
+	}
+	for _, s := range combined {
+		if !looksLikeCompileError(s) && !goDiagnosticBlocks(s) {
+			t.Errorf("combined classifier (looksLikeCompileError || goDiagnosticBlocks)(%q) = false, want true", s)
+		}
+	}
+}
+
+// goTestBuildFailedOutput959 is the verbatim `go test` output from run
+// 07bce059 (#959): a clean compiler diagnostic plus `FAIL <pkg> [build
+// failed]`. The test phase previously skipped this as infra
+// (test_nonzero_non_failure); it is a definitive compile failure of the
+// tree being pushed and must block.
+const goTestBuildFailedOutput959 = `# github.com/kuhlman-labs/fishhawk/backend/internal/server [github.com/kuhlman-labs/fishhawk/backend/internal/server.test]
+internal/server/trace_test.go:2408:74: cannot use 1 (untyped int constant) as []reviewerInvocation value in struct literal
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/server [build failed]
+FAIL`
+
+// TestGoDiagnosticBlocks covers the #959 primary classifier: block on
+// any clean Go compiler/typecheck diagnostic line (file:line:col,
+// optional `vet: ` prefix) unless every such line is a recognized
+// dependency-resolution form. The two verbatim run-07bce059 outputs are
+// pinned as blocking; dep-resolution forms (which print in the SAME
+// file:line:col shape under GOPROXY=off), bare [build failed]/[setup
+// failed] with no diagnostic, go-test log lines (file:line:, no
+// column), and exec/OOM noise must not block.
+func TestGoDiagnosticBlocks(t *testing.T) {
+	block := []struct{ name, output string }{
+		{"verbatim #959 vet unknown-field diagnostic",
+			"vet: internal/server/trace_test.go:2381:3: unknown field PlanReviewer in struct literal of type Config"},
+		{"verbatim #959 go test build-failed with diagnostic", goTestBuildFailedOutput959},
+		{"bare diagnostic without vet prefix", "./x.go:3:9: undefined: Bar"},
+		// Deliberate #959 behavior change: a vet ANALYZER finding (plain
+		// file:line:col under a `# pkg` header) now blocks — CI's
+		// golangci-lint bundles govet so the PR would red-line anyway, and
+		// a block routes to verify_fix_reinvoke, not a dead stage.
+		{"vet analyzer finding", "# example.com/moda\n./a.go:5:14: fmt.Printf format %d has arg \"x\" of wrong type string"},
+	}
+	for _, tt := range block {
+		t.Run(tt.name, func(t *testing.T) {
+			if !goDiagnosticBlocks(tt.output) {
+				t.Errorf("goDiagnosticBlocks(...) = false, want true\noutput:\n%s", tt.output)
+			}
+		})
+	}
+	skip := []struct{ name, output string }{
+		{"dep resolution in diagnostic shape (GOPROXY=off)",
+			"use_test.go:6:2: no required module provides package example.com/totally/absent/pkg; to add it:\n\tgo get example.com/totally/absent/pkg"},
+		{"missing go.sum entry in diagnostic shape",
+			"x.go:5:2: missing go.sum entry for module providing package example.com/y"},
+		{"bare build-failed with no diagnostic line", "FAIL\texample.com/mod [build failed]\nFAIL"},
+		{"setup failed", "FAIL\texample.com/mod [setup failed]\nFAIL"},
+		{"go test log line has no column", "--- FAIL: TestGet (0.00s)\n    reg_test.go:7: Get(x) = 0, want 42\nFAIL"},
+		{"exec noise", "fork/exec /usr/local/go/pkg/tool/darwin_arm64/vet: cannot allocate memory"},
+		{"empty output", ""},
+	}
+	for _, tt := range skip {
+		t.Run(tt.name, func(t *testing.T) {
+			if goDiagnosticBlocks(tt.output) {
+				t.Errorf("goDiagnosticBlocks(...) = true, want false\noutput:\n%s", tt.output)
+			}
+		})
+	}
+}
+
+// TestGoDiagnosticBlocks_FlakeAbsorbOrdering pins the #972/#959
+// classification ordering (approval condition): a testcontainers
+// container-start-timeout output must route to the infra-flake absorb
+// (isTestcontainersStartFlake, checked FIRST in both committed-tree
+// verify gates), never to the #959 failure classification — the flake
+// outputs carry go-test log lines (file:line:, no column), so
+// goDiagnosticBlocks must not match them.
+func TestGoDiagnosticBlocks_FlakeAbsorbOrdering(t *testing.T) {
+	for _, tt := range []struct{ name, output string }{
+		{"verbatim #972 approval-package failure", flakeOutputApproval},
+		{"verbatim #972 audit-package failure", flakeOutputAudit},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if !isTestcontainersStartFlake(tt.output) {
+				t.Errorf("isTestcontainersStartFlake(...) = false, want true (flake retry must claim this output)")
+			}
+			if goDiagnosticBlocks(tt.output) {
+				t.Errorf("goDiagnosticBlocks(...) = true, want false (testcontainers flake must route to the #972 absorb, not the #959 classification)")
+			}
+		})
+	}
 }
 
 // TestRun_ImplementStage_CompileGateFailure_CategoryB confirms the #728
@@ -6721,11 +6865,13 @@ func TestRun_ImplementStage_CompileGateFailure_CategoryB(t *testing.T) {
 }
 
 // TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater
-// guards the per-module loop continuation: a non-compile `go vet` failure
-// in an EARLIER module (here a Printf analyzer finding) must not abandon
-// the gate — a genuine build-required-drift compile error in a LATER
-// module must still be caught. (Regression: an earlier `return nil` on
-// the non-compile skip would have returned before reaching modb.)
+// guards the per-module loop continuation: a non-blocking `go vet`
+// failure in an EARLIER module (here a dependency-resolution failure —
+// since #959 the only still-skipping diagnostic-shaped class; an
+// analyzer finding now blocks) must not abandon the gate — a genuine
+// build-required-drift compile error in a LATER module must still be
+// caught. (Regression: an earlier `return nil` on the non-blocking skip
+// would have returned before reaching modb.)
 func TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go not available")
@@ -6733,6 +6879,8 @@ func TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater(t *tes
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Setenv("GOPROXY", "off")
+
 	repo, runGit := compileGateRepo(t)
 	// moda is iterated first (go work edit -json preserves use order).
 	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./moda\nuse ./modb\n")
@@ -6742,27 +6890,27 @@ func TestVerifyCommittedTreeCompiles_NonCompileVetFailureDoesNotMaskLater(t *tes
 		}
 		mustWrite(t, filepath.Join(repo, m, "go.mod"), "module example.com/"+m+"\n\ngo 1.21\n")
 	}
-	// moda: compiles, but `go vet` flags a Printf format mismatch (non-zero
-	// exit, NOT a compile/typecheck diagnostic → non-blocking skip).
+	// moda: imports an unavailable dependency (GOPROXY=off), so `go vet`
+	// exits non-zero with a dep-resolution diagnostic → non-blocking skip.
 	mustWrite(t, filepath.Join(repo, "moda", "a.go"),
-		"package moda\n\nimport \"fmt\"\n\nfunc Bad() { fmt.Printf(\"%d\\n\", \"x\") }\n")
+		"package moda\n\nimport _ \"example.com/totally/absent/pkg\"\n")
 	// modb: the interface-ripple compile error in a _test.go file.
 	mustWrite(t, filepath.Join(repo, "modb", "doer.go"),
 		"package modb\n\ntype Doer interface{ Do() }\n\ntype impl struct{}\n")
 	mustWrite(t, filepath.Join(repo, "modb", "doer_test.go"),
 		"package modb\n\nvar _ Doer = impl{}\n")
 	runGit("add", "-A")
-	runGit("commit", "-m", "moda vet-warns; modb missing Do()")
+	runGit("commit", "-m", "moda dep-resolution failure; modb missing Do()")
 	head := gitHead(t, repo)
 
 	var log bytes.Buffer
 	err := verifyCommittedTreeCompiles(context.Background(), repo, head, []string{"modb/doer.go"}, []string{"modb/doer.go"}, &log)
 	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) {
-		t.Fatalf("err = %v, want ErrCommitWouldNotCompile (modb compile error must be caught despite moda vet warning)\nlog: %s", err, log.String())
+		t.Fatalf("err = %v, want ErrCommitWouldNotCompile (modb compile error must be caught despite moda's dep-resolution skip)\nlog: %s", err, log.String())
 	}
-	// moda's non-compile failure should have been logged as a skip.
+	// moda's dep-resolution failure should have been logged as a skip.
 	if !strings.Contains(log.String(), "vet_nonzero_non_compile") {
-		t.Errorf("expected moda's non-compile vet failure to log a skip; log: %s", log.String())
+		t.Errorf("expected moda's dep-resolution vet failure to log a skip; log: %s", log.String())
 	}
 }
 
