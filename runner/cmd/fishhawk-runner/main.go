@@ -715,8 +715,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// !noPR && maxIter==0; fix loop = implement && !noPR && maxIter>0.
 	if res.OK && stageType == "implement" && !cfg.noPR &&
 		cfg.verifyCmd != "" && cfg.verifyMaxIterations == 0 {
-		ev, tree, demote := runVerifyGateCommitted(ctx, cfg, logSink)
-		res.Events = append(res.Events, ev)
+		evs, tree, demote := runVerifyGateCommitted(ctx, cfg, logSink)
+		res.Events = append(res.Events, evs...)
 		verifiedTreeSHA = tree
 		if demote != nil {
 			res.OK = false
@@ -1759,6 +1759,41 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 // the existing non-blocking skip path (verify_fix_skipped), never category-A.
 const maxFixInvokeInfraRetries = 2
 
+// isTestcontainersStartFlake reports whether a failed verify's output matches
+// the testcontainers container-start-timeout signature (#972): under
+// full-suite parallel load a developer-Mac Docker daemon intermittently times
+// out starting a Postgres container, failing one unlucky package with
+// "... wait until ready: mapped port: check target: retries: 9 ... context
+// deadline exceeded" against docker.sock — load contention, not a code bug.
+// Both committed-tree gates use this to re-run the verify ONCE in place
+// (without invoking the fix agent and without consuming a fix iteration)
+// before the normal failure path resumes.
+//
+// The matcher is deliberately conservative: it requires the generic
+// "context deadline exceeded" AND at least one container-start marker, so an
+// ordinary Go test failure that merely mentions a deadline never matches.
+// Matching is on testcontainers-go error text and can drift across library
+// upgrades; failure is safe in both directions (a missed match degrades to
+// today's fail-the-stage behavior, a false positive costs exactly one extra
+// verify run). The table test pins both verbatim #972 outputs.
+func isTestcontainersStartFlake(output string) bool {
+	if !strings.Contains(output, "context deadline exceeded") {
+		return false
+	}
+	for _, marker := range []string{
+		"/var/run/docker.sock",
+		"%2Fvar%2Frun%2Fdocker.sock", // URL-escaped socket path inside the client's GET error
+		"failed to start container",
+		"mapped port",
+		"wait until ready",
+	} {
+		if strings.Contains(output, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // runVerifyFixLoop is the committed-tree verify-fix loop (#651). It runs
 // ONLY on the implement push path with executor.verify.max_iterations > 0
 // (the caller gates that). Per iteration it:
@@ -1830,6 +1865,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		verifiedTreeSHA string // set only on a passing iteration's real verify (#960)
 		lastIterErr     error  // non-nil only on a PRE-commit infra failure → non-blocking skip
 		fatalErr        error  // non-nil on a POST-commit reset failure (#816) or a passed-but-unresolvable verified tree (#960) → hard abort
+		flakeRetried    bool   // once-per-stage testcontainers infra-flake absorb (#972) already spent
 	)
 
 	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
@@ -1909,6 +1945,37 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			passed = true
 			break
 		}
+
+		// Testcontainers start-timeout infra-flake absorb (#972): a failed
+		// verify whose output carries the container-start-timeout signature is
+		// re-run ONCE in place — repeat the iteration via the existing loop
+		// body (re-stage, re-commit, re-verify) WITHOUT invoking the fix agent
+		// and WITHOUT advancing iter, mirroring the maxFixInvokeInfraRetries
+		// budget-preserving pattern below. The once-flag bounds the absorb to
+		// one extra verify run per stage; a second flake or a real failure
+		// proceeds into the fix-loop / exhaustion path unchanged. This sits
+		// AFTER the reset --soft above, so the #816 fatal-reset and #960
+		// verified-tree invariants are untouched, and BEFORE the exhaustion
+		// check so a flake on the last iteration is absorbed rather than
+		// demoting the stage category-A. Never silent: each absorb emits a
+		// verify_infra_flake_retry log line + trace event.
+		if !flakeRetried && isTestcontainersStartFlake(out) {
+			flakeRetried = true
+			const detail = "testcontainers container-start timeout signature in verify output; re-running verify once without consuming a fix iteration"
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, iter+1, detail)
+			res.Events = append(res.Events, agent.Event{
+				Kind: "verify_infra_flake_retry",
+				Payload: agent.MakePayload(map[string]any{
+					"iteration": iter + 1,
+					"detail":    detail,
+				}),
+			})
+			iter--
+			continue
+		}
+
 		if iter == cfg.verifyMaxIterations {
 			// Budget exhausted — terminal demotion, no re-invoke.
 			break
@@ -2044,7 +2111,13 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 //     HEAD untouched, so it is a NON-BLOCKING skip: emit a skipped verify_run +
 //     nil error — never invent a failure from gate plumbing. The real push runs
 //     its own #728/#800 gate.
-//   - A non-zero verify exit returns the event plus an error wrapping
+//   - A non-zero verify exit whose output matches the testcontainers
+//     start-timeout signature (#972, isTestcontainersStartFlake) is re-run
+//     ONCE against the same throwaway headSHA before the reset; both
+//     verify_run events plus a verify_infra_flake_retry event ship in the
+//     returned slice. Only if the retry also fails does the gate classify
+//     the failure as below.
+//   - A non-zero verify exit returns the events plus an error wrapping
 //     gitops.ErrCommittedTestsFailed, naming the drift files + captured output
 //     (category-B at the call site, symmetric with #800).
 //   - A POST-commit gitResetSoftHEAD1 failure is FATAL, not a skip (#802
@@ -2061,7 +2134,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 // (ErrPushedTreeNotVerified, category-B): an empty tree would silently
 // disable the invariant. The empty-string/no-enforcement return is reserved
 // for the paths where no gate verdict exists (skip, nothing staged, failure).
-func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent.Event, string, error) {
+func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) ([]agent.Event, string, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
@@ -2076,19 +2149,19 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent
 	// Pre-commit infra error — HEAD never moved; non-blocking skip.
 	drift, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopeFiles)
 	if err != nil {
-		return verifyRunEvent(cfg.verifyCmd, "", "", -1, "stage_scoped: "+err.Error(), "skipped"), "", nil
+		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "stage_scoped: "+err.Error(), "skipped")}, "", nil
 	}
 
 	// (b) Throwaway commit to materialize a committed-HEAD SHA. Still pre-commit
 	// from HEAD's perspective on error (the commit failed) → non-blocking skip.
 	committed, err := commitVerifyWIP(ctx, cfg, repoDir)
 	if err != nil {
-		return verifyRunEvent(cfg.verifyCmd, "", "", -1, "commit_wip: "+err.Error(), "skipped"), "", nil
+		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "commit_wip: "+err.Error(), "skipped")}, "", nil
 	}
 	if !committed {
 		// Nothing staged — no scope-only change to gate. The real push hits its
 		// NoChanges short-circuit; treat as a no-op skip (no demotion).
-		return verifyRunEvent(cfg.verifyCmd, "", "", 0, "no scope-only changes to gate", "skipped"), "", nil
+		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", 0, "no scope-only changes to gate", "skipped")}, "", nil
 	}
 
 	// (c) Resolve the throwaway commit's SHA. HEAD has now moved, so any undo
@@ -2099,13 +2172,38 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent
 		// is left as the real push expects, then non-blocking skip. A failed
 		// undo here is FATAL for the same reason as (e).
 		if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
-			return verifyRunEvent(cfg.verifyCmd, "", "", -1, "reset_after_revparse: "+rerr.Error(), "failed"), "", rerr
+			return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "reset_after_revparse: "+rerr.Error(), "failed")}, "", rerr
 		}
-		return verifyRunEvent(cfg.verifyCmd, "", "", -1, "rev_parse: "+err.Error(), "skipped"), "", nil
+		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "rev_parse: "+err.Error(), "skipped")}, "", nil
 	}
 
 	// (d) Verify against the committed scope-only tree.
 	ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+	events := []agent.Event{ev}
+
+	// Testcontainers start-timeout infra-flake absorb (#972): a failed verify
+	// whose output carries the container-start-timeout signature is re-run
+	// ONCE against the SAME throwaway headSHA — still before the reset --soft
+	// below, so the (e)/(f) invariants are untouched. Both verify_run events
+	// plus the verify_infra_flake_retry event ship in the trace. Only if the
+	// retry also fails does the gate classify ErrCommittedTestsFailed as
+	// before; the single-shot gate has no loop, so the retry is inherently
+	// once-per-stage.
+	if outcome == "failed" && isTestcontainersStartFlake(out) {
+		const detail = "testcontainers container-start timeout signature in verify output; re-running verify once"
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, 1, detail)
+		events = append(events, agent.Event{
+			Kind: "verify_infra_flake_retry",
+			Payload: agent.MakePayload(map[string]any{
+				"iteration": 1,
+				"detail":    detail,
+			}),
+		})
+		ev, out, outcome = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+		events = append(events, ev)
+	}
 
 	// Capture the verified tree's object hash BEFORE the reset (#960). Only a
 	// real pass earns a verified tree; the tolerant skip paths return empty
@@ -2123,7 +2221,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent
 	// pushing the WIP commit into the PR. Do NOT swallow it to a skip (#802
 	// approval condition) — propagate it so the stage fails loudly.
 	if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
-		return ev, "", rerr
+		return events, "", rerr
 	}
 
 	// Fail closed on a passed-but-unresolvable verified tree (#960 approval
@@ -2131,17 +2229,17 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent
 	// invariant for a gate that DID pass — an inconsistent state, never a
 	// tolerated one. Wrapped so it classifies category-B like its siblings.
 	if outcome == "passed" && treeErr != nil {
-		return ev, "", fmt.Errorf("%w: committed-tree gate passed for %s but its verified tree could not be resolved: %v",
+		return events, "", fmt.Errorf("%w: committed-tree gate passed for %s but its verified tree could not be resolved: %v",
 			gitops.ErrPushedTreeNotVerified, headSHA, treeErr)
 	}
 
 	// (f) Non-zero exit blocks as category-B, symmetric with #800. The infra
 	// "skipped" outcome stays tolerant here (reclassification is #959's scope).
 	if outcome == "failed" {
-		return ev, "", fmt.Errorf("%w: committed tree verify command %q failed; %d file(s) outside scope are build/test-required: %s\n%s",
+		return events, "", fmt.Errorf("%w: committed tree verify command %q failed; %d file(s) outside scope are build/test-required: %s\n%s",
 			gitops.ErrCommittedTestsFailed, cfg.verifyCmd, len(drift), strings.Join(drift, ", "), out)
 	}
-	return ev, verifiedTreeSHA, nil
+	return events, verifiedTreeSHA, nil
 }
 
 // verifyFixPrompt builds the fix-iteration prompt fed back to the agent when

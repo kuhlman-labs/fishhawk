@@ -33,10 +33,21 @@ modules() {
   go work edit -json | jq -r '.Use[].DiskPath'
 }
 
+# Full-suite runs bound test-binary parallelism (#972): ~16 backend packages
+# start a testcontainers Postgres each, and at the default -p (~GOMAXPROCS) a
+# developer-Mac Docker daemon intermittently times out starting one
+# ("context deadline exceeded" after 9 retries against docker.sock), failing
+# the suite on load contention rather than a real bug. `go test -p n` caps how
+# many test binaries run concurrently (tests within one binary are serial
+# unless they call t.Parallel()), so this caps concurrent container starts.
+# Modules run sequentially below, making the bound effectively global.
+# Operator override: FISHHAWK_TEST_P. `single` runs are left unbounded.
+TEST_P="${FISHHAWK_TEST_P:-4}"
+
 cmd_test() {
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
-    (cd "$m" && go test -race ./...)
+    (cd "$m" && go test -race -p "$TEST_P" ./...)
   done < <(modules)
 }
 
@@ -44,7 +55,7 @@ cmd_coverage() {
   local profiles=()
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
-    (cd "$m" && go test -race -coverprofile=coverage.out -covermode=atomic ./...)
+    (cd "$m" && go test -race -p "$TEST_P" -coverprofile=coverage.out -covermode=atomic ./...)
     profiles+=("$m/coverage.out")
   done < <(modules)
   python3 "$ROOT/scripts/check-coverage.py" --threshold 80 --exclude '/db/' "${profiles[@]}"
