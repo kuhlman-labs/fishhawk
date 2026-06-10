@@ -5490,12 +5490,15 @@ func TestRunVerifyGateCommitted_InfraSkipNonBlocking(t *testing.T) {
 		verifyCmd:  "true",
 		scopeFiles: []upload.ScopeFile{{Path: "a.txt", Operation: "modify"}},
 	}
-	ev, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	ev, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
 	if err != nil {
 		t.Fatalf("pre-commit infra error must be a non-blocking skip, got %v", err)
 	}
 	if !strings.Contains(string(ev.Payload), `"outcome":"skipped"`) {
 		t.Errorf("expected skipped verify_run on infra error, got %s", ev.Payload)
+	}
+	if tree != "" {
+		t.Errorf("skip path must return an empty verified tree (no enforcement), got %q", tree)
 	}
 }
 
@@ -5517,7 +5520,7 @@ func TestRunVerifyGateCommitted_PostCommitResetFailureFatal(t *testing.T) {
 		verifyCmd:  "true", // the command itself passes; the reset is what fails
 		scopeFiles: []upload.ScopeFile{{Path: "a.txt", Operation: "create"}},
 	}
-	_, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	_, _, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
 	if err == nil {
 		t.Fatal("a post-commit reset failure must be FATAL (hard error), not swallowed to a skip")
 	}
@@ -5551,7 +5554,7 @@ func TestRunVerifyFixLoop_PostCommitResetFailureFatal(t *testing.T) {
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	_, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	_, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
 	if err == nil {
 		t.Fatal("a post-commit reset failure must be FATAL (hard error), not a non-blocking skip")
 	}
@@ -6730,4 +6733,400 @@ func TestDecompositionFanout_TrackingRefMaterialized_RoutesSubsequent(t *testing
 	if isSubsequent := remoteBranchExists(ctx, repo, sharedBranch); !isSubsequent {
 		t.Fatal("child B routing: remoteBranchExists = false after child A's URL push — the #770 bug (tracking ref not materialized); want true (RebaseFromRemote path)")
 	}
+}
+
+// verifiedTreeRepo builds the #960 integration fixture: a real repo with a
+// local bare `origin` holding main, a `url.insteadOf` rewrite so the
+// production push path's hardcoded https://github.com/<owner>/<repo> URL
+// resolves to the bare repo (no network), and a dirty in-scope edit standing
+// in for the agent's work. Returns the repo path, the bare path, and the
+// run-branch name the production routing will derive.
+func verifiedTreeRepo(t *testing.T) (repo, bare, branch string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare = filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	mustWrite(t, filepath.Join(repo, "a.txt"), "base\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	runGit("init", "--bare", bare)
+	runGit("remote", "add", "origin", bare)
+	runGit("push", "origin", "main")
+	// Production builds the push/fetch URL as https://github.com/<slug>;
+	// rewrite it to the local bare repo so FreshFetchBase + push stay local.
+	runGit("config", "url."+bare+".insteadOf", "https://github.com/test-owner/test-repo")
+
+	// The agent's in-scope edit.
+	mustWrite(t, filepath.Join(repo, "a.txt"), "agent change\n")
+
+	branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(verifiedTreeRunID), shortID(verifiedTreeStageID))
+	return repo, bare, branch
+}
+
+const (
+	verifiedTreeRunID   = "11112222333344445555666677778888"
+	verifiedTreeStageID = "99990000aaaabbbbccccddddeeeeffff"
+)
+
+// verifiedTreeCfg is the config openPRAndShipArtifact sees for the #960
+// integration tests: a standalone implement push (default branch routing →
+// FreshFetchBase set) against the rewritten github URL.
+func verifiedTreeCfg(repo, verifyCmd string) config {
+	return config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		workingDir: repo,
+		githubRepo: "test-owner/test-repo",
+		baseBranch: "main",
+		backendURL: "https://api.fishhawk.test",
+		verifyCmd:  verifyCmd,
+		scopeFiles: []upload.ScopeFile{{Path: "a.txt", Operation: "modify"}},
+	}
+}
+
+// moveBareMain advances the bare remote's main by one commit made in a side
+// clone — the "origin/<base> moved between gate and push" shape that makes
+// FreshFetchBase produce a pushed tree the gates never saw.
+func moveBareMain(t *testing.T, bare string) {
+	t.Helper()
+	side := filepath.Join(t.TempDir(), "side")
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run(filepath.Dir(side), "clone", bare, side)
+	run(side, "config", "user.name", "other")
+	run(side, "config", "user.email", "other@example.com")
+	run(side, "config", "commit.gpgsign", "false")
+	mustWrite(t, filepath.Join(side, "b.txt"), "moved base\n")
+	run(side, "add", "-A")
+	run(side, "commit", "-m", "base moved by another writer")
+	run(side, "push", "origin", "main")
+}
+
+// withFakePROpenerOnly swaps ONLY the PR-opener seam, keeping the REAL
+// gitops.Pusher — the #960 integration tests cross the closure → gitops push
+// boundary for real, so unlike withFakeGitOps the pusher must not be faked.
+func withFakePROpenerOnly(t *testing.T) *fakePROpener {
+	t.Helper()
+	fpr := &fakePROpener{}
+	orig := newPROpener
+	newPROpener = func(token string) prOpener {
+		fpr.gotToken = token
+		return fpr
+	}
+	t.Cleanup(func() { newPROpener = orig })
+	return fpr
+}
+
+// TestRunVerifyGateCommitted_ReturnsVerifiedTreeSHA: on a pass the single-shot
+// gate returns the throwaway commit's tree object hash (#960) and stamps the
+// verify_run event with tree_sha. The returned hash must equal the tree of an
+// equivalent real commit of the same snapshot (tree hashes are metadata-
+// independent), which is exactly the equivalence the pre-push invariant
+// relies on.
+func TestRunVerifyGateCommitted_ReturnsVerifiedTreeSHA(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, "true")
+	ev, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if err != nil {
+		t.Fatalf("runVerifyGateCommitted: %v", err)
+	}
+	if tree == "" {
+		t.Fatal("passing gate must return the verified tree hash")
+	}
+	if !strings.Contains(string(ev.Payload), fmt.Sprintf(`"tree_sha":%q`, tree)) {
+		t.Errorf("verify_run payload must carry tree_sha %q:\n%s", tree, ev.Payload)
+	}
+	// Commit the same snapshot for real; its tree must equal the gate's.
+	for _, args := range [][]string{{"add", "a.txt"}, {"commit", "-m", "real commit, different metadata"}} {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, cerr := cmd.CombinedOutput(); cerr != nil {
+			t.Fatalf("git %v: %v\n%s", args, cerr, out)
+		}
+	}
+	wantTree, terr := gitRevParseTreeOf(context.Background(), repo, "HEAD")
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	if tree != wantTree {
+		t.Errorf("verified tree = %q, want %q (tree of an identical-snapshot commit)", tree, wantTree)
+	}
+}
+
+// TestRunVerifyGateCommitted_FailReturnsEmptyTree: a failing verify returns
+// the ErrCommittedTestsFailed demotion and NO verified tree — the
+// empty-string/no-enforcement convention is reserved for no-pass paths.
+func TestRunVerifyGateCommitted_FailReturnsEmptyTree(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, "false")
+	_, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Fatalf("err = %v, want ErrCommittedTestsFailed", err)
+	}
+	if tree != "" {
+		t.Errorf("failing gate must return an empty verified tree, got %q", tree)
+	}
+}
+
+// TestRunVerifyFixLoop_ReturnsVerifiedTreeSHA: the fix loop's passing
+// iteration returns the verified tree hash; exhaustion returns empty.
+func TestRunVerifyFixLoop_ReturnsVerifiedTreeSHA(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, "true")
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v", err)
+	}
+	if reinvoked {
+		t.Error("first-iteration pass must not reinvoke")
+	}
+	if tree == "" {
+		t.Error("passing fix loop must return the verified tree hash")
+	}
+}
+
+// TestRunVerifyFixLoop_ExhaustionReturnsEmptyTree: when the budget runs out
+// without a pass, no verified tree is returned (no enforcement — the stage is
+// demoted to category-A anyway).
+func TestRunVerifyFixLoop_ExhaustionReturnsEmptyTree(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, "false")
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	_, tree, err := runVerifyFixLoop(context.Background(), cfg, &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v", err)
+	}
+	if tree != "" {
+		t.Errorf("exhausted fix loop must return an empty verified tree, got %q", tree)
+	}
+	if res.OK || res.FailureCategory != "A" {
+		t.Errorf("exhaustion must demote to category-A; OK=%t category=%q", res.OK, res.FailureCategory)
+	}
+}
+
+// TestRunVerifyCommittedTree_OutcomeStrings pins the outcome-string contract
+// (#960): "passed" on exit 0, "failed" on non-zero, and "skipped" on a gate
+// infra failure (forced here via an unresolvable head SHA so worktree_add
+// fails) — the lossy ok bool used to return true for infra paths,
+// indistinguishable from a real pass.
+func TestRunVerifyCommittedTree_OutcomeStrings(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("add", "a.txt")
+	runGit("commit", "-m", "committed tree")
+	head, err := gitRevParseHEAD(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ev, _, outcome := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute); outcome != "passed" {
+		t.Errorf("exit-0 outcome = %q, want passed (%s)", outcome, ev.Payload)
+	}
+	if _, _, outcome := runVerifyCommittedTree(context.Background(), "false", repo, head, time.Minute); outcome != "failed" {
+		t.Errorf("non-zero outcome = %q, want failed", outcome)
+	}
+	bogus := strings.Repeat("deadbeef", 5)
+	if ev, _, outcome := runVerifyCommittedTree(context.Background(), "true", repo, bogus, time.Minute); outcome != "skipped" {
+		t.Errorf("worktree_add-failure outcome = %q, want skipped (%s)", outcome, ev.Payload)
+	}
+}
+
+// TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush is
+// the #960 cross-layer seam test (the shape that broke on run 07bce059): the
+// committed-tree gate verifies tree T, origin/<base> then moves, so the real
+// commit CommitAndPush builds (fresh-fetched base + same scope edit) carries
+// a DIFFERENT tree. The pre-push hook must detect the mismatch, run the
+// strict re-verify, and — when it fails — return ErrPushedTreeNotVerified
+// with NO ref created on the bare remote.
+func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Gate passes against the pre-move base; capture the verified tree.
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	moveBareMain(t, bare)
+
+	// The re-verify command fails → the push must be blocked.
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, verifiedTree)
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
+	}
+	if !strings.Contains(logSink.String(), `"event":"verified_tree_mismatch"`) {
+		t.Errorf("expected verified_tree_mismatch event:\n%s", logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run after a blocked push")
+	}
+	// No ref may have reached the bare remote — origin untouched.
+	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+}
+
+// TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes: same
+// moved-base mismatch, but the strict re-verify passes — the pushed SHA is
+// now itself gate-verified, so the push proceeds, pushed_tree_reverified is
+// logged, and pull_request_opened carries verified_tree_sha + tree_sha.
+func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	moveBareMain(t, bare)
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, verifiedTree); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	logs := logSink.String()
+	if !strings.Contains(logs, `"event":"verified_tree_mismatch"`) {
+		t.Errorf("expected verified_tree_mismatch before the re-verify:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"event":"pushed_tree_reverified"`) {
+		t.Errorf("expected pushed_tree_reverified after the passing re-verify:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"event":"pull_request_opened"`) ||
+		!strings.Contains(logs, fmt.Sprintf(`"verified_tree_sha":%q`, verifiedTree)) {
+		t.Errorf("pull_request_opened must carry verified_tree_sha %q:\n%s", verifiedTree, logs)
+	}
+	if fpr.gotArgs == nil {
+		t.Error("OpenPR should have run after the re-verified push")
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+		t.Errorf("run branch %s missing from the bare remote after a re-verified push: %v", branch, rerr)
+	}
+}
+
+// TestOpenPRAndShipArtifact_VerifiedTreeMatch_NoReverify pins the happy path:
+// identical trees push with ZERO extra verify-command invocations, observed
+// via a counter-file verify command — tree-hash equality transfers the gates'
+// verdict for free.
+func TestOpenPRAndShipArtifact_VerifiedTreeMatch_NoReverify(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counter := filepath.Join(t.TempDir(), "verify-invocations")
+	countCmd := fmt.Sprintf("echo run >> %q", counter)
+
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, countCmd), io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+	if lines := countLines(t, counter); lines != 1 {
+		t.Fatalf("verify invocations after gate = %d, want 1", lines)
+	}
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, verifiedTree); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if lines := countLines(t, counter); lines != 1 {
+		t.Errorf("verify invocations after push = %d, want 1 (equal trees must not re-verify)", lines)
+	}
+	if !strings.Contains(logSink.String(), `"event":"verified_tree_match"`) {
+		t.Errorf("expected verified_tree_match on the equal-trees path:\n%s", logSink.String())
+	}
+	if strings.Contains(logSink.String(), `"event":"verified_tree_mismatch"`) {
+		t.Errorf("equal trees must not log a mismatch:\n%s", logSink.String())
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+		t.Errorf("run branch %s missing from the bare remote: %v", branch, rerr)
+	}
+}
+
+// TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp pins the disable-on-empty
+// contract (#960 approval condition): verifiedTreeSHA == "" (no committed-tree
+// gate ran) makes the pre-push check a pure no-op — even with a moved base
+// AND a verify command that would fail, the push proceeds unchanged and no
+// verified_tree_* event is emitted.
+func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moveBareMain(t, bare)
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, ""); err != nil {
+		t.Fatalf("empty verifiedTreeSHA must disable the check, got: %v\n%s", err, logSink.String())
+	}
+	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified"} {
+		if strings.Contains(logSink.String(), `"event":"`+ev+`"`) {
+			t.Errorf("no-gate path must not emit %s:\n%s", ev, logSink.String())
+		}
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+		t.Errorf("run branch %s missing from the bare remote on the no-op path: %v", branch, rerr)
+	}
+}
+
+// countLines returns the number of newline-terminated lines in path; 0 when
+// the file does not exist yet.
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(b), "\n")
 }

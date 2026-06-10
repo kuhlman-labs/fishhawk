@@ -590,6 +590,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// compounding (DECISION c2). It is placed BEFORE EmitStage so the span's
 	// token/model counts include the fix-loop invocations' cost (ADR-030).
 	reinvoked := false
+	// verifiedTreeSHA is the tree object hash the committed-tree gates passed
+	// against (#960), threaded into openPRAndShipArtifact's pre-push invariant.
+	// Empty when no gate ran (plan stage, --no-pr, verifyCmd unset, skip).
+	verifiedTreeSHA := ""
 	if res.OK && stageType == "implement" && !cfg.noPR &&
 		cfg.verifyCmd != "" && cfg.verifyMaxIterations > 0 {
 		// A POST-commit reset failure (#816) is fatal: the throwaway commit is
@@ -597,7 +601,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// to category-B (park for re-scope/re-plan; no self-retry), mirroring
 		// runVerifyGateCommitted's treatment of its post-commit reset failure.
 		var ferr error
-		reinvoked, ferr = runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink)
+		reinvoked, verifiedTreeSHA, ferr = runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink)
 		if ferr != nil {
 			res.OK = false
 			res.FailureCategory = "B"
@@ -638,8 +642,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// !noPR && maxIter==0; fix loop = implement && !noPR && maxIter>0.
 	if res.OK && stageType == "implement" && !cfg.noPR &&
 		cfg.verifyCmd != "" && cfg.verifyMaxIterations == 0 {
-		ev, demote := runVerifyGateCommitted(ctx, cfg, logSink)
+		ev, tree, demote := runVerifyGateCommitted(ctx, cfg, logSink)
 		res.Events = append(res.Events, ev)
+		verifiedTreeSHA = tree
 		if demote != nil {
 			res.OK = false
 			res.FailureCategory = "B"
@@ -898,7 +903,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			if err := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured); err != nil {
+			if err := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, verifiedTreeSHA); err != nil {
 				res.OK = false
 				// Wrong-shaped output → category-B (parks the run for
 				// re-scope/re-plan). ErrPullRequestInvalid is the backend
@@ -915,13 +920,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// ErrBaseRebaseConflict is the fresh-fetch base path (#866,
 				// ADR-035) failing because the run branched from a base that
 				// diverged from the agent's edits, so reapplying them onto the
-				// clean fetched base conflicts (re-base/re-plan). Everything else
-				// (network, git, GitHub API) is category-C infra.
+				// clean fetched base conflicts (re-base/re-plan).
+				// ErrPushedTreeNotVerified is the verified-SHA invariant (#960):
+				// the staged commit's tree is not the tree the committed-tree
+				// gates verified and the single strict re-verify did not pass —
+				// pushing it would vouch for a tree no gate ever saw. Everything
+				// else (network, git, GitHub API) is category-C infra.
 				if errors.Is(err, upload.ErrPullRequestInvalid) ||
 					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
 					errors.Is(err, gitops.ErrCommittedTestsFailed) ||
 					errors.Is(err, gitops.ErrCreatedOutOfScope) ||
-					errors.Is(err, gitops.ErrBaseRebaseConflict) {
+					errors.Is(err, gitops.ErrBaseRebaseConflict) ||
+					errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 					res.FailureCategory = "B"
 				} else {
 					res.FailureCategory = "C"
@@ -1719,7 +1729,14 @@ const maxFixInvokeInfraRetries = 2
 // scope-only git_diff event after the loop, so the implement review and policy
 // re-eval evaluate the reconciled committed tree rather than the pre-reconcile
 // diff computeAndEmitDiff emitted before the loop ran.
-func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) (bool, error) {
+//
+// On the passing iteration it also returns the verified tree object hash
+// (#960), captured before the reset, for the pre-push VerifyCommit invariant.
+// A passing verify whose tree cannot be resolved FAILS CLOSED
+// (ErrPushedTreeNotVerified, hard error → category-B at the call site) — an
+// empty tree would silently disable the invariant. Empty is returned only on
+// the no-verdict paths: nothing-staged pass, skip, and exhaustion.
+func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) (bool, string, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
@@ -1731,12 +1748,13 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 	}
 
 	var (
-		passed      bool
-		reinvoked   bool
-		attempts    int
-		lastOutput  string
-		lastIterErr error // non-nil only on a PRE-commit infra failure → non-blocking skip
-		fatalErr    error // non-nil only on a POST-commit reset failure → hard abort (#816)
+		passed          bool
+		reinvoked       bool
+		attempts        int
+		lastOutput      string
+		verifiedTreeSHA string // set only on a passing iteration's real verify (#960)
+		lastIterErr     error  // non-nil only on a PRE-commit infra failure → non-blocking skip
+		fatalErr        error  // non-nil on a POST-commit reset failure (#816) or a passed-but-unresolvable verified tree (#960) → hard abort
 	)
 
 	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
@@ -1776,10 +1794,19 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		}
 
 		// (c) Verify against the committed tree.
-		ev, out, ok := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+		ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
 		res.Events = append(res.Events, ev)
 		attempts++
 		lastOutput = out
+
+		// Capture the verified tree's object hash BEFORE the reset (#960).
+		// Only a real "passed" earns one; the tolerant infra-skip outcome
+		// keeps the loop's existing skip-as-pass treatment below but carries
+		// no verified tree (no enforcement — reclassification is #959's scope).
+		var treeErr error
+		if outcome == "passed" {
+			verifiedTreeSHA, treeErr = gitRevParseTreeOf(ctx, repoDir, headSHA)
+		}
 
 		// (d)/(e)/(f) Always undo the throwaway commit first — git reset --soft
 		// moves HEAD without touching the index or working tree, so the agent's
@@ -1793,7 +1820,17 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			break
 		}
 
-		if ok {
+		// Fail closed on a passed-but-unresolvable verified tree (#960
+		// approval condition): an empty tree would silently disable the
+		// pre-push invariant for a verify that DID pass.
+		if outcome == "passed" && treeErr != nil {
+			verifiedTreeSHA = ""
+			fatalErr = fmt.Errorf("%w: committed-tree verify passed for %s but its verified tree could not be resolved: %v",
+				gitops.ErrPushedTreeNotVerified, headSHA, treeErr)
+			break
+		}
+
+		if outcome != "failed" {
 			passed = true
 			break
 		}
@@ -1890,10 +1927,11 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 	})
 
 	if fatalErr != nil {
-		// A POST-commit reset failure left HEAD on the throwaway commit (#816).
+		// A POST-commit reset failure left HEAD on the throwaway commit (#816),
+		// or a passing verify's tree could not be resolved (#960 fail-closed).
 		// Abort the stage hard — the call site demotes to category-B so the real
-		// push never stacks the real commit on top of the throwaway WIP commit.
-		return reinvoked, fatalErr
+		// push never ships an unverified or throwaway-stacked commit.
+		return reinvoked, "", fatalErr
 	}
 
 	if lastIterErr != nil {
@@ -1904,7 +1942,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_fix_skipped","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, lastIterErr.Error())
-		return reinvoked, nil
+		return reinvoked, "", nil
 	}
 
 	if !passed {
@@ -1912,8 +1950,9 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		res.FailureCategory = "A"
 		res.FailureReason = fmt.Sprintf("verify command %q still failing after %d iteration(s):\n%s",
 			cfg.verifyCmd, attempts, lastOutput)
+		return reinvoked, "", nil
 	}
-	return reinvoked, nil
+	return reinvoked, verifiedTreeSHA, nil
 }
 
 // runVerifyGateCommitted is the single-shot committed-tree verify gate (#802):
@@ -1939,7 +1978,15 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 //     commit would stack on top and push the WIP commit into the PR. Propagate
 //     it as a hard error so the stage fails loudly instead of silently shipping
 //     a throwaway commit.
-func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent.Event, error) {
+//
+// On a pass it also returns the verified tree object hash (#960) — captured
+// via gitRevParseTreeOf(headSHA) before the reset — which the pre-push
+// VerifyCommit hook compares against the real commit's tree. A passing gate
+// whose tree cannot be resolved is an inconsistent state and FAILS CLOSED
+// (ErrPushedTreeNotVerified, category-B): an empty tree would silently
+// disable the invariant. The empty-string/no-enforcement return is reserved
+// for the paths where no gate verdict exists (skip, nothing staged, failure).
+func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent.Event, string, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
@@ -1954,19 +2001,19 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent
 	// Pre-commit infra error — HEAD never moved; non-blocking skip.
 	drift, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopeFiles)
 	if err != nil {
-		return verifyRunEvent(cfg.verifyCmd, "", -1, "stage_scoped: "+err.Error(), "skipped"), nil
+		return verifyRunEvent(cfg.verifyCmd, "", "", -1, "stage_scoped: "+err.Error(), "skipped"), "", nil
 	}
 
 	// (b) Throwaway commit to materialize a committed-HEAD SHA. Still pre-commit
 	// from HEAD's perspective on error (the commit failed) → non-blocking skip.
 	committed, err := commitVerifyWIP(ctx, cfg, repoDir)
 	if err != nil {
-		return verifyRunEvent(cfg.verifyCmd, "", -1, "commit_wip: "+err.Error(), "skipped"), nil
+		return verifyRunEvent(cfg.verifyCmd, "", "", -1, "commit_wip: "+err.Error(), "skipped"), "", nil
 	}
 	if !committed {
 		// Nothing staged — no scope-only change to gate. The real push hits its
 		// NoChanges short-circuit; treat as a no-op skip (no demotion).
-		return verifyRunEvent(cfg.verifyCmd, "", 0, "no scope-only changes to gate", "skipped"), nil
+		return verifyRunEvent(cfg.verifyCmd, "", "", 0, "no scope-only changes to gate", "skipped"), "", nil
 	}
 
 	// (c) Resolve the throwaway commit's SHA. HEAD has now moved, so any undo
@@ -1977,13 +2024,23 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent
 		// is left as the real push expects, then non-blocking skip. A failed
 		// undo here is FATAL for the same reason as (e).
 		if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
-			return verifyRunEvent(cfg.verifyCmd, "", -1, "reset_after_revparse: "+rerr.Error(), "failed"), rerr
+			return verifyRunEvent(cfg.verifyCmd, "", "", -1, "reset_after_revparse: "+rerr.Error(), "failed"), "", rerr
 		}
-		return verifyRunEvent(cfg.verifyCmd, "", -1, "rev_parse: "+err.Error(), "skipped"), nil
+		return verifyRunEvent(cfg.verifyCmd, "", "", -1, "rev_parse: "+err.Error(), "skipped"), "", nil
 	}
 
 	// (d) Verify against the committed scope-only tree.
-	ev, out, ok := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+	ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+
+	// Capture the verified tree's object hash BEFORE the reset (#960). Only a
+	// real pass earns a verified tree; the tolerant skip paths return empty
+	// (no enforcement). The fail-closed decision on a capture error is made
+	// AFTER the reset below — the throwaway commit must be undone either way.
+	var verifiedTreeSHA string
+	var treeErr error
+	if outcome == "passed" {
+		verifiedTreeSHA, treeErr = gitRevParseTreeOf(ctx, repoDir, headSHA)
+	}
 
 	// (e) ALWAYS undo the throwaway commit so the working tree + index survive
 	// for openPRAndShipArtifact's real commit. A reset failure here is FATAL:
@@ -1991,15 +2048,25 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, _ io.Writer) (agent
 	// pushing the WIP commit into the PR. Do NOT swallow it to a skip (#802
 	// approval condition) — propagate it so the stage fails loudly.
 	if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
-		return ev, rerr
+		return ev, "", rerr
 	}
 
-	// (f) Non-zero exit blocks as category-B, symmetric with #800.
-	if !ok {
-		return ev, fmt.Errorf("%w: committed tree verify command %q failed; %d file(s) outside scope are build/test-required: %s\n%s",
+	// Fail closed on a passed-but-unresolvable verified tree (#960 approval
+	// condition): downgrading to empty would silently disable the pre-push
+	// invariant for a gate that DID pass — an inconsistent state, never a
+	// tolerated one. Wrapped so it classifies category-B like its siblings.
+	if outcome == "passed" && treeErr != nil {
+		return ev, "", fmt.Errorf("%w: committed-tree gate passed for %s but its verified tree could not be resolved: %v",
+			gitops.ErrPushedTreeNotVerified, headSHA, treeErr)
+	}
+
+	// (f) Non-zero exit blocks as category-B, symmetric with #800. The infra
+	// "skipped" outcome stays tolerant here (reclassification is #959's scope).
+	if outcome == "failed" {
+		return ev, "", fmt.Errorf("%w: committed tree verify command %q failed; %d file(s) outside scope are build/test-required: %s\n%s",
 			gitops.ErrCommittedTestsFailed, cfg.verifyCmd, len(drift), strings.Join(drift, ", "), out)
 	}
-	return ev, nil
+	return ev, verifiedTreeSHA, nil
 }
 
 // verifyFixPrompt builds the fix-iteration prompt fed back to the agent when
@@ -2027,19 +2094,28 @@ green.`, verifyCmd, output)
 // pattern: `git worktree add --detach` checks out the committed scope-only
 // tree without disturbing the runner's working tree, so the verify command
 // sees the drift-excluded tree and not the dirty working tree. It emits a
-// verify_run event carrying the committed head_sha and returns the captured
-// output plus whether the command exited zero.
+// verify_run event carrying the committed head_sha + tree_sha and returns the
+// captured output plus an explicit outcome string: "passed" (command exited
+// zero), "failed" (non-zero exit), or "skipped" (gate infra never ran the
+// command). The outcome replaces the former lossy ok bool, whose infra paths
+// returned true indistinguishably from a real pass — the verified-SHA
+// invariant's strict re-verify (#960) needs "passed" to be unambiguous.
 //
 // Setpgid + cmd.Cancel kill the whole process group on context cancellation
 // so the verify command's grandchildren (e.g. `go test` subprocesses) don't
 // keep the output pipe open and block CombinedOutput — the same hazard
-// runVerifyGate handles. A worktree-add failure (infra) returns passed=true
-// so the loop does not invent a failure from gate plumbing; the real push's
-// own #728/#800 gate still runs.
-func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration) (agent.Event, string, bool) {
+// runVerifyGate handles. A worktree-tmp/worktree-add failure (infra) returns
+// outcome "skipped"; the gate call sites map that to their existing tolerant
+// behavior (no failure invented from gate plumbing — reclassification is
+// #959's scope), while the #960 re-verify treats it as not-verified.
+func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration) (agent.Event, string, string) {
+	// Best-effort tree identity for the trace event: the enforcement-grade
+	// capture is the gates' fail-closed gitRevParseTreeOf; an empty tree_sha
+	// here only degrades the audit stamp, never the invariant.
+	treeSHA, _ := gitRevParseTreeOf(ctx, repoDir, headSHA)
 	parent, err := os.MkdirTemp("", "fishhawk-verify-*")
 	if err != nil {
-		return verifyRunEvent(verifyCmd, headSHA, -1, "worktree_tmp: "+err.Error(), "skipped"), "", true
+		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1, "worktree_tmp: "+err.Error(), "skipped"), "", "skipped"
 	}
 	wt := filepath.Join(parent, "tree")
 	defer func() {
@@ -2048,8 +2124,8 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	}()
 	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
 		"worktree", "add", "--detach", wt, headSHA).CombinedOutput(); err != nil {
-		return verifyRunEvent(verifyCmd, headSHA, -1,
-			"worktree_add: "+strings.TrimSpace(string(out)), "skipped"), "", true
+		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1,
+			"worktree_add: "+strings.TrimSpace(string(out)), "skipped"), "", "skipped"
 	}
 
 	childCtx, childCancel := context.WithTimeout(ctx, timeout)
@@ -2081,18 +2157,20 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	if exitCode != 0 {
 		outcome = "failed"
 	}
-	return verifyRunEvent(verifyCmd, headSHA, exitCode, string(output), outcome), string(output), exitCode == 0
+	return verifyRunEvent(verifyCmd, headSHA, treeSHA, exitCode, string(output), outcome), string(output), outcome
 }
 
 // verifyRunEvent builds the verify_run trace event for a committed-tree verify
-// run, carrying the committed head_sha alongside the command/exit/output the
-// working-tree gate (runVerifyGate) emits.
-func verifyRunEvent(command, headSHA string, exitCode int, output, outcome string) agent.Event {
+// run, carrying the committed head_sha and its tree_sha (#960 — the tree the
+// gate actually ran against; empty on the pre-commit skip paths) alongside the
+// command/exit/output the working-tree gate (runVerifyGate) emits.
+func verifyRunEvent(command, headSHA, treeSHA string, exitCode int, output, outcome string) agent.Event {
 	return agent.Event{
 		Kind: "verify_run",
 		Payload: agent.MakePayload(map[string]any{
 			"command":   command,
 			"head_sha":  headSHA,
+			"tree_sha":  treeSHA,
 			"exit_code": exitCode,
 			"output":    output,
 			"outcome":   outcome,
@@ -2134,6 +2212,20 @@ func gitRevParseHEAD(ctx context.Context, repoDir string) (string, error) {
 	out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", "HEAD").Output()
 	if err != nil {
 		return "", fmt.Errorf("verify-fix: rev-parse HEAD: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// gitRevParseTreeOf resolves rev to its tree object hash via the
+// gitrevisions(7) `<rev>^{tree}` peel syntax. The tree hash is the
+// content-addressed identity of the snapshot (content + modes + paths,
+// independent of commit metadata), so two commits with equal tree hashes
+// are byte-identical trees — the equivalence the verified-SHA invariant
+// (#960) compares on.
+func gitRevParseTreeOf(ctx context.Context, repoDir, rev string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", rev+"^{tree}").Output()
+	if err != nil {
+		return "", fmt.Errorf("verify-gate: rev-parse %s^{tree}: %w", rev, err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -2526,7 +2618,13 @@ func touchedPackageArgs(diskPath string, scopeFiles []string) []string {
 // is a real workflow signal but not necessarily a failure; we emit
 // a policy_event into the trace via a follow-up bundle so the
 // approver sees "agent decided no changes were needed."
-func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool) error {
+//
+// verifiedTreeSHA, when non-empty, is the tree object hash the committed-tree
+// verify gates (#651/#802) passed against; the pre-push VerifyCommit hook
+// enforces the verified-SHA invariant (#960) against it — see the closure
+// below. Empty disables the check (no committed-tree gate ran: plan stage,
+// --no-pr, verifyCmd unset, or gate skipped).
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, verifiedTreeSHA string) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -2785,6 +2883,53 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				event, cfg.runID, cfg.stageID, headSHA, driftJSON)
 			return err
 		}
+		// Verified-SHA invariant (#960), the cheap backstop run LAST so the
+		// more specific, more actionable sentinels above report first. The
+		// committed-tree gates verified a throwaway scope-only commit; THIS
+		// commit was built independently (re-staged scope, possibly a
+		// freshly-fetched moved base via FreshFetchBase), so prove the trees
+		// match before anything reaches origin. Equal tree hashes mean a
+		// byte-identical snapshot — the gates' verdict transfers for free. A
+		// mismatch gets exactly ONE strict re-verify against the real
+		// committed HEAD; only an explicit "passed" lets the push proceed
+		// (an infra-skip is NOT a pass — #959-complementary), anything else
+		// returns ErrPushedTreeNotVerified BEFORE the push (origin untouched,
+		// category-B). Empty verifiedTreeSHA = no gate ran = no-op.
+		if verifiedTreeSHA == "" {
+			return nil
+		}
+		realTree, terr := gitRevParseTreeOf(ctx, repoDir, headSHA)
+		if terr != nil {
+			// A gate passed, so an unresolvable pushed tree is fail-closed:
+			// never push a tree whose equivalence to the verified one is
+			// unprovable (#960 approval condition).
+			return fmt.Errorf("%w: verified tree %s, but the staged commit %s tree could not be resolved: %v",
+				gitops.ErrPushedTreeNotVerified, verifiedTreeSHA, headSHA, terr)
+		}
+		if realTree == verifiedTreeSHA {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verified_tree_match","run_id":%q,"stage_id":%q,"head_sha":%q,"tree_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, headSHA, realTree)
+			return nil
+		}
+		driftJSON, _ := json.Marshal(drift)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"verified_tree_mismatch","run_id":%q,"stage_id":%q,"head_sha":%q,"verified_tree_sha":%q,"pushed_tree_sha":%q,"drift":%s}`+"\n",
+			cfg.runID, cfg.stageID, headSHA, verifiedTreeSHA, realTree, driftJSON)
+		reverifyTimeout := cfg.verifyTimeout
+		if reverifyTimeout == 0 {
+			reverifyTimeout = 10 * time.Minute
+		}
+		_, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout)
+		if outcome != "passed" {
+			return fmt.Errorf("%w: gates verified tree %s but the staged commit %s carries tree %s, and the strict re-verify of %q did not pass (outcome %s); %d file(s) excluded as scope drift: %s\n%s",
+				gitops.ErrPushedTreeNotVerified, verifiedTreeSHA, headSHA, realTree,
+				cfg.verifyCmd, outcome, len(drift), strings.Join(drift, ", "), out)
+		}
+		// The pushed SHA is now itself gate-verified.
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pushed_tree_reverified","run_id":%q,"stage_id":%q,"head_sha":%q,"tree_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, headSHA, realTree)
 		return nil
 	}
 
@@ -2905,8 +3050,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// path reports it.
 	if isFixup {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"implement_fixup_pushed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
-			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
+			`{"event":"implement_fixup_pushed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"verified_tree_sha":%q,"tree_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA, verifiedTreeSHA, cap.TreeSHA,
 		)
 		filesChanged := 0
 		if d, err := (&gitdiff.Runner{}).Run(ctx, baseRef, repoDir); err == nil {
@@ -2947,8 +3092,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// opened a child-owned PR the parent never tracked.)
 	if isDecomposed {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"implement_child_pushed","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q,"is_subsequent":%t}`+"\n",
-			cfg.runID, cfg.stageID, branch, cap.HeadSHA, isSubsequent,
+			`{"event":"implement_child_pushed","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q,"is_subsequent":%t,"verified_tree_sha":%q,"tree_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA, isSubsequent, verifiedTreeSHA, cap.TreeSHA,
 		)
 
 		// Report child-push SUCCESS to the backend (#771). The backend's
@@ -3004,9 +3149,12 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	if err != nil {
 		return fmt.Errorf("open PR: %w", err)
 	}
+	// verified_tree_sha + tree_sha close the audit chain (#960): the trail
+	// proves gates_verified_tree == pushed tree (or that the pushed tree was
+	// itself re-verified — see pushed_tree_reverified above).
 	_, _ = fmt.Fprintf(logSink,
-		`{"event":"pull_request_opened","run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q}`+"\n",
-		cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, cap.HeadSHA,
+		`{"event":"pull_request_opened","run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"verified_tree_sha":%q,"tree_sha":%q}`+"\n",
+		cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, cap.HeadSHA, verifiedTreeSHA, cap.TreeSHA,
 	)
 
 	// Diff size: count files via gitdiff against the base ref.
