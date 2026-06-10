@@ -3182,16 +3182,49 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		if reverifyTimeout == 0 {
 			reverifyTimeout = 10 * time.Minute
 		}
-		_, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout)
+		ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout)
+		// Emit the decisive re-verify's verify_run record unconditionally
+		// (pass or fail) before the outcome check (#969). The gate's first
+		// verify_run shipped inside the trace bundle, but the bundle is
+		// sealed and uploaded before this pre-push hook runs (#742 forward
+		// gating), so logSink — the channel carrying the rest of the
+		// invariant chain — is the record's home. `output` is omitted: the
+		// failure path embeds the full verify output in the returned
+		// ErrPushedTreeNotVerified error, and an unbounded blob would bloat
+		// a single JSONL line.
+		var evp struct {
+			Command  string `json:"command"`
+			HeadSHA  string `json:"head_sha"`
+			TreeSHA  string `json:"tree_sha"`
+			ExitCode int    `json:"exit_code"`
+			Outcome  string `json:"outcome"`
+		}
+		_ = json.Unmarshal(ev.Payload, &evp)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"verify_run","run_id":%q,"stage_id":%q,"command":%q,"head_sha":%q,"tree_sha":%q,"exit_code":%d,"outcome":%q}`+"\n",
+			cfg.runID, cfg.stageID, evp.Command, evp.HeadSHA, evp.TreeSHA, evp.ExitCode, evp.Outcome)
 		if outcome != "passed" {
 			return fmt.Errorf("%w: gates verified tree %s but the staged commit %s carries tree %s, and the strict re-verify of %q did not pass (outcome %s); %d file(s) excluded as scope drift: %s\n%s",
 				gitops.ErrPushedTreeNotVerified, verifiedTreeSHA, headSHA, realTree,
 				cfg.verifyCmd, outcome, len(drift), strings.Join(drift, ", "), out)
 		}
-		// The pushed SHA is now itself gate-verified.
+		// The pushed SHA is now itself gate-verified. Stamp the forensic
+		// record with BOTH trees — verified_tree_sha is the ORIGINAL
+		// throwaway gate tree, tree_sha the re-verified pushed tree,
+		// mirroring verified_tree_mismatch's field naming — BEFORE the
+		// rebind below, so the original gate tree's provenance survives
+		// (#969).
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"pushed_tree_reverified","run_id":%q,"stage_id":%q,"head_sha":%q,"tree_sha":%q}`+"\n",
-			cfg.runID, cfg.stageID, headSHA, realTree)
+			`{"event":"pushed_tree_reverified","run_id":%q,"stage_id":%q,"head_sha":%q,"verified_tree_sha":%q,"tree_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, headSHA, verifiedTreeSHA, realTree)
+		// Rebind the effective verified tree to the re-verified pushed tree.
+		// The closure shares verifiedTreeSHA with openPRAndShipArtifact, and
+		// this hook runs before CommitAndPush returns, so the stamp sites
+		// downstream (implement_fixup_pushed, implement_child_pushed,
+		// pull_request_opened) record verified_tree_sha == tree_sha
+		// unconditionally — the audit trail's equality claim holds on the
+		// reverify-pass path too (#969).
+		verifiedTreeSHA = realTree
 		return nil
 	}
 
@@ -3412,8 +3445,10 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		return fmt.Errorf("open PR: %w", err)
 	}
 	// verified_tree_sha + tree_sha close the audit chain (#960): the trail
-	// proves gates_verified_tree == pushed tree (or that the pushed tree was
-	// itself re-verified — see pushed_tree_reverified above).
+	// proves verified_tree_sha == tree_sha unconditionally — on the
+	// reverify-pass path the pre-push hook rebound verified_tree_sha to the
+	// re-verified pushed tree (#969); the original gate tree's provenance
+	// lives in verified_tree_mismatch + pushed_tree_reverified above.
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"pull_request_opened","run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"verified_tree_sha":%q,"tree_sha":%q}`+"\n",
 		cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, cap.HeadSHA, verifiedTreeSHA, cap.TreeSHA,

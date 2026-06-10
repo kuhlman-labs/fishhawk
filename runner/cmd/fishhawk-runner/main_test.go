@@ -7716,6 +7716,12 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 	if !strings.Contains(logSink.String(), `"event":"verified_tree_mismatch"`) {
 		t.Errorf("expected verified_tree_mismatch event:\n%s", logSink.String())
 	}
+	// The verify_run record is emitted unconditionally — failed re-verifies
+	// leave the record too (#969).
+	if !strings.Contains(logSink.String(), `"event":"verify_run"`) ||
+		!strings.Contains(logSink.String(), `"outcome":"failed"`) {
+		t.Errorf("expected a verify_run log event with outcome failed:\n%s", logSink.String())
+	}
 	if fpr.gotArgs != nil {
 		t.Error("OpenPR must not run after a blocked push")
 	}
@@ -7727,8 +7733,10 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 
 // TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes: same
 // moved-base mismatch, but the strict re-verify passes — the pushed SHA is
-// now itself gate-verified, so the push proceeds, pushed_tree_reverified is
-// logged, and pull_request_opened carries verified_tree_sha + tree_sha.
+// now itself gate-verified, so the push proceeds, pushed_tree_reverified
+// carries BOTH trees (original gate tree + re-verified tree), the re-verify's
+// verify_run record is emitted, and pull_request_opened stamps the RE-VERIFIED
+// tree as verified_tree_sha so verified_tree_sha == tree_sha holds (#969).
 func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *testing.T) {
 	repo, bare, branch := verifiedTreeRepo(t)
 	fpr := withFakePROpenerOnly(t)
@@ -7752,18 +7760,45 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	if !strings.Contains(logs, `"event":"verified_tree_mismatch"`) {
 		t.Errorf("expected verified_tree_mismatch before the re-verify:\n%s", logs)
 	}
-	if !strings.Contains(logs, `"event":"pushed_tree_reverified"`) {
-		t.Errorf("expected pushed_tree_reverified after the passing re-verify:\n%s", logs)
-	}
-	if !strings.Contains(logs, `"event":"pull_request_opened"`) ||
-		!strings.Contains(logs, fmt.Sprintf(`"verified_tree_sha":%q`, verifiedTree)) {
-		t.Errorf("pull_request_opened must carry verified_tree_sha %q:\n%s", verifiedTree, logs)
-	}
 	if fpr.gotArgs == nil {
 		t.Error("OpenPR should have run after the re-verified push")
 	}
-	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
-		t.Errorf("run branch %s missing from the bare remote after a re-verified push: %v", branch, rerr)
+	// Resolve the pushed tree independently from the bare remote; the
+	// moved-base premise means it must differ from the original gate tree.
+	pushedTreeOut, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "refs/heads/"+branch+"^{tree}").Output()
+	if rerr != nil {
+		t.Fatalf("run branch %s missing from the bare remote after a re-verified push: %v", branch, rerr)
+	}
+	pushedTree := strings.TrimSpace(string(pushedTreeOut))
+	if pushedTree == verifiedTree {
+		t.Fatalf("moved-base premise broken: pushed tree %s equals the original gate tree", pushedTree)
+	}
+	var prLine, reverifiedLine, verifyRunLine string
+	for _, line := range strings.Split(logs, "\n") {
+		switch {
+		case strings.Contains(line, `"event":"pull_request_opened"`):
+			prLine = line
+		case strings.Contains(line, `"event":"pushed_tree_reverified"`):
+			reverifiedLine = line
+		case strings.Contains(line, `"event":"verify_run"`):
+			verifyRunLine = line
+		}
+	}
+	// The rebind (#969): pull_request_opened stamps the RE-VERIFIED pushed
+	// tree as verified_tree_sha, so the stamped pair is equal.
+	if !strings.Contains(prLine, fmt.Sprintf(`"verified_tree_sha":%q,"tree_sha":%q`, pushedTree, pushedTree)) {
+		t.Errorf("pull_request_opened must stamp verified_tree_sha == tree_sha == re-verified tree %q:\n%s", pushedTree, logs)
+	}
+	// Forensics: pushed_tree_reverified carries BOTH trees — the original
+	// gate tree and the re-verified pushed tree.
+	if !strings.Contains(reverifiedLine, fmt.Sprintf(`"verified_tree_sha":%q,"tree_sha":%q`, verifiedTree, pushedTree)) {
+		t.Errorf("pushed_tree_reverified must carry original gate tree %q and re-verified tree %q:\n%s", verifiedTree, pushedTree, logs)
+	}
+	// The re-verify's verify_run record — the gate's first verify_run shipped
+	// in the (already sealed) trace bundle; this is the decisive re-verify's.
+	if !strings.Contains(verifyRunLine, `"outcome":"passed"`) ||
+		!strings.Contains(verifyRunLine, fmt.Sprintf(`"tree_sha":%q`, pushedTree)) {
+		t.Errorf("expected a verify_run log event with outcome passed and tree_sha %q:\n%s", pushedTree, logs)
 	}
 }
 
@@ -7827,7 +7862,7 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, ""); err != nil {
 		t.Fatalf("empty verifiedTreeSHA must disable the check, got: %v\n%s", err, logSink.String())
 	}
-	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified"} {
+	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified", "verify_run"} {
 		if strings.Contains(logSink.String(), `"event":"`+ev+`"`) {
 			t.Errorf("no-gate path must not emit %s:\n%s", ev, logSink.String())
 		}
