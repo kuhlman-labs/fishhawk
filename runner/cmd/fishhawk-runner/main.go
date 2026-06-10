@@ -1023,13 +1023,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// ErrPushedTreeNotVerified is the verified-SHA invariant (#960):
 				// the staged commit's tree is not the tree the committed-tree
 				// gates verified and the single strict re-verify did not pass —
-				// pushing it would vouch for a tree no gate ever saw. Everything
-				// else (network, git, GitHub API) is category-C infra.
+				// pushing it would vouch for a tree no gate ever saw.
+				// ErrCommitOutOfScope is the post-commit scope assertion (#980):
+				// the staged commit contains a path outside the declared
+				// scope.files, so the drift report disagrees with the commit's
+				// actual content. Everything else (network, git, GitHub API) is
+				// category-C infra.
 				if errors.Is(err, upload.ErrPullRequestInvalid) ||
 					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
 					errors.Is(err, gitops.ErrCommittedTestsFailed) ||
 					errors.Is(err, gitops.ErrCreatedOutOfScope) ||
 					errors.Is(err, gitops.ErrBaseRebaseConflict) ||
+					errors.Is(err, gitops.ErrCommitOutOfScope) ||
 					errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 					res.FailureCategory = "B"
 				} else {
@@ -3307,6 +3312,19 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"scope_drift","run_id":%q,"stage_id":%q,"undeclared":%s}`+"\n",
 			cfg.runID, cfg.stageID, driftJSON)
+		// Defensive build-artifact WARN (#980): a drift path that looks like
+		// a compiled binary (the agent's accidental `go build` output) gets
+		// its own advisory event so the operator can spot it before staging
+		// drift by hand. Log-only — the post-commit ErrCommitOutOfScope
+		// assertion and the #818 created-out-of-scope gate are the
+		// enforcement layers.
+		for _, dp := range cap.ScopeDrift {
+			if hit, size := isBinaryArtifactDrift(repoDir, dp); hit {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"scope_drift_binary_artifact","run_id":%q,"stage_id":%q,"path":%q,"size_bytes":%d}`+"\n",
+					cfg.runID, cfg.stageID, dp, size)
+			}
+		}
 	}
 	if cap.NoChanges {
 		_, _ = fmt.Fprintf(logSink,
@@ -3667,6 +3685,38 @@ func scopePaths(files []upload.ScopeFile) []string {
 		paths = append(paths, f.Path)
 	}
 	return paths
+}
+
+// binaryArtifactSizeThreshold is the on-disk size above which an
+// executable scope-drift file is flagged as a likely compiled build
+// artifact (#980 advisory WARN). 5 MiB clears every plausible source
+// file while catching Go binaries (the incident's fishhawk-runner
+// binary was 21MB).
+const binaryArtifactSizeThreshold = 5 << 20
+
+// isBinaryArtifactDrift classifies a scope-drift path as a likely compiled
+// build artifact the agent accidentally produced in the working tree (#980:
+// a `go build`-dropped 21MB fishhawk-runner binary rode toward a run's
+// commit). Two heuristics, either sufficient: (a) the file on disk is
+// executable (any 0111 bit) and larger than binaryArtifactSizeThreshold;
+// (b) the path has the Go module-binary shape cmd/<name>/<name> — basename
+// equal to its parent directory, itself directly under a cmd/ segment,
+// exactly where `go build ./...` from inside a module drops the binary.
+// Advisory only: false negatives are acceptable because the post-commit
+// ErrCommitOutOfScope assertion and the #818 created-out-of-scope gate are
+// the enforcement layers. Returns the stat'd size when available (0 when
+// the path is gone or a shape-only hit on an unstattable file).
+func isBinaryArtifactDrift(repoDir, path string) (bool, int64) {
+	var size int64
+	executableOversized := false
+	if fi, err := os.Stat(filepath.Join(repoDir, path)); err == nil && fi.Mode().IsRegular() {
+		size = fi.Size()
+		executableOversized = fi.Mode().Perm()&0o111 != 0 && size > binaryArtifactSizeThreshold
+	}
+	parts := strings.Split(path, "/")
+	n := len(parts)
+	cmdBinaryShape := n >= 3 && parts[n-1] == parts[n-2] && parts[n-3] == "cmd"
+	return executableOversized || cmdBinaryShape, size
 }
 
 // pullRequestDescriptionPath mirrors prompt.PullRequestDescriptionPath
