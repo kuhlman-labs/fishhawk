@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -451,6 +452,104 @@ func TestFixupStage_NoChangeRefundNeverExtendsCeiling(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
 		t.Errorf("body missing fixup_ceiling_reached code: %s", w.Body.String())
+	}
+}
+
+// categoryErrAuditRepo wraps auditFake to fail ListForRunByCategory for
+// ONE category only. Handlers that read several categories in sequence
+// (the fix-up handler: implement_reviewed → stage_fixup_triggered →
+// fixup_no_changes) need a later read to fail while earlier ones succeed,
+// which the fake's blanket listByCategoryErr knob can't do.
+type categoryErrAuditRepo struct {
+	*auditFake
+	errCategory string
+	err         error
+}
+
+func (c *categoryErrAuditRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == c.errCategory {
+		return nil, c.err
+	}
+	return c.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestFixupStage_RefundCountReadErrorFails500: the budget refund depends on
+// reading the stage's fixup_no_changes audit entries; a read failure there
+// must refuse the trigger with a 500 rather than silently treating the
+// refund count as 0 (which could wrongly reject an admissible pass). Only
+// the fixup_no_changes read errors — the earlier implement_reviewed and
+// stage_fixup_triggered reads succeed, pinning the failure to
+// countFixupNoChangeRefunds.
+func TestFixupStage_RefundCountReadErrorFails500(t *testing.T) {
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	s := New(Config{
+		Addr:    "127.0.0.1:0",
+		RunRepo: repo,
+		AuditRepo: &categoryErrAuditRepo{
+			auditFake:   au,
+			errCategory: "fixup_no_changes",
+			err:         errors.New("audit store unavailable"),
+		},
+	})
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "count refunded fix-up passes failed") {
+		t.Errorf("body missing the refund-count error message: %s", w.Body.String())
+	}
+	// No stage_fixup_triggered entry was recorded — the trigger was refused
+	// before the transition.
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			t.Errorf("stage_fixup_triggered appended despite the 500")
+		}
+	}
+}
+
+// TestFixupStage_RefundClampedToPriorPasses: a fixup_no_changes entry with
+// NO prior stage_fixup_triggered pass (impossible in normal flow — the
+// report path only records it after a triggered pass — but reachable via
+// manual audit writes or partial history) must not widen the budget past
+// the configured max: the refund is clamped to the prior-pass count (0
+// here) and audited as such.
+func TestFixupStage_RefundClampedToPriorPasses(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+	// A no-change entry with no triggered pass behind it.
+	seedFixupNoChanges(au, stage)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var last *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryStageFixupTriggered {
+			last = &au.appended[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("no stage_fixup_triggered entry appended")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(last.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	// Without the clamp this would read 1 (and MaxPasses would have been
+	// widened to 2 with zero passes actually triggered).
+	if payload["refunded_passes"].(float64) != 0 {
+		t.Errorf("refunded_passes = %v, want 0 (clamped to the prior-pass count)", payload["refunded_passes"])
 	}
 }
 

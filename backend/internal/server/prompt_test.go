@@ -1945,6 +1945,20 @@ func TestGetStagePrompt_Implement_NoFixup_OmitsWireFlag(t *testing.T) {
 	}
 }
 
+// TestResolveFixupExpectedHeadSHA_ReadErrorOmitsField: the expected-head
+// resolver is best-effort — a ListForRunByCategory failure on the
+// reported-head ledger must WARN and return "" (the runner then skips the
+// SHA comparison) rather than failing the dispatch (#967).
+func TestResolveFixupExpectedHeadSHA_ReadErrorOmitsField(t *testing.T) {
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{listErr: errors.New("audit store unavailable")},
+	})
+	if got := s.resolveFixupExpectedHeadSHA(context.Background(), uuid.New(), uuid.New()); got != "" {
+		t.Errorf("resolveFixupExpectedHeadSHA = %q, want empty on a ledger read error", got)
+	}
+}
+
 // TestGetStagePrompt_Implement_FixupDecomposedChild_SharedBranch covers the
 // decomposed-child fix-up branch form (#784): the runner routes a decomposed
 // child onto the shared parent branch fishhawk/run-<shortID(parentRunID)>, so
