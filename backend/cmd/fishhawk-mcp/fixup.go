@@ -10,15 +10,19 @@ import (
 )
 
 // FixupStageInput is the fishhawk_fixup_stage tool's input schema
-// (E22.X / #762). Mirrors `POST /v0/stages/{stage_id}/fixup`. Concerns
-// selects which recorded implement-review concerns (by their index in
-// the stage's resolved concern set, as surfaced in the implement_reviewed
-// audit entry) to route back to the agent; it must be non-empty. Reason
-// is an optional operator note recorded on the fix-up audit entry.
+// (E22.X / #762). Mirrors `POST /v0/stages/{stage_id}/fixup`.
+// ConcernIDs is the PRIMARY addressing scheme (#964): stable concern
+// UUIDs surfaced by fishhawk_get_run_status's run.concerns block.
+// Concerns (positional indices into the stage's flattened resolved
+// concern set) is DEPRECATED — ambiguous once multiple heterogeneous
+// review entries exist per stage — and only valid when ConcernIDs is
+// absent; supplying both is rejected. Reason is an optional operator
+// note recorded on the fix-up audit entry.
 type FixupStageInput struct {
-	StageID  string `json:"stage_id" jsonschema:"the Fishhawk implement stage UUID to fix up (parked at the implement-review gate, or succeeded with the run's review gate still open)"`
-	Concerns []int  `json:"concerns" jsonschema:"indices of the recorded implement-review concerns to route back to the agent; at least one required"`
-	Reason   string `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the stage_fixup_triggered audit entry"`
+	StageID    string   `json:"stage_id" jsonschema:"the Fishhawk implement stage UUID to fix up (parked at the implement-review gate, or succeeded with the run's review gate still open)"`
+	ConcernIDs []string `json:"concern_ids,omitempty" jsonschema:"PRIMARY addressing: stable concern UUIDs to route back to the agent (from fishhawk_get_run_status's run.concerns.items[].id). At least one of concern_ids/concerns required; supplying both is rejected"`
+	Concerns   []int    `json:"concerns,omitempty" jsonschema:"DEPRECATED positional fallback: indices into the stage's flattened implement-review concern set. Ambiguous when multiple review entries exist per stage — prefer concern_ids. Only valid when concern_ids is absent"`
+	Reason     string   `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the stage_fixup_triggered audit entry and as the routed concerns' state_reason"`
 	// AllowCreate declares net-new files this fix-up will create (#823).
 	AllowCreate []string `json:"allow_create,omitempty" jsonschema:"optional repo-relative paths the fix-up will CREATE; folded into the effective scope.files for THIS pass only (bounded, explicit, operator-authorized) so the runner stages them instead of failing category-B created-out-of-scope. Any created file NOT declared here still fails category-B."`
 	// ForceAdditionalPass is the bounded operator override (#860).
@@ -87,11 +91,17 @@ Applies to an implement stage in either flow:
 Inputs:
   - stage_id : the implement stage (parked at the review gate, or
     succeeded with the run's review gate still open).
-  - concerns : indices of the recorded implement-review concerns to route
-    back (at least one). The indices address the concern set in the
-    stage's implement_reviewed audit entry; inspect it via
-    fishhawk_list_audit.
-  - reason   : optional operator note, recorded on the audit entry.
+  - concern_ids : PRIMARY addressing (#964) — stable concern UUIDs to
+    route back (at least one). Read them from fishhawk_get_run_status's
+    run.concerns.items[].id (open implement-stage concerns only; a
+    plan-stage or already-resolved ID is rejected). Routed concerns are
+    marked addressed_pending in the durable concern store.
+  - concerns : DEPRECATED positional fallback — indices into the stage's
+    flattened implement_reviewed concern set. Ambiguous once multiple
+    heterogeneous review entries exist per stage; prefer concern_ids.
+    Only valid when concern_ids is absent (supplying both is rejected).
+  - reason   : optional operator note, recorded on the audit entry and
+    as the routed concerns' state_reason.
   - allow_create : optional repo-relative paths the fix-up will CREATE.
     Each declared path is folded into the effective scope.files for THIS
     pass only (bounded, explicit, operator-authorized), so the runner
@@ -128,7 +138,9 @@ pass including refunded ones.
 Returns the re-opened Stage row (pending → dispatched) on success.
 Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
-  - validation_failed (empty concerns / out-of-range index, 400)
+  - validation_failed (no concern selection / both concern_ids and
+    indices supplied / out-of-range index / unknown, foreign, plan-stage,
+    or non-open concern_id, 400)
   - cross_run_fixup (a run-bound token reaching another run's stage, 403)
   - stage_not_found (404)
   - fixup_not_applicable (no recorded approve_with_concerns verdict, or
@@ -150,10 +162,13 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, FixupStageOutput{}, fmt.Errorf("stage_id %q is not a valid UUID: %w", in.StageID, err)
 	}
-	if len(in.Concerns) == 0 {
-		return nil, FixupStageOutput{}, fmt.Errorf("concerns must select at least one recorded implement-review concern")
+	if len(in.ConcernIDs) > 0 && len(in.Concerns) > 0 {
+		return nil, FixupStageOutput{}, fmt.Errorf("supply concern_ids (stable concern UUIDs — the primary scheme) OR the deprecated positional concerns indices, not both")
 	}
-	fixed, err := r.api.FixupStage(ctx, stageID, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass)
+	if len(in.ConcernIDs) == 0 && len(in.Concerns) == 0 {
+		return nil, FixupStageOutput{}, fmt.Errorf("concern_ids must select at least one recorded implement-review concern (stable UUIDs from fishhawk_get_run_status's run.concerns block; the positional concerns field is a deprecated fallback)")
+	}
+	fixed, err := r.api.FixupStage(ctx, stageID, in.ConcernIDs, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass)
 	if err != nil {
 		return nil, FixupStageOutput{}, fmt.Errorf("fixup stage: %w", err)
 	}

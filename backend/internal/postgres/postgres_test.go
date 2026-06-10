@@ -205,11 +205,21 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0029 (#961) added the
-	// scope_amendments table; the down migration drops it. Confirm: the
+	// MigrateDown rolls back one step. 0030 (#964) added the
+	// review_concerns table; the down migration drops it. Confirm: the
 	// table is gone, but every prior migration's effect is still present
-	// (cost_usd_total + resolved_model from 0028, self_retry_count +
-	// scopes from 0027, decomposed_from from 0026, etc.).
+	// (scope_amendments from 0029, cost_usd_total + resolved_model from
+	// 0028, self_retry_count + scopes from 0027, etc.).
+	var reviewConcernsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables
+		 WHERE table_name = 'review_concerns'`,
+	).Scan(&reviewConcernsTable); err != nil {
+		t.Fatalf("query review_concerns table: %v", err)
+	}
+	if reviewConcernsTable != 0 {
+		t.Errorf("review_concerns table count after MigrateDown = %d, want 0 (0030 down dropped it)", reviewConcernsTable)
+	}
 	var scopeAmendmentsTable int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables
@@ -217,8 +227,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&scopeAmendmentsTable); err != nil {
 		t.Fatalf("query scope_amendments table: %v", err)
 	}
-	if scopeAmendmentsTable != 0 {
-		t.Errorf("scope_amendments table count after MigrateDown = %d, want 0 (0029 down dropped it)", scopeAmendmentsTable)
+	if scopeAmendmentsTable != 1 {
+		t.Errorf("scope_amendments table count after MigrateDown = %d, want 1 (0029 still applied; only 0030 rolled back)", scopeAmendmentsTable)
 	}
 	var costUSDTotalCol int
 	if err := pool.QueryRow(context.Background(),

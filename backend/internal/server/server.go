@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -160,6 +161,15 @@ type Config struct {
 	// stage runs (E22.X / #961). Wired by the /v0/runs/{id}/
 	// scope-amendments handlers; nil leaves them returning 503.
 	ScopeAmendmentRepo scopeamendment.Repository
+
+	// ConcernRepo persists the durable review-concern lifecycle
+	// behind stable concern IDs (E22.X / #964): every plan_reviewed /
+	// implement_reviewed verdict's concerns land here, fix-up routing
+	// resolves concern_ids against it, and GET /v0/runs/{id} surfaces
+	// the open set. Best-effort throughout — nil disables persistence
+	// (the audit payload remains the authoritative record) and leaves
+	// the ID-addressed fix-up path returning 503.
+	ConcernRepo concern.Repository
 
 	// AuthRepo persists users + sessions for the OAuth
 	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil

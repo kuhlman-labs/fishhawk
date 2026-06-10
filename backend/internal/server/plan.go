@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -1003,18 +1004,24 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			FreeForm:      verdict.FreeForm,
 		}
 		payloadBytes, _ := json.Marshal(payload)
-		if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 			RunID:     runID,
 			StageID:   &stageID,
 			Timestamp: time.Now().UTC(),
 			Category:  "plan_reviewed",
 			ActorKind: &systemKind,
 			Payload:   payloadBytes,
-		}); aerr != nil {
+		})
+		if aerr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: append audit entry failed",
 				slog.String("run_id", runID.String()),
 				slog.String("error", aerr.Error()),
 			)
+		} else if entry != nil {
+			// Persist the verdict's concerns with stable IDs (#964) using
+			// the sequence the append returned; a failed append (no
+			// sequence) skips persistence for this verdict.
+			s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindPlan, model, entry.Sequence, verdict.Concerns)
 		}
 
 		// Capture this reviewer invocation's agent token cost (#681). The

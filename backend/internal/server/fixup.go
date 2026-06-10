@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -58,15 +59,21 @@ const defaultMaxFixupPasses = 1
 const defaultFixupCeiling = 3
 
 // fixupRequest is the JSON body of POST /v0/stages/{stage_id}/fixup.
-// Concerns selects which recorded implement-review concerns (by their
-// index in the stage's resolved concern set) to route back to the
-// agent; it must be non-empty. Reason is an optional operator note
-// recorded on the audit entry. AllowCreate declares net-new files this
-// fix-up pass will create (#823); the paths are folded into the
-// effective scope.files for THAT dispatch only so the runner's #818
-// created-out-of-scope gate stages them rather than failing category-B.
-// Any created file NOT declared here still trips the gate.
+// ConcernIDs is the PRIMARY addressing scheme (#964): the stable
+// concern UUIDs (surfaced by GET /v0/runs/{run_id}'s concerns block) to
+// route back to the agent. Concerns (positional indices into the
+// stage's flattened resolved concern set) is DEPRECATED — with multiple
+// heterogeneous review entries per stage the flattened index is
+// ambiguous (the run-73456dc8 mis-route) — and remains only as a
+// fallback when ConcernIDs is absent; supplying both is rejected.
+// Reason is an optional operator note recorded on the audit entry.
+// AllowCreate declares net-new files this fix-up pass will create
+// (#823); the paths are folded into the effective scope.files for THAT
+// dispatch only so the runner's #818 created-out-of-scope gate stages
+// them rather than failing category-B. Any created file NOT declared
+// here still trips the gate.
 type fixupRequest struct {
+	ConcernIDs  []string `json:"concern_ids"`
 	Concerns    []int    `json:"concerns"`
 	Reason      string   `json:"reason"`
 	AllowCreate []string `json:"allow_create"`
@@ -166,11 +173,31 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if len(reqBody.Concerns) == 0 {
+	if len(reqBody.ConcernIDs) > 0 && len(reqBody.Concerns) > 0 {
+		// Mixed addressing is rejected outright: the two schemes can
+		// disagree about which concern they name, and silently preferring
+		// one would reintroduce the ambiguity stable IDs exist to remove.
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"concerns must select at least one recorded implement-review concern",
-			map[string]any{"field": "concerns"})
+			"supply concern_ids (stable concern UUIDs) OR the deprecated positional concerns indices, not both",
+			map[string]any{"field": "concern_ids"})
 		return
+	}
+	if len(reqBody.ConcernIDs) == 0 && len(reqBody.Concerns) == 0 {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"concern_ids must select at least one recorded implement-review concern (stable UUIDs from the run's concerns block; the positional concerns field is a deprecated fallback)",
+			map[string]any{"field": "concern_ids"})
+		return
+	}
+	concernIDs := make([]uuid.UUID, 0, len(reqBody.ConcernIDs))
+	for _, raw := range reqBody.ConcernIDs {
+		cid, perr := uuid.Parse(raw)
+		if perr != nil {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				fmt.Sprintf("concern_ids entry %q is not a valid UUID", raw),
+				map[string]any{"field": "concern_ids", "got": raw})
+			return
+		}
+		concernIDs = append(concernIDs, cid)
 	}
 
 	// Validate the optional allow-create paths (#823) before any state
@@ -218,30 +245,57 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Resolve the stage's recorded implement-review concerns from the
-	// implement_reviewed audit entries (approve_with_concerns verdicts),
-	// in append order. This is the set the operator's indices address.
-	concerns, err := s.resolveImplementConcerns(r.Context(), stage.RunID, stageID)
-	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"resolve implement-review concerns failed", map[string]any{"error": err.Error()})
-		return
-	}
-	if len(concerns) == 0 {
-		s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_not_applicable",
-			"stage has no recorded approve_with_concerns implement-review concerns to route back to the agent",
-			nil)
-		return
-	}
+	// Resolve the selected concerns. The primary path addresses them by
+	// stable ID against the durable concern store (#964); the deprecated
+	// fallback resolves positional indices against the flattened
+	// implement_reviewed audit-entry concern set.
+	var selected []planreview.Concern
+	if len(concernIDs) > 0 {
+		if s.cfg.ConcernRepo == nil {
+			s.writeError(w, r, http.StatusServiceUnavailable, "fixup_unconfigured",
+				"concern_ids addressing requires a configured concern repository; use the deprecated positional concerns field or configure the store",
+				nil)
+			return
+		}
+		rows, rerr := s.resolveConcernsByID(r.Context(), stage.RunID, stageID, concernIDs)
+		if rerr != nil {
+			var bad *concernSelectionError
+			if errors.As(rerr, &bad) {
+				s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+					bad.Error(), map[string]any{"field": "concern_ids"})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"resolve concern_ids failed", map[string]any{"error": rerr.Error()})
+			return
+		}
+		selected = rows
+	} else {
+		// DEPRECATED positional-index path. Flattened across every
+		// reviewer entry, so with multiple heterogeneous reviews per
+		// stage the index is ambiguous — prefer concern_ids.
+		concerns, err := s.resolveImplementConcerns(r.Context(), stage.RunID, stageID)
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"resolve implement-review concerns failed", map[string]any{"error": err.Error()})
+			return
+		}
+		if len(concerns) == 0 {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_not_applicable",
+				"stage has no recorded approve_with_concerns implement-review concerns to route back to the agent",
+				nil)
+			return
+		}
 
-	// Validate the selected indices against the resolved set and collect
-	// the selected concern objects (deduped, in selection order).
-	selected, err := selectConcerns(concerns, reqBody.Concerns)
-	if err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			err.Error(),
-			map[string]any{"field": "concerns", "available": len(concerns)})
-		return
+		// Validate the selected indices against the resolved set and collect
+		// the selected concern objects (deduped, in selection order).
+		selected, err = selectConcerns(concerns, reqBody.Concerns)
+		if err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				err.Error(),
+				map[string]any{"field": "concerns", "available": len(concerns)})
+			return
+		}
 	}
 
 	// Count prior fix-up passes for this stage to enforce the bound.
@@ -309,7 +363,22 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// Audit first so the fix-up intent (and the selected concerns the
 	// prompt renderer reads back) is recorded even if the orchestrator
 	// handoff below fails. Same posture as the retry handler.
-	s.writeFixupAudit(r, dec, selected, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses)
+	s.writeFixupAudit(r, dec, selected, concernIDs, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses)
+
+	// Mark the routed concerns addressed_pending in the durable store
+	// (#964), recording the operator's reason. AFTER the audit append so
+	// the trigger entry is the durable record; best-effort like the
+	// append — a failure warn-logs and never unwinds the committed
+	// transition.
+	if len(concernIDs) > 0 && s.cfg.ConcernRepo != nil {
+		if merr := s.cfg.ConcernRepo.MarkAddressedPending(r.Context(), concernIDs, reqBody.Reason); merr != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"fixup: mark concerns addressed_pending failed",
+				slog.String("run_id", dec.Stage.RunID.String()),
+				slog.String("stage_id", dec.Stage.ID.String()),
+				slog.String("error", merr.Error()))
+		}
+	}
 
 	// The fix-up re-open lands the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire
@@ -334,6 +403,59 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "stage_fixup")
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+}
+
+// concernSelectionError marks a concern_ids selection problem the
+// handler maps to 400 validation_failed (unknown ID, a concern from a
+// different run/stage, a plan-stage concern, or a non-open state) as
+// opposed to an infrastructure failure (500).
+type concernSelectionError struct{ msg string }
+
+func (e *concernSelectionError) Error() string { return e.msg }
+
+// resolveConcernsByID resolves stable concern UUIDs against the durable
+// concern store, scoped to the implement stage being fixed up (#964).
+// Every ID must name an implement-stage concern of THIS stage in an
+// open state — a plan-stage concern ID (surfaced by the same run-status
+// block) is rejected explicitly so it can never route into an implement
+// fix-up. Returns the selected concerns in selection order as the
+// planreview shape the audit payload and prompt renderer consume.
+func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UUID, ids []uuid.UUID) ([]planreview.Concern, error) {
+	seen := make(map[uuid.UUID]struct{}, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			return nil, &concernSelectionError{msg: fmt.Sprintf("concern_id %s selected more than once", id)}
+		}
+		seen[id] = struct{}{}
+	}
+	rows, err := s.cfg.ConcernRepo.GetByIDs(ctx, ids)
+	if err != nil {
+		if errors.Is(err, concern.ErrNotFound) {
+			return nil, &concernSelectionError{msg: fmt.Sprintf("unknown concern_id: %s", err.Error())}
+		}
+		return nil, fmt.Errorf("get concerns by id: %w", err)
+	}
+	out := make([]planreview.Concern, 0, len(rows))
+	for _, c := range rows {
+		if c.StageKind != concern.StageKindImplement {
+			return nil, &concernSelectionError{msg: fmt.Sprintf(
+				"concern_id %s is a %s-stage concern; only implement-stage concerns can be routed into an implement fix-up", c.ID, c.StageKind)}
+		}
+		if c.RunID != runID || c.StageID != stageID {
+			return nil, &concernSelectionError{msg: fmt.Sprintf(
+				"concern_id %s belongs to a different run/stage than the fix-up target", c.ID)}
+		}
+		if !c.State.IsOpen() {
+			return nil, &concernSelectionError{msg: fmt.Sprintf(
+				"concern_id %s is not open (state %s); only raised/addressed_pending/reopened concerns can be routed", c.ID, c.State)}
+		}
+		out = append(out, planreview.Concern{
+			Severity: planreview.ConcernSeverity(c.Severity),
+			Category: c.Category,
+			Note:     c.Note,
+		})
+	}
+	return out, nil
 }
 
 // resolveImplementConcerns gathers the stage's recorded implement-
@@ -429,13 +551,14 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 }
 
 // writeFixupAudit appends a stage_fixup_triggered entry capturing the
-// selected concern indices, the resolved concern objects (so the prompt
-// renderer delivers them as binding instructions), the operator reason,
-// the declared allow-create paths (#823, folded into the effective
-// scope.files for the fix-up dispatch), and the bounded-pass receipt
-// fields. Best-effort: the transition is already committed, so a failure
-// here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int) {
+// routed stable concern IDs (#964, the primary addressing scheme) or
+// the deprecated selected indices, the resolved concern objects (so the
+// prompt renderer delivers them as binding instructions), the operator
+// reason, the declared allow-create paths (#823, folded into the
+// effective scope.files for the fix-up dispatch), and the bounded-pass
+// receipt fields. Best-effort: the transition is already committed, so
+// a failure here logs but doesn't unwind.
+func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -454,9 +577,14 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 		// because the operator forced it (#860).
 		admissibilityReason += "; operator-forced override"
 	}
+	routedIDs := make([]string, 0, len(concernIDs))
+	for _, id := range concernIDs {
+		routedIDs = append(routedIDs, id.String())
+	}
 	fields := map[string]any{
 		"stage_id":             dec.Stage.ID.String(),
 		"prior_state":          string(dec.PriorState),
+		"concern_ids":          routedIDs,
 		"selected_indices":     indices,
 		"concerns":             selected,
 		"reason":               reason,

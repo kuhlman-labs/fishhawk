@@ -229,6 +229,17 @@ func TestReviewActionHintFor(t *testing.T) {
 			if !strings.Contains(hint.Message, "fishhawk_fixup_stage") && !strings.Contains(hint.Message, "fresh run") {
 				t.Errorf("Message should reference fishhawk_fixup_stage or a fresh run; got %q", hint.Message)
 			}
+			// #964: when the hint points at a fix-up it must steer the
+			// operator at stable concern_ids (the primary addressing
+			// scheme), never the deprecated positional indices.
+			if strings.Contains(hint.Message, "fishhawk_fixup_stage") {
+				if !strings.Contains(hint.Message, "concern_ids") {
+					t.Errorf("Message should point at concern_ids addressing; got %q", hint.Message)
+				}
+				if strings.Contains(hint.Message, "concern indices") {
+					t.Errorf("Message still points at deprecated positional indices; got %q", hint.Message)
+				}
+			}
 		})
 	}
 }

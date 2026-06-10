@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1034,5 +1037,424 @@ func TestFixupStage_MCPTokenMismatchedRunReturns403(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "cross_run_fixup") {
 		t.Errorf("body missing cross_run_fixup code: %s", w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stable concern-ID addressing (#964)
+// ---------------------------------------------------------------------------
+
+// seqAuditFake wraps auditFake to stamp a monotonically increasing
+// sequence on the entry AppendChained returns, mirroring the Postgres
+// repository's RETURNING contract. The review loops persist concern
+// rows with origin_review_sequence taken from that returned entry, so
+// tests asserting the sequence threading need real values here.
+type seqAuditFake struct {
+	*auditFake
+	nextSeq int64
+	entries []*audit.Entry
+}
+
+func newSeqAuditFake() *seqAuditFake {
+	return &seqAuditFake{auditFake: newAuditFake(), nextSeq: 100}
+}
+
+func (a *seqAuditFake) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	e, err := a.auditFake.AppendChained(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.nextSeq++
+	e.Sequence = a.nextSeq
+	e.Category = p.Category
+	e.StageID = p.StageID
+	e.Payload = p.Payload
+	a.entries = append(a.entries, e)
+	return e, nil
+}
+
+// entriesByCategory returns the sequence-stamped entries of one category
+// in append order.
+func (a *seqAuditFake) entriesByCategory(cat string) []*audit.Entry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []*audit.Entry
+	for _, e := range a.entries {
+		if e.Category == cat {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// fakeConcernRepo is an in-memory concern.Repository for handler tests.
+// State transitions run through the real concern.Transition machine so
+// the fake cannot drift from the production lifecycle rules. The
+// Postgres adapter is exercised separately in
+// backend/internal/concern/postgres_test.go via testcontainers.
+type fakeConcernRepo struct {
+	mu        sync.Mutex
+	rows      []*concern.Concern
+	insertErr error
+	listErr   error
+}
+
+func newFakeConcernRepo() *fakeConcernRepo { return &fakeConcernRepo{} }
+
+func (f *fakeConcernRepo) InsertRaised(_ context.Context, p concern.InsertRaisedParams) ([]*concern.Concern, error) {
+	if f.insertErr != nil {
+		return nil, f.insertErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var rm *string
+	if p.ReviewerModel != "" {
+		m := p.ReviewerModel
+		rm = &m
+	}
+	out := make([]*concern.Concern, 0, len(p.Concerns))
+	for _, c := range p.Concerns {
+		row := &concern.Concern{
+			ID:                   uuid.New(),
+			RunID:                p.RunID,
+			StageID:              p.StageID,
+			StageKind:            p.StageKind,
+			OriginReviewSequence: p.OriginReviewSequence,
+			ReviewerModel:        rm,
+			Severity:             c.Severity,
+			Category:             c.Category,
+			Note:                 c.Note,
+			State:                concern.StateRaised,
+		}
+		f.rows = append(f.rows, row)
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func (f *fakeConcernRepo) GetByIDs(_ context.Context, ids []uuid.UUID) ([]*concern.Concern, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*concern.Concern, 0, len(ids))
+	for _, id := range ids {
+		var found *concern.Concern
+		for _, row := range f.rows {
+			if row.ID == id {
+				found = row
+				break
+			}
+		}
+		if found == nil {
+			return nil, fmt.Errorf("%w: %s", concern.ErrNotFound, id)
+		}
+		out = append(out, found)
+	}
+	return out, nil
+}
+
+func (f *fakeConcernRepo) ListByRun(_ context.Context, runID uuid.UUID) ([]*concern.Concern, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*concern.Concern
+	for _, row := range f.rows {
+		if row.RunID == runID {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeConcernRepo) ListOpenByRun(_ context.Context, runID uuid.UUID) ([]*concern.Concern, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*concern.Concern
+	for _, row := range f.rows {
+		if row.RunID == runID && row.State.IsOpen() {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeConcernRepo) MarkAddressedPending(ctx context.Context, ids []uuid.UUID, reason string) error {
+	rows, err := f.GetByIDs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, row := range rows {
+		if row.State == concern.StateAddressedPending {
+			continue
+		}
+		if err := concern.Transition(row.State, concern.StateAddressedPending); err != nil {
+			return err
+		}
+		row.State = concern.StateAddressedPending
+		row.StateReason = reason
+	}
+	return nil
+}
+
+func (f *fakeConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to concern.State, reason string) (*concern.Concern, error) {
+	rows, err := f.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := rows[0]
+	if err := concern.Transition(row.State, to); err != nil {
+		return nil, err
+	}
+	row.State = to
+	row.StateReason = reason
+	return row, nil
+}
+
+// seedConcernRow inserts one concern row directly, returning it.
+func seedConcernRow(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, stageKind string, seq int64, note string) *concern.Concern {
+	t.Helper()
+	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID:                runID,
+		StageID:              stageID,
+		StageKind:            stageKind,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: seq,
+		Concerns:             []concern.RaisedConcern{{Severity: "medium", Category: "scope", Note: note}},
+	})
+	if err != nil {
+		t.Fatalf("seed concern: %v", err)
+	}
+	return rows[0]
+}
+
+// fixupServerWithConcerns is fixupServer plus a wired concern store, for
+// the stable-ID addressing path (#964).
+func fixupServerWithConcerns(t *testing.T) (*Server, *approvalRunRepo, *auditFake, *fakeConcernRepo) {
+	t.Helper()
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     repo,
+		AuditRepo:   au,
+		ConcernRepo: cr,
+	})
+	return s, repo, au, cr
+}
+
+// TestFixupStage_ConcernIDs_RoutesExactConcern is the run-73456dc8
+// mis-route regression: with concerns persisted from TWO review entries,
+// addressing one from the SECOND entry by stable ID flips exactly that
+// concern to addressed_pending — a flattened positional index 0 would
+// have resolved into the first entry's set.
+func TestFixupStage_ConcernIDs_RoutesExactConcern(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	first := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "first reviewer's concern")
+	second := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 102, "second reviewer's concern")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs: []string{second.ID.String()},
+		Reason:     "address the second entry's concern",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// Exactly the addressed concern flips addressed_pending with the
+	// operator reason; the other stays raised.
+	if second.State != concern.StateAddressedPending {
+		t.Errorf("second.State = %q, want addressed_pending", second.State)
+	}
+	if second.StateReason != "address the second entry's concern" {
+		t.Errorf("second.StateReason = %q", second.StateReason)
+	}
+	if first.State != concern.StateRaised {
+		t.Errorf("first.State = %q, want raised (untouched)", first.State)
+	}
+
+	// The audit payload records the routed stable ID alongside the
+	// embedded concern copy the prompt renderer reads back.
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	ids, ok := payload["concern_ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != second.ID.String() {
+		t.Errorf("payload.concern_ids = %v, want [%s]", payload["concern_ids"], second.ID)
+	}
+	concerns, ok := payload["concerns"].([]any)
+	if !ok || len(concerns) != 1 {
+		t.Fatalf("payload.concerns = %v, want one resolved concern", payload["concerns"])
+	}
+	if note := concerns[0].(map[string]any)["note"]; note != "second reviewer's concern" {
+		t.Errorf("resolved concern note = %v, want the second entry's", note)
+	}
+}
+
+// TestFixupStage_ConcernIDs_BothFormsRejected pins mixed addressing as
+// validation_failed: silently preferring one form would reintroduce the
+// ambiguity stable IDs remove.
+func TestFixupStage_ConcernIDs_BothFormsRejected(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	c := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "concern")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs: []string{c.ID.String()},
+		Concerns:   []int{0},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "validation_failed") {
+		t.Errorf("body missing validation_failed code: %s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0 (validation precedes any state change)", len(au.appended))
+	}
+	if c.State != concern.StateRaised {
+		t.Errorf("concern state = %q, want raised (untouched)", c.State)
+	}
+}
+
+// TestFixupStage_ConcernIDs_PlanStageConcernRejected is the binding
+// approval-condition case: a plan-stage concern UUID surfaced by the
+// same run-status block must NEVER route into an implement fix-up — the
+// stage_kind/stage_id mismatch is validation_failed, explicitly.
+func TestFixupStage_ConcernIDs_PlanStageConcernRejected(t *testing.T) {
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	planStageID := uuid.New()
+	planConcern := seedConcernRow(t, cr, stage.RunID, planStageID, concern.StageKindPlan, 50, "plan-stage concern")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{planConcern.ID.String()}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "validation_failed") {
+		t.Errorf("body missing validation_failed code: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "plan-stage concern") {
+		t.Errorf("body should name the plan-stage mismatch explicitly: %s", w.Body.String())
+	}
+	if planConcern.State != concern.StateRaised {
+		t.Errorf("plan concern state = %q, want raised (untouched)", planConcern.State)
+	}
+}
+
+// TestFixupStage_ConcernIDs_ForeignStageRejected covers an implement
+// concern belonging to a DIFFERENT stage of the run.
+func TestFixupStage_ConcernIDs_ForeignStageRejected(t *testing.T) {
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	otherStageID := uuid.New()
+	foreign := seedConcernRow(t, cr, stage.RunID, otherStageID, concern.StageKindImplement, 60, "another stage's concern")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{foreign.ID.String()}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "different run/stage") {
+		t.Errorf("body should name the run/stage mismatch: %s", w.Body.String())
+	}
+}
+
+func TestFixupStage_ConcernIDs_UnknownIDRejected(t *testing.T) {
+	s, repo, _, _ := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{uuid.New().String()}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "unknown concern_id") {
+		t.Errorf("body should report the unknown id: %s", w.Body.String())
+	}
+}
+
+func TestFixupStage_ConcernIDs_MalformedUUIDRejected(t *testing.T) {
+	s, repo, _, _ := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{"not-a-uuid"}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestFixupStage_ConcernIDs_NonOpenRejected: a concern already resolved
+// (addressed) cannot be routed again.
+func TestFixupStage_ConcernIDs_NonOpenRejected(t *testing.T) {
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	c := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 70, "resolved concern")
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{c.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	if _, err := cr.ApplyResolution(context.Background(), c.ID, concern.StateAddressed, "confirmed"); err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{c.ID.String()}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "not open") {
+		t.Errorf("body should report the non-open state: %s", w.Body.String())
+	}
+}
+
+// TestFixupStage_ConcernIDs_NoRepo503: the ID path needs the concern
+// store; without one the handler refuses rather than silently falling
+// back to positional resolution.
+func TestFixupStage_ConcernIDs_NoRepo503(t *testing.T) {
+	s, repo, au := fixupServer(t) // no ConcernRepo wired
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{uuid.New().String()}})
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_unconfigured") {
+		t.Errorf("body missing fixup_unconfigured code: %s", w.Body.String())
+	}
+}
+
+// TestFixupStage_LegacyIndices_StillWork pins the deprecated positional
+// path: indices alone resolve against the audit-entry concern set even
+// with a concern store wired, and no concern row is touched (positional
+// routing predates stable IDs and has no ID to mark).
+func TestFixupStage_LegacyIndices_StillWork(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+	c := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 80, "stored concern")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, Reason: "legacy path"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if c.State != concern.StateRaised {
+		t.Errorf("stored concern state = %q, want raised (legacy path never marks rows)", c.State)
 	}
 }

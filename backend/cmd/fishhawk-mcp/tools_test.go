@@ -3801,3 +3801,62 @@ func TestGetRunStatus_OmitsBudgetWhenNoBudget(t *testing.T) {
 		t.Errorf("expected no budget block; got %+v", out.Budget)
 	}
 }
+
+// TestGetRunStatus_ConcernsBlock_PropagatesEndToEnd (#964, cf. #618):
+// the backend run row's concerns block — open count, by_state, and the
+// stable concern IDs fixup's concern_ids addressing needs — must cross
+// the real HTTP + JSON-decode path into the tool output, not just exist
+// as a struct field.
+func TestGetRunStatus_ConcernsBlock_PropagatesEndToEnd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	concernID := uuid.NewString()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change",
+		State: "running",
+		Concerns: &RunConcerns{
+			Open:    2,
+			ByState: map[string]int{"raised": 1, "addressed_pending": 1},
+			Items: []RunConcernItem{
+				{ID: concernID, StageKind: "implement", Severity: "medium", Category: "scope", State: "raised"},
+				{ID: uuid.NewString(), StageKind: "plan", Severity: "low", Category: "verification", State: "addressed_pending"},
+			},
+		},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	got := out.Run.Concerns
+	if got == nil {
+		t.Fatal("Run.Concerns = nil, want the decoded block")
+	}
+	if got.Open != 2 {
+		t.Errorf("Open = %d, want 2", got.Open)
+	}
+	if got.ByState["raised"] != 1 || got.ByState["addressed_pending"] != 1 {
+		t.Errorf("ByState = %v", got.ByState)
+	}
+	if len(got.Items) != 2 || got.Items[0].ID != concernID || got.Items[0].StageKind != "implement" {
+		t.Errorf("Items = %+v, want the stable IDs decoded through", got.Items)
+	}
+}
+
+// TestGetRunStatus_NoConcernsBlock_NilField: a run with no open concerns
+// (backend omits the key) decodes to a nil pointer, never a zero block.
+func TestGetRunStatus_NoConcernsBlock_NilField(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Run.Concerns != nil {
+		t.Errorf("Run.Concerns = %+v, want nil when the backend omits the block", out.Run.Concerns)
+	}
+}

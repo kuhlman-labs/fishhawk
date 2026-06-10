@@ -251,3 +251,83 @@ func TestFixupStage_CrossRun_PropagatesAs403(t *testing.T) {
 		t.Errorf("err = %v, want cross_run_fixup", err)
 	}
 }
+
+// --- stable concern-ID addressing (#964) ---
+
+func TestFixupStage_ConcernIDs_ThreadIntoBody(t *testing.T) {
+	// concern_ids (the PRIMARY addressing scheme) must reach the backend
+	// request body verbatim, with the deprecated indices field absent.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	fb.fixupResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: uuid.NewString(),
+		Type:  "implement",
+		State: "pending",
+	}
+	id1, id2 := uuid.NewString(), uuid.NewString()
+
+	_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:    stageID.String(),
+		ConcernIDs: []string{id1, id2},
+		Reason:     "route both by stable id",
+	})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if out.Stage.State != "pending" {
+		t.Errorf("State = %q, want pending", out.Stage.State)
+	}
+	if !reflect.DeepEqual(fb.fixupBody.ConcernIDs, []string{id1, id2}) {
+		t.Errorf("body concern_ids = %v, want [%s %s]", fb.fixupBody.ConcernIDs, id1, id2)
+	}
+	if len(fb.fixupBody.Concerns) != 0 {
+		t.Errorf("body concerns = %v, want absent on the ID path", fb.fixupBody.Concerns)
+	}
+}
+
+func TestFixupStage_BothAddressingForms_FailsLocally(t *testing.T) {
+	// Mixed addressing short-circuits before the HTTP hop with the
+	// deprecation messaging: concern_ids is primary, indices deprecated.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:    uuid.NewString(),
+		ConcernIDs: []string{uuid.NewString()},
+		Concerns:   []int{0},
+	})
+	if err == nil {
+		t.Fatal("expected validation error for mixed addressing")
+	}
+	if !strings.Contains(err.Error(), "not both") {
+		t.Errorf("err = %v, want both-forms rejection", err)
+	}
+	if !strings.Contains(err.Error(), "deprecated") {
+		t.Errorf("err = %v, want the deprecation called out", err)
+	}
+	if len(fb.fixupCalledByID) != 0 {
+		t.Errorf("backend fixup called %d times, want 0", len(fb.fixupCalledByID))
+	}
+}
+
+func TestFixupStage_NeitherAddressingForm_MessagePointsAtConcernIDs(t *testing.T) {
+	// The empty-selection error steers the operator at concern_ids (the
+	// primary scheme) and names the positional field as deprecated.
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID: uuid.NewString(),
+	})
+	if err == nil {
+		t.Fatal("expected validation error for no concern selection")
+	}
+	if !strings.Contains(err.Error(), "concern_ids") {
+		t.Errorf("err = %v, want concern_ids named as the primary scheme", err)
+	}
+	if !strings.Contains(err.Error(), "deprecated") {
+		t.Errorf("err = %v, want the positional fallback marked deprecated", err)
+	}
+}
