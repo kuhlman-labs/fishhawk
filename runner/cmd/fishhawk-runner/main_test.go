@@ -6802,6 +6802,36 @@ func verifiedTreeCfg(repo, verifyCmd string) config {
 	}
 }
 
+// unresolvableTreeVerifyCmd returns a verify command that PASSES (exit 0) but
+// leaves the throwaway commit's tree unresolvable in the main repo: running in
+// the gate's isolated worktree (shared object store), it soft-resets the main
+// repo's HEAD off the throwaway commit FIRST (so the gate's own post-verify
+// reset still resolves HEAD~1 — the fixture needs two base commits for that
+// second step back) and then deletes the throwaway commit's loose object, so
+// the gate's fail-closed gitRevParseTreeOf(headSHA) capture errors after a
+// real pass — the outcome=="passed" && treeErr != nil branch (#960 approval
+// condition).
+func unresolvableTreeVerifyCmd(repo string) string {
+	return fmt.Sprintf(
+		`sha=$(git rev-parse HEAD) && git -C %q reset --soft HEAD~1 && rm -f %q/.git/objects/$(printf %%s "$sha" | cut -c1-2)/$(printf %%s "$sha" | cut -c3-)`,
+		repo, repo)
+}
+
+// addSecondBaseCommit commits one extra tracked file on top of the fixture's
+// base WITHOUT staging the dirty in-scope edit, so a repo whose HEAD was
+// already soft-reset once by unresolvableTreeVerifyCmd still has a parent for
+// the gate's own reset --soft HEAD~1.
+func addSecondBaseCommit(t *testing.T, repo string) {
+	t.Helper()
+	mustWrite(t, filepath.Join(repo, "extra.txt"), "second base commit\n")
+	for _, args := range [][]string{{"add", "extra.txt"}, {"commit", "-m", "second base commit"}} {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
 // moveBareMain advances the bare remote's main by one commit made in a side
 // clone — the "origin/<base> moved between gate and push" shape that makes
 // FreshFetchBase produce a pushed tree the gates never saw.
@@ -7114,6 +7144,131 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	}
 	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
 		t.Errorf("run branch %s missing from the bare remote on the no-op path: %v", branch, rerr)
+	}
+}
+
+// TestRunVerifyGateCommitted_PassedButUnresolvableTree_FailsClosed exercises
+// the single-shot gate's fail-closed branch (#960 approval condition): the
+// verify command PASSES but the throwaway commit's tree can no longer be
+// resolved (outcome=="passed" && treeErr != nil), which must return
+// ErrPushedTreeNotVerified — never the silent empty-tree downgrade that would
+// disable the pre-push invariant for a gate that DID pass.
+func TestRunVerifyGateCommitted_PassedButUnresolvableTree_FailsClosed(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	addSecondBaseCommit(t, repo)
+	cfg := verifiedTreeCfg(repo, unresolvableTreeVerifyCmd(repo))
+	_, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
+	}
+	if tree != "" {
+		t.Errorf("fail-closed gate must return an empty verified tree, got %q", tree)
+	}
+}
+
+// TestRunVerifyFixLoop_PassedButUnresolvableTree_FailsClosed is the fix-loop
+// twin: a passing iteration whose verified tree cannot be resolved aborts the
+// loop hard with ErrPushedTreeNotVerified (fatalErr path) instead of
+// returning passed-with-no-enforcement.
+func TestRunVerifyFixLoop_PassedButUnresolvableTree_FailsClosed(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	addSecondBaseCommit(t, repo)
+	cfg := verifiedTreeCfg(repo, unresolvableTreeVerifyCmd(repo))
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
+	}
+	if reinvoked {
+		t.Error("the verify passed, so the fail-closed abort must not have reinvoked the agent")
+	}
+	if tree != "" {
+		t.Errorf("fail-closed fix loop must return an empty verified tree, got %q", tree)
+	}
+}
+
+// TestOpenPRAndShipArtifact_UnresolvableStagedTree_FailsClosed exercises the
+// pre-push hook's terr != nil arm (#960 approval condition): a committed-tree
+// gate passed (non-empty verifiedTreeSHA), but the REAL staged commit's tree
+// cannot be resolved — the push must be blocked with ErrPushedTreeNotVerified,
+// never attempted with an unprovable tree. CommitAndPush resolves HEAD^{tree}
+// itself before invoking the hook, so the only way the hook's own rev-parse
+// can fail is the commit object vanishing in between — forced here via a
+// post-checkout git hook fired by the compile gate's isolated `git worktree
+// add` (the single script-execution point between the two rev-parses), which
+// deletes the just-committed object. The hook no-ops for main-repo checkouts
+// (FreshFetchBase's checkout -b) so only the worktree-add trigger fires.
+func TestOpenPRAndShipArtifact_UnresolvableStagedTree_FailsClosed(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, gerr := cmd.CombinedOutput(); gerr != nil {
+			t.Fatalf("git %v: %v\n%s", args, gerr, out)
+		}
+	}
+
+	// The compile gate only worktree-adds when drift is non-empty AND go.work
+	// exists, so commit both to the base (and push: FreshFetchBase cuts the
+	// run branch from origin/main) plus an out-of-scope edit to b.txt as the
+	// tracked-modified drift (untracked drift would trip the more specific
+	// created-out-of-scope gate first).
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.22\n")
+	mustWrite(t, filepath.Join(repo, "b.txt"), "tracked base\n")
+	runGit("add", "go.work", "b.txt")
+	runGit("commit", "-m", "gate fixture: go.work + tracked b.txt")
+	runGit("push", "origin", "main")
+	mustWrite(t, filepath.Join(repo, "b.txt"), "out-of-scope edit\n")
+
+	repoReal, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := fmt.Sprintf(`#!/bin/sh
+[ "$(pwd -P)" = %q ] && exit 0
+sha="$2"
+rm -f %q/.git/objects/$(printf %%s "$sha" | cut -c1-2)/$(printf %%s "$sha" | cut -c3-)
+exit 0
+`, repoReal, repo)
+	runGit("config", "core.hooksPath", ".git/hooks")
+	if err := os.WriteFile(filepath.Join(repo, ".git", "hooks", "post-checkout"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any non-empty verifiedTreeSHA arms the invariant; the base tree stands
+	// in for a gate pass (running the real gate here would fire the hook on
+	// the gate's own worktree add and fail-close there instead).
+	verifiedTree, err := gitRevParseTreeOf(context.Background(), repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, verifiedTree)
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Fatalf("err = %v, want ErrPushedTreeNotVerified\n%s", err, logSink.String())
+	}
+	// The mismatch/re-verify path wraps the same sentinel — pin THIS arm:
+	// the unresolvable-tree error reports before any tree comparison.
+	if !strings.Contains(err.Error(), "could not be resolved") {
+		t.Errorf("err = %v, want the unresolvable-staged-tree arm (\"could not be resolved\")", err)
+	}
+	if strings.Contains(logSink.String(), `"event":"verified_tree_mismatch"`) {
+		t.Errorf("an unresolvable tree must fail before the mismatch comparison:\n%s", logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run after a blocked push")
+	}
+	// No ref may have reached the bare remote — origin untouched.
+	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
 	}
 }
 
