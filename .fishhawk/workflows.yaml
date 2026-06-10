@@ -126,7 +126,11 @@ workflows:
         produces:
           - artifact: pull_request
         constraints:
-          - max_files_changed: 30
+          # Raised 30 -> 45 (2026-06-10): run 575e6a74 (#964/PR #982) failed
+          # category-B at 32 files on a plan the gate had approved with a
+          # 32-file scope — the cap lagged real feature sizes. Plan-gate
+          # coherence pre-check (scope.files vs this cap) tracked separately.
+          - max_files_changed: 45
           - forbidden_paths:
               - ".github/workflows/**"
               - ".fishhawk/**"
