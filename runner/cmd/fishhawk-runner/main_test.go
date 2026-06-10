@@ -5386,6 +5386,302 @@ func TestRun_VerifyFixLoop_TransientFixInvokeError_RetriesWithoutBudgetBurn(t *t
 	assertVerifySummary(t, events, "passed", 2, 2)
 }
 
+// The two VERBATIM #972 verify-gate failure outputs (operator-binding plan
+// condition): the matcher must hold against the real observed text, not an
+// abbreviation, so a testcontainers-go wording change fails this test instead
+// of silently dropping coverage.
+//
+// flakeOutputApproval is the approval-package failure observed in the
+// dogfood verify gate on 2026-06-10 ~10:11 (#972 bullet 1; captured from the
+// gate's verify_run trace event, run 73456dc8).
+const flakeOutputApproval = `ok  	github.com/kuhlman-labs/fishhawk/backend/internal/anthropic	3.988s
+ok  	github.com/kuhlman-labs/fishhawk/backend/internal/apitoken	19.693s
+?   	github.com/kuhlman-labs/fishhawk/backend/internal/apitoken/db	[no test files]
+--- FAIL: TestPostgres_Submit_Idempotent (63.27s)
+    postgres_test.go:135: start postgres: run postgres: generic container: start container: started hook: wait until ready: mapped port: check target: retries: 9, port: "invalid port", last err: get state: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.54/containers/dd45dc0863d386b8e4a5e6a6a0829b4be99e4b5da54e667a192f6a142dfe5baf/json": context deadline exceeded
+FAIL
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/approval	75.415s
+?   	github.com/kuhlman-labs/fishhawk/backend/internal/approval/db	[no test files]
+ok  	github.com/kuhlman-labs/fishhawk/backend/internal/artifact	12.374s`
+
+// flakeOutputAudit is the audit-package failure observed in run 1cef465f's
+// implement verify gate on 2026-06-10 ~12:06 (#972 bullet 2; captured from
+// the failed iteration's verify_run trace event / stage_retried prior_reason).
+const flakeOutputAudit = `ok  	github.com/kuhlman-labs/fishhawk/backend/internal/artifact	12.811s
+?   	github.com/kuhlman-labs/fishhawk/backend/internal/artifact/db	[no test files]
+--- FAIL: TestPostgres_ListAll_MixesBothChainsTimeDesc (63.19s)
+    postgres_test.go:740: start postgres: run postgres: generic container: start container: started hook: wait until ready: mapped port: check target: retries: 9, port: "invalid port", last err: get state: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.54/containers/a2d7f90285ac6d9be2e47ff50c4071c39f30cb2ba15f8600e2feaac1cbbf1625/json": context deadline exceeded
+FAIL
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/audit	111.660s
+?   	github.com/kuhlman-labs/fishhawk/backend/internal/audit/db	[no test files]`
+
+func TestIsTestcontainersStartFlake(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"verbatim #972 approval-package failure", flakeOutputApproval, true},
+		{"verbatim #972 audit-package failure", flakeOutputAudit, true},
+		{"ordinary assertion failure", "--- FAIL: TestGet (0.00s)\n    reg_test.go:7: Get(x) = 0, want 42\nFAIL\nFAIL\texample.com/mod\t0.012s\nFAIL", false},
+		{"deadline without container marker", "--- FAIL: TestFetch (30.00s)\n    fetch_test.go:42: Get \"http://example.com/api\": context deadline exceeded\nFAIL", false},
+		{"container marker without deadline", "--- FAIL: TestStart (5.00s)\n    main_test.go:10: failed to start container: image not found\nFAIL", false},
+		{"empty output", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTestcontainersStartFlake(tt.output); got != tt.want {
+				t.Errorf("isTestcontainersStartFlake(...) = %v, want %v\noutput:\n%s", got, tt.want, tt.output)
+			}
+		})
+	}
+}
+
+// flakeEchoLine is the signature line the scripted verify commands below emit
+// to simulate a testcontainers start-timeout failure. It carries the same
+// marker set as the verbatim #972 outputs.
+const flakeEchoLine = `wait until ready: mapped port: check target: retries: 9, port: "invalid port", last err: get state: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.54/containers/x/json": context deadline exceeded`
+
+// flakeThenPassVerifyCmd writes a verify script that emits the testcontainers
+// flake signature and exits non-zero on its FIRST invocation (sentinel file
+// outside the worktree), then runs the real module tests on every later
+// invocation — the minimal reproduction of a one-shot infra flake.
+func flakeThenPassVerifyCmd(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "flaked")
+	script := filepath.Join(dir, "verify.sh")
+	mustWrite(t, script, "#!/bin/sh\n"+
+		"if [ ! -e "+sentinel+" ]; then\n"+
+		"  : > "+sentinel+"\n"+
+		"  echo '"+flakeEchoLine+"'\n"+
+		"  exit 1\n"+
+		"fi\n"+
+		"cd mod && go test ./...\n")
+	return "sh " + script
+}
+
+// TestRun_VerifyFixLoop_InfraFlakeRetry_NoBudgetBurn is the #972 fix-loop
+// case: the first committed-tree verify fails with the testcontainers
+// start-timeout signature; the loop re-runs the verify ONCE in place and it
+// passes. The flake must NOT invoke the fix agent and must NOT consume a
+// verifyMaxIterations unit, and it must be RECORDED as a
+// verify_infra_flake_retry trace event + log line, never swallowed.
+func TestRun_VerifyFixLoop_InfraFlakeRetry_NoBudgetBurn(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	// The scope tree is green from the start — the only failure is the flake.
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       flakeThenPassVerifyCmd(t),
+		VerifyMaxIterations: 1,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// ZERO fix-agent invocations: the flake retry is verify-only.
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (initial only — no fix re-invoke on a flake)", invoker.callIdx)
+	}
+	if fp.gotArgs == nil {
+		t.Error("CommitAndPush should run after the absorbed flake")
+	}
+	if fpr.gotArgs == nil {
+		t.Error("OpenPR should run after the absorbed flake")
+	}
+
+	events := readBundleEvents(t, bundlePath)
+	verifyRuns, flakeRetries := 0, 0
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			verifyRuns++
+		case "verify_infra_flake_retry":
+			flakeRetries++
+		}
+	}
+	if verifyRuns != 2 {
+		t.Errorf("verify_run events = %d, want 2 (flaked + retried)", verifyRuns)
+	}
+	if flakeRetries != 1 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 1 (recorded, not swallowed)", flakeRetries)
+	}
+	if !strings.Contains(stderr.String(), "verify_infra_flake_retry") {
+		t.Errorf("missing verify_infra_flake_retry log line:\n%s", stderr.String())
+	}
+	// Budget NOT burned: 2 verify attempts against max_iterations=1, passed.
+	assertVerifySummary(t, events, "passed", 2, 1)
+}
+
+// TestRun_VerifyFixLoop_PersistentInfraFlake_FallsThroughToFixLoop: the flake
+// absorb is once-per-stage. A verify that keeps failing with the flake
+// signature gets exactly ONE in-place retry, then proceeds into the normal
+// fix loop and, on exhaustion, still fails category-A with the captured
+// output — a persistent "flake" is treated as a real failure.
+func TestRun_VerifyFixLoop_PersistentInfraFlake_FallsThroughToFixLoop(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	// Verify ALWAYS fails with the flake signature.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "verify.sh")
+	mustWrite(t, script, "#!/bin/sh\necho '"+flakeEchoLine+"'\nexit 1\n")
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "sh " + script,
+		VerifyMaxIterations: 1,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("expected category-A terminal demotion after the once-only absorb:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "context deadline exceeded") {
+		t.Errorf("failure reason must carry the captured verify output:\n%s", stderr.String())
+	}
+	// Initial + exactly one fix re-invoke: the absorb spent its one retry,
+	// then the normal fix loop ran its single budgeted iteration.
+	if invoker.callIdx != 2 {
+		t.Errorf("Invoke call count = %d, want 2 (initial + 1 fix)", invoker.callIdx)
+	}
+	if fp.gotArgs != nil {
+		t.Error("CommitAndPush must not run after a terminal verify-fix exhaustion")
+	}
+
+	events := readBundleEvents(t, bundlePath)
+	flakeRetries := 0
+	for _, ev := range events {
+		if ev.Kind == "verify_infra_flake_retry" {
+			flakeRetries++
+		}
+	}
+	if flakeRetries != 1 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 1 (once-per-stage bound)", flakeRetries)
+	}
+	// 3 verify attempts: flaked + absorbed retry + post-fix iteration.
+	assertVerifySummary(t, events, "failed", 3, 1)
+}
+
+// TestRun_VerifyGateCommitted_InfraFlakeRetry_PassProceeds is the #972
+// single-shot (#802, max_iterations==0) case: a failed verify whose output
+// matches the flake signature is re-run once against the same throwaway
+// commit; the retry passes, the gate returns a verified tree, and the push
+// proceeds — no ErrCommittedTestsFailed demotion.
+func TestRun_VerifyGateCommitted_InfraFlakeRetry_PassProceeds(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       flakeThenPassVerifyCmd(t),
+		VerifyMaxIterations: 0, // single-shot committed gate (#802)
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK (flake absorbed, no ErrCommittedTestsFailed):\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Error("CommitAndPush should run after the absorbed flake")
+	}
+	if fpr.gotArgs == nil {
+		t.Error("OpenPR should run after the absorbed flake")
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (single-shot, no re-invoke)", invoker.callIdx)
+	}
+
+	events := readBundleEvents(t, bundlePath)
+	verifyRuns, flakeRetries := 0, 0
+	var sawFailed, sawPassed bool
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			verifyRuns++
+			if strings.Contains(string(ev.Data), `"outcome":"failed"`) {
+				sawFailed = true
+			}
+			if strings.Contains(string(ev.Data), `"outcome":"passed"`) {
+				sawPassed = true
+			}
+		case "verify_infra_flake_retry":
+			flakeRetries++
+		}
+	}
+	if verifyRuns != 2 {
+		t.Errorf("verify_run events = %d, want 2 (flaked + retried)", verifyRuns)
+	}
+	if flakeRetries != 1 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 1", flakeRetries)
+	}
+	if !sawFailed || !sawPassed {
+		t.Errorf("expected one failed and one passed verify_run (failed=%v passed=%v)", sawFailed, sawPassed)
+	}
+}
+
 // TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip is the #804
 // Gap-1/Gap-2 persistent case: EVERY fix re-invocation returns an infra error.
 // The loop must (a) hard-bound the fix-Invokes at maxFixInvokeInfraRetries per
@@ -5730,12 +6026,15 @@ func TestRunVerifyGateCommitted_InfraSkipNonBlocking(t *testing.T) {
 		verifyCmd:  "true",
 		scopeFiles: []upload.ScopeFile{{Path: "a.txt", Operation: "modify"}},
 	}
-	ev, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	evs, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
 	if err != nil {
 		t.Fatalf("pre-commit infra error must be a non-blocking skip, got %v", err)
 	}
-	if !strings.Contains(string(ev.Payload), `"outcome":"skipped"`) {
-		t.Errorf("expected skipped verify_run on infra error, got %s", ev.Payload)
+	if len(evs) != 1 {
+		t.Fatalf("event count = %d, want 1 (skip path)", len(evs))
+	}
+	if !strings.Contains(string(evs[0].Payload), `"outcome":"skipped"`) {
+		t.Errorf("expected skipped verify_run on infra error, got %s", evs[0].Payload)
 	}
 	if tree != "" {
 		t.Errorf("skip path must return an empty verified tree (no enforcement), got %q", tree)
@@ -7120,15 +7419,18 @@ func withFakePROpenerOnly(t *testing.T) *fakePROpener {
 func TestRunVerifyGateCommitted_ReturnsVerifiedTreeSHA(t *testing.T) {
 	repo, _, _ := verifiedTreeRepo(t)
 	cfg := verifiedTreeCfg(repo, "true")
-	ev, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	evs, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
 	if err != nil {
 		t.Fatalf("runVerifyGateCommitted: %v", err)
 	}
 	if tree == "" {
 		t.Fatal("passing gate must return the verified tree hash")
 	}
-	if !strings.Contains(string(ev.Payload), fmt.Sprintf(`"tree_sha":%q`, tree)) {
-		t.Errorf("verify_run payload must carry tree_sha %q:\n%s", tree, ev.Payload)
+	if len(evs) != 1 {
+		t.Fatalf("event count = %d, want 1 (pass path)", len(evs))
+	}
+	if !strings.Contains(string(evs[0].Payload), fmt.Sprintf(`"tree_sha":%q`, tree)) {
+		t.Errorf("verify_run payload must carry tree_sha %q:\n%s", tree, evs[0].Payload)
 	}
 	// Commit the same snapshot for real; its tree must equal the gate's.
 	for _, args := range [][]string{{"add", "a.txt"}, {"commit", "-m", "real commit, different metadata"}} {
