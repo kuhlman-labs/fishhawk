@@ -62,6 +62,9 @@ func TestReviewActionHintFor(t *testing.T) {
 	tests := []struct {
 		name   string
 		status *ReviewStatus
+		// runState is the run state fed to the hint; empty defaults to
+		// "running". Terminal states suppress the hint entirely (#968).
+		runState string
 		// seedConcerns, when > 0, seeds one implement_reviewed entry with
 		// that many concerns against the implement stage.
 		seedConcerns int
@@ -139,6 +142,43 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantRemaining:     1,
 			wantOverride:      false,
 		},
+		{
+			// #968: a terminal run has no actionable fix-up — the server
+			// refuses with fixup_not_applicable — so the hint must suppress
+			// even when concerns remain and the ceiling has headroom (the
+			// shape that advertised override_available on run 68e13183).
+			name:         "run succeeded -> no hint despite concerns",
+			status:       completeStatus(),
+			runState:     "succeeded",
+			seedConcerns: 1,
+			priorPasses:  1,
+			wantNil:      true,
+		},
+		{
+			name:         "run failed -> no hint despite concerns",
+			status:       completeStatus(),
+			runState:     "failed",
+			seedConcerns: 1,
+			wantNil:      true,
+		},
+		{
+			name:         "run cancelled -> no hint despite concerns",
+			status:       completeStatus(),
+			runState:     "cancelled",
+			seedConcerns: 1,
+			wantNil:      true,
+		},
+		{
+			name:          "run running -> hint still surfaces",
+			status:        completeStatus(),
+			runState:      "running",
+			seedConcerns:  1,
+			priorPasses:   1,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 0,
+			wantOverride:  true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -160,7 +200,11 @@ func TestReviewActionHintFor(t *testing.T) {
 			}
 			r := newResolver(srv, nil)
 
-			hint, err := r.reviewActionHintFor(context.Background(), runID, implementStageID, tc.status)
+			runState := tc.runState
+			if runState == "" {
+				runState = "running"
+			}
+			hint, err := r.reviewActionHintFor(context.Background(), runID, implementStageID, runState, tc.status)
 			if err != nil {
 				t.Fatalf("reviewActionHintFor: %v", err)
 			}
@@ -203,7 +247,7 @@ func TestReviewActionHintFor_LatestRoundOnly(t *testing.T) {
 	seedImplementReviewedAudit(fb, runID, stageID, 1)
 
 	r := newResolver(srv, nil)
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, completeStatus())
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus())
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}

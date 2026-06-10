@@ -289,11 +289,24 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 				reason = "agent invocation failed (no reason supplied)"
 			}
 			if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureA, reason); err != nil {
+				// #968: FailStage rejecting the transition means this is a
+				// duplicate/stale failure report (e.g. the stage was already
+				// recovered by fix-up recovery). A report that transitioned
+				// nothing must not advance the run — doing so once routed a
+				// run with its review gate still open to completeRun and
+				// stamped it succeeded.
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 					"trace upload: transition to failed-A failed",
 					slog.String("run_id", runID.String()),
 					slog.String("stage_id", stageID.String()),
 					slog.String("error", err.Error()))
+				s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
+					RunID:       runID,
+					StageID:     stageID,
+					Variant:     string(variant),
+					ContentHash: contentHash,
+				})
+				return
 			}
 			// Advance so the orchestrator walks the run to its
 			// terminal state — without this the run stays in
@@ -473,12 +486,15 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 				cat := run.FailureB
 				reason := implementReviewGatingRejectReason
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
+					// #968: a failure report FailStage rejected (duplicate /
+					// already-recovered stage) must not advance the run.
 					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 						"trace upload: transition to failed-B after implement-review gating reject failed",
 						slog.String("run_id", runID.String()),
 						slog.String("stage_id", stageID.String()),
 						slog.String("error", ferr.Error()),
 					)
+					return
 				}
 				s.advanceAfterFailure(r, runID, stageID)
 				s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
@@ -996,11 +1012,16 @@ func isEmptyConstraints(c policy.Constraints) bool {
 // bundleBytes is used for runtime calibration emit (best-effort).
 func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, reason string, bundleBytes []byte) {
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureB, reason); err != nil {
+		// #968: FailStage rejecting the transition means this report is a
+		// duplicate against an already-resolved stage (e.g. fix-up recovery
+		// restored it to succeeded with the review gate re-parked). A report
+		// that transitioned nothing must not advance the run.
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"trace upload: transition to failed-B failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
+		return
 	}
 	s.advanceAfterFailure(r, runID, stageID)
 	// Best-effort: emit runtime calibration for implement stages that
@@ -1018,11 +1039,17 @@ func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, r
 // failures log at WARN and never unwind the already-stored upload.
 func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, reason string, bundleBytes []byte) {
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureC, reason); err != nil {
+		// #968: same duplicate-report discipline as the B helper — the
+		// 68e13183 incident was a duplicate cat-C report arriving after
+		// fix-up recovery restored the stage and re-parked the review gate;
+		// the fall-through Advance stamped the run succeeded with the gate
+		// open. Never advance on a report that transitioned nothing.
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"trace upload: transition to failed-C failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
+		return
 	}
 	s.advanceAfterFailure(r, runID, stageID)
 	// Best-effort: emit runtime calibration for implement stages that

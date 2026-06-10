@@ -113,6 +113,9 @@ type FixupDecision struct {
 //
 //   - the stage must be an implement stage; fix-up routes concerns back
 //     to the implement agent, so plan/review stages are not eligible.
+//   - the run must not be terminal (#968): a completed run has no live
+//     gate to flow the fix-up back into, so re-opening its stages would
+//     strand them at pending forever.
 //   - the implement stage must be re-openable, in one of two shapes:
 //   - awaiting_approval — the commit-yourself flow: the implement
 //     stage is its own review gate. Re-opened awaiting_approval →
@@ -165,6 +168,19 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 	if stage.Type != StageTypeImplement {
 		return nil, fmt.Errorf("%w: stage is type %q (only implement stages can be fixed up)",
 			ErrFixupNotApplicable, stage.Type)
+	}
+
+	// #968 defense-in-depth: never re-open stages inside a completed run.
+	// A terminal run has no live gate to flow the fix-up back into, so a
+	// re-open would strand the re-parked stages at pending forever (every
+	// later Advance no-ops on the terminal run state).
+	r, err := repo.GetRun(ctx, stage.RunID)
+	if err != nil {
+		return nil, fmt.Errorf("FixupStage: get run: %w", err)
+	}
+	if r.State.IsTerminal() {
+		return nil, fmt.Errorf("%w: run %s is already terminal (%s); a completed run's stages cannot be re-opened",
+			ErrFixupNotApplicable, r.ID, r.State)
 	}
 
 	// Decide applicability and, on the push_and_open_pr flow, locate the

@@ -155,6 +155,7 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// would be wrong because the upstream output they depended on
 	// never landed.
 	var next *run.Stage
+	var gated *run.Stage
 	for _, s := range stages {
 		if s.State == run.StageStateFailed || s.State == run.StageStateCancelled {
 			return o.completeRun(ctx, r, stages)
@@ -163,9 +164,28 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 			next = s
 			break
 		}
+		if !s.State.IsTerminal() && gated == nil {
+			// Non-terminal but not pending: dispatched, running,
+			// awaiting_approval, or awaiting_children — an open gate or
+			// in-flight stage.
+			gated = s
+		}
 	}
 
 	if next == nil {
+		// #968: a run must never roll up succeeded while a gate is still
+		// open or a stage is in flight. With nothing pending but a
+		// non-terminal stage present (e.g. a review re-parked at
+		// awaiting_approval), there is nothing to dispatch AND nothing to
+		// complete — stay running at the gate.
+		if gated != nil {
+			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: stage non-terminal, nothing pending",
+				slog.String("run_id", r.ID.String()),
+				slog.String("stage_id", gated.ID.String()),
+				slog.String("stage_state", string(gated.State)),
+			)
+			return OutcomeNoOp, nil
+		}
 		// Every stage has terminated successfully. completeRun
 		// transitions the run to succeeded.
 		return o.completeRun(ctx, r, stages)
@@ -691,6 +711,23 @@ func (o *Orchestrator) completeRun(ctx context.Context, r *run.Run, stages []*ru
 		}
 		if s.State == run.StageStateCancelled {
 			target = run.StateCancelled
+		}
+	}
+	// #968 belt-and-suspenders: refuse to stamp a run succeeded while ANY
+	// stage is non-terminal (awaiting_approval, awaiting_children,
+	// dispatched, running) — the single chokepoint covering every caller.
+	// Applies ONLY to the succeeded target: a failed/cancelled run
+	// legitimately completes with downstream stages still pending.
+	if target == run.StateSucceeded {
+		for _, s := range stages {
+			if !s.State.IsTerminal() {
+				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator refused run completion: stage non-terminal",
+					slog.String("run_id", r.ID.String()),
+					slog.String("stage_id", s.ID.String()),
+					slog.String("stage_state", string(s.State)),
+				)
+				return OutcomeNoOp, nil
+			}
 		}
 	}
 	if _, err := o.Runs.TransitionRun(ctx, r.ID, target); err != nil {

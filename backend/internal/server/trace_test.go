@@ -2436,3 +2436,54 @@ func TestImplementReviewLoop_RepublishesAuditCompleteWhenReviewLands(t *testing.
 		t.Errorf("republished conclusion = %q want success", last.params.Conclusion)
 	}
 }
+
+// TestFailStageCategoryC_DuplicateReport_DoesNotAdvanceRun reproduces the
+// #968 incident sequence at the server layer: a fix-up re-dispatch failed,
+// fix-up recovery restored the implement stage to succeeded and re-parked
+// the review stage at awaiting_approval — then a DUPLICATE category-C
+// failure report arrives for the same stage. FailStage rejects the
+// transition (the stage is already terminal succeeded), and the handler
+// must NOT fall through to advanceAfterFailure: with the review gate at
+// awaiting_approval and nothing pending, the old fall-through routed the
+// run to completeRun and stamped it succeeded while the human gate was
+// still open (run 68e13183). The duplicate report must change nothing.
+func TestFailStageCategoryC_DuplicateReport_DoesNotAdvanceRun(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+
+	runRow := rr.seedRun() // StateRunning
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateSucceeded)
+	reviewStage := rr.seedStage(runRow.ID, 2, run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	implStage.Type = run.StageTypeImplement
+	reviewStage.Type = run.StageTypeReview
+	rr.mu.Unlock()
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runRow.ID.String()+"/trace", nil)
+	s.failStageCategoryC(req, runRow.ID, implStage.ID,
+		"no_diff_captured: duplicate report after fix-up recovery", nil)
+
+	// The recovered implement stage stays succeeded.
+	if cur, _ := rr.GetStage(context.Background(), implStage.ID); cur.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded)", cur.State)
+	}
+	// The re-parked review gate stays open.
+	if cur, _ := rr.GetStage(context.Background(), reviewStage.ID); cur.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want unchanged (awaiting_approval)", cur.State)
+	}
+	// The run stays running at its gate — NOT stamped succeeded.
+	got, err := rr.GetRun(context.Background(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (duplicate report must not complete the run)", got.State)
+	}
+}

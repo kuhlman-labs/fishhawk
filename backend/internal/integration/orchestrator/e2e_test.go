@@ -384,19 +384,52 @@ func TestDecomposition_E2E_HappyPath(t *testing.T) {
 		t.Errorf("children_settled entries = %d, want 1", got)
 	}
 
-	// (m) Sweeper's internal Advance already dispatched review.
-	// A second explicit Advance finds no pending stages and completes
-	// the run (OutcomeRunCompleted, state = succeeded).
+	// (m) Sweeper's internal Advance already dispatched review, which is
+	// still non-terminal (dispatched). A second explicit Advance finds no
+	// pending stage but MUST NOT complete the run while that stage is in
+	// flight (#968): it no-ops and the parent stays running at its review.
 	outcome, err = o.Advance(ctx, parentID)
 	if err != nil {
 		t.Fatalf("Advance second: %v", err)
 	}
-	if outcome != orchestrator.OutcomeRunCompleted {
-		t.Errorf("Advance second outcome = %q, want %q", outcome, orchestrator.OutcomeRunCompleted)
+	if outcome != orchestrator.OutcomeNoOp {
+		t.Errorf("Advance second outcome = %q, want %q (review still dispatched)", outcome, orchestrator.OutcomeNoOp)
 	}
 	parent, err := runRepo.GetRun(ctx, parentID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
+	}
+	if parent.State != runpkg.StateRunning {
+		t.Errorf("parent run state = %q, want running (review stage non-terminal)", parent.State)
+	}
+
+	// (n) Drive the review stage to terminal, then Advance completes the
+	// run: every stage terminal → OutcomeRunCompleted, state = succeeded.
+	var reviewStage *runpkg.Stage
+	for _, s := range stages {
+		if s.Type == runpkg.StageTypeReview {
+			reviewStage = s
+			break
+		}
+	}
+	if reviewStage == nil {
+		t.Fatal("review stage not found")
+	}
+	for _, to := range []runpkg.StageState{runpkg.StageStateRunning, runpkg.StageStateSucceeded} {
+		if _, err := runRepo.TransitionStage(ctx, reviewStage.ID, to, nil); err != nil {
+			t.Fatalf("TransitionStage review %s: %v", to, err)
+		}
+	}
+	outcome, err = o.Advance(ctx, parentID)
+	if err != nil {
+		t.Fatalf("Advance third: %v", err)
+	}
+	if outcome != orchestrator.OutcomeRunCompleted {
+		t.Errorf("Advance third outcome = %q, want %q", outcome, orchestrator.OutcomeRunCompleted)
+	}
+	parent, err = runRepo.GetRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("GetRun after review terminal: %v", err)
 	}
 	if parent.State != runpkg.StateSucceeded {
 		t.Errorf("parent run state = %q, want succeeded", parent.State)

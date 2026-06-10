@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -676,6 +677,9 @@ func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
 // (the shared fixture omits it), since the /pull-request handler requires
 // the artifact repo even on the failure variant. Both servers share the
 // pool, so the state the recovery writes is visible through fx.runRepo.
+// The Orchestrator is wired (as in production) so the post-failure Advance
+// path is genuinely exercised — load-bearing for the #968 duplicate-report
+// leg, where the old Advance completed the run with its review gate open.
 func failPushPRViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID) {
 	t.Helper()
 	s := server.New(server.Config{
@@ -684,6 +688,7 @@ func failPushPRViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, sta
 		SigningRepo:  signing.NewPostgresRepository(fx.pool),
 		AuditRepo:    audit.NewPostgresRepository(fx.pool),
 		ArtifactRepo: artifact.NewPostgresRepository(fx.pool),
+		Orchestrator: &orchestrator.Orchestrator{Runs: fx.runRepo},
 	})
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
@@ -1733,5 +1738,205 @@ func decodeStructured(t *testing.T, r *mcp.CallToolResult, dst any) {
 	}
 	if err := json.Unmarshal(raw, dst); err != nil {
 		t.Fatalf("decode structured output: %v", err)
+	}
+}
+
+// TestE2E_Fixup_DuplicateFailureReportThenForcedOverride drives the full
+// #968 incident sequence across the MCP → server → run → orchestrator
+// layers — the seam the per-layer units cannot cover (cf. #618):
+//
+//  1. a fix-up re-dispatch FAILS and #788 recovery restores the run to its
+//     review gate (implement succeeded, review awaiting_approval);
+//  2. a DUPLICATE failure report for the same stage arrives. FailStage
+//     rejects it (the stage is already recovered), and the fall-through
+//     Advance — which in the incident stamped run 68e13183 succeeded with
+//     its gate open — must leave the run RUNNING at its gate;
+//  3. the re-review lands a fresh concern: get_run_status's
+//     review_action_hint advertises the operator override
+//     (override_available=true), and the fixup endpoint AGREES — a forced
+//     pass (force_additional_pass=true) is ACCEPTED within the 3-pass
+//     ceiling and re-parks the review stage again, instead of the hint
+//     advertising an override the server would refuse (the #968 disagreement).
+func TestE2E_Fixup_DuplicateFailureReportThenForcedOverride(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+
+	// push_and_open_pr shape: implement SUCCEEDED (PR open), separate
+	// review stage holding the human gate.
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         2,
+		Type:             runpkg.StageTypeReview,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+
+	// 1. Fix-up pass 1 through the real MCP binary, then the re-dispatch
+	// fails its push step: #788 recovery restores the review gate.
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "address the scope concern on the open PR",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+	shipPushFixupTraceViaBackend(t, ctx, fx, impl.ID)
+	failPushPRViaBackend(t, ctx, fx, impl.ID)
+
+	assertReviewGateRestored := func(step string) {
+		t.Helper()
+		curImpl, err := fx.runRepo.GetStage(ctx, impl.ID)
+		if err != nil {
+			t.Fatalf("%s: GetStage(implement): %v", step, err)
+		}
+		if curImpl.State != runpkg.StageStateSucceeded {
+			t.Errorf("%s: implement state = %q, want succeeded", step, curImpl.State)
+		}
+		curReview, err := fx.runRepo.GetStage(ctx, review.ID)
+		if err != nil {
+			t.Fatalf("%s: GetStage(review): %v", step, err)
+		}
+		if curReview.State != runpkg.StageStateAwaitingApproval {
+			t.Errorf("%s: review state = %q, want awaiting_approval", step, curReview.State)
+		}
+		curRun, err := fx.runRepo.GetRun(ctx, fx.runID)
+		if err != nil {
+			t.Fatalf("%s: GetRun: %v", step, err)
+		}
+		if curRun.State != runpkg.StateRunning {
+			t.Errorf("%s: run state = %q, want running (never succeeded with the gate open)", step, curRun.State)
+		}
+	}
+	assertReviewGateRestored("after recovery")
+
+	// 2. The DUPLICATE failure report — the 68e13183 trigger. FailStage
+	// rejects it (the stage already recovered to succeeded); the run must
+	// stay running at its gate, not roll up succeeded.
+	failPushPRViaBackend(t, ctx, fx, impl.ID)
+	assertReviewGateRestored("after duplicate failure report")
+
+	// The duplicate recovered nothing — still exactly one
+	// stage_fixup_recovered entry.
+	recovered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupRecovered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(recovered): %v", err)
+	}
+	if len(recovered) != 1 {
+		t.Errorf("stage_fixup_recovered entries = %d, want 1 (the duplicate must not recover again)", len(recovered))
+	}
+
+	// 3. The re-review lands a fresh concern. The hint advertises the
+	// operator override — and must AGREE with the fixup endpoint.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "the re-review still sees drift"})
+	hint := getReviewActionHint(t, ctx, session, fx.runID)
+	if hint == nil {
+		t.Fatalf("review_action_hint absent; want the override pointer (budget spent, run running at its gate)")
+	}
+	if hint.RemainingFixupBudget != 0 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d, want 0", hint.RemainingFixupBudget)
+	}
+	if !hint.OverrideAvailable {
+		t.Errorf("review_action_hint.override_available = false, want true (one pass used, ceiling 3)")
+	}
+
+	// The endpoint agrees with the advertised hint: the forced pass is
+	// ACCEPTED within the ceiling and re-parks the review stage again.
+	forcedRes, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":              impl.ID.String(),
+			"concerns":              []int{0},
+			"reason":                "operator-granted override pass",
+			"force_additional_pass": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool forced fishhawk_fixup_stage: %v", err)
+	}
+	if forcedRes.IsError {
+		t.Fatalf("forced fix-up refused — hint advertised an override the server would not grant (#968 disagreement): %s",
+			toolContentString(t, forcedRes))
+	}
+
+	curImpl, err := fx.runRepo.GetStage(ctx, impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage(implement) after forced pass: %v", err)
+	}
+	if curImpl.State != runpkg.StageStatePending {
+		t.Errorf("implement state after forced pass = %q, want pending (re-opened)", curImpl.State)
+	}
+	curReview, err := fx.runRepo.GetStage(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("GetStage(review) after forced pass: %v", err)
+	}
+	if curReview.State != runpkg.StageStatePending {
+		t.Errorf("review state after forced pass = %q, want pending (re-parked, NOT stranded)", curReview.State)
+	}
+
+	// The forced pass is durably audited: two stage_fixup_triggered
+	// entries, the latest marked forced and naming the re-parked review.
+	triggered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(triggered): %v", err)
+	}
+	if len(triggered) != 2 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 2", len(triggered))
+	}
+	var forcedPayload struct {
+		Forced                bool   `json:"forced"`
+		ReparkedReviewStageID string `json:"reparked_review_stage_id"`
+	}
+	if err := json.Unmarshal(triggered[len(triggered)-1].Payload, &forcedPayload); err != nil {
+		t.Fatalf("unmarshal forced payload: %v", err)
+	}
+	if !forcedPayload.Forced {
+		t.Errorf("forced fix-up audit forced = false, want true")
+	}
+	if forcedPayload.ReparkedReviewStageID != review.ID.String() {
+		t.Errorf("reparked_review_stage_id = %q, want %s", forcedPayload.ReparkedReviewStageID, review.ID)
+	}
+
+	// 4. After the forced pass the latest round has no landed concerns yet,
+	// so the hint suppresses — consistent with there being nothing further
+	// to route back until the re-review lands.
+	if hint := getReviewActionHint(t, ctx, session, fx.runID); hint != nil {
+		t.Errorf("review_action_hint = %+v, want nil after the forced pass (no concerns in the new round yet)", hint)
 	}
 }

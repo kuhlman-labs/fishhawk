@@ -640,11 +640,18 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// nil — never fails the stage. start_run is excluded by construction.
 	var reviewActionHint *ReviewActionHint
 	if in.Stage == "implement" {
+		// Run state for the hint's terminal suppression (#968). Best-effort:
+		// a fetch error leaves it "" (non-terminal), so the hint computes as
+		// before rather than failing the stage.
+		runState := ""
+		if runRow, rerr := r.api.GetRun(ctx, runUUID); rerr == nil && runRow != nil {
+			runState = runRow.State
+		}
 		implementReviewStatus, hintErr := r.reviewStatusFor(ctx, runUUID, "implement")
 		if hintErr != nil {
 			warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
 		} else {
-			reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, implementReviewStatus)
+			reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus)
 			if hintErr != nil {
 				warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
 			}

@@ -35,9 +35,12 @@ func fixupServer(t *testing.T) (*Server, *approvalRunRepo, *auditFake) {
 }
 
 // seedImplementGateStage seeds an implement stage parked at the review
-// gate (awaiting_approval) — the precondition for a fix-up.
+// gate (awaiting_approval) — the precondition for a fix-up — plus its
+// run row in `running` (FixupStage refuses terminal runs, #968).
 func seedImplementGateStage(repo *approvalRunRepo) *run.Stage {
-	return repo.seedGatelessStage(run.StageStateAwaitingApproval)
+	stage := repo.seedGatelessStage(run.StageStateAwaitingApproval)
+	repo.seedRun(&run.Run{ID: stage.RunID, State: run.StateRunning})
+	return stage
 }
 
 // seedConcernsReview records an implement_reviewed audit entry carrying
@@ -65,6 +68,7 @@ func seedConcernsReview(au *auditFake, stage *run.Stage, concerns ...planreview.
 // the given state, both sharing one RunID. Returns (implement, review).
 func seedPushOpenPRStages(repo *approvalRunRepo, reviewState run.StageState) (*run.Stage, *run.Stage) {
 	impl := repo.seedGatelessStage(run.StageStateSucceeded)
+	repo.seedRun(&run.Run{ID: impl.RunID, State: run.StateRunning})
 	review := repo.seedStage(reviewState)
 	repo.mu.Lock()
 	review.RunID = impl.RunID
@@ -704,6 +708,7 @@ func TestFixupStage_WrongStateReturns422(t *testing.T) {
 	s, repo, au := fixupServer(t)
 	// Implement stage that is running, not parked at the gate.
 	stage := repo.seedGatelessStage(run.StageStateRunning)
+	repo.seedRun(&run.Run{ID: stage.RunID, State: run.StateRunning})
 	seedConcernsReview(au, stage,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
 	)
@@ -714,6 +719,41 @@ func TestFixupStage_WrongStateReturns422(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "fixup_not_applicable") {
 		t.Errorf("body missing fixup_not_applicable code: %s", w.Body.String())
+	}
+}
+
+func TestFixupStage_TerminalRunReturns422(t *testing.T) {
+	// #968: a run that already rolled up terminal has no live gate to flow
+	// a fix-up back into — the handler surfaces run.FixupStage's terminal-
+	// run refusal as fixup_not_applicable, even for a forced pass.
+	s, repo, au := fixupServer(t)
+	impl, review := seedPushOpenPRStages(repo, run.StageStateAwaitingApproval)
+	// Overwrite the run row terminal — the incident shape: the run rolled
+	// up succeeded while the review gate stayed open.
+	repo.seedRun(&run.Run{ID: impl.RunID, State: run.StateSucceeded})
+	seedConcernsReview(au, impl,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	w := postFixup(t, s, impl.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_not_applicable") {
+		t.Errorf("body missing fixup_not_applicable code: %s", w.Body.String())
+	}
+	// Neither stage may be touched.
+	if cur, _ := repo.GetStage(context.Background(), impl.ID); cur.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded)", cur.State)
+	}
+	if cur, _ := repo.GetStage(context.Background(), review.ID); cur.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want unchanged (awaiting_approval)", cur.State)
+	}
+	// No stage_fixup_triggered entry may have been written.
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			t.Errorf("unexpected %s audit entry on a refused fix-up", CategoryStageFixupTriggered)
+		}
 	}
 }
 

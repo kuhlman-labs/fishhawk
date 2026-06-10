@@ -561,6 +561,82 @@ func TestAdvance_AllStagesTerminal_TransitionsRun(t *testing.T) {
 	}
 }
 
+func TestAdvance_GatedStageNoPending_NoOp(t *testing.T) {
+	// #968: the exact incident shape — nothing pending, but the review
+	// gate is still open at awaiting_approval. Advance must NOT route to
+	// completeRun (which stamped run 68e13183 succeeded with its gate
+	// open); it no-ops and the run stays running at the gate.
+	o, rs, gh := newOrchestrator(t)
+	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateAwaitingApproval},
+	})
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeNoOp {
+		t.Errorf("Outcome = %q, want noop", out)
+	}
+	if rs.runs[r.ID].State != run.StateRunning {
+		t.Errorf("run state = %q, want running (gate still open)", rs.runs[r.ID].State)
+	}
+	if len(rs.runTransitions) != 0 {
+		t.Errorf("run transitions = %d, want 0", len(rs.runTransitions))
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("dispatch fired with nothing pending: %d", len(gh.calls))
+	}
+}
+
+func TestAdvance_AwaitingChildrenNoPending_NoOp(t *testing.T) {
+	// #968: same invariant for a decomposed parent parked at
+	// awaiting_children — non-terminal but not pending must hold the run
+	// open, not complete it.
+	o, rs, gh := newOrchestrator(t)
+	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingChildren},
+	})
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeNoOp {
+		t.Errorf("Outcome = %q, want noop", out)
+	}
+	if rs.runs[r.ID].State != run.StateRunning {
+		t.Errorf("run state = %q, want running (children still settling)", rs.runs[r.ID].State)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("dispatch fired with nothing pending: %d", len(gh.calls))
+	}
+}
+
+func TestCompleteRun_RefusesSucceededWithNonTerminalStage(t *testing.T) {
+	// #968 belt-and-suspenders: completeRun itself refuses to stamp a run
+	// succeeded while any stage is non-terminal, covering every caller.
+	o, rs, _ := newOrchestrator(t)
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateAwaitingApproval},
+	})
+
+	out, err := o.completeRun(context.Background(), r, stages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeNoOp {
+		t.Errorf("Outcome = %q, want noop", out)
+	}
+	if rs.runs[r.ID].State != run.StateRunning {
+		t.Errorf("run state = %q, want running", rs.runs[r.ID].State)
+	}
+}
+
 func TestAdvance_AnyStageFailed_RunFails(t *testing.T) {
 	o, rs, _ := newOrchestrator(t)
 	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{

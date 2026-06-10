@@ -84,6 +84,10 @@ func implementReviewMergeHint(implementStatus *ReviewStatus) string {
 // reviewActionHintFor computes the display-only review-action hint for a run's
 // implement stage from audit data (#777, #860). It returns nil (no hint) when:
 //
+//   - the run state is terminal (succeeded/failed/cancelled, #968): a
+//     terminal run has no actionable fix-up — the server refuses with
+//     fixup_not_applicable — so advertising override_available here would
+//     make the hint and the server-side applicability predicate disagree;
 //   - the implement review is not complete (status != "complete"): no landed
 //     verdict to act on yet;
 //   - the LATEST review round carries zero approve_with_concerns concerns:
@@ -102,7 +106,10 @@ func implementReviewMergeHint(implementStatus *ReviewStatus) string {
 // itself and passes the result). The concern COUNT, however, is recomputed
 // here from a sequence-aware audit read so it can be scoped to the latest
 // review round.
-func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementStageID uuid.UUID, implementStatus *ReviewStatus) (*ReviewActionHint, error) {
+func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementStageID uuid.UUID, runState string, implementStatus *ReviewStatus) (*ReviewActionHint, error) {
+	if runStateIsTerminal(runState) {
+		return nil, nil
+	}
 	if implementStatus == nil || implementStatus.Status != "complete" {
 		return nil, nil
 	}
