@@ -1988,6 +1988,21 @@ paths:
                       (shortID = first 8 chars of the UUID). A divergence would
                       re-create the `checkout -b <existing branch>` failure
                       (#784).
+                  fixup_expected_head_sha:
+                    type: string
+                    description: |
+                      The run's recorded head SHA — the newest `head_sha`
+                      across the run's reported-head ledger entries
+                      (`pull_request_opened` / `child_pushed` /
+                      `fixup_pushed`), the same audit source the ADR-035
+                      branch-lineage verifier treats as the run's legitimate
+                      tips. Present only when `fixup` is true and resolution
+                      succeeded. Before invoking the agent the runner fetches
+                      + checks out `fixup_branch` and fails fast when the
+                      fetched tip differs from this value (#967). Absent
+                      (older backend, or backend-side resolution failure)
+                      means the runner proceeds with checkout only, skipping
+                      the comparison.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -2092,6 +2107,9 @@ paths:
                   fixup_branch:
                     type: string
                     description: Existing PR branch a fix-up pass commits onto; present only when `fixup` is true. Matches the runner's branch formula — non-decomposed `fishhawk/run-<shortID(run_id)>/stage-<shortID(stage_id)>`, decomposed `fishhawk/run-<shortID(decomposed_from_run_id)>` (#784).
+                  fixup_expected_head_sha:
+                    type: string
+                    description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

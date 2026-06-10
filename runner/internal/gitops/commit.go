@@ -697,6 +697,53 @@ func CaptureHead(ctx context.Context, repoDir string) (ref string, detached bool
 	return strings.TrimSpace(sha), true, nil
 }
 
+// CheckoutRemoteBranch fetches refs/heads/<branch> from the named remote
+// and checks the local working tree out onto it, returning the fetched tip
+// SHA so the caller can run the ADR-035 lineage comparison against the
+// stage's recorded head (#967). It is the fix-up pass's base-establishment
+// primitive: instead of inheriting the operator's incidental checkout, the
+// runner pins the working tree to the live PR-branch tip before the agent
+// is invoked.
+//
+// The fetch uses an explicit refspec `+refs/heads/<branch>:<trackingRef>`
+// where trackingRef is refs/remotes/<remote>/<branch> derived from the SAME
+// remote the fetch targets — fetch source and compared/checked-out ref stay
+// in lockstep by construction, never a hard-coded "origin" against a
+// different remote. Per git-fetch(1), a refspec given on the command line
+// overrides the configured fetch refspecs and an explicit destination ref
+// is updated directly (the leading + forces a non-fast-forward update), so
+// the tracking ref deterministically holds the fetched tip regardless of
+// the repo's fetch config. The checkout is `checkout -B <branch>
+// <trackingRef>`, resetting any stale local branch of the same name to the
+// fetched tip.
+//
+// Auth is ambient: the fetch targets the named remote (default
+// DefaultRemote), using whatever credentials the operator's checkout
+// already has for it — the pre-invoke call site has no installation token
+// yet (it is minted post-invoke on the push path). Like CaptureHead /
+// RestoreHead it is a package-level function because the caller has no
+// *Pusher in scope.
+func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch string) (tipSHA string, err error) {
+	if branch == "" {
+		return "", errors.New("gitops: branch required")
+	}
+	remote = orDefault(remote, DefaultRemote)
+	trackingRef := fmt.Sprintf("refs/remotes/%s/%s", remote, branch)
+	p := &Pusher{}
+	if err := p.run(ctx, repoDir, "fetch", remote,
+		fmt.Sprintf("+refs/heads/%s:%s", branch, trackingRef)); err != nil {
+		return "", fmt.Errorf("gitops: fetch %s from %s: %w", branch, remote, err)
+	}
+	tip, err := p.runOut(ctx, repoDir, "rev-parse", trackingRef)
+	if err != nil {
+		return "", fmt.Errorf("gitops: rev-parse %s: %w", trackingRef, err)
+	}
+	if err := p.run(ctx, repoDir, "checkout", "-B", branch, trackingRef); err != nil {
+		return "", fmt.Errorf("gitops: checkout -B %s %s: %w", branch, trackingRef, err)
+	}
+	return strings.TrimSpace(tip), nil
+}
+
 // RestoreHead returns the operator's checkout to ref via `git checkout
 // --force` (#911). After an implement/fix-up pass the runner has switched
 // HEAD onto the run branch (via CommitAndPush's `checkout -b`/`-B`), and on a

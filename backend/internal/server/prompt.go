@@ -92,6 +92,15 @@ type promptResponse struct {
 	// `fishhawk/run-<shortID(decomposedFromRunID)>`. A divergence would
 	// re-create the `checkout -b <existing branch>` already-exists failure.
 	FixupBranch string `json:"fixup_branch,omitempty"`
+	// FixupExpectedHeadSHA is the run's recorded head — the newest head_sha
+	// across the run's reported-head ledger (pull_request_opened /
+	// child_pushed / fixup_pushed audit entries, the same source the ADR-035
+	// branch-lineage verifier treats as the run's legitimate tips). Set only
+	// when Fixup is true so the runner can verify the fetched PR-branch tip
+	// IS the stage's recorded head before invoking the agent (#967). Empty
+	// when resolution fails (WARN-and-proceed) — the runner then skips the
+	// SHA comparison rather than blocking the pass.
+	FixupExpectedHeadSHA string `json:"fixup_expected_head_sha,omitempty"`
 }
 
 // shortID returns the first 8 characters of a UUID's string form, mirroring
@@ -372,6 +381,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	var scopeFiles []scopeFile
 	var fixup bool
 	var fixupBranch string
+	var fixupExpectedHeadSHA string
 	if stage.Type == run.StageTypeImplement {
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
@@ -436,6 +446,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// same-branch path instead of `checkout -b <existing branch>`.
 			fixup = true
 			fixupBranch = fixupBranchFor(runRow, stage)
+			// Advertise the run's recorded head so the runner can verify the
+			// fetched PR-branch tip before invoking the agent (#967).
+			fixupExpectedHeadSHA = s.resolveFixupExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 		}
 	}
 
@@ -494,6 +507,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		CommitAuthorEmail:    commitAuthorEmail,
 		Fixup:                fixup,
 		FixupBranch:          fixupBranch,
+		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -575,6 +589,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	var scopeFiles []scopeFile
 	var fixup bool
 	var fixupBranch string
+	var fixupExpectedHeadSHA string
 	if stage.Type == run.StageTypeImplement {
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
@@ -640,6 +655,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// the displayed and dispatched responses identical.
 			fixup = true
 			fixupBranch = fixupBranchFor(runRow, stage)
+			fixupExpectedHeadSHA = s.resolveFixupExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 		}
 	}
 
@@ -698,6 +714,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		CommitAuthorEmail:    commitAuthorEmail,
 		Fixup:                fixup,
 		FixupBranch:          fixupBranch,
+		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -1548,6 +1565,62 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		return rendered, strings.Join(notes, "\n")
 	}
 	return nil, ""
+}
+
+// resolveFixupExpectedHeadSHA returns the run's recorded head SHA — the
+// newest head_sha across the run's reported-head ledger entries
+// (lineageLedgerCategories: pull_request_opened / child_pushed /
+// fixup_pushed), the same audit source buildReportedHeadLedger feeds the
+// ADR-035 branch-lineage verifier and resolveLastRunAuthoredHead. A
+// fix-up dispatch advertises it as `fixup_expected_head_sha` so the
+// runner can verify the PR-branch tip it fetched IS the stage's recorded
+// head before invoking the agent (#967).
+//
+// Returns "" when the AuditRepo is unconfigured, no entry carries a
+// head_sha, or on any read error — best-effort WARN-and-proceed, same
+// posture as the other prompt resolvers. The runner then skips the SHA
+// comparison (checkout only) rather than blocking the pass.
+func (s *Server) resolveFixupExpectedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
+	if s.cfg.AuditRepo == nil {
+		return ""
+	}
+	var newest *audit.Entry
+	var newestSHA string
+	for _, cat := range lineageLedgerCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: list reported-head audit entries for fixup_expected_head_sha failed; omitting field",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()),
+			)
+			return ""
+		}
+		for _, e := range entries {
+			var payload struct {
+				HeadSHA string `json:"head_sha"`
+			}
+			if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.HeadSHA == "" {
+				continue
+			}
+			if newest == nil || e.Timestamp.After(newest.Timestamp) ||
+				(e.Timestamp.Equal(newest.Timestamp) && e.Sequence > newest.Sequence) {
+				newest = e
+				newestSHA = payload.HeadSHA
+			}
+		}
+	}
+	if newest == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: no reported-head audit entry found for fixup_expected_head_sha; omitting field",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		return ""
+	}
+	return newestSHA
 }
 
 // resolveFixupAllowCreate returns the net-new file paths the operator

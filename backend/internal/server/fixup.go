@@ -252,9 +252,30 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// No-change refund (#967): a fix-up pass that produced no commit
+	// (fixup_no_changes audit entry, #856) is refunded against the NORMAL
+	// budget — the pass consumed a stage_fixup_triggered entry but changed
+	// nothing on the PR branch. Implemented by widening MaxPasses by the
+	// refunded count, which is equivalent to subtracting the refunds from
+	// the budget comparison (raw >= max+refunded ⟺ raw-refunded >= max)
+	// while HardCeiling keeps counting RAW triggered passes, so the
+	// absolute 3-pass cap is unaffected and a pathologically no-op'ing
+	// agent is still hard-stopped.
+	refundedPasses, err := s.countFixupNoChangeRefunds(r.Context(), stage.RunID, stageID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"count refunded fix-up passes failed", map[string]any{"error": err.Error()})
+		return
+	}
+	if refundedPasses > priorPasses {
+		// Defensive clamp: a refund can never exceed the passes actually
+		// triggered (would widen the budget past the configured max).
+		refundedPasses = priorPasses
+	}
+
 	dec, err := run.FixupStage(r.Context(), s.cfg.RunRepo, stageID, run.FixupOptions{
 		PriorPassCount:      priorPasses,
-		MaxPasses:           defaultMaxFixupPasses,
+		MaxPasses:           defaultMaxFixupPasses + refundedPasses,
 		ForceAdditionalPass: reqBody.ForceAdditionalPass,
 		HardCeiling:         defaultFixupCeiling,
 	})
@@ -273,7 +294,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			return
 		case errors.Is(err, run.ErrFixupBudgetExhausted):
 			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_budget_exhausted",
-				err.Error(), map[string]any{"max_passes": defaultMaxFixupPasses, "used": priorPasses})
+				err.Error(), map[string]any{"max_passes": defaultMaxFixupPasses, "used": priorPasses, "refunded_passes": refundedPasses})
 			return
 		case errors.Is(err, run.ErrFixupNotApplicable):
 			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_not_applicable",
@@ -288,7 +309,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// Audit first so the fix-up intent (and the selected concerns the
 	// prompt renderer reads back) is recorded even if the orchestrator
 	// handoff below fails. Same posture as the retry handler.
-	s.writeFixupAudit(r, dec, selected, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses)
+	s.writeFixupAudit(r, dec, selected, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses)
 
 	// The fix-up re-open lands the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire
@@ -352,11 +373,31 @@ func (s *Server) resolveImplementConcerns(ctx context.Context, runID, stageID uu
 
 // countFixupPasses returns the number of prior stage_fixup_triggered
 // audit entries recorded for the stage — the durable fix-up-pass
-// counter the bound is enforced against.
+// counter the bound is enforced against. This RAW count always feeds
+// the hard-ceiling check; the no-change refund (#967) never reduces it.
 func (s *Server) countFixupPasses(ctx context.Context, runID, stageID uuid.UUID) (int, error) {
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
 	if err != nil {
 		return 0, fmt.Errorf("list %s audit entries: %w", CategoryStageFixupTriggered, err)
+	}
+	n := 0
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// countFixupNoChangeRefunds returns the number of fixup_no_changes audit
+// entries recorded for the stage (#856 report path, pullrequest.go) — the
+// fix-up passes that produced no commit and are refunded against the
+// NORMAL budget (#967). The report path's stage-keyed idempotency dedup
+// admits at most one such entry per stage, so in practice this is 0 or 1.
+func (s *Server) countFixupNoChangeRefunds(ctx context.Context, runID, stageID uuid.UUID) (int, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "fixup_no_changes")
+	if err != nil {
+		return 0, fmt.Errorf("list fixup_no_changes audit entries: %w", err)
 	}
 	n := 0
 	for _, e := range entries {
@@ -394,7 +435,7 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // scope.files for the fix-up dispatch), and the bounded-pass receipt
 // fields. Best-effort: the transition is already committed, so a failure
 // here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, indices []int, reason string, allowCreate []string, priorPasses int) {
+func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -405,6 +446,9 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 	passOrdinal := priorPasses + 1
 	admissibilityReason := fmt.Sprintf("fix-up pass %d of %d; %d concern(s) routed back; via %s",
 		passOrdinal, defaultMaxFixupPasses, len(selected), fixupScopeUsed(id))
+	if refundedPasses > 0 {
+		admissibilityReason += fmt.Sprintf("; %d no-change pass(es) refunded", refundedPasses)
+	}
 	if dec.Forced {
 		// Durably record that this pass ran past the normal budget only
 		// because the operator forced it (#860).
@@ -421,6 +465,7 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 		"max_passes":           defaultMaxFixupPasses,
 		"hard_ceiling":         defaultFixupCeiling,
 		"remaining_budget":     dec.RemainingBudget,
+		"refunded_passes":      refundedPasses,
 		"forced":               dec.Forced,
 		"admissibility_reason": admissibilityReason,
 	}

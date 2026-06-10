@@ -2064,6 +2064,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	t.Helper()
 	origP, origO := newPusher, newPROpener
 	origCap, origRes := captureHead, restoreHead
+	origCheckout := checkoutFixupBase
 	newPusher = func() pusher { return fp }
 	newPROpener = func(token string) prOpener {
 		fpr.gotToken = token
@@ -2079,11 +2080,19 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 		return "operator-branch", false, nil
 	}
 	restoreHead = func(_ context.Context, _, _ string) error { return nil }
+	// Stub the fix-up base establishment (#967) the same way: a fixup run()
+	// test must never fetch + force-checkout the runner's own source repo.
+	// The canned tip flows into the lineage comparison; tests that assert
+	// the wiring swap in recording spies AFTER this.
+	checkoutFixupBase = func(_ context.Context, _, _, _ string) (string, error) {
+		return "fixup-branch-tip-sha", nil
+	}
 	t.Cleanup(func() {
 		newPusher = origP
 		newPROpener = origO
 		captureHead = origCap
 		restoreHead = origRes
+		checkoutFixupBase = origCheckout
 	})
 }
 
@@ -3570,6 +3579,237 @@ func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"implement_fixup_push_reported"`) {
 		t.Errorf("missing implement_fixup_push_reported log line:\n%s", stderr.String())
+	}
+}
+
+// fixupPromptResp builds the fix-up prompt response the #967 base-
+// establishment tests dispatch against.
+func fixupPromptResp(expectedHeadSHA string) *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:              "22222222-3333-4444-5555-666666666666",
+		StageType:            "implement",
+		Prompt:               "implement",
+		PromptHash:           "h",
+		Fixup:                true,
+		FixupBranch:          "fishhawk/run-11111111/stage-22222222",
+		FixupExpectedHeadSHA: expectedHeadSHA,
+	}
+}
+
+// runFixupStage drives run() with the standard fix-up argv.
+func runFixupStage(t *testing.T, stderr *strings.Builder) int {
+	t.Helper()
+	return run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, stderr)
+}
+
+// TestRun_Fixup_EstablishesBaseBeforeAgentInvoke is the #967 regression: a
+// fix-up dispatch with the operator's tree on a DIFFERENT ref (main) must
+// fetch + checkout the run's PR branch BEFORE the agent is invoked — never
+// run the agent against the operator's incidental checkout — and restore
+// the operator's original ref afterwards. The success path fires BOTH
+// restore defers (run()-level #967 + openPRAndShipArtifact's #911); the
+// second is a harmless same-ref restore, so every call targets the
+// original ref and no restore-failure event is emitted.
+func TestRun_Fixup_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	// Ordered spy: the agent invocation must observe the checkout already
+	// requested.
+	var order []string
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			order = append(order, "invoke")
+		},
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupPromptResp("fixup-branch-tip-sha")
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	// The operator's tree sits on main — the exact #967 shape.
+	var restoredRefs []string
+	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutFixupBase
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return "main", false, nil
+	}
+	restoreHead = func(_ context.Context, _, ref string) error {
+		restoredRefs = append(restoredRefs, ref)
+		return nil
+	}
+	var gotBranch, gotRemote string
+	checkoutFixupBase = func(_ context.Context, _, remote, branch string) (string, error) {
+		order = append(order, "checkout")
+		gotRemote = remote
+		gotBranch = branch
+		return "fixup-branch-tip-sha", nil
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; checkoutFixupBase = origCheckout })
+
+	var stderr strings.Builder
+	if got := runFixupStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if len(order) < 2 || order[0] != "checkout" || order[1] != "invoke" {
+		t.Errorf("order = %v, want the run-branch checkout BEFORE the agent invocation", order)
+	}
+	if gotBranch != "fishhawk/run-11111111/stage-22222222" {
+		t.Errorf("checkout branch = %q, want the prompt's fixup_branch", gotBranch)
+	}
+	if gotRemote != gitops.DefaultRemote {
+		t.Errorf("checkout remote = %q, want %q", gotRemote, gitops.DefaultRemote)
+	}
+	// Binding amendment (opus, step 6a): the success path emits
+	// fixup_base_established carrying branch + head_sha + original_ref.
+	for _, want := range []string{
+		`"event":"fixup_base_established"`,
+		`"branch":"fishhawk/run-11111111/stage-22222222"`,
+		`"head_sha":"fixup-branch-tip-sha"`,
+		`"original_ref":"main"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in fixup_base_established emission:\n%s", want, stderr.String())
+		}
+	}
+	// Both restore defers fired; every restore targets the ORIGINAL ref and
+	// the double restore is error-free.
+	if len(restoredRefs) != 2 {
+		t.Errorf("restoreHead called %d times, want 2 (run()-level + openPRAndShipArtifact defers)", len(restoredRefs))
+	}
+	for i, ref := range restoredRefs {
+		if ref != "main" {
+			t.Errorf("restoredRefs[%d] = %q, want %q (the operator's original ref)", i, ref, "main")
+		}
+	}
+	if strings.Contains(stderr.String(), `"event":"working_tree_restore_failed"`) {
+		t.Errorf("double restore emitted a restore-failure event:\n%s", stderr.String())
+	}
+}
+
+// TestRun_Fixup_BaseMismatch_FailsBeforeAgentInvoke: when the fetched
+// branch tip differs from the backend-advertised fixup_expected_head_sha,
+// the runner fails fast — the agent is NEVER invoked, the mismatch event
+// names both SHAs (ADR-035), and the operator's original ref is restored
+// (the checkout had already moved HEAD).
+func TestRun_Fixup_BaseMismatch_FailsBeforeAgentInvoke(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupPromptResp("expected-recorded-head-sha")
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	var restoredRefs []string
+	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutFixupBase
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return "main", false, nil
+	}
+	restoreHead = func(_ context.Context, _, ref string) error {
+		restoredRefs = append(restoredRefs, ref)
+		return nil
+	}
+	checkoutFixupBase = func(_ context.Context, _, _, _ string) (string, error) {
+		return "foreign-tip-sha", nil
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; checkoutFixupBase = origCheckout })
+
+	var stderr strings.Builder
+	if got := runFixupStage(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on a lineage mismatch:\n%s", got, stderr.String())
+	}
+	if inv.gotInv != nil {
+		t.Error("agent was invoked despite the fixup base mismatch — must fail fast BEFORE any invocation")
+	}
+	for _, want := range []string{
+		`"event":"fixup_base_mismatch"`,
+		`"fetched_tip_sha":"foreign-tip-sha"`,
+		`"expected_head_sha":"expected-recorded-head-sha"`,
+		`"reason":"fixup_base_mismatch"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in mismatch emission:\n%s", want, stderr.String())
+		}
+	}
+	// The checkout moved HEAD before the comparison, so the run()-level
+	// defer must put the operator back.
+	if len(restoredRefs) != 1 || restoredRefs[0] != "main" {
+		t.Errorf("restoredRefs = %v, want exactly one restore to %q", restoredRefs, "main")
+	}
+}
+
+// TestRun_Fixup_MissingExpectedSHA_ProceedsWithCheckoutOnly: an empty
+// fixup_expected_head_sha (older backend / backend-side resolution
+// failure) must not block the pass — the runner checks the branch out,
+// emits the skip warning, and invokes the agent.
+func TestRun_Fixup_MissingExpectedSHA_ProceedsWithCheckoutOnly(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupPromptResp("")
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	var stderr strings.Builder
+	if got := runFixupStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if inv.gotInv == nil {
+		t.Error("agent was not invoked — a missing expected SHA must proceed, not block")
+	}
+	if !strings.Contains(stderr.String(), `"event":"fixup_expected_head_missing"`) {
+		t.Errorf("missing fixup_expected_head_missing warning:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"fixup_base_established"`) {
+		t.Errorf("missing fixup_base_established event:\n%s", stderr.String())
+	}
+}
+
+// TestRun_Fixup_AgentFailureAfterCheckout_RestoresOriginalRef: an agent
+// (category-A) failure after the fix-up checkout never reaches
+// openPRAndShipArtifact's restore defer — the run()-level defer (#967)
+// must still return the operator to their original ref.
+func TestRun_Fixup_AgentFailureAfterCheckout_RestoresOriginalRef(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent crash"},
+		returnErr: errors.New("agent crash"),
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupPromptResp("fixup-branch-tip-sha")
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	var restoredRefs []string
+	origCap, origRes := captureHead, restoreHead
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return "main", false, nil
+	}
+	restoreHead = func(_ context.Context, _, ref string) error {
+		restoredRefs = append(restoredRefs, ref)
+		return nil
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+
+	var stderr strings.Builder
+	if got := runFixupStage(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on agent crash:\n%s", got, stderr.String())
+	}
+	if len(restoredRefs) != 1 || restoredRefs[0] != "main" {
+		t.Errorf("restoredRefs = %v, want exactly one restore to %q (run()-level defer on the agent-failure path)",
+			restoredRefs, "main")
+	}
+	if !strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("missing working_tree_restored event on the agent-failure path:\n%s", stderr.String())
 	}
 }
 

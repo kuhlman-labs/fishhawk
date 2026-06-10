@@ -118,6 +118,13 @@ fixup_ceiling_reached error (the override no longer helps — file a
 follow-up and merge, or start a fresh run). A run-bound token may fix up
 only its own run's stages. The operator still owns the merge.
 
+No-change refund (#967): a pass whose re-dispatch produced NO commit
+(fishhawk_run_stage returned fixup_no_changes:true; a fixup_no_changes
+audit entry exists for the stage) is REFUNDED against the normal budget —
+the next trigger is admitted without force_additional_pass. The refund
+never extends the absolute 3-pass ceiling, which counts every triggered
+pass including refunded ones.
+
 Returns the re-opened Stage row (pending → dispatched) on success.
 Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)

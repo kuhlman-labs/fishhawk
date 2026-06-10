@@ -1283,6 +1283,39 @@ func TestSummarizeRunStageEvents(t *testing.T) {
 			t.Errorf("Turns = %d, want 2 (from heartbeat)", summary.Turns)
 		}
 	})
+
+	t.Run("implement_fixup_no_changes sets the FixupNoChanges flag", func(t *testing.T) {
+		// A no-change fix-up pass (#967): the relayed stream carries the
+		// runner's implement_fixup_no_changes event followed by a plain-ok
+		// runner_completed. The summary must surface the no-op as a
+		// dedicated flag (Outcome alone reads as plain success) and retain
+		// the event in the filtered slice.
+		in := []RunnerEvent{
+			{Payload: map[string]any{"event": "implement_fixup_no_changes",
+				"branch": "fishhawk/run-aaaaaaaa/stage-bbbbbbbb", "base_sha": "cafe"}},
+			{Payload: map[string]any{"event": "runner_completed", "outcome": "ok", "tokens_used": float64(7)}},
+		}
+		summary, filtered := summarizeRunStageEvents(in)
+		if !summary.FixupNoChanges {
+			t.Error("FixupNoChanges = false, want true after an implement_fixup_no_changes event")
+		}
+		if summary.Outcome != "ok" {
+			t.Errorf("Outcome = %q, want ok (the flag complements, not replaces, the outcome)", summary.Outcome)
+		}
+		if len(filtered) != 2 {
+			t.Errorf("filtered = %d, want 2 (the no-changes event is retained)", len(filtered))
+		}
+	})
+
+	t.Run("no fixup event leaves FixupNoChanges false", func(t *testing.T) {
+		in := []RunnerEvent{
+			{Payload: map[string]any{"event": "runner_completed", "outcome": "ok"}},
+		}
+		summary, _ := summarizeRunStageEvents(in)
+		if summary.FixupNoChanges {
+			t.Error("FixupNoChanges = true, want false without an implement_fixup_no_changes event")
+		}
+	})
 }
 
 // --- DiffSummary, AuditPointer, RunURL enrichment (#442) ---

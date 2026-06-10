@@ -575,7 +575,8 @@ func TestFetchPrompt_DecodesFixup(t *testing.T) {
 		"prompt": "p",
 		"prompt_hash": "h",
 		"fixup": true,
-		"fixup_branch": "fishhawk/run-aaaaaaaa/stage-bbbbbbbb"
+		"fixup_branch": "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"fixup_expected_head_sha": "cafe000000000000000000000000000000000000"
 	}`
 	c := quickClient(srv)
 
@@ -591,6 +592,9 @@ func TestFetchPrompt_DecodesFixup(t *testing.T) {
 	}
 	if got.FixupBranch != "fishhawk/run-aaaaaaaa/stage-bbbbbbbb" {
 		t.Errorf("FixupBranch = %q", got.FixupBranch)
+	}
+	if got.FixupExpectedHeadSHA != "cafe000000000000000000000000000000000000" {
+		t.Errorf("FixupExpectedHeadSHA = %q, want the advertised recorded head (#967)", got.FixupExpectedHeadSHA)
 	}
 }
 
@@ -609,8 +613,9 @@ func TestFetchPrompt_FixupOmittedWhenAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchPrompt: %v", err)
 	}
-	if got.Fixup || got.FixupBranch != "" {
-		t.Errorf("fixup = (%t,%q), want (false,\"\") when absent", got.Fixup, got.FixupBranch)
+	if got.Fixup || got.FixupBranch != "" || got.FixupExpectedHeadSHA != "" {
+		t.Errorf("fixup = (%t,%q,%q), want (false,\"\",\"\") when absent",
+			got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA)
 	}
 }
 
