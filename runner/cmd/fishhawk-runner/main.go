@@ -237,6 +237,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// preserving the existing local-replay behavior.
 	var stageType string
 
+	// fixupExpectedHeadSHA is the fetched prompt's fixup_expected_head_sha
+	// (#967): the run's recorded head per the backend's ADR-035 lineage
+	// ledger. The pre-invoke fix-up base establishment below fetches +
+	// checks out cfg.fixupBranch and fails fast when the fetched tip
+	// differs from this value. Empty (older backend / backend-side
+	// resolution failure, or no --fetch-prompt) skips the comparison.
+	// Function-scoped rather than a cfg field: it is produced and consumed
+	// entirely within run().
+	var fixupExpectedHeadSHA string
+
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
 	// a temp file. Sets cfg.promptFile so the rest of the path is
@@ -257,7 +267,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -279,6 +289,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.commitAuthorEmail = commitAuthorEmail
 		cfg.fixup = fixup
 		cfg.fixupBranch = fixupBranch
+		fixupExpectedHeadSHA = expectedHeadSHA
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
@@ -435,6 +446,68 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			preAgentDetached = detached
 			preAgentCaptured = true
 		}
+	}
+
+	// Fix-up base establishment (#967): a fix-up pass must run against the
+	// run's PR branch, not the operator's incidental checkout — an operator
+	// tree left on main makes the agent's edits a silent no-op that burns a
+	// fix-up pass. Before invoking the agent, fetch + checkout the PR branch
+	// and verify the fetched tip against the backend-advertised recorded
+	// head (ADR-035 lineage): a mismatch means the branch tip is not the
+	// stage's recorded head, so FAIL FAST before any agent invocation. An
+	// empty expected SHA (older backend, or backend-side resolution failure)
+	// proceeds with checkout only. The run()-level restore defer below puts
+	// the operator back on their original ref even on agent-failure paths
+	// that never reach openPRAndShipArtifact's restore defer (#911 family);
+	// on the success path both defers fire — the second is a harmless
+	// same-ref checkout.
+	if stageType == "implement" && cfg.fixup {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		fixupCheckoutMoved := false
+		if preAgentCaptured {
+			defer func() {
+				if !fixupCheckoutMoved {
+					return
+				}
+				if rerr := restoreHead(ctx, repoDir, preAgentRef); rerr != nil {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"working_tree_restore_failed","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t,"detail":%q}`+"\n",
+						cfg.runID, cfg.stageID, preAgentRef, preAgentDetached, rerr.Error())
+					return
+				}
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"working_tree_restored","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t}`+"\n",
+					cfg.runID, cfg.stageID, preAgentRef, preAgentDetached)
+			}()
+		}
+		tipSHA, coErr := checkoutFixupBase(ctx, repoDir, gitops.DefaultRemote, cfg.fixupBranch)
+		if coErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"fixup_base_checkout","detail":%q}`+"\n", coErr.Error())
+			return exitFailure
+		}
+		fixupCheckoutMoved = true
+		if fixupExpectedHeadSHA != "" && tipSHA != fixupExpectedHeadSHA {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_base_mismatch","run_id":%q,"stage_id":%q,"branch":%q,"fetched_tip_sha":%q,"expected_head_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, cfg.fixupBranch, tipSHA, fixupExpectedHeadSHA)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"fixup_base_mismatch","detail":%q}`+"\n",
+				fmt.Sprintf("run branch %s tip %s does not match the stage's recorded head %s (ADR-035): the branch carries commits the run did not report, or the recorded head was never pushed",
+					cfg.fixupBranch, tipSHA, fixupExpectedHeadSHA))
+			return exitFailure
+		}
+		if fixupExpectedHeadSHA == "" {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_expected_head_missing","run_id":%q,"stage_id":%q,"branch":%q,"detail":"backend advertised no fixup_expected_head_sha; proceeding with checkout only (no lineage comparison)"}`+"\n",
+				cfg.runID, cfg.stageID, cfg.fixupBranch)
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"fixup_base_established","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"original_ref":%q}`+"\n",
+			cfg.runID, cfg.stageID, cfg.fixupBranch, tipSHA, preAgentRef)
 	}
 
 	invokeStart := time.Now()
@@ -1117,17 +1190,19 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // gitops default bot identity. fixup and fixupBranch (#762) mark an
 // operator-triggered implement-review fix-up pass: when fixup is true the
 // implement stage commits onto the existing PR branch fixupBranch and updates
-// the open PR rather than opening a new one.
+// the open PR rather than opening a new one. fixupExpectedHeadSHA (#967) is
+// the run's recorded head the pre-invoke fix-up base establishment verifies
+// the fetched branch tip against; empty skips the comparison.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -1135,20 +1210,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -2312,6 +2387,15 @@ var (
 	// exercised directly by the gitops unit tests against throwaway repos.
 	captureHead = gitops.CaptureHead
 	restoreHead = gitops.RestoreHead
+
+	// checkoutFixupBase is the fix-up base-establishment seam (#967).
+	// Production wires it to gitops.CheckoutRemoteBranch, which fetches the
+	// run's PR branch from the named remote and checks the working tree out
+	// onto the fetched tip, returning that tip SHA for the ADR-035 lineage
+	// comparison. A package-level var for the same reason as captureHead /
+	// restoreHead: the fake-pusher run() tests default repoDir to "." and
+	// must never fetch + force-checkout the runner's own source repo.
+	checkoutFixupBase = gitops.CheckoutRemoteBranch
 )
 
 // compileDiagnosticMarkers are substrings that positively identify a

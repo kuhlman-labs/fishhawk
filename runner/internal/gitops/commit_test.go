@@ -602,6 +602,165 @@ func initRepo(t *testing.T) string {
 	return repo
 }
 
+// TestCheckoutRemoteBranch_EstablishesFixupBase is the #967 fix-up
+// base-establishment seam against a real repo pair: the local working
+// tree starts on a DIFFERENT branch (main, the operator's incidental
+// checkout) with no local copy of the PR branch, and CheckoutRemoteBranch
+// must fetch the remote branch tip, update the remote-tracking ref via
+// the explicit refspec, check the tree out onto it, and return the tip
+// SHA. This is the concrete test for the explicit-refspec fetch
+// semantics the helper relies on — it fails if the tracking ref is not
+// deterministically updated.
+func TestCheckoutRemoteBranch_EstablishesFixupBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	// Create the PR branch with a commit and push it, then return the local
+	// tree to main and ERASE every local trace of the branch (local ref +
+	// tracking ref) — the operator's checkout knows nothing about the run
+	// branch, the shape #967 fixes.
+	const branch = "fishhawk/run-12345678/stage-87654321"
+	mustGit(t, repo, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repo, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "fix-up target")
+	mustGit(t, repo, "push", "origin", branch)
+	remoteTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "checkout", "main")
+	mustGit(t, repo, "branch", "-D", branch)
+	mustGit(t, repo, "update-ref", "-d", "refs/remotes/origin/"+branch)
+
+	tip, err := CheckoutRemoteBranch(context.Background(), repo, "origin", branch)
+	if err != nil {
+		t.Fatalf("CheckoutRemoteBranch: %v", err)
+	}
+	if tip != remoteTip {
+		t.Errorf("returned tip = %q, want the remote branch tip %q", tip, remoteTip)
+	}
+	// The working tree is now ON the branch at the fetched tip.
+	if got := mustGitOut(t, repo, "symbolic-ref", "--short", "HEAD"); got != branch {
+		t.Errorf("HEAD = %q, want %q", got, branch)
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != remoteTip {
+		t.Errorf("HEAD sha = %q, want %q", got, remoteTip)
+	}
+	// The explicit refspec updated the remote-tracking ref.
+	if got := mustGitOut(t, repo, "rev-parse", "refs/remotes/origin/"+branch); got != remoteTip {
+		t.Errorf("tracking ref = %q, want %q", got, remoteTip)
+	}
+	// The agent's edits land on the run branch from here.
+	if err := os.WriteFile(filepath.Join(repo, "fix.txt"), []byte("fix v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCheckoutRemoteBranch_RemoteNameLockstep proves the fetch source and
+// the tracking/checkout ref are derived from the SAME remote name — never
+// a hard-coded "origin" — by running against a remote named "upstream"
+// and asserting refs/remotes/upstream/<branch> is what gets updated and
+// checked out. It also covers the stale-local-branch shape: a local
+// branch of the same name pointing at an OLD commit is reset to the
+// fetched tip by checkout -B.
+func TestCheckoutRemoteBranch_RemoteNameLockstep(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "upstream.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "upstream", bare)
+
+	// Local PR branch with one commit — the STALE local state.
+	const branch = "fishhawk/run-aaaabbbb/stage-ccccdddd"
+	mustGit(t, repo, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repo, "fix.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "v1")
+	staleTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "push", "upstream", branch)
+
+	// Advance the branch in the remote only (a fixup_pushed head the local
+	// clone never fetched), then rewind the local branch to the stale tip.
+	if err := os.WriteFile(filepath.Join(repo, "fix.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "v2")
+	remoteTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "push", "upstream", branch)
+	mustGit(t, repo, "reset", "--hard", staleTip)
+	mustGit(t, repo, "update-ref", "-d", "refs/remotes/upstream/"+branch)
+	mustGit(t, repo, "checkout", "main")
+
+	tip, err := CheckoutRemoteBranch(context.Background(), repo, "upstream", branch)
+	if err != nil {
+		t.Fatalf("CheckoutRemoteBranch: %v", err)
+	}
+	if tip != remoteTip {
+		t.Errorf("returned tip = %q, want remote tip %q (not the stale local %q)", tip, remoteTip, staleTip)
+	}
+	// Lockstep invariant: the UPSTREAM tracking ref was updated; no origin
+	// ref was invented.
+	if got := mustGitOut(t, repo, "rev-parse", "refs/remotes/upstream/"+branch); got != remoteTip {
+		t.Errorf("refs/remotes/upstream/%s = %q, want %q", branch, got, remoteTip)
+	}
+	if out, err := exec.Command("git", "-C", repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch).Output(); err == nil {
+		t.Errorf("refs/remotes/origin/%s unexpectedly exists (= %q): tracking ref must derive from the fetch remote", branch, strings.TrimSpace(string(out)))
+	}
+	// The stale local branch was reset to the fetched tip.
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != remoteTip {
+		t.Errorf("HEAD sha = %q, want fetched tip %q", got, remoteTip)
+	}
+	if got := mustGitOut(t, repo, "symbolic-ref", "--short", "HEAD"); got != branch {
+		t.Errorf("HEAD = %q, want %q", got, branch)
+	}
+}
+
+// TestCheckoutRemoteBranch_RejectsEmptyBranch pins the input contract.
+func TestCheckoutRemoteBranch_RejectsEmptyBranch(t *testing.T) {
+	if _, err := CheckoutRemoteBranch(context.Background(), t.TempDir(), "origin", ""); err == nil {
+		t.Fatal("expected error for empty branch")
+	}
+}
+
 func mustGitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

@@ -336,6 +336,124 @@ func reparkFixupStage(repo *approvalRunRepo, stageID uuid.UUID) {
 	repo.mu.Unlock()
 }
 
+// seedFixupNoChanges records a fixup_no_changes audit entry for the stage,
+// modeling the #856 no-change report path (succeedFixupNoChangesStage in
+// pullrequest.go) — the durable signal the budget refund counts (#967).
+func seedFixupNoChanges(au *auditFake, stage *run.Stage) {
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":   stage.RunID.String(),
+		"stage_id": stage.ID.String(),
+		"branch":   "fishhawk/run-x/stage-y",
+		"base_sha": "deadbeef",
+	})
+	rid := stage.RunID
+	sid := stage.ID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: "fixup_no_changes", Payload: payload})
+}
+
+// TestFixupStage_NoChangeRefundAdmitsSecondPass: a fix-up pass whose
+// re-dispatch produced no commit (fixup_no_changes audit entry, #856) is
+// refunded against the NORMAL budget (#967), so a second trigger is
+// admitted WITHOUT force_additional_pass and the refund is recorded on the
+// audit payload's refunded_passes field.
+func TestFixupStage_NoChangeRefundAdmitsSecondPass(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	// Pass 1: normal, spends the budget...
+	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}}); w.Code != http.StatusOK {
+		t.Fatalf("first fixup status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	// ...but the re-dispatch produced no commit: the #856 report path
+	// recorded a fixup_no_changes entry for the stage.
+	seedFixupNoChanges(au, stage)
+	reparkFixupStage(repo, stage.ID)
+
+	// Pass 2: admitted without force — the no-change pass was refunded.
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, Reason: "retry after no-op pass"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("refunded second fixup status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// The new stage_fixup_triggered entry records the refund.
+	var last *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryStageFixupTriggered {
+			last = &au.appended[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("no stage_fixup_triggered entry appended")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(last.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["refunded_passes"].(float64) != 1 {
+		t.Errorf("refunded_passes = %v, want 1", payload["refunded_passes"])
+	}
+	if payload["forced"] != false {
+		t.Errorf("forced = %v, want false — the refunded pass is within the normal budget", payload["forced"])
+	}
+
+	// Pass 3 without force: the single refund is consumed (raw=2,
+	// refunded=1, effective=1 >= max=1) — refused with the normal
+	// budget-exhausted code, and its details carry the refund count.
+	reparkFixupStage(repo, stage.ID)
+	w = postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("third fixup status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
+		t.Errorf("body missing fixup_budget_exhausted code: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "refunded_passes") {
+		t.Errorf("budget-exhausted details missing refunded_passes: %s", w.Body.String())
+	}
+}
+
+// TestFixupStage_NoChangeRefundNeverExtendsCeiling: the refund applies to
+// the NORMAL budget only — the absolute hard ceiling keeps counting RAW
+// stage_fixup_triggered entries, so 3 triggered passes hard-stop the stage
+// even when one of them was a refunded no-change pass (#967).
+func TestFixupStage_NoChangeRefundNeverExtendsCeiling(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	// Pass 1 (normal), then a no-change report refunds it.
+	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}}); w.Code != http.StatusOK {
+		t.Fatalf("pass 1 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	seedFixupNoChanges(au, stage)
+	// Pass 2 (refund-admitted) and pass 3 (forced) reach the raw ceiling.
+	reparkFixupStage(repo, stage.ID)
+	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}}); w.Code != http.StatusOK {
+		t.Fatalf("pass 2 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	reparkFixupStage(repo, stage.ID)
+	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true}); w.Code != http.StatusOK {
+		t.Fatalf("pass 3 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// 4th attempt: 3 RAW passes triggered — refused with the distinct
+	// ceiling code despite the refund, even when forced.
+	reparkFixupStage(repo, stage.ID)
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("ceiling status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
+		t.Errorf("body missing fixup_ceiling_reached code: %s", w.Body.String())
+	}
+}
+
 func TestFixupStage_ForceAdditionalPassGrantsForcedPass(t *testing.T) {
 	// The normal budget (1) is spent after one pass; force_additional_pass
 	// grants one more, audited as forced (#860).

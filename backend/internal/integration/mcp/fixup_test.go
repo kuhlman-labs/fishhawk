@@ -942,6 +942,251 @@ func succeedFixupPushViaBackend(t *testing.T, ctx context.Context, fx *e2eFixtur
 	}
 }
 
+// TestE2E_Fixup_ExpectedHeadAdvertisedAndNoChangeRefund drives the #967
+// seams end to end through the real HTTP server, crossing the backend wire
+// payload → runner consumption → budget-refund layers the per-layer units
+// cannot (cf. #618):
+//
+//   - (a) after a fix-up trigger, the stage prompt payload carries
+//     fixup=true, fixup_branch, AND fixup_expected_head_sha equal to the
+//     run's recorded run-authored head (the NEWEST reported head across
+//     the lineage-ledger audit categories) — the value the runner's
+//     pre-invoke base establishment compares the fetched branch tip
+//     against;
+//   - (b) a {outcome:"fixup_no_changes"} /pull-request report refunds the
+//     spent pass against the NORMAL budget (a second trigger is admitted
+//     without force_additional_pass, with refunded_passes recorded on the
+//     audit payload), while the absolute 3-pass ceiling keeps counting RAW
+//     triggered passes and still rejects the pass beyond it.
+func TestE2E_Fixup_ExpectedHeadAdvertisedAndNoChangeRefund(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+
+	// GitHub-wired sibling server over the same pool so prompt-render
+	// serves (same shape as TestE2E_Fixup_ConcernRoutedBackAndBounded).
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// 1. Implement stage parked at the review gate, with a recorded
+	// implement-review concern to route back.
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+
+	// 2. Seed the reported-head ledger: an older PR-open head, then a NEWER
+	// pushed head — the recorded run-authored head the prompt must advertise.
+	const olderHead = "1111111111111111111111111111111111111111"
+	const recordedHead = "2222222222222222222222222222222222222222"
+	seedReportedHead(t, ctx, auditRepo, fx.runID, stage.ID, "pull_request_opened", olderHead, time.Now().Add(-2*time.Hour).UTC())
+	seedReportedHead(t, ctx, auditRepo, fx.runID, stage.ID, "fixup_pushed", recordedHead, time.Now().Add(-1*time.Hour).UTC())
+
+	// 3. Trigger the fix-up through the real fishhawk-mcp binary.
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	callFixup := func(force bool) *mcp.CallToolResult {
+		t.Helper()
+		if cur, err := fx.runRepo.GetStage(ctx, stage.ID); err != nil {
+			t.Fatalf("GetStage: %v", err)
+		} else if cur.State != runpkg.StageStateAwaitingApproval {
+			parkAtGate(t, ctx, fx.runRepo, stage.ID)
+		}
+		args := map[string]any{
+			"stage_id": stage.ID.String(),
+			"concerns": []int{0},
+		}
+		if force {
+			args["force_additional_pass"] = true
+		}
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_fixup_stage", Arguments: args})
+		if err != nil {
+			t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+		}
+		return res
+	}
+	if res := callFixup(false); res.IsError {
+		t.Fatalf("first fix-up returned error: %s", toolContentString(t, res))
+	}
+
+	// 4. Seam (a): the prompt payload advertises the fix-up routing AND the
+	// recorded head — the value the runner's pre-invoke base establishment
+	// verifies the fetched fixup_branch tip against (ADR-035).
+	var promptOut struct {
+		Fixup                bool   `json:"fixup"`
+		FixupBranch          string `json:"fixup_branch"`
+		FixupExpectedHeadSHA string `json:"fixup_expected_head_sha"`
+	}
+	getPromptRenderJSON(t, ctx, httpSrv.URL, stage.ID, &promptOut)
+	if !promptOut.Fixup {
+		t.Error("prompt fixup = false, want true after the fix-up trigger")
+	}
+	wantBranch := "fishhawk/run-" + fx.runID.String()[:8] + "/stage-" + stage.ID.String()[:8]
+	if promptOut.FixupBranch != wantBranch {
+		t.Errorf("prompt fixup_branch = %q, want %q", promptOut.FixupBranch, wantBranch)
+	}
+	if promptOut.FixupExpectedHeadSHA != recordedHead {
+		t.Errorf("prompt fixup_expected_head_sha = %q, want the NEWEST recorded head %q (not the older %q)",
+			promptOut.FixupExpectedHeadSHA, recordedHead, olderHead)
+	}
+
+	// 5. Seam (b): the re-dispatch produced no commit — ship the
+	// {outcome:"fixup_no_changes"} report through the real /pull-request
+	// handler, which writes the fixup_no_changes audit entry the refund
+	// counts.
+	reportFixupNoChangesViaBackend(t, ctx, fx, stage.ID, wantBranch)
+
+	// 6. A second fix-up WITHOUT force is admitted — the no-change pass was
+	// refunded against the normal budget — and the audit receipt records it.
+	if res := callFixup(false); res.IsError {
+		t.Fatalf("refunded second fix-up returned error: %s", toolContentString(t, res))
+	}
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 2 after the refunded pass", len(entries))
+	}
+	var refunded struct {
+		RefundedPasses int  `json:"refunded_passes"`
+		Forced         bool `json:"forced"`
+	}
+	if err := json.Unmarshal(entries[len(entries)-1].Payload, &refunded); err != nil {
+		t.Fatalf("unmarshal refunded payload: %v", err)
+	}
+	if refunded.RefundedPasses != 1 {
+		t.Errorf("refunded_passes = %d, want 1", refunded.RefundedPasses)
+	}
+	if refunded.Forced {
+		t.Error("refund-admitted pass audited as forced; want a normal-budget pass")
+	}
+
+	// 7. The ceiling counts RAW passes: a third pass (forced — the refund
+	// is consumed) reaches 3 raw passes, and the next attempt is rejected
+	// with the DISTINCT ceiling error even when forced.
+	if res := callFixup(true); res.IsError {
+		t.Fatalf("third fix-up returned error: %s", toolContentString(t, res))
+	}
+	ceil := callFixup(true)
+	if !ceil.IsError {
+		t.Fatalf("fix-up beyond the raw ceiling unexpectedly succeeded; want fixup_ceiling_reached")
+	}
+	if body := toolContentString(t, ceil); !strings.Contains(body, "fixup_ceiling_reached") {
+		t.Errorf("ceiling fix-up error missing fixup_ceiling_reached code: %s", body)
+	}
+}
+
+// seedReportedHead appends a reported-head ledger audit entry
+// (pull_request_opened / child_pushed / fixup_pushed) carrying a head_sha
+// at the given timestamp — the source resolveFixupExpectedHeadSHA reads.
+func seedReportedHead(t *testing.T, ctx context.Context, repo audit.Repository, runID, stageID uuid.UUID, category, headSHA string, ts time.Time) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"head_sha": headSHA})
+	if err != nil {
+		t.Fatalf("marshal %s payload: %v", category, err)
+	}
+	kind := audit.ActorKind("agent")
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: ts,
+		Category:  category,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("AppendChained %s: %v", category, err)
+	}
+}
+
+// getPromptRenderJSON fetches GET /v0/stages/{id}/prompt-render and decodes
+// the full response body into out, so tests can assert wire fields beyond
+// the prompt text (fixup routing, expected head).
+func getPromptRenderJSON(t *testing.T, ctx context.Context, baseURL string, stageID uuid.UUID, out any) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		baseURL+"/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	if err != nil {
+		t.Fatalf("build prompt-render request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("prompt-render request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prompt-render status %d: %s", resp.StatusCode, raw)
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		t.Fatalf("decode prompt-render response: %v", err)
+	}
+}
+
+// reportFixupNoChangesViaBackend POSTs a /pull-request
+// {outcome:"fixup_no_changes"} report for the implement stage, signed with
+// the run's signing key — the real #856 report path that writes the
+// fixup_no_changes audit entry the #967 budget refund counts.
+func reportFixupNoChangesViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID, branch string) {
+	t.Helper()
+	s := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		SigningRepo:  signing.NewPostgresRepository(fx.pool),
+		AuditRepo:    audit.NewPostgresRepository(fx.pool),
+		ArtifactRepo: artifact.NewPostgresRepository(fx.pool),
+	})
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	body, err := json.Marshal(map[string]any{
+		"outcome":  "fixup_no_changes",
+		"branch":   branch,
+		"base_sha": "2222222222222222222222222222222222222222",
+	})
+	if err != nil {
+		t.Fatalf("marshal fixup_no_changes body: %v", err)
+	}
+	digest := sha256.Sum256(body)
+	signature := ed25519.Sign(fx.signingPriv, digest[:])
+	url := srv.URL + "/v0/runs/" + fx.runID.String() + "/pull-request?stage_id=" + stageID.String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build pull-request request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(signature))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("fixup_no_changes POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("fixup_no_changes status %d: %s", resp.StatusCode, raw)
+	}
+}
+
 // TestE2E_Fixup_ReviewActionHintSurfacesAndOverride drives the
 // review-action-hint + operator-override seam end to end (#777, #860): the
 // audit-persistence → hint-compute → MCP-response and the MCP-input → HTTP →

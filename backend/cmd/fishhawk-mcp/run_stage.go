@@ -154,6 +154,8 @@ type RunStageOutput struct {
 	ElapsedSeconds int    `json:"elapsed_seconds,omitempty" jsonschema:"wall-clock seconds from the last stage_progress heartbeat"`
 	LastEventKind  string `json:"last_event_kind,omitempty" jsonschema:"the agent's last event kind from the last stage_progress heartbeat"`
 
+	FixupNoChanges bool `json:"fixup_no_changes,omitempty" jsonschema:"true when this fix-up pass produced NO commit (the runner reported implement_fixup_no_changes): the PR branch tip is unchanged and the stage returned to its review gate. The pass is refunded against the normal fix-up budget (the absolute 3-pass ceiling still counts it), so a corrected fixup can be re-triggered without force_additional_pass"`
+
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort after the stage runs. Omitted when
 	// the workflow declares no budget or the fetch failed (a fetch error
@@ -663,6 +665,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		TokensUsed:       summary.TokensUsed,
 		ElapsedSeconds:   summary.ElapsedSeconds,
 		LastEventKind:    summary.LastEventKind,
+		FixupNoChanges:   summary.FixupNoChanges,
 		Budget:           budgetStatus,
 		ReviewActionHint: reviewActionHint,
 	}
@@ -850,6 +853,11 @@ type runStageSummary struct {
 	TokensUsed     int
 	ElapsedSeconds int
 	LastEventKind  string
+	// FixupNoChanges is set when the relayed stream carried an
+	// implement_fixup_no_changes event (#967): the fix-up pass produced no
+	// commit, which summary.Outcome alone ("ok" from runner_completed)
+	// would mask as a plain success.
+	FixupNoChanges bool
 }
 
 // summarizeRunStageEvents walks the runner's events once and returns
@@ -901,6 +909,12 @@ func summarizeRunStageEvents(events []RunnerEvent) (runStageSummary, []RunnerEve
 				summary.Outcome = oc
 			}
 			summary.TokensUsed = numInt(m, "tokens_used")
+		case "implement_fixup_no_changes":
+			// No-change fix-up pass (#967): surfaced as a dedicated flag so
+			// the operator sees the no-op in the tool result instead of a
+			// plain runner_completed "ok". The event stays in the filtered
+			// slice (it is not a routine heartbeat).
+			summary.FixupNoChanges = true
 		}
 		filtered = append(filtered, ev)
 	}

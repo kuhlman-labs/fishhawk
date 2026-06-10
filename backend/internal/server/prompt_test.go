@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -1730,6 +1731,18 @@ func makeFixupEntry(runID, stageID uuid.UUID, concerns []planreview.Concern) *au
 	return &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
 }
 
+// makeReportedHeadEntry builds a reported-head ledger audit entry
+// (pull_request_opened / child_pushed / fixup_pushed) carrying a head_sha
+// at the given timestamp, so resolveFixupExpectedHeadSHA's newest-entry
+// pick can be exercised (#967).
+func makeReportedHeadEntry(runID, stageID uuid.UUID, category, headSHA string, ts time.Time) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"head_sha": headSHA})
+	rid := runID
+	sid := stageID
+	return &audit.Entry{ID: uuid.New(), Category: category, RunID: &rid, StageID: &sid,
+		Timestamp: ts, Payload: payload}
+}
+
 // TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded confirms that
 // when an implement stage carries a stage_fixup_triggered audit entry, the
 // prompt renders the selected concerns as binding instructions and folds a
@@ -1780,8 +1793,17 @@ func TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded(t *testing.T) 
 		{Severity: planreview.SeverityHigh, Category: "coverage",
 			Note: "add a test in backend/internal/run/fixup_test.go for the bound"},
 	}
+	// Seed the reported-head ledger: a PR-open head then a NEWER fixup_pushed
+	// head, so the expected-head resolver must pick the newest entry across
+	// categories rather than the first one it sees (#967).
 	auditByRun := map[uuid.UUID][]*audit.Entry{
-		runID: {makeFixupEntry(runID, implStageID, concerns)},
+		runID: {
+			makeFixupEntry(runID, implStageID, concerns),
+			makeReportedHeadEntry(runID, implStageID, "pull_request_opened",
+				"aaaa000000000000000000000000000000000000", time.Now().Add(-2*time.Hour)),
+			makeReportedHeadEntry(runID, implStageID, "fixup_pushed",
+				"bbbb111111111111111111111111111111111111", time.Now().Add(-1*time.Hour)),
+		},
 	}
 
 	priv, _ := sf.issue(t, runID)
@@ -1837,6 +1859,14 @@ func TestGetStagePrompt_Implement_FixupConcerns_RenderedAndFolded(t *testing.T) 
 	wantBranch := fmt.Sprintf("fishhawk/run-%s/stage-%s", runID.String()[:8], implStageID.String()[:8])
 	if resp.FixupBranch != wantBranch {
 		t.Errorf("fixup_branch = %q, want %q", resp.FixupBranch, wantBranch)
+	}
+
+	// The fix-up dispatch advertises the run's recorded head — the NEWEST
+	// reported head across the lineage ledger categories (#967): here the
+	// fixup_pushed head, not the older pull_request_opened one.
+	if want := "bbbb111111111111111111111111111111111111"; resp.FixupExpectedHeadSHA != want {
+		t.Errorf("fixup_expected_head_sha = %q, want %q (the newest reported head)",
+			resp.FixupExpectedHeadSHA, want)
 	}
 }
 
@@ -1909,6 +1939,9 @@ func TestGetStagePrompt_Implement_NoFixup_OmitsWireFlag(t *testing.T) {
 	}
 	if resp.FixupBranch != "" {
 		t.Errorf("fixup_branch = %q, want empty for a normal implement dispatch", resp.FixupBranch)
+	}
+	if resp.FixupExpectedHeadSHA != "" {
+		t.Errorf("fixup_expected_head_sha = %q, want empty for a normal implement dispatch", resp.FixupExpectedHeadSHA)
 	}
 }
 

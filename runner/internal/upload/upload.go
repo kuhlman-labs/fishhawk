@@ -378,6 +378,14 @@ type FetchedPrompt struct {
 	// this branch (fetch + pull --rebase) and pushes the fix-up commit so
 	// the open PR's head advances; it does NOT call OpenPR.
 	FixupBranch string `json:"fixup_branch,omitempty"`
+	// FixupExpectedHeadSHA is the run's recorded head — the newest
+	// reported head_sha in the backend's lineage ledger. Non-empty only
+	// when Fixup is true. Before invoking the agent on a fix-up pass the
+	// runner fetches + checks out FixupBranch and verifies the fetched tip
+	// equals this SHA (ADR-035, #967), failing fast on a mismatch. Empty
+	// (older backend, or backend-side resolution failure) means the runner
+	// skips the comparison and proceeds with checkout only.
+	FixupExpectedHeadSHA string `json:"fixup_expected_head_sha,omitempty"`
 }
 
 // ScopeFile is one entry in FetchedPrompt.ScopeFiles: a declared path
