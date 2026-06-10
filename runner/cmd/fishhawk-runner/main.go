@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -2497,18 +2498,16 @@ var (
 )
 
 // compileDiagnosticMarkers are substrings that positively identify a
-// Go compile / typecheck diagnostic in `go vet` output, as opposed to a
-// dependency-resolution failure (cold cache / no network) or a pure vet
-// analyzer finding. The gate blocks ONLY when one of these appears — a
-// positive allowlist, not a blanket "vet exited non-zero → block" — so a
-// dep-fetch failure or an unrelated vet warning degrades to a
-// non-blocking skip rather than killing every implement stage (#728,
-// reviewer concern 2). The first three are the markers the reviewer
-// named explicitly; the rest cover the same typecheck-error class —
-// including the selector-on-type form 'X undefined (type Y has no field
-// or method Z)' ("undefined (" + "has no field or method"), which the
-// colon form "undefined:" does not match (#774, surfaced driving #762
-// child D whose broken HEAD opened as a PR).
+// Go compile / typecheck diagnostic in `go vet` output. Since #959 they
+// are a BACKSTOP behind goDiagnosticBlocks, not the primary classifier:
+// the gate blocks on any clean compiler diagnostic line (the regexp),
+// and these markers additionally catch diagnostic shapes the regexp
+// could miss. The marker-allowlist-only era chased the open-ended
+// typecheck-message tail one production bug at a time — #774 added the
+// selector-on-type form 'X undefined (type Y has no field or method
+// Z)' ("undefined (" + "has no field or method") after #762 child D,
+// and #959's 'unknown field ... in struct literal' slipped past the
+// list again, letting an uncompilable head push (run 07bce059).
 var compileDiagnosticMarkers = []string{
 	"does not implement",
 	"cannot use",
@@ -2525,9 +2524,9 @@ var compileDiagnosticMarkers = []string{
 }
 
 // looksLikeCompileError reports whether `go vet` output contains a
-// genuine compile / typecheck diagnostic. Used to separate a real
-// build failure (block, category-B) from a dependency-resolution
-// failure or vet-analyzer finding (skip, non-blocking).
+// known compile / typecheck diagnostic marker. Since #959 it is the
+// backstop half of the gate's block condition — the primary classifier
+// is goDiagnosticBlocks; see compileDiagnosticMarkers.
 func looksLikeCompileError(output string) bool {
 	for _, m := range compileDiagnosticMarkers {
 		if strings.Contains(output, m) {
@@ -2537,19 +2536,78 @@ func looksLikeCompileError(output string) bool {
 	return false
 }
 
+// goDiagnosticLine matches a Go compiler / typecheck diagnostic line:
+// `path/to/file.go:LINE:COL: message`, optionally prefixed with `vet: `
+// (go vet prefixes typecheck/load errors that way; analyzer findings
+// print the bare form under a `# pkg` header). The COLUMN field is the
+// discriminator that keeps `go test` log lines (`file_test.go:42: msg`,
+// no column) and testcontainers/infra noise out: only the toolchain
+// emits the three-field form. The trailing capture group is the
+// diagnostic message, which goDiagnosticBlocks checks against
+// depResolutionMarkers.
+var goDiagnosticLine = regexp.MustCompile(`(?m)^(?:vet: )?[^\s:]+\.go:\d+:\d+: (.+)$`)
+
+// depResolutionMarkers identify the dependency-resolution failure
+// class WITHIN diagnostic-shaped lines. This exclusion is load-bearing:
+// a cold module cache / offline run prints dep failures in the same
+// `file.go:LINE:COL: message` form as a compile error (e.g.
+// `use_test.go:6:2: no required module provides package example.com/x;
+// to add it: go get ...` under GOPROXY=off), so the regexp alone would
+// false-block on gate infrastructure, violating the #728/#800
+// infra-skip contract.
+var depResolutionMarkers = []string{
+	"no required module provides",
+	"missing go.sum entry",
+	"cannot find module",
+	"cannot find package",
+	"cannot query module",
+}
+
+// goDiagnosticBlocks reports whether toolchain output carries a clean
+// Go compiler / typecheck diagnostic the committed-tree gates must
+// BLOCK on (#959): at least one line matches goDiagnosticLine and that
+// line's message is not a recognized dependency-resolution form. This
+// replaces marker-only classification as the primary block condition —
+// a definitive `file.go:LINE:COL:` diagnostic is evidence the tree
+// being pushed does not compile, regardless of whether the message text
+// is in compileDiagnosticMarkers. A skip now requires evidence the
+// toolchain itself failed (no parseable diagnostic, or dep-resolution-
+// only diagnostics), not merely a nonzero exit with an unrecognized
+// message — the #959 misclassification that let run 07bce059 push an
+// uncompilable head.
+func goDiagnosticBlocks(output string) bool {
+	for _, m := range goDiagnosticLine.FindAllStringSubmatch(output, -1) {
+		msg := m[1]
+		dep := false
+		for _, dm := range depResolutionMarkers {
+			if strings.Contains(msg, dm) {
+				dep = true
+				break
+			}
+		}
+		if !dep {
+			return true
+		}
+	}
+	return false
+}
+
 // testFailureMarkers are substrings that positively identify a GENUINE
-// `go test` failure to block on (#800), as opposed to a test-binary build
-// failure, a setup failure, or a dependency-resolution error. The test
-// gate blocks ONLY when one of these appears — a positive allowlist
-// symmetric with compileDiagnosticMarkers, the inverse of the compile
-// gate. `--- FAIL` is a failed assertion / sub-test; `panic:` is a test
-// panic. Deliberately EXCLUDED are the bare `FAIL\t<pkg> [build failed]`
-// and `[setup failed]` lines, which are infra (the test binary won't
-// build / deps unresolvable) and must SKIP, plus `ok\t<pkg>`, `no test
-// files`, and dep-resolution errors. The asymmetry favors SKIP on its
-// own: a false BLOCK breaks a legitimate push (worse — it stalls the loop
-// on gate infra), while a false SKIP merely misses one detection CI still
-// catches. When uncertain, skip.
+// `go test` failure to block on (#800): `--- FAIL` is a failed
+// assertion / sub-test; `panic:` is a test panic. Since #959 these are
+// the FIRST of two block conditions in the test phase — a `FAIL <pkg>
+// [build failed]` accompanied by a clean compiler diagnostic line now
+// also blocks (goDiagnosticBlocks → ErrCommitWouldNotCompile) instead
+// of skipping as infra, because a definitive compile failure of the
+// tree being pushed is not gate infrastructure. Still-skipping shapes:
+// `[setup failed]`, bare `[build failed]` with no diagnostic line,
+// dep-resolution errors, `ok\t<pkg>`, `no test files`, exec/OOM noise.
+// The skip-on-uncertainty asymmetry of #728/#800 narrows accordingly:
+// uncertain means NO parseable diagnostic, not an unrecognized
+// diagnostic message — and a block routes to verify_fix_reinvoke (an
+// in-place agent fix) rather than killing the stage outright, so the
+// false-block cost that originally justified the wide skip no longer
+// holds.
 var testFailureMarkers = []string{
 	"--- FAIL",
 	"panic:",
@@ -2582,12 +2640,18 @@ func looksLikeTestFailure(output string) bool {
 // (missing method ...)` that `go build ./...` would miss.
 //
 // It returns ErrCommitWouldNotCompile (wrapped, naming the drift files)
-// ONLY on a genuine compile failure. Every infrastructure problem — no
-// drift to drop, no go.work (non-Go repo), no Go toolchain, a worktree
-// or `go work edit` failure, or a dependency-resolution failure — is a
-// NON-blocking skip (logged as compile_gate_skipped, returns nil), so
-// the gate never becomes a new failure source in non-Go or misconfigured
-// environments. It degrades to today's "open the PR" behavior instead.
+// on a genuine compile failure: any clean compiler/typecheck diagnostic
+// line (goDiagnosticBlocks, #959) or a known diagnostic marker
+// (looksLikeCompileError, the backstop). Every infrastructure problem —
+// no drift to drop, no go.work (non-Go repo), no Go toolchain, a
+// worktree or `go work edit` failure, or a dependency-resolution
+// failure — is a NON-blocking skip (logged as compile_gate_skipped,
+// returns nil), so the gate never becomes a new failure source in
+// non-Go or misconfigured environments. A skip requires the failure to
+// look like toolchain/dependency infrastructure (no parseable
+// diagnostic, or dep-resolution-only diagnostics) — NOT merely a
+// nonzero exit with a message outside the marker list, the #959
+// misclassification (#728/#800/#774 history).
 //
 // After the per-module `go vet` compile check passes, it runs a second
 // phase (#800): `go test` on the touched packages (the packages
@@ -2597,11 +2661,15 @@ func looksLikeTestFailure(output string) bool {
 // (#780/#776) where a scope-only commit compiles but a necessary test
 // fake/helper was dropped as scope drift, so the committed tree's tests
 // are red while the agent's full working tree is green. A genuine test
-// failure (`--- FAIL`/`panic:`) returns ErrCommittedTestsFailed; every
-// test-infrastructure failure (test binary won't build, deps
-// unresolvable, exec error) is a non-blocking skip (test_gate_skipped).
-// The test phase runs ONLY on the drift-present path — the len(drift)==0
-// and empty-scope fast paths return before it.
+// failure (`--- FAIL`/`panic:`) returns ErrCommittedTestsFailed; a test
+// package that fails to BUILD with a clean compiler diagnostic returns
+// ErrCommitWouldNotCompile (#959 — `[build failed]` plus a
+// file:line:col diagnostic is a definitive compile failure of the tree
+// being pushed, not infra); only genuine test-infrastructure failures
+// (deps unresolvable, setup failure, exec error, no parseable
+// diagnostic) are a non-blocking skip (test_gate_skipped). The test
+// phase runs ONLY on the drift-present path — the len(drift)==0 and
+// empty-scope fast paths return before it.
 func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, drift, scopeFiles []string, logSink io.Writer) error {
 	// Fast paths (zero runtime on the common case): no excluded files
 	// means nothing build-required could have been dropped; no go.work at
@@ -2683,14 +2751,20 @@ func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, d
 			skip("vet_exec", verr.Error())
 			return nil
 		}
-		// vet ran and exited non-zero. Block ONLY on a genuine compile /
-		// typecheck diagnostic; a dependency-resolution failure (cold cache
-		// / no network) or vet-analyzer finding is a non-blocking skip
-		// (reviewer concern 2). `continue` (not return) so a non-compile
-		// failure in ONE module doesn't abandon the gate — a later module
-		// may still carry the real build-required-drift compile error.
+		// vet ran and exited non-zero. Block on any clean compiler /
+		// typecheck diagnostic line (goDiagnosticBlocks, #959) or a known
+		// diagnostic marker (looksLikeCompileError, the backstop); a
+		// dependency-resolution failure (cold cache / no network) or a
+		// nonzero exit with no parseable diagnostic is a non-blocking skip.
+		// Note this means a vet ANALYZER finding (plain file:line:col under
+		// a `# pkg` header) now blocks too — deliberate (#959): CI's
+		// golangci-lint bundles govet so the PR would red-line anyway, and
+		// a block routes to verify_fix_reinvoke rather than failing the
+		// stage. `continue` (not return) so a skipped failure in ONE module
+		// doesn't abandon the gate — a later module may still carry the
+		// real build-required-drift compile error.
 		vetOut := strings.TrimSpace(string(out))
-		if !looksLikeCompileError(vetOut) {
+		if !looksLikeCompileError(vetOut) && !goDiagnosticBlocks(vetOut) {
 			skip("vet_nonzero_non_compile", vetOut)
 			continue
 		}
@@ -2732,17 +2806,23 @@ func verifyCommittedTreeCompiles(ctx context.Context, repoDir, headSHA string, d
 			skipTest("test_exec", terr.Error())
 			continue
 		}
-		// go test ran and exited non-zero. Block ONLY on a positively
-		// identified test failure (`--- FAIL`/`panic:`); a test-binary build
-		// failure (`[build failed]`), setup failure, or dep-resolution error
-		// is a non-blocking skip — never block on gate infrastructure.
+		// go test ran and exited non-zero. A positively identified test
+		// failure (`--- FAIL`/`panic:`) blocks first; then a `[build
+		// failed]` accompanied by a clean compiler diagnostic line is a
+		// definitive compile failure of the tree being pushed, not infra,
+		// and blocks as ErrCommitWouldNotCompile (#959). Only outputs with
+		// neither — `[setup failed]`, dep resolution, exec/OOM noise —
+		// skip as gate infrastructure.
 		testOut := strings.TrimSpace(string(out))
-		if !looksLikeTestFailure(testOut) {
-			skipTest("test_nonzero_non_failure", testOut)
-			continue
+		if looksLikeTestFailure(testOut) {
+			return fmt.Errorf("%w: committed tree tests fail; %d file(s) outside scope are build/test-required: %s\n%s",
+				gitops.ErrCommittedTestsFailed, len(drift), strings.Join(drift, ", "), testOut)
 		}
-		return fmt.Errorf("%w: committed tree tests fail; %d file(s) outside scope are build/test-required: %s\n%s",
-			gitops.ErrCommittedTestsFailed, len(drift), strings.Join(drift, ", "), testOut)
+		if goDiagnosticBlocks(testOut) {
+			return fmt.Errorf("%w: committed tree's test packages do not compile; %d file(s) outside scope are build-required: %s\n%s",
+				gitops.ErrCommitWouldNotCompile, len(drift), strings.Join(drift, ", "), testOut)
+		}
+		skipTest("test_nonzero_non_failure", testOut)
 	}
 	return nil
 }
