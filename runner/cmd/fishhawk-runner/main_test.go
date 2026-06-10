@@ -6846,7 +6846,7 @@ func moveBareMain(t *testing.T, bare string) {
 			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 		}
 	}
-	run(filepath.Dir(side), "clone", bare, side)
+	run(filepath.Dir(side), "clone", "-b", "main", bare, side)
 	run(side, "config", "user.name", "other")
 	run(side, "config", "user.email", "other@example.com")
 	run(side, "config", "commit.gpgsign", "false")
