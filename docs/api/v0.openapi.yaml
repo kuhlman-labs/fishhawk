@@ -304,12 +304,80 @@ components:
             from the trace manifest at cost-rollup time. Empty string for
             legacy/unstamped runs.
           example: claude-opus-4-8
+        concerns:
+          $ref: '#/components/schemas/RunConcerns'
+          description: |
+            Summary of the run's OPEN review concerns (#964): count,
+            per-state breakdown, and the stable concern IDs the fix-up
+            endpoint's `concern_ids` addressing consumes. Emitted by
+            `GET /v0/runs/{run_id}` ONLY — the list endpoint omits it
+            (no per-row concern query) — and omitted when the run has
+            no open concerns.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    RunConcerns:
+      type: object
+      description: |
+        A run's OPEN review concerns (#964) — states `raised`,
+        `addressed_pending`, `reopened`. Every `plan_reviewed` /
+        `implement_reviewed` verdict's concerns are persisted with
+        server-minted stable UUIDs; this block surfaces what is still
+        unresolved plus the IDs fix-up routing needs, in one read. Note
+        text is intentionally elided (bounded payload) — read the
+        originating `*_reviewed` audit entry for the full note.
+      required: [open, by_state, items]
+      properties:
+        open:
+          type: integer
+          minimum: 0
+          description: Number of open concerns on the run.
+        by_state:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Open-concern count per lifecycle state.
+          example: { raised: 2, addressed_pending: 1 }
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunConcernItem'
+
+    RunConcernItem:
+      type: object
+      description: One open review concern.
+      required: [id, stage_kind, severity, category, state]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+          description: |
+            Stable server-minted concern ID — the primary addressing
+            scheme for the fix-up endpoint's `concern_ids` (positional
+            indices are deprecated).
+        stage_kind:
+          type: string
+          enum: [plan, implement]
+          description: |
+            Stage the concern originated from. Only implement-stage
+            concerns can be routed into an implement fix-up.
+        severity:
+          type: string
+          description: |
+            Reviewer-emitted severity, stored verbatim (tolerant
+            decode — typically high/medium/low).
+        category:
+          type: string
+          example: scope
+        state:
+          type: string
+          description: |
+            Lifecycle state. Open states are raised, addressed_pending,
+            reopened; the full enum adds addressed, waived, superseded
+            (closed states never appear in this block).
 
     IssueContext:
       type: object
@@ -2633,9 +2701,13 @@ paths:
             SEPARATE **review** stage is still parked at `awaiting_approval`
             (the PR is open, not merged). Refused once the review stage has
             merged/resolved, or when the run has no review stage.
-        - the stage must carry a recorded **`approve_with_concerns`**
-          implement-review verdict (the concern set the `concerns` indices
-          address). With no recorded concerns, 422 (`fixup_not_applicable`).
+        - on the deprecated positional path, the stage must carry a
+          recorded **`approve_with_concerns`** implement-review verdict
+          (the concern set the `concerns` indices address). With no
+          recorded concerns, 422 (`fixup_not_applicable`). The
+          `concern_ids` path resolves against the durable concern store
+          instead (#964); an unknown, foreign, plan-stage, or non-open ID
+          is 400 (`validation_failed`).
 
         On success the implement stage transitions to `pending`
         (`awaiting_approval → pending`, or `succeeded → pending` on the
@@ -2645,11 +2717,15 @@ paths:
         re-parked review stage id is recorded on the audit entry as
         `reparked_review_stage_id`). The orchestrator then walks
         `pending → dispatched` and fires `workflow_dispatch`, and a
-        `stage_fixup_triggered` audit entry is written carrying the selected
-        concern indices, the resolved concern objects (read back by the
+        `stage_fixup_triggered` audit entry is written carrying the routed
+        stable concern IDs (`concern_ids`, #964) or the deprecated selected
+        indices, the resolved concern objects (read back by the
         prompt renderer to deliver them as binding instructions — the #558
         condition-delivery framing), and the bounded-pass receipt
-        (`pass_ordinal`, `max_passes`, `remaining_budget`). Returns 200 with
+        (`pass_ordinal`, `max_passes`, `remaining_budget`). On the
+        `concern_ids` path the routed concerns are additionally marked
+        `addressed_pending` in the durable concern store (best-effort,
+        with `reason` as the `state_reason`). Returns 200 with
         the post-orchestrator stage (typically `dispatched`). Orchestrator
         failures are logged but don't fail the request — the stage stays at
         `pending` and an operator can re-fire Advance manually.
@@ -2678,32 +2754,56 @@ paths:
         required: true
         description: |
           Selects which recorded implement-review concerns to route back to
-          the agent.
+          the agent: by stable concern ID (`concern_ids`, the primary
+          scheme, #964) or by deprecated positional index (`concerns`).
+          Exactly one of the two forms must be supplied — both at once is
+          400 (`validation_failed`), as is neither.
         content:
           application/json:
             schema:
               type: object
               additionalProperties: false
-              required: [concerns]
               properties:
+                concern_ids:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                    format: uuid
+                  description: |
+                    PRIMARY addressing (#964): stable concern UUIDs to route
+                    back to the agent (at least one), as surfaced by
+                    `GET /v0/runs/{run_id}`'s `concerns.items[].id`. Each ID
+                    must name an OPEN (`raised`/`addressed_pending`/
+                    `reopened`) implement-stage concern of THIS stage — an
+                    unknown, duplicate, foreign-run/-stage, plan-stage, or
+                    already-resolved ID is rejected (400
+                    `validation_failed`), so a plan-stage concern can never
+                    route into an implement fix-up. Requires the concern
+                    store (503 `fixup_unconfigured` otherwise).
                 concerns:
                   type: array
                   minItems: 1
                   items:
                     type: integer
                     minimum: 0
+                  deprecated: true
                   description: |
-                    Indices of the recorded implement-review concerns to
-                    route back to the agent (at least one). The indices
-                    address the concern set in the stage's
-                    `implement_reviewed` audit entry, in append order across
-                    reviewers. An out-of-range or duplicate index is rejected
+                    DEPRECATED positional fallback: indices of the recorded
+                    implement-review concerns to route back to the agent (at
+                    least one). The indices address the concern set in the
+                    stage's `implement_reviewed` audit entry, in append order
+                    flattened across reviewers — ambiguous once multiple
+                    heterogeneous review entries exist per stage (#964);
+                    prefer `concern_ids`. Only valid when `concern_ids` is
+                    absent. An out-of-range or duplicate index is rejected
                     (400 `validation_failed`).
                 reason:
                   type: string
                   description: |
                     Optional operator rationale, recorded on the
-                    `stage_fixup_triggered` audit entry.
+                    `stage_fixup_triggered` audit entry (and as the routed
+                    concerns' `state_reason` on the `concern_ids` path).
                 allow_create:
                   type: array
                   items:
@@ -2741,8 +2841,10 @@ paths:
               schema: { $ref: '#/components/schemas/Stage' }
         '400':
           description: |
-            Malformed body, empty `concerns`, or an out-of-range / duplicate
-            concern index. Body's `error` is `validation_failed`.
+            Malformed body, no concern selection, both `concern_ids` and
+            `concerns` supplied, an out-of-range / duplicate concern index,
+            or an unknown / foreign / plan-stage / non-open `concern_id`.
+            Body's `error` is `validation_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

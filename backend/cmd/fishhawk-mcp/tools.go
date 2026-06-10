@@ -760,6 +760,15 @@ free_form; a {category:"scope"} concern flags scope.files drift
 implement stage. A verdict of "skipped" with a reason marks an agent
 layer that was configured but not wired on the backend.
 
+The run row also carries run.concerns when the run has OPEN review
+concerns (#964): the open count, a by_state breakdown (raised /
+addressed_pending / reopened), and items[] with each concern's STABLE id,
+stage_kind, severity, category, and state. Those ids are the primary
+addressing scheme for fishhawk_fixup_stage's concern_ids parameter
+(positional indices are deprecated). Note text is elided — read the
+originating plan_reviewed / implement_reviewed audit entry for the full
+note.
+
 Also returns review_action_hint when the implement review landed with
 unresolved approve_with_concerns concerns and the bounded fix-up budget
 is not yet spent: a one-line pointer at fishhawk_fixup_stage (route the

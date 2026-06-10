@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -47,6 +48,32 @@ type runResponse struct {
 	ResolvedModel string    `json:"resolved_model"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	// Concerns is the run's OPEN review-concern summary (#964): count,
+	// per-state breakdown, and the stable IDs fishhawk_fixup_stage's
+	// concern_ids addressing needs. Populated by handleGetRun ONLY —
+	// toRunResponse never sets it, so the list endpoint stays free of a
+	// per-row concern query (N+1). Omitted when the run has no open
+	// concerns (or no concern store is configured).
+	Concerns *runConcernsPayload `json:"concerns,omitempty"`
+}
+
+// runConcernsPayload summarizes a run's OPEN review concerns (#964).
+// Items carries id/stage_kind/severity/category/state only — the note
+// text is intentionally elided (bounded payload); read the originating
+// *_reviewed audit entry for the full note.
+type runConcernsPayload struct {
+	Open    int                 `json:"open"`
+	ByState map[string]int      `json:"by_state"`
+	Items   []runConcernPayload `json:"items"`
+}
+
+// runConcernPayload is one open concern on the wire.
+type runConcernPayload struct {
+	ID        uuid.UUID `json:"id"`
+	StageKind string    `json:"stage_kind"`
+	Severity  string    `json:"severity"`
+	Category  string    `json:"category"`
+	State     string    `json:"state"`
 }
 
 // issueContextPayload mirrors run.IssueContext on the wire. Kept
@@ -567,7 +594,46 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, r, http.StatusOK, toRunResponse(got))
+	resp := toRunResponse(got)
+	// Attach the open-concern summary (#964) on the single-run read
+	// ONLY — the list endpoint deliberately omits it (no N+1 concern
+	// query per row). Best-effort: a concern-store failure warn-logs
+	// and the field is omitted rather than failing the run read.
+	if s.cfg.ConcernRepo != nil {
+		open, cerr := s.cfg.ConcernRepo.ListOpenByRun(r.Context(), runID)
+		if cerr != nil {
+			s.cfg.Logger.Warn("list open concerns failed; omitting concerns block",
+				"run_id", runID.String(), "error", cerr.Error())
+		} else {
+			resp.Concerns = buildRunConcernsPayload(open)
+		}
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// buildRunConcernsPayload renders the open-concern summary for the
+// single-run read. Returns nil (field omitted) when there is nothing
+// open.
+func buildRunConcernsPayload(open []*concern.Concern) *runConcernsPayload {
+	if len(open) == 0 {
+		return nil
+	}
+	out := &runConcernsPayload{
+		Open:    len(open),
+		ByState: make(map[string]int, 3),
+		Items:   make([]runConcernPayload, 0, len(open)),
+	}
+	for _, c := range open {
+		out.ByState[string(c.State)]++
+		out.Items = append(out.Items, runConcernPayload{
+			ID:        c.ID,
+			StageKind: c.StageKind,
+			Severity:  c.Severity,
+			Category:  c.Category,
+			State:     string(c.State),
+		})
+	}
+	return out
 }
 
 const (

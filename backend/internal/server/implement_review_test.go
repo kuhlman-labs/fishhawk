@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
@@ -1141,5 +1143,137 @@ func TestShipTrace_ImplementReview_Heterogeneous_UnresolvableProvider_Gating(t *
 	// reviewer approved, so the gating implement stage must not fail.
 	if implStage.State == run.StageStateFailed {
 		t.Errorf("gating resolve failure must not fail the stage; state = %q", implStage.State)
+	}
+}
+
+// TestImplementReviewLoop_PersistsConcernsWithOriginSequence is the #964
+// insert-AFTER-append contract test: two implement_reviewed entries from
+// different reviewer models append, and each verdict's concerns persist
+// in the durable store with origin_review_sequence equal to THAT entry's
+// returned audit sequence, state raised, stage_kind implement.
+func TestImplementReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev1 := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict: planreview.VerdictApproveWithConcerns,
+			Concerns: []planreview.Concern{
+				{Severity: planreview.SeverityHigh, Category: "correctness", Note: "first-a"},
+				{Severity: planreview.SeverityLow, Category: "style", Note: "first-b"},
+			},
+		},
+		model: "claude-opus-4-8",
+	}
+	rev2 := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictApproveWithConcerns,
+			Concerns: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "second-a"}},
+		},
+		model: "gpt-5.5",
+	}
+
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev1}, {reviewer: rev2}},
+		planreview.AuthorityAdvisory, "prompt", "author-model")
+
+	reviewed := au.entriesByCategory("implement_reviewed")
+	if len(reviewed) != 2 {
+		t.Fatalf("implement_reviewed entries = %d, want 2", len(reviewed))
+	}
+
+	rows, err := cr.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("persisted concerns = %d, want 3", len(rows))
+	}
+	for i, row := range rows {
+		if row.StageID != stageID {
+			t.Errorf("row %d StageID = %s, want %s", i, row.StageID, stageID)
+		}
+		if row.StageKind != concern.StageKindImplement {
+			t.Errorf("row %d StageKind = %q, want implement", i, row.StageKind)
+		}
+		if row.State != concern.StateRaised {
+			t.Errorf("row %d State = %q, want raised", i, row.State)
+		}
+	}
+	// The first verdict's two concerns carry the FIRST entry's returned
+	// sequence + model; the second verdict's concern carries the SECOND's.
+	for i := 0; i < 2; i++ {
+		if rows[i].OriginReviewSequence != reviewed[0].Sequence {
+			t.Errorf("row %d sequence = %d, want first entry's %d", i, rows[i].OriginReviewSequence, reviewed[0].Sequence)
+		}
+		if rows[i].ReviewerModel == nil || *rows[i].ReviewerModel != "claude-opus-4-8" {
+			t.Errorf("row %d ReviewerModel = %v, want claude-opus-4-8", i, rows[i].ReviewerModel)
+		}
+	}
+	if rows[2].OriginReviewSequence != reviewed[1].Sequence {
+		t.Errorf("row 2 sequence = %d, want second entry's %d", rows[2].OriginReviewSequence, reviewed[1].Sequence)
+	}
+	if rows[2].ReviewerModel == nil || *rows[2].ReviewerModel != "gpt-5.5" {
+		t.Errorf("row 2 ReviewerModel = %v, want gpt-5.5", rows[2].ReviewerModel)
+	}
+	if reviewed[0].Sequence == reviewed[1].Sequence {
+		t.Error("the two entries must carry distinct sequences")
+	}
+}
+
+// TestImplementReviewLoop_FailedAppendSkipsConcernPersistence: when the
+// audit append fails there is no sequence to stamp, so concern
+// persistence for that verdict is skipped (warn-only) — the audit chain
+// stays the sole sequence authority.
+func TestImplementReviewLoop_FailedAppendSkipsConcernPersistence(t *testing.T) {
+	au := newAuditFake()
+	au.appendErr = errors.New("db down")
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictApproveWithConcerns,
+			Concerns: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}},
+		},
+		model: "claude-opus-4-8",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author")
+
+	rows, _ := cr.ListByRun(context.Background(), runID)
+	if len(rows) != 0 {
+		t.Errorf("persisted concerns = %d, want 0 when the append failed", len(rows))
+	}
+}
+
+// TestImplementReviewLoop_ConcernInsertFailureDoesNotFailLoop: a concern
+// store failure warn-logs and never affects the loop's verdict handling —
+// the audit payload remains authoritative.
+func TestImplementReviewLoop_ConcernInsertFailureDoesNotFailLoop(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	cr.insertErr = errors.New("store down")
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictReject,
+			Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "correctness", Note: "n"}},
+		},
+		model: "claude-opus-4-8",
+	}
+	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author")
+
+	if !hasRejection {
+		t.Error("hasRejection = false, want true (insert failure must not mask the verdict)")
+	}
+	if len(au.entriesByCategory("implement_reviewed")) != 1 {
+		t.Error("the implement_reviewed entry must still have appended")
 	}
 }

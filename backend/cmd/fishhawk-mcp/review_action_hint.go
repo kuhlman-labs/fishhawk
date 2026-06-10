@@ -142,7 +142,7 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 			RemainingFixupBudget: remaining,
 			OverrideAvailable:    false,
 			Message: fmt.Sprintf(
-				"%d concern(s) from the implement review — route them back with fishhawk_fixup_stage(stage_id=%s, concern indices), or approve to merge. Remaining fix-up budget: %d.",
+				"%d concern(s) from the implement review — route them back with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. Remaining fix-up budget: %d.",
 				concerns, implementStageID, remaining),
 		}, nil
 	}
@@ -156,7 +156,7 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 			RemainingFixupBudget: 0,
 			OverrideAvailable:    true,
 			Message: fmt.Sprintf(
-				"%d concern(s) remain after the fix-up budget is spent (%d/%d normal passes used). Either merge now and file a follow-up, or grant ONE bounded override pass with fishhawk_fixup_stage(stage_id=%s, concern indices, force_additional_pass=true) — capped at %d total passes.",
+				"%d concern(s) remain after the fix-up budget is spent (%d/%d normal passes used). Either merge now and file a follow-up, or grant ONE bounded override pass with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id, force_additional_pass=true) — capped at %d total passes.",
 				concerns, priorPasses, maxFixupPasses, implementStageID, fixupCeiling),
 		}, nil
 	}

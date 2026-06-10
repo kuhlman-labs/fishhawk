@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -2304,18 +2305,25 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			FreeForm:      verdict.FreeForm,
 		}
 		payloadBytes, _ := json.Marshal(payload)
-		if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 			RunID:     runID,
 			StageID:   &stageID,
 			Timestamp: time.Now().UTC(),
 			Category:  "implement_reviewed",
 			ActorKind: &systemKind,
 			Payload:   payloadBytes,
-		}); aerr != nil {
+		})
+		if aerr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append audit entry failed",
 				slog.String("run_id", runID.String()),
 				slog.String("error", aerr.Error()),
 			)
+		} else if entry != nil {
+			// Persist the verdict's concerns with stable IDs (#964),
+			// stamped with the sequence the append returned — the audit
+			// chain stays the sole sequence authority, so a failed append
+			// (no sequence) skips persistence for this verdict.
+			s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, entry.Sequence, verdict.Concerns)
 		}
 
 		// Capture this reviewer invocation's agent token cost (#681). The
@@ -2339,6 +2347,42 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	s.recomputeAndPublishAuditComplete(ctx, runID)
 
 	return hasRejection
+}
+
+// persistReviewConcerns records one review verdict's concerns into the
+// durable concern store with stable server-minted IDs (#964), stamped
+// with the audit sequence AppendChained returned for the *_reviewed
+// entry. Shared by the implement-review and plan-review loops.
+// Best-effort like the append itself: a nil repo or an insert failure
+// warn-logs and never fails the review loop — the audit payload remains
+// the authoritative record and this store is a derived index over it.
+func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.UUID, stageKind, reviewerModel string, originSequence int64, concerns []planreview.Concern) {
+	if s.cfg.ConcernRepo == nil || len(concerns) == 0 {
+		return
+	}
+	raised := make([]concern.RaisedConcern, 0, len(concerns))
+	for _, c := range concerns {
+		raised = append(raised, concern.RaisedConcern{
+			Severity: string(c.Severity),
+			Category: c.Category,
+			Note:     c.Note,
+		})
+	}
+	if _, err := s.cfg.ConcernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID:                runID,
+		StageID:              stageID,
+		StageKind:            stageKind,
+		ReviewerModel:        reviewerModel,
+		OriginReviewSequence: originSequence,
+		Concerns:             raised,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review concerns: persist failed — audit payload remains authoritative",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("stage_kind", stageKind),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // renderDiffForReview formats a policy.Diff (per-file path + git status)

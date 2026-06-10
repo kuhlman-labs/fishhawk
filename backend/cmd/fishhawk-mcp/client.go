@@ -83,8 +83,35 @@ type Run struct {
 	MaxRetriesSnapshot int           `json:"max_retries_snapshot"`
 	RunnerKind         string        `json:"runner_kind,omitempty"`
 	IssueContext       *IssueContext `json:"issue_context,omitempty"`
-	CreatedAt          time.Time     `json:"created_at"`
-	UpdatedAt          time.Time     `json:"updated_at"`
+	// Concerns is the run's OPEN review-concern summary (#964), mirrored
+	// from GET /v0/runs/{run_id}: count, per-state breakdown, and the
+	// stable concern IDs fishhawk_fixup_stage's concern_ids addressing
+	// needs. The backend emits it on the single-run read only; omitted
+	// when the run has no open concerns.
+	Concerns  *RunConcerns `json:"concerns,omitempty" jsonschema:"OPEN review concerns for the run: open count, by_state breakdown, and items carrying the stable concern IDs fishhawk_fixup_stage's concern_ids parameter addresses. Omitted when nothing is open"`
+	CreatedAt time.Time    `json:"created_at"`
+	UpdatedAt time.Time    `json:"updated_at"`
+}
+
+// RunConcerns mirrors the backend's run-status concerns block (#964):
+// the run's OPEN review concerns (states raised, addressed_pending,
+// reopened). Note text is intentionally elided — read the originating
+// *_reviewed audit entry for the full note.
+type RunConcerns struct {
+	Open    int              `json:"open" jsonschema:"number of open review concerns on the run"`
+	ByState map[string]int   `json:"by_state,omitempty" jsonschema:"open-concern count per lifecycle state (raised, addressed_pending, reopened)"`
+	Items   []RunConcernItem `json:"items,omitempty" jsonschema:"the open concerns; each carries the stable id to pass to fishhawk_fixup_stage concern_ids"`
+}
+
+// RunConcernItem is one open concern. ID is the stable server-minted
+// UUID — the primary fix-up addressing scheme (positional indices are
+// deprecated).
+type RunConcernItem struct {
+	ID        string `json:"id" jsonschema:"stable concern UUID — pass these to fishhawk_fixup_stage concern_ids"`
+	StageKind string `json:"stage_kind" jsonschema:"plan or implement; only implement-stage concerns can be routed into an implement fix-up"`
+	Severity  string `json:"severity"`
+	Category  string `json:"category"`
+	State     string `json:"state" jsonschema:"raised, addressed_pending, or reopened"`
 }
 
 // IssueContext mirrors the OpenAPI shape: the GitHub issue payload
@@ -294,14 +321,16 @@ func (c *apiClient) RetryStage(ctx context.Context, id uuid.UUID) (*Stage, error
 
 // fixupRequest mirrors the backend's
 // `POST /v0/stages/{stage_id}/fixup` body
-// (`backend/internal/server/fixup.go::fixupRequest`). Concerns selects
-// which recorded implement-review concerns (by their index in the
-// stage's resolved concern set) to route back to the agent; it must be
-// non-empty. Reason is an optional operator note recorded on the audit
-// entry.
+// (`backend/internal/server/fixup.go::fixupRequest`). ConcernIDs is the
+// PRIMARY addressing scheme (#964): stable concern UUIDs from the run's
+// concerns block. Concerns (positional indices into the stage's
+// flattened resolved concern set) is DEPRECATED and only valid when
+// ConcernIDs is absent — the backend rejects supplying both. Reason is
+// an optional operator note recorded on the audit entry.
 type fixupRequest struct {
-	Concerns []int  `json:"concerns"`
-	Reason   string `json:"reason,omitempty"`
+	ConcernIDs []string `json:"concern_ids,omitempty"`
+	Concerns   []int    `json:"concerns,omitempty"`
+	Reason     string   `json:"reason,omitempty"`
 	// AllowCreate declares net-new files the fix-up will create (#823),
 	// folded into the effective scope.files for that pass only. omitempty:
 	// the common fix-up omits it and stays unaffected.
@@ -323,7 +352,9 @@ type fixupRequest struct {
 // alongside — the push_and_open_pr flow, #780). Returns the re-opened
 // Stage row (pending, or dispatched once the orchestrator advances it
 // before the response returns). 4xx surfaces:
-//   - 400 validation_failed (empty concerns / out-of-range index)
+//   - 400 validation_failed (no concern selection / both concern_ids and
+//     indices supplied / out-of-range index / unknown, foreign,
+//     plan-stage, or non-open concern_id)
 //   - 403 cross_run_fixup (a run-bound token reaching another run's stage)
 //   - 404 stage_not_found
 //   - 422 fixup_not_applicable (no recorded approve_with_concerns verdict,
@@ -340,8 +371,8 @@ type fixupRequest struct {
 // (absolute / containing "..") surfaces 400 validation_failed.
 // forceAdditionalPass is the bounded operator override (#860): grant ONE
 // pass beyond the normal budget, hard-capped at 3 total passes.
-func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool) (*Stage, error) {
-	body, err := json.Marshal(fixupRequest{Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass})
+func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []string, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool) (*Stage, error) {
+	body, err := json.Marshal(fixupRequest{ConcernIDs: concernIDs, Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass})
 	if err != nil {
 		return nil, fmt.Errorf("marshal fixup: %w", err)
 	}

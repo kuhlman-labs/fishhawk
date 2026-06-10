@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -2053,5 +2054,51 @@ func TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Gating(t *test
 		if call.StageID == stageID && call.To == run.StageStateFailed {
 			t.Errorf("gating resolve failure must not fail the stage when the resolvable reviewer approves")
 		}
+	}
+}
+
+// TestPlanReviewLoop_PersistsConcernsWithOriginSequence is the plan-side
+// #964 persistence test: a plan_reviewed verdict's concerns land in the
+// durable store with stage_kind plan and origin_review_sequence equal to
+// the appended entry's returned sequence.
+func TestPlanReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictApproveWithConcerns,
+			Concerns: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "verification", Note: "missing integration test"}},
+		},
+		model: "gpt-5.5",
+	}
+	s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model")
+
+	reviewed := au.entriesByCategory("plan_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1", len(reviewed))
+	}
+	rows, err := cr.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("persisted concerns = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.StageKind != concern.StageKindPlan {
+		t.Errorf("StageKind = %q, want plan", row.StageKind)
+	}
+	if row.OriginReviewSequence != reviewed[0].Sequence {
+		t.Errorf("OriginReviewSequence = %d, want %d", row.OriginReviewSequence, reviewed[0].Sequence)
+	}
+	if row.State != concern.StateRaised {
+		t.Errorf("State = %q, want raised", row.State)
+	}
+	if row.ReviewerModel == nil || *row.ReviewerModel != "gpt-5.5" {
+		t.Errorf("ReviewerModel = %v, want gpt-5.5", row.ReviewerModel)
 	}
 }
