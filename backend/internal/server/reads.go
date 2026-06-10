@@ -332,6 +332,24 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional since_sequence filter (#962) — narrows the feed to
+	// entries with Sequence strictly greater than the given value.
+	// The sequence-anchored await primitive (fishhawk_await_audit)
+	// uses this so a poll for "the next <category> entry after the
+	// fix-up" never needs pagination or a limit large enough to
+	// reach the tail.
+	var sinceSequence int64
+	if rawSince := q.Get("since_sequence"); rawSince != "" {
+		n, perr := strconv.ParseInt(rawSince, 10, 64)
+		if perr != nil || n < 0 {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"since_sequence must be a non-negative integer",
+				map[string]any{"field": "since_sequence", "got": rawSince})
+			return
+		}
+		sinceSequence = n
+	}
+
 	// Optional stage_id filter (#215) — narrows the per-run feed to
 	// entries the dispatcher / runner / handlers tagged with a
 	// specific stage. Used by the implement-stage session view to
@@ -376,6 +394,18 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 		filtered := entries[:0]
 		for _, e := range entries {
 			if e.StageID != nil && *e.StageID == *stageFilter {
+				filtered = append(filtered, e)
+			}
+		}
+		entries = filtered
+	}
+
+	if sinceSequence > 0 {
+		// Same in-memory pattern as the stage_id filter above; applied
+		// before pagination so the cursor walks the filtered set.
+		filtered := entries[:0]
+		for _, e := range entries {
+			if e.Sequence > sinceSequence {
 				filtered = append(filtered, e)
 			}
 		}

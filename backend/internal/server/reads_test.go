@@ -817,6 +817,111 @@ func TestListRunAudit_StageFilter(t *testing.T) {
 	}
 }
 
+// TestListRunAudit_SinceSequenceFilter verifies the since_sequence
+// query param (#962) narrows the feed to entries with Sequence
+// strictly greater than the anchor — the contract the sequence-
+// anchored await primitive (fishhawk_await_audit) re-arms on.
+func TestListRunAudit_SinceSequenceFilter(t *testing.T) {
+	a := newAuditReadFake()
+	a.all = makeAuditEntries(5)
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?since_sequence=3", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []auditEntryResponse `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("items = %d, want 2 (sequences 4,5)", len(got.Items))
+	}
+	for i, e := range got.Items {
+		if e.Sequence <= 3 {
+			t.Errorf("item %d has sequence %d, want strictly > 3", i, e.Sequence)
+		}
+	}
+}
+
+func TestListRunAudit_SinceSequenceZero_NoOp(t *testing.T) {
+	a := newAuditReadFake()
+	a.all = makeAuditEntries(3)
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?since_sequence=0", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got struct {
+		Items []auditEntryResponse `json:"items"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if len(got.Items) != 3 {
+		t.Errorf("items = %d, want 3 (since_sequence=0 is a no-op)", len(got.Items))
+	}
+}
+
+func TestListRunAudit_BadSinceSequence_400(t *testing.T) {
+	a := newAuditReadFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+	for _, bad := range []string{"abc", "-1", "1.5"} {
+		req := httptest.NewRequest(http.MethodGet,
+			fmt.Sprintf("/v0/runs/%s/audit?since_sequence=%s", uuid.New(), bad), nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("since_sequence=%q: status = %d, want 400", bad, w.Code)
+		}
+		if !strings.Contains(w.Body.String(), `"validation_failed"`) {
+			t.Errorf("since_sequence=%q: body missing validation_failed: %s", bad, w.Body.String())
+		}
+	}
+}
+
+// TestListRunAudit_SinceSequenceComposesWithCategoryAndLimit drives
+// the filter through the category fetch + pagination together: the
+// since filter applies before paging, so limit=1 returns the FIRST
+// entry past the anchor (sequence-ascending), which is exactly the
+// await primitive's fast-path read.
+func TestListRunAudit_SinceSequenceComposesWithCategoryAndLimit(t *testing.T) {
+	a := newAuditReadFake()
+	a.byCat["implement_reviewed"] = makeAuditEntries(5)
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?category=implement_reviewed&since_sequence=2&limit=1", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items      []auditEntryResponse `json:"items"`
+		NextCursor string               `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(got.Items))
+	}
+	if got.Items[0].Sequence != 3 {
+		t.Errorf("first item sequence = %d, want 3 (first past the anchor)", got.Items[0].Sequence)
+	}
+	if got.NextCursor == "" {
+		t.Error("next_cursor empty; expected a cursor (sequences 4,5 remain)")
+	}
+}
+
 func TestListRunAudit_BadStageID_400(t *testing.T) {
 	a := newAuditReadFake()
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})

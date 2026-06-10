@@ -1626,6 +1626,17 @@ paths:
             Optional. When set, the response is filtered to entries
             tagged with this stage id. Used by the implement-stage
             session view (#215) to render a per-stage activity feed.
+        - name: since_sequence
+          in: query
+          schema: { type: integer, format: int64, minimum: 0 }
+          description: |
+            Optional. When set, the response is filtered to entries with
+            `sequence` strictly greater than this value (applied before
+            pagination). `0` is a no-op (sequences start at 1). This is
+            the anchor for the sequence-anchored await primitive
+            (`fishhawk_await_audit`, #962): a caller polling for "the
+            next `<category>` entry after sequence N" never needs
+            pagination or a tail-sized limit.
         - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
@@ -1643,7 +1654,8 @@ paths:
                         items: { $ref: '#/components/schemas/AuditEntry' }
         '400':
           description: |
-            `validation_failed` — `stage_id` not a UUID, or `limit` out of range.
+            `validation_failed` — `stage_id` not a UUID, `since_sequence`
+            not a non-negative integer, or `limit` out of range.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
