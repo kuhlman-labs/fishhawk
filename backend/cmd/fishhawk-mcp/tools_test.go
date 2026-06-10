@@ -140,6 +140,19 @@ type fakeBackend struct {
 	fixupErrBody    string
 	fixupCalledByID map[uuid.UUID]int
 
+	// #961 fixtures: GET /v0/runs/{id}/scope-amendments + the decision
+	// POST. amendmentsByRun seeds the list response; decideResp seeds the
+	// decided row keyed by amendment id; decideBody captures the last
+	// decoded decision body; *Status / *ErrBody drive error paths.
+	amendmentsByRun      map[uuid.UUID][]ScopeAmendmentItem
+	amendmentsStatus     int
+	amendmentsErrBody    string
+	decideAmendmentResp  map[uuid.UUID]ScopeAmendmentItem
+	decideAmendmentBody  scopeAmendmentDecisionRequest
+	decideAmendmentState int
+	decideAmendmentErr   string
+	decideCalledByID     map[uuid.UUID]int
+
 	// E22.4 fixtures: POST /v0/stages/{id}/approvals.
 	// approvalsBody captures the last decoded body so tests can
 	// assert decision + comment threading.
@@ -203,6 +216,11 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fixupResp:                map[uuid.UUID]Stage{},
 		fixupStatus:              http.StatusOK,
 		fixupCalledByID:          map[uuid.UUID]int{},
+		amendmentsByRun:          map[uuid.UUID][]ScopeAmendmentItem{},
+		amendmentsStatus:         http.StatusOK,
+		decideAmendmentResp:      map[uuid.UUID]ScopeAmendmentItem{},
+		decideAmendmentState:     http.StatusOK,
+		decideCalledByID:         map[uuid.UUID]int{},
 		approvalsResp:            map[uuid.UUID]Stage{},
 		approvalsStatus:          http.StatusOK,
 		approvalsCalledByID:      map[uuid.UUID]int{},
@@ -288,6 +306,58 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if !ok {
 			resp = Stage{ID: id.String(), State: "pending"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		status := fb.amendmentsStatus
+		errBody := fb.amendmentsErrBody
+		items := fb.amendmentsByRun[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if items == nil {
+			items = []ScopeAmendmentItem{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, perr := uuid.Parse(r.PathValue("run_id")); perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		amendmentID, perr := uuid.Parse(r.PathValue("amendment_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body scopeAmendmentDecisionRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.decideCalledByID[amendmentID]++
+		fb.decideAmendmentBody = body
+		status := fb.decideAmendmentState
+		errBody := fb.decideAmendmentErr
+		resp, ok := fb.decideAmendmentResp[amendmentID]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = ScopeAmendmentItem{ID: amendmentID.String(), Status: "approved"}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -822,9 +892,9 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// description, not a target — the #778 density guard wants dense, not
 	// padded, prose.
 	const minDescriptionLen = 80
-	// The registered tool set is the 16 fishhawk_* tools swept in #778. Bump
+	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 17
+	const wantToolCount = 19
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

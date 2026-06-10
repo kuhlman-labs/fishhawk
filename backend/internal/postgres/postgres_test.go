@@ -205,11 +205,21 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0028 (#649) added the
-	// runs.cost_usd_total and runs.resolved_model columns; the down
-	// migration drops both. Confirm: those columns are gone, but every
-	// prior migration's effect is still present (self_retry_count +
+	// MigrateDown rolls back one step. 0029 (#961) added the
+	// scope_amendments table; the down migration drops it. Confirm: the
+	// table is gone, but every prior migration's effect is still present
+	// (cost_usd_total + resolved_model from 0028, self_retry_count +
 	// scopes from 0027, decomposed_from from 0026, etc.).
+	var scopeAmendmentsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables
+		 WHERE table_name = 'scope_amendments'`,
+	).Scan(&scopeAmendmentsTable); err != nil {
+		t.Fatalf("query scope_amendments table: %v", err)
+	}
+	if scopeAmendmentsTable != 0 {
+		t.Errorf("scope_amendments table count after MigrateDown = %d, want 0 (0029 down dropped it)", scopeAmendmentsTable)
+	}
 	var costUSDTotalCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -217,8 +227,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&costUSDTotalCol); err != nil {
 		t.Fatalf("query runs.cost_usd_total column: %v", err)
 	}
-	if costUSDTotalCol != 0 {
-		t.Errorf("runs.cost_usd_total count after MigrateDown = %d, want 0 (0028 down dropped it)", costUSDTotalCol)
+	if costUSDTotalCol != 1 {
+		t.Errorf("runs.cost_usd_total count after MigrateDown = %d, want 1 (0028 still applied after one-step down)", costUSDTotalCol)
 	}
 	var resolvedModelCol int
 	if err := pool.QueryRow(context.Background(),
@@ -227,8 +237,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&resolvedModelCol); err != nil {
 		t.Fatalf("query runs.resolved_model column: %v", err)
 	}
-	if resolvedModelCol != 0 {
-		t.Errorf("runs.resolved_model count after MigrateDown = %d, want 0 (0028 down dropped it)", resolvedModelCol)
+	if resolvedModelCol != 1 {
+		t.Errorf("runs.resolved_model count after MigrateDown = %d, want 1 (0028 still applied after one-step down)", resolvedModelCol)
 	}
 	var selfRetryCountCol int
 	if err := pool.QueryRow(context.Background(),

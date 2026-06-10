@@ -422,6 +422,23 @@ func buildImplement(t Trigger) string {
 		b.WriteString(" Allocate carefully and prefer incremental verification.\n\n")
 	}
 
+	// Mid-stage scope amendments (#961): the operator-gated escape hatch
+	// for a genuinely missing scope.files entry. Documented inline because
+	// the agent reads the prompt and nothing else. The request/poll loop
+	// uses the same FISHHAWK_API_TOKEN / FISHHAWK_BACKEND_URL env the MCP
+	// token wiring injects (E19.8); delivery is poll-based — no push
+	// channel exists in v0.
+	b.WriteString("### Mid-stage scope amendments\n\n")
+	b.WriteString("If, while implementing, you discover a file that MUST change but is not in the effective scope.files (a coupled test, a registration table, a doc companion), do NOT edit it — an undeclared edit is dropped from the commit and an undeclared created file fails the stage. Instead, request an operator-gated scope amendment:\n")
+	b.WriteString("\n")
+	b.WriteString("1. POST `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` with header `Authorization: Bearer $FISHHAWK_API_TOKEN` and body `{\"paths\": [{\"path\": \"dir/file.ext\", \"operation\": \"modify\"|\"create\"}], \"reason\": \"why each path must change\"}`. Paths are repo-relative; use `create` for net-new files.\n")
+	b.WriteString("2. Poll GET `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` (same bearer) every 15–30 seconds until your request's `status` leaves `pending`. Keep working on in-scope files while you wait; give up on the amendment after ~5 minutes of polling and proceed as if denied.\n")
+	b.WriteString("3. On `approved`: the paths are folded into the effective scope — edit them as normal.\n")
+	b.WriteString("4. On `denied` (read the `decision_reason`): adapt within the original scope. If the change is genuinely impossible without the denied file, stop and surface that in your final response (fail loud) rather than working around the boundary.\n")
+	b.WriteString("\n")
+	b.WriteString("You may file at most 2 amendment requests for this stage (denied requests count). Batch every needed path into one request rather than dribbling them. NEVER edit or create a requested file before the approval lands.\n")
+	b.WriteString("\n")
+
 	// PR description: write to a known path so the runner can lift
 	// it into the GitHub PR's title + body. Format is documented
 	// here in the prompt itself (rather than a separate spec doc)

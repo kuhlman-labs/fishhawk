@@ -30,12 +30,16 @@ type fakeMCPTokenRepo struct {
 	mu        sync.Mutex
 	issued    []mcptoken.IssueParams
 	tokens    map[uuid.UUID]*mcptoken.Token
+	byPlain   map[string]*mcptoken.Token
 	issueErr  error
 	nextToken func(p mcptoken.IssueParams) *mcptoken.Token
 }
 
 func newFakeMCPTokenRepo() *fakeMCPTokenRepo {
-	return &fakeMCPTokenRepo{tokens: map[uuid.UUID]*mcptoken.Token{}}
+	return &fakeMCPTokenRepo{
+		tokens:  map[uuid.UUID]*mcptoken.Token{},
+		byPlain: map[string]*mcptoken.Token{},
+	}
 }
 
 func (f *fakeMCPTokenRepo) Issue(_ context.Context, p mcptoken.IssueParams) (*mcptoken.Token, error) {
@@ -53,19 +57,29 @@ func (f *fakeMCPTokenRepo) Issue(_ context.Context, p mcptoken.IssueParams) (*mc
 		if ttl <= 0 {
 			ttl = mcptoken.DefaultTTL
 		}
+		id := uuid.New()
 		tok = &mcptoken.Token{
-			ID:        uuid.New(),
+			ID:        id,
 			RunID:     p.RunID,
 			IssuedAt:  time.Now().UTC(),
 			ExpiresAt: time.Now().UTC().Add(ttl),
-			PlainText: mcptoken.TokenPrefix + "stub-plaintext-value",
+			Scopes:    append([]string(nil), p.Scopes...),
+			PlainText: mcptoken.TokenPrefix + "stub-plaintext-" + id.String(),
 		}
 	}
 	f.tokens[tok.ID] = tok
+	if tok.PlainText != "" {
+		f.byPlain[tok.PlainText] = tok
+	}
 	return tok, nil
 }
 
-func (f *fakeMCPTokenRepo) Authenticate(_ context.Context, _ string) (*mcptoken.Token, error) {
+func (f *fakeMCPTokenRepo) Authenticate(_ context.Context, plaintext string) (*mcptoken.Token, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if tok, ok := f.byPlain[plaintext]; ok {
+		return tok, nil
+	}
 	return nil, mcptoken.ErrNotFound
 }
 
@@ -427,5 +441,117 @@ func TestBearerAuth_APITokenSkipsMCPRoute(t *testing.T) {
 
 	if mcpAuth.called != 0 {
 		t.Errorf("MCP authenticator hit on fhk_ token; called %d times", mcpAuth.called)
+	}
+}
+
+// --- write:scope-amendments grant (E22.X / #961) ---
+
+// scopeAmendmentTokenServer is mcpTokenServer plus a seeded executing
+// stage of the given type and a scope-amendment repo, exercising the
+// NON-self-retry implement path: the run carries no workflow spec, so
+// resolveAgentSelfRetry contributes nothing and the grant must come
+// from the unconditional implement-stage branch alone.
+func scopeAmendmentTokenServer(t *testing.T, stageType run.StageType) (*Server, *signingFake, *fakeMCPTokenRepo, *orchestratorRepo, *run.Run, *run.Stage) {
+	t.Helper()
+	sf := newSigningFake()
+	mt := newFakeMCPTokenRepo()
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 1, run.StageStateRunning)
+	stage.Type = stageType
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		SigningRepo:        sf,
+		MCPTokenRepo:       mt,
+		AuditRepo:          &auditCapture{},
+		ScopeAmendmentRepo: newFakeScopeAmendmentRepo(),
+	})
+	return s, sf, mt, rr, runRow, stage
+}
+
+func TestHandleIssueMCPToken_ImplementStageGrantsScopeAmendments(t *testing.T) {
+	s, sf, mt, _, runRow, _ := scopeAmendmentTokenServer(t, run.StageTypeImplement)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	resp := signedMCPTokenRequest(t, s, runRow.ID, priv, []byte{})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("status = %d; body = %s", resp.Code, resp.Body.String())
+	}
+	if len(mt.issued) != 1 {
+		t.Fatalf("Issue calls = %d, want 1", len(mt.issued))
+	}
+	scopes := mt.issued[0].Scopes
+	want := map[string]bool{"mcp:read": false, "write:scope-amendments": false}
+	for _, sc := range scopes {
+		if sc == "write:retries" {
+			t.Errorf("non-self-retry implement token granted write:retries: %v", scopes)
+		}
+		if _, ok := want[sc]; ok {
+			want[sc] = true
+		}
+	}
+	for sc, got := range want {
+		if !got {
+			t.Errorf("implement-stage token missing scope %q: %v", sc, scopes)
+		}
+	}
+}
+
+func TestHandleIssueMCPToken_PlanStageOmitsScopeAmendments(t *testing.T) {
+	s, sf, mt, _, runRow, _ := scopeAmendmentTokenServer(t, run.StageTypePlan)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	resp := signedMCPTokenRequest(t, s, runRow.ID, priv, []byte{})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("status = %d; body = %s", resp.Code, resp.Body.String())
+	}
+	for _, sc := range mt.issued[0].Scopes {
+		if sc == "write:scope-amendments" {
+			t.Errorf("plan-stage token granted write:scope-amendments: %v", mt.issued[0].Scopes)
+		}
+	}
+}
+
+// TestHandleIssueMCPToken_TokenCanReadOwnRunAmendments is the
+// end-to-end auth check the #961 plan names: a freshly issued
+// implement-stage agent token GETs its own run's scope amendments
+// (200) through the full bearer-auth middleware, and gets 403 on
+// another run's.
+func TestHandleIssueMCPToken_TokenCanReadOwnRunAmendments(t *testing.T) {
+	s, sf, _, rr, runRow, _ := scopeAmendmentTokenServer(t, run.StageTypeImplement)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	resp := signedMCPTokenRequest(t, s, runRow.ID, priv, []byte{})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("issue status = %d; body = %s", resp.Code, resp.Body.String())
+	}
+	var issued mcpTokenResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &issued); err != nil {
+		t.Fatal(err)
+	}
+
+	// Own run → 200 through the real middleware + handler chain.
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/runs/"+runRow.ID.String()+"/scope-amendments", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+issued.Token)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("own-run GET status = %d; body = %s", w.Code, w.Body.String())
+	}
+
+	// Another run → 403.
+	otherRun := rr.seedRun()
+	req = httptest.NewRequest(http.MethodGet,
+		"/v0/runs/"+otherRun.ID.String()+"/scope-amendments", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+issued.Token)
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("cross-run GET status = %d, want 403; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "cross_run_scope_amendment") {
+		t.Errorf("body: %s", w.Body.String())
 	}
 }

@@ -811,3 +811,120 @@ func TestFetchMCPToken_RejectsBadKey(t *testing.T) {
 		t.Errorf("err = %v, want private key length error", err)
 	}
 }
+
+// canonicalScopeAmendmentsJSON is the wire fixture for GET
+// /v0/runs/{run_id}/scope-amendments, matching the backend's
+// scopeAmendmentListResponse shape (backend/internal/server/
+// scope_amendment.go). The runner e2e in cmd/fishhawk-runner/
+// main_test.go serves the same canonical shape so the seam is pinned
+// from both sides (#618 cross-boundary test rule).
+const canonicalScopeAmendmentsJSON = `{
+  "items": [
+    {
+      "id": "0b54f9f3-0c83-4f6e-9c6e-1a54a3b1a001",
+      "run_id": "run-abc",
+      "stage_id": "0b54f9f3-0c83-4f6e-9c6e-1a54a3b1a002",
+      "paths": [
+        {"path": "pkg/extra.go", "operation": "modify"},
+        {"path": "pkg/newfile.go", "operation": "create"}
+      ],
+      "reason": "the seam needs these",
+      "status": "approved",
+      "decision_reason": "ok",
+      "decided_by": "github:operator",
+      "requested_at": "2026-06-10T12:00:00Z",
+      "decided_at": "2026-06-10T12:01:00Z"
+    },
+    {
+      "id": "0b54f9f3-0c83-4f6e-9c6e-1a54a3b1a003",
+      "run_id": "run-abc",
+      "stage_id": "0b54f9f3-0c83-4f6e-9c6e-1a54a3b1a002",
+      "paths": [{"path": "pkg/denied.go", "operation": "modify"}],
+      "reason": "nope",
+      "status": "denied",
+      "decision_reason": "out of bounds",
+      "decided_by": "github:operator",
+      "requested_at": "2026-06-10T12:02:00Z",
+      "decided_at": "2026-06-10T12:03:00Z"
+    }
+  ]
+}`
+
+func TestFetchScopeAmendments_HappyPath(t *testing.T) {
+	var receivedAuth string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, canonicalScopeAmendmentsJSON)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	got, err := c.FetchScopeAmendments(context.Background(), FetchScopeAmendmentsArgs{
+		RunID:    "run-abc",
+		MCPToken: "fhm_runnerheld",
+	})
+	if err != nil {
+		t.Fatalf("FetchScopeAmendments: %v", err)
+	}
+	if receivedAuth != "Bearer fhm_runnerheld" {
+		t.Errorf("Authorization = %q, want the run-bound fhm_ bearer", receivedAuth)
+	}
+	if len(got) != 2 {
+		t.Fatalf("items = %d, want 2", len(got))
+	}
+	if got[0].Status != "approved" || len(got[0].Paths) != 2 ||
+		got[0].Paths[1].Operation != "create" || got[0].Paths[1].Path != "pkg/newfile.go" {
+		t.Errorf("approved item decoded wrong: %+v", got[0])
+	}
+	if got[1].Status != "denied" || got[1].DecisionReason != "out of bounds" {
+		t.Errorf("denied item decoded wrong: %+v", got[1])
+	}
+}
+
+func TestFetchScopeAmendments_Non200(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":"cross_run_scope_amendment"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	_, err := c.FetchScopeAmendments(context.Background(), FetchScopeAmendmentsArgs{
+		RunID: "run-abc", MCPToken: "fhm_x",
+	})
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Errorf("err = %v, want status error carrying 403", err)
+	}
+}
+
+func TestFetchScopeAmendments_NotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	_, err := c.FetchScopeAmendments(context.Background(), FetchScopeAmendmentsArgs{
+		RunID: "run-abc", MCPToken: "fhm_x",
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestFetchScopeAmendments_RejectsMissingInputs(t *testing.T) {
+	c := New("http://nowhere")
+	if _, err := c.FetchScopeAmendments(context.Background(), FetchScopeAmendmentsArgs{MCPToken: "fhm_x"}); err == nil || !strings.Contains(err.Error(), "run_id") {
+		t.Errorf("err = %v, want run_id error", err)
+	}
+	if _, err := c.FetchScopeAmendments(context.Background(), FetchScopeAmendmentsArgs{RunID: "run-abc"}); err == nil || !strings.Contains(err.Error(), "mcp token") {
+		t.Errorf("err = %v, want mcp token error", err)
+	}
+}

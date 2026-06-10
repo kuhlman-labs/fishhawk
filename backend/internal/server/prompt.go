@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
@@ -251,6 +252,47 @@ func (s *Server) mergeFixupAllowCreate(ctx context.Context, scopeFiles []scopeFi
 	return s.foldScopePaths(ctx, scopeFiles, paths, "fixup-allow-create")
 }
 
+// mergeApprovedScopeAmendments folds the operator-approved mid-stage scope
+// amendment paths (E22.X / #961) into the implement stage's effective scope
+// set, so a stage restart or fix-up prompt fetch carries the amended scope —
+// the prompt-side half of the activation path; the runner's pre-commit
+// refresh is the other. Shares the same empty-scope guard as the other
+// folders: an otherwise-empty scope stays empty so the runner's `git add -A`
+// fallback isn't narrowed.
+func (s *Server) mergeApprovedScopeAmendments(ctx context.Context, scopeFiles []scopeFile, runID, stageID uuid.UUID) []scopeFile {
+	if len(scopeFiles) == 0 || s.cfg.ScopeAmendmentRepo == nil {
+		return scopeFiles
+	}
+	paths := s.resolveApprovedScopeAmendments(ctx, runID, stageID)
+	return s.foldScopePaths(ctx, scopeFiles, paths, "scope-amendment")
+}
+
+// resolveApprovedScopeAmendments returns the paths of every APPROVED scope
+// amendment filed by the given stage. Pending/denied rows are excluded — a
+// pending amendment confers nothing until the operator decides. Best-effort:
+// a repository error logs and returns nil (the original scope remains
+// authoritative).
+func (s *Server) resolveApprovedScopeAmendments(ctx context.Context, runID, stageID uuid.UUID) []string {
+	items, err := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: list scope amendments failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	var out []string
+	for _, a := range items {
+		if a.StageID != stageID || a.Status != scopeamendment.StatusApproved {
+			continue
+		}
+		for _, p := range a.Paths {
+			out = append(out, p.Path)
+		}
+	}
+	return out
+}
+
 // foldScopePaths appends paths not already present (compared by .Path) to the
 // scope set with Operation=modify, dedups, and info-logs the additions. It is
 // the shared body behind mergeConditionScopeFiles (#730 prose fold) and
@@ -426,6 +468,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// path rather than benign scope_drift (#730). No-op when scope is
 		// empty (keeps the runner's git add -A fallback).
 		scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, trigger.ApprovalConditions)
+		// Fold the operator-approved mid-stage scope amendment paths (#961)
+		// into the effective scope so a stage restart or fix-up prompt
+		// carries the amended scope. No-op on an empty scope (keeps the
+		// runner's git add -A fallback).
+		scopeFiles = s.mergeApprovedScopeAmendments(r.Context(), scopeFiles, runRow.ID, stage.ID)
 		// Fix-up pass (#762): when the operator routed implement-review
 		// concerns back to this stage, deliver them as binding instructions
 		// (reusing #558's framing) and fold any file the concern names into
@@ -634,6 +681,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// path rather than benign scope_drift (#730). No-op when scope is
 		// empty (keeps the runner's git add -A fallback).
 		scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, trigger.ApprovalConditions)
+		// Fold the operator-approved mid-stage scope amendment paths (#961),
+		// same derivation as the dispatch path so the rendered view matches.
+		scopeFiles = s.mergeApprovedScopeAmendments(r.Context(), scopeFiles, runRow.ID, stage.ID)
 		// Fix-up pass (#762): when the operator routed implement-review
 		// concerns back to this stage, deliver them as binding instructions
 		// (reusing #558's framing) and fold any file the concern names into

@@ -311,6 +311,17 @@ Notes:
   `notifyStatusUpdate` hook, not this audit kind). Mirrors the sibling `fixup_pushed`
   (#794) minus the new commit. Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
+- The mid-stage scope-amendment audit kinds — `scope_amendment_requested` /
+  `scope_amendment_decided` (#961) — are **internal audit kinds, not issue-comment
+  surfaces**. Nothing in `issuecomment` posts them; they have no Notifier methods.
+  `server/scope_amendment.go` writes the requested entry (agent actor, payload
+  `{amendment_id, paths, reason, remaining_budget}`) when the implement agent files
+  a mid-stage scope amendment request, and the decided entry (user actor, payload
+  `{amendment_id, decision, reason, decided_by}`) when the operator approves or
+  denies it. The requested entry doubles as the operator's `fishhawk_await_audit`
+  anchor (#977); delivery to the agent is poll-based (the agent polls the GET
+  endpoint), so no comment surface is involved. Listed here only so a future reader
+  grepping the audit categories doesn't mistake them for comment surfaces.
 - The self-consistency invariant kind — `invariant_violation` (#764) — is an
   **internal, system-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method.
