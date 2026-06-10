@@ -2555,6 +2555,10 @@ paths:
 
         - the stage must be an **implement** stage (plan/review stages are
           not eligible). Otherwise 422 (`fixup_not_applicable`).
+        - the run must not already be terminal
+          (`succeeded`/`failed`/`cancelled`, #968): a completed run has no
+          live gate to flow the fix-up back into, so its stages are never
+          re-opened. Otherwise 422 (`fixup_not_applicable`).
         - the implement stage must be re-openable, in one of two flows.
           Otherwise 422 (`fixup_not_applicable`):
           - **commit-yourself**: the implement stage is its own gate, parked

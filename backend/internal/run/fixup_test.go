@@ -10,22 +10,50 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
+// fixupRepo wraps memRepo with a run-state-aware GetRun: FixupStage
+// checks the run state on every eligible call (#968), and the shared
+// memRepo's GetRun is not armed for that. Run ids without an explicit
+// override serve a running run.
+type fixupRepo struct {
+	*memRepo
+	runStates map[uuid.UUID]run.State
+}
+
+func newFixupRepo(s ...*run.Stage) *fixupRepo {
+	return &fixupRepo{memRepo: newMemRepo(s...), runStates: map[uuid.UUID]run.State{}}
+}
+
+// setRunState arms GetRun to serve the given state for a run id —
+// used to assert FixupStage refuses to re-open stages inside a
+// terminal run (#968).
+func (r *fixupRepo) setRunState(id uuid.UUID, state run.State) {
+	r.runStates[id] = state
+}
+
+func (r *fixupRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	state := run.StateRunning
+	if s, ok := r.runStates[id]; ok {
+		state = s
+	}
+	return &run.Run{ID: id, State: state}, nil
+}
+
 // implementStage builds an implement stage in the given state — what
 // FixupStage walks at the start of every call. Reuses newStage's
 // fixture and overrides the type, since the default fixture is a plan
 // stage.
-func implementStage(t *testing.T, state run.StageState) (*memRepo, *run.Stage) {
+func implementStage(t *testing.T, state run.StageState) (*fixupRepo, *run.Stage) {
 	t.Helper()
 	stage := newStage(state)
 	stage.Type = run.StageTypeImplement
-	repo := newMemRepo(stage)
+	repo := newFixupRepo(stage)
 	return repo, stage
 }
 
 // implementWithReview builds an implement stage and a review stage
 // sharing one RunID — the push_and_open_pr shape (#780): the implement
 // stage has succeeded (PR opened) while the review stage holds the gate.
-func implementWithReview(t *testing.T, implState, reviewState run.StageState) (*memRepo, *run.Stage, *run.Stage) {
+func implementWithReview(t *testing.T, implState, reviewState run.StageState) (*fixupRepo, *run.Stage, *run.Stage) {
 	t.Helper()
 	runID := uuid.New()
 	impl := newStage(implState)
@@ -36,7 +64,7 @@ func implementWithReview(t *testing.T, implState, reviewState run.StageState) (*
 	review.Type = run.StageTypeReview
 	review.RunID = runID
 	review.Sequence = 2
-	repo := newMemRepo(impl, review)
+	repo := newFixupRepo(impl, review)
 	return repo, impl, review
 }
 
@@ -405,6 +433,76 @@ func TestFixupStage_HardCeilingWinsEvenWhenForced(t *testing.T) {
 	cur, _ := repo.GetStage(context.Background(), stage.ID)
 	if cur.State != run.StageStateAwaitingApproval {
 		t.Errorf("state = %q, want unchanged (awaiting_approval)", cur.State)
+	}
+}
+
+func TestFixupStage_RefusesTerminalRun(t *testing.T) {
+	// #968 defense-in-depth: a terminal run's stages must never be
+	// re-opened — there is no live gate for the fix-up to flow back into,
+	// so the re-opened stages would strand at pending forever. Refused for
+	// both the normal and the operator-forced pass, for every terminal
+	// run state.
+	for _, runState := range []run.State{run.StateSucceeded, run.StateFailed, run.StateCancelled} {
+		for _, forced := range []bool{false, true} {
+			repo, impl, review := implementWithReview(t, run.StageStateSucceeded, run.StageStateAwaitingApproval)
+			repo.setRunState(impl.RunID, runState)
+			priorPasses := 0
+			if forced {
+				// The forced pass models the incident shape: normal budget
+				// spent, override requested.
+				priorPasses = 1
+			}
+
+			_, err := run.FixupStage(context.Background(), repo, impl.ID, run.FixupOptions{
+				PriorPassCount:      priorPasses,
+				MaxPasses:           1,
+				HardCeiling:         3,
+				ForceAdditionalPass: forced,
+			})
+			if !errors.Is(err, run.ErrFixupNotApplicable) {
+				t.Fatalf("run %s forced=%v: err = %v, want ErrFixupNotApplicable", runState, forced, err)
+			}
+			// Neither stage may be touched.
+			if cur, _ := repo.GetStage(context.Background(), impl.ID); cur.State != run.StageStateSucceeded {
+				t.Errorf("run %s forced=%v: implement state = %q, want unchanged (succeeded)", runState, forced, cur.State)
+			}
+			if cur, _ := repo.GetStage(context.Background(), review.ID); cur.State != run.StageStateAwaitingApproval {
+				t.Errorf("run %s forced=%v: review state = %q, want unchanged (awaiting_approval)", runState, forced, cur.State)
+			}
+		}
+	}
+}
+
+func TestFixupStage_ForcedPassReparksReviewOnRunningRun(t *testing.T) {
+	// #968 regression: a FORCED pass on a healthy running run must re-park
+	// the review stage identically to the normal-budget branch — the
+	// incident's first hypothesis was that the forced branch skipped the
+	// re-park; this pins that it does not.
+	repo, impl, review := implementWithReview(t, run.StageStateSucceeded, run.StageStateAwaitingApproval)
+
+	dec, err := run.FixupStage(context.Background(), repo, impl.ID, run.FixupOptions{
+		PriorPassCount:      1,
+		MaxPasses:           1,
+		HardCeiling:         3,
+		ForceAdditionalPass: true,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage forced on running run: %v", err)
+	}
+	if !dec.Forced {
+		t.Errorf("Forced = false, want true")
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending", dec.Stage.State)
+	}
+	if dec.ReparkedReview == nil {
+		t.Fatal("ReparkedReview = nil, want the re-parked review stage (forced branch must re-park identically to the normal branch)")
+	}
+	if dec.ReparkedReview.ID != review.ID {
+		t.Errorf("ReparkedReview.ID = %s, want %s", dec.ReparkedReview.ID, review.ID)
+	}
+	if dec.ReparkedReview.State != run.StageStatePending {
+		t.Errorf("re-parked review state = %q, want pending", dec.ReparkedReview.State)
 	}
 }
 

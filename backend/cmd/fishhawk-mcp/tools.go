@@ -829,7 +829,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// field stays nil — never fails the snapshot.
 	var reviewActionHint *ReviewActionHint
 	if implementStageID, ok := stageIDOfType(stages, "implement"); ok {
-		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, implementReviewStatus)
+		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, runRow.State, implementReviewStatus)
 	}
 
 	// Stage-execution wait status (#879/#880, ADR-037), derived from the
