@@ -8245,3 +8245,67 @@ func TestScopeAmendment_RunnerEndToEnd(t *testing.T) {
 		t.Errorf("log missing scope_amendments_folded: %s", log.String())
 	}
 }
+
+// TestIsBinaryArtifactDrift unit-tests the #980 advisory build-artifact
+// classifier: an oversized executable hits, the Go module-binary path shape
+// cmd/<name>/<name> hits without needing the file on disk, and a plain
+// source file misses. The classifier is log-only — these pin the heuristics
+// so the scope_drift_binary_artifact WARN fires on the incident shape (a
+// 21MB fishhawk-runner binary) without flagging ordinary drift.
+func TestIsBinaryArtifactDrift(t *testing.T) {
+	repoDir := t.TempDir()
+
+	// (a) Executable above the size threshold → hit, size reported.
+	bigExec := filepath.Join(repoDir, "bigtool")
+	if err := os.WriteFile(bigExec, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(bigExec, binaryArtifactSizeThreshold+1); err != nil {
+		t.Fatal(err)
+	}
+	if hit, size := isBinaryArtifactDrift(repoDir, "bigtool"); !hit || size != binaryArtifactSizeThreshold+1 {
+		t.Errorf("oversized executable: hit=%v size=%d, want hit=true size=%d", hit, size, binaryArtifactSizeThreshold+1)
+	}
+
+	// Executable but small → miss (a shell script is not a build artifact).
+	smallExec := filepath.Join(repoDir, "script.sh")
+	if err := os.WriteFile(smallExec, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if hit, _ := isBinaryArtifactDrift(repoDir, "script.sh"); hit {
+		t.Error("small executable should not classify as a build artifact")
+	}
+
+	// Oversized but not executable → miss (a large fixture is not a binary).
+	bigData := filepath.Join(repoDir, "fixture.json")
+	if err := os.WriteFile(bigData, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(bigData, binaryArtifactSizeThreshold+1); err != nil {
+		t.Fatal(err)
+	}
+	if hit, _ := isBinaryArtifactDrift(repoDir, "fixture.json"); hit {
+		t.Error("oversized non-executable should not classify as a build artifact")
+	}
+
+	// (b) cmd/<name>/<name> shape → hit even when the file is not stattable
+	// (size 0): basename equals parent dir, directly under a cmd/ segment.
+	if hit, size := isBinaryArtifactDrift(repoDir, "runner/cmd/fishhawk-runner/fishhawk-runner"); !hit || size != 0 {
+		t.Errorf("cmd/<name>/<name> shape: hit=%v size=%d, want hit=true size=0", hit, size)
+	}
+	if hit, _ := isBinaryArtifactDrift(repoDir, "cmd/tool/tool"); !hit {
+		t.Error("top-level cmd/tool/tool shape should classify as a build artifact")
+	}
+
+	// Plain source files miss: basename != parent dir, or no cmd/ segment.
+	for _, miss := range []string{
+		"runner/cmd/fishhawk-runner/main.go",
+		"backend/internal/foo/foo.go",
+		"pkg/tool/tool", // <name>/<name> but not under cmd/
+		"README.md",
+	} {
+		if hit, _ := isBinaryArtifactDrift(repoDir, miss); hit {
+			t.Errorf("%s should not classify as a build artifact", miss)
+		}
+	}
+}

@@ -69,6 +69,21 @@ var ErrCreatedOutOfScope = errors.New("gitops: created out-of-scope files")
 // (ADR-027).
 var ErrFixupCreatedOutOfScope = fmt.Errorf("%w (fix-up)", ErrCreatedOutOfScope)
 
+// ErrCommitOutOfScope is the post-commit out-of-scope assertion sentinel
+// (#980): after the scope-only commit is created on the ScopeFiles path,
+// CommitAndPush diffs the new commit against its parent and asserts every
+// committed path matches the SAME declared-set matcher StageScoped staged
+// with. A violation means the staging invariant broke — a path the drift
+// report claims was excluded actually landed in the commit (run 4c2c6374's
+// 21MB pre-staged binary) — so it fails loud naming each violating path,
+// returned BEFORE the push (origin untouched, no broken branch, no PR).
+// The runner classifies it category-B (artifact broken → re-scope/re-plan),
+// symmetric with ErrCommitWouldNotCompile / ErrPushedTreeNotVerified. It is
+// the commit-side complement of #960's tree-equivalence invariant: #960
+// proves the pushed tree is the gate-verified tree, this proves the pushed
+// commit's content is the declared scope and nothing else.
+var ErrCommitOutOfScope = errors.New("gitops: commit contains out-of-scope paths")
+
 // ErrCommittedTestsFailed is the test-gate analogue of
 // ErrCommitWouldNotCompile (#800): the scope-only committed tree COMPILES
 // (go vet passes) but a touched package's tests fail because a build- or
@@ -444,6 +459,18 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 	treeSHA = strings.TrimSpace(treeSHA)
 
+	// Post-commit out-of-scope assertion (#980), ScopeFiles path only (the
+	// add -A fallback has no scope to bound against). StageScoped's mixed
+	// reset makes a violation structurally impossible, so this is the
+	// fail-loud backstop proving the drift report and the commit's actual
+	// content agree — returned BEFORE the push and before the (more
+	// expensive) VerifyCommit gates, so origin stays untouched.
+	if len(args.ScopeFiles) > 0 {
+		if err := p.assertCommitInScope(ctx, args.RepoDir, headSHA, args.ScopeFiles); err != nil {
+			return nil, err
+		}
+	}
+
 	// Compile-gate hook (#728): verify the scope-only committed tree
 	// before any push. Runs after the commit exists (so headSHA is real
 	// and checkoutable in an isolated worktree) but before the push, so a
@@ -514,7 +541,9 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 }
 
 // StageScoped stages exactly the declared scope paths and returns the
-// set of dirty-but-undeclared paths (scope drift). It reads `git status
+// set of dirty-but-undeclared paths (scope drift). It first runs a mixed
+// `git reset -q` (whole-tree, index → HEAD, working tree untouched) so the
+// index is the single source of truth (#980), then reads `git status
 // --porcelain -uall` to enumerate every dirty path, stages the ones that
 // match a declared path via a single `git add -A -- <paths>` (per-path
 // -A covers create, modify, AND delete), and returns the remainder as
@@ -522,37 +551,37 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 // are a no-op. Staging only the paths git already reports dirty means
 // `git add` never errors on a pathspec that matches nothing.
 //
+// Index-authority postcondition: on return the index equals HEAD plus
+// exactly the declared dirty paths. Without the reset, a file the agent
+// pre-staged with its own `git add` was never unstaged — `git commit`
+// commits the index, so the pre-staged out-of-scope file landed in the
+// commit while the drift report claimed it was excluded (#980, run
+// 4c2c6374's 21MB binary). The reset also makes a pre-staged net-new file
+// untracked again, restoring the #818 created-out-of-scope gate's reach:
+// `git ls-files --others` (UntrackedPaths) excludes index-resident files,
+// so a staged net-new file was invisible to the gate.
+//
 // -uall (--untracked-files=all) enumerates untracked files inside a
 // brand-new directory individually rather than collapsing them to a
 // single directory entry (e.g. `?? backend/internal/budget/`), which
 // matches no file-level scope.files entry and would be misclassified as
 // drift, leaving the declared file unstaged (#691).
 func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []string) (drift []string, err error) {
+	if err := p.run(ctx, repoDir, "reset", "-q"); err != nil {
+		return nil, fmt.Errorf("gitops: reset index: %w", err)
+	}
 	status, err := p.runOut(ctx, repoDir, "status", "--porcelain", "-uall")
 	if err != nil {
 		return nil, fmt.Errorf("gitops: status: %w", err)
 	}
-	// Split declared entries into exact-match paths and directory prefixes.
-	// A trailing-slash entry (#824) is a folded directory: every created
-	// file beneath it should stage. A plain entry stays exact-match — a
-	// regular file must not prefix-match a sibling (foo/bar.go must never
-	// stage foo/bar.go.bak).
-	declared := make(map[string]bool, len(scopeFiles))
-	var dirPrefixes []string
-	for _, f := range scopeFiles {
-		if strings.HasSuffix(f, "/") {
-			dirPrefixes = append(dirPrefixes, f)
-			continue
-		}
-		declared[f] = true
-	}
+	matcher := newScopeMatcher(scopeFiles)
 	var toStage []string
 	for _, line := range strings.Split(status, "\n") {
 		path := porcelainPath(line)
 		if path == "" {
 			continue
 		}
-		if declared[path] || hasDirPrefix(path, dirPrefixes) {
+		if matcher.matches(path) {
 			toStage = append(toStage, path)
 		} else {
 			drift = append(drift, path)
@@ -618,6 +647,68 @@ func (p *Pusher) popStash(ctx context.Context, repoDir string) error {
 	}
 	return fmt.Errorf("%w: working tree reset to fetched base, stashed edits preserved (git stash list) — re-base the run or replan: %v",
 		ErrBaseRebaseConflict, popErr)
+}
+
+// scopeMatcher is the single source of truth for "does this repo-relative
+// path match the declared scope.files set" (#980). StageScoped partitions
+// dirty paths with it, and assertCommitInScope re-checks the committed
+// paths against it, so staging and the post-commit assertion can never
+// disagree on what "in scope" means. Declared entries split into exact-match
+// paths and trailing-slash directory prefixes: a trailing-slash entry (#824)
+// is a folded directory — every created file beneath it matches — while a
+// plain entry stays exact-match, so a regular file never prefix-matches a
+// sibling (foo/bar.go must never match foo/bar.go.bak).
+type scopeMatcher struct {
+	declared    map[string]bool
+	dirPrefixes []string
+}
+
+func newScopeMatcher(scopeFiles []string) scopeMatcher {
+	m := scopeMatcher{declared: make(map[string]bool, len(scopeFiles))}
+	for _, f := range scopeFiles {
+		if strings.HasSuffix(f, "/") {
+			m.dirPrefixes = append(m.dirPrefixes, f)
+			continue
+		}
+		m.declared[f] = true
+	}
+	return m
+}
+
+func (m scopeMatcher) matches(path string) bool {
+	return m.declared[path] || hasDirPrefix(path, m.dirPrefixes)
+}
+
+// assertCommitInScope enforces the post-commit out-of-scope assertion
+// (#980): every path the commit changed relative to its parent must match
+// the declared scope set. It runs `git diff-tree -r -z --no-commit-id
+// --name-only <sha>` — the commit produced by the staging path is always
+// parented (CommitAndPush captures a pre-existing HEAD as BaseSHA before
+// committing), so diff-tree lists its changes against that parent; -z
+// yields NUL-separated unquoted paths, immune to core.quotePath quoting.
+// Any committed path outside the matcher returns ErrCommitOutOfScope
+// naming each violating path; callers invoke it BEFORE the push so a
+// violation leaves origin untouched.
+func (p *Pusher) assertCommitInScope(ctx context.Context, repoDir, headSHA string, scopeFiles []string) error {
+	out, err := p.runOut(ctx, repoDir, "diff-tree", "-r", "-z", "--no-commit-id", "--name-only", headSHA)
+	if err != nil {
+		return fmt.Errorf("gitops: diff-tree %s: %w", headSHA, err)
+	}
+	matcher := newScopeMatcher(scopeFiles)
+	var violations []string
+	for _, path := range strings.Split(out, "\x00") {
+		if path == "" {
+			continue
+		}
+		if !matcher.matches(path) {
+			violations = append(violations, path)
+		}
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf("%w: commit %s contains %d path(s) outside the declared scope.files: %s",
+			ErrCommitOutOfScope, headSHA, len(violations), strings.Join(violations, ", "))
+	}
+	return nil
 }
 
 // hasDirPrefix reports whether path lies under any of the trailing-slash

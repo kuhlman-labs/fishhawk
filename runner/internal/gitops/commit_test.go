@@ -565,6 +565,267 @@ func TestCommitAndPush_ScopeBounded_AllStrayIsNoChanges(t *testing.T) {
 	}
 }
 
+// TestCommitAndPush_PreStagedOutOfScopeBinaryExcluded is the #980 regression
+// test reproducing the incident shape (run 4c2c6374): an in-scope edit plus an
+// out-of-scope untracked binary that the agent PRE-STAGED with its own
+// `git add`. Before the StageScoped mixed reset, the binary stayed in the
+// index — `git commit` commits the index — so it landed in the commit while
+// ScopeDrift reported it as excluded. The commit's diff-tree path set must
+// exactly equal the in-scope paths, the drift must name the binary, and the
+// two must agree (report == commit content). Fails on pre-#980 code.
+func TestCommitAndPush_PreStagedOutOfScopeBinaryExcluded(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+
+	// In-scope edit + an out-of-scope "binary" the agent built AND staged.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binPath := "cmd/tool/tool"
+	if err := os.MkdirAll(filepath.Join(repo, "cmd", "tool"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, binPath), []byte("\x7fELF fake binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", binPath)
+
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/scope/prestaged",
+		CommitMessage: "Scoped commit",
+		RemoteURL:     bare,
+		ScopeFiles:    []string{"README.md"},
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush: %v", err)
+	}
+
+	// The commit's content is exactly the in-scope set — the pre-staged
+	// binary must NOT have ridden into it.
+	committed := mustGitOut(t, repo, "diff-tree", "-r", "--no-commit-id", "--name-only", res.HeadSHA)
+	if committed != "README.md" {
+		t.Errorf("committed paths = %q, want exactly README.md (pre-staged binary excluded)", committed)
+	}
+	// The exclusion report names the binary…
+	if len(res.ScopeDrift) != 1 || res.ScopeDrift[0] != binPath {
+		t.Errorf("ScopeDrift = %v, want [%s]", res.ScopeDrift, binPath)
+	}
+	// …and report and commit content agree: nothing reported excluded is in
+	// the commit (the #980 disagreement).
+	for _, d := range res.ScopeDrift {
+		if strings.Contains(committed, d) {
+			t.Errorf("drift path %q reported excluded but present in commit content %q", d, committed)
+		}
+	}
+	// The binary survives in the working tree as untracked again — excluded,
+	// not lost, and visible to the #818 gate's `git ls-files --others`.
+	status := mustGitOut(t, repo, "status", "--porcelain", "-uall")
+	if !strings.Contains(status, "?? "+binPath) {
+		t.Errorf("binary should be untracked after the commit; status = %q", status)
+	}
+}
+
+// TestStageScoped_PreStagedUndeclaredIsUnstaged pins the StageScoped half of
+// #980 in isolation: a file the agent pre-staged with its own `git add` but
+// did not declare must be absent from the index after StageScoped (mixed
+// reset → index == HEAD + declared set) and present in the drift report.
+func TestStageScoped_PreStagedUndeclaredIsUnstaged(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "artifact.bin"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "artifact.bin")
+
+	p := &Pusher{}
+	drift, err := p.StageScoped(context.Background(), repo, []string{"README.md"})
+	if err != nil {
+		t.Fatalf("StageScoped: %v", err)
+	}
+
+	staged := mustGitOut(t, repo, "diff", "--cached", "--name-only")
+	if staged != "README.md" {
+		t.Errorf("staged files = %q, want only README.md (pre-staged artifact.bin unstaged)", staged)
+	}
+	if len(drift) != 1 || drift[0] != "artifact.bin" {
+		t.Errorf("drift = %v, want [artifact.bin]", drift)
+	}
+}
+
+// TestStageScoped_PostSoftResetStagedEntry exercises the verify-fix-loop
+// entry condition (#980 approval condition 1): runVerifyFixLoop's iterations
+// call StageScoped, make a THROWAWAY commit, and undo it with `git reset
+// --soft HEAD~1` — which leaves the scope files STAGED. The next StageScoped
+// call (next iteration, or the real CommitAndPush) therefore enters with a
+// staged index, not a clean one; the mixed reset must be idempotent there:
+// re-partition and re-stage the declared set, keep classifying the stray as
+// drift, and produce a commit containing exactly the declared paths.
+func TestStageScoped_PostSoftResetStagedEntry(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "stray.pid"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	// Iteration 1: stage scope-only, throwaway commit, soft reset — the
+	// verify-fix loop's exact sequence (StageScoped → commitVerifyWIP →
+	// gitResetSoftHEAD1).
+	if _, err := p.StageScoped(context.Background(), repo, []string{"README.md"}); err != nil {
+		t.Fatalf("StageScoped (iteration 1): %v", err)
+	}
+	mustGit(t, repo, "commit", "--no-verify", "-m", "WIP verify throwaway")
+	mustGit(t, repo, "reset", "--soft", "HEAD~1")
+
+	// Entry state for iteration 2: README.md is STAGED (soft reset preserves
+	// the index), stray.pid untracked.
+	if staged := mustGitOut(t, repo, "diff", "--cached", "--name-only"); staged != "README.md" {
+		t.Fatalf("precondition: staged = %q, want README.md staged after reset --soft", staged)
+	}
+
+	// Iteration 2 entry: StageScoped from the STAGED state must be idempotent.
+	drift, err := p.StageScoped(context.Background(), repo, []string{"README.md"})
+	if err != nil {
+		t.Fatalf("StageScoped (post-soft-reset entry): %v", err)
+	}
+	staged := mustGitOut(t, repo, "diff", "--cached", "--name-only")
+	if staged != "README.md" {
+		t.Errorf("staged files = %q, want only README.md after re-entry", staged)
+	}
+	if len(drift) != 1 || drift[0] != "stray.pid" {
+		t.Errorf("drift = %v, want [stray.pid] on re-entry", drift)
+	}
+
+	// The re-staged index commits exactly the declared path.
+	mustGit(t, repo, "commit", "--no-verify", "-m", "real commit")
+	committed := mustGitOut(t, repo, "diff-tree", "-r", "--no-commit-id", "--name-only", "HEAD")
+	if committed != "README.md" {
+		t.Errorf("committed paths = %q, want exactly README.md", committed)
+	}
+}
+
+// TestAssertCommitInScope_NamesViolatingPath drives the post-commit
+// out-of-scope assertion (#980) directly against a raw-git crafted commit
+// that bypasses StageScoped — the only way to produce the violation the
+// assertion guards against. The crafted commit is PARENTED (initRepo's
+// initial commit is the parent), matching the commit shape the staging path
+// produces, so the diff-tree invocation is confirmed against the real shape.
+// The returned error must wrap ErrCommitOutOfScope and name the violating
+// path; a fully-declared commit must pass.
+func TestAssertCommitInScope_NamesViolatingPath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "undeclared.bin"), []byte("oops"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "crafted out-of-scope commit")
+	head := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	p := &Pusher{}
+	err := p.assertCommitInScope(context.Background(), repo, head, []string{"README.md"})
+	if !errors.Is(err, ErrCommitOutOfScope) {
+		t.Fatalf("assertCommitInScope = %v, want ErrCommitOutOfScope", err)
+	}
+	if !strings.Contains(err.Error(), "undeclared.bin") {
+		t.Errorf("error %q must name the violating path undeclared.bin", err.Error())
+	}
+	if strings.Contains(err.Error(), "README.md") {
+		t.Errorf("error %q must not name the declared in-scope path", err.Error())
+	}
+
+	// A commit whose every path is declared passes.
+	if err := p.assertCommitInScope(context.Background(), repo, head, []string{"README.md", "undeclared.bin"}); err != nil {
+		t.Errorf("assertCommitInScope (all declared) = %v, want nil", err)
+	}
+}
+
+// TestUntrackedPaths_SeesPreStagedFileAfterStageScoped pins the #818-reach
+// half of #980: `git ls-files --others` excludes index-resident files, so a
+// net-new out-of-scope file the agent pre-staged was invisible to the
+// created-out-of-scope gate (the run died later on the #960 tree-mismatch
+// path instead of ErrCreatedOutOfScope naming the file). After StageScoped's
+// mixed reset the file is untracked again and the gate sees it. Passes
+// trivially without StageScoped's reset only if the file was never staged —
+// the pre-staging here is what makes it the regression.
+func TestUntrackedPaths_SeesPreStagedFileAfterStageScoped(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "newfile.bin"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "newfile.bin")
+
+	// Pre-staged → in the index → invisible to ls-files --others (the gap).
+	before, err := UntrackedPaths(context.Background(), repo, []string{"newfile.bin"})
+	if err != nil {
+		t.Fatalf("UntrackedPaths (before): %v", err)
+	}
+	if len(before) != 0 {
+		t.Fatalf("precondition: pre-staged file should be invisible to UntrackedPaths, got %v", before)
+	}
+
+	p := &Pusher{}
+	drift, err := p.StageScoped(context.Background(), repo, []string{"README.md"})
+	if err != nil {
+		t.Fatalf("StageScoped: %v", err)
+	}
+	if len(drift) != 1 || drift[0] != "newfile.bin" {
+		t.Errorf("drift = %v, want [newfile.bin]", drift)
+	}
+
+	after, err := UntrackedPaths(context.Background(), repo, []string{"newfile.bin"})
+	if err != nil {
+		t.Fatalf("UntrackedPaths (after): %v", err)
+	}
+	if len(after) != 1 || after[0] != "newfile.bin" {
+		t.Errorf("UntrackedPaths after StageScoped = %v, want [newfile.bin] (gate reach restored)", after)
+	}
+}
+
 func TestPorcelainPath(t *testing.T) {
 	cases := map[string]string{
 		" M README.md":        "README.md",
