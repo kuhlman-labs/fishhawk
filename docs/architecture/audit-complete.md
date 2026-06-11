@@ -48,6 +48,10 @@ The publisher (`backend/internal/auditcheckpublisher`) mirrors the state to the 
 
 `pull_request.synchronize` webhooks fire `server/pullrequest_synchronize.go::republishOnSynchronize`, which looks up the matching Fishhawk run via `runs.pull_request_url` (#216) and re-runs Compute + publish so branch protection sees the drift immediately rather than waiting for the next SPA visit. Falls open (returns pass) when `ArtifactRepo` or `AuditRepo` aren't wired — same posture as the other check-derivation paths.
 
+## Reconcile sweep
+
+Every publish surface above is one-shot best-effort: a transient GitHub failure (the #971 401 during the 2026-06-10 incident) drops the Check Run, the publisher dedup cache stays unrecorded (a failed publish never poisons it — pinned by `TestPublish_GitHubError_Returned`), and nothing retries until the next SPA visit or webhook (#973). The merge reconciler (`backend/internal/mergereconciler/`, `--enable-merge-reconciler`) closes this: each tick calls `server.RepublishAuditCheck` (→ `recomputeAndPublishAuditComplete`) for every review stage parked in `awaiting_approval`, BEFORE the merge poll so a GitHub poll failure cannot also skip the heal. A dropped publish heals within one tick of GitHub recovering; an already-published state dedups to a no-op. Re-creating a Check Run that already exists is safe — GitHub evaluates the latest check run per `(name, head_sha)`. Persistent-failure surfacing (audit entry / issue comment after repeated failed republishes) is deferred to a follow-up; the repeated WARN log is the interim signal.
+
 ## Verifier mirror
 
 The verifier package (`/verifier/internal/audit`) ships an external mirror of rules 1–4; rules 5 and 6 are **backend-only** — rule 5 needs GitHub access, rule 6 needs the live spec-reviewers + backstop closures, neither of which the verifier has.

@@ -245,6 +245,98 @@ func TestTick_ClosedUnmerged_ReverifierNotConsulted(t *testing.T) {
 	}
 }
 
+// stubRepublisher records RepublishAuditCheck calls, modeling the
+// server-side audit-complete recompute+publish heal (#973).
+type stubRepublisher struct {
+	calls []uuid.UUID
+}
+
+func (s *stubRepublisher) RepublishAuditCheck(_ context.Context, runID uuid.UUID) {
+	s.calls = append(s.calls, runID)
+}
+
+// TestTick_OpenPR_RepublisherInvoked: a parked review stage with an open
+// PR gets the audit-check heal every tick even though the merge poll
+// resolves nothing — exactly the window where a dropped publish would
+// otherwise wedge the merge gate (#971/#973).
+func TestTick_OpenPR_RepublisherInvoked(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	res := &stubResolver{}
+	rep := &stubRepublisher{}
+	tk := newTicker(repo, pg, res)
+	tk.AuditCheckRepublisher = rep
+	tk.Tick(context.Background())
+
+	if len(rep.calls) != 1 || rep.calls[0] != r.ID {
+		t.Errorf("republish calls = %v, want [%s]", rep.calls, r.ID)
+	}
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (open PR left parked)", len(res.calls))
+	}
+}
+
+// TestTick_GetPRError_RepublisherStillInvoked: the heal must run BEFORE
+// the merge poll — a GitHub outage that fails GetPullRequest (the same
+// outage shape that dropped the publish) cannot also skip the retry.
+func TestTick_GetPRError_RepublisherStillInvoked(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{err: errors.New("502 bad gateway")}
+	res := &stubResolver{}
+	rep := &stubRepublisher{}
+	tk := newTicker(repo, pg, res)
+	tk.AuditCheckRepublisher = rep
+	tk.Tick(context.Background())
+
+	if len(rep.calls) != 1 || rep.calls[0] != r.ID {
+		t.Errorf("republish calls = %v, want [%s] (heal must not depend on the poll)", rep.calls, r.ID)
+	}
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 on a PR-get error", len(res.calls))
+	}
+}
+
+// TestTick_NilRepublisher_BehaviorUnchanged: a nil AuditCheckRepublisher
+// preserves the pre-#973 ticker byte-for-byte — the merge still resolves.
+func TestTick_NilRepublisher_BehaviorUnchanged(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	newTicker(repo, pg, res).Tick(context.Background()) // AuditCheckRepublisher left nil
+
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Errorf("resolve calls = %+v, want one merged=true resolve (nil republisher = today's behavior)", res.calls)
+	}
+}
+
+// TestTick_SkipCleanStages_RepublisherNotInvoked: the skip-clean guards
+// (no installation_id, no pull_request_url) run BEFORE the heal — a run
+// that never reached a PR has no Check Run to republish.
+func TestTick_SkipCleanStages_RepublisherNotInvoked(t *testing.T) {
+	noInst, noInstStage := reviewRun("https://github.com/x/y/pull/42", nil)
+	noPR, noPRStage := reviewRun("", instID(99))
+	repo := &fakeRepo{
+		awaiting: []*run.Stage{noInstStage, noPRStage},
+		runs:     map[uuid.UUID]*run.Run{noInst.ID: noInst, noPR.ID: noPR},
+	}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	res := &stubResolver{}
+	rep := &stubRepublisher{}
+	tk := newTicker(repo, pg, res)
+	tk.AuditCheckRepublisher = rep
+	tk.Tick(context.Background())
+
+	if len(rep.calls) != 0 {
+		t.Errorf("republish calls = %v, want none for skip-clean stages", rep.calls)
+	}
+	if pg.calls != 0 || len(res.calls) != 0 {
+		t.Errorf("expected clean skips; PR get calls=%d resolve calls=%d", pg.calls, len(res.calls))
+	}
+}
+
 func TestTick_ClosedUnmerged_ResolvesCancelled(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
