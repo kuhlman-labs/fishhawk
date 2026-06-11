@@ -459,6 +459,64 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Run()-level restore net (#953, the #941 residual): the restore defers
+	// inside openPRAndShipArtifact and the fixup block below only cover their
+	// own paths, so an implement stage whose agent moved HEAD (e.g. `git
+	// checkout -b`) and then FAILED before reaching them stranded the operator
+	// on the agent's branch. Installed here — before the fixup defer and the
+	// agent invoke — so LIFO ordering makes it fire LAST at run() exit, on
+	// every path: success, failure, or panic. Double-fire safe: when an inner
+	// defer already restored (or HEAD never moved — the common failure case
+	// where the agent only edited files), the re-read below sees HEAD on the
+	// captured ref and the defer no-ops. That guard is load-bearing:
+	// restoreHead is `git checkout --force`, which discards staged+unstaged
+	// tracked modifications, and an unconditional checkout here would destroy
+	// the dirty tree the operator inspects after a failure. --no-pr keeps its
+	// deliberate leave-the-tree-as-is semantics (the dirty tree IS the
+	// deliverable), so the defer is skipped entirely. Note it fires AFTER
+	// logCompletion, so the working_tree_restored line lands after the
+	// completion log line on failure paths — stderr-only; the trace bundle was
+	// already uploaded earlier either way, matching the success-path behavior.
+	if stageType == "implement" && preAgentCaptured && !cfg.noPR {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		defer func() {
+			// A deadline/cancellation-failed stage is exactly a failure path
+			// this net targets, and `git checkout` under the already-dead ctx
+			// would silently fail — detach from the parent's cancellation and
+			// bound the restore with a fresh timeout so a hung git cannot
+			// stall runner exit indefinitely.
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			curRef, curDetached, capErr := captureHead(rctx, repoDir)
+			if capErr != nil {
+				// Never run `git checkout --force` blind: destroying
+				// uncommitted work is worse than leaving the operator
+				// stranded (stranded is recoverable by hand).
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"working_tree_restore_failed","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t,"detail":%q}`+"\n",
+					cfg.runID, cfg.stageID, preAgentRef, preAgentDetached,
+					"restore skipped: current HEAD could not be determined: "+capErr.Error())
+				return
+			}
+			if curRef == preAgentRef && curDetached == preAgentDetached {
+				// HEAD never moved, or an inner defer already restored it.
+				return
+			}
+			if rerr := restoreHead(rctx, repoDir, preAgentRef); rerr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"working_tree_restore_failed","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t,"detail":%q}`+"\n",
+					cfg.runID, cfg.stageID, preAgentRef, preAgentDetached, rerr.Error())
+				return
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"working_tree_restored","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t}`+"\n",
+				cfg.runID, cfg.stageID, preAgentRef, preAgentDetached)
+		}()
+	}
+
 	// Fix-up base establishment (#967): a fix-up pass must run against the
 	// run's PR branch, not the operator's incidental checkout — an operator
 	// tree left on main makes the agent's edits a silent no-op that burns a
@@ -467,11 +525,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// head (ADR-035 lineage): a mismatch means the branch tip is not the
 	// stage's recorded head, so FAIL FAST before any agent invocation. An
 	// empty expected SHA (older backend, or backend-side resolution failure)
-	// proceeds with checkout only. The run()-level restore defer below puts
-	// the operator back on their original ref even on agent-failure paths
-	// that never reach openPRAndShipArtifact's restore defer (#911 family);
-	// on the success path both defers fire — the second is a harmless
-	// same-ref checkout.
+	// proceeds with checkout only. The restore defer below puts the operator
+	// back on their original ref even on agent-failure paths that never reach
+	// openPRAndShipArtifact's restore defer (#911 family); on the success
+	// path both defers fire — the second is a harmless same-ref checkout.
+	// Either way this defer restores BEFORE the #953 stage-wide net installed
+	// above it (LIFO), whose moved-HEAD guard then sees HEAD already back on
+	// the captured ref and no-ops — double-fire safe by construction.
 	if stageType == "implement" && cfg.fixup {
 		repoDir := cfg.workingDir
 		if repoDir == "" {
@@ -3311,6 +3371,10 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// it never overrides the function's primary push success/failure outcome.
 	// preAgentCaptured is false when the capture in run() failed (or was
 	// skipped); restoration is then skipped, never breaking the push path.
+	// This defer restores BEFORE run()'s #953 stage-wide net (LIFO: run()'s
+	// defer was installed first, so it fires last), whose moved-HEAD guard
+	// then sees HEAD already back on the captured ref and no-ops — the two
+	// never double-checkout.
 	if preAgentCaptured {
 		defer func() {
 			if rerr := restoreHead(ctx, repoDir, preAgentRef); rerr != nil {
