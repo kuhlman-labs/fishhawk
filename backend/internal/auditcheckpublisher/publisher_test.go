@@ -415,6 +415,375 @@ func TestPublish_NilReceiver_NoOp(t *testing.T) {
 	}
 }
 
+// --- Persistent-failure episodes (#993) ---
+
+// TestPublish_OnDegraded_FiresOnceAtThreshold pins the once-per-episode
+// contract: the callback fires exactly when the consecutive-failure
+// streak reaches DefaultDegradedThreshold and stays silent on attempts
+// past it.
+func TestPublish_OnDegraded_FiresOnceAtThreshold(t *testing.T) {
+	rec := &episodeCalls{}
+	runID, gh, pub := callbackDeps(t, rec)
+	gh.err = errors.New("401 Bad credentials")
+
+	for i := 1; i <= auditcheckpublisher.DefaultDegradedThreshold+3; i++ {
+		if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err == nil {
+			t.Fatalf("attempt %d: expected error", i)
+		}
+		want := 0
+		if i >= auditcheckpublisher.DefaultDegradedThreshold {
+			want = 1
+		}
+		if got := len(rec.degradedCalls()); got != want {
+			t.Fatalf("after attempt %d: degraded calls = %d, want %d", i, got, want)
+		}
+	}
+	d := rec.degradedCalls()[0]
+	if d.runID != runID {
+		t.Errorf("degraded run_id = %s, want %s", d.runID, runID)
+	}
+	if d.headSHA != "abc123" {
+		t.Errorf("degraded head_sha = %q, want abc123", d.headSHA)
+	}
+	if d.attempts != auditcheckpublisher.DefaultDegradedThreshold {
+		t.Errorf("degraded attempts = %d, want %d", d.attempts, auditcheckpublisher.DefaultDegradedThreshold)
+	}
+	if d.lastErr == nil || !strings.Contains(d.lastErr.Error(), "401") {
+		t.Errorf("degraded last_err should wrap the GitHub error: %v", d.lastErr)
+	}
+	if got := len(rec.recoveredCalls()); got != 0 {
+		t.Errorf("recovered calls = %d, want 0 (never succeeded)", got)
+	}
+}
+
+// TestPublish_SuccessMidStreak_ResetsCount: a success before the
+// threshold clears the streak, so no degraded callback ever fires
+// even though the total failure count crosses the threshold.
+func TestPublish_SuccessMidStreak_ResetsCount(t *testing.T) {
+	rec := &episodeCalls{}
+	runID, gh, pub := callbackDeps(t, rec)
+
+	gh.err = errors.New("boom")
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold-1; i++ {
+		_, _ = pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+	}
+	gh.err = nil
+	if ok, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err != nil || !ok {
+		t.Fatalf("mid-streak success: ok=%v err=%v", ok, err)
+	}
+	// Fail again with a DIFFERENT state (same state would dedup-skip
+	// against the just-recorded success and never reach GitHub).
+	gh.err = errors.New("boom")
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold-1; i++ {
+		_, _ = pub.Publish(context.Background(), runID, stagecheck.StateFail, nil)
+	}
+	if got := len(rec.degradedCalls()); got != 0 {
+		t.Fatalf("degraded calls = %d, want 0 (success reset the streak)", got)
+	}
+}
+
+// TestPublish_RecoveryAfterDegradation: success after degradation
+// invokes OnRecovered carrying the streak it cleared, and a fresh
+// failure streak afterwards starts a NEW episode that degrades again.
+func TestPublish_RecoveryAfterDegradation(t *testing.T) {
+	rec := &episodeCalls{}
+	runID, gh, pub := callbackDeps(t, rec)
+
+	gh.err = errors.New("boom")
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold; i++ {
+		_, _ = pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+	}
+	if got := len(rec.degradedCalls()); got != 1 {
+		t.Fatalf("degraded calls = %d, want 1", got)
+	}
+
+	gh.err = nil
+	if ok, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err != nil || !ok {
+		t.Fatalf("recovery publish: ok=%v err=%v", ok, err)
+	}
+	recovered := rec.recoveredCalls()
+	if len(recovered) != 1 {
+		t.Fatalf("recovered calls = %d, want 1", len(recovered))
+	}
+	if recovered[0].runID != runID || recovered[0].headSHA != "abc123" {
+		t.Errorf("recovered call = %+v", recovered[0])
+	}
+	if recovered[0].attempts != auditcheckpublisher.DefaultDegradedThreshold {
+		t.Errorf("recovered attempts = %d, want %d", recovered[0].attempts, auditcheckpublisher.DefaultDegradedThreshold)
+	}
+
+	// A fresh streak (different state so the dedup cache doesn't
+	// short-circuit) is a new episode and degrades independently.
+	gh.err = errors.New("boom again")
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold; i++ {
+		_, _ = pub.Publish(context.Background(), runID, stagecheck.StateFail, nil)
+	}
+	if got := len(rec.degradedCalls()); got != 2 {
+		t.Fatalf("degraded calls after second streak = %d, want 2", got)
+	}
+}
+
+// TestPublish_CleanSuccess_InvokesOnRecoveredWithZeroAttempts pins the
+// always-invoke contract OnRecovered's doc promises: the durable
+// open-episode decision belongs to the callee, so even a success with
+// no in-process streak (e.g. right after a daemon restart) reports.
+func TestPublish_CleanSuccess_InvokesOnRecoveredWithZeroAttempts(t *testing.T) {
+	rec := &episodeCalls{}
+	runID, _, pub := callbackDeps(t, rec)
+
+	if ok, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err != nil || !ok {
+		t.Fatalf("publish: ok=%v err=%v", ok, err)
+	}
+	recovered := rec.recoveredCalls()
+	if len(recovered) != 1 {
+		t.Fatalf("recovered calls = %d, want 1", len(recovered))
+	}
+	if recovered[0].attempts != 0 {
+		t.Errorf("attempts = %d, want 0", recovered[0].attempts)
+	}
+}
+
+// TestPublish_SkipAndReadErrorPaths_DontCount: only the CreateCheckRun
+// attempt proper advances the streak — skip paths (no PR artifact) and
+// GetRun read errors stay invisible no matter how often they repeat.
+func TestPublish_SkipAndReadErrorPaths_DontCount(t *testing.T) {
+	rec := &episodeCalls{}
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{}}
+	gh := &fakeGitHub{err: errors.New("boom")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+		OnDegraded:  rec.onDegraded,
+		OnRecovered: rec.onRecovered,
+	})
+
+	// Skip path: no PR artifact yet — repeat well past the threshold.
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold+2; i++ {
+		if ok, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); ok || err != nil {
+			t.Fatalf("skip publish: ok=%v err=%v", ok, err)
+		}
+	}
+	// Read-error path: GetRun failing is not a publish attempt.
+	repoRuns.getErr = errors.New("db down")
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold+2; i++ {
+		if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err == nil {
+			t.Fatal("expected GetRun error")
+		}
+	}
+	repoRuns.getErr = nil
+	if got := len(rec.degradedCalls()); got != 0 {
+		t.Fatalf("degraded calls = %d, want 0 (no CreateCheckRun attempted)", got)
+	}
+
+	// Once the artifact lands, the streak starts from zero and fires
+	// exactly at the threshold.
+	repoArts.byStage[implID] = []*artifact.Artifact{prArtifact(implID, "abc123")}
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold; i++ {
+		_, _ = pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+	}
+	if got := len(rec.degradedCalls()); got != 1 {
+		t.Fatalf("degraded calls = %d, want 1", got)
+	}
+	if got := rec.degradedCalls()[0].attempts; got != auditcheckpublisher.DefaultDegradedThreshold {
+		t.Errorf("attempts = %d, want %d (skips must not have counted)", got, auditcheckpublisher.DefaultDegradedThreshold)
+	}
+}
+
+// TestPublish_EpisodesKeyedPerRun: two runs sharing repo AND head_sha
+// (the #993 amendment case) have independent failure episodes — run
+// A's sub-threshold streak never bleeds into run B's count, and the
+// degraded callback names the run that actually crossed.
+func TestPublish_EpisodesKeyedPerRun(t *testing.T) {
+	rec := &episodeCalls{}
+	runA, runB := uuid.New(), uuid.New()
+	implA, implB := uuid.New(), uuid.New()
+	const sharedSHA = "feedfeedfeedfeedfeedfeedfeedfeedfeedfeed"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{
+			runA: {ID: runA, Repo: "x/y", InstallationID: int64Ptr(42)},
+			runB: {ID: runB, Repo: "x/y", InstallationID: int64Ptr(42)},
+		},
+		stages: map[uuid.UUID][]*run.Stage{
+			runA: {{ID: implA, Type: run.StageTypeImplement, RunID: runA}},
+			runB: {{ID: implB, Type: run.StageTypeImplement, RunID: runB}},
+		},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implA: {prArtifact(implA, sharedSHA)},
+		implB: {prArtifact(implB, sharedSHA)},
+	}}
+	gh := &fakeGitHub{err: errors.New("boom")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+		OnDegraded:  rec.onDegraded,
+		OnRecovered: rec.onRecovered,
+	})
+
+	// Run A: one short of the threshold. Run B: one short, too. A
+	// shared (repo, head_sha) key would have crossed long ago.
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold-1; i++ {
+		_, _ = pub.Publish(context.Background(), runA, stagecheck.StatePass, nil)
+		_, _ = pub.Publish(context.Background(), runB, stagecheck.StatePass, nil)
+	}
+	if got := len(rec.degradedCalls()); got != 0 {
+		t.Fatalf("degraded calls = %d, want 0 (episodes must be per-run)", got)
+	}
+
+	// Run B alone crosses; the callback must name run B.
+	_, _ = pub.Publish(context.Background(), runB, stagecheck.StatePass, nil)
+	degraded := rec.degradedCalls()
+	if len(degraded) != 1 {
+		t.Fatalf("degraded calls = %d, want 1", len(degraded))
+	}
+	if degraded[0].runID != runB {
+		t.Errorf("degraded run_id = %s, want run B %s", degraded[0].runID, runB)
+	}
+	if degraded[0].headSHA != sharedSHA {
+		t.Errorf("degraded head_sha = %q", degraded[0].headSHA)
+	}
+}
+
+// TestPublish_DedupHit_ClosesOpenEpisode: run A publishes successfully
+// first and records the (repo, head_sha) dedup cache; run B — same
+// repo AND head, with an open degraded episode — then publishes the
+// same state. The dedup no-op must still clear B's episode and fire
+// OnRecovered with B's streak length, otherwise B's degraded entry
+// would never get its paired recovered entry.
+func TestPublish_DedupHit_ClosesOpenEpisode(t *testing.T) {
+	rec := &episodeCalls{}
+	runA, runB := uuid.New(), uuid.New()
+	implA, implB := uuid.New(), uuid.New()
+	const sharedSHA = "feedfeedfeedfeedfeedfeedfeedfeedfeedfeed"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{
+			runA: {ID: runA, Repo: "x/y", InstallationID: int64Ptr(42)},
+			runB: {ID: runB, Repo: "x/y", InstallationID: int64Ptr(42)},
+		},
+		stages: map[uuid.UUID][]*run.Stage{
+			runA: {{ID: implA, Type: run.StageTypeImplement, RunID: runA}},
+			runB: {{ID: implB, Type: run.StageTypeImplement, RunID: runB}},
+		},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implA: {prArtifact(implA, sharedSHA)},
+		implB: {prArtifact(implB, sharedSHA)},
+	}}
+	gh := &fakeGitHub{err: errors.New("boom")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+		OnDegraded:  rec.onDegraded,
+		OnRecovered: rec.onRecovered,
+	})
+
+	// Run B degrades against the shared head.
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold; i++ {
+		_, _ = pub.Publish(context.Background(), runB, stagecheck.StatePass, nil)
+	}
+	if got := len(rec.degradedCalls()); got != 1 {
+		t.Fatalf("degraded calls = %d, want 1", got)
+	}
+
+	// GitHub recovers; run A publishes clean first, filling the
+	// (repo, head_sha) dedup cache before B ever publishes itself.
+	gh.err = nil
+	if ok, err := pub.Publish(context.Background(), runA, stagecheck.StatePass, nil); err != nil || !ok {
+		t.Fatalf("run A publish: ok=%v err=%v", ok, err)
+	}
+	ghCalls := len(gh.calls)
+
+	// Run B's next publish is a dedup no-op — no GitHub call — but it
+	// must still close B's open episode.
+	published, err := pub.Publish(context.Background(), runB, stagecheck.StatePass, nil)
+	if err != nil || published {
+		t.Fatalf("run B dedup publish: published=%v err=%v", published, err)
+	}
+	if got := len(gh.calls); got != ghCalls {
+		t.Fatalf("dedup hit hit GitHub: calls = %d, want %d", got, ghCalls)
+	}
+	recovered := rec.recoveredCalls()
+	if len(recovered) != 2 {
+		t.Fatalf("recovered calls = %d, want 2 (run A clean + run B dedup)", len(recovered))
+	}
+	last := recovered[len(recovered)-1]
+	if last.runID != runB {
+		t.Errorf("recovered run_id = %s, want run B %s", last.runID, runB)
+	}
+	if last.attempts != auditcheckpublisher.DefaultDegradedThreshold {
+		t.Errorf("recovered attempts = %d, want %d (B's cleared streak)", last.attempts, auditcheckpublisher.DefaultDegradedThreshold)
+	}
+
+	// The episode is gone: a further dedup hit reports a zero streak.
+	_, _ = pub.Publish(context.Background(), runB, stagecheck.StatePass, nil)
+	recovered = rec.recoveredCalls()
+	if got := recovered[len(recovered)-1].attempts; got != 0 {
+		t.Errorf("post-close recovered attempts = %d, want 0 (episode not cleared)", got)
+	}
+}
+
+// TestPublish_NilCallbacks_Safe: a publisher without the optional
+// callbacks survives a full degrade → recover cycle untouched.
+func TestPublish_NilCallbacks_Safe(t *testing.T) {
+	runID, gh, pub := happyDeps(t)
+	gh.err = errors.New("boom")
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold+1; i++ {
+		if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err == nil {
+			t.Fatal("expected error")
+		}
+	}
+	gh.err = nil
+	if ok, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err != nil || !ok {
+		t.Fatalf("recovery publish: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestPublish_Concurrent_CallbacksOutsideMutex drives concurrent
+// Publish calls under -race with a degraded callback that RE-ENTERS
+// the publisher. If the implementation invoked callbacks while
+// holding p.mu, the nested Publish would deadlock on the
+// non-reentrant mutex and the test would time out.
+func TestPublish_Concurrent_CallbacksOutsideMutex(t *testing.T) {
+	rec := &episodeCalls{}
+	runID, gh, pub := callbackDeps(t, rec)
+	gh.err = errors.New("boom")
+	var reentered sync.WaitGroup
+	reentered.Add(1)
+	rec.onDegradedHook = func() {
+		// Re-enter the publisher from inside the callback: this
+		// acquires p.mu and deadlocks if the callback runs locked.
+		_, _ = pub.Publish(context.Background(), runID, stagecheck.StateFail, nil)
+		reentered.Done()
+	}
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold; i++ {
+				_, _ = pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+			}
+		}()
+	}
+	wg.Wait()
+	reentered.Wait()
+	if got := len(rec.degradedCalls()); got != 1 {
+		t.Fatalf("degraded calls = %d, want exactly 1 across all goroutines", got)
+	}
+}
+
 // --- helpers ---
 
 func happyDeps(t *testing.T) (uuid.UUID, *fakeGitHub, *auditcheckpublisher.Publisher) {
@@ -441,6 +810,81 @@ func happyDeps(t *testing.T) (uuid.UUID, *fakeGitHub, *auditcheckpublisher.Publi
 		t.Fatal("publisher nil")
 	}
 	return runID, gh, pub
+}
+
+// callbackDeps is happyDeps with the #993 episode callbacks wired to
+// a recorder.
+func callbackDeps(t *testing.T, rec *episodeCalls) (uuid.UUID, *fakeGitHub, *auditcheckpublisher.Publisher) {
+	t.Helper()
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+		OnDegraded:  rec.onDegraded,
+		OnRecovered: rec.onRecovered,
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	return runID, gh, pub
+}
+
+// episodeCalls records OnDegraded / OnRecovered invocations.
+// onDegradedHook, when set, runs inside the callback (used to prove
+// callbacks execute outside the publisher's mutex).
+type episodeCalls struct {
+	mu             sync.Mutex
+	degraded       []episodeCall
+	recovered      []episodeCall
+	onDegradedHook func()
+}
+
+type episodeCall struct {
+	runID    uuid.UUID
+	headSHA  string
+	attempts int
+	lastErr  error
+}
+
+func (r *episodeCalls) onDegraded(_ context.Context, runID uuid.UUID, headSHA string, attempts int, lastErr error) {
+	r.mu.Lock()
+	r.degraded = append(r.degraded, episodeCall{runID: runID, headSHA: headSHA, attempts: attempts, lastErr: lastErr})
+	hook := r.onDegradedHook
+	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+func (r *episodeCalls) onRecovered(_ context.Context, runID uuid.UUID, headSHA string, attempts int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recovered = append(r.recovered, episodeCall{runID: runID, headSHA: headSHA, attempts: attempts})
+}
+
+func (r *episodeCalls) degradedCalls() []episodeCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]episodeCall{}, r.degraded...)
+}
+
+func (r *episodeCalls) recoveredCalls() []episodeCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]episodeCall{}, r.recovered...)
 }
 
 func int64Ptr(v int64) *int64 { return &v }

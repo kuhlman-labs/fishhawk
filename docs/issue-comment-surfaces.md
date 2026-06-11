@@ -358,6 +358,20 @@ Notes:
   anchor (#977); delivery to the agent is poll-based (the agent polls the GET
   endpoint), so no comment surface is involved. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for comment surfaces.
+- The audit-check publish-health audit kinds — `audit_check_publish_degraded` /
+  `audit_check_publish_recovered` (#993) — are **internal, system-actor audit
+  kinds, not issue-comment surfaces**. Nothing in `issuecomment` posts them; they
+  have no Notifier methods. `server/checks.go::auditCheckPublishDegraded` writes
+  the degraded entry (system actor, payload `{head_sha, attempts, last_error}`)
+  exactly once per failure episode when the `fishhawk_audit_complete` Check Run
+  publish has failed `auditcheckpublisher.DefaultDegradedThreshold` consecutive
+  times for a `(run_id, head_sha)`, and `auditCheckPublishRecovered` writes the
+  paired recovered entry (payload `{head_sha, attempts}`) on the successful
+  publish that closes the open episode. Run-surface visibility comes from
+  `fishhawk_get_run_status` / the SPA reading run-chain entries generically; an
+  issue-comment mirror would be a separate follow-up surface. Listed here only so
+  a future reader grepping the audit categories doesn't mistake them for comment
+  surfaces.
 - The self-consistency invariant kind — `invariant_violation` (#764) — is an
   **internal, system-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method.
