@@ -219,6 +219,76 @@ func (c *Client) GetWorkflowSpec(ctx context.Context, installationID int64, repo
 	return c.GetFile(ctx, installationID, repo, WorkflowSpecPath, ref)
 }
 
+// DirEntry is one entry in a Contents-API directory listing
+// (ListDirectory): the entry's base name, repo-relative path, and type
+// ("file" | "dir" | "symlink" | "submodule").
+type DirEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Type string `json:"type"`
+}
+
+// ListDirectory lists a repository directory's entries at the given ref.
+// path is relative to the repo root (no leading slash); ref="" serves
+// the repository's default branch.
+//
+//	GET /repos/{owner}/{repo}/contents/{path}?ref={ref}
+//
+// On a directory path the Contents API returns a JSON ARRAY of entries
+// (name/path/type) rather than GetFile's single-object file shape, capped
+// at 1000 entries per directory — far above any Go package directory's
+// file count, so no pagination here. Returns ErrNotFound when the
+// directory or repo isn't visible to the installation, ErrForbidden on
+// auth issues, and a descriptive error (never a panic) when path names a
+// file — GitHub answers with a JSON object instead of an array there.
+func (c *Client) ListDirectory(ctx context.Context, installationID int64, repo RepoRef, path, ref string) ([]DirEntry, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if path == "" {
+		return nil, errors.New("githubclient: path required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/contents/" + escapePath(path))
+	if ref != "" {
+		endpoint = endpoint + "?ref=" + url.QueryEscape(ref)
+	}
+
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: list directory: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("list directory", resp); err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: read directory listing: %w", err)
+	}
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, fmt.Errorf("githubclient: %s is not a directory (contents response is not a listing array)", path)
+	}
+	var entries []DirEntry
+	if err := json.Unmarshal(trimmed, &entries); err != nil {
+		return nil, fmt.Errorf("githubclient: decode directory listing: %w", err)
+	}
+	return entries, nil
+}
+
 // Issue is the slice of an issue payload Fishhawk surfaces for
 // prompt construction. We deliberately don't expose the full
 // GitHub Issue type — adding fields here is opt-in as new prompt

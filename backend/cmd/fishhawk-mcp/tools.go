@@ -315,6 +315,34 @@ type GetPlanOutput struct {
 	// scope.files evaluated against the static surface registry for
 	// sibling surfaces a plan must move in lockstep with.
 	SurfaceSweep *SurfaceSweep `json:"surface_sweep,omitempty" jsonschema:"plan-gate surface sweep (#763): flags sibling surfaces a plan must move together with. When scope.files touches one surface of a known multi-surface pattern (an @-mention render surface, or an audit-kind emitter that mandates a docs/issue-comment-surfaces.md entry) but omits a required sibling, that sibling is reported. Present (possibly with empty findings) when the plan stage ran the sweep; absent on older runs predating it. A non-empty findings[] means the plan likely forgot a surface that must change in lockstep"`
+	// TestSweep surfaces the plan-gate test-sweep advisory (#942):
+	// scope.files evaluated against the repository's existing *_test.go
+	// files via the Contents API.
+	TestSweep *TestSweep `json:"test_sweep,omitempty" jsonschema:"plan-gate test sweep (#942): heuristic advisory flagging EXISTING *_test.go files adjacent to the plan's scoped .go files that the plan omitted — a stem-sibling test of a scoped production file, or existing tests in a package where the plan creates a new test file. Judge whether the changed behavior's tests or shared harness live in the flagged files; if so the plan must scope them or the runner will scope_drift-exclude the agent's edits to them. Present (possibly with empty findings) when the plan stage ran the sweep; absent on older runs, non-GitHub triggers, and fail-open paths. listed_dirs below scanned directories means some listings failed and findings may be incomplete"`
+}
+
+// TestSweepFinding is one test-sweep result decoded from a plan_test_sweep
+// audit entry (#942): the plan touches TriggerPath but omits the existing
+// test files MissingTests the named Rule (stem_sibling |
+// new_test_in_tested_package) associates with it. OmittedCount carries the
+// number of additional existing test files truncated from MissingTests.
+// Mirrors the server-side TestSweepFinding shape exactly.
+type TestSweepFinding struct {
+	Rule         string   `json:"rule"`
+	TriggerPath  string   `json:"trigger_path"`
+	MissingTests []string `json:"missing_tests"`
+	OmittedCount int      `json:"omitted_count,omitempty"`
+}
+
+// TestSweep is the plan-gate test-sweep result decoded from the newest
+// plan_test_sweep audit entry (#942). Findings is empty when no existing
+// test file adjacent to the scoped change was left out of scope;
+// ScannedFiles is the number of scope.files evaluated; ListedDirs counts
+// the directories successfully listed via the Contents API.
+type TestSweep struct {
+	Findings     []TestSweepFinding `json:"findings,omitempty" jsonschema:"existing test files the plan omitted; empty when the scoped directories carried no missing adjacent tests"`
+	ScannedFiles int                `json:"scanned_files" jsonschema:"number of scope.files the sweep evaluated"`
+	ListedDirs   int                `json:"listed_dirs" jsonschema:"directories successfully listed via the Contents API; lower than the scoped-directory count means some listings failed open and findings may be incomplete"`
 }
 
 // SurfaceSweepFinding is one missing-sibling result decoded from a
@@ -438,6 +466,10 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if err != nil {
 				return nil, GetPlanOutput{}, fmt.Errorf("load surface sweep: %w", err)
 			}
+			testSweep, err := r.loadTestSweep(ctx, current)
+			if err != nil {
+				return nil, GetPlanOutput{}, fmt.Errorf("load test sweep: %w", err)
+			}
 			return nil, GetPlanOutput{
 				Status:           "available",
 				Plan:             p,
@@ -446,6 +478,7 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 				PlanReviewStatus: reviewStatus,
 				ScopePrecheck:    scopePrecheck,
 				SurfaceSweep:     surfaceSweep,
+				TestSweep:        testSweep,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -635,6 +668,41 @@ func (r *runResolver) loadSurfaceSweep(ctx context.Context, runID uuid.UUID) (*S
 		return nil, nil
 	}
 	return &ss, nil
+}
+
+// loadTestSweep fetches the NEWEST plan_test_sweep audit entry (#942) for
+// the run and decodes its payload into a TestSweep. As with
+// loadScopePrecheck and loadSurfaceSweep the backend's per-run audit
+// endpoint returns entries sequence-ascending, so the authoritative entry
+// is the last one: a schema-retry run re-uploads the plan and writes a
+// second sweep, and the latest reflects the plan the human actually
+// approves. Returns nil when no entry exists (an older run predating the
+// sweep, or a fail-open no-op) so the field is omitted. A corrupt payload
+// is treated as "not checked" rather than failing the whole plan fetch.
+func (r *runResolver) loadTestSweep(ctx context.Context, runID uuid.UUID) (*TestSweep, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "plan_test_sweep",
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return nil, nil
+	}
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return nil, nil
+	}
+	var ts TestSweep
+	if uerr := json.Unmarshal(raw, &ts); uerr != nil {
+		return nil, nil
+	}
+	return &ts, nil
 }
 
 // auditLimitDefault is the default value for the get_run_status

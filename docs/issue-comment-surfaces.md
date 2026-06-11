@@ -100,6 +100,25 @@ Notes:
   sees a "scope hits forbidden_paths — wrong workflow?" advisory before approving.
   Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
+- The plan-gate test-sweep audit kind — `plan_test_sweep` (#942), written by
+  the plan upload handler (`server/test_sweep.go::runTestSweep`) immediately
+  after `plan_surface_sweep` and before plan review — is an **internal,
+  advisory audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread. It consults the repository
+  tree via the GitHub Contents API (default-branch HEAD) and flags EXISTING
+  `*_test.go` files adjacent to the plan's scoped `.go` files that the plan
+  omitted — a stem-sibling test of a scoped production file
+  (`stem_sibling`), or existing tests in a package where the plan creates a
+  new test file (`new_test_in_tested_package`, capped at 10 names +
+  `omitted_count`) — with payload `{findings, scanned_files, listed_dirs}`.
+  Advisory + fail-open (nil GitHub client, nil installation, every listing
+  failing → no entry, never a block) and written even on a clean sweep
+  (empty `findings`) so a reader can distinguish "checked and clean" from
+  "never checked". Read back by the MCP surface (`fishhawk_get_plan`
+  `test_sweep`, newest entry wins) and rendered into the plan-review
+  prompt's gate-evidence section as a reviewer-judged advisory. Listed here
+  only so a future reader grepping the audit categories doesn't mistake it
+  for a comment surface.
 - The cost-accounting audit kind — `cost_recorded` (#649), written by the
   trace upload handler (`trace.go::recordCost`) once per bundle receipt with
   payload `{model, input_tokens, output_tokens, usd, known_model,
