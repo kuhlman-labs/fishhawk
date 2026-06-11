@@ -286,6 +286,10 @@ type approvalRequest struct {
 //     landed_terminal)
 //   - 422 plan_violates_budget (plan predicted runtime exceeds the
 //     implement-stage budget; decompose or --override-budget)
+//   - 422 plan_violates_scope_cap (#983: effective scope.files — plan
+//     scope plus add_scope_files — exceeds the implement stage's
+//     max_files_changed; re-scope the plan or include
+//     --override-scope-cap in the comment)
 func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string) (*Stage, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:            decision,

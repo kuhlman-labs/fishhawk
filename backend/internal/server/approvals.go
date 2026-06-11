@@ -161,6 +161,16 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		if !s.checkPlanReviewSettled(w, r, stage) {
 			return
 		}
+		// Scope-cap gate (#983): refuse an approve whose effective scope
+		// (plan scope.files ∪ add_scope_files) exceeds the implement
+		// stage's max_files_changed, unless the comment carries
+		// --override-scope-cap. PRE-Submit for the same ADR-036 reason as
+		// checkPlanReviewSettled: a refused approval must insert no row so
+		// a retry after re-scope or with the override flows normally
+		// (post-Submit, the idempotent-first-wins retry would skip gates).
+		if !s.checkPlanScopeCap(w, r, stage, req.Comment, req.AddScopeFiles) {
+			return
+		}
 	}
 
 	// ADR-017 (#249, #253): the approval handler no longer gates on
@@ -625,6 +635,82 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 			"predicted_minutes": approvedPlan.PredictedRuntimeMinutes,
 			"budget_minutes":    budgetMinutes,
 			"timeout_source":    timeoutSource,
+		})
+	return false
+}
+
+// checkPlanScopeCap enforces the scope-cap gate on plan-stage approvals
+// (#983). Returns true when the approval should proceed; returns false
+// (and writes the 422 plan_violates_scope_cap response) when the
+// effective scope — the plan's scope.files unioned with the approval's
+// add_scope_files, prior add_scope_files folds, and approved scope
+// amendments, deduped exactly as the prompt builder's foldScopePaths
+// dedupes — exceeds the implement stage's resolved max_files_changed
+// and the comment lacks --override-scope-cap.
+//
+// Override-able rather than hard-fail because declared scope is an
+// upper bound on the eventual diff, not a prediction: the post-implement
+// gate counts actual diff files, and the cap may legitimately be about
+// to change. --override-scope-cap mirrors checkPlanBudget's
+// --override-budget posture, acknowledged via a
+// plan_scope_cap_override_acknowledged audit entry.
+//
+// Fail-open matching checkPlanBudget: any read failure, absent spec, or
+// missing plan skips the check (effectiveScopeHeadroom WARN-logs), so a
+// degraded backend can never brick the approval gate. A cap of 0 means
+// no cap is configured — nothing to enforce.
+func (s *Server) checkPlanScopeCap(w http.ResponseWriter, r *http.Request, stage *run.Stage, comment string, addScopeFiles []string) bool {
+	effectiveCount, maxFiles, ok := s.effectiveScopeHeadroom(r.Context(), stage.RunID, addScopeFiles)
+	if !ok || maxFiles <= 0 || effectiveCount <= maxFiles {
+		return true
+	}
+
+	auditPayload, _ := json.Marshal(map[string]any{
+		"stage_id":              stage.ID.String(),
+		"scoped_files":          effectiveCount,
+		"max_files_changed":     maxFiles,
+		"add_scope_files_count": len(addScopeFiles),
+	})
+	systemKind := audit.ActorKind("system")
+
+	if strings.Contains(comment, "--override-scope-cap") {
+		if s.cfg.AuditRepo != nil {
+			if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+				RunID:     stage.RunID,
+				StageID:   &stage.ID,
+				Timestamp: time.Now().UTC(),
+				Category:  "plan_scope_cap_override_acknowledged",
+				ActorKind: &systemKind,
+				Payload:   auditPayload,
+			}); err != nil {
+				s.cfg.Logger.Error("audit append failed for scope-cap override",
+					"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+			}
+		}
+		return true
+	}
+
+	if s.cfg.AuditRepo != nil {
+		if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+			RunID:     stage.RunID,
+			StageID:   &stage.ID,
+			Timestamp: time.Now().UTC(),
+			Category:  "plan_violates_scope_cap",
+			ActorKind: &systemKind,
+			Payload:   auditPayload,
+		}); err != nil {
+			s.cfg.Logger.Error("audit append failed for scope-cap violation",
+				"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+		}
+	}
+
+	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_violates_scope_cap",
+		"effective scope.files (plan scope plus add_scope_files) exceeds the implement stage's max_files_changed; re-scope the plan or include --override-scope-cap in the comment",
+		map[string]any{
+			"stage_id":              stage.ID.String(),
+			"scoped_files":          effectiveCount,
+			"max_files_changed":     maxFiles,
+			"add_scope_files_count": len(addScopeFiles),
 		})
 	return false
 }

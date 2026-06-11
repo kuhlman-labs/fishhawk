@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -64,6 +65,16 @@ type scopeAmendmentResponse struct {
 	DecidedBy      *string                    `json:"decided_by,omitempty"`
 	RequestedAt    time.Time                  `json:"requested_at"`
 	DecidedAt      *time.Time                 `json:"decided_at,omitempty"`
+	// Scope-cap headroom (#983), warn-only: what the run's effective
+	// scope file count would be with this amendment's paths folded in,
+	// against the implement stage's resolved max_files_changed. Absent
+	// when the headroom computation failed open or no cap is configured.
+	// Populated on request/decision responses and, in the list, on
+	// PENDING items only — decided rows carry their decision-time
+	// numbers in the audit log, and recomputing them post-hoc would be
+	// misleading.
+	EffectiveScopeFilesAfterApproval *int `json:"effective_scope_files_after_approval,omitempty"`
+	MaxFilesChanged                  *int `json:"max_files_changed,omitempty"`
 }
 
 // scopeAmendmentListResponse is the GET list envelope.
@@ -84,6 +95,25 @@ func amendmentToResponse(a *scopeamendment.Amendment) scopeAmendmentResponse {
 		RequestedAt:    a.RequestedAt,
 		DecidedAt:      a.DecidedAt,
 	}
+}
+
+// amendmentHeadroom computes the #983 warn-only headroom pair for one
+// amendment: the effective scope file count with the amendment's paths
+// folded in (as effectiveScopeHeadroom's extraPaths — already-approved
+// amendments dedupe against themselves) and the implement stage's
+// resolved max_files_changed. Returns (nil, nil) on fail-open or when
+// no cap is configured, so callers attach nothing (omitempty) rather
+// than a misleading zero.
+func (s *Server) amendmentHeadroom(ctx context.Context, a *scopeamendment.Amendment) (effective, maxFiles *int) {
+	paths := make([]string, 0, len(a.Paths))
+	for _, p := range a.Paths {
+		paths = append(paths, p.Path)
+	}
+	count, capValue, ok := s.effectiveScopeHeadroom(ctx, a.RunID, paths)
+	if !ok || capValue <= 0 {
+		return nil, nil
+	}
+	return &count, &capValue
 }
 
 // runBoundTokenRunID extracts the run UUID from a run-bound MCP token
@@ -219,10 +249,14 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	effective, maxFiles := s.amendmentHeadroom(r.Context(), amendment)
 	s.writeScopeAmendmentRequestedAudit(r, amendment, id.Subject,
-		maxScopeAmendmentsPerStage-used-1)
+		maxScopeAmendmentsPerStage-used-1, effective, maxFiles)
 
-	s.writeJSON(w, r, http.StatusCreated, amendmentToResponse(amendment))
+	resp := amendmentToResponse(amendment)
+	resp.EffectiveScopeFilesAfterApproval = effective
+	resp.MaxFilesChanged = maxFiles
+	s.writeJSON(w, r, http.StatusCreated, resp)
 }
 
 // handleListScopeAmendments implements GET
@@ -281,7 +315,15 @@ func (s *Server) handleListScopeAmendments(w http.ResponseWriter, r *http.Reques
 	}
 	resp := scopeAmendmentListResponse{Items: make([]scopeAmendmentResponse, 0, len(items))}
 	for _, a := range items {
-		resp.Items = append(resp.Items, amendmentToResponse(a))
+		item := amendmentToResponse(a)
+		// Headroom (#983) for PENDING items only: the operator deciding
+		// from the list sees what approving would do; decided rows carry
+		// their decision-time numbers in the audit log.
+		if a.Status == scopeamendment.StatusPending {
+			item.EffectiveScopeFilesAfterApproval, item.MaxFilesChanged =
+				s.amendmentHeadroom(r.Context(), a)
+		}
+		resp.Items = append(resp.Items, item)
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
@@ -398,9 +440,13 @@ func (s *Server) handleDecideScopeAmendment(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	s.writeScopeAmendmentDecidedAudit(r, decided, reqBody.Decision)
+	effective, maxFiles := s.amendmentHeadroom(r.Context(), decided)
+	s.writeScopeAmendmentDecidedAudit(r, decided, reqBody.Decision, effective, maxFiles)
 
-	s.writeJSON(w, r, http.StatusOK, amendmentToResponse(decided))
+	resp := amendmentToResponse(decided)
+	resp.EffectiveScopeFilesAfterApproval = effective
+	resp.MaxFilesChanged = maxFiles
+	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
 // resolveExecutingImplementStage returns the run's currently-executing
@@ -429,14 +475,19 @@ func (s *Server) resolveExecutingImplementStage(r *http.Request, runID uuid.UUID
 // chain entry. Best-effort: a failure logs but doesn't unwind the
 // request — the row is the durable record; the audit entry is the
 // operator's await anchor (fishhawk_await_audit, #977).
-func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamendment.Amendment, subject string, remainingBudget int) {
+func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamendment.Amendment, subject string, remainingBudget int, effectiveAfterApproval, maxFiles *int) {
 	actorKind := audit.ActorAgent
-	payload, _ := json.Marshal(map[string]any{
+	payloadMap := map[string]any{
 		"amendment_id":     a.ID.String(),
 		"paths":            a.Paths,
 		"reason":           a.Reason,
 		"remaining_budget": remainingBudget,
-	})
+	}
+	if effectiveAfterApproval != nil && maxFiles != nil {
+		payloadMap["effective_scope_files_after_approval"] = *effectiveAfterApproval
+		payloadMap["max_files_changed"] = *maxFiles
+	}
+	payload, _ := json.Marshal(payloadMap)
 	stageID := a.StageID
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        a.RunID,
@@ -457,18 +508,23 @@ func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamen
 
 // writeScopeAmendmentDecidedAudit appends the scope_amendment_decided
 // chain entry. Best-effort, same posture as the requested entry.
-func (s *Server) writeScopeAmendmentDecidedAudit(r *http.Request, a *scopeamendment.Amendment, decision string) {
+func (s *Server) writeScopeAmendmentDecidedAudit(r *http.Request, a *scopeamendment.Amendment, decision string, effectiveAfterApproval, maxFiles *int) {
 	actorKind := audit.ActorUser
 	subject := ""
 	if a.DecidedBy != nil {
 		subject = *a.DecidedBy
 	}
-	payload, _ := json.Marshal(map[string]any{
+	payloadMap := map[string]any{
 		"amendment_id": a.ID.String(),
 		"decision":     decision,
 		"reason":       a.DecisionReason,
 		"decided_by":   subject,
-	})
+	}
+	if effectiveAfterApproval != nil && maxFiles != nil {
+		payloadMap["effective_scope_files_after_approval"] = *effectiveAfterApproval
+		payloadMap["max_files_changed"] = *maxFiles
+	}
+	payload, _ := json.Marshal(payloadMap)
 	stageID := a.StageID
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        a.RunID,

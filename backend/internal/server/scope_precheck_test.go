@@ -8,6 +8,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // specImplementPathConstraints is a feature_change workflow whose
@@ -278,6 +279,70 @@ workflows:
 
 	if n := countScopePrecheckEntries(au); n != 0 {
 		t.Fatalf("want no entry written when there is no implement stage; got %d", n)
+	}
+}
+
+// TestScopePrecheck_PayloadCarriesCapWhenClean is the #983 headroom
+// assertion: even a clean (no-violations) payload records the resolved
+// max_files_changed so downstream surfaces can render the 29/30
+// near-miss a violations-only payload hides.
+func TestScopePrecheck_PayloadCarriesCapWhenClean(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify},
+	})
+
+	s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+
+	got := lastScopePrecheckEntry(t, au)
+	if len(got.Violations) != 0 {
+		t.Fatalf("want zero violations; got %+v", got.Violations)
+	}
+	if got.MaxFilesChanged != 3 {
+		t.Errorf("MaxFilesChanged = %d, want 3", got.MaxFilesChanged)
+	}
+}
+
+// TestScopePrecheck_PayloadCarriesCapWhenOverCap asserts the cap rides
+// the payload alongside the max_files_changed violation.
+func TestScopePrecheck_PayloadCarriesCapWhenOverCap(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+		{Path: "backend/c.go", Operation: plan.FileOpModify},
+		{Path: "backend/d.go", Operation: plan.FileOpModify},
+	})
+
+	s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+
+	got := lastScopePrecheckEntry(t, au)
+	if !hasViolation(got, "max_files_changed") {
+		t.Fatalf("want a max_files_changed violation; got %+v", got.Violations)
+	}
+	if got.MaxFilesChanged != 3 {
+		t.Errorf("MaxFilesChanged = %d, want 3", got.MaxFilesChanged)
+	}
+}
+
+// TestFlattenPathConstraints_MaxFilesMinWins asserts the flatten keeps
+// the MINIMUM when two constraints set max_files_changed, matching the
+// post-implement gate's mergeConstraints (trace.go) — the previous
+// last-wins behavior was a latent divergence (#983).
+func TestFlattenPathConstraints_MaxFilesMinWins(t *testing.T) {
+	got := flattenPathConstraints([]spec.Constraint{
+		{MaxFilesChanged: 5},
+		{MaxFilesChanged: 8},
+	})
+	if got.MaxFilesChanged != 5 {
+		t.Errorf("MaxFilesChanged = %d, want 5 (min-wins)", got.MaxFilesChanged)
+	}
+	got = flattenPathConstraints([]spec.Constraint{
+		{MaxFilesChanged: 8},
+		{MaxFilesChanged: 5},
+	})
+	if got.MaxFilesChanged != 5 {
+		t.Errorf("MaxFilesChanged = %d, want 5 (min-wins regardless of order)", got.MaxFilesChanged)
 	}
 }
 

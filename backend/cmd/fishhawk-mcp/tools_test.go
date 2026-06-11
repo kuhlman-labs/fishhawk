@@ -3860,3 +3860,82 @@ func TestGetRunStatus_NoConcernsBlock_NilField(t *testing.T) {
 		t.Errorf("Run.Concerns = %+v, want nil when the backend omits the block", out.Run.Concerns)
 	}
 }
+
+// TestGetPlan_ScopePrecheck_MaxFilesChangedCrossesSeam asserts the #983
+// cap field rides the backend-write -> mcp-read JSON contract: a
+// server-side payload with MaxFilesChanged set surfaces on the tool
+// output so the approver can read headroom.
+func TestGetPlan_ScopePrecheck_MaxFilesChangedCrossesSeam(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedScopePrecheckAudit(fb, runID, server.ScopePrecheckPayload{
+		WorkflowID:       "feature_change",
+		ImplementStageID: "implement",
+		ScannedFiles:     29,
+		Violations:       []policy.Violation{},
+		MaxFilesChanged:  30,
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.ScopePrecheck == nil {
+		t.Fatal("ScopePrecheck is nil; want populated")
+	}
+	if out.ScopePrecheck.MaxFilesChanged != 30 {
+		t.Errorf("MaxFilesChanged = %d, want 30", out.ScopePrecheck.MaxFilesChanged)
+	}
+	if out.ScopePrecheck.ScannedFiles != 29 {
+		t.Errorf("ScannedFiles = %d, want 29", out.ScopePrecheck.ScannedFiles)
+	}
+}
+
+// TestGetPlan_ScopePrecheck_OlderBackendWithoutCapDecodes asserts
+// forward/backward compat: a pre-#983 payload lacking the
+// max_files_changed key decodes cleanly with the field at zero.
+func TestGetPlan_ScopePrecheck_OlderBackendWithoutCapDecodes(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// Raw map rather than the server type: older backends never wrote
+	// the max_files_changed key at all.
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: 1,
+		RunID:    runID.String(),
+		Category: "plan_scope_precheck",
+		Payload: map[string]any{
+			"workflow_id":        "feature_change",
+			"implement_stage_id": "implement",
+			"violations":         []any{},
+			"scanned_files":      2,
+		},
+	})
+	fb.mu.Unlock()
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.ScopePrecheck == nil {
+		t.Fatal("ScopePrecheck is nil; want populated")
+	}
+	if out.ScopePrecheck.MaxFilesChanged != 0 {
+		t.Errorf("MaxFilesChanged = %d, want 0 for an older-backend payload", out.ScopePrecheck.MaxFilesChanged)
+	}
+}
