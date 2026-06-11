@@ -1292,7 +1292,7 @@ func seedBudgetPlanArtifact(t *testing.T, art *fakeArtifactRepo, stageID uuid.UU
 
 // newBudgetCheckServer wires a Server with an orchestratorRepo and a
 // fakeArtifactRepo so budget-check tests can drive the full approval path.
-func newBudgetCheckServer(t *testing.T, ar artifact.Repository) (*Server, *orchestratorRepo, *approvalAuditFake) {
+func newBudgetCheckServer(t *testing.T, ar artifact.Repository) (*Server, *orchestratorRepo, *approvalAuditFake, *fakeApprovalRepo) {
 	t.Helper()
 	rr := newOrchestratorRepo()
 	app := newFakeApprovalRepo()
@@ -1306,7 +1306,7 @@ func newBudgetCheckServer(t *testing.T, ar artifact.Repository) (*Server, *orche
 		Orchestrator: o,
 		ArtifactRepo: ar,
 	})
-	return s, rr, au
+	return s, rr, au, app
 }
 
 // seedBudgetRun creates a run and a plan stage in awaiting_approval, seeds the
@@ -1324,7 +1324,7 @@ func TestSubmitApproval_BudgetCheck_OverBudgetNoDecompNoOverride_Returns422(t *t
 	// Plan predicts 20 minutes; default budget is 15. No decomposition,
 	// no --override-budget → 422 + plan_violates_budget in audit + orchestrator NOT called.
 	art := newFakeArtifactRepo()
-	s, rr, au := newBudgetCheckServer(t, art)
+	s, rr, au, app := newBudgetCheckServer(t, art)
 
 	p := &plan.Plan{
 		PlanVersion:             "standard_v1",
@@ -1338,6 +1338,12 @@ func TestSubmitApproval_BudgetCheck_OverBudgetNoDecompNoOverride_Returns422(t *t
 	}
 	if !strings.Contains(w.Body.String(), `"plan_violates_budget"`) {
 		t.Errorf("body missing plan_violates_budget: %s", w.Body.String())
+	}
+
+	// #986: the 422 fires PRE-Submit, so no approval row may exist —
+	// the submission slot stays free for the --override-budget retry.
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0 (refused before insert)", len(rows), err)
 	}
 
 	// Stage must NOT have advanced (orchestrator not called).
@@ -1363,7 +1369,7 @@ func TestSubmitApproval_BudgetCheck_OverBudgetNoDecompNoOverride_Returns422(t *t
 func TestSubmitApproval_BudgetCheck_OverBudgetWithDecomp_Proceeds(t *testing.T) {
 	// Plan is over-budget but includes a decomposition block → proceed (200).
 	art := newFakeArtifactRepo()
-	s, rr, au := newBudgetCheckServer(t, art)
+	s, rr, au, _ := newBudgetCheckServer(t, art)
 
 	p := &plan.Plan{
 		PlanVersion:             "standard_v1",
@@ -1394,7 +1400,7 @@ func TestSubmitApproval_BudgetCheck_OverBudgetWithOverrideComment_Proceeds(t *te
 	// Over-budget, no decomposition, but --override-budget in comment → 200 +
 	// plan_budget_override_acknowledged audit + orchestrator called.
 	art := newFakeArtifactRepo()
-	s, rr, au := newBudgetCheckServer(t, art)
+	s, rr, au, _ := newBudgetCheckServer(t, art)
 
 	p := &plan.Plan{
 		PlanVersion:             "standard_v1",
@@ -1427,7 +1433,7 @@ func TestSubmitApproval_BudgetCheck_OverBudgetWithOverrideComment_Proceeds(t *te
 func TestSubmitApproval_BudgetCheck_WithinBudget_Proceeds(t *testing.T) {
 	// Plan predicts 10 minutes, within 15m default budget → 200, no budget audit.
 	art := newFakeArtifactRepo()
-	s, rr, au := newBudgetCheckServer(t, art)
+	s, rr, au, _ := newBudgetCheckServer(t, art)
 
 	p := &plan.Plan{
 		PlanVersion:             "standard_v1",
@@ -1446,6 +1452,151 @@ func TestSubmitApproval_BudgetCheck_WithinBudget_Proceeds(t *testing.T) {
 		if e.Category == "plan_violates_budget" || e.Category == "plan_budget_override_acknowledged" {
 			t.Errorf("unexpected budget audit entry when within budget: %s", e.Category)
 		}
+	}
+}
+
+func TestSubmitApproval_BudgetCheck_OverrideRetryAfter422_Succeeds(t *testing.T) {
+	// THE #986 regression: over-budget approve → 422 with NO approval row
+	// recorded → the documented retry by the SAME subject with
+	// --override-budget flows normally through Submit → advanceStage.
+	// On pre-#986 code the Submit preceded checkPlanBudget, so the 422
+	// left a row behind and this retry dead-ended as a silent duplicate
+	// 200 with the stage still parked in awaiting_approval.
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 20, // exceeds 15m default
+	}
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("first status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if rows, _ := app.ListForStage(context.Background(), stage.ID); len(rows) != 0 {
+		t.Fatalf("approval rows after 422 = %d, want 0", len(rows))
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Fatalf("stage.State after 422 = %q, want awaiting_approval", stage.State)
+	}
+
+	w = submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"lgtm --override-budget"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("override retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State after override retry = %q, want succeeded", stage.State)
+	}
+	// The retry is a genuine first insert, not a duplicate.
+	if strings.Contains(w.Body.String(), `"duplicate_submission"`) {
+		t.Errorf("override retry body labeled duplicate: %s", w.Body.String())
+	}
+	var foundOverride, foundSubmitted bool
+	for _, e := range au.appended {
+		switch e.Category {
+		case "plan_budget_override_acknowledged":
+			foundOverride = true
+		case "approval_submitted":
+			foundSubmitted = true
+		}
+	}
+	if !foundOverride || !foundSubmitted {
+		t.Errorf("audit missing override ack (%v) or approval_submitted (%v): %+v",
+			foundOverride, foundSubmitted, au.appended)
+	}
+}
+
+func TestSubmitApproval_BudgetCheck_DuplicateAfterOverride_LabeledNoGates(t *testing.T) {
+	// codex's failing case from the plan review: an over-budget plan
+	// approved with --override-budget, then re-submitted by the same
+	// subject WITHOUT the override. The duplicate pre-check answers
+	// before any gate runs: labeled duplicate 200, no
+	// plan_violates_budget, no new audit entries of any kind.
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 20,
+	}
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	if w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"lgtm --override-budget"}`); w.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	auditAfterFirst := len(au.appended)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("re-submission status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var got approvalSubmitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.DuplicateSubmission || got.PriorDecision != "approve" || got.PriorSubmittedAt == "" {
+		t.Errorf("duplicate labeling = %+v, want duplicate_submission=true prior_decision=approve prior_submitted_at set", got)
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded (unchanged)", stage.State)
+	}
+	if len(au.appended) != auditAfterFirst {
+		t.Errorf("audit entries after duplicate = %d, want %d (no new entries)", len(au.appended), auditAfterFirst)
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" {
+			t.Errorf("unexpected plan_violates_budget — the duplicate must run no gates")
+		}
+	}
+}
+
+func TestSubmitApproval_Duplicate_LabeledResponse(t *testing.T) {
+	// #986: the duplicate 200 carries duplicate_submission/prior_decision/
+	// prior_submitted_at from the EXISTING row (approve-then-reject pins
+	// provenance: prior_decision is the first submission's), while the
+	// first-submission 200 body omits the keys entirely (additive-only
+	// contract for existing clients).
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var first map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"duplicate_submission", "prior_decision", "prior_submitted_at"} {
+		if _, ok := first[k]; ok {
+			t.Errorf("first-submission body must omit %q: %s", k, w.Body.String())
+		}
+	}
+
+	w = submitApproval(t, s, stage.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("duplicate status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var got approvalSubmitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.DuplicateSubmission {
+		t.Errorf("duplicate_submission = false, want true")
+	}
+	if got.PriorDecision != "approve" {
+		t.Errorf("prior_decision = %q, want approve (the existing row's, not the new request's)", got.PriorDecision)
+	}
+	if got.PriorSubmittedAt == "" {
+		t.Errorf("prior_submitted_at empty, want the existing row's timestamp")
+	}
+	if got.State != string(run.StageStateSucceeded) {
+		t.Errorf("State = %q, want succeeded (unchanged by the duplicate)", got.State)
+	}
+	if len(au.appended) != 1 {
+		t.Errorf("audit entries = %d, want 1 (no entry for the duplicate)", len(au.appended))
 	}
 }
 

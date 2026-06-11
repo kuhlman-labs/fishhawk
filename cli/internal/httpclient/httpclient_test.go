@@ -452,6 +452,66 @@ func TestGetStage(t *testing.T) {
 	}
 }
 
+// TestSubmitApproval_DecodesBothResponseShapes pins the #986 wire seam
+// from the client side: a bare-Stage 200 (first submission) decodes to
+// zero-valued duplicate fields, and a duplicate-labeled 200 surfaces
+// duplicate_submission/prior_decision/prior_submitted_at.
+func TestSubmitApproval_DecodesBothResponseShapes(t *testing.T) {
+	stageID := uuid.New()
+	runID := uuid.New()
+	stageJSON := `"id":"` + stageID.String() + `","run_id":"` + runID.String() + `",` +
+		`"sequence":1,"type":"plan","executor":{"kind":"agent","ref":"claude-code"},` +
+		`"state":"succeeded","created_at":"2026-06-10T00:00:00Z","updated_at":"2026-06-10T00:00:00Z"`
+	tests := []struct {
+		name          string
+		body          string
+		wantDuplicate bool
+		wantPrior     string
+	}{
+		{
+			name: "first submission: bare Stage, zero duplicate fields",
+			body: `{` + stageJSON + `}`,
+		},
+		{
+			name: "duplicate: labeled fields decoded",
+			body: `{` + stageJSON + `,"duplicate_submission":true,` +
+				`"prior_decision":"approve","prior_submitted_at":"2026-06-10T12:00:00Z"}`,
+			wantDuplicate: true,
+			wantPrior:     "approve",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(srv.Close)
+
+			c := New(srv.URL, "")
+			got, err := c.SubmitApproval(context.Background(), stageID, SubmitApprovalInput{
+				Decision: ApprovalApprove,
+			})
+			if err != nil {
+				t.Fatalf("SubmitApproval: %v", err)
+			}
+			if got.ID != stageID || got.State != "succeeded" {
+				t.Errorf("stage = (%s, %s), want (%s, succeeded)", got.ID, got.State, stageID)
+			}
+			if got.DuplicateSubmission != tc.wantDuplicate {
+				t.Errorf("DuplicateSubmission = %v, want %v", got.DuplicateSubmission, tc.wantDuplicate)
+			}
+			if got.PriorDecision != tc.wantPrior {
+				t.Errorf("PriorDecision = %q, want %q", got.PriorDecision, tc.wantPrior)
+			}
+			if tc.wantDuplicate && got.PriorSubmittedAt == "" {
+				t.Errorf("PriorSubmittedAt empty on the duplicate path")
+			}
+		})
+	}
+}
+
 func TestAPIError_Error(t *testing.T) {
 	tests := []struct {
 		name string

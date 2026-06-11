@@ -106,7 +106,7 @@ func planDecision(name string, decision httpclient.ApprovalDecision, args []stri
 		return exitCode
 	}
 
-	stage, err := client.SubmitApproval(ctx, planStage.ID, httpclient.SubmitApprovalInput{
+	res, err := client.SubmitApproval(ctx, planStage.ID, httpclient.SubmitApprovalInput{
 		Decision: decision,
 		Comment:  *reason,
 	})
@@ -117,12 +117,24 @@ func planDecision(name string, decision httpclient.ApprovalDecision, args []stri
 
 	switch *outputFmt {
 	case "json":
-		if err := json.NewEncoder(stdout).Encode(stage); err != nil {
+		// The duplicate fields ride along in the encoded object
+		// (omitempty: absent on a first submission). Exit stays 0 —
+		// the HTTP request succeeded; scripting on approval EFFECT
+		// should read the labeled fields.
+		if err := json.NewEncoder(stdout).Encode(res); err != nil {
 			_, _ = fmt.Fprintf(stderr, "%s: encode: %v\n", name, err)
 			return exitFailure
 		}
 	default:
-		printStage(stdout, stage)
+		if res.DuplicateSubmission {
+			// #986: never render a no-op as a normal result. The prior
+			// decision stands, the stage didn't move, and no gates
+			// re-ran on this call.
+			_, _ = fmt.Fprintf(stderr,
+				"%s: duplicate submission — prior %s decision (%s) stands; stage state unchanged\n",
+				name, res.PriorDecision, res.PriorSubmittedAt)
+		}
+		printStage(stdout, &res.Stage)
 	}
 
 	// #428: post or edit the sticky status comment for local-runner

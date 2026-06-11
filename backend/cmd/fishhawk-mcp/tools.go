@@ -1598,6 +1598,10 @@ type ApprovePlanInput struct {
 type ApprovePlanOutput struct {
 	Stage   Stage  `json:"stage"`
 	StageID string `json:"stage_id" jsonschema:"the resolved plan-stage UUID the approval was posted to"`
+	// Duplicate labeling (#986): set when this call was a no-op because the
+	// same subject already submitted a decision for this stage.
+	DuplicateSubmission bool   `json:"duplicate_submission,omitempty" jsonschema:"true when this submission was a no-op duplicate: the same subject already decided this stage, the prior decision stands, the stage state is unchanged, and NO gates re-ran and NO audit entries were emitted"`
+	PriorDecision       string `json:"prior_decision,omitempty" jsonschema:"on a duplicate submission, the existing approval row's decision (approve|reject) — the decision that actually stands"`
 }
 
 // RejectPlanInput mirrors `fishhawk plan reject <run-id> [--reason
@@ -1612,6 +1616,9 @@ type RejectPlanInput struct {
 type RejectPlanOutput struct {
 	Stage   Stage  `json:"stage"`
 	StageID string `json:"stage_id" jsonschema:"the resolved plan-stage UUID the rejection was posted to"`
+	// Duplicate labeling (#986): see ApprovePlanOutput.
+	DuplicateSubmission bool   `json:"duplicate_submission,omitempty" jsonschema:"true when this submission was a no-op duplicate: the same subject already decided this stage, the prior decision stands, the stage state is unchanged, and NO gates re-ran and NO audit entries were emitted"`
+	PriorDecision       string `json:"prior_decision,omitempty" jsonschema:"on a duplicate submission, the existing approval row's decision (approve|reject) — the decision that actually stands"`
 }
 
 // registerApprovePlan wires the fishhawk_approve_plan tool (E22.4
@@ -1648,6 +1655,16 @@ Common error shapes (surfaced as tool errors):
     terminal or in a non-approvable state
   - role-based 403 from the backend when the caller's subject
     isn't in the gate's approver list
+
+Duplicate labeling (#986, NOT an error — a 200): when the same
+subject already submitted a decision for this stage, the call is a
+no-op. The output carries duplicate_submission=true and
+prior_decision, and the result text says so explicitly: the prior
+decision stands, the stage state is unchanged, and the budget/scope
+gates did NOT re-run. Never read a duplicate as an effective
+approval. The 422 budget/scope-cap refusals fire BEFORE any approval
+row is recorded, so retrying with --override-budget /
+--override-scope-cap in the reason flows normally.
 `),
 	}, resolver.approvePlan)
 }
@@ -1720,7 +1737,12 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 		}
 		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
-	return approverLoginWarning(warn), ApprovePlanOutput{Stage: *updated, StageID: updated.ID}, nil
+	return approvalSubmitResult(updated, warn), ApprovePlanOutput{
+		Stage:               updated.Stage,
+		StageID:             updated.ID,
+		DuplicateSubmission: updated.DuplicateSubmission,
+		PriorDecision:       updated.PriorDecision,
+	}, nil
 }
 
 // rejectPlan is the tool handler.
@@ -1740,7 +1762,12 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
-	return approverLoginWarning(warn), RejectPlanOutput{Stage: *updated, StageID: updated.ID}, nil
+	return approvalSubmitResult(updated, warn), RejectPlanOutput{
+		Stage:               updated.Stage,
+		StageID:             updated.ID,
+		DuplicateSubmission: updated.DuplicateSubmission,
+		PriorDecision:       updated.PriorDecision,
+	}, nil
 }
 
 // resolveApproverGithubLogin wraps resolveGitHubLoginViaGh for the
@@ -1761,17 +1788,27 @@ func resolveApproverGithubLogin() (login, warning string) {
 	}
 }
 
-// approverLoginWarning turns a non-empty warning into a CallToolResult
-// carrying it as text content, or nil when there's nothing to report.
-// Mirrors startRun's warnings-on-the-result pattern so the operator
-// sees the degradation without it failing the call.
-func approverLoginWarning(warning string) *mcp.CallToolResult {
-	if warning == "" {
+// approvalSubmitResult composes the tool result for an approve/reject
+// submission. A duplicate submission (#986) LEADS with an explicit
+// no-op banner — the operator loop must never mistake it for an
+// effective approval — followed by the approver-login warning when one
+// applies (mirroring startRun's warnings-on-the-result pattern so the
+// operator sees the degradation without it failing the call). Nil when
+// there is nothing to report.
+func approvalSubmitResult(res *approvalResult, warning string) *mcp.CallToolResult {
+	var content []mcp.Content
+	if res.DuplicateSubmission {
+		content = append(content, &mcp.TextContent{Text: fmt.Sprintf(
+			"duplicate submission — your prior %s decision (submitted %s) stands; stage state unchanged; budget/scope gates were NOT re-run and no transition or audit entry occurred",
+			res.PriorDecision, res.PriorSubmittedAt)})
+	}
+	if warning != "" {
+		content = append(content, &mcp.TextContent{Text: warning})
+	}
+	if len(content) == 0 {
 		return nil
 	}
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: warning}},
-	}
+	return &mcp.CallToolResult{Content: content}
 }
 
 // resolvePlanStage walks the run's stages and returns the one with

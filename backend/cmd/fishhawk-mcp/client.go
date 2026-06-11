@@ -262,6 +262,20 @@ type approvalRequest struct {
 	AddScopeFiles []string `json:"add_scope_files,omitempty"`
 }
 
+// approvalResult is the decoded 200 body of POST /v0/stages/{id}/
+// approvals (#986). On a first submission the duplicate fields are
+// absent (zero values). On a duplicate — the same subject already
+// decided this stage — DuplicateSubmission is true, the prior decision
+// stands, the stage state is unchanged, and the backend ran NO gates
+// and emitted NO audit entries; PriorDecision/PriorSubmittedAt carry
+// the EXISTING approval row's provenance.
+type approvalResult struct {
+	Stage
+	DuplicateSubmission bool   `json:"duplicate_submission"`
+	PriorDecision       string `json:"prior_decision"`
+	PriorSubmittedAt    string `json:"prior_submitted_at"`
+}
+
 // SubmitApproval posts an approve or reject decision against the
 // given stage. `decision` must be "approve" or "reject"; `comment`
 // is optional but recommended on rejects (the CLI emits a warning
@@ -285,12 +299,15 @@ type approvalRequest struct {
 //     plan_review_skipped. details carry configured_agents +
 //     landed_terminal)
 //   - 422 plan_violates_budget (plan predicted runtime exceeds the
-//     implement-stage budget; decompose or --override-budget)
+//     implement-stage budget; decompose or --override-budget. #986:
+//     refused PRE-insert — no approval row is recorded, so the same
+//     subject's retry with the override flows normally)
 //   - 422 plan_violates_scope_cap (#983: effective scope.files — plan
 //     scope plus add_scope_files — exceeds the implement stage's
 //     max_files_changed; re-scope the plan or include
-//     --override-scope-cap in the comment)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string) (*Stage, error) {
+//     --override-scope-cap in the comment. Also pre-insert and
+//     override-retryable, same as plan_violates_budget)
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:            decision,
 		Comment:             comment,
@@ -300,11 +317,11 @@ func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decis
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)
 	}
-	var s Stage
-	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/approvals", body, &s); err != nil {
+	var res approvalResult
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/approvals", body, &res); err != nil {
 		return nil, err
 	}
-	return &s, nil
+	return &res, nil
 }
 
 // RetryStage re-fires a failed stage via
