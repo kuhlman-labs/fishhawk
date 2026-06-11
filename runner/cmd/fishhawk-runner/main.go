@@ -2390,10 +2390,13 @@ Re-land your full original slice on top of the current tree:
 // only an explicit pass reaches origin (#969 stamps the re-verified tree).
 //
 // Returns nil when the agent re-invocation succeeded (events/tokens/model are
-// accumulated into res). A non-nil error — checkout failure or infra-retry
-// exhaustion (the maxFixInvokeInfraRetries pattern, #804) — means the
-// re-invoke could not run; the caller falls through to the unchanged
-// category-B failure path with the ORIGINAL conflict error.
+// accumulated into res). A non-nil error — checkout failure, infra-retry
+// exhaustion (the maxFixInvokeInfraRetries pattern, #804), or the agent
+// completing with OK=false (it declined or failed semantically; its trace is
+// still accumulated) — means the re-invoke did not produce a usable re-land;
+// the caller falls through to the unchanged category-B failure path with the
+// ORIGINAL conflict error rather than retrying the push with a tree the agent
+// itself did not vouch for.
 func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, conflictErr error, logSink io.Writer) error {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
@@ -2473,6 +2476,13 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 	res.OutputTokens += reRes.OutputTokens
 	if reRes.Model != "" {
 		res.Model = reRes.Model
+	}
+	if !reRes.OK {
+		// The invocation completed but the agent reported failure (declined,
+		// errored mid-run, produced no usable re-land). Retrying the push on
+		// such a tree could ship partial or unchanged work — abort instead.
+		return fmt.Errorf("base-rebase re-invoke: agent completed without success (category %s): %s",
+			reRes.FailureCategory, reRes.FailureReason)
 	}
 	return nil
 }
