@@ -2653,17 +2653,26 @@ paths:
             Possible error codes:
 
             - `plan_violates_budget` — the plan's
-              `predicted_runtime_minutes` exceeds the spec-resolved
-              implement-stage timeout and neither a
+              `predicted_runtime_minutes` exceeds the resolved
+              implement-stage budget and neither a
               `decomposition.sub_plans` block nor an
               `--override-budget` marker in the comment is present.
-              `details` includes `predicted_minutes`, `budget_minutes`,
-              and `timeout_source` (`stage_executor_timeout`,
+              The budget is the spec-resolved implement-stage timeout
+              widened to the calibration p95 × 1.5 when implement
+              runtime data exists, clamped to spec × 2 (#994) — the
+              same base the dynamic implement kill cap builds on, so
+              gate and runtime cannot disagree. `details` includes
+              `predicted_minutes`, `budget_minutes` (the RESOLVED
+              budget), `budget_source` (`spec`, `p95`, or `ceiling` —
+              which term won the resolution), `spec_budget_minutes`
+              (the raw spec-resolved floor), and `timeout_source`
+              (`stage_executor_timeout`,
               `workflow_policy_max_stage_runtime`, or
-              `backend_default`). Refused BEFORE any approval row is
-              recorded (#986), so the same subject's retry with the
-              override flows normally rather than dead-ending as an
-              idempotent duplicate. To unblock: either re-plan with a
+              `backend_default` — the spec value's provenance).
+              Refused BEFORE any approval row is recorded (#986), so
+              the same subject's retry with the override flows
+              normally rather than dead-ending as an idempotent
+              duplicate. To unblock: either re-plan with a
               decomposition block, or re-submit the approval with
               `--override-budget` in the comment.
             - `plan_violates_scope_cap` — #983: the effective scope —

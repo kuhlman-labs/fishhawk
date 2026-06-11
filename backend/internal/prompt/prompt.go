@@ -352,11 +352,24 @@ type GatePolicyViolation struct {
 // PlanGateEvidence is the plan-side gate evidence rendered into the
 // plan-review prompt's "### Gate evidence" section (#963). Each sub-result
 // is nil when its gate failed open (no result computed), in which case
-// only the available subsection renders; both nil is equivalent to a nil
+// only the available subsections render; all nil is equivalent to a nil
 // PlanGateEvidence (section omitted).
 type PlanGateEvidence struct {
 	ScopePrecheck *ScopePrecheckEvidence
 	SurfaceSweep  *SurfaceSweepEvidence
+	BudgetCheck   *BudgetCheckEvidence
+}
+
+// BudgetCheckEvidence is the approval-time budget gate's resolved input
+// (#994): the p95-resolved implement-stage budget checkPlanBudget will
+// enforce at plan approval, the term that produced it ("spec" | "p95" |
+// "ceiling"), and the plan's own prediction — rendered so the reviewer
+// cites the same number the gate enforces instead of re-deriving a
+// budget from the spec.
+type BudgetCheckEvidence struct {
+	ResolvedBudgetMinutes int
+	BudgetSource          string
+	PredictedMinutes      int
 }
 
 // ScopePrecheckEvidence is the plan_scope_precheck result: the plan's
@@ -873,7 +886,7 @@ func buildPlanReview(t Trigger) string {
 // own text-level findings. Writes nothing when no gate produced a result,
 // so the no-evidence prompt stays byte-identical to the pre-#963 output.
 func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
-	if ev == nil || (ev.ScopePrecheck == nil && ev.SurfaceSweep == nil) {
+	if ev == nil || (ev.ScopePrecheck == nil && ev.SurfaceSweep == nil && ev.BudgetCheck == nil) {
 		return
 	}
 	b.WriteString("### Gate evidence (machine-verified — outranks text-level findings)\n\n")
@@ -913,6 +926,18 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 				fmt.Fprintf(b, "- MISSING SIBLINGS (%s): %s is in scope but the pattern's required sibling(s) are absent from scope.files: %s\n",
 					f.Pattern, f.TriggerPath, strings.Join(f.MissingSiblings, ", "))
 			}
+		}
+		b.WriteString("\n")
+	}
+
+	if bc := ev.BudgetCheck; bc != nil {
+		b.WriteString("Budget check (plan prediction vs the resolved implement-stage budget the approval gate enforces):\n\n")
+		fmt.Fprintf(b, "- resolved implement budget: %d minutes (source: %s)\n", bc.ResolvedBudgetMinutes, bc.BudgetSource)
+		fmt.Fprintf(b, "- plan predicted_runtime_minutes: %d\n", bc.PredictedMinutes)
+		if bc.PredictedMinutes > bc.ResolvedBudgetMinutes {
+			b.WriteString("- verdict: over budget (approval will be refused without decomposition or --override-budget)\n")
+		} else {
+			b.WriteString("- verdict: within budget\n")
 		}
 		b.WriteString("\n")
 	}

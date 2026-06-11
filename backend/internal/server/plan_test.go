@@ -1256,6 +1256,49 @@ func TestShipPlan_ReviewAgents_GateEvidenceReachesReviewPrompt(t *testing.T) {
 	}
 }
 
+// TestShipPlan_ReviewAgents_BudgetEvidenceReachesReviewPrompt is the #994
+// seam check: the resolved implement budget runPlanReviews computes via
+// planBudgetEvidence must flow through the trigger mapping into the
+// rendered plan-review prompt's Budget check block, citing the same
+// number the approval gate enforces. The spec's implement stage declares
+// no timeout and the workflow no policy, so the budget resolves to the
+// 15m default with source "spec"; planfixture.Valid() predicts 20 → over.
+func TestShipPlan_ReviewAgents_BudgetEvidenceReachesReviewPrompt(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, _, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithConstraints)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// Gating review (human: 0) runs synchronously, so the captured prompt
+	// is available as soon as the upload returns.
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	wants := []string{
+		"Budget check (plan prediction vs the resolved implement-stage budget the approval gate enforces):",
+		"- resolved implement budget: 15 minutes (source: spec)",
+		"- plan predicted_runtime_minutes: 20",
+		"- verdict: over budget",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing budget-evidence element %q — threading seam broken:\n%s", want, got)
+		}
+	}
+}
+
 // TestShipPlan_ReviewAgents_GatingReject_StageFailedB verifies that in
 // gating mode (agent>0 && human==0) a reject verdict transitions the
 // stage to failed-B so trace-driven awaiting_approval is blocked.

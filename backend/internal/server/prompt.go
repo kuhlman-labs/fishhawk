@@ -1273,22 +1273,54 @@ func (s *Server) resolveAgentTimeout(ctx context.Context, runRow *run.Run, stage
 	return int(resolved.Seconds())
 }
 
-// Dynamic implement-stage timeout terms (#523). The timeout is
-// max(spec budget, predicted×2, p95×1.5) clamped to spec×2. The spec
-// budget stays the approval-time scope gate (checkPlanBudget); these
-// terms only widen the runtime kill cap.
+// Dynamic implement-stage timeout terms (#523, #994). The shared
+// plan-gate budget (resolvePlanGateBudget) is max(spec budget, p95×1.5)
+// clamped to spec×2 — the same number checkPlanBudget enforces at
+// approval and the plan-review prompt cites as gate evidence. The
+// runtime kill cap (resolveImplementTimeout) builds on that base and
+// additionally raises it to predicted×2, so the cap can widen past the
+// gate budget but the two can never disagree about the shared terms.
 const (
 	implementPlanMultiplier       = 2   // plan.predicted_runtime_minutes × 2
 	implementP95Multiplier        = 1.5 // calibration implement p95 × 1.5
 	implementTimeoutCeilingFactor = 2   // hard ceiling = spec budget × 2
 )
 
+// resolvePlanGateBudget computes the shared implement-stage budget (#994):
+// the spec-resolved budget raised to the calibration p95×implementP95Multiplier
+// when data exists, clamped to spec×implementTimeoutCeilingFactor. Returns
+// the resolved value and its source ("spec" | "p95" | "ceiling").
+//
+// It deliberately EXCLUDES the plan term (predicted×implementPlanMultiplier)
+// resolveImplementTimeout adds: feeding the plan's own prediction into the
+// budget would make the approval gate self-satisfying — any prediction X
+// yields a budget ≥ 2X up to the ceiling, so nothing could ever fail.
+//
+// Three surfaces consume it so they all cite the same number and source:
+// checkPlanBudget (approval gate + 422/audit payloads), resolveImplementTimeout
+// (kill-cap base), and runPlanReviews (the plan-review prompt's Budget check
+// gate evidence). Fail-open: calibration unavailability leaves the budget at
+// the spec-resolved floor. Reuses the memoized implementCalibrationP95
+// (60s TTL), so prompt build and approval gate read the same cached p95.
+func (s *Server) resolvePlanGateBudget(ctx context.Context, workflowID string, specResolved time.Duration) (time.Duration, string) {
+	candidate, source := specResolved, "spec"
+	if p95, ok := s.implementCalibrationP95(ctx, workflowID); ok && p95 > 0 {
+		if p95Term := time.Duration(p95 * implementP95Multiplier * float64(time.Minute)); p95Term > candidate {
+			candidate, source = p95Term, "p95"
+		}
+	}
+	if ceiling := specResolved * implementTimeoutCeilingFactor; candidate > ceiling {
+		candidate, source = ceiling, "ceiling"
+	}
+	return candidate, source
+}
+
 // resolveImplementTimeout computes the dynamic wall-clock kill cap for an
-// implement stage. It starts at the spec-resolved budget (the floor, so the
-// timeout can never be smaller than today), raises the candidate to
-// predicted_runtime_minutes×2 when an approved plan is loadable, raises it
-// to the implement-stage calibration p95×1.5 when calibration data exists,
-// then clamps the result to spec×implementTimeoutCeilingFactor.
+// implement stage. It starts from resolvePlanGateBudget's shared base —
+// max(spec budget, p95×1.5) clamped to spec×2, the floor, so the timeout
+// can never be smaller than the approval-gate budget — raises the candidate
+// to predicted_runtime_minutes×2 when an approved plan is loadable, then
+// re-clamps the result to spec×implementTimeoutCeilingFactor.
 //
 // Best-effort throughout: a plan-load or calibration failure leaves the
 // candidate at the spec floor. Crucially, at PLAN-stage prompt build there
@@ -1296,12 +1328,19 @@ const (
 // plan term falls back to the floor — the implement budget shown to the
 // planner stays spec-resolved (no circularity).
 func (s *Server) resolveImplementTimeout(ctx context.Context, runRow *run.Run, specResolved time.Duration) time.Duration {
-	candidate := specResolved
-	winner := "spec"
+	// Shared base (#994): max(spec, p95×1.5) clamped to spec×2 — the same
+	// number checkPlanBudget gates on, so gate and kill cap cannot drift.
+	candidate, winner := s.resolvePlanGateBudget(ctx, runRow.WorkflowID, specResolved)
+
+	// Raw p95 term, re-read for the log line below (memoized — the same
+	// cached scan resolvePlanGateBudget just consulted).
 	var planTerm, p95Term time.Duration
+	if p95, ok := s.implementCalibrationP95(ctx, runRow.WorkflowID); ok && p95 > 0 {
+		p95Term = time.Duration(p95 * implementP95Multiplier * float64(time.Minute))
+	}
 
 	// Plan term: predicted_runtime_minutes × 2. Best-effort — any load
-	// failure or absent/zero prediction leaves the candidate at the floor.
+	// failure or absent/zero prediction leaves the candidate at the base.
 	if p, err := s.loadApprovedPlanForRun(ctx, runRow.ID); err == nil && p != nil && p.PredictedRuntimeMinutes > 0 {
 		planTerm = time.Duration(p.PredictedRuntimeMinutes*implementPlanMultiplier) * time.Minute
 		if planTerm > candidate {
@@ -1309,16 +1348,8 @@ func (s *Server) resolveImplementTimeout(ctx context.Context, runRow *run.Run, s
 		}
 	}
 
-	// p95 term: historical implement-stage actual p95 × 1.5.
-	if p95, ok := s.implementCalibrationP95(ctx, runRow.WorkflowID); ok && p95 > 0 {
-		p95Term = time.Duration(p95 * implementP95Multiplier * float64(time.Minute))
-		if p95Term > candidate {
-			candidate, winner = p95Term, "p95"
-		}
-	}
-
-	// Hard ceiling: a pathological plan estimate or p95 cannot produce an
-	// unbounded timeout.
+	// Re-clamp: a pathological plan estimate cannot produce an unbounded
+	// timeout (the base is already clamped).
 	if ceiling := specResolved * implementTimeoutCeilingFactor; candidate > ceiling {
 		candidate, winner = ceiling, "ceiling"
 	}
