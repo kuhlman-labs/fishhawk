@@ -29,12 +29,16 @@ const categoryPlanScopePrecheck = "plan_scope_precheck"
 // so the plan-gate pre-check payload matches the post-implement
 // policy_evaluated gate's shape exactly — the MCP read side decodes the
 // same JSON contract. ScannedFiles is the count of scope.files the
-// pre-check evaluated.
+// pre-check evaluated. MaxFilesChanged is the resolved implement-stage
+// cap (#983; 0 = no cap configured) so downstream surfaces can render
+// headroom (scanned_files vs cap) even when violations is empty — the
+// 29/30 near-miss a violations-only payload makes invisible.
 type ScopePrecheckPayload struct {
 	WorkflowID       string             `json:"workflow_id"`
 	ImplementStageID string             `json:"implement_stage_id"`
 	Violations       []policy.Violation `json:"violations"`
 	ScannedFiles     int                `json:"scanned_files"`
+	MaxFilesChanged  int                `json:"max_files_changed"`
 }
 
 // runScopePrecheck evaluates an uploaded plan's scope.files against the
@@ -114,6 +118,7 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 		ImplementStageID: implStageID,
 		Violations:       violations,
 		ScannedFiles:     len(diff.ChangedFiles),
+		MaxFilesChanged:  constraints.MaxFilesChanged,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -185,8 +190,14 @@ func flattenPathConstraints(cs []spec.Constraint) policy.Constraints {
 		if len(c.AllowedPaths) > 0 {
 			out.AllowedPaths = append(out.AllowedPaths, c.AllowedPaths...)
 		}
+		// Min-wins when more than one constraint sets the cap, matching
+		// the post-implement gate's mergeConstraints (trace.go) so the
+		// plan-time verdict equals the verdict the implement stage
+		// produces for the same spec.
 		if c.MaxFilesChanged > 0 {
-			out.MaxFilesChanged = c.MaxFilesChanged
+			if out.MaxFilesChanged == 0 || c.MaxFilesChanged < out.MaxFilesChanged {
+				out.MaxFilesChanged = c.MaxFilesChanged
+			}
 		}
 		// c.RequiredOutcomes deliberately dropped — see the doc comment
 		// on resolveImplementConstraints.

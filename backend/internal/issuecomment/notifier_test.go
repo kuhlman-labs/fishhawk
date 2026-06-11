@@ -1698,3 +1698,107 @@ func (f *fakeAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Ent
 	}
 	return out, nil
 }
+
+// newFullPlanNotifier wires the rendered_comment full-plan path
+// (mirrors TestNotifyPlanReady_FullPlanSpec_PostsFullDocument's setup)
+// so the #983 scope-cap line tests can pre-seed plan_scope_precheck
+// audit entries and assert the rendered body.
+func newFullPlanNotifier(t *testing.T) (uuid.UUID, *fakeGitHub, *fakeAudit, *issuecomment.Notifier) {
+	t.Helper()
+	runID := uuid.New()
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	runs := map[uuid.UUID]*run.Run{runID: {
+		ID:             runID,
+		Repo:           "x/y",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     ptrStr("issue:42"),
+		InstallationID: int64Ptr(99),
+		WorkflowSpec:   fullPlanSpecYAML(true),
+	}}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{runs: runs},
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+		Now:         func() time.Time { return time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC) },
+	})
+	if n == nil {
+		t.Fatal("notifier nil")
+	}
+	return runID, gh, au, n
+}
+
+// TestNotifyPlanReady_FullPlan_ScopeCapLine asserts the #983 headroom
+// line renders under **Scope** when a plan_scope_precheck entry
+// carries a configured max_files_changed.
+func TestNotifyPlanReady_FullPlan_ScopeCapLine(t *testing.T) {
+	runID, gh, au, n := newFullPlanNotifier(t)
+	au.preSeed(runID, "plan_scope_precheck", map[string]any{
+		"workflow_id":        "feature_change",
+		"implement_stage_id": "implement",
+		"violations":         []any{},
+		"scanned_files":      29,
+		"max_files_changed":  30,
+	})
+	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
+
+	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
+		t.Fatalf("NotifyPlanReady: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "_29 files in scope; implement-stage cap 30 (headroom 1)._") {
+		t.Errorf("body missing cap line:\n%s", body)
+	}
+	if strings.Contains(body, "⚠") {
+		t.Errorf("clean precheck must not render the over-cap callout:\n%s", body)
+	}
+}
+
+// TestNotifyPlanReady_FullPlan_OverCapCallout asserts the ⚠ callout
+// renders when the precheck recorded a max_files_changed violation.
+func TestNotifyPlanReady_FullPlan_OverCapCallout(t *testing.T) {
+	runID, gh, au, n := newFullPlanNotifier(t)
+	au.preSeed(runID, "plan_scope_precheck", map[string]any{
+		"workflow_id":        "feature_change",
+		"implement_stage_id": "implement",
+		"violations": []any{map[string]any{
+			"constraint": "max_files_changed",
+			"detail":     "31 files exceeds cap 30",
+		}},
+		"scanned_files":     31,
+		"max_files_changed": 30,
+	})
+	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
+
+	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
+		t.Fatalf("NotifyPlanReady: %v", err)
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "_31 files in scope; implement-stage cap 30 (headroom -1)._") {
+		t.Errorf("body missing over-cap line:\n%s", body)
+	}
+	if !strings.Contains(body, "⚠ This plan exceeds the implement stage's max_files_changed and cannot pass as scoped.") {
+		t.Errorf("body missing over-cap callout:\n%s", body)
+	}
+}
+
+// TestNotifyPlanReady_FullPlan_NoPrecheckEntry_NoCapLine asserts the
+// fail-open fallback: older runs with no plan_scope_precheck entry
+// render with no cap line at all.
+func TestNotifyPlanReady_FullPlan_NoPrecheckEntry_NoCapLine(t *testing.T) {
+	runID, gh, _, n := newFullPlanNotifier(t)
+	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
+
+	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
+		t.Fatalf("NotifyPlanReady: %v", err)
+	}
+	body := gh.calls[0].body
+	if strings.Contains(body, "implement-stage cap") || strings.Contains(body, "⚠") {
+		t.Errorf("no precheck entry must render no cap line:\n%s", body)
+	}
+}

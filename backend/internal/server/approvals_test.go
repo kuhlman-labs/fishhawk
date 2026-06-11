@@ -1972,3 +1972,223 @@ func TestSubmitApproval_PlanReviewGate_TerminalListError_FailsOpen(t *testing.T)
 		t.Errorf("stage.State = %q, want succeeded", stage.State)
 	}
 }
+
+// --- Scope-cap gate (#983) ---
+
+// newScopeCapServer wires the full approval path against a run whose
+// cached workflow spec sets implement-stage max_files_changed (3 via
+// specImplementPathConstraints) and whose plan stage carries a plan
+// artifact with the given scope.files. Returns every fake so tests can
+// assert refused approvals insert NO row (the gate is PRE-Submit).
+func newScopeCapServer(t *testing.T, workflowSpec []byte, scopeFiles []plan.ScopeFile) (*Server, *fakeApprovalRepo, *orchestratorRepo, *approvalAuditFake, *run.Stage) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = workflowSpec
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingApproval)
+	if scopeFiles != nil {
+		seedBudgetPlanArtifact(t, art, stage.ID, &plan.Plan{
+			PlanVersion: "standard_v1",
+			Scope:       plan.Scope{Files: scopeFiles},
+		})
+	}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: app,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ArtifactRepo: art,
+	})
+	return s, app, rr, au, stage
+}
+
+func scopeCapFiles(n int) []plan.ScopeFile {
+	out := make([]plan.ScopeFile, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, plan.ScopeFile{
+			Path:      fmt.Sprintf("backend/file%d.go", i),
+			Operation: plan.FileOpModify,
+		})
+	}
+	return out
+}
+
+// TestSubmitApproval_ScopeCap_OverCapPlanAlone_Returns422AndRetryWithOverrideSucceeds
+// is the #983 end-to-end gate test: an over-cap plan (4 files vs cap 3)
+// is refused 422 plan_violates_scope_cap, the refusal appends the audit
+// entry and inserts NO approval row (PRE-Submit — the ADR-036
+// stranded-retry hazard), and an immediate retry with
+// --override-scope-cap succeeds, advances the stage, and lands
+// plan_scope_cap_override_acknowledged.
+func TestSubmitApproval_ScopeCap_OverCapPlanAlone_Returns422AndRetryWithOverrideSucceeds(t *testing.T) {
+	s, app, _, au, stage := newScopeCapServer(t, specImplementPathConstraints, scopeCapFiles(4))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_violates_scope_cap"`) {
+		t.Errorf("body missing plan_violates_scope_cap: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"scoped_files":4`) ||
+		!strings.Contains(w.Body.String(), `"max_files_changed":3`) {
+		t.Errorf("details missing scoped_files/max_files_changed: %s", w.Body.String())
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval (refusal must not advance)", stage.State)
+	}
+	app.mu.Lock()
+	rows := len(app.all)
+	app.mu.Unlock()
+	if rows != 0 {
+		t.Fatalf("approval rows = %d, want 0 (PRE-Submit refusal must insert nothing)", rows)
+	}
+	var foundViolation bool
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_scope_cap" {
+			foundViolation = true
+		}
+		if e.Category == "approval_submitted" {
+			t.Errorf("unexpected approval_submitted audit entry on refusal")
+		}
+	}
+	if !foundViolation {
+		t.Errorf("expected plan_violates_scope_cap audit entry, got %+v", au.appended)
+	}
+
+	// Immediate retry with the override must flow through Submit normally.
+	w = submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"cap is about to change --override-scope-cap"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("override retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded after override", stage.State)
+	}
+	app.mu.Lock()
+	rows = len(app.all)
+	app.mu.Unlock()
+	if rows != 1 {
+		t.Errorf("approval rows = %d, want 1 after override retry", rows)
+	}
+	var foundAck bool
+	for _, e := range au.appended {
+		if e.Category == "plan_scope_cap_override_acknowledged" {
+			foundAck = true
+		}
+	}
+	if !foundAck {
+		t.Errorf("expected plan_scope_cap_override_acknowledged audit entry, got %+v", au.appended)
+	}
+}
+
+// TestSubmitApproval_ScopeCap_AddScopeFilesPushOverCap_Returns422 covers
+// the run-575e6a74 shape: the plan is AT the cap (3/3, precheck clean)
+// and the approval-time add_scope_files fold pushes the effective scope
+// past it.
+func TestSubmitApproval_ScopeCap_AddScopeFilesPushOverCap_Returns422(t *testing.T) {
+	s, app, _, _, stage := newScopeCapServer(t, specImplementPathConstraints, scopeCapFiles(3))
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/extra.go"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_violates_scope_cap"`) {
+		t.Errorf("body missing plan_violates_scope_cap: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"add_scope_files_count":1`) {
+		t.Errorf("details missing add_scope_files_count: %s", w.Body.String())
+	}
+	app.mu.Lock()
+	rows := len(app.all)
+	app.mu.Unlock()
+	if rows != 0 {
+		t.Errorf("approval rows = %d, want 0", rows)
+	}
+}
+
+// TestSubmitApproval_ScopeCap_AddScopeFilesDedupedAgainstPlan asserts
+// the gate counts by exact path the way foldScopePaths dedupes: an
+// add_scope_files entry already in the plan scope does not consume
+// headroom.
+func TestSubmitApproval_ScopeCap_AddScopeFilesDedupedAgainstPlan(t *testing.T) {
+	s, _, _, _, stage := newScopeCapServer(t, specImplementPathConstraints, scopeCapFiles(3))
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/file0.go"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (duplicate path must not push over cap):\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestSubmitApproval_ScopeCap_UnderCap_Proceeds asserts the happy path
+// is untouched: under-cap approves flow with no scope-cap audit noise.
+func TestSubmitApproval_ScopeCap_UnderCap_Proceeds(t *testing.T) {
+	s, _, _, au, stage := newScopeCapServer(t, specImplementPathConstraints, scopeCapFiles(2))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_scope_cap" || e.Category == "plan_scope_cap_override_acknowledged" {
+			t.Errorf("unexpected %s audit entry on an under-cap approve", e.Category)
+		}
+	}
+}
+
+// TestSubmitApproval_ScopeCap_NoCapConfigured_Proceeds asserts a
+// workflow without max_files_changed never trips the gate regardless
+// of scope size.
+func TestSubmitApproval_ScopeCap_NoCapConfigured_Proceeds(t *testing.T) {
+	specNoCap := []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - forbidden_paths:
+              - ".github/workflows/**"
+`)
+	s, _, _, _, stage := newScopeCapServer(t, specNoCap, scopeCapFiles(50))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no cap configured):\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestSubmitApproval_ScopeCap_NoPlanArtifact_FailsOpen asserts the
+// fail-open contract: a run with a cap but no readable plan artifact
+// skips the check rather than bricking the gate.
+func TestSubmitApproval_ScopeCap_NoPlanArtifact_FailsOpen(t *testing.T) {
+	s, _, _, au, stage := newScopeCapServer(t, specImplementPathConstraints, nil)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open with no plan):\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_scope_cap" {
+			t.Errorf("unexpected plan_violates_scope_cap on fail-open")
+		}
+	}
+}

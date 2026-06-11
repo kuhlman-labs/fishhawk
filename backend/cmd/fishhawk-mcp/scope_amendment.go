@@ -32,6 +32,13 @@ type ScopeAmendmentItem struct {
 	DecidedBy      string               `json:"decided_by,omitempty"`
 	RequestedAt    string               `json:"requested_at,omitempty"`
 	DecidedAt      string               `json:"decided_at,omitempty"`
+	// Scope-cap headroom (#983), warn-only and optional: what the run's
+	// effective scope file count would be with this amendment approved,
+	// against the implement stage's max_files_changed. Absent (nil) when
+	// no cap is configured, on decided items in the list, or on payloads
+	// from older backends — absent fields must not break decode.
+	EffectiveScopeFilesAfterApproval *int `json:"effective_scope_files_after_approval,omitempty" jsonschema:"effective scope file count if this amendment is approved; compare against max_files_changed — exceeding it means the implement stage's post-implement gate may fail category-B as scoped"`
+	MaxFilesChanged                  *int `json:"max_files_changed,omitempty" jsonschema:"the implement stage's resolved max_files_changed cap; absent when no cap is configured"`
 }
 
 // ListScopeAmendments wraps GET /v0/runs/{run_id}/scope-amendments
@@ -116,7 +123,36 @@ func (r *runResolver) listScopeAmendments(ctx context.Context, _ *mcp.CallToolRe
 	if err != nil {
 		return nil, ListScopeAmendmentsOutput{}, fmt.Errorf("list scope amendments: %w", err)
 	}
-	return nil, ListScopeAmendmentsOutput{Items: items}, nil
+	var warnings []string
+	for _, item := range items {
+		if w := scopeCapWarning(item); w != "" {
+			warnings = append(warnings, w)
+		}
+	}
+	var meta *mcp.CallToolResult
+	if len(warnings) > 0 {
+		meta = &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(warnings, "\n")}},
+		}
+	}
+	return meta, ListScopeAmendmentsOutput{Items: items}, nil
+}
+
+// scopeCapWarning renders the #983 over-cap warning line for one
+// amendment, empty when the headroom fields are absent or within the
+// cap. Warn-only: approving an over-cap amendment still succeeds —
+// mid-stage amendments are often forced — but the operator should know
+// the post-implement max_files_changed gate may fail the stage as
+// scoped.
+func scopeCapWarning(item ScopeAmendmentItem) string {
+	if item.EffectiveScopeFilesAfterApproval == nil || item.MaxFilesChanged == nil {
+		return ""
+	}
+	if *item.EffectiveScopeFilesAfterApproval <= *item.MaxFilesChanged {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: approving amendment %s puts the effective scope at %d files, over the implement stage's max_files_changed cap of %d — the post-implement gate may fail category-B as scoped.",
+		item.ID, *item.EffectiveScopeFilesAfterApproval, *item.MaxFilesChanged)
 }
 
 // DecideScopeAmendmentInput is the fishhawk_decide_scope_amendment
@@ -186,5 +222,11 @@ func (r *runResolver) decideScopeAmendment(ctx context.Context, _ *mcp.CallToolR
 	if err != nil {
 		return nil, DecideScopeAmendmentOutput{}, fmt.Errorf("decide scope amendment: %w", err)
 	}
-	return nil, DecideScopeAmendmentOutput{Amendment: *decided}, nil
+	var meta *mcp.CallToolResult
+	if w := scopeCapWarning(*decided); w != "" {
+		meta = &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: w}},
+		}
+	}
+	return meta, DecideScopeAmendmentOutput{Amendment: *decided}, nil
 }

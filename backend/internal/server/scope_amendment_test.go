@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 )
@@ -595,5 +596,209 @@ func TestScopeAmendment_EndToEnd_DecisionThenList(t *testing.T) {
 	}
 	if len(item.Paths) != 2 || item.Paths[1].Operation != "create" {
 		t.Errorf("paths = %+v", item.Paths)
+	}
+}
+
+// --- Scope-cap headroom on amendment surfaces (#983) ---
+
+// scopeAmendmentHeadroomServer mirrors scopeAmendmentServer but wires
+// the ArtifactRepo + a cached workflow spec (implement-stage
+// max_files_changed: 3 via specImplementPathConstraints) + a plan
+// artifact with two scope files, so effectiveScopeHeadroom resolves
+// instead of failing open.
+func scopeAmendmentHeadroomServer(t *testing.T) (*Server, *fakeScopeAmendmentRepo, *auditCapture, *run.Run, *run.Stage) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specImplementPathConstraints
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	stage := rr.seedStage(runRow.ID, 2, run.StageStateRunning)
+	stage.Type = run.StageTypeImplement
+	sa := newFakeScopeAmendmentRepo()
+	au := &auditCapture{}
+	art := newFakeArtifactRepo()
+	seedBudgetPlanArtifact(t, art, planStage.ID, &plan.Plan{
+		PlanVersion: "standard_v1",
+		Scope: plan.Scope{Files: []plan.ScopeFile{
+			{Path: "backend/a.go", Operation: plan.FileOpModify},
+			{Path: "backend/b.go", Operation: plan.FileOpModify},
+		}},
+	})
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          au,
+		ArtifactRepo:       art,
+	})
+	return s, sa, au, runRow, stage
+}
+
+// TestScopeAmendment_HeadroomFields_RequestDecideFlow is the #983
+// cross-boundary seam test: a request→decide flow through both HTTP
+// handlers against a real spec snapshot must carry the headroom fields
+// in both wire responses AND both audit payloads, with the same count
+// the prompt builder's foldScopePaths produces for identical inputs.
+func TestScopeAmendment_HeadroomFields_RequestDecideFlow(t *testing.T) {
+	s, _, au, runRow, _ := scopeAmendmentHeadroomServer(t)
+
+	// validAmendmentBody adds 2 new paths to the 2-file plan scope:
+	// effective-after-approval = 4 against cap 3.
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+	var reqResp scopeAmendmentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &reqResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if reqResp.EffectiveScopeFilesAfterApproval == nil || *reqResp.EffectiveScopeFilesAfterApproval != 4 {
+		t.Errorf("request effective_scope_files_after_approval = %v, want 4", reqResp.EffectiveScopeFilesAfterApproval)
+	}
+	if reqResp.MaxFilesChanged == nil || *reqResp.MaxFilesChanged != 3 {
+		t.Errorf("request max_files_changed = %v, want 3", reqResp.MaxFilesChanged)
+	}
+
+	// Dedupe-parity seam: the reported count must equal what the prompt
+	// builder folds for the same plan scope + amendment paths.
+	folded := s.foldScopePaths(context.Background(),
+		[]scopeFile{{Path: "backend/a.go", Operation: "modify"}, {Path: "backend/b.go", Operation: "modify"}},
+		[]string{"backend/internal/server/extra.go", "docs/new.md"}, "test")
+	if len(folded) != *reqResp.EffectiveScopeFilesAfterApproval {
+		t.Errorf("foldScopePaths produced %d, response reports %d — dedupe semantics diverged",
+			len(folded), *reqResp.EffectiveScopeFilesAfterApproval)
+	}
+
+	var reqPayload map[string]any
+	_ = json.Unmarshal(au.appended[0].Payload, &reqPayload)
+	if reqPayload["effective_scope_files_after_approval"] != float64(4) {
+		t.Errorf("requested audit effective_scope_files_after_approval = %v, want 4", reqPayload["effective_scope_files_after_approval"])
+	}
+	if reqPayload["max_files_changed"] != float64(3) {
+		t.Errorf("requested audit max_files_changed = %v, want 3", reqPayload["max_files_changed"])
+	}
+
+	// Decide (approve) — over-cap approve still succeeds (warn-only),
+	// and the decision response + audit carry the same numbers.
+	w = postDecision(t, s, runRow.ID, reqResp.ID, `{"decision":"approve","reason":"forced"}`, func(r *http.Request) *http.Request {
+		return withOperatorIdentity(r, "write:stages")
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("decision status = %d, want 200 (over-cap approve is warn-only); body = %s", w.Code, w.Body.String())
+	}
+	var decResp scopeAmendmentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &decResp); err != nil {
+		t.Fatalf("decode decision: %v", err)
+	}
+	if decResp.EffectiveScopeFilesAfterApproval == nil || *decResp.EffectiveScopeFilesAfterApproval != 4 {
+		t.Errorf("decision effective_scope_files_after_approval = %v, want 4", decResp.EffectiveScopeFilesAfterApproval)
+	}
+	if decResp.MaxFilesChanged == nil || *decResp.MaxFilesChanged != 3 {
+		t.Errorf("decision max_files_changed = %v, want 3", decResp.MaxFilesChanged)
+	}
+
+	var decPayload map[string]any
+	found := false
+	for _, e := range au.appended {
+		if e.Category != CategoryScopeAmendmentDecided {
+			continue
+		}
+		found = true
+		_ = json.Unmarshal(e.Payload, &decPayload)
+	}
+	if !found {
+		t.Fatalf("no scope_amendment_decided audit entry; audit = %+v", au.appended)
+	}
+	if decPayload["effective_scope_files_after_approval"] != float64(4) {
+		t.Errorf("decided audit effective_scope_files_after_approval = %v, want 4", decPayload["effective_scope_files_after_approval"])
+	}
+	if decPayload["max_files_changed"] != float64(3) {
+		t.Errorf("decided audit max_files_changed = %v, want 3", decPayload["max_files_changed"])
+	}
+}
+
+// TestScopeAmendment_HeadroomFields_AbsentWithoutCap asserts the
+// fields stay absent (omitempty, fail-open) when no plan artifact /
+// spec resolution is available — the scopeAmendmentServer harness has
+// no ArtifactRepo.
+func TestScopeAmendment_HeadroomFields_AbsentWithoutCap(t *testing.T) {
+	s, _, _, au, runRow, _ := scopeAmendmentServer(t)
+
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "effective_scope_files_after_approval") ||
+		strings.Contains(w.Body.String(), "max_files_changed") {
+		t.Errorf("headroom fields must be absent on fail-open; body = %s", w.Body.String())
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(au.appended[0].Payload, &payload)
+	if _, ok := payload["effective_scope_files_after_approval"]; ok {
+		t.Errorf("audit payload must omit headroom fields on fail-open; payload = %v", payload)
+	}
+}
+
+// TestScopeAmendment_HeadroomFields_ListPendingOnly asserts the list
+// handler populates the fields for PENDING items only — decided rows
+// carry their decision-time numbers in the audit log.
+func TestScopeAmendment_HeadroomFields_ListPendingOnly(t *testing.T) {
+	s, _, _, runRow, _ := scopeAmendmentHeadroomServer(t)
+	agent := func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	}
+
+	// First amendment: decided (deny). Second: left pending.
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, agent)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("first request: %d; %s", w.Code, w.Body.String())
+	}
+	var first scopeAmendmentResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &first)
+	if w := postDecision(t, s, runRow.ID, first.ID, `{"decision":"deny","reason":"no"}`, func(r *http.Request) *http.Request {
+		return withOperatorIdentity(r, "write:stages")
+	}); w.Code != http.StatusOK {
+		t.Fatalf("decision: %d; %s", w.Code, w.Body.String())
+	}
+	if w := postAmendment(t, s, runRow.ID,
+		`{"paths":[{"path":"backend/second.go","operation":"modify"}],"reason":"second"}`,
+		agent); w.Code != http.StatusCreated {
+		t.Fatalf("second request: %d", w.Code)
+	}
+
+	w = getAmendments(t, s, runRow.ID, agent)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d; %s", w.Code, w.Body.String())
+	}
+	var list scopeAmendmentListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(list.Items))
+	}
+	for _, item := range list.Items {
+		switch item.Status {
+		case "denied":
+			if item.EffectiveScopeFilesAfterApproval != nil || item.MaxFilesChanged != nil {
+				t.Errorf("decided item must omit headroom fields; got %+v", item)
+			}
+		case "pending":
+			if item.EffectiveScopeFilesAfterApproval == nil || item.MaxFilesChanged == nil {
+				t.Errorf("pending item must carry headroom fields; got %+v", item)
+			} else if *item.EffectiveScopeFilesAfterApproval != 3 || *item.MaxFilesChanged != 3 {
+				// 2 plan files + backend/second.go (the denied
+				// amendment's paths confer nothing).
+				t.Errorf("pending headroom = %d/%d, want 3/3",
+					*item.EffectiveScopeFilesAfterApproval, *item.MaxFilesChanged)
+			}
+		default:
+			t.Errorf("unexpected status %q", item.Status)
+		}
 	}
 }

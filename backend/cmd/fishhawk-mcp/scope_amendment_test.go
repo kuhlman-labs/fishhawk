@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // --- fishhawk_list_scope_amendments / fishhawk_decide_scope_amendment (#961) ---
@@ -171,5 +172,142 @@ func TestListScopeAmendments_BudgetExhaustedErrorSurfaced(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "amendment_budget_exhausted") {
 		t.Errorf("err = %v, want amendment_budget_exhausted surfaced", err)
+	}
+}
+
+// --- Scope-cap headroom fields + warning (#983) ---
+
+func headroomInt(v int) *int { return &v }
+
+func TestListScopeAmendments_OverCapHeadroom_RendersWarning(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	itemID := uuid.New().String()
+	fb.amendmentsByRun[runID] = []ScopeAmendmentItem{
+		{
+			ID:     itemID,
+			RunID:  runID.String(),
+			Status: "pending",
+			Reason: "the seam needs these",
+			Paths: []ScopeAmendmentPath{
+				{Path: "pkg/extra.go", Operation: "modify"},
+			},
+			EffectiveScopeFilesAfterApproval: headroomInt(31),
+			MaxFilesChanged:                  headroomInt(30),
+		},
+	}
+
+	meta, out, err := r.listScopeAmendments(context.Background(), nil, ListScopeAmendmentsInput{
+		RunID: runID.String(),
+	})
+	if err != nil {
+		t.Fatalf("listScopeAmendments: %v", err)
+	}
+	got := out.Items[0]
+	if got.EffectiveScopeFilesAfterApproval == nil || *got.EffectiveScopeFilesAfterApproval != 31 {
+		t.Errorf("EffectiveScopeFilesAfterApproval = %v, want 31", got.EffectiveScopeFilesAfterApproval)
+	}
+	if got.MaxFilesChanged == nil || *got.MaxFilesChanged != 30 {
+		t.Errorf("MaxFilesChanged = %v, want 30", got.MaxFilesChanged)
+	}
+	if meta == nil || len(meta.Content) == 0 {
+		t.Fatal("meta = nil, want an over-cap warning")
+	}
+	text := meta.Content[0].(*mcp.TextContent).Text
+	for _, want := range []string{"WARNING", itemID, "31", "max_files_changed cap of 30"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("warning missing %q: %s", want, text)
+		}
+	}
+}
+
+func TestListScopeAmendments_UnderCapOrFieldsAbsent_NoWarning(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.amendmentsByRun[runID] = []ScopeAmendmentItem{
+		{
+			// Under cap: fields present, within bounds.
+			ID: uuid.New().String(), RunID: runID.String(), Status: "pending",
+			EffectiveScopeFilesAfterApproval: headroomInt(3),
+			MaxFilesChanged:                  headroomInt(30),
+		},
+		{
+			// Older-backend shape: fields absent entirely.
+			ID: uuid.New().String(), RunID: runID.String(), Status: "pending",
+		},
+	}
+
+	meta, out, err := r.listScopeAmendments(context.Background(), nil, ListScopeAmendmentsInput{
+		RunID: runID.String(),
+	})
+	if err != nil {
+		t.Fatalf("listScopeAmendments: %v", err)
+	}
+	if meta != nil {
+		t.Errorf("meta = %+v, want nil (no over-cap items)", meta)
+	}
+	// Backward compat: the absent-fields item decodes with nils.
+	if out.Items[1].EffectiveScopeFilesAfterApproval != nil || out.Items[1].MaxFilesChanged != nil {
+		t.Errorf("absent fields must decode to nil; got %+v", out.Items[1])
+	}
+}
+
+func TestDecideScopeAmendment_OverCapHeadroom_RendersWarning(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	amendmentID := uuid.New()
+	fb.decideAmendmentResp[amendmentID] = ScopeAmendmentItem{
+		ID:                               amendmentID.String(),
+		RunID:                            runID.String(),
+		Status:                           "approved",
+		EffectiveScopeFilesAfterApproval: headroomInt(31),
+		MaxFilesChanged:                  headroomInt(30),
+	}
+
+	meta, out, err := r.decideScopeAmendment(context.Background(), nil, DecideScopeAmendmentInput{
+		RunID:       runID.String(),
+		AmendmentID: amendmentID.String(),
+		Decision:    "approve",
+		Reason:      "forced",
+	})
+	if err != nil {
+		t.Fatalf("decideScopeAmendment: %v", err)
+	}
+	if out.Amendment.Status != "approved" {
+		t.Errorf("status = %q, want approved (over-cap approve is warn-only)", out.Amendment.Status)
+	}
+	if meta == nil || len(meta.Content) == 0 {
+		t.Fatal("meta = nil, want an over-cap warning")
+	}
+	text := meta.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "max_files_changed cap of 30") {
+		t.Errorf("warning text = %s", text)
+	}
+}
+
+func TestDecideScopeAmendment_FieldsAbsent_NoWarning(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	amendmentID := uuid.New()
+	fb.decideAmendmentResp[amendmentID] = ScopeAmendmentItem{
+		ID:     amendmentID.String(),
+		RunID:  runID.String(),
+		Status: "denied",
+	}
+
+	meta, _, err := r.decideScopeAmendment(context.Background(), nil, DecideScopeAmendmentInput{
+		RunID:       runID.String(),
+		AmendmentID: amendmentID.String(),
+		Decision:    "deny",
+	})
+	if err != nil {
+		t.Fatalf("decideScopeAmendment: %v", err)
+	}
+	if meta != nil {
+		t.Errorf("meta = %+v, want nil for an older-backend shape", meta)
 	}
 }

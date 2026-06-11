@@ -355,6 +355,10 @@ type ScopePrecheckViolation struct {
 type ScopePrecheck struct {
 	Violations   []ScopePrecheckViolation `json:"violations,omitempty" jsonschema:"path-constraint mismatches; empty when the plan's scope.files satisfy the implement stage's forbidden_paths/allowed_paths/max_files_changed"`
 	ScannedFiles int                      `json:"scanned_files" jsonschema:"number of scope.files the pre-check evaluated"`
+	// MaxFilesChanged is the resolved implement-stage cap (#983).
+	// Omitted (0) on payloads from older backends and when no cap is
+	// configured.
+	MaxFilesChanged int `json:"max_files_changed,omitempty" jsonschema:"the implement stage's resolved max_files_changed cap; read headroom as max_files_changed - scanned_files before approving (add_scope_files and mid-stage amendments consume it). A non-empty violations[] containing a max_files_changed entry means this plan cannot pass the implement stage it configures as scoped — re-scope, decompose, or approve with --override-scope-cap. Absent when no cap is configured or the backend predates #983"`
 }
 
 // registerGetPlan wires the fishhawk_get_plan tool. The handler

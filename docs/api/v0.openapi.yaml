@@ -183,6 +183,26 @@ components:
         decided_at:
           type: string
           format: date-time
+        effective_scope_files_after_approval:
+          type: integer
+          description: |
+            Scope-cap headroom (#983), warn-only: the run's effective
+            scope file count (plan `scope.files` ∪ approve-time
+            `add_scope_files` ∪ approved amendments ∪ this
+            amendment's paths, deduped by exact path) if this
+            amendment is approved. Compare against
+            `max_files_changed` — exceeding it means the
+            post-implement gate may fail category-B as scoped, but
+            the approve still succeeds (mid-stage amendments are
+            often forced). Present on request/decision responses and
+            on PENDING items in the list; absent when no cap is
+            configured or the computation failed open.
+        max_files_changed:
+          type: integer
+          description: |
+            The implement stage's resolved `max_files_changed` cap
+            (#983). Absent when no cap is configured or the
+            computation failed open.
 
     Run:
       type: object
@@ -2560,17 +2580,35 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '422':
           description: |
-            `plan_violates_budget` — the plan's
-            `predicted_runtime_minutes` exceeds the spec-resolved
-            implement-stage timeout and neither a
-            `decomposition.sub_plans` block nor an
-            `--override-budget` marker in the comment is present.
-            `details` includes `predicted_minutes`, `budget_minutes`,
-            and `timeout_source` (`stage_executor_timeout`,
-            `workflow_policy_max_stage_runtime`, or
-            `backend_default`). To unblock: either re-plan with a
-            decomposition block, or re-submit the approval with
-            `--override-budget` in the comment.
+            Possible error codes:
+
+            - `plan_violates_budget` — the plan's
+              `predicted_runtime_minutes` exceeds the spec-resolved
+              implement-stage timeout and neither a
+              `decomposition.sub_plans` block nor an
+              `--override-budget` marker in the comment is present.
+              `details` includes `predicted_minutes`, `budget_minutes`,
+              and `timeout_source` (`stage_executor_timeout`,
+              `workflow_policy_max_stage_runtime`, or
+              `backend_default`). To unblock: either re-plan with a
+              decomposition block, or re-submit the approval with
+              `--override-budget` in the comment.
+            - `plan_violates_scope_cap` — #983: the effective scope —
+              the plan's `scope.files` unioned with the request's
+              `add_scope_files`, prior approve-time folds, and
+              already-approved scope amendments, deduped by exact
+              path — exceeds the implement stage's resolved
+              `max_files_changed` and the comment lacks an
+              `--override-scope-cap` marker. Refused BEFORE any
+              approval row is recorded, so a retry after re-scoping
+              (or carrying the override) flows normally. `details`
+              includes `scoped_files`, `max_files_changed`, and
+              `add_scope_files_count`; the refusal appends a
+              `plan_violates_scope_cap` audit entry, the override a
+              `plan_scope_cap_override_acknowledged` entry. Declared
+              scope is an upper bound on the eventual diff, so the
+              override exists for legitimately-forced cases (e.g. the
+              cap itself is about to change).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -258,7 +258,12 @@ func (n *Notifier) notifyFullPlan(ctx context.Context, runID uuid.UUID, planStag
 		return fmt.Errorf("issuecomment: lookup plan approval: %w", err)
 	}
 
-	body := renderFullPlanBody(ctxv, planStage, planArtifact, n.externalURL, status)
+	// Scope-cap headroom line (#983), best-effort: absent precheck entry
+	// (older runs) or no configured cap renders nothing — byte-identical
+	// to the pre-#983 body.
+	precheck := n.latestScopePrecheck(ctx, runID)
+
+	body := renderFullPlanBody(ctxv, planStage, planArtifact, n.externalURL, status, precheck)
 
 	if existingID > 0 {
 		if !persistence.UpdateOnChange {
@@ -439,6 +444,61 @@ func planOriginatingIssuePersistence(workflowSpec []byte, workflowID string, pla
 	return nil
 }
 
+// scopePrecheckSummary carries the bits of the newest
+// plan_scope_precheck audit payload (#658/#983) the plan-comment
+// renderer needs: the scanned scope.files count, the implement stage's
+// resolved max_files_changed cap, and whether the precheck recorded a
+// max_files_changed violation. Decoded into this package-local struct
+// rather than importing the server package's ScopePrecheckPayload —
+// issuecomment must not import server (import cycle).
+type scopePrecheckSummary struct {
+	scannedFiles    int
+	maxFilesChanged int
+	overCap         bool
+}
+
+// latestScopePrecheck fetches the run's newest plan_scope_precheck
+// audit entry and decodes the fields the **Scope** cap line renders.
+// Returns nil — and the renderer omits the line entirely — when no
+// entry exists (older runs), the payload doesn't decode, or no cap is
+// configured (max_files_changed 0, including pre-#983 payloads that
+// lack the field). Best-effort: a list failure logs nothing and
+// renders nothing; the cap line is advisory, never load-bearing.
+func (n *Notifier) latestScopePrecheck(ctx context.Context, runID uuid.UUID) *scopePrecheckSummary {
+	entries, err := n.audit.ListForRunByCategory(ctx, runID, "plan_scope_precheck")
+	if err != nil {
+		return nil
+	}
+	// Ascending-by-sequence; walk from the end so the newest entry wins.
+	for i := len(entries) - 1; i >= 0; i-- {
+		var p struct {
+			Violations []struct {
+				Constraint string `json:"constraint"`
+			} `json:"violations"`
+			ScannedFiles    int `json:"scanned_files"`
+			MaxFilesChanged int `json:"max_files_changed"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &p); err != nil {
+			continue
+		}
+		if p.MaxFilesChanged <= 0 {
+			return nil
+		}
+		s := &scopePrecheckSummary{
+			scannedFiles:    p.ScannedFiles,
+			maxFilesChanged: p.MaxFilesChanged,
+		}
+		for _, v := range p.Violations {
+			if v.Constraint == "max_files_changed" {
+				s.overCap = true
+				break
+			}
+		}
+		return s
+	}
+	return nil
+}
+
 // planStatus carries the latest approval state for the plan stage,
 // used by renderFullPlanBody to render the `_Status:_` footer
 // introduced in #377. Nil status renders as "awaiting approval";
@@ -475,7 +535,7 @@ type planStatus struct {
 // renderer truncates at a safe rune boundary and appends a
 // "View full plan →" link to the SPA's plan-document page so the
 // reviewer can see the untruncated body.
-func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, externalURL string, status *planStatus) string {
+func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, externalURL string, status *planStatus, precheck *scopePrecheckSummary) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**Fishhawk plan** for Run [`%s`](%s)\n\n", shortID(c.run.ID), c.runURL)
 	fmt.Fprintf(&b, "Workflow: `%s`\n\n", c.run.WorkflowID)
@@ -486,6 +546,16 @@ func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, ex
 	if files := renderFileList(p.Scope.Files, len(p.Scope.Files)); files != "" {
 		b.WriteString("**Scope**\n\n")
 		b.WriteString(files)
+		// Cap headroom line (#983): rendered only when the plan-gate
+		// scope precheck recorded a configured max_files_changed.
+		if precheck != nil {
+			fmt.Fprintf(&b, "\n_%d files in scope; implement-stage cap %d (headroom %d)._\n",
+				precheck.scannedFiles, precheck.maxFilesChanged,
+				precheck.maxFilesChanged-precheck.scannedFiles)
+			if precheck.overCap {
+				b.WriteString("\n⚠ This plan exceeds the implement stage's max_files_changed and cannot pass as scoped.\n")
+			}
+		}
 		b.WriteString("\n")
 	}
 	if len(p.Approach) > 0 {
