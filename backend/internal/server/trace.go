@@ -1350,13 +1350,25 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 	s.checkBudgetAlerts(ctx, runID, stageID)
 }
 
-// reviewerInputTokenWarnCeiling is the per-invocation known-input-token level
-// above which recordReviewerCost WARN-logs (#995). A review invocation reads
-// one server-composed prompt (plan/diff + instructions), so a six-figure
-// input count signals a context-assembly blowup (e.g. an agentic reviewer
+// reviewerInputTokenWarnCeiling is the per-invocation known FRESH
+// (cache-exclusive) input-token level above which recordReviewerCost
+// WARN-logs (#995). Usage.InputTokens is normalized to cache-exclusive for
+// every adapter (#1010), so this ceiling fires on genuine fresh-token
+// blowups and is no longer false-tripped by a heavily-cached codex review
+// whose raw cache-inclusive total is large. A review invocation reads one
+// server-composed prompt (plan/diff + instructions), so a six-figure fresh
+// count signals a context-assembly blowup (e.g. an agentic reviewer
 // exploring its cwd across many turns), not a big artifact. Observability
 // only — the cost is still priced and recorded.
 const reviewerInputTokenWarnCeiling = 100_000
+
+// reviewerTotalInputTokenWarnCeiling is the companion ceiling on the TOTAL
+// input-side count (fresh + cached, #1010): it catches a runaway total
+// context under heavy caching that the fresh ceiling no longer sees. Seeded
+// by the observed 689k-total / ~572k-cached codex review (run 0a0765ff) —
+// that run still trips it, while a normal cached review does not. Advisory
+// (WARN-only), like the fresh ceiling.
+const reviewerTotalInputTokenWarnCeiling = 500_000
 
 // recordReviewerCost prices and records the cost of one advisory reviewer
 // (plan-review / implement-review) agent invocation (#681). Unlike runner
@@ -1402,9 +1414,10 @@ func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUI
 		rec.USD = 0
 	}
 
-	// Context-assembly blowup tripwire (#995): a known input-token count past
-	// the ceiling is anomalous for a single composed review prompt. WARN so
-	// the next ~400k-token review is loud, not a silent ledger line.
+	// Context-assembly blowup tripwire (#995): a known FRESH (cache-exclusive,
+	// #1010) input-token count past the ceiling is anomalous for a single
+	// composed review prompt. WARN so the next ~400k-fresh-token review is
+	// loud, not a silent ledger line.
 	if usage.Known && usage.InputTokens > reviewerInputTokenWarnCeiling {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"reviewer cost: input tokens exceed warn ceiling — possible context-assembly blowup",
@@ -1417,15 +1430,37 @@ func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUI
 			slog.Int("ceiling", reviewerInputTokenWarnCeiling))
 	}
 
-	// turns / cached_input_tokens are observability-only (#995): turns exposes
-	// a multi-turn agentic blowup, and the cached split makes codex
-	// (cached-inclusive input_tokens) comparable with the Anthropic-side
-	// adapters (cache-exclusive). Pricing is untouched.
+	// Companion total-context tripwire (#1010): fresh + cached past the
+	// higher ceiling means a runaway total context that heavy caching kept
+	// off the fresh ceiling — still worth a loud line.
+	totalInputTokens := usage.InputTokens + usage.CachedInputTokens
+	if usage.Known && totalInputTokens > reviewerTotalInputTokenWarnCeiling {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"reviewer cost: total input tokens (fresh + cached) exceed warn ceiling — runaway total context",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("source", source),
+			slog.String("model", model),
+			slog.Int("total_input_tokens", totalInputTokens),
+			slog.Int("input_tokens", usage.InputTokens),
+			slog.Int("cached_input_tokens", usage.CachedInputTokens),
+			slog.Int("turns", usage.Turns),
+			slog.Int("ceiling", reviewerTotalInputTokenWarnCeiling))
+	}
+
+	// turns / cached_input_tokens / total_input_tokens are observability-only
+	// (#995/#1010): turns exposes a multi-turn agentic blowup; input_tokens is
+	// the normalized FRESH (cache-exclusive) count for every adapter, with
+	// cached_input_tokens the additional cache-served split; and
+	// total_input_tokens (= fresh + cached) preserves the raw input-side total
+	// so fresh-vs-cached pricing math stays possible when per-model cache
+	// pricing lands. Pricing is untouched.
 	payload, _ := json.Marshal(map[string]any{
 		"model":               rec.Model,
 		"input_tokens":        rec.InputTokens,
 		"output_tokens":       rec.OutputTokens,
 		"cached_input_tokens": usage.CachedInputTokens,
+		"total_input_tokens":  totalInputTokens,
 		"turns":               usage.Turns,
 		"usd":                 rec.USD,
 		"known_model":         rec.KnownModel,

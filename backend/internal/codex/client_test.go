@@ -31,8 +31,9 @@ func TestHelperProcess(t *testing.T) {
 	}
 	defer os.Exit(0)
 
-	// A pinned, well-formed turn.completed usage line: 1234 input (incl. 100
-	// cached) + 567 output + 33 reasoning → InputTokens=1234, OutputTokens=600.
+	// A pinned, well-formed turn.completed usage line: 1234 raw input (incl.
+	// 100 cached) + 567 output + 33 reasoning → fresh InputTokens=1134
+	// (1234-100, the #1010 cache-exclusive contract), OutputTokens=600.
 	const usageLine = `{"type":"turn.completed","usage":{"input_tokens":1234,"cached_input_tokens":100,"output_tokens":567,"reasoning_output_tokens":33}}`
 
 	switch os.Getenv("HELPER_MODE") {
@@ -239,10 +240,11 @@ func TestInference_HappyUsage(t *testing.T) {
 	if !usage.Known {
 		t.Error("Usage.Known = false, want true for a transcript with a turn.completed usage line")
 	}
-	// 1234 input (incl. 100 cached); 567 output + 33 reasoning = 600 output;
-	// one turn.completed line = 1 turn (#995).
-	if usage.InputTokens != 1234 || usage.OutputTokens != 600 {
-		t.Errorf("Usage = %+v, want {InputTokens:1234 OutputTokens:600 Known:true}", usage)
+	// 1234 raw input (incl. 100 cached) → fresh 1134 per the cache-exclusive
+	// contract (#1010); 567 output + 33 reasoning = 600 output; one
+	// turn.completed line = 1 turn (#995).
+	if usage.InputTokens != 1134 || usage.OutputTokens != 600 {
+		t.Errorf("Usage = %+v, want {InputTokens:1134 OutputTokens:600 Known:true}", usage)
 	}
 	if usage.CachedInputTokens != 100 || usage.Turns != 1 {
 		t.Errorf("Usage = %+v, want CachedInputTokens=100 Turns=1", usage)
@@ -531,6 +533,8 @@ func TestInference_ArgvModelAndEffort(t *testing.T) {
 // turn.completed lines rather than last-wins, including the #995
 // instrumentation: cached_input_tokens sums alongside and turns counts the
 // turn.completed lines, so a multi-turn agentic blowup is recorded data.
+// InputTokens is the FRESH count per the cache-exclusive contract (#1010):
+// summed raw input 175 minus summed cached 60 = 115.
 func TestParseStream_SumsMultipleTurns(t *testing.T) {
 	out := []byte(`{"type":"item.completed","item":{"type":"agent_message","text":"{\"verdict\":\"approve\"}"}}
 {"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":30,"output_tokens":8,"reasoning_output_tokens":2}}
@@ -543,14 +547,34 @@ func TestParseStream_SumsMultipleTurns(t *testing.T) {
 	if text != `{"verdict":"approve"}` {
 		t.Errorf("text = %q, want the verdict body", text)
 	}
-	if usage.InputTokens != 175 || usage.OutputTokens != 17 || !usage.Known {
-		t.Errorf("Usage = %+v, want {InputTokens:175 OutputTokens:17 Known:true}", usage)
+	if usage.InputTokens != 115 || usage.OutputTokens != 17 || !usage.Known {
+		t.Errorf("Usage = %+v, want {InputTokens:115 OutputTokens:17 Known:true}", usage)
 	}
 	if usage.CachedInputTokens != 60 {
 		t.Errorf("CachedInputTokens = %d, want 60 (summed across turns)", usage.CachedInputTokens)
 	}
 	if usage.Turns != 3 {
 		t.Errorf("Turns = %d, want 3 (one per turn.completed line)", usage.Turns)
+	}
+}
+
+// TestParseStream_ClampsNegativeFresh pins the defensive clamp in the #1010
+// normalization: a stream whose summed cached_input_tokens exceeds the summed
+// raw input_tokens (malformed by the pinned codex-cli 0.137.0 semantics, where
+// cached is a subset of input) degrades to InputTokens=0 — a conservative
+// 0-fresh count, never a negative ledger figure.
+func TestParseStream_ClampsNegativeFresh(t *testing.T) {
+	out := []byte(`{"type":"item.completed","item":{"type":"agent_message","text":"{\"verdict\":\"approve\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":50,"cached_input_tokens":80,"output_tokens":4,"reasoning_output_tokens":1}}`)
+	_, usage, err := parseStream(out)
+	if err != nil {
+		t.Fatalf("parseStream: %v", err)
+	}
+	if usage.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0 (clamped: cached 80 > raw input 50)", usage.InputTokens)
+	}
+	if usage.CachedInputTokens != 80 || usage.OutputTokens != 5 || !usage.Known {
+		t.Errorf("Usage = %+v, want {CachedInputTokens:80 OutputTokens:5 Known:true}", usage)
 	}
 }
 

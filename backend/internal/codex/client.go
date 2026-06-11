@@ -123,12 +123,15 @@ type codexItem struct {
 //	{"type":"turn.completed","usage":{"input_tokens":N,"cached_input_tokens":N,
 //	 "output_tokens":N,"reasoning_output_tokens":N}}
 //
-// cached_input_tokens is a (cheaper) SUBSET of input_tokens, so it is not added
-// in — input_tokens already counts it. reasoning_output_tokens is a SEPARATE
+// The CLI's raw input_tokens is CACHE-INCLUSIVE (pinned codex-cli 0.137.0):
+// cached_input_tokens is a (cheaper) SUBSET of it. The adapter subtracts the
+// cached sum at the boundary (fresh = input - cached, clamped at 0) so the
+// reported planreview.Usage.InputTokens satisfies the normalized
+// cache-EXCLUSIVE contract (#1010). reasoning_output_tokens is a SEPARATE
 // completion-side count (the hidden reasoning tokens, distinct from
 // output_tokens which counts the visible message), so it IS added to the output
-// side to avoid undercounting billable output. Identical accounting to the
-// runner executor adapter (runner/internal/agent/codex/codex.go).
+// side to avoid undercounting billable output. The runner executor adapter
+// (runner/internal/agent/codex/codex.go) sums the same raw fields.
 type usageBlock struct {
 	InputTokens           int `json:"input_tokens"`
 	CachedInputTokens     int `json:"cached_input_tokens"`
@@ -330,10 +333,11 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 			}
 		case "turn.completed":
 			// Codex reports usage PER TURN, so SUM across turns rather than
-			// last-wins. input_tokens already includes cached_input_tokens
-			// (which is summed separately so the cached split stays visible,
-			// #995); reasoning_output_tokens is added to the output side. The
-			// turn count makes a multi-turn agentic blowup observable.
+			// last-wins. The raw input_tokens is cache-INCLUSIVE (it counts
+			// cached_input_tokens); both are summed here and normalized to
+			// fresh = input - cached below (#1010). reasoning_output_tokens is
+			// added to the output side. The turn count makes a multi-turn
+			// agentic blowup observable (#995).
 			turns++
 			if ev.Usage != nil {
 				inputTokens += ev.Usage.InputTokens
@@ -352,8 +356,17 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 	// leaves Known=false → the server degrades to a usd=0 record rather than
 	// guessing (#681/#682).
 	if haveUsage {
+		// Normalize to the cache-EXCLUSIVE Usage contract (#1010): the CLI's
+		// raw input_tokens includes the cached portion, so fresh = input -
+		// cached. Clamped at 0 defensively — a malformed stream whose summed
+		// cached exceeds summed input degrades to a conservative 0-fresh
+		// count rather than a negative ledger figure.
+		freshTok := inputTokens - cachedTok
+		if freshTok < 0 {
+			freshTok = 0
+		}
 		usage = planreview.Usage{
-			InputTokens:       inputTokens,
+			InputTokens:       freshTok,
 			CachedInputTokens: cachedTok,
 			OutputTokens:      outputTok,
 			Turns:             turns,

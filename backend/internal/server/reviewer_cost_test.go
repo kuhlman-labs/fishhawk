@@ -25,6 +25,7 @@ type reviewerCostPayload struct {
 	InputTokens       int     `json:"input_tokens"`
 	OutputTokens      int     `json:"output_tokens"`
 	CachedInputTokens int     `json:"cached_input_tokens"`
+	TotalInputTokens  int     `json:"total_input_tokens"`
 	Turns             int     `json:"turns"`
 	USD               float64 `json:"usd"`
 	KnownModel        bool    `json:"known_model"`
@@ -158,6 +159,9 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 	if got.CachedInputTokens != cachedTok || got.Turns != turns {
 		t.Errorf("plan_review cost payload cached_input_tokens=%d turns=%d, want %d/%d (#995)", got.CachedInputTokens, got.Turns, cachedTok, turns)
 	}
+	if got.TotalInputTokens != inTok+cachedTok {
+		t.Errorf("plan_review cost payload total_input_tokens=%d, want %d (fresh + cached, #1010)", got.TotalInputTokens, inTok+cachedTok)
+	}
 	if got.USD != wantUSD {
 		t.Errorf("plan_review usd = %v, want %v (pricing.Cost)", got.USD, wantUSD)
 	}
@@ -249,6 +253,9 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	if got.CachedInputTokens != cachedTok || got.Turns != turns {
 		t.Errorf("implement_review cost payload cached_input_tokens=%d turns=%d, want %d/%d (#995)", got.CachedInputTokens, got.Turns, cachedTok, turns)
 	}
+	if got.TotalInputTokens != inTok+cachedTok {
+		t.Errorf("implement_review cost payload total_input_tokens=%d, want %d (fresh + cached, #1010)", got.TotalInputTokens, inTok+cachedTok)
+	}
 	if got.USD != wantUSD {
 		t.Errorf("implement_review usd = %v, want %v (pricing.Cost)", got.USD, wantUSD)
 	}
@@ -290,36 +297,55 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	}
 }
 
-// TestRecordReviewerCost_WarnCeiling asserts the #995 context-assembly
-// tripwire: recordReviewerCost WARN-logs when a reviewer invocation's KNOWN
-// input tokens exceed reviewerInputTokenWarnCeiling, and stays silent at or
-// below the ceiling and for unknown usage (whose token counts are
-// zero-value by contract and must not trip a misleading warning).
+// TestRecordReviewerCost_WarnCeiling asserts the two advisory tripwires
+// (#995/#1010): recordReviewerCost WARN-logs when a reviewer invocation's
+// KNOWN FRESH (cache-exclusive) input tokens exceed
+// reviewerInputTokenWarnCeiling, separately WARN-logs when the TOTAL
+// input-side count (fresh + cached) exceeds the higher
+// reviewerTotalInputTokenWarnCeiling — the codex-shaped heavy-cache case,
+// like the observed 689k-total/572k-cached review, trips the total ceiling
+// while the fresh ceiling stays silent — and stays silent at or below both
+// ceilings and for unknown usage (whose token counts are zero-value by
+// contract and must not trip a misleading warning).
 func TestRecordReviewerCost_WarnCeiling(t *testing.T) {
+	// The two WARN messages are distinguishable by these substrings; the
+	// fresh message is NOT a substring of the total message and vice versa.
+	const freshWarnMsg = "input tokens exceed warn ceiling — possible context-assembly blowup"
+	const totalWarnMsg = "exceed warn ceiling — runaway total context"
 	tests := []struct {
-		name     string
-		usage    planreview.Usage
-		wantWarn bool
+		name          string
+		usage         planreview.Usage
+		wantFreshWarn bool
+		wantTotalWarn bool
 	}{
 		{
-			name:     "above ceiling warns",
-			usage:    planreview.Usage{InputTokens: reviewerInputTokenWarnCeiling + 1, OutputTokens: 900, Turns: 12, Known: true},
-			wantWarn: true,
+			name:          "above fresh ceiling warns",
+			usage:         planreview.Usage{InputTokens: reviewerInputTokenWarnCeiling + 1, OutputTokens: 900, Turns: 12, Known: true},
+			wantFreshWarn: true,
 		},
 		{
-			name:     "at ceiling stays silent",
-			usage:    planreview.Usage{InputTokens: reviewerInputTokenWarnCeiling, OutputTokens: 900, Turns: 1, Known: true},
-			wantWarn: false,
+			name:  "at fresh ceiling stays silent",
+			usage: planreview.Usage{InputTokens: reviewerInputTokenWarnCeiling, OutputTokens: 900, Turns: 1, Known: true},
 		},
 		{
-			name:     "typical review stays silent",
-			usage:    planreview.Usage{InputTokens: 4053, OutputTokens: 900, Turns: 1, Known: true},
-			wantWarn: false,
+			name:  "typical review stays silent",
+			usage: planreview.Usage{InputTokens: 4053, OutputTokens: 900, Turns: 1, Known: true},
 		},
 		{
-			name:     "unknown usage never warns",
-			usage:    planreview.Usage{Known: false},
-			wantWarn: false,
+			// The observed codex shape (run 0a0765ff scaled to fresh < 100k):
+			// heavy caching keeps fresh under the fresh ceiling, but the total
+			// context is a runaway — only the total ceiling fires.
+			name:          "heavy-cache total blowup trips total ceiling only",
+			usage:         planreview.Usage{InputTokens: 90_000, CachedInputTokens: 560_000, OutputTokens: 900, Turns: 21, Known: true},
+			wantTotalWarn: true,
+		},
+		{
+			name:  "cached review under both ceilings stays silent",
+			usage: planreview.Usage{InputTokens: 4000, CachedInputTokens: 120_000, OutputTokens: 900, Turns: 3, Known: true},
+		},
+		{
+			name:  "unknown usage never warns",
+			usage: planreview.Usage{Known: false},
 		},
 	}
 	for _, tt := range tests {
@@ -337,11 +363,13 @@ func TestRecordReviewerCost_WarnCeiling(t *testing.T) {
 			s.recordReviewerCost(context.Background(), runID, stageID, "gpt-5.5", tt.usage, "plan_review")
 
 			logs := buf.String()
-			gotWarn := strings.Contains(logs, "exceed warn ceiling")
-			if gotWarn != tt.wantWarn {
-				t.Fatalf("warn logged = %v, want %v; logs:\n%s", gotWarn, tt.wantWarn, logs)
+			if gotFresh := strings.Contains(logs, freshWarnMsg); gotFresh != tt.wantFreshWarn {
+				t.Fatalf("fresh warn logged = %v, want %v; logs:\n%s", gotFresh, tt.wantFreshWarn, logs)
 			}
-			if tt.wantWarn {
+			if gotTotal := strings.Contains(logs, totalWarnMsg); gotTotal != tt.wantTotalWarn {
+				t.Fatalf("total warn logged = %v, want %v; logs:\n%s", gotTotal, tt.wantTotalWarn, logs)
+			}
+			if tt.wantFreshWarn || tt.wantTotalWarn {
 				// The warning carries the locating attrs an operator needs.
 				for _, want := range []string{
 					runID.String(), stageID.String(), `"source":"plan_review"`,
@@ -349,6 +377,18 @@ func TestRecordReviewerCost_WarnCeiling(t *testing.T) {
 				} {
 					if !strings.Contains(logs, want) {
 						t.Errorf("warn log missing %s; logs:\n%s", want, logs)
+					}
+				}
+			}
+			if tt.wantTotalWarn {
+				// The total warn carries the fresh/cached split alongside the sum.
+				total := tt.usage.InputTokens + tt.usage.CachedInputTokens
+				for _, want := range []string{
+					fmt.Sprintf(`"total_input_tokens":%d`, total),
+					fmt.Sprintf(`"cached_input_tokens":%d`, tt.usage.CachedInputTokens),
+				} {
+					if !strings.Contains(logs, want) {
+						t.Errorf("total warn log missing %s; logs:\n%s", want, logs)
 					}
 				}
 			}

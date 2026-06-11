@@ -487,9 +487,12 @@ func TestReviewer_PopulatesUsageFromEnvelope(t *testing.T) {
 	}
 }
 
-// TestReviewer_PopulatesCachedUsageFromEnvelope asserts the envelope's cache
-// members sum into Usage.CachedInputTokens with Turns=1 (#995), keeping
-// input_tokens as the cache-EXCLUSIVE Anthropic-side figure.
+// TestReviewer_PopulatesCachedUsageFromEnvelope is the claudecode contract
+// pin for the normalized Usage accounting (#1010): InputTokens stays the
+// envelope's cache-EXCLUSIVE fresh count (10 — NOT inflated by the ~19k cache
+// tokens), and CachedInputTokens = cache_read + cache_creation, ADDITIONAL to
+// it, with Turns=1 (#995). A cache-inclusive envelope (or an adapter that
+// started subtracting) would break the 10/19263 expectations loudly.
 func TestReviewer_PopulatesCachedUsageFromEnvelope(t *testing.T) {
 	verdict, _, err := reviewerWithMode("happy_usage_cache").Review(context.Background(), "review this plan")
 	if err != nil {
@@ -499,7 +502,7 @@ func TestReviewer_PopulatesCachedUsageFromEnvelope(t *testing.T) {
 		t.Error("Usage.Known = false, want true for an envelope carrying a usage object")
 	}
 	if verdict.Usage.InputTokens != 10 || verdict.Usage.OutputTokens != 41 {
-		t.Errorf("Usage = %+v, want {InputTokens:10 OutputTokens:41}", verdict.Usage)
+		t.Errorf("Usage = %+v, want {InputTokens:10 OutputTokens:41} (fresh, cache-exclusive)", verdict.Usage)
 	}
 	// cache_read 11944 + cache_creation 7319 = 19263.
 	if verdict.Usage.CachedInputTokens != 19263 {
