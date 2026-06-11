@@ -2107,6 +2107,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	origCap, origRes := captureHead, restoreHead
 	origCheckout := checkoutFixupBase
 	origRunBranch := checkoutRunBranch
+	origDirty, origClean, origResPres := dirtyPaths, cleanDriftPaths, restoreHeadPreserving
 	newPusher = func() pusher { return fp }
 	newPROpener = func(token string) prOpener {
 		fpr.gotToken = token
@@ -2133,6 +2134,14 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	// re-invoke handler must never force-checkout the runner's own source
 	// repo in a fake-pusher run() test.
 	checkoutRunBranch = func(_ context.Context, _, _ string) error { return nil }
+	// Stub the #943 drift-cleanup seam: dirtyPaths reports a clean pre-agent
+	// tree, cleanDriftPaths and restoreHeadPreserving do nothing — a
+	// fake-pusher run() test must never stash/checkout the runner's own
+	// source repo. Tests that assert the partition wiring swap in recording
+	// spies AFTER this.
+	dirtyPaths = func(_ context.Context, _ string) ([]string, error) { return nil, nil }
+	cleanDriftPaths = func(_ context.Context, _ string, _ []string) error { return nil }
+	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error { return nil }
 	t.Cleanup(func() {
 		newPusher = origP
 		newPROpener = origO
@@ -2140,6 +2149,9 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 		restoreHead = origRes
 		checkoutFixupBase = origCheckout
 		checkoutRunBranch = origRunBranch
+		dirtyPaths = origDirty
+		cleanDriftPaths = origClean
+		restoreHeadPreserving = origResPres
 	})
 }
 
@@ -3681,13 +3693,20 @@ func TestRun_Fixup_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	fp := &fakePusher{}
 	withFakeGitOps(t, fp, &fakePROpener{})
 
-	// The operator's tree sits on main — the exact #967 shape.
+	// The operator's tree sits on main — the exact #967 shape. Both restore
+	// seams record into restoredRefs: run()'s fixup defer calls restoreHead,
+	// openPRAndShipArtifact's defer calls restoreHeadPreserving (#943).
 	var restoredRefs []string
 	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutFixupBase
+	origResPres := restoreHeadPreserving
 	captureHead = func(_ context.Context, _ string) (string, bool, error) {
 		return "main", false, nil
 	}
 	restoreHead = func(_ context.Context, _, ref string) error {
+		restoredRefs = append(restoredRefs, ref)
+		return nil
+	}
+	restoreHeadPreserving = func(_ context.Context, _, ref string, _ []string) error {
 		restoredRefs = append(restoredRefs, ref)
 		return nil
 	}
@@ -3698,7 +3717,12 @@ func TestRun_Fixup_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 		gotBranch = branch
 		return "fixup-branch-tip-sha", nil
 	}
-	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; checkoutFixupBase = origCheckout })
+	t.Cleanup(func() {
+		captureHead = origCap
+		restoreHead = origRes
+		checkoutFixupBase = origCheckout
+		restoreHeadPreserving = origResPres
+	})
 
 	var stderr strings.Builder
 	if got := runFixupStage(t, &stderr); got != exitOK {
@@ -3976,15 +4000,17 @@ func TestRun_ImplementStage_CaptureFailure_DoesNotBreakPush(t *testing.T) {
 	fpr := &fakePROpener{}
 	withFakeGitOps(t, fp, fpr)
 
-	// captureHead fails; restoreHead must never be reached because the defer is
-	// skipped. Install AFTER withFakeGitOps so these override its no-op stubs.
+	// captureHead fails; neither restore seam must be reached because the
+	// defers are skipped. Install AFTER withFakeGitOps so these override its
+	// no-op stubs.
 	restoreCalls := 0
-	origCap, origRes := captureHead, restoreHead
+	origCap, origRes, origResPres := captureHead, restoreHead, restoreHeadPreserving
 	captureHead = func(_ context.Context, _ string) (string, bool, error) {
 		return "", false, errors.New("symbolic-ref failed")
 	}
 	restoreHead = func(_ context.Context, _, _ string) error { restoreCalls++; return nil }
-	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error { restoreCalls++; return nil }
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; restoreHeadPreserving = origResPres })
 
 	var stderr strings.Builder
 	got := run([]string{
@@ -4028,14 +4054,17 @@ func TestRun_ImplementStage_RestoreFailure_PreservesOutcome(t *testing.T) {
 	fpr := &fakePROpener{}
 	withFakeGitOps(t, fp, fpr)
 
-	// captureHead succeeds (defer installs); restoreHead fails. Install AFTER
-	// withFakeGitOps so these override its no-op stubs.
-	origCap, origRes := captureHead, restoreHead
+	// captureHead succeeds (defer installs); the restore itself fails — the
+	// openPRAndShipArtifact defer calls restoreHeadPreserving (#943). Install
+	// AFTER withFakeGitOps so these override its no-op stubs.
+	origCap, origResPres := captureHead, restoreHeadPreserving
 	captureHead = func(_ context.Context, _ string) (string, bool, error) {
 		return "operator-main", false, nil
 	}
-	restoreHead = func(_ context.Context, _, _ string) error { return errors.New("checkout --force failed") }
-	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error {
+		return errors.New("checkout --force failed")
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHeadPreserving = origResPres })
 
 	var stderr strings.Builder
 	got := run([]string{
@@ -4056,16 +4085,232 @@ func TestRun_ImplementStage_RestoreFailure_PreservesOutcome(t *testing.T) {
 	}
 }
 
+// driftPartitionArgv drives run() with the standard implement argv for the
+// #943 drift-partition tests. The caller installs the invoker/uploader/git
+// fakes and seam spies first.
+func driftPartitionArgv(t *testing.T, stderr *strings.Builder) int {
+	t.Helper()
+	return run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, stderr)
+}
+
+// implementPromptResp is the minimal implement-stage prompt response the
+// #943 tests fetch.
+func implementPromptResp() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+}
+
+// TestRun_ImplementStage_DriftPartition_CleansAgentPreservesOperator is the
+// #943 partition wiring: CommitAndPush's ScopeDrift is split against the
+// pre-agent dirty snapshot — paths NOT dirty pre-agent are agent-introduced
+// and go to cleanDriftPaths, paths dirty pre-agent are operator-owned and go
+// to restoreHeadPreserving's preserve set — and the drift_cleaned /
+// drift_preserved events land in the log sink.
+func TestRun_ImplementStage_DriftPartition_CleansAgentPreservesOperator(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = implementPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{
+		HeadSHA:    "head-sha-abc",
+		BaseSHA:    "base-sha-def",
+		ScopeDrift: []string{"operator-edit.txt", "agent-drift.txt", "agent-new.txt"},
+	}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	// Spies installed AFTER withFakeGitOps override its no-op stubs.
+	var cleanedPaths, preservedPaths []string
+	origDirty, origClean, origResPres := dirtyPaths, cleanDriftPaths, restoreHeadPreserving
+	dirtyPaths = func(_ context.Context, _ string) ([]string, error) {
+		return []string{"operator-edit.txt"}, nil
+	}
+	cleanDriftPaths = func(_ context.Context, _ string, paths []string) error {
+		cleanedPaths = append(cleanedPaths, paths...)
+		return nil
+	}
+	restoreHeadPreserving = func(_ context.Context, _, _ string, preserve []string) error {
+		preservedPaths = append(preservedPaths, preserve...)
+		return nil
+	}
+	t.Cleanup(func() { dirtyPaths = origDirty; cleanDriftPaths = origClean; restoreHeadPreserving = origResPres })
+
+	var stderr strings.Builder
+	if got := driftPartitionArgv(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if len(cleanedPaths) != 2 || cleanedPaths[0] != "agent-drift.txt" || cleanedPaths[1] != "agent-new.txt" {
+		t.Errorf("cleanDriftPaths got %v, want the agent-introduced drift [agent-drift.txt agent-new.txt]", cleanedPaths)
+	}
+	if len(preservedPaths) != 1 || preservedPaths[0] != "operator-edit.txt" {
+		t.Errorf("restoreHeadPreserving preserve = %v, want the operator's pre-agent edit [operator-edit.txt]", preservedPaths)
+	}
+	for _, want := range []string{
+		`"event":"drift_cleaned"`,
+		`"paths":["agent-drift.txt","agent-new.txt"]`,
+		`"event":"drift_preserved"`,
+		`"paths":["operator-edit.txt"]`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in drift-partition emission:\n%s", want, stderr.String())
+		}
+	}
+}
+
+// TestRun_ImplementStage_DirtyCaptureFailure_DisablesCleanup: when the
+// pre-agent dirty snapshot fails there is no trustworthy baseline, so the
+// runner must never revert blind — cleanup is disabled for the stage
+// (cleanDriftPaths never called, no drift events), the diagnostic
+// working_tree_dirty_capture_failed is emitted, and the push outcome is
+// unaffected.
+func TestRun_ImplementStage_DirtyCaptureFailure_DisablesCleanup(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = implementPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{
+		HeadSHA:    "head-sha-abc",
+		BaseSHA:    "base-sha-def",
+		ScopeDrift: []string{"agent-drift.txt"},
+	}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	cleanCalls := 0
+	var preservedPaths []string
+	origDirty, origClean, origResPres := dirtyPaths, cleanDriftPaths, restoreHeadPreserving
+	dirtyPaths = func(_ context.Context, _ string) ([]string, error) {
+		return nil, errors.New("status failed")
+	}
+	cleanDriftPaths = func(_ context.Context, _ string, _ []string) error { cleanCalls++; return nil }
+	restoreHeadPreserving = func(_ context.Context, _, _ string, preserve []string) error {
+		preservedPaths = append(preservedPaths, preserve...)
+		return nil
+	}
+	t.Cleanup(func() { dirtyPaths = origDirty; cleanDriftPaths = origClean; restoreHeadPreserving = origResPres })
+
+	var stderr strings.Builder
+	if got := driftPartitionArgv(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK (a dirty-capture failure must not break the push):\n%s", got, stderr.String())
+	}
+	if cleanCalls != 0 {
+		t.Errorf("cleanDriftPaths called %d times, want 0 — never revert blind without a pre-agent baseline", cleanCalls)
+	}
+	if len(preservedPaths) != 0 {
+		t.Errorf("restoreHeadPreserving preserve = %v, want empty (plain restore semantics)", preservedPaths)
+	}
+	if !strings.Contains(stderr.String(), `"event":"working_tree_dirty_capture_failed"`) {
+		t.Errorf("missing working_tree_dirty_capture_failed diagnostic:\n%s", stderr.String())
+	}
+	for _, banned := range []string{`"event":"drift_cleaned"`, `"event":"drift_preserved"`} {
+		if strings.Contains(stderr.String(), banned) {
+			t.Errorf("unexpected %s after a dirty-capture failure:\n%s", banned, stderr.String())
+		}
+	}
+}
+
+// TestRun_ImplementStage_NoChangesWithDrift_StillCleans: the
+// NoChanges-with-drift return (everything the agent touched was out of scope
+// — no branch created, nothing pushed) still reports ScopeDrift, and the
+// agent-introduced drift must still be cleaned so it doesn't accumulate
+// across loop runs.
+func TestRun_ImplementStage_NoChangesWithDrift_StillCleans(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = implementPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{
+		NoChanges:  true,
+		BaseSHA:    "base-sha-def",
+		ScopeDrift: []string{"agent-drift.txt"},
+	}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var cleanedPaths []string
+	origDirty, origClean := dirtyPaths, cleanDriftPaths
+	dirtyPaths = func(_ context.Context, _ string) ([]string, error) { return nil, nil }
+	cleanDriftPaths = func(_ context.Context, _ string, paths []string) error {
+		cleanedPaths = append(cleanedPaths, paths...)
+		return nil
+	}
+	t.Cleanup(func() { dirtyPaths = origDirty; cleanDriftPaths = origClean })
+
+	var stderr strings.Builder
+	if got := driftPartitionArgv(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if len(cleanedPaths) != 1 || cleanedPaths[0] != "agent-drift.txt" {
+		t.Errorf("cleanDriftPaths got %v, want [agent-drift.txt] on the NoChanges-with-drift path", cleanedPaths)
+	}
+	if !strings.Contains(stderr.String(), `"event":"drift_cleaned"`) {
+		t.Errorf("missing drift_cleaned event:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_no_changes"`) {
+		t.Errorf("missing implement_no_changes event:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_DriftCleanFailure_PreservesOutcome: a
+// cleanDriftPaths failure is best-effort and log-only — drift_clean_failed is
+// emitted with the paths and detail, and the stage's primary push outcome
+// stands.
+func TestRun_ImplementStage_DriftCleanFailure_PreservesOutcome(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = implementPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{
+		HeadSHA:    "head-sha-abc",
+		BaseSHA:    "base-sha-def",
+		ScopeDrift: []string{"agent-drift.txt"},
+	}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	origDirty, origClean := dirtyPaths, cleanDriftPaths
+	dirtyPaths = func(_ context.Context, _ string) ([]string, error) { return nil, nil }
+	cleanDriftPaths = func(_ context.Context, _ string, _ []string) error {
+		return errors.New("stash push failed")
+	}
+	t.Cleanup(func() { dirtyPaths = origDirty; cleanDriftPaths = origClean })
+
+	var stderr strings.Builder
+	if got := driftPartitionArgv(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK (drift cleanup is log-only; it must never override the push outcome):\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"drift_clean_failed"`) {
+		t.Errorf("missing drift_clean_failed event:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"detail":"stash push failed"`) {
+		t.Errorf("missing failure detail in drift_clean_failed:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"drift_cleaned"`) {
+		t.Errorf("drift_cleaned must NOT be emitted when cleaning failed:\n%s", stderr.String())
+	}
+}
+
 // installRestoreSpy swaps the #911 capture/restore seam for recording spies:
-// captureHead returns origRef, and restoreHead records the ref it was called
-// with plus a call count. Returns pointers the caller asserts on. Must be
-// called AFTER withFakeGitOps (whose no-op stubs it overrides). Restored via
-// t.Cleanup.
+// captureHead returns origRef, and both restore seams — restoreHead (run()'s
+// nets) and restoreHeadPreserving (openPRAndShipArtifact's defer, #943) —
+// record the ref they were called with into a shared call count. Returns
+// pointers the caller asserts on. Must be called AFTER withFakeGitOps (whose
+// no-op stubs it overrides). Restored via t.Cleanup.
 func installRestoreSpy(t *testing.T, origRef string) (gotRef *string, calls *int) {
 	t.Helper()
 	gotRef = new(string)
 	calls = new(int)
-	origCap, origRes := captureHead, restoreHead
+	origCap, origRes, origResPres := captureHead, restoreHead, restoreHeadPreserving
 	captureHead = func(_ context.Context, _ string) (string, bool, error) {
 		return origRef, false, nil
 	}
@@ -4074,7 +4319,12 @@ func installRestoreSpy(t *testing.T, origRef string) (gotRef *string, calls *int
 		*calls++
 		return nil
 	}
-	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+	restoreHeadPreserving = func(_ context.Context, _, ref string, _ []string) error {
+		*gotRef = ref
+		*calls++
+		return nil
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; restoreHeadPreserving = origResPres })
 	return gotRef, calls
 }
 
@@ -4115,9 +4365,10 @@ func TestRun_ImplementStage_CapturesHeadBeforeAgentInvoke(t *testing.T) {
 
 	// captureHead returns the pre-agent ref until the invoker runs, then the
 	// agent's branch. Install AFTER withFakeGitOps so these override its no-op
-	// stubs. restoreHead records the ref it was handed.
+	// stubs. Both restore seams record the ref they were handed — the
+	// openPRAndShipArtifact defer calls restoreHeadPreserving (#943).
 	gotRef := new(string)
-	origCap, origRes := captureHead, restoreHead
+	origCap, origRes, origResPres := captureHead, restoreHead, restoreHeadPreserving
 	captureHead = func(_ context.Context, _ string) (string, bool, error) {
 		if agentInvoked {
 			return "agent-branch", false, nil
@@ -4128,7 +4379,11 @@ func TestRun_ImplementStage_CapturesHeadBeforeAgentInvoke(t *testing.T) {
 		*gotRef = ref
 		return nil
 	}
-	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+	restoreHeadPreserving = func(_ context.Context, _, ref string, _ []string) error {
+		*gotRef = ref
+		return nil
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; restoreHeadPreserving = origResPres })
 
 	var stderr strings.Builder
 	got := run([]string{
@@ -8276,7 +8531,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 
 	// The re-verify command fails → the push must be blocked.
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, verifiedTree)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
 	}
@@ -8320,7 +8575,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, verifiedTree); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	logs := logSink.String()
@@ -8393,7 +8648,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMatch_NoReverify(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, verifiedTree); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	if lines := countLines(t, counter); lines != 1 {
@@ -8426,7 +8681,7 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, ""); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, ""); err != nil {
 		t.Fatalf("empty verifiedTreeSHA must disable the check, got: %v\n%s", err, logSink.String())
 	}
 	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified", "verify_run"} {
@@ -8543,7 +8798,7 @@ exit 0
 	}
 
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, verifiedTree)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified\n%s", err, logSink.String())
 	}

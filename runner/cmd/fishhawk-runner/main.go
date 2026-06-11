@@ -442,6 +442,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		preAgentRef      string
 		preAgentDetached bool
 		preAgentCaptured bool
+		// preAgentDirty is the pre-agent dirty-paths snapshot (#943),
+		// captured alongside the HEAD ref so the post-push drift cleanup can
+		// partition CommitAndPush's ScopeDrift into agent-introduced drift
+		// (reverted) and operator pre-existing edits (preserved across the
+		// HEAD restore). A capture failure disables cleanup for the stage —
+		// never revert blind: with no trustworthy pre-agent baseline, every
+		// drift path must be treated as potentially operator-owned.
+		preAgentDirty         []string
+		preAgentDirtyCaptured bool
 	)
 	if stageType == "implement" {
 		repoDir := cfg.workingDir
@@ -456,6 +465,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			preAgentRef = origRef
 			preAgentDetached = detached
 			preAgentCaptured = true
+		}
+		if dirty, derr := dirtyPaths(ctx, repoDir); derr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"working_tree_dirty_capture_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, derr.Error())
+		} else {
+			preAgentDirty = dirty
+			preAgentDirtyCaptured = true
 		}
 	}
 
@@ -1072,7 +1089,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, verifiedTreeSHA)
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA)
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
@@ -1091,7 +1108,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			if prErr != nil && errors.Is(prErr, gitops.ErrBaseRebaseConflict) &&
 				(willOpenPR || willPushChild) {
 				if rerr := reinvokeOnBaseRebaseConflict(ctx, cfg, invoker, inv, &res, prErr, logSink); rerr == nil {
-					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, verifiedTreeSHA)
+					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA)
 				} else {
 					// Re-invoke infra exhaustion (or checkout failure): log and
 					// fall through to the unchanged category-B failure path
@@ -2771,6 +2788,20 @@ var (
 	captureHead = gitops.CaptureHead
 	restoreHead = gitops.RestoreHead
 
+	// dirtyPaths / cleanDriftPaths / restoreHeadPreserving are the #943
+	// drift-cleanup seam. dirtyPaths snapshots the pre-agent dirty set in
+	// run(); after a successful implement push, cleanDriftPaths reverts the
+	// agent-introduced subset of the scope drift (pathspec-limited stash
+	// push + drop) and restoreHeadPreserving carries the operator's
+	// pre-existing edits across the forced HEAD restore that previously
+	// discarded them. Package-level vars for the same reason as captureHead
+	// / restoreHead: the fake-pusher run() tests default repoDir to "." and
+	// must never stash/checkout the runner's own source repo. The real
+	// helpers are exercised by the gitops unit tests against throwaway repos.
+	dirtyPaths            = gitops.DirtyPaths
+	cleanDriftPaths       = gitops.CleanDriftPaths
+	restoreHeadPreserving = gitops.RestoreHeadPreserving
+
 	// checkoutFixupBase is the fix-up base-establishment seam (#967).
 	// Production wires it to gitops.CheckoutRemoteBranch, which fetches the
 	// run's PR branch from the named remote and checks the working tree out
@@ -3251,7 +3282,7 @@ func resolveImplementBranchRouting(ctx context.Context, cfg config, repoDir, bas
 // enforces the verified-SHA invariant (#960) against it — see the closure
 // below. Empty disables the check (no committed-tree gate ran: plan stage,
 // --no-pr, verifyCmd unset, or gate skipped).
-func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, verifiedTreeSHA string) error {
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -3375,9 +3406,17 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// defer was installed first, so it fires last), whose moved-HEAD guard
 	// then sees HEAD already back on the captured ref and no-ops — the two
 	// never double-checkout.
+	//
+	// preservedDrift names the operator's pre-existing edits the post-push
+	// drift partition below identifies (#943); the defer closes over it so
+	// restoreHeadPreserving carries them across the forced checkout (stash /
+	// checkout / pop) instead of discarding them. It stays nil on every
+	// failure path and whenever the pre-agent dirty snapshot failed, where
+	// restoreHeadPreserving delegates to the plain RestoreHead semantics.
+	var preservedDrift []string
 	if preAgentCaptured {
 		defer func() {
-			if rerr := restoreHead(ctx, repoDir, preAgentRef); rerr != nil {
+			if rerr := restoreHeadPreserving(ctx, repoDir, preAgentRef, preservedDrift); rerr != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"working_tree_restore_failed","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t,"detail":%q}`+"\n",
 					cfg.runID, cfg.stageID, preAgentRef, preAgentDetached, rerr.Error())
@@ -3623,6 +3662,51 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 					`{"event":"scope_drift_binary_artifact","run_id":%q,"stage_id":%q,"path":%q,"size_bytes":%d}`+"\n",
 					cfg.runID, cfg.stageID, dp, size)
 			}
+		}
+	}
+	// Drift cleanup (#943): partition the scope drift against the pre-agent
+	// dirty snapshot. Paths NOT dirty before the agent ran are
+	// agent-introduced — revert them (tracked and untracked alike) so they
+	// don't accumulate across loop runs. Paths dirty pre-agent are
+	// operator-owned — preserve them across the restore defer above. Runs on
+	// every CommitAndPush success including the NoChanges-with-drift return
+	// (which never creates the branch but still reports ScopeDrift). All
+	// best-effort and log-only, matching the restore discipline: a cleanup
+	// failure never overrides the push's primary outcome. Skipped entirely
+	// when the pre-agent snapshot failed (preAgentDirtyCaptured false) —
+	// with no trustworthy baseline, never revert blind. A pre-agent-dirty
+	// path that also carries agent edits is preserved whole (never destroy
+	// operator work) — separating intra-file edits is out of scope.
+	if preAgentDirtyCaptured && len(cap.ScopeDrift) > 0 {
+		preDirty := make(map[string]bool, len(preAgentDirty))
+		for _, dp := range preAgentDirty {
+			preDirty[dp] = true
+		}
+		var agentDrift []string
+		for _, dp := range cap.ScopeDrift {
+			if preDirty[dp] {
+				preservedDrift = append(preservedDrift, dp)
+			} else {
+				agentDrift = append(agentDrift, dp)
+			}
+		}
+		if len(agentDrift) > 0 {
+			agentDriftJSON, _ := json.Marshal(agentDrift)
+			if cerr := cleanDriftPaths(ctx, repoDir, agentDrift); cerr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"drift_clean_failed","run_id":%q,"stage_id":%q,"paths":%s,"detail":%q}`+"\n",
+					cfg.runID, cfg.stageID, agentDriftJSON, cerr.Error())
+			} else {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"drift_cleaned","run_id":%q,"stage_id":%q,"paths":%s}`+"\n",
+					cfg.runID, cfg.stageID, agentDriftJSON)
+			}
+		}
+		if len(preservedDrift) > 0 {
+			preservedJSON, _ := json.Marshal(preservedDrift)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"drift_preserved","run_id":%q,"stage_id":%q,"paths":%s}`+"\n",
+				cfg.runID, cfg.stageID, preservedJSON)
 		}
 	}
 	if cap.NoChanges {

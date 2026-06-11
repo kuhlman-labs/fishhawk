@@ -2193,6 +2193,409 @@ func gitConfigPresent(t *testing.T, dir, key string) bool {
 	return cmd.Run() == nil
 }
 
+// TestDirtyPaths_EnumeratesModifiedAndUntracked: DirtyPaths reports tracked
+// modifications, tracked deletions, and untracked files — including files
+// inside a brand-new directory listed individually (-uall, the #691
+// rationale) — and an empty list on a clean tree.
+func TestDirtyPaths_EnumeratesModifiedAndUntracked(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	clean, err := DirtyPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("DirtyPaths (clean): %v", err)
+	}
+	if len(clean) != 0 {
+		t.Fatalf("DirtyPaths on a clean tree = %v, want empty", clean)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "tracked-del.txt"), []byte("doomed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "add tracked-del")
+
+	// Tracked modification, tracked deletion, untracked file, and an
+	// untracked file inside a brand-new directory.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# modified\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(repo, "tracked-del.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "stray.txt"), []byte("stray\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "newdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "newdir", "inner.txt"), []byte("inner\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dirty, err := DirtyPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("DirtyPaths: %v", err)
+	}
+	got := make(map[string]bool, len(dirty))
+	for _, p := range dirty {
+		got[p] = true
+	}
+	for _, want := range []string{"README.md", "tracked-del.txt", "stray.txt", "newdir/inner.txt"} {
+		if !got[want] {
+			t.Errorf("DirtyPaths missing %q; got %v", want, dirty)
+		}
+	}
+	if len(dirty) != 4 {
+		t.Errorf("DirtyPaths = %v, want exactly 4 paths", dirty)
+	}
+}
+
+// TestCleanDriftPaths_RevertsNamedLeavesUndeclared: one CleanDriftPaths call
+// reverts a tracked modification, a tracked deletion, and an untracked file
+// while an undeclared dirty path is untouched — the concrete test for the
+// pathspec-scoped stash semantics the helper relies on (git-stash(1),
+// pathspec after `--`, --include-untracked). The stash entry is dropped, so
+// the stash stack ends empty.
+func TestCleanDriftPaths_RevertsNamedLeavesUndeclared(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "tracked-del.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "add tracked-del")
+
+	// Drift: tracked modification, tracked deletion, untracked creation.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# drift\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(repo, "tracked-del.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "drift-new.txt"), []byte("net new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Undeclared dirty path that must survive untouched.
+	if err := os.WriteFile(filepath.Join(repo, "operator.txt"), []byte("operator edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := CleanDriftPaths(context.Background(), repo,
+		[]string{"README.md", "tracked-del.txt", "drift-new.txt"})
+	if err != nil {
+		t.Fatalf("CleanDriftPaths: %v", err)
+	}
+
+	if got, _ := os.ReadFile(filepath.Join(repo, "README.md")); string(got) != "# initial\n" {
+		t.Errorf("README.md = %q, want reverted to HEAD content", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(repo, "tracked-del.txt")); string(got) != "keep me\n" {
+		t.Errorf("tracked-del.txt = %q, want the deletion reverted", got)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "drift-new.txt")); !os.IsNotExist(err) {
+		t.Errorf("drift-new.txt still exists; untracked drift must be removed")
+	}
+	if got, _ := os.ReadFile(filepath.Join(repo, "operator.txt")); string(got) != "operator edit\n" {
+		t.Errorf("operator.txt = %q, want the undeclared path left alone", got)
+	}
+	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
+		t.Errorf("stash list = %q, want empty (drift entry dropped)", list)
+	}
+}
+
+// TestCleanDriftPaths_NoOpKeepsOperatorStash pins the entry-created guard: a
+// CleanDriftPaths call whose named paths are already clean is a "No local
+// changes" stash no-op (exit 0, no entry created), and the follow-up drop
+// must NOT fire — a pre-existing operator stash entry survives. Without the
+// refs/stash before/after probe, the blind drop would destroy it.
+func TestCleanDriftPaths_NoOpKeepsOperatorStash(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	// The operator's own stash entry, created before the runner's cleanup.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# operator stash\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "stash", "push", "-m", "operator wip")
+
+	// Named paths are clean (README.md was just stashed) → no-op success.
+	if err := CleanDriftPaths(context.Background(), repo, []string{"README.md"}); err != nil {
+		t.Fatalf("CleanDriftPaths (clean paths): %v", err)
+	}
+	list := mustGitOut(t, repo, "stash", "list")
+	if !strings.Contains(list, "operator wip") {
+		t.Errorf("stash list = %q, want the operator's pre-existing entry preserved", list)
+	}
+
+	// Empty path list short-circuits without touching git at all.
+	if err := CleanDriftPaths(context.Background(), repo, nil); err != nil {
+		t.Fatalf("CleanDriftPaths (empty): %v", err)
+	}
+}
+
+// TestRestoreHeadPreserving_RoundTripsOperatorEdit: an operator's uncommitted
+// edit named in preserve survives the forced branch switch byte-identical —
+// the carve-out RestoreHead's `checkout --force` would otherwise discard.
+func TestRestoreHeadPreserving_RoundTripsOperatorEdit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+	mustGit(t, repo, "checkout", "-b", "fishhawk/run-943/stage-x")
+
+	// The operator's pre-existing edit, carried onto the run branch.
+	const operatorEdit = "# operator pre-existing edit\n"
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte(operatorEdit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Agent leftovers a plain RestoreHead would discard too — NOT preserved,
+	// so the forced checkout must drop this one.
+	if err := os.WriteFile(filepath.Join(repo, "agent-junk.txt"), []byte("junk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "agent-junk.txt")
+	mustGit(t, repo, "commit", "-m", "track agent junk")
+	if err := os.WriteFile(filepath.Join(repo, "agent-junk.txt"), []byte("dirty junk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RestoreHeadPreserving(context.Background(), repo, "main", []string{"README.md"})
+	if err != nil {
+		t.Fatalf("RestoreHeadPreserving: %v", err)
+	}
+
+	if branch := mustGitOut(t, repo, "branch", "--show-current"); branch != "main" {
+		t.Errorf("branch = %q, want %q", branch, "main")
+	}
+	if got, _ := os.ReadFile(filepath.Join(repo, "README.md")); string(got) != operatorEdit {
+		t.Errorf("README.md = %q, want the operator edit byte-identical across the restore", got)
+	}
+	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
+		t.Errorf("stash list = %q, want empty after a clean pop", list)
+	}
+}
+
+// TestRestoreHeadPreserving_EmptyPreserveDelegates: an empty preserve set is
+// exactly RestoreHead — the forced checkout discards tracked modifications
+// and moves HEAD, with no stash machinery involved.
+func TestRestoreHeadPreserving_EmptyPreserveDelegates(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+	mustGit(t, repo, "checkout", "-b", "fishhawk/run-943/stage-y")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# discarded\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RestoreHeadPreserving(context.Background(), repo, "main", nil); err != nil {
+		t.Fatalf("RestoreHeadPreserving (empty preserve): %v", err)
+	}
+	if branch := mustGitOut(t, repo, "branch", "--show-current"); branch != "main" {
+		t.Errorf("branch = %q, want %q", branch, "main")
+	}
+	if got, _ := os.ReadFile(filepath.Join(repo, "README.md")); string(got) != "# initial\n" {
+		t.Errorf("README.md = %q, want tracked modification discarded (plain RestoreHead semantics)", got)
+	}
+	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
+		t.Errorf("stash list = %q, want empty (no stash on the delegate path)", list)
+	}
+}
+
+// TestRestoreHeadPreserving_PopConflict_LeavesStashRecoverable: when
+// reapplying the preserved edit onto the restored ref conflicts, the popStash
+// (#989) machinery aborts cleanly — the checkout stands, the working tree is
+// clean, and the operator's content stays recoverable via `git stash list`
+// (git-stash(1): a conflicted pop does not drop the entry). Never silently
+// destroyed.
+func TestRestoreHeadPreserving_PopConflict_LeavesStashRecoverable(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	// A branch whose README diverges from main's, so a stash taken on it
+	// cannot reapply onto main without a conflict.
+	mustGit(t, repo, "checkout", "-b", "diverged")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# diverged committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "diverge README")
+	// The operator's uncommitted edit on the diverged branch.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# operator edit on diverged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RestoreHeadPreserving(context.Background(), repo, "main", []string{"README.md"})
+	if err == nil {
+		t.Fatal("RestoreHeadPreserving = nil, want a pop-conflict error")
+	}
+	if !errors.Is(err, ErrBaseRebaseConflict) {
+		t.Errorf("err = %v, want errors.Is ErrBaseRebaseConflict (popStash's typed conflict)", err)
+	}
+	if branch := mustGitOut(t, repo, "branch", "--show-current"); branch != "main" {
+		t.Errorf("branch = %q, want %q (the checkout stands; only the reapply failed)", branch, "main")
+	}
+	if status := mustGitOut(t, repo, "status", "--porcelain"); status != "" {
+		t.Errorf("status = %q, want a clean tree after the conflict abort", status)
+	}
+	if list := mustGitOut(t, repo, "stash", "list"); list == "" {
+		t.Error("stash list empty — the operator's preserved edit must stay recoverable after a pop conflict")
+	}
+}
+
+// TestDriftCleanup_EndToEnd_PreservesOperatorEdit is the #943 cross-layer
+// integration test (#618 rule: the change spans the gitops primitives and the
+// runner's partition orchestration, so per-layer units are not sufficient).
+// Against a real repo + bare remote: the operator has a pre-existing
+// uncommitted edit, the agent then modifies an in-scope file, modifies an
+// out-of-scope tracked file, and creates an out-of-scope untracked file.
+// CommitAndPush (ScopeFiles + FreshFetchBase, the standalone implement shape)
+// pushes the scoped commit and reports the other three paths as drift; the
+// runner-side sequence — partition against the pre-agent DirtyPaths snapshot,
+// CleanDriftPaths the agent-introduced subset, RestoreHeadPreserving the rest
+// — must end with: scoped commit on the remote, agent drift (tracked and
+// untracked) gone from the working tree, and the operator's pre-existing edit
+// byte-identical on the restored original ref.
+func TestDriftCleanup_EndToEnd_PreservesOperatorEdit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	for name, content := range map[string]string{
+		"scoped.txt":        "scoped base\n",
+		"operator.txt":      "operator base\n",
+		"drift-tracked.txt": "drift base\n",
+	} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	// The operator's pre-existing uncommitted edit, present BEFORE the agent.
+	const operatorEdit = "operator pre-existing edit\n"
+	if err := os.WriteFile(filepath.Join(repo, "operator.txt"), []byte(operatorEdit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pre-agent snapshot run() captures (#943).
+	preDirty, err := DirtyPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("DirtyPaths (pre-agent): %v", err)
+	}
+	if len(preDirty) != 1 || preDirty[0] != "operator.txt" {
+		t.Fatalf("pre-agent dirty = %v, want exactly [operator.txt]", preDirty)
+	}
+
+	// The agent's edits: in-scope, out-of-scope tracked, out-of-scope untracked.
+	if err := os.WriteFile(filepath.Join(repo, "scoped.txt"), []byte("agent scoped edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "drift-tracked.txt"), []byte("agent drift edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "drift-new.txt"), []byte("agent net-new drift\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const branch = "fishhawk/run-943/stage-e2e"
+	res, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "scoped implement commit",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		ScopeFiles:     []string{"scoped.txt"},
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush: %v", err)
+	}
+	driftSet := make(map[string]bool, len(res.ScopeDrift))
+	for _, p := range res.ScopeDrift {
+		driftSet[p] = true
+	}
+	for _, want := range []string{"operator.txt", "drift-tracked.txt", "drift-new.txt"} {
+		if !driftSet[want] {
+			t.Fatalf("ScopeDrift = %v, want it to contain %q (path identity stable across the #866 stash cycle)", res.ScopeDrift, want)
+		}
+	}
+
+	// The runner's partition (openPRAndShipArtifact): pre-agent-dirty paths
+	// are preserved, the rest of the drift is agent-introduced and cleaned.
+	preSet := make(map[string]bool, len(preDirty))
+	for _, p := range preDirty {
+		preSet[p] = true
+	}
+	var agentDrift, preserved []string
+	for _, p := range res.ScopeDrift {
+		if preSet[p] {
+			preserved = append(preserved, p)
+		} else {
+			agentDrift = append(agentDrift, p)
+		}
+	}
+	if err := CleanDriftPaths(context.Background(), repo, agentDrift); err != nil {
+		t.Fatalf("CleanDriftPaths: %v", err)
+	}
+	if err := RestoreHeadPreserving(context.Background(), repo, "main", preserved); err != nil {
+		t.Fatalf("RestoreHeadPreserving: %v", err)
+	}
+
+	// Final state: the scoped commit is on the remote with ONLY scoped.txt.
+	if got := mustGitOut(t, bare, "show", branch+":scoped.txt"); got != "agent scoped edit" {
+		t.Errorf("remote scoped.txt = %q, want the agent's in-scope edit pushed", got)
+	}
+	committed := mustGitOut(t, bare, "diff-tree", "-r", "--no-commit-id", "--name-only", branch)
+	if committed != "scoped.txt" {
+		t.Errorf("committed paths = %q, want only scoped.txt", committed)
+	}
+	// The operator is back on main with the pre-existing edit byte-identical.
+	if got := mustGitOut(t, repo, "branch", "--show-current"); got != "main" {
+		t.Errorf("branch = %q, want main", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(repo, "operator.txt")); string(got) != operatorEdit {
+		t.Errorf("operator.txt = %q, want the pre-existing edit byte-identical", got)
+	}
+	// Agent drift — tracked and untracked — is gone from the working tree.
+	if got, _ := os.ReadFile(filepath.Join(repo, "drift-tracked.txt")); string(got) != "drift base\n" {
+		t.Errorf("drift-tracked.txt = %q, want the agent's tracked drift reverted", got)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "drift-new.txt")); !os.IsNotExist(err) {
+		t.Error("drift-new.txt still exists; agent untracked drift must not accumulate")
+	}
+	// Nothing left dangling on the stash stack.
+	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
+		t.Errorf("stash list = %q, want empty", list)
+	}
+	// The only dirt left is the operator's own edit.
+	status := strings.TrimSpace(mustGitOut(t, repo, "status", "--porcelain", "-uall"))
+	if !strings.Contains(status, "operator.txt") || strings.Contains(status, "\n") {
+		t.Errorf("status = %q, want exactly one dirty path: the operator's edit", status)
+	}
+}
+
 // Make sure `errors` is used so a refactor that drops the import
 // stays caught by go vet/imports tooling.
 var _ = errors.New

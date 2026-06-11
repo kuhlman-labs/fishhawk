@@ -960,6 +960,122 @@ func RestoreHead(ctx context.Context, repoDir, ref string) error {
 	return nil
 }
 
+// DirtyPaths enumerates every dirty repo-relative path in repoDir — staged,
+// unstaged, and untracked alike — via `git status --porcelain -uall`. -uall
+// lists untracked files inside a brand-new directory individually rather than
+// collapsing them to one directory entry, the same per-file enumeration
+// rationale as StageScoped (#691): the caller compares these paths against
+// per-file drift lists, so a folded directory entry would never match. The
+// runner captures this snapshot BEFORE the agent is invoked (#943) so the
+// post-stage drift cleanup can tell operator pre-existing edits apart from
+// agent-introduced drift. It is a package-level function (not a *Pusher
+// method) to mirror CaptureHead / UntrackedPaths — the run() call site has no
+// *Pusher in scope.
+func DirtyPaths(ctx context.Context, repoDir string) ([]string, error) {
+	out, err := (&Pusher{}).runOut(ctx, repoDir, "status", "--porcelain", "-uall")
+	if err != nil {
+		return nil, fmt.Errorf("gitops: status: %w", err)
+	}
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		if p := porcelainPath(line); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}
+
+// CleanDriftPaths reverts the given drift paths via a pathspec-limited
+// `git stash push --include-untracked -- <paths...>` followed by `git stash
+// drop` (#943). One mechanism covers tracked-modified, tracked-deleted, and
+// untracked drift in a single step; --include-untracked extends the pathspec
+// to untracked files (git >= 2.13). When the named paths turn out to be clean
+// the push is a "No local changes" no-op (exit 0, no stash entry created) and
+// that is treated as success — the entry-created probe below guards the drop
+// so a pre-existing operator stash entry is never destroyed. If the drop
+// fails, the entry is left on the stash stack (recoverable via `git stash
+// list`) and an annotated error is returned for the caller to log.
+//
+// Known limitation: a rename's source-path deletion is not in the drift list
+// (porcelainPath returns the destination), so a renamed-as-drift source may
+// stay dirty — rare, flag-only, matching ADR-027's non-blocking drift posture.
+func CleanDriftPaths(ctx context.Context, repoDir string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	p := &Pusher{}
+	created, err := stashPushPaths(ctx, p, repoDir, "fishhawk: drift-excluded paths", paths)
+	if err != nil {
+		return fmt.Errorf("gitops: stash drift paths: %w", err)
+	}
+	if !created {
+		// The named paths were already clean — nothing to revert.
+		return nil
+	}
+	if err := p.run(ctx, repoDir, "stash", "drop"); err != nil {
+		return fmt.Errorf("gitops: drop drift stash (entry left recoverable via `git stash list`): %w", err)
+	}
+	return nil
+}
+
+// RestoreHeadPreserving is RestoreHead with a preserved-paths carve-out
+// (#943): the named paths — operator edits that pre-dated the agent — are
+// stashed before the forced checkout (which would otherwise discard tracked
+// modifications) and reapplied after it. An empty preserve set delegates to
+// RestoreHead unchanged. The reapply reuses popStash's #989 conflict
+// handling: a pop conflict aborts cleanly (reset --hard), leaves the stash
+// entry intact and recoverable via `git stash list`, and returns a typed
+// error for the caller to log — operator content is never silently
+// destroyed. Like RestoreHead, callers invoke this best-effort and log-only.
+func RestoreHeadPreserving(ctx context.Context, repoDir, ref string, preserve []string) error {
+	if len(preserve) == 0 {
+		return RestoreHead(ctx, repoDir, ref)
+	}
+	p := &Pusher{}
+	created, err := stashPushPaths(ctx, p, repoDir, "fishhawk: operator pre-existing edits", preserve)
+	if err != nil {
+		return fmt.Errorf("gitops: stash operator edits: %w", err)
+	}
+	if err := p.run(ctx, repoDir, "checkout", "--force", ref); err != nil {
+		if created {
+			return fmt.Errorf("gitops: restore HEAD to %s (operator edits stashed; recover via `git stash pop`): %w", ref, err)
+		}
+		return fmt.Errorf("gitops: restore HEAD to %s: %w", ref, err)
+	}
+	if !created {
+		return nil
+	}
+	if err := p.popStash(ctx, repoDir); err != nil {
+		return fmt.Errorf("gitops: reapply operator edits after restore (stash entry recoverable via `git stash list`): %w", err)
+	}
+	return nil
+}
+
+// stashPushPaths runs a pathspec-limited `git stash push --include-untracked`
+// and reports whether an entry was actually created. The created probe
+// (refs/stash before vs after) is load-bearing: stash push exits 0 with "No
+// local changes to save" when the named paths are clean, and a blind follow-up
+// drop/pop would then destroy or replay a PRE-EXISTING stash entry the
+// operator owns.
+func stashPushPaths(ctx context.Context, p *Pusher, repoDir, message string, paths []string) (created bool, err error) {
+	before := stashTip(ctx, p, repoDir)
+	args := append([]string{"stash", "push", "--include-untracked", "-m", message, "--"}, paths...)
+	if err := p.run(ctx, repoDir, args...); err != nil {
+		return false, err
+	}
+	after := stashTip(ctx, p, repoDir)
+	return after != "" && after != before, nil
+}
+
+// stashTip resolves refs/stash, returning "" when the stash stack is empty.
+func stashTip(ctx context.Context, p *Pusher, repoDir string) string {
+	out, err := p.runOut(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/stash")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
 // porcelainPath extracts the repo-relative path from one `git status
 // --porcelain` line. Returns "" for blank/short lines. For a rename
 // ("R  old -> new") it returns the destination path, which is what a
