@@ -4146,6 +4146,206 @@ func TestRun_ImplementStage_CapturesHeadBeforeAgentInvoke(t *testing.T) {
 	}
 }
 
+// runFailedImplementStage drives run() with the standard implement argv for
+// the #953 failure-path tests. The caller installs the invoker/uploader/git
+// fakes first.
+func runFailedImplementStage(t *testing.T, stderr *strings.Builder, extraArgs ...string) int {
+	t.Helper()
+	args := []string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}
+	return run(append(args, extraArgs...), stderr)
+}
+
+// installMovingHeadSpy swaps the capture/restore seam for the #953 tests: the
+// FIRST captureHead call (run()'s pre-agent capture) returns origRef; every
+// subsequent call (the run()-level defer's re-read) returns movedRef —
+// modeling an agent that ran `git checkout -b` mid-stage. restoreHead records
+// the refs it was handed. Must be called AFTER withFakeGitOps. Restored via
+// t.Cleanup.
+func installMovingHeadSpy(t *testing.T, origRef, movedRef string) (restoredRefs *[]string) {
+	t.Helper()
+	restoredRefs = new([]string)
+	captureCalls := 0
+	origCap, origRes := captureHead, restoreHead
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		captureCalls++
+		if captureCalls == 1 {
+			return origRef, false, nil
+		}
+		return movedRef, false, nil
+	}
+	restoreHead = func(_ context.Context, _, ref string) error {
+		*restoredRefs = append(*restoredRefs, ref)
+		return nil
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+	return restoredRefs
+}
+
+// TestRun_ImplementStage_AgentFailure_MovedHead_RestoresOperatorRef is the
+// #953 fix (the #941 residual): an implement stage whose agent moves HEAD
+// (e.g. `git checkout -b`) and then FAILS never reaches openPRAndShipArtifact's
+// restore defer — the run()-level net must still return the operator to their
+// original ref, and the stage's failure exit code is preserved.
+func TestRun_ImplementStage_AgentFailure_MovedHead_RestoresOperatorRef(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent crash"},
+		returnErr: errors.New("agent crash"),
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	restoredRefs := installMovingHeadSpy(t, "operator-main", "agent-branch")
+
+	var stderr strings.Builder
+	if got := runFailedImplementStage(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on agent crash:\n%s", got, stderr.String())
+	}
+	if len(*restoredRefs) != 1 || (*restoredRefs)[0] != "operator-main" {
+		t.Errorf("restoredRefs = %v, want exactly one restore to %q (run()-level net on the agent-failure path)",
+			*restoredRefs, "operator-main")
+	}
+	if !strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("missing working_tree_restored event on the agent-failure path:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_AgentFailure_UnmovedHead_SkipsRestore pins the #953
+// destructive-checkout guard: when the agent FAILED but never moved HEAD (the
+// common case — it only edited files), the run()-level net must NOT call
+// restoreHead. restoreHead is `git checkout --force`, which would discard the
+// staged+unstaged tracked edits the operator inspects after a failure. This
+// test fails if the moved-HEAD guard is removed.
+func TestRun_ImplementStage_AgentFailure_UnmovedHead_SkipsRestore(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent crash"},
+		returnErr: errors.New("agent crash"),
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	// HEAD never moves: every capture (pre-agent + in-defer re-read) reports
+	// the same ref.
+	restoredRefs := installMovingHeadSpy(t, "operator-main", "operator-main")
+
+	var stderr strings.Builder
+	if got := runFailedImplementStage(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on agent crash:\n%s", got, stderr.String())
+	}
+	if len(*restoredRefs) != 0 {
+		t.Errorf("restoredRefs = %v, want none — an unmoved HEAD must never be force-checked-out (the dirty tree is the operator's to inspect)",
+			*restoredRefs)
+	}
+	if strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("working_tree_restored must NOT be emitted when HEAD never moved:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_AgentFailure_NoPR_SkipsRestore pins the #953 --no-pr
+// opt-out: local-runner mode deliberately leaves the tree as-is (the dirty
+// tree IS the deliverable), so the run()-level net is skipped entirely — even
+// when the agent moved HEAD before failing.
+func TestRun_ImplementStage_AgentFailure_NoPR_SkipsRestore(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent crash"},
+		returnErr: errors.New("agent crash"),
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	restoredRefs := installMovingHeadSpy(t, "operator-main", "agent-branch")
+
+	var stderr strings.Builder
+	if got := runFailedImplementStage(t, &stderr, "--no-pr"); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on agent crash:\n%s", got, stderr.String())
+	}
+	if len(*restoredRefs) != 0 {
+		t.Errorf("restoredRefs = %v, want none — --no-pr opts out of restoration entirely", *restoredRefs)
+	}
+	if strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("working_tree_restored must NOT be emitted under --no-pr:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_AgentFailure_RecaptureFails_SkipsRestore pins the
+// #953 blind-checkout guard: when the run()-level net's in-defer HEAD re-read
+// fails, it must NOT fall back to a blind `git checkout --force` (destroying
+// uncommitted work is worse than leaving the operator stranded) — it emits
+// working_tree_restore_failed and skips.
+func TestRun_ImplementStage_AgentFailure_RecaptureFails_SkipsRestore(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent crash"},
+		returnErr: errors.New("agent crash"),
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	// First capture (pre-agent) succeeds; the defer's re-read fails.
+	captureCalls := 0
+	restoreCalls := 0
+	origCap, origRes := captureHead, restoreHead
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		captureCalls++
+		if captureCalls == 1 {
+			return "operator-main", false, nil
+		}
+		return "", false, errors.New("symbolic-ref failed in defer")
+	}
+	restoreHead = func(_ context.Context, _, _ string) error { restoreCalls++; return nil }
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes })
+
+	var stderr strings.Builder
+	if got := runFailedImplementStage(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on agent crash:\n%s", got, stderr.String())
+	}
+	if restoreCalls != 0 {
+		t.Errorf("restoreHead called %d times, want 0 — never force-checkout blind when current HEAD is unknown", restoreCalls)
+	}
+	if !strings.Contains(stderr.String(), `"event":"working_tree_restore_failed"`) {
+		t.Errorf("missing working_tree_restore_failed event for the skipped restore:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"working_tree_restored"`) {
+		t.Errorf("working_tree_restored must NOT be emitted when the re-read failed:\n%s", stderr.String())
+	}
+}
+
 // TestRun_ImplementStage_Fixup_NoChanges_ReportsFixupNoChanges is the #856 fix:
 // a fix-up re-dispatch that produces NO changes must NOT bare-return (the
 // push_fixup trace gate left the stage in `running`, so a bare return hangs it
