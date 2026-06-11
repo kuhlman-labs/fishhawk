@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -9,12 +10,25 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
+
+// CategoryAuditCheckPublishDegraded is the audit-log category for the
+// run-chain entry appended when the fishhawk_audit_complete Check Run
+// publish has failed auditcheckpublisher.DefaultDegradedThreshold
+// consecutive times for the run's head_sha (#993). Exactly one per
+// failure episode; payload carries {head_sha, attempts, last_error}.
+const CategoryAuditCheckPublishDegraded = "audit_check_publish_degraded"
+
+// CategoryAuditCheckPublishRecovered is the paired entry appended on
+// the successful publish that closes an open degraded episode (#993).
+// Payload carries {head_sha, attempts}.
+const CategoryAuditCheckPublishRecovered = "audit_check_publish_recovered"
 
 // stageCheckResponse mirrors what the SPA's BlockingChecksPanel
 // expects: a small `{name, state, …}` shape with the SPA's enum
@@ -149,7 +163,12 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 // enforcement still proceeds so a GitHub outage doesn't black-
 // hole approvals. Nil-safe — the publisher is nil when
 // ExternalURL or GitHub aren't wired (legacy / dev posture), and
-// Publish returns immediately in that case.
+// Publish returns immediately in that case. A PERSISTENT publish
+// failure additionally surfaces on the run record itself: the
+// publisher's episode callbacks (wired in New) append paired
+// audit_check_publish_degraded / _recovered run-chain entries
+// (#993), so a desynced merge gate is visible from
+// fishhawk_get_run_status and the SPA without a daemon-log grep.
 func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem) {
 	if s.auditCheckPublisher == nil {
 		return
@@ -171,6 +190,127 @@ func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state s
 			slog.String("state", string(state)),
 		)
 	}
+}
+
+// auditCheckPublishDegraded is the auditcheckpublisher's OnDegraded
+// callback (#993): it surfaces a persistently failing
+// fishhawk_audit_complete publish on the run record by appending a
+// chained audit_check_publish_degraded entry. The publisher fires it
+// at most once per in-process failure episode. Best-effort: an append
+// failure logs at WARN and never unwinds the publish path.
+func (s *Server) auditCheckPublishDegraded(ctx context.Context, runID uuid.UUID, headSHA string, attempts int, lastErr error) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	lastError := ""
+	if lastErr != nil {
+		lastError = lastErr.Error()
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"head_sha":   headSHA,
+		"attempts":   attempts,
+		"last_error": lastError,
+	})
+	systemKind := audit.ActorSystem
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryAuditCheckPublishDegraded,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"audit-check publish degraded: audit append failed",
+			slog.String("run_id", runID.String()),
+			slog.String("head_sha", headSHA),
+			slog.String("error", err.Error()))
+	}
+}
+
+// auditCheckPublishRecovered is the auditcheckpublisher's OnRecovered
+// callback (#993). The publisher invokes it on EVERY successful
+// publish; whether a recovered entry is due derives from the run's
+// audit chain — an audit_check_publish_degraded entry for this
+// head_sha with no later audit_check_publish_recovered marks an open
+// episode — NOT from the publisher's in-memory counter, so a daemon
+// restart mid-episode can never orphan a degraded entry. Best-effort
+// like the degraded side.
+func (s *Server) auditCheckPublishRecovered(ctx context.Context, runID uuid.UUID, headSHA string, attempts int) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	open, err := s.openDegradedPublishEpisode(ctx, runID, headSHA)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"audit-check publish recovered: episode lookup failed",
+			slog.String("run_id", runID.String()),
+			slog.String("head_sha", headSHA),
+			slog.String("error", err.Error()))
+		return
+	}
+	if !open {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"head_sha": headSHA,
+		"attempts": attempts,
+	})
+	systemKind := audit.ActorSystem
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryAuditCheckPublishRecovered,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"audit-check publish recovered: audit append failed",
+			slog.String("run_id", runID.String()),
+			slog.String("head_sha", headSHA),
+			slog.String("error", err.Error()))
+	}
+}
+
+// openDegradedPublishEpisode reports whether the run's audit chain
+// carries an audit_check_publish_degraded entry for headSHA with no
+// later audit_check_publish_recovered entry for the same headSHA —
+// the durable definition of an open episode (#993).
+func (s *Server) openDegradedPublishEpisode(ctx context.Context, runID uuid.UUID, headSHA string) (bool, error) {
+	degradedSeq, degraded, err := lastPublishEpisodeSeq(ctx, s.cfg.AuditRepo, runID, CategoryAuditCheckPublishDegraded, headSHA)
+	if err != nil || !degraded {
+		return false, err
+	}
+	recoveredSeq, recovered, err := lastPublishEpisodeSeq(ctx, s.cfg.AuditRepo, runID, CategoryAuditCheckPublishRecovered, headSHA)
+	if err != nil {
+		return false, err
+	}
+	return !recovered || recoveredSeq < degradedSeq, nil
+}
+
+// lastPublishEpisodeSeq returns the highest chain sequence among the
+// run's entries of `category` whose payload head_sha matches.
+// Entries with unparseable payloads are skipped — they can't be
+// matched to an episode either way.
+func lastPublishEpisodeSeq(ctx context.Context, repo audit.Repository, runID uuid.UUID, category, headSHA string) (int64, bool, error) {
+	entries, err := repo.ListForRunByCategory(ctx, runID, category)
+	if err != nil {
+		return 0, false, err
+	}
+	var seq int64
+	found := false
+	for _, e := range entries {
+		var p struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA != headSHA {
+			continue
+		}
+		if !found || e.Sequence > seq {
+			seq = e.Sequence
+			found = true
+		}
+	}
+	return seq, found, nil
 }
 
 func toStageCheckResponse(c *stagecheck.Check) stageCheckResponse {
@@ -249,7 +389,11 @@ func (s *Server) recomputeAndPublishAuditComplete(ctx context.Context, runID uui
 // parked review stage retries exactly the dropped publishes (a transient
 // GitHub failure heals within one tick after recovery) while an
 // already-published state dedups to a no-op. Best-effort, like the
-// recompute it delegates to.
+// recompute it delegates to. When the retried publish keeps failing,
+// the publisher's episode tracking degrades to a run-chain
+// audit_check_publish_degraded entry after
+// auditcheckpublisher.DefaultDegradedThreshold consecutive attempts
+// (#993) — see publishAuditCheck.
 func (s *Server) RepublishAuditCheck(ctx context.Context, runID uuid.UUID) {
 	s.recomputeAndPublishAuditComplete(ctx, runID)
 }

@@ -398,6 +398,11 @@ func New(cfg Config) *Server {
 			Runs:        cfg.RunRepo,
 			Artifacts:   cfg.ArtifactRepo,
 			ExternalURL: cfg.ExternalURL,
+			// Persistent-failure surfacing (#993): a sustained
+			// CreateCheckRun failure streak / its eventual recovery
+			// land as paired run-chain audit entries.
+			OnDegraded:  s.auditCheckPublishDegraded,
+			OnRecovered: s.auditCheckPublishRecovered,
 		})
 		s.issueNotifier = issuecomment.New(issuecomment.Deps{
 			GitHub:      cfg.GitHub,

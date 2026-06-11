@@ -47,6 +47,15 @@ import (
 // this exact string into their branch-protection rule.
 const CheckName = "fishhawk_audit_complete"
 
+// DefaultDegradedThreshold is the number of CONSECUTIVE failed
+// CreateCheckRun attempts for one (run, head_sha) episode after which
+// the publisher fires OnDegraded (#993). At the reconciler's one
+// attempt per tick (mergereconciler.DefaultInterval = 60s) that is
+// ~5 minutes of sustained failure; other Publish callers (SPA reads,
+// synchronize webhooks) count toward the same episode and can only
+// make the signal earlier, never noisier.
+const DefaultDegradedThreshold = 5
+
 // CheckRunCreator is the slice of githubclient.Client this package
 // needs. Defining it as an interface lets tests swap in a fake
 // without standing up a fake api.github.com.
@@ -61,9 +70,21 @@ type Publisher struct {
 	runs        run.Repository
 	artifacts   artifact.Repository
 	externalURL string
+	onDegraded  func(ctx context.Context, runID uuid.UUID, headSHA string, attempts int, lastErr error)
+	onRecovered func(ctx context.Context, runID uuid.UUID, headSHA string, attempts int)
 
-	mu   sync.Mutex
-	last map[string]stagecheck.State // (repo, head_sha) → most-recent published state
+	mu       sync.Mutex
+	last     map[string]stagecheck.State // (repo, head_sha) → most-recent published state
+	episodes map[string]*episode         // (run_id, head_sha) → consecutive CreateCheckRun failure streak
+}
+
+// episode tracks one (run, head_sha) pair's consecutive-failure
+// streak. `degraded` latches once OnDegraded has fired so attempts
+// past the threshold stay silent; the episode is deleted on the
+// first successful publish.
+type episode struct {
+	count    int
+	degraded bool
 }
 
 // Deps groups the dependencies New needs. Production wires the
@@ -73,6 +94,23 @@ type Deps struct {
 	Runs        run.Repository
 	Artifacts   artifact.Repository
 	ExternalURL string
+
+	// OnDegraded, when non-nil, is invoked exactly once per failure
+	// episode (#993): the moment a (run, head_sha) pair accumulates
+	// DefaultDegradedThreshold CONSECUTIVE CreateCheckRun failures.
+	// Only the publish attempt proper counts — GetRun/findHeadSHA
+	// read errors and the skip paths never touch the streak. Invoked
+	// outside the publisher's mutex; the callback may do DB I/O.
+	OnDegraded func(ctx context.Context, runID uuid.UUID, headSHA string, attempts int, lastErr error)
+
+	// OnRecovered, when non-nil, is invoked after EVERY successful
+	// CreateCheckRun publish, carrying the in-process failure streak
+	// length the success cleared (0 when there was none). Whether a
+	// recovered signal is actually due is the callee's decision from
+	// durable state (the run's audit chain), NOT this process's
+	// counter — so a daemon restart mid-episode can never orphan a
+	// degraded signal. Invoked outside the publisher's mutex.
+	OnRecovered func(ctx context.Context, runID uuid.UUID, headSHA string, attempts int)
 }
 
 // New returns a Publisher. Returns nil when the deps don't add up
@@ -93,7 +131,10 @@ func New(d Deps) *Publisher {
 		runs:        d.Runs,
 		artifacts:   d.Artifacts,
 		externalURL: strings.TrimRight(d.ExternalURL, "/"),
+		onDegraded:  d.OnDegraded,
+		onRecovered: d.OnRecovered,
 		last:        map[string]stagecheck.State{},
+		episodes:    map[string]*episode{},
 	}
 }
 
@@ -143,10 +184,41 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 
 	params := buildParams(state, missing, headSHA, p.detailsURL(runID))
 	if _, err := p.github.CreateCheckRun(ctx, *runRow.InstallationID, repo, params); err != nil {
-		return false, fmt.Errorf("auditcheckpublisher: create check run: %w", err)
+		err = fmt.Errorf("auditcheckpublisher: create check run: %w", err)
+		p.recordFailure(ctx, runID, headSHA, err)
+		return false, err
 	}
-	p.recordPublished(repo, headSHA, state)
+	attempts := p.recordPublished(repo, runID, headSHA, state)
+	if p.onRecovered != nil {
+		p.onRecovered(ctx, runID, headSHA, attempts)
+	}
 	return true, nil
+}
+
+// recordFailure advances the (run, head_sha) consecutive-failure
+// streak and fires OnDegraded exactly when the streak reaches
+// DefaultDegradedThreshold (== compare; the latched `degraded` flag
+// keeps attempts past the threshold silent). The decision is made
+// under the mutex but the callback runs after release — it does DB
+// I/O and must not serialize concurrent Publish calls.
+func (p *Publisher) recordFailure(ctx context.Context, runID uuid.UUID, headSHA string, lastErr error) {
+	key := episodeKey(runID, headSHA)
+	p.mu.Lock()
+	ep := p.episodes[key]
+	if ep == nil {
+		ep = &episode{}
+		p.episodes[key] = ep
+	}
+	ep.count++
+	fire := ep.count == DefaultDegradedThreshold && !ep.degraded
+	if fire {
+		ep.degraded = true
+	}
+	attempts := ep.count
+	p.mu.Unlock()
+	if fire && p.onDegraded != nil {
+		p.onDegraded(ctx, runID, headSHA, attempts, lastErr)
+	}
 }
 
 // shouldPublish returns true when the cached state for this
@@ -163,14 +235,33 @@ func (p *Publisher) shouldPublish(repo githubclient.RepoRef, headSHA string, sta
 	return prev != state
 }
 
-func (p *Publisher) recordPublished(repo githubclient.RepoRef, headSHA string, state stagecheck.State) {
+// recordPublished caches the published state for dedup and clears the
+// run's failure episode, returning the streak length the success ended
+// (0 when there was none). A dedup hit never needs episode handling:
+// the cache records only on success, so a hit implies this path
+// already cleared the episode.
+func (p *Publisher) recordPublished(repo githubclient.RepoRef, runID uuid.UUID, headSHA string, state stagecheck.State) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.last[cacheKey(repo, headSHA)] = state
+	key := episodeKey(runID, headSHA)
+	attempts := 0
+	if ep := p.episodes[key]; ep != nil {
+		attempts = ep.count
+		delete(p.episodes, key)
+	}
+	return attempts
 }
 
 func cacheKey(repo githubclient.RepoRef, headSHA string) string {
 	return repo.Owner + "/" + repo.Name + "@" + headSHA
+}
+
+// episodeKey keys failure episodes by (run_id, head_sha) — NOT the
+// dedup cache's (repo, head_sha) — so two runs sharing a head commit
+// have independent episodes with entries on their own run chains.
+func episodeKey(runID uuid.UUID, headSHA string) string {
+	return runID.String() + "@" + headSHA
 }
 
 func (p *Publisher) detailsURL(runID uuid.UUID) string {
