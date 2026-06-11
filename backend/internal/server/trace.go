@@ -2093,6 +2093,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// thread the remainder through so the reviewer treats them as in-scope
 		// rather than flagging them as scope drift.
 		AmendedScopeFiles: s.amendedScopeFilesForReview(ctx, runRow, approvedPlan),
+		// The stage's previously recorded implement-review concerns for the
+		// delta-verification section (#984): open states the reviewer must
+		// resolve plus waived concerns shown as not-re-litigable context. A
+		// first review finds no rows → empty set → the section is omitted
+		// and the prompt stays byte-identical; the post-fixup re-review
+		// (same stage_id, new head_sha per #797) finds the
+		// addressed_pending rows the fix-up trigger wrote.
+		PriorConcerns: s.priorConcernsForReview(ctx, runID, stageID),
 	}
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title
@@ -2303,6 +2311,10 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			Verdict:       verdict.Verdict,
 			Concerns:      verdict.Concerns,
 			FreeForm:      verdict.FreeForm,
+			// The reviewer's delta-verification verdicts on prior concerns
+			// (#984) ride on the authoritative audit payload; the concern
+			// store applies them below as a derived index.
+			ConcernResolutions: verdict.ConcernResolutions,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2324,6 +2336,9 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// chain stays the sole sequence authority, so a failed append
 			// (no sequence) skips persistence for this verdict.
 			s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, entry.Sequence, verdict.Concerns)
+			// Apply the delta-verification resolutions to the concern
+			// store (#984) — same append-gated, best-effort posture.
+			s.applyConcernResolutions(ctx, runID, stageID, verdict.ConcernResolutions)
 		}
 
 		// Capture this reviewer invocation's agent token cost (#681). The
@@ -2347,6 +2362,115 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	s.recomputeAndPublishAuditComplete(ctx, runID)
 
 	return hasRejection
+}
+
+// priorConcernsForReview gathers the stage's previously recorded
+// implement-review concerns for the implement-review prompt's
+// delta-verification section (#984): every open-state concern (raised,
+// addressed_pending, reopened) plus waived ones (rendered as
+// not-re-litigable context with the operator's audited reason).
+// Addressed/superseded concerns are settled and stay out of the prompt.
+// Best-effort: a nil repo or a list error returns nil (warn-logged) —
+// a store outage must never block review dispatch, and an empty set
+// keeps the prompt byte-identical to the pre-#984 output.
+func (s *Server) priorConcernsForReview(ctx context.Context, runID, stageID uuid.UUID) []prompt.PriorConcern {
+	if s.cfg.ConcernRepo == nil {
+		return nil
+	}
+	rows, err := s.cfg.ConcernRepo.ListByRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list concerns failed — dispatching without the prior-concerns section",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	var out []prompt.PriorConcern
+	for _, c := range rows {
+		if c.StageID != stageID || c.StageKind != concern.StageKindImplement {
+			continue
+		}
+		if !c.State.IsOpen() && c.State != concern.StateWaived {
+			continue
+		}
+		out = append(out, prompt.PriorConcern{
+			ID:          c.ID.String(),
+			State:       string(c.State),
+			Severity:    c.Severity,
+			Category:    c.Category,
+			Note:        c.Note,
+			StateReason: c.StateReason,
+		})
+	}
+	return out
+}
+
+// applyConcernResolutions applies one reviewer's delta-verification
+// resolutions (#984) to the durable concern store: confirmed →
+// addressed, reopened → reopened, superseded → superseded, via
+// ApplyResolution's state-machine validation. Every malformed or
+// inapplicable entry — unparseable UUID, unknown ID, a concern from a
+// different run/stage or a plan stage, an unknown resolution string, or
+// an InvalidTransitionError — is WARN-logged and skipped, with valid
+// sibling entries still applied: a sloppy reviewer can never wedge the
+// gate, and the store stays the best-effort derived index #982
+// established (the audit payload already carries the resolutions
+// authoritatively). REOPEN WINS over confirm needs no reconciliation
+// pass here: the state machine encodes it order-independently
+// (addressed → reopened is a valid edge; reopened → addressed is
+// absent and surfaces as the warn-logged InvalidTransitionError).
+func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, resolutions []planreview.ConcernResolution) {
+	if s.cfg.ConcernRepo == nil || len(resolutions) == 0 {
+		return
+	}
+	warn := func(res planreview.ConcernResolution, reason string) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "concern resolutions: skipping entry",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("concern_id", res.ID),
+			slog.String("resolution", res.Resolution),
+			slog.String("reason", reason),
+		)
+	}
+	for _, res := range resolutions {
+		cid, perr := uuid.Parse(res.ID)
+		if perr != nil {
+			warn(res, "id is not a valid UUID: "+perr.Error())
+			continue
+		}
+		var to concern.State
+		switch res.Resolution {
+		case "confirmed":
+			to = concern.StateAddressed
+		case "reopened":
+			to = concern.StateReopened
+		case "superseded":
+			to = concern.StateSuperseded
+		default:
+			warn(res, "unknown resolution (want confirmed|reopened|superseded)")
+			continue
+		}
+		rows, gerr := s.cfg.ConcernRepo.GetByIDs(ctx, []uuid.UUID{cid})
+		if gerr != nil {
+			warn(res, "get concern failed: "+gerr.Error())
+			continue
+		}
+		row := rows[0]
+		if row.RunID != runID || row.StageID != stageID || row.StageKind != concern.StageKindImplement {
+			// A reviewer can never touch another run's, another stage's,
+			// or a plan-stage concern through this path.
+			warn(res, "concern belongs to a different run/stage or is not an implement-stage concern")
+			continue
+		}
+		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, cid, to, res.Note); aerr != nil {
+			// InvalidTransitionError lands here — including the
+			// confirm-after-reopen case across heterogeneous reviewers,
+			// satisfying concern.go's never-silently-swallow contract.
+			warn(res, "apply resolution failed: "+aerr.Error())
+			continue
+		}
+	}
 }
 
 // persistReviewConcerns records one review verdict's concerns into the

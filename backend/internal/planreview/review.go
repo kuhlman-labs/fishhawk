@@ -57,6 +57,20 @@ type Usage struct {
 	Known        bool
 }
 
+// ConcernResolution is one reviewer judgment on a PRIOR concern listed
+// in the implement-review prompt's delta-verification section (E22.X /
+// #984). ID is the concern's stable UUID echoed back from the prompt;
+// Resolution is one of "confirmed" (the diff resolves it), "reopened"
+// (it does not), or "superseded" (overtaken by a different change). The
+// server tolerantly maps these onto the concern state machine —
+// unknown IDs and resolution strings are warn-and-skipped, never a
+// gate failure.
+type ConcernResolution struct {
+	ID         string `json:"id"`
+	Resolution string `json:"resolution"`
+	Note       string `json:"note,omitempty"`
+}
+
 // ReviewVerdict is the structured response emitted by a review agent.
 // The review-agent prompt instructs agents to return only this shape
 // as a JSON object — no prose, no re-planning.
@@ -64,6 +78,13 @@ type ReviewVerdict struct {
 	Verdict  Verdict   `json:"verdict"`
 	Concerns []Concern `json:"concerns,omitempty"`
 	FreeForm string    `json:"free_form,omitempty"`
+
+	// ConcernResolutions carries the reviewer's per-concern verdicts on
+	// the prior concerns threaded into a re-review prompt (#984). Absent
+	// (nil) on a first review and on output from reviewers predating the
+	// field — encoding/json ignores unknown members in both directions,
+	// so old reviewer output stays valid.
+	ConcernResolutions []ConcernResolution `json:"concern_resolutions,omitempty"`
 
 	// Usage is the reviewer backend's token usage for this invocation,
 	// populated by the adapter AFTER it decodes the verdict JSON — usage
@@ -211,4 +232,11 @@ type ImplementReviewedPayload struct {
 	Verdict       Verdict       `json:"verdict"`
 	Concerns      []Concern     `json:"concerns,omitempty"`
 	FreeForm      string        `json:"free_form,omitempty"`
+
+	// ConcernResolutions records the reviewer's delta-verification
+	// verdicts on prior concerns (#984) on the authoritative audit
+	// payload — the concern store applies them as a derived index.
+	// omitempty keeps resolution-free payloads byte-identical to
+	// pre-#984 entries, and old stored payloads decode unchanged.
+	ConcernResolutions []ConcernResolution `json:"concern_resolutions,omitempty"`
 }

@@ -140,6 +140,20 @@ type fakeBackend struct {
 	fixupErrBody    string
 	fixupCalledByID map[uuid.UUID]int
 
+	// #984 fixtures: POST /v0/concerns/{id}/waive.
+	// waiveBody captures the last decoded request body (the reason).
+	// waiveResp seeds the waived-concern response keyed by concern id;
+	// default is a minimal WaivedConcern with State="waived".
+	// waiveStatus drives the HTTP status (default 200).
+	// waiveErrBody, when set, is written verbatim — drives the 400 / 403
+	// / 404 / 422 error-path tests.
+	// waiveCalledByID counts waive calls per concern id.
+	waiveBody       waiveConcernRequest
+	waiveResp       map[uuid.UUID]WaivedConcern
+	waiveStatus     int
+	waiveErrBody    string
+	waiveCalledByID map[uuid.UUID]int
+
 	// #961 fixtures: GET /v0/runs/{id}/scope-amendments + the decision
 	// POST. amendmentsByRun seeds the list response; decideResp seeds the
 	// decided row keyed by amendment id; decideBody captures the last
@@ -216,6 +230,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fixupResp:                map[uuid.UUID]Stage{},
 		fixupStatus:              http.StatusOK,
 		fixupCalledByID:          map[uuid.UUID]int{},
+		waiveResp:                map[uuid.UUID]WaivedConcern{},
+		waiveStatus:              http.StatusOK,
+		waiveCalledByID:          map[uuid.UUID]int{},
 		amendmentsByRun:          map[uuid.UUID][]ScopeAmendmentItem{},
 		amendmentsStatus:         http.StatusOK,
 		decideAmendmentResp:      map[uuid.UUID]ScopeAmendmentItem{},
@@ -306,6 +323,32 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if !ok {
 			resp = Stage{ID: id.String(), State: "pending"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("concern_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body waiveConcernRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.waiveCalledByID[id]++
+		fb.waiveBody = body
+		status := fb.waiveStatus
+		errBody := fb.waiveErrBody
+		resp, ok := fb.waiveResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = WaivedConcern{ID: id.String(), State: "waived", StateReason: body.Reason}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -894,7 +937,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 19
+	const wantToolCount = 20
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

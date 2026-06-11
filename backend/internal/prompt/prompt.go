@@ -256,6 +256,32 @@ type Trigger struct {
 	// paths as in-scope — the reviewer must NOT flag them as drift. Empty/nil
 	// when no amendment was folded or for any non-implement-review build.
 	AmendedScopeFiles []string
+	// PriorConcerns carries the stage's previously recorded review
+	// concerns for the implement-review prompt's delta-verification
+	// section (E22.X / #984): open-state concerns the reviewer must
+	// explicitly confirm/reopen/supersede (addressed_pending), plus
+	// waived concerns shown as not-re-litigable context with the
+	// operator's audited reason. Implement-review-only; empty/nil (a
+	// first review, no concern store, or any non-implement-review
+	// build) omits the section and keeps the prompt byte-identical to
+	// the pre-#984 output.
+	PriorConcerns []PriorConcern
+}
+
+// PriorConcern is one previously recorded concern rendered into the
+// implement-review prompt's "Prior concerns (delta verification)"
+// section (#984). ID is the stable concern UUID the reviewer echoes
+// back in concern_resolutions; State is the lifecycle state driving the
+// per-concern instruction (addressed_pending → resolution mandatory;
+// waived → context only); StateReason carries the operator's audited
+// waive reason for waived concerns (empty otherwise).
+type PriorConcern struct {
+	ID          string
+	State       string
+	Severity    string
+	Category    string
+	Note        string
+	StateReason string
 }
 
 // Build returns the constructed prompt for the given stage type
@@ -812,6 +838,36 @@ func buildImplementReview(t Trigger) string {
 		b.WriteString("\n")
 	}
 
+	// Prior-concerns delta-verification section (#984). Rendered only on a
+	// re-review of a stage that already has recorded concerns (a fix-up
+	// pass, a re-pack) — a first review has none and the section is
+	// omitted, keeping the prompt byte-identical to the pre-#984 output.
+	// addressed_pending concerns MUST each receive a concern_resolutions
+	// entry; waived concerns are operator-resolved context that must not
+	// be re-litigated; concerns[] stays reserved for genuinely new
+	// findings so a listed concern is never re-minted as a fresh row.
+	if len(t.PriorConcerns) > 0 {
+		b.WriteString("### Prior concerns (delta verification)\n\n")
+		b.WriteString("Earlier reviews of this stage recorded the concerns below, each with a stable id and its " +
+			"lifecycle state. These rules are BINDING:\n\n")
+		b.WriteString("- For EVERY concern listed in state `addressed_pending` (the operator routed it back to the " +
+			"agent for the fix-up under review), you MUST emit exactly one entry in the verdict's " +
+			"`concern_resolutions` array, echoing the concern's `id`: `confirmed` (the diff resolves it), " +
+			"`reopened` (it does not), or `superseded` (a different change made it moot).\n")
+		b.WriteString("- Concerns in state `waived` are context only: the operator waived them with the audited " +
+			"reason shown. You MUST NOT re-raise or re-litigate a waived concern absent genuinely new evidence.\n")
+		b.WriteString("- `concerns[]` is ONLY for genuinely NEW findings. NEVER re-mint a concern already listed " +
+			"here — address it via `concern_resolutions` (or leave it alone if it is not addressed_pending).\n\n")
+		for _, c := range t.PriorConcerns {
+			fmt.Fprintf(&b, "- id: %s\n  state: %s\n  severity: %s\n  category: %s\n  note: %s\n",
+				c.ID, c.State, c.Severity, c.Category, c.Note)
+			if c.State == "waived" && c.StateReason != "" {
+				fmt.Fprintf(&b, "  operator waive reason: %s\n", c.StateReason)
+			}
+		}
+		b.WriteString("\n")
+	}
+
 	// Approved plan section — what the diff is being measured against.
 	if t.ApprovedPlan != nil {
 		writePlanForReview(&b, t.ApprovedPlan)
@@ -824,6 +880,9 @@ func buildImplementReview(t Trigger) string {
 	writeReviewIssueContext(&b, t)
 
 	// Verdict schema — inline so the reviewer doesn't need to fetch it.
+	// The concern_resolutions member renders only when prior concerns are
+	// listed above (#984): a first review has nothing to resolve, and the
+	// omission keeps that prompt byte-identical to the pre-#984 output.
 	b.WriteString("### Verdict schema\n\n")
 	b.WriteString("Emit exactly this JSON shape. All fields shown; omit `concerns` and `free_form` when empty:\n\n")
 	b.WriteString("{\n")
@@ -835,6 +894,15 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("      \"note\": \"<free-form explanation of the concern>\"\n")
 	b.WriteString("    }\n")
 	b.WriteString("  ],\n")
+	if len(t.PriorConcerns) > 0 {
+		b.WriteString("  \"concern_resolutions\": [\n")
+		b.WriteString("    {\n")
+		b.WriteString("      \"id\": \"<the concern id from the Prior concerns section above>\",\n")
+		b.WriteString("      \"resolution\": \"confirmed\" | \"reopened\" | \"superseded\",\n")
+		b.WriteString("      \"note\": \"<optional short justification>\"\n")
+		b.WriteString("    }\n")
+		b.WriteString("  ],\n")
+	}
 	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
 	b.WriteString("}\n\n")
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -1275,5 +1276,325 @@ func TestImplementReviewLoop_ConcernInsertFailureDoesNotFailLoop(t *testing.T) {
 	}
 	if len(au.entriesByCategory("implement_reviewed")) != 1 {
 		t.Error("the implement_reviewed entry must still have appended")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Delta-verifying re-reviews + resolution processing (#984)
+// ---------------------------------------------------------------------------
+
+// TestImplementReviewLoop_ConfirmedResolutionTransitionsToAddressed is the
+// #984 wire → decode → process → store seam: a reviewer verdict carrying a
+// confirmed concern_resolutions entry transitions the seeded
+// addressed_pending row to addressed, and the resolutions are recorded on
+// the authoritative implement_reviewed audit payload.
+func TestImplementReviewLoop_ConfirmedResolutionTransitionsToAddressed(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "unhandled error path")
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{row.ID}, "routed"); err != nil {
+		t.Fatalf("seed addressed_pending: %v", err)
+	}
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict: planreview.VerdictApprove,
+			ConcernResolutions: []planreview.ConcernResolution{
+				{ID: row.ID.String(), Resolution: "confirmed", Note: "the fixup handles the error"},
+			},
+		},
+		model: "claude-opus-4-8",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author")
+
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
+	if rows[0].State != concern.StateAddressed {
+		t.Errorf("state = %q, want addressed", rows[0].State)
+	}
+	if rows[0].StateReason != "the fixup handles the error" {
+		t.Errorf("state_reason = %q, want the resolution note", rows[0].StateReason)
+	}
+
+	reviewed := au.entriesByCategory("implement_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1", len(reviewed))
+	}
+	var p planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(reviewed[0].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if len(p.ConcernResolutions) != 1 || p.ConcernResolutions[0].ID != row.ID.String() ||
+		p.ConcernResolutions[0].Resolution != "confirmed" {
+		t.Errorf("payload resolutions = %+v, want the confirmed entry recorded authoritatively", p.ConcernResolutions)
+	}
+}
+
+// TestImplementReviewLoop_ReopenWinsBothOrders pins #984's REOPEN WINS
+// contract across heterogeneous reviewers in BOTH arrival orders: a
+// confirm landing before the reopen is overridden (addressed → reopened
+// is a valid edge), and a confirm landing after the reopen is rejected
+// by the state machine (reopened → addressed is absent, warn-skipped).
+// Both interleavings end reopened — order-independent, no reconciliation
+// pass.
+func TestImplementReviewLoop_ReopenWinsBothOrders(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		resolutions [2]string // reviewer A's then reviewer B's resolution
+	}{
+		{"confirm_then_reopen", [2]string{"confirmed", "reopened"}},
+		{"reopen_then_confirm", [2]string{"reopened", "confirmed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			au := newSeqAuditFake()
+			cr := newFakeConcernRepo()
+			s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+			runID, stageID := uuid.New(), uuid.New()
+
+			row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "contested concern")
+			if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{row.ID}, "routed"); err != nil {
+				t.Fatalf("seed addressed_pending: %v", err)
+			}
+
+			revA := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{
+					Verdict:            planreview.VerdictApprove,
+					ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: tc.resolutions[0]}},
+				},
+				model: "claude-opus-4-8",
+			}
+			revB := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{
+					Verdict:            planreview.VerdictApprove,
+					ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: tc.resolutions[1]}},
+				},
+				model: "gpt-5.5",
+			}
+			s.runImplementReviewInvocations(context.Background(), runID, stageID,
+				[]reviewerInvocation{{reviewer: revA}, {reviewer: revB}},
+				planreview.AuthorityAdvisory, "prompt", "author")
+
+			rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
+			if rows[0].State != concern.StateReopened {
+				t.Errorf("state = %q, want reopened (reopen wins over confirm in order %v)", rows[0].State, tc.resolutions)
+			}
+		})
+	}
+}
+
+// TestImplementReviewLoop_SloppyResolutionsWarnSkip: every malformed or
+// inapplicable resolution entry — garbage UUID, unknown ID, unknown
+// resolution string, a plan-stage concern's ID — is warn-skipped while
+// the valid sibling entry still applies, and the loop returns normally.
+// A sloppy reviewer can never wedge the gate (#984 / #982 posture).
+func TestImplementReviewLoop_SloppyResolutionsWarnSkip(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	valid := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "valid concern")
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{valid.ID}, "routed"); err != nil {
+		t.Fatalf("seed addressed_pending: %v", err)
+	}
+	planConcern := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindPlan, 90, "plan-stage concern")
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict: planreview.VerdictApprove,
+			ConcernResolutions: []planreview.ConcernResolution{
+				{ID: "not-a-uuid", Resolution: "confirmed"},
+				{ID: uuid.NewString(), Resolution: "confirmed"},        // unknown ID
+				{ID: planConcern.ID.String(), Resolution: "confirmed"}, // plan-stage concern
+				{ID: valid.ID.String(), Resolution: "fixed-i-promise"}, // unknown resolution string
+				{ID: valid.ID.String(), Resolution: "confirmed"},       // the valid sibling
+			},
+		},
+		model: "claude-opus-4-8",
+	}
+	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author")
+	if hasRejection {
+		t.Error("hasRejection = true, want false (sloppy resolutions must not affect the verdict)")
+	}
+
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{valid.ID, planConcern.ID})
+	if rows[0].State != concern.StateAddressed {
+		t.Errorf("valid concern state = %q, want addressed (valid sibling still applied)", rows[0].State)
+	}
+	if rows[1].State != concern.StateRaised {
+		t.Errorf("plan concern state = %q, want raised (a reviewer can never touch a plan-stage concern)", rows[1].State)
+	}
+}
+
+// TestShipTrace_ImplementReview_PriorConcernsThreadedIntoPrompt is the
+// #984 cross-boundary prompt test: seeded addressed_pending AND waived
+// concern rows for the stage reach the built reviewer prompt's delta-
+// verification section end-to-end through the trace-upload path —
+// the waived one with the operator's audited reason and the not-
+// re-litigable framing, the addressed_pending one under the mandatory-
+// resolution rule.
+func TestShipTrace_ImplementReview_PriorConcernsThreadedIntoPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+
+	pending := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 100, "unhandled error path")
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{pending.ID}, "routed"); err != nil {
+		t.Fatalf("seed addressed_pending: %v", err)
+	}
+	waived := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 101, "doc companion drift")
+	if _, err := cr.ApplyResolution(context.Background(), waived.ID, concern.StateWaived, "accepted trade-off"); err != nil {
+		t.Fatalf("seed waived: %v", err)
+	}
+	// A foreign-stage concern must NOT thread into this stage's prompt.
+	foreign := seedConcernRow(t, cr, runRow.ID, uuid.New(), concern.StageKindImplement, 102, "other-stage concern")
+
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"### Prior concerns (delta verification)",
+		pending.ID.String(),
+		"state: addressed_pending",
+		"you MUST emit exactly one entry in the verdict's `concern_resolutions` array",
+		waived.ID.String(),
+		"state: waived",
+		"operator waive reason: accepted trade-off",
+		"MUST NOT re-raise or re-litigate a waived concern",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q from threaded prior concerns:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, foreign.ID.String()) {
+		t.Errorf("reviewer prompt must not carry another stage's concern %s:\n%s", foreign.ID, got)
+	}
+}
+
+// TestShipTrace_ImplementReview_NoConcerns_PromptUnchanged: a stage with
+// no recorded concerns dispatches a review prompt with neither the
+// prior-concerns section nor the schema's concern_resolutions member —
+// the first review's prompt is unchanged from the pre-#984 output (the
+// byte-level identity is pinned in prompt_test.go; this guards the
+// trace-handler seam).
+func TestShipTrace_ImplementReview_NoConcerns_PromptUnchanged(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	s.cfg.ConcernRepo = newFakeConcernRepo()
+
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	if strings.Contains(got, "### Prior concerns") {
+		t.Errorf("concern-free stage must not render the prior-concerns section:\n%s", got)
+	}
+	if strings.Contains(got, "concern_resolutions") {
+		t.Errorf("concern-free stage must not extend the verdict schema:\n%s", got)
+	}
+}
+
+// TestWaiveConcern_SuppressedFromOpenConcernsButThreadedIntoPrompt is the
+// #984 done-means end-to-end: after the operator waives a concern through
+// the real handler, it disappears from GET /v0/runs/{id}'s open-states-
+// only concerns block AND appears only in the next re-review prompt's
+// not-re-litigable section.
+func TestWaiveConcern_SuppressedFromOpenConcernsButThreadedIntoPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+
+	stillOpen := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 100, "still open")
+	toWaive := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 101, "waive me")
+
+	// Waive through the real handler so the audit-first contract runs.
+	if w := postWaive(t, s, toWaive.ID.String(), waiveConcernRequest{Reason: "false positive"}); w.Code != http.StatusOK {
+		t.Fatalf("waive status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// The run's concerns block lists ONLY the open concern.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runRow.ID.String(), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get run status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal run: %v", err)
+	}
+	if resp.Concerns == nil {
+		t.Fatalf("concerns block missing:\n%s", w.Body.String())
+	}
+	if resp.Concerns.Open != 1 {
+		t.Errorf("concerns.open = %d, want 1 (the waived concern is suppressed)", resp.Concerns.Open)
+	}
+	for _, item := range resp.Concerns.Items {
+		if item.ID == toWaive.ID {
+			t.Errorf("waived concern %s listed in the open-concerns block", toWaive.ID)
+		}
+	}
+
+	// The re-review prompt carries the waived concern ONLY in the
+	// not-re-litigable prior-concerns section, with the audited reason.
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	wr := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if wr.Code != http.StatusAccepted {
+		t.Fatalf("ship status = %d, want 202:\n%s", wr.Code, wr.Body.String())
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"### Prior concerns (delta verification)",
+		toWaive.ID.String(),
+		"state: waived",
+		"operator waive reason: false positive",
+		stillOpen.ID.String(),
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q:\n%s", want, got)
+		}
 	}
 }
