@@ -304,6 +304,9 @@ func implementDiffBundleWithGateEvidence(t *testing.T, files []map[string]string
 		"scope_facts": map[string]any{
 			"declared_files": 2, "staged_files": 1,
 			"undeclared_paths": []string{"backend/internal/foo/helper.go"},
+			"undeclared_categorized": []map[string]any{
+				{"path": "backend/internal/foo/helper.go", "category": "A", "disposition": "excluded_from_commit"},
+			},
 		},
 	})
 	evidenceLine, _ := json.Marshal(map[string]any{
@@ -357,7 +360,10 @@ func TestShipTrace_ImplementReview_GateEvidenceThreadedIntoPrompt(t *testing.T) 
 		"Verify summary: outcome=failed (iterations 1/3)",
 		"- declared scope.files: 2",
 		"- files staged into the commit: 1",
-		"backend/internal/foo/helper.go",
+		// The per-path drift category (#991) crosses the wire-decode →
+		// server-map → render seam intact.
+		"- backend/internal/foo/helper.go (category A: agent edit to a tracked file EXCLUDED from the commit — " +
+			"the pushed head may be missing a required change)",
 		// The softened non-goals preamble defers to the evidence section.
 		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section above",
 	} {

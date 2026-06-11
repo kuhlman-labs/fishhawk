@@ -271,11 +271,27 @@ type VerifySummaryEvidence struct {
 // the commit (a pointer so "no git_diff event ran" stays
 // distinguishable from a real zero-file diff), and the scope_drift
 // undeclared list (paths the agent dirtied that were EXCLUDED from
-// the commit).
+// the commit). UndeclaredCategorized is the per-path A/B
+// categorization of the same list (#991); older runners don't emit it,
+// so it decodes nil and UndeclaredPaths stays the authoritative list.
 type ScopeFactsEvidence struct {
-	DeclaredFiles   int      `json:"declared_files"`
-	StagedFiles     *int     `json:"staged_files,omitempty"`
-	UndeclaredPaths []string `json:"undeclared_paths,omitempty"`
+	DeclaredFiles         int                 `json:"declared_files"`
+	StagedFiles           *int                `json:"staged_files,omitempty"`
+	UndeclaredPaths       []string            `json:"undeclared_paths,omitempty"`
+	UndeclaredCategorized []DriftPathEvidence `json:"undeclared_categorized,omitempty"`
+}
+
+// DriftPathEvidence is one categorized scope-drift path (#991):
+// category "A" is an agent edit to a tracked file excluded from the
+// commit (the pushed head may be missing a required change); "B" is a
+// file created out of scope. Disposition is what enforcement did with
+// the path ("excluded_from_commit" | "would_fail_loud"). Mirrors the
+// runner's driftPathEvidence — the json tags MUST stay identical to
+// the composer, same lockstep wire contract as the parent payload.
+type DriftPathEvidence struct {
+	Path        string `json:"path"`
+	Category    string `json:"category"`
+	Disposition string `json:"disposition,omitempty"`
 }
 
 // PolicyViolationEvidence is one digested constraint-violation

@@ -217,6 +217,10 @@ func TestComposeGateEvidence_ScopeFactsAndViolations(t *testing.T) {
 		{Kind: "policy_event", Payload: agent.MakePayload(map[string]any{
 			"check": "scope_drift", "outcome": "excluded",
 			"undeclared": []string{"stray/file.go", "other/thing.md"},
+			"undeclared_categorized": []driftPathEvidence{
+				{Path: "stray/file.go", Category: "A", Disposition: "excluded_from_commit"},
+				{Path: "other/thing.md", Category: "B", Disposition: "would_fail_loud"},
+			},
 		})},
 		{Kind: "policy_event", Payload: agent.MakePayload(map[string]any{
 			"check": "constraints", "outcome": "violation",
@@ -249,6 +253,18 @@ func TestComposeGateEvidence_ScopeFactsAndViolations(t *testing.T) {
 			t.Errorf("undeclared_paths[%d] = %q, want %q", i, sf.UndeclaredPaths[i], w)
 		}
 	}
+	wantCategorized := []driftPathEvidence{
+		{Path: "stray/file.go", Category: "A", Disposition: "excluded_from_commit"},
+		{Path: "other/thing.md", Category: "B", Disposition: "would_fail_loud"},
+	}
+	if len(sf.UndeclaredCategorized) != len(wantCategorized) {
+		t.Fatalf("undeclared_categorized = %+v, want %+v", sf.UndeclaredCategorized, wantCategorized)
+	}
+	for i, w := range wantCategorized {
+		if sf.UndeclaredCategorized[i] != w {
+			t.Errorf("undeclared_categorized[%d] = %+v, want %+v", i, sf.UndeclaredCategorized[i], w)
+		}
+	}
 
 	if len(p.PolicyViolations) != 1 {
 		t.Fatalf("policy_violations = %d, want 1", len(p.PolicyViolations))
@@ -268,6 +284,30 @@ func TestComposeGateEvidence_ScopeFactsAndViolations(t *testing.T) {
 	pv := decodeEvidence(t, composeGateEvidence(valid, 3))
 	if len(pv.PolicyViolations) != 0 {
 		t.Errorf("valid policy_event produced violations: %+v", pv.PolicyViolations)
+	}
+}
+
+func TestComposeGateEvidence_UncategorizedDriftStaysNil(t *testing.T) {
+	// A scope_drift event without the additive undeclared_categorized
+	// key (an older emitter, or the categorize-failed degradation path)
+	// must still surface the undeclared list while leaving the
+	// categorized slice nil — the tolerant-decode contract (#991).
+	events := []agent.Event{
+		{Kind: "policy_event", Payload: agent.MakePayload(map[string]any{
+			"check": "scope_drift", "outcome": "excluded",
+			"undeclared": []string{"stray/file.go"},
+		})},
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 2))
+	sf := p.ScopeFacts
+	if sf == nil {
+		t.Fatal("scope_facts missing")
+	}
+	if len(sf.UndeclaredPaths) != 1 || sf.UndeclaredPaths[0] != "stray/file.go" {
+		t.Errorf("undeclared_paths = %v, want [stray/file.go]", sf.UndeclaredPaths)
+	}
+	if sf.UndeclaredCategorized != nil {
+		t.Errorf("undeclared_categorized = %+v, want nil", sf.UndeclaredCategorized)
 	}
 }
 
