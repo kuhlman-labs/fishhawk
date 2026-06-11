@@ -65,9 +65,15 @@ type ScopePrecheckPayload struct {
 // Best-effort throughout: every failure path WARN-logs and returns
 // without unwinding the upload, matching runPlanReviews' degradation
 // contract.
-func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID, planBody []byte) {
+//
+// Returns the computed result payload so handleShipPlan can thread it
+// into the plan-review prompt's gate-evidence section (#963); nil on
+// every fail-open path (no result was computed). An audit-append failure
+// still returns the computed result — the entry is observability, the
+// evaluation itself succeeded.
+func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID, planBody []byte) *ScopePrecheckPayload {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
-		return
+		return nil
 	}
 
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
@@ -76,14 +82,14 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return
+		return nil
 	}
 
 	constraints, implStageID, ok := s.resolveImplementConstraints(ctx, runRow)
 	if !ok {
 		// Fail-open: no spec, unparseable spec, or no implement stage —
 		// nothing to check against, so write nothing and never block.
-		return
+		return nil
 	}
 
 	// Validation already passed in handleShipPlan; a parse failure here
@@ -94,7 +100,7 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return
+		return nil
 	}
 
 	diff := policy.Diff{}
@@ -113,13 +119,14 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 		violations = []policy.Violation{}
 	}
 
-	payload, _ := json.Marshal(ScopePrecheckPayload{
+	result := &ScopePrecheckPayload{
 		WorkflowID:       runRow.WorkflowID,
 		ImplementStageID: implStageID,
 		Violations:       violations,
 		ScannedFiles:     len(diff.ChangedFiles),
 		MaxFilesChanged:  constraints.MaxFilesChanged,
-	})
+	}
+	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
@@ -135,6 +142,7 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 			slog.String("error", aerr.Error()),
 		)
 	}
+	return result
 }
 
 // resolveImplementConstraints reads the run's workflow spec, finds the

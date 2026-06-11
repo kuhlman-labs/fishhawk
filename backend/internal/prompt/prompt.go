@@ -280,6 +280,16 @@ type Trigger struct {
 	// (run 07bce059). Nil (older bundles, no gate ran, extraction error)
 	// omits the section and keeps the prompt byte-identical to today.
 	GateEvidence *GateEvidence
+
+	// PlanGateEvidence carries the backend-computed plan-gate results —
+	// the plan_scope_precheck verdict against the implement stage's path
+	// constraints and the plan_surface_sweep sibling-surface findings —
+	// into the plan-review prompt (#963). Populated by runPlanReviews from
+	// the results handleShipPlan's synchronous gates return; path/count
+	// data only, no redaction needed. Nil (both gates failed open, or any
+	// non-plan-review build) omits the "### Gate evidence" section and
+	// keeps the prompt byte-identical to the pre-#963 output.
+	PlanGateEvidence *PlanGateEvidence
 }
 
 // GateEvidence is the prompt-side mirror of bundle.GateEvidence (#963):
@@ -337,6 +347,55 @@ type GatePolicyViolation struct {
 	Constraint string
 	Detail     string
 	Files      []string
+}
+
+// PlanGateEvidence is the plan-side gate evidence rendered into the
+// plan-review prompt's "### Gate evidence" section (#963). Each sub-result
+// is nil when its gate failed open (no result computed), in which case
+// only the available subsection renders; both nil is equivalent to a nil
+// PlanGateEvidence (section omitted).
+type PlanGateEvidence struct {
+	ScopePrecheck *ScopePrecheckEvidence
+	SurfaceSweep  *SurfaceSweepEvidence
+}
+
+// ScopePrecheckEvidence is the plan_scope_precheck result: the plan's
+// scope.files evaluated against the implement stage's path constraints
+// (forbidden_paths / allowed_paths / max_files_changed). An empty
+// Violations means "checked and clean", which renders explicitly so the
+// reviewer can tell it apart from "never checked" (nil ScopePrecheck).
+type ScopePrecheckEvidence struct {
+	ImplementStageID string
+	ScannedFiles     int
+	// MaxFilesChanged is the resolved implement-stage cap; 0 means no cap
+	// configured (line omitted).
+	MaxFilesChanged int
+	Violations      []GateViolation
+}
+
+// GateViolation is one machine-verified constraint hit in the scope
+// pre-check, mirroring the policy-evaluator violation shape without
+// importing the policy package.
+type GateViolation struct {
+	Constraint string
+	Detail     string
+	Files      []string
+}
+
+// SurfaceSweepEvidence is the plan_surface_sweep result: the plan's
+// scope.files evaluated against the static multi-surface lockstep
+// registry. Empty Findings means "checked and clean".
+type SurfaceSweepEvidence struct {
+	ScannedFiles int
+	Findings     []SurfaceSweepFindingEvidence
+}
+
+// SurfaceSweepFindingEvidence is one missing-sibling finding: the plan
+// touches TriggerPath but omits the pattern's required sibling surfaces.
+type SurfaceSweepFindingEvidence struct {
+	Pattern         string
+	TriggerPath     string
+	MissingSiblings []string
 }
 
 // PriorConcern is one previously recorded concern rendered into the
@@ -754,6 +813,13 @@ func buildPlanReview(t Trigger) string {
 	// they can assess whether the plan actually addresses the issue.
 	writeReviewIssueContext(&b, t)
 
+	// Gate evidence (#963): the plan gate's machine-verified results
+	// (scope pre-check + surface sweep), rendered so the reviewer never
+	// re-derives — or contradicts — what the gates already measured.
+	// Absent when neither gate produced a result (fail-open paths),
+	// keeping the prompt byte-identical to the pre-#963 output.
+	writePlanGateEvidence(&b, t.PlanGateEvidence)
+
 	// Verdict schema — inline so the reviewer doesn't need to fetch it.
 	// The JSON shape below is load-bearing and kept verbatim; surrounding
 	// prose is trimmed to keep the per-call token cost down (#606).
@@ -799,6 +865,57 @@ func buildPlanReview(t Trigger) string {
 
 	b.WriteString("Emit your verdict now. JSON only, no surrounding prose.\n")
 	return b.String()
+}
+
+// writePlanGateEvidence renders the plan-review prompt's "### Gate
+// evidence" section (#963): the backend's synchronous plan-gate results,
+// presented as machine-verified ground truth that outranks the reviewer's
+// own text-level findings. Writes nothing when no gate produced a result,
+// so the no-evidence prompt stays byte-identical to the pre-#963 output.
+func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
+	if ev == nil || (ev.ScopePrecheck == nil && ev.SurfaceSweep == nil) {
+		return
+	}
+	b.WriteString("### Gate evidence (machine-verified — outranks text-level findings)\n\n")
+	b.WriteString("The plan gate ran the machine checks below against this plan before dispatching review. " +
+		"Their results are ground truth: a violation or finding listed here MUST be recorded as a " +
+		"high-severity concern and named FIRST among your concerns — it outranks any stylistic or " +
+		"text-level finding, and once recorded you may shortcut the remaining review criteria. " +
+		"A clean result does NOT certify plan quality: every review criterion below still applies.\n\n")
+
+	if pc := ev.ScopePrecheck; pc != nil {
+		b.WriteString("Scope pre-check (scope.files evaluated against the implement stage's path constraints):\n\n")
+		fmt.Fprintf(b, "- files scanned: %d\n", pc.ScannedFiles)
+		if pc.MaxFilesChanged > 0 {
+			fmt.Fprintf(b, "- max_files_changed cap: %d\n", pc.MaxFilesChanged)
+		}
+		if len(pc.Violations) == 0 {
+			b.WriteString("- violations: none (checked and clean)\n")
+		} else {
+			for _, v := range pc.Violations {
+				fmt.Fprintf(b, "- VIOLATION %s: %s", v.Constraint, v.Detail)
+				if len(v.Files) > 0 {
+					fmt.Fprintf(b, " [%s]", strings.Join(v.Files, ", "))
+				}
+				b.WriteString("\n")
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	if sw := ev.SurfaceSweep; sw != nil {
+		b.WriteString("Surface sweep (multi-surface lockstep patterns):\n\n")
+		fmt.Fprintf(b, "- files scanned: %d\n", sw.ScannedFiles)
+		if len(sw.Findings) == 0 {
+			b.WriteString("- findings: none (checked and clean)\n")
+		} else {
+			for _, f := range sw.Findings {
+				fmt.Fprintf(b, "- MISSING SIBLINGS (%s): %s is in scope but the pattern's required sibling(s) are absent from scope.files: %s\n",
+					f.Pattern, f.TriggerPath, strings.Join(f.MissingSiblings, ", "))
+			}
+		}
+		b.WriteString("\n")
+	}
 }
 
 // buildImplementReview constructs the constrained prompt for an

@@ -1399,6 +1399,132 @@ func TestBuild_PlanReview_NoIssueContext_SectionAbsent(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_Renders pins the "### Gate evidence"
+// section (#963): with both gate results present, the prompt must carry
+// the outrank guidance, the scope pre-check violation with its files, the
+// cap line, and the surface-sweep missing-sibling finding.
+func TestBuild_PlanReview_GateEvidence_Renders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopePrecheck: &ScopePrecheckEvidence{
+				ImplementStageID: "implement",
+				ScannedFiles:     4,
+				MaxFilesChanged:  45,
+				Violations: []GateViolation{
+					{
+						Constraint: "forbidden_paths",
+						Detail:     "path matches forbidden pattern .github/workflows/**",
+						Files:      []string{".github/workflows/ci.yml"},
+					},
+				},
+			},
+			SurfaceSweep: &SurfaceSweepEvidence{
+				ScannedFiles: 4,
+				Findings: []SurfaceSweepFindingEvidence{
+					{
+						Pattern:         "audit kind requires surfaces doc",
+						TriggerPath:     "backend/internal/issuecomment/notifier.go",
+						MissingSiblings: []string{"docs/issue-comment-surfaces.md"},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"high-severity concern and named FIRST",
+		"A clean result does NOT certify plan quality",
+		"Scope pre-check",
+		"- files scanned: 4",
+		"- max_files_changed cap: 45",
+		"- VIOLATION forbidden_paths: path matches forbidden pattern .github/workflows/** [.github/workflows/ci.yml]",
+		"Surface sweep",
+		"- MISSING SIBLINGS (audit kind requires surfaces doc): backend/internal/issuecomment/notifier.go is in scope but the pattern's required sibling(s) are absent from scope.files: docs/issue-comment-surfaces.md",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing gate-evidence element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_CleanResultsRenderExplicitly verifies
+// the "checked and clean" rendering: empty violations/findings must show
+// as explicit clean lines, never as silently absent subsections, so the
+// reviewer can tell "checked and clean" apart from "never checked".
+func TestBuild_PlanReview_GateEvidence_CleanResultsRenderExplicitly(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopePrecheck: &ScopePrecheckEvidence{ScannedFiles: 2},
+			SurfaceSweep:  &SurfaceSweepEvidence{ScannedFiles: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"- violations: none (checked and clean)",
+		"- findings: none (checked and clean)",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing clean-result line %q:\n%s", w, got)
+		}
+	}
+	// No cap configured (0) must omit the cap line rather than print 0.
+	if strings.Contains(got, "max_files_changed cap") {
+		t.Errorf("cap line must be omitted when MaxFilesChanged is 0:\n%s", got)
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_AbsentWhenNil pins the #984-style
+// additive property: a nil (or empty) PlanGateEvidence leaves the
+// plan-review prompt byte-identical to omitting the field, with no
+// gate-evidence section rendered.
+func TestBuild_PlanReview_GateEvidence_AbsentWhenNil(t *testing.T) {
+	base := Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	}
+	gotBase, err := Build("plan_review", base)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	withNil := base
+	withNil.PlanGateEvidence = nil
+	gotNil, err := Build("plan_review", withNil)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// A non-nil evidence struct whose sub-results are both nil is the
+	// "every gate failed open" shape — it must also omit the section.
+	withEmpty := base
+	withEmpty.PlanGateEvidence = &PlanGateEvidence{}
+	gotEmpty, err := Build("plan_review", withEmpty)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if strings.Contains(gotBase, "### Gate evidence") {
+		t.Errorf("gate-evidence section should be absent when PlanGateEvidence is unset:\n%s", gotBase)
+	}
+	if gotNil != gotBase {
+		t.Errorf("explicit-nil PlanGateEvidence must be byte-identical to omitting it")
+	}
+	if gotEmpty != gotBase {
+		t.Errorf("PlanGateEvidence with both sub-results nil must be byte-identical to omitting it")
+	}
+}
+
 func TestBuild_PlanReview_ReviewCriteriaPresent(t *testing.T) {
 	got, err := Build("plan_review", Trigger{
 		Repo:         "x/y",
