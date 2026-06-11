@@ -2,9 +2,11 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -81,6 +83,34 @@ func TestHelperProcess(t *testing.T) {
 		// backslash are double-escaped here because the text is itself a JSON
 		// string value inside the JSONL line.
 		fmt.Println(`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"` + "```json\\n{\\\"verdict\\\":\\\"reject\\\",\\\"free_form\\\":\\\"redact ghs_[A-Za-z0-9_.\\\\-]{36,}\\\"}\\n```" + `"}}`)
+		fmt.Println(usageLine)
+	case "echo_cwd":
+		// The #995 workspace-bound probe: approve only when this child is
+		// running from an EMPTY directory distinct from the parent test
+		// process's cwd (passed via HELPER_PARENT_CWD) — i.e. the adapter set
+		// cmd.Dir to a fresh scratch dir, leaving the agentic sandbox nothing
+		// to read. The free_form carries the observed cwd for diagnosis.
+		verdict := "approve"
+		detail := ""
+		wd, err := os.Getwd()
+		switch {
+		case err != nil:
+			verdict, detail = "reject", "getwd failed: "+err.Error()
+		case wd == os.Getenv("HELPER_PARENT_CWD"):
+			verdict, detail = "reject", "cwd is the parent process cwd: "+wd
+		default:
+			if entries, rerr := os.ReadDir(wd); rerr != nil {
+				verdict, detail = "reject", "readdir failed: "+rerr.Error()
+			} else if len(entries) > 0 {
+				verdict, detail = "reject", fmt.Sprintf("cwd %s not empty: %d entries", wd, len(entries))
+			}
+		}
+		body, _ := json.Marshal(map[string]string{"verdict": verdict, "free_form": detail})
+		line, _ := json.Marshal(map[string]any{
+			"type": "item.completed",
+			"item": map[string]string{"id": "item_0", "type": "agent_message", "text": string(body)},
+		})
+		fmt.Println(string(line))
 		fmt.Println(usageLine)
 	case "echo_env":
 		// Approve only if the adapter forwarded the expected OPENAI_API_KEY;
@@ -209,9 +239,13 @@ func TestInference_HappyUsage(t *testing.T) {
 	if !usage.Known {
 		t.Error("Usage.Known = false, want true for a transcript with a turn.completed usage line")
 	}
-	// 1234 input; 567 output + 33 reasoning = 600 output.
+	// 1234 input (incl. 100 cached); 567 output + 33 reasoning = 600 output;
+	// one turn.completed line = 1 turn (#995).
 	if usage.InputTokens != 1234 || usage.OutputTokens != 600 {
 		t.Errorf("Usage = %+v, want {InputTokens:1234 OutputTokens:600 Known:true}", usage)
+	}
+	if usage.CachedInputTokens != 100 || usage.Turns != 1 {
+		t.Errorf("Usage = %+v, want CachedInputTokens=100 Turns=1", usage)
 	}
 }
 
@@ -494,11 +528,14 @@ func TestInference_ArgvModelAndEffort(t *testing.T) {
 }
 
 // TestParseStream_SumsMultipleTurns asserts usage is SUMMED across multiple
-// turn.completed lines rather than last-wins.
+// turn.completed lines rather than last-wins, including the #995
+// instrumentation: cached_input_tokens sums alongside and turns counts the
+// turn.completed lines, so a multi-turn agentic blowup is recorded data.
 func TestParseStream_SumsMultipleTurns(t *testing.T) {
 	out := []byte(`{"type":"item.completed","item":{"type":"agent_message","text":"{\"verdict\":\"approve\"}"}}
-{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":8,"reasoning_output_tokens":2}}
-{"type":"turn.completed","usage":{"input_tokens":50,"cached_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":1}}`)
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":30,"output_tokens":8,"reasoning_output_tokens":2}}
+{"type":"turn.completed","usage":{"input_tokens":50,"cached_input_tokens":20,"output_tokens":4,"reasoning_output_tokens":1}}
+{"type":"turn.completed","usage":{"input_tokens":25,"cached_input_tokens":10,"output_tokens":2,"reasoning_output_tokens":0}}`)
 	text, usage, err := parseStream(out)
 	if err != nil {
 		t.Fatalf("parseStream: %v", err)
@@ -506,7 +543,95 @@ func TestParseStream_SumsMultipleTurns(t *testing.T) {
 	if text != `{"verdict":"approve"}` {
 		t.Errorf("text = %q, want the verdict body", text)
 	}
-	if usage.InputTokens != 150 || usage.OutputTokens != 15 || !usage.Known {
-		t.Errorf("Usage = %+v, want {InputTokens:150 OutputTokens:15 Known:true}", usage)
+	if usage.InputTokens != 175 || usage.OutputTokens != 17 || !usage.Known {
+		t.Errorf("Usage = %+v, want {InputTokens:175 OutputTokens:17 Known:true}", usage)
+	}
+	if usage.CachedInputTokens != 60 {
+		t.Errorf("CachedInputTokens = %d, want 60 (summed across turns)", usage.CachedInputTokens)
+	}
+	if usage.Turns != 3 {
+		t.Errorf("Turns = %d, want 3 (one per turn.completed line)", usage.Turns)
+	}
+}
+
+// TestInference_ScratchDirWorkspace pins the #995 workspace bound: the codex
+// subprocess runs from a fresh EMPTY scratch directory distinct from the
+// fishhawkd process cwd (verified by the child itself via the echo_cwd probe),
+// the prompt remains the SOLE positional argument (the composed context the
+// reviewer receives is exactly the server-built prompt — nothing rides in via
+// argv), and the scratch dir is removed after the invocation.
+func TestInference_ScratchDirWorkspace(t *testing.T) {
+	const prompt = "review this plan"
+	parentCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Setenv("HELPER_PARENT_CWD", parentCwd)
+
+	c := NewClient(testConfig())
+	var capturedArgs []string
+	var capturedCmd *exec.Cmd
+	build := helperCommand("echo_cwd")
+	c.Cmd = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		capturedArgs = append([]string(nil), args...)
+		capturedCmd = build(ctx, name, args...)
+		return capturedCmd
+	}
+
+	text, _, _, err := c.Inference(context.Background(), prompt)
+	if err != nil {
+		t.Fatalf("Inference: %v", err)
+	}
+	// The child approves only when its observed cwd is an empty directory
+	// distinct from the parent cwd; its free_form names the failure cause.
+	if !strings.Contains(text, `"verdict":"approve"`) {
+		t.Errorf("child cwd probe rejected the workspace: %s", text)
+	}
+	// The prompt is the sole positional arg, after the pinned flag set.
+	wantArgv := []string{
+		"exec", "--json", "--skip-git-repo-check",
+		"--model", "gpt-5-codex",
+		prompt,
+	}
+	if !slices.Equal(capturedArgs, wantArgv) {
+		t.Errorf("argv = %q, want %q", capturedArgs, wantArgv)
+	}
+	// cmd.Dir was pointed at a scratch dir, not inherited (empty) or the
+	// process cwd — and the deferred cleanup removed it.
+	if capturedCmd.Dir == "" {
+		t.Fatal("cmd.Dir is unset — the child inherits the fishhawkd cwd (the #995 unbounded-workspace regression)")
+	}
+	if capturedCmd.Dir == parentCwd {
+		t.Errorf("cmd.Dir = %q is the process cwd, want a fresh scratch dir", capturedCmd.Dir)
+	}
+	if _, serr := os.Stat(capturedCmd.Dir); !os.IsNotExist(serr) {
+		t.Errorf("scratch dir %q still exists after the invocation (stat err = %v), want it removed", capturedCmd.Dir, serr)
+	}
+}
+
+// TestInference_ScratchDirFailureFailsClosed asserts the MkdirTemp-failure
+// branch FAILS CLOSED (#995 approval condition): when the scratch workspace
+// cannot be created, the invocation errors before the subprocess is ever
+// spawned — a review that silently regained an unbounded workspace would
+// defeat the bound. The per-invocation failure degrades the advisory review
+// gracefully server-side (#955 path).
+func TestInference_ScratchDirFailureFailsClosed(t *testing.T) {
+	// os.MkdirTemp("", ...) resolves os.TempDir() from $TMPDIR per call on
+	// Unix; pointing it at a missing directory forces the failure.
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+
+	var attempts int
+	c := NewClient(testConfig())
+	c.Cmd = countingHelperCommand("happy", &attempts)
+
+	_, _, _, err := c.Inference(context.Background(), "review")
+	if err == nil {
+		t.Fatal("expected error when the scratch dir cannot be created, got nil (fail-open regression)")
+	}
+	if !strings.Contains(err.Error(), "scratch workspace dir") {
+		t.Errorf("error = %q, want it to name the scratch workspace dir", err)
+	}
+	if attempts != 0 {
+		t.Errorf("attempts = %d, want 0 (the subprocess must never spawn without the workspace bound)", attempts)
 	}
 }

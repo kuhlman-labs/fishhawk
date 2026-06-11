@@ -1,9 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -17,13 +21,45 @@ import (
 // reviewer entry (plan_review / implement_review) from a runner stage-agent
 // entry (no source), and known_usage is the graceful-degradation marker.
 type reviewerCostPayload struct {
-	Model        string  `json:"model"`
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	USD          float64 `json:"usd"`
-	KnownModel   bool    `json:"known_model"`
-	KnownUsage   bool    `json:"known_usage"`
-	Source       string  `json:"source"`
+	Model             string  `json:"model"`
+	InputTokens       int     `json:"input_tokens"`
+	OutputTokens      int     `json:"output_tokens"`
+	CachedInputTokens int     `json:"cached_input_tokens"`
+	Turns             int     `json:"turns"`
+	USD               float64 `json:"usd"`
+	KnownModel        bool    `json:"known_model"`
+	KnownUsage        bool    `json:"known_usage"`
+	Source            string  `json:"source"`
+}
+
+// reviewedTokenFields decodes only the #995 token members of a persisted
+// plan_reviewed / implement_reviewed audit payload, pinning the wire field
+// names independently of the planreview payload structs.
+type reviewedTokenFields struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+// findReviewedTokens returns the token fields of the single audit entry with
+// the given category (plan_reviewed / implement_reviewed), failing the test
+// when none exists.
+func findReviewedTokens(t *testing.T, au *auditFake, category string) reviewedTokenFields {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i := range au.appended {
+		e := au.appended[i]
+		if e.Category != category {
+			continue
+		}
+		var p reviewedTokenFields
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode %s payload: %v", category, err)
+		}
+		return p
+	}
+	t.Fatalf("no %s audit entry found", category)
+	return reviewedTokenFields{}
 }
 
 // usageReviewer is a fake PlanReviewer backend that reports token usage
@@ -83,7 +119,7 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 	// and must NOT clobber that pin (#684).
 	const stageAgentModel = "claude-opus-4-8"
 	const reviewerModel = "claude-sonnet-4-6"
-	const inTok, outTok = 1000, 2000
+	const inTok, outTok, cachedTok, turns = 1000, 2000, 400, 3
 	wantUSD, ok := pricing.Cost(reviewerModel, inTok, outTok)
 	if !ok {
 		t.Fatalf("pricing.Cost ok=false for %q — fixture model must be priced", reviewerModel)
@@ -92,7 +128,10 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 	reviewer := &usageReviewer{
 		verdict: &planreview.ReviewVerdict{
 			Verdict: planreview.VerdictApprove,
-			Usage:   planreview.Usage{InputTokens: inTok, OutputTokens: outTok, Known: true},
+			// Fully populated usage (#995): the cached split and turn count
+			// must cross the adapter-contract → server-record → audit-payload
+			// seam end to end, alongside the priced token counts.
+			Usage: planreview.Usage{InputTokens: inTok, OutputTokens: outTok, CachedInputTokens: cachedTok, Turns: turns, Known: true},
 		},
 		model: reviewerModel,
 	}
@@ -116,11 +155,20 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 	if got.Model != reviewerModel || got.InputTokens != inTok || got.OutputTokens != outTok {
 		t.Errorf("plan_review cost payload mismatch: %+v", got)
 	}
+	if got.CachedInputTokens != cachedTok || got.Turns != turns {
+		t.Errorf("plan_review cost payload cached_input_tokens=%d turns=%d, want %d/%d (#995)", got.CachedInputTokens, got.Turns, cachedTok, turns)
+	}
 	if got.USD != wantUSD {
 		t.Errorf("plan_review usd = %v, want %v (pricing.Cost)", got.USD, wantUSD)
 	}
 	if !got.KnownModel || !got.KnownUsage {
 		t.Errorf("plan_review known_model=%v known_usage=%v, want both true", got.KnownModel, got.KnownUsage)
+	}
+
+	// The persisted plan_reviewed audit payload carries the invocation's token
+	// usage on the review surface itself (#995).
+	if rv := findReviewedTokens(t, au, "plan_reviewed"); rv.InputTokens != inTok || rv.OutputTokens != outTok {
+		t.Errorf("plan_reviewed payload tokens = %+v, want input_tokens=%d output_tokens=%d", rv, inTok, outTok)
 	}
 
 	// (ii) the per-run rollup folded it in via a real AddRunCost call.
@@ -161,7 +209,7 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	// DIFFERENT model) runs. The reviewer must not clobber that pin (#684).
 	const stageAgentModel = "claude-opus-4-8"
 	const reviewerModel = "claude-sonnet-4-6"
-	const inTok, outTok = 1500, 3000
+	const inTok, outTok, cachedTok, turns = 1500, 3000, 250, 2
 	wantUSD, ok := pricing.Cost(reviewerModel, inTok, outTok)
 	if !ok {
 		t.Fatalf("pricing.Cost ok=false for %q — fixture model must be priced", reviewerModel)
@@ -170,7 +218,8 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	reviewer := &usageReviewer{
 		verdict: &planreview.ReviewVerdict{
 			Verdict: planreview.VerdictApprove,
-			Usage:   planreview.Usage{InputTokens: inTok, OutputTokens: outTok, Known: true},
+			// Fully populated usage (#995), mirroring the plan-side seam test.
+			Usage: planreview.Usage{InputTokens: inTok, OutputTokens: outTok, CachedInputTokens: cachedTok, Turns: turns, Known: true},
 		},
 		model: reviewerModel,
 	}
@@ -197,11 +246,20 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	if got.Model != reviewerModel || got.InputTokens != inTok || got.OutputTokens != outTok {
 		t.Errorf("implement_review cost payload mismatch: %+v", got)
 	}
+	if got.CachedInputTokens != cachedTok || got.Turns != turns {
+		t.Errorf("implement_review cost payload cached_input_tokens=%d turns=%d, want %d/%d (#995)", got.CachedInputTokens, got.Turns, cachedTok, turns)
+	}
 	if got.USD != wantUSD {
 		t.Errorf("implement_review usd = %v, want %v (pricing.Cost)", got.USD, wantUSD)
 	}
 	if !got.KnownModel || !got.KnownUsage {
 		t.Errorf("implement_review known_model=%v known_usage=%v, want both true", got.KnownModel, got.KnownUsage)
+	}
+
+	// The persisted implement_reviewed audit payload carries the invocation's
+	// token usage on the review surface itself (#995), mirroring the plan side.
+	if rv := findReviewedTokens(t, au, "implement_reviewed"); rv.InputTokens != inTok || rv.OutputTokens != outTok {
+		t.Errorf("implement_reviewed payload tokens = %+v, want input_tokens=%d output_tokens=%d", rv, inTok, outTok)
 	}
 
 	// (ii) the per-run rollup folded it in via a real AddRunCost call.
@@ -229,6 +287,72 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	// (#684). This assertion fails on the pre-fix code that passed rec.Model.
 	if gotRun.ResolvedModel != stageAgentModel {
 		t.Errorf("run.ResolvedModel = %q, want %q (stage-agent pin must survive the reviewer)", gotRun.ResolvedModel, stageAgentModel)
+	}
+}
+
+// TestRecordReviewerCost_WarnCeiling asserts the #995 context-assembly
+// tripwire: recordReviewerCost WARN-logs when a reviewer invocation's KNOWN
+// input tokens exceed reviewerInputTokenWarnCeiling, and stays silent at or
+// below the ceiling and for unknown usage (whose token counts are
+// zero-value by contract and must not trip a misleading warning).
+func TestRecordReviewerCost_WarnCeiling(t *testing.T) {
+	tests := []struct {
+		name     string
+		usage    planreview.Usage
+		wantWarn bool
+	}{
+		{
+			name:     "above ceiling warns",
+			usage:    planreview.Usage{InputTokens: reviewerInputTokenWarnCeiling + 1, OutputTokens: 900, Turns: 12, Known: true},
+			wantWarn: true,
+		},
+		{
+			name:     "at ceiling stays silent",
+			usage:    planreview.Usage{InputTokens: reviewerInputTokenWarnCeiling, OutputTokens: 900, Turns: 1, Known: true},
+			wantWarn: false,
+		},
+		{
+			name:     "typical review stays silent",
+			usage:    planreview.Usage{InputTokens: 4053, OutputTokens: 900, Turns: 1, Known: true},
+			wantWarn: false,
+		},
+		{
+			name:     "unknown usage never warns",
+			usage:    planreview.Usage{Known: false},
+			wantWarn: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			s := New(Config{
+				Addr:      "127.0.0.1:0",
+				AuditRepo: newAuditFake(),
+				RunRepo:   newPromptRunRepo(),
+				Logger:    logger,
+			})
+
+			s.recordReviewerCost(context.Background(), runID, stageID, "gpt-5.5", tt.usage, "plan_review")
+
+			logs := buf.String()
+			gotWarn := strings.Contains(logs, "exceed warn ceiling")
+			if gotWarn != tt.wantWarn {
+				t.Fatalf("warn logged = %v, want %v; logs:\n%s", gotWarn, tt.wantWarn, logs)
+			}
+			if tt.wantWarn {
+				// The warning carries the locating attrs an operator needs.
+				for _, want := range []string{
+					runID.String(), stageID.String(), `"source":"plan_review"`,
+					`"model":"gpt-5.5"`, fmt.Sprintf(`"turns":%d`, tt.usage.Turns),
+				} {
+					if !strings.Contains(logs, want) {
+						t.Errorf("warn log missing %s; logs:\n%s", want, logs)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -296,4 +296,7 @@ func TestReviewer_PopulatesUsage(t *testing.T) {
 	if verdict.Usage.InputTokens != 100 || verdict.Usage.OutputTokens != 20 {
 		t.Errorf("Usage = %+v, want {InputTokens:100 OutputTokens:20 Known:true}", verdict.Usage)
 	}
+	if verdict.Usage.Turns != 1 {
+		t.Errorf("Usage.Turns = %d, want 1 (single Messages call)", verdict.Usage.Turns)
+	}
 }

@@ -51,10 +51,27 @@ type Concern struct {
 // usage leaves Known false (with zero-value token counts), and the server
 // records the cost at usd=0 with known_usage=false rather than guessing —
 // mirroring the cost/pricing unknown-model ok=false contract.
+//
+// Accounting asymmetry (#995): the backends do NOT report comparable raw
+// input figures. Codex's per-turn `input_tokens` already INCLUDES
+// `cached_input_tokens` (a cheaper subset, pinned against codex-cli
+// 0.137.0), while Anthropic-side `input_tokens` EXCLUDES cache reads and
+// cache writes (reported in separate usage fields). CachedInputTokens
+// carries the cached split so the two totals can be compared like-for-like,
+// and Turns makes a multi-turn agentic blowup (many turns each re-sending
+// the growing conversation) visible instead of a single opaque sum.
 type Usage struct {
 	InputTokens  int
 	OutputTokens int
-	Known        bool
+	// CachedInputTokens is the cache-served portion of the input-side count.
+	// For codex it is a subset of InputTokens; for the Anthropic-side
+	// adapters it is ADDITIONAL to InputTokens (cache_read + cache_creation).
+	CachedInputTokens int
+	// Turns is the number of model turns the invocation took: summed
+	// turn.completed lines for codex, 1 for the single-shot adapters
+	// (claudecode --print, anthropic Messages). 0 when unknown.
+	Turns int
+	Known bool
 }
 
 // ConcernResolution is one reviewer judgment on a PRIOR concern listed
@@ -212,6 +229,14 @@ type PlanReviewedPayload struct {
 	Verdict       Verdict       `json:"verdict"`
 	Concerns      []Concern     `json:"concerns,omitempty"`
 	FreeForm      string        `json:"free_form,omitempty"`
+
+	// InputTokens / OutputTokens surface the reviewer invocation's token
+	// usage on the review audit surface itself (#995), so a context-assembly
+	// blowup is visible where operators already read verdicts — not only in
+	// the cost_recorded ledger. omitempty keeps usage-free payloads
+	// byte-identical to pre-#995 entries.
+	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens int `json:"output_tokens,omitempty"`
 }
 
 // ImplementReviewedPayload is the JSON payload stored in an audit entry
@@ -239,4 +264,9 @@ type ImplementReviewedPayload struct {
 	// omitempty keeps resolution-free payloads byte-identical to
 	// pre-#984 entries, and old stored payloads decode unchanged.
 	ConcernResolutions []ConcernResolution `json:"concern_resolutions,omitempty"`
+
+	// InputTokens / OutputTokens mirror PlanReviewedPayload (#995): the
+	// reviewer invocation's token usage on the review audit surface.
+	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens int `json:"output_tokens,omitempty"`
 }

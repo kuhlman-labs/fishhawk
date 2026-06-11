@@ -31,6 +31,12 @@ func TestHelperProcess(t *testing.T) {
 	case "happy_usage":
 		// A success envelope carrying a top-level `usage` object (#681).
 		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\"}","usage":{"input_tokens":1234,"output_tokens":567}}`)
+	case "happy_usage_cache":
+		// A success envelope whose usage carries the cache members (#995). The
+		// field names are pinned against a live `claude --print --output-format
+		// json` envelope: input_tokens EXCLUDES the cache counts, which arrive
+		// as cache_read_input_tokens / cache_creation_input_tokens.
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\"}","usage":{"input_tokens":10,"output_tokens":41,"cache_read_input_tokens":11944,"cache_creation_input_tokens":7319}}`)
 	case "error":
 		// Non-zero exit stands in for a subprocess failure.
 		fmt.Fprintln(os.Stderr, "claude: model rate-limited")
@@ -472,6 +478,35 @@ func TestReviewer_PopulatesUsageFromEnvelope(t *testing.T) {
 	}
 	if verdict.Usage.InputTokens != 1234 || verdict.Usage.OutputTokens != 567 {
 		t.Errorf("Usage = %+v, want {InputTokens:1234 OutputTokens:567 Known:true}", verdict.Usage)
+	}
+	if verdict.Usage.Turns != 1 {
+		t.Errorf("Usage.Turns = %d, want 1 (single-shot --print)", verdict.Usage.Turns)
+	}
+	if verdict.Usage.CachedInputTokens != 0 {
+		t.Errorf("Usage.CachedInputTokens = %d, want 0 for an envelope without cache members", verdict.Usage.CachedInputTokens)
+	}
+}
+
+// TestReviewer_PopulatesCachedUsageFromEnvelope asserts the envelope's cache
+// members sum into Usage.CachedInputTokens with Turns=1 (#995), keeping
+// input_tokens as the cache-EXCLUSIVE Anthropic-side figure.
+func TestReviewer_PopulatesCachedUsageFromEnvelope(t *testing.T) {
+	verdict, _, err := reviewerWithMode("happy_usage_cache").Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if !verdict.Usage.Known {
+		t.Error("Usage.Known = false, want true for an envelope carrying a usage object")
+	}
+	if verdict.Usage.InputTokens != 10 || verdict.Usage.OutputTokens != 41 {
+		t.Errorf("Usage = %+v, want {InputTokens:10 OutputTokens:41}", verdict.Usage)
+	}
+	// cache_read 11944 + cache_creation 7319 = 19263.
+	if verdict.Usage.CachedInputTokens != 19263 {
+		t.Errorf("CachedInputTokens = %d, want 19263 (cache_read + cache_creation)", verdict.Usage.CachedInputTokens)
+	}
+	if verdict.Usage.Turns != 1 {
+		t.Errorf("Usage.Turns = %d, want 1 (single-shot --print)", verdict.Usage.Turns)
 	}
 }
 

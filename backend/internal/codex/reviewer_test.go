@@ -31,6 +31,11 @@ func TestReviewer_HappyPath(t *testing.T) {
 	if !verdict.Usage.Known || verdict.Usage.InputTokens != 1234 || verdict.Usage.OutputTokens != 600 {
 		t.Errorf("Usage = %+v, want {1234 600 true}", verdict.Usage)
 	}
+	// The #995 instrumentation rides the same pass-through: cached split and
+	// turn count reach the server contract unmodified.
+	if verdict.Usage.CachedInputTokens != 100 || verdict.Usage.Turns != 1 {
+		t.Errorf("Usage = %+v, want CachedInputTokens=100 Turns=1", verdict.Usage)
+	}
 }
 
 // TestReviewer_SubprocessError asserts a non-zero exit surfaces as an error.

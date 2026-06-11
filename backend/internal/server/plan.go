@@ -1087,6 +1087,9 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			Verdict:       verdict.Verdict,
 			Concerns:      verdict.Concerns,
 			FreeForm:      verdict.FreeForm,
+			// Per-invocation token usage on the review surface (#995).
+			InputTokens:  verdict.Usage.InputTokens,
+			OutputTokens: verdict.Usage.OutputTokens,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
