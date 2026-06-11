@@ -1583,6 +1583,24 @@ func TestCommitAndPush_FreshFetchBase_StashPopConflict(t *testing.T) {
 		t.Fatalf("CommitAndPush error = %v, want ErrBaseRebaseConflict", err)
 	}
 
+	// (a2) The error is the typed *BaseRebaseConflictError carrying the
+	// conflict context for the runner's bounded re-invoke (#989): the
+	// conflicted path, the conflict-marker hunks captured before the abort,
+	// and the agent's stashed patch captured after it.
+	var bre *BaseRebaseConflictError
+	if !errors.As(err, &bre) {
+		t.Fatalf("CommitAndPush error = %v, want *BaseRebaseConflictError via errors.As", err)
+	}
+	if len(bre.ConflictPaths) != 1 || bre.ConflictPaths[0] != "shared.txt" {
+		t.Errorf("ConflictPaths = %v, want [shared.txt]", bre.ConflictPaths)
+	}
+	if !strings.Contains(bre.ConflictHunks, "<<<<<<<") {
+		t.Errorf("ConflictHunks must contain conflict markers, got: %q", bre.ConflictHunks)
+	}
+	if !strings.Contains(bre.StashPatch, "agent-edited line") {
+		t.Errorf("StashPatch must contain the agent's stashed edit, got: %q", bre.StashPatch)
+	}
+
 	// (b) The stash entry survives the conflicted pop — recoverable.
 	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
 		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
@@ -1597,6 +1615,205 @@ func TestCommitAndPush_FreshFetchBase_StashPopConflict(t *testing.T) {
 	}
 
 	// (d) Nothing was pushed — the run branch does not exist on the bare remote.
+	out, lsErr := exec.Command("git", "--git-dir="+bare, "ls-remote", bare, branch).Output()
+	if lsErr != nil {
+		t.Fatalf("ls-remote: %v", lsErr)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("run branch %q was pushed to the bare remote on a conflicted pop: %q", branch, string(out))
+	}
+}
+
+// TestCommitAndPush_RebaseFromRemote_SiblingAppendConflict_CapturesContext pins
+// the exact #989 regression shape (run 8342436e / child 4e595927): a shared
+// decomposition branch carries an earlier sibling's commit that APPENDED at an
+// anchor line, and the current child's uncommitted working tree appends a
+// different line at the SAME anchor — a trivially-resolvable keep-both
+// conflict. The stash-reapply onto the fetched shared-branch tip conflicts,
+// and the typed error must carry BOTH sides of the conflict (the sibling's
+// committed addition in the hunks, the child's own addition in the stash
+// patch) so the re-invoke prompt can instruct a keep-both re-land.
+func TestCommitAndPush_RebaseFromRemote_SiblingAppendConflict_CapturesContext(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-989shared"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "registry.txt"), []byte("header\nanchor\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+
+	// Child 1's commit lands on the shared branch on the remote: an append at
+	// the anchor. The local checkout is reset back so the addition only exists
+	// on the remote tip (the RebaseFromRemote fetch pulls it in).
+	mustGit(t, repo, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repo, "registry.txt"), []byte("header\nanchor\nchild-one addition\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "child 1 appends at anchor")
+	mustGit(t, repo, "push", "origin", branch)
+	remoteTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "reset", "--hard", "HEAD~1")
+
+	// Child 2's uncommitted append at the SAME anchor.
+	if err := os.WriteFile(filepath.Join(repo, "registry.txt"), []byte("header\nanchor\nchild-two addition\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:          repo,
+		Branch:           branch,
+		CommitMessage:    "child 2",
+		RemoteURL:        bare,
+		RebaseFromRemote: true,
+	})
+
+	if !errors.Is(err, ErrBaseRebaseConflict) {
+		t.Fatalf("CommitAndPush error = %v, want ErrBaseRebaseConflict", err)
+	}
+	var bre *BaseRebaseConflictError
+	if !errors.As(err, &bre) {
+		t.Fatalf("CommitAndPush error = %v, want *BaseRebaseConflictError via errors.As", err)
+	}
+	if len(bre.ConflictPaths) != 1 || bre.ConflictPaths[0] != "registry.txt" {
+		t.Errorf("ConflictPaths = %v, want [registry.txt]", bre.ConflictPaths)
+	}
+	// Both-sides context: the hunks carry the conflict markers plus the
+	// sibling's committed addition AND the child's own addition (the
+	// half-applied working tree holds both between the markers); the stash
+	// patch carries the child's un-landed slice.
+	if !strings.Contains(bre.ConflictHunks, "<<<<<<<") {
+		t.Errorf("ConflictHunks must contain conflict markers, got: %q", bre.ConflictHunks)
+	}
+	if !strings.Contains(bre.ConflictHunks, "child-one addition") ||
+		!strings.Contains(bre.ConflictHunks, "child-two addition") {
+		t.Errorf("ConflictHunks must carry both sides of the append conflict, got: %q", bre.ConflictHunks)
+	}
+	if !strings.Contains(bre.StashPatch, "child-two addition") {
+		t.Errorf("StashPatch must contain the child's own stashed addition, got: %q", bre.StashPatch)
+	}
+
+	// Clean-abort invariants hold unchanged (#866): stash preserved, tree
+	// clean, remote tip untouched.
+	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
+		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
+	}
+	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
+		t.Errorf("ls-files --unmerged not empty after abort: %q", unmerged)
+	}
+	if got := mustGitOut(t, repo, "--git-dir="+bare, "rev-parse", branch); got != remoteTip {
+		t.Errorf("remote branch tip = %q, want unchanged %q (no push on conflicted pop)", got, remoteTip)
+	}
+}
+
+// TestCommitAndPush_FreshFetchBase_ConflictCaptureFailure pins the #989
+// degradation contract: when the CONFIRMED-conflict context captures fail (the
+// `git diff` hunk read and the `git stash show -p` patch read both error), the
+// error keeps full ErrBaseRebaseConflict semantics — typed, unwrapping to the
+// sentinel, conflicted paths intact from the already-read unmerged listing —
+// with the failed captures degraded to empty fields, and the #866 clean-abort
+// invariants (stash preserved, tree reset, no push) still hold.
+func TestCommitAndPush_FreshFetchBase_ConflictCaptureFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-989degraded"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("base line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("remote-advanced line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "remote advances shared line")
+	mustGit(t, repo, "push", "origin", "main")
+	mustGit(t, repo, "reset", "--hard", "HEAD~1")
+
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("agent-edited line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cmd override: delegate to real git EXCEPT the two best-effort context
+	// captures — the bare `git diff` hunk read and the `git stash show`
+	// patch read — which are rewritten to an unknown flag so they exit
+	// non-zero, while the conflict probe, the abort, and everything else run
+	// normally against the real repo.
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			if len(args) == 1 && args[0] == "diff" {
+				return exec.CommandContext(ctx, name, "diff", "--fishhawk-no-such-flag")
+			}
+			if len(args) >= 2 && args[0] == "stash" && args[1] == "show" {
+				return exec.CommandContext(ctx, name, "stash", "show", "--fishhawk-no-such-flag")
+			}
+			return exec.CommandContext(ctx, name, args...)
+		},
+	}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "agent stage commit",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+	})
+
+	if !errors.Is(err, ErrBaseRebaseConflict) {
+		t.Fatalf("CommitAndPush error = %v, want ErrBaseRebaseConflict despite capture failures", err)
+	}
+	var bre *BaseRebaseConflictError
+	if !errors.As(err, &bre) {
+		t.Fatalf("CommitAndPush error = %v, want *BaseRebaseConflictError via errors.As", err)
+	}
+	if len(bre.ConflictPaths) != 1 || bre.ConflictPaths[0] != "shared.txt" {
+		t.Errorf("ConflictPaths = %v, want [shared.txt] (from the already-read unmerged listing)", bre.ConflictPaths)
+	}
+	if bre.ConflictHunks != "" {
+		t.Errorf("ConflictHunks must degrade to empty on a failed capture, got: %q", bre.ConflictHunks)
+	}
+	if bre.StashPatch != "" {
+		t.Errorf("StashPatch must degrade to empty on a failed capture, got: %q", bre.StashPatch)
+	}
+
+	// Clean-abort invariants hold unchanged.
+	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
+		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
+	}
+	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
+		t.Errorf("ls-files --unmerged not empty after abort: %q", unmerged)
+	}
 	out, lsErr := exec.Command("git", "--git-dir="+bare, "ls-remote", bare, branch).Output()
 	if lsErr != nil {
 		t.Fatalf("ls-remote: %v", lsErr)

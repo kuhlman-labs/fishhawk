@@ -123,6 +123,57 @@ var ErrPushedTreeNotVerified = errors.New("gitops: pushed tree was not verified 
 // tree, the exact class the fail-loud path avoids.
 var ErrBaseRebaseConflict = errors.New("gitops: stash pop conflicted reapplying agent edits onto fetched base")
 
+// conflictCaptureByteCap bounds each captured conflict-context blob
+// (ConflictHunks, StashPatch) on a BaseRebaseConflictError so a pathological
+// diff cannot bloat the returned error or the re-invoke prompt built from it
+// (#989).
+const conflictCaptureByteCap = 64 << 10
+
+// BaseRebaseConflictError is the typed form of ErrBaseRebaseConflict (#989):
+// it carries the conflict context popStash captures during the clean abort so
+// the runner can re-invoke the agent ONCE on the fresh base with both sides of
+// the conflict in hand, instead of immediately failing the stage category-B.
+// Unwrap returns the ErrBaseRebaseConflict sentinel, so every existing
+// errors.Is classification keeps working unchanged. All context fields are
+// BEST-EFFORT: a failed capture command degrades the field to empty without
+// blocking or reordering the #866/#893 clean-abort sequence.
+type BaseRebaseConflictError struct {
+	// ConflictPaths are the repo-relative paths the conflicted pop left with
+	// unmerged index entries (parsed from `git ls-files --unmerged`).
+	ConflictPaths []string
+
+	// ConflictHunks is the `git diff` of the half-applied conflicted pop —
+	// the combined-diff representation carrying the conflict markers —
+	// captured BETWEEN the unmerged probe and the `reset --hard` abort (the
+	// only window the markers exist). Truncated to conflictCaptureByteCap.
+	ConflictHunks string
+
+	// StashPatch is the agent's stashed patch (`git stash show -p`), captured
+	// AFTER the reset — a pop conflict preserves the stash entry. Truncated
+	// to conflictCaptureByteCap.
+	StashPatch string
+
+	// popErr is the original `git stash pop` failure, preserved for the
+	// error message.
+	popErr error
+}
+
+func (e *BaseRebaseConflictError) Error() string {
+	msg := ErrBaseRebaseConflict.Error() +
+		": working tree reset to fetched base, stashed edits preserved (git stash list) — re-base the run or replan"
+	if len(e.ConflictPaths) > 0 {
+		msg += " (conflicted paths: " + strings.Join(e.ConflictPaths, ", ") + ")"
+	}
+	if e.popErr != nil {
+		msg += ": " + e.popErr.Error()
+	}
+	return msg
+}
+
+// Unwrap returns the ErrBaseRebaseConflict sentinel so
+// errors.Is(err, ErrBaseRebaseConflict) holds for the typed error.
+func (*BaseRebaseConflictError) Unwrap() error { return ErrBaseRebaseConflict }
+
 // DefaultAuthorName + DefaultAuthorEmail are the dev/CLI fallback bot
 // identity used ONLY when the caller doesn't override — i.e. runs with no
 // resolvable GitHub App (local-runner, CLI, dev). For App-backed runs the
@@ -603,7 +654,10 @@ func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []s
 // not). When conflicted it aborts the half-applied pop with `git reset --hard`
 // — restoring the working tree to the clean fetched base (HEAD) without touching
 // the stash stack, so the stashed edits stay recoverable via `git stash list`
-// (a pop conflict does not drop the stash) — and returns ErrBaseRebaseConflict.
+// (a pop conflict does not drop the stash) — and returns a typed
+// *BaseRebaseConflictError carrying the best-effort-captured conflict context
+// (paths, conflict-marker hunks, stash patch) that unwraps to
+// ErrBaseRebaseConflict (#989).
 // A non-conflict pop failure returns the original wrapped git error unchanged,
 // preserving today's generic fail-loud behavior for that case.
 //
@@ -642,11 +696,61 @@ func (p *Pusher) popStash(ctx context.Context, repoDir string) error {
 	}
 	// Real pop conflict: abort the half-applied pop so the working tree returns
 	// to the clean fetched base; the stash entry is left intact and recoverable.
+	//
+	// Capture the conflict context BEST-EFFORT for the runner's bounded
+	// re-invoke (#989), never blocking or reordering the clean-abort sequence
+	// (#866/#893 invariants): the conflicted paths come from the unmerged
+	// listing already in hand; the conflict-marker hunks only exist between
+	// this probe and the `reset --hard` abort, so `git diff` is read here; the
+	// stash patch is read after the reset (a pop conflict preserves the stash
+	// entry). Any capture command failing degrades its field to empty — the
+	// abort still runs and the returned error still unwraps to
+	// ErrBaseRebaseConflict.
+	conflictPaths := unmergedConflictPaths(unmerged)
+	var conflictHunks string
+	if d, derr := p.runOut(ctx, repoDir, "diff"); derr == nil {
+		conflictHunks = truncateCapture(d)
+	}
 	if err := p.run(ctx, repoDir, "reset", "--hard"); err != nil {
 		return fmt.Errorf("gitops: reset --hard after conflicted stash pop: %w", err)
 	}
-	return fmt.Errorf("%w: working tree reset to fetched base, stashed edits preserved (git stash list) — re-base the run or replan: %v",
-		ErrBaseRebaseConflict, popErr)
+	var stashPatch string
+	if sp, serr := p.runOut(ctx, repoDir, "stash", "show", "-p", "stash@{0}"); serr == nil {
+		stashPatch = truncateCapture(sp)
+	}
+	return &BaseRebaseConflictError{
+		ConflictPaths: conflictPaths,
+		ConflictHunks: conflictHunks,
+		StashPatch:    stashPatch,
+		popErr:        popErr,
+	}
+}
+
+// unmergedConflictPaths parses `git ls-files --unmerged` output (lines of
+// `<mode> <sha> <stage>\t<path>`, up to three stage entries per conflicted
+// path) into a deduplicated, order-preserving path list.
+func unmergedConflictPaths(unmerged string) []string {
+	seen := make(map[string]bool)
+	var paths []string
+	for _, line := range strings.Split(unmerged, "\n") {
+		_, path, ok := strings.Cut(line, "\t")
+		if !ok || path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+// truncateCapture bounds a captured conflict-context blob to
+// conflictCaptureByteCap, annotating the cut so a truncated capture is
+// distinguishable from a complete one.
+func truncateCapture(s string) string {
+	if len(s) <= conflictCaptureByteCap {
+		return s
+	}
+	return s[:conflictCaptureByteCap] + "\n… [truncated]"
 }
 
 // scopeMatcher is the single source of truth for "does this repo-relative
