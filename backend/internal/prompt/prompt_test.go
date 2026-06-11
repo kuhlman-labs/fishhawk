@@ -1484,6 +1484,96 @@ func TestBuild_PlanReview_GateEvidence_CleanResultsRenderExplicitly(t *testing.T
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_BudgetCheckRenders pins the Budget
+// check block (#994): the resolved implement budget, its source, the
+// plan's prediction, and the within/over verdict line. A BudgetCheck
+// alone (both other gates failed open) must still render the section.
+func TestBuild_PlanReview_GateEvidence_BudgetCheckRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			BudgetCheck: &BudgetCheckEvidence{
+				ResolvedBudgetMinutes: 39,
+				BudgetSource:          "p95",
+				PredictedMinutes:      35,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"Budget check (plan prediction vs the resolved implement-stage budget the approval gate enforces):",
+		"- resolved implement budget: 39 minutes (source: p95)",
+		"- plan predicted_runtime_minutes: 35",
+		"- verdict: within budget",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing budget-check element %q:\n%s", w, got)
+		}
+	}
+
+	over, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			BudgetCheck: &BudgetCheckEvidence{
+				ResolvedBudgetMinutes: 30,
+				BudgetSource:          "spec",
+				PredictedMinutes:      45,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(over, "- verdict: over budget (approval will be refused without decomposition or --override-budget)") {
+		t.Errorf("plan_review prompt missing over-budget verdict line:\n%s", over)
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_NilBudgetCheckByteIdentical verifies
+// the additive property for the #994 block: evidence carrying only the
+// pre-existing sub-results renders byte-identically with BudgetCheck nil,
+// so prompts for runs without budget evidence are unchanged.
+func TestBuild_PlanReview_GateEvidence_NilBudgetCheckByteIdentical(t *testing.T) {
+	mk := func(bc *BudgetCheckEvidence) string {
+		t.Helper()
+		got, err := Build("plan_review", Trigger{
+			Repo:         "x/y",
+			ApprovedPlan: fixturePlan(),
+			PlanGateEvidence: &PlanGateEvidence{
+				ScopePrecheck: &ScopePrecheckEvidence{ScannedFiles: 2},
+				BudgetCheck:   bc,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+	withNil := mk(nil)
+	if strings.Contains(withNil, "Budget check") {
+		t.Errorf("Budget check block must be absent when BudgetCheck is nil:\n%s", withNil)
+	}
+	withBudget := mk(&BudgetCheckEvidence{ResolvedBudgetMinutes: 30, BudgetSource: "spec", PredictedMinutes: 10})
+	if !strings.Contains(withBudget, "Budget check") {
+		t.Errorf("Budget check block missing when BudgetCheck is set:\n%s", withBudget)
+	}
+	// Additive insertion: stripping the budget block from the with-budget
+	// prompt must reproduce the nil-BudgetCheck prompt byte-for-byte.
+	block := "Budget check (plan prediction vs the resolved implement-stage budget the approval gate enforces):\n\n" +
+		"- resolved implement budget: 30 minutes (source: spec)\n" +
+		"- plan predicted_runtime_minutes: 10\n" +
+		"- verdict: within budget\n\n"
+	if strings.Replace(withBudget, block, "", 1) != withNil {
+		t.Errorf("budget block is not a clean additive insertion over the nil-BudgetCheck prompt")
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_AbsentWhenNil pins the #984-style
 // additive property: a nil (or empty) PlanGateEvidence leaves the
 // plan-review prompt byte-identical to omitting the field, with no

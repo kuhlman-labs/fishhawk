@@ -767,11 +767,20 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	}
 
 	// Build the plan_review prompt using the same trigger-context
-	// machinery as the agent prompt handler.
+	// machinery as the agent prompt handler. The gate evidence carries
+	// the resolved budget the approval gate will enforce (#994) so the
+	// reviewer cites the same number checkPlanBudget compares against.
+	gateEv := planGateEvidence(precheck, sweep)
+	if bc := s.planBudgetEvidence(ctx, runRow, parsedPlan); bc != nil {
+		if gateEv == nil {
+			gateEv = &prompt.PlanGateEvidence{}
+		}
+		gateEv.BudgetCheck = bc
+	}
 	trig := prompt.Trigger{
 		Repo:             runRow.Repo,
 		ApprovedPlan:     parsedPlan,
-		PlanGateEvidence: planGateEvidence(precheck, sweep),
+		PlanGateEvidence: gateEv,
 	}
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title
@@ -901,6 +910,30 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 		ev.SurfaceSweep = sw
 	}
 	return ev
+}
+
+// planBudgetEvidence resolves the same implement-stage budget
+// checkPlanBudget will enforce at plan approval (#994) — via the shared
+// resolvePlanGateBudget — and pairs it with the plan's own prediction
+// for the plan-review prompt's Budget check block. Returns nil (block
+// omitted) when the spec can't be resolved, the same fail-open posture
+// as the gate itself.
+func (s *Server) planBudgetEvidence(ctx context.Context, runRow *run.Run, parsedPlan *plan.Plan) *prompt.BudgetCheckEvidence {
+	wf, specStage, _, err := resolveSpecStageForRun(runRow, run.StageTypeImplement)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: resolve spec stage for budget evidence failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	specBudget := spec.ResolveStageTimeout(wf, specStage, spec.DefaultStageTimeout)
+	budget, source := s.resolvePlanGateBudget(ctx, runRow.WorkflowID, specBudget)
+	return &prompt.BudgetCheckEvidence{
+		ResolvedBudgetMinutes: int(budget.Minutes()),
+		BudgetSource:          source,
+		PredictedMinutes:      parsedPlan.PredictedRuntimeMinutes,
+	}
 }
 
 // emitReviewStarted appends a best-effort *_review_started audit entry at

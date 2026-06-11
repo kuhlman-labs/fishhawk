@@ -615,8 +615,15 @@ func resolveSpecStageForRun(runRow *run.Run, stageType run.StageType) (spec.Work
 // checkPlanBudget enforces the budget gate on plan-stage approvals.
 // Returns true when the approval should proceed; returns false (and
 // writes the error response) when the plan's predicted runtime
-// exceeds the spec-resolved implement-stage timeout and neither
+// exceeds the resolved implement-stage budget and neither
 // decomposition nor --override-budget is present in the comment.
+//
+// The budget is the IMPLEMENT stage's spec-resolved timeout widened by
+// resolvePlanGateBudget (#994) — max(spec, calibration p95×1.5) clamped
+// to spec×2 — the same base the dynamic kill cap builds on, so the gate
+// and the runtime the stage actually gets cannot drift apart. Fail-open:
+// any spec-parse or calibration unavailability leaves the budget at the
+// spec-resolved floor.
 //
 // When ArtifactRepo is nil or no plan is found (race / manual run),
 // the check is skipped and the approval proceeds.
@@ -634,7 +641,11 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 		return true
 	}
 
-	wf, specStage, timeoutSource, err := resolveSpecStageForRun(runRow, stage.Type)
+	// Resolve the IMPLEMENT stage's spec budget explicitly — the gate
+	// compares the plan's prediction against the implement budget, not
+	// the plan stage under approval (stage.Type), which this code used
+	// to resolve.
+	wf, specStage, timeoutSource, err := resolveSpecStageForRun(runRow, run.StageTypeImplement)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "budget check: resolve spec stage failed",
 			slog.String("stage_id", stage.ID.String()),
@@ -643,8 +654,10 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 		return true
 	}
 
-	timeout := spec.ResolveStageTimeout(wf, specStage, spec.DefaultStageTimeout)
-	budgetMinutes := int(timeout.Minutes())
+	specBudget := spec.ResolveStageTimeout(wf, specStage, spec.DefaultStageTimeout)
+	budget, budgetSource := s.resolvePlanGateBudget(r.Context(), runRow.WorkflowID, specBudget)
+	budgetMinutes := int(budget.Minutes())
+	specBudgetMinutes := int(specBudget.Minutes())
 
 	approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), stage.RunID)
 	if err != nil || approvedPlan == nil {
@@ -660,11 +673,18 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 		return true
 	}
 
+	// budget_minutes is the resolved (p95-aware) value the gate enforces;
+	// spec_budget_minutes records the raw spec-resolved floor so historical
+	// pre-#994 entries (where budget_minutes WAS the spec value) stay
+	// interpretable. timeout_source keeps describing the spec value's
+	// provenance; budget_source says which term won the resolution.
 	auditPayload, _ := json.Marshal(map[string]any{
-		"stage_id":          stage.ID.String(),
-		"predicted_minutes": approvedPlan.PredictedRuntimeMinutes,
-		"budget_minutes":    budgetMinutes,
-		"timeout_source":    timeoutSource,
+		"stage_id":            stage.ID.String(),
+		"predicted_minutes":   approvedPlan.PredictedRuntimeMinutes,
+		"budget_minutes":      budgetMinutes,
+		"budget_source":       budgetSource,
+		"spec_budget_minutes": specBudgetMinutes,
+		"timeout_source":      timeoutSource,
 	})
 	systemKind := audit.ActorKind("system")
 
@@ -700,12 +720,14 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 	}
 
 	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_violates_budget",
-		"plan predicted_runtime_minutes exceeds the implement-stage budget; add decomposition.sub_plans or include --override-budget in the comment",
+		"plan predicted_runtime_minutes exceeds the resolved implement-stage budget; add decomposition.sub_plans or include --override-budget in the comment",
 		map[string]any{
-			"stage_id":          stage.ID.String(),
-			"predicted_minutes": approvedPlan.PredictedRuntimeMinutes,
-			"budget_minutes":    budgetMinutes,
-			"timeout_source":    timeoutSource,
+			"stage_id":            stage.ID.String(),
+			"predicted_minutes":   approvedPlan.PredictedRuntimeMinutes,
+			"budget_minutes":      budgetMinutes,
+			"budget_source":       budgetSource,
+			"spec_budget_minutes": specBudgetMinutes,
+			"timeout_source":      timeoutSource,
 		})
 	return false
 }

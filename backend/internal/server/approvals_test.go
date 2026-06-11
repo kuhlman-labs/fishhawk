@@ -328,11 +328,20 @@ func (r *approvalRunRepo) RetryStage(_ context.Context, id uuid.UUID, to run.Sta
 }
 
 // approvalAuditFake records AppendChained calls so tests assert
-// audit-entry shape and category.
+// audit-entry shape and category. allEntries seeds ListAll, which
+// implementCalibrationP95 scans for runtime_observed samples when the
+// budget gate resolves the p95 term (#994).
 type approvalAuditFake struct {
-	mu        sync.Mutex
-	appended  []audit.ChainAppendParams
-	appendErr error
+	mu         sync.Mutex
+	appended   []audit.ChainAppendParams
+	appendErr  error
+	allEntries []*audit.Entry
+}
+
+func (a *approvalAuditFake) seedAll(entries ...*audit.Entry) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.allEntries = append(a.allEntries, entries...)
 }
 
 func newApprovalAuditFake() *approvalAuditFake { return &approvalAuditFake{} }
@@ -363,7 +372,9 @@ func (a *approvalAuditFake) ListGlobal(context.Context) ([]*audit.Entry, error) 
 	return nil, nil
 }
 func (a *approvalAuditFake) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
-	return nil, nil
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.allEntries, nil
 }
 func (a *approvalAuditFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
@@ -1451,6 +1462,221 @@ func TestSubmitApproval_BudgetCheck_WithinBudget_Proceeds(t *testing.T) {
 	for _, e := range au.appended {
 		if e.Category == "plan_violates_budget" || e.Category == "plan_budget_override_acknowledged" {
 			t.Errorf("unexpected budget audit entry when within budget: %s", e.Category)
+		}
+	}
+}
+
+// specBudgetDistinctTimeouts declares DIFFERENT executor timeouts for the
+// plan (10m) and implement (30m) stages of workflow "w" (the id
+// orchestratorRepo.seedRun uses). Every test built on it also proves the
+// #994 stage-type fix: the gate must resolve the IMPLEMENT stage's 30m,
+// not the plan stage under approval's 10m.
+var specBudgetDistinctTimeouts = []byte(`version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: "10m"
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          timeout: "30m"
+        produces:
+          - artifact: pull_request
+`)
+
+// TestSubmitApproval_BudgetCheck_P95WidensBudget_Approves is the #994
+// repro: spec implement budget 30m, one calibration sample of 26 actual
+// minutes → resolved budget 26×1.5 = 39m. A plan predicting 35 minutes —
+// over the spec floor but under the resolved budget — must be approved
+// with no override and no budget audit entries.
+func TestSubmitApproval_BudgetCheck_P95WidensBudget_Approves(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 35,
+	}
+	r, stage := seedBudgetRun(t, rr, art, p)
+	r.WorkflowSpec = specBudgetDistinctTimeouts
+	au.seedAll(runtimeObservedImplementEntry(r.ID, 26))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (35 ≤ resolved 39m budget):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" || e.Category == "plan_budget_override_acknowledged" {
+			t.Errorf("unexpected budget audit entry within the resolved budget: %s", e.Category)
+		}
+	}
+}
+
+// TestSubmitApproval_BudgetCheck_OverResolvedBudget_422CarriesResolvedPayload
+// asserts the 422 and audit payloads carry the RESOLVED budget (#994):
+// budget_minutes is the p95-widened value, budget_source names the winning
+// term, and spec_budget_minutes records the raw spec floor. Also asserts
+// the plan-review prompt's budget evidence (planBudgetEvidence) cites the
+// identical number for the same seeded data — gate, payload, and reviewer
+// prompt agree by construction.
+func TestSubmitApproval_BudgetCheck_OverResolvedBudget_422CarriesResolvedPayload(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 45, // over the resolved 39m budget
+	}
+	r, stage := seedBudgetRun(t, rr, art, p)
+	r.WorkflowSpec = specBudgetDistinctTimeouts
+	au.seedAll(runtimeObservedImplementEntry(r.ID, 26))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+
+	var violation *audit.ChainAppendParams
+	for i, e := range au.appended {
+		if e.Category == "plan_violates_budget" {
+			violation = &au.appended[i]
+		}
+	}
+	if violation == nil {
+		t.Fatalf("expected plan_violates_budget audit entry, got %+v", au.appended)
+	}
+	var payload struct {
+		PredictedMinutes  int    `json:"predicted_minutes"`
+		BudgetMinutes     int    `json:"budget_minutes"`
+		BudgetSource      string `json:"budget_source"`
+		SpecBudgetMinutes int    `json:"spec_budget_minutes"`
+		TimeoutSource     string `json:"timeout_source"`
+	}
+	if err := json.Unmarshal(violation.Payload, &payload); err != nil {
+		t.Fatalf("decode plan_violates_budget payload: %v", err)
+	}
+	if payload.BudgetMinutes != 39 {
+		t.Errorf("budget_minutes = %d, want 39 (p95 26 × 1.5)", payload.BudgetMinutes)
+	}
+	if payload.BudgetSource != "p95" {
+		t.Errorf("budget_source = %q, want p95", payload.BudgetSource)
+	}
+	if payload.SpecBudgetMinutes != 30 {
+		t.Errorf("spec_budget_minutes = %d, want 30", payload.SpecBudgetMinutes)
+	}
+	if payload.TimeoutSource != "stage_executor_timeout" {
+		t.Errorf("timeout_source = %q, want stage_executor_timeout", payload.TimeoutSource)
+	}
+	// The 422 details mirror the audit payload.
+	for _, want := range []string{`"budget_minutes":39`, `"budget_source":"p95"`, `"spec_budget_minutes":30`} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("422 body missing %s:\n%s", want, w.Body.String())
+		}
+	}
+
+	// Cross-surface agreement (#994): the budget evidence runPlanReviews
+	// renders into the plan-review prompt must cite the same resolved
+	// number the gate just enforced.
+	ev := s.planBudgetEvidence(context.Background(), r, p)
+	if ev == nil {
+		t.Fatal("planBudgetEvidence = nil, want budget evidence")
+	}
+	if ev.ResolvedBudgetMinutes != payload.BudgetMinutes {
+		t.Errorf("prompt evidence budget = %d, gate budget = %d — surfaces disagree",
+			ev.ResolvedBudgetMinutes, payload.BudgetMinutes)
+	}
+	if ev.BudgetSource != payload.BudgetSource {
+		t.Errorf("prompt evidence source = %q, gate source = %q", ev.BudgetSource, payload.BudgetSource)
+	}
+}
+
+// TestSubmitApproval_BudgetCheck_AntiCircularity_PlanTermExcluded proves
+// the gate budget ignores the plan's own predicted_runtime_minutes: with
+// no calibration data the budget must stay at the 30m spec floor, so a
+// prediction of 40 (which the kill cap's predicted×2 term would widen to
+// 60m and self-justify) and a pathological 100 both 422 against 30.
+func TestSubmitApproval_BudgetCheck_AntiCircularity_PlanTermExcluded(t *testing.T) {
+	for _, predicted := range []int{40, 100} {
+		t.Run(fmt.Sprintf("predicted_%d", predicted), func(t *testing.T) {
+			art := newFakeArtifactRepo()
+			s, rr, au, _ := newBudgetCheckServer(t, art)
+
+			p := &plan.Plan{
+				PlanVersion:             "standard_v1",
+				PredictedRuntimeMinutes: predicted,
+			}
+			r, stage := seedBudgetRun(t, rr, art, p)
+			r.WorkflowSpec = specBudgetDistinctTimeouts
+			// No calibration samples seeded: the budget must stay at the
+			// spec floor, not predicted×2.
+
+			w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, want 422 (gate must not self-satisfy from the plan term):\n%s",
+					w.Code, w.Body.String())
+			}
+			var found bool
+			for _, e := range au.appended {
+				if e.Category != "plan_violates_budget" {
+					continue
+				}
+				found = true
+				var payload struct {
+					BudgetMinutes int    `json:"budget_minutes"`
+					BudgetSource  string `json:"budget_source"`
+				}
+				if err := json.Unmarshal(e.Payload, &payload); err != nil {
+					t.Fatalf("decode payload: %v", err)
+				}
+				if payload.BudgetMinutes != 30 {
+					t.Errorf("budget_minutes = %d, want 30 (spec floor)", payload.BudgetMinutes)
+				}
+				if payload.BudgetSource != "spec" {
+					t.Errorf("budget_source = %q, want spec", payload.BudgetSource)
+				}
+			}
+			if !found {
+				t.Error("expected plan_violates_budget audit entry")
+			}
+		})
+	}
+}
+
+// TestSubmitApproval_BudgetCheck_UsesImplementStageTimeout pins the #994
+// stage-type fix in isolation: with distinct plan (10m) and implement
+// (30m) executor timeouts and no calibration data, a plan predicting 20
+// minutes must be approved — the gate compares against the implement
+// stage's 30m, not the 10m of the plan stage under approval (which the
+// pre-#994 code resolved via stage.Type).
+func TestSubmitApproval_BudgetCheck_UsesImplementStageTimeout(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 20, // over plan-stage 10m, under implement 30m
+	}
+	r, stage := seedBudgetRun(t, rr, art, p)
+	r.WorkflowSpec = specBudgetDistinctTimeouts
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (implement-stage 30m budget governs):\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" {
+			t.Errorf("unexpected plan_violates_budget — gate compared against the wrong stage's timeout")
 		}
 	}
 }

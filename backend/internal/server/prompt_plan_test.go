@@ -831,6 +831,68 @@ func TestResolveImplementTimeout(t *testing.T) {
 	}
 }
 
+// TestResolvePlanGateBudget exercises the shared approval-time budget
+// resolver (#994): max(spec budget, p95×1.5) clamped to spec×2, with the
+// plan term deliberately excluded (no plan artifact is ever consulted)
+// and calibration unavailability failing open to the spec floor.
+func TestResolvePlanGateBudget(t *testing.T) {
+	cases := []struct {
+		name        string
+		spec        time.Duration
+		p95Samples  []float64 // implement actual_minutes; nil → no calibration
+		wantMinutes float64
+		wantSource  string
+	}{
+		{
+			name:        "no calibration → spec floor",
+			spec:        30 * time.Minute,
+			wantMinutes: 30,
+			wantSource:  "spec",
+		},
+		{
+			name:        "p95 above spec → p95 wins",
+			spec:        30 * time.Minute,
+			p95Samples:  []float64{26},
+			wantMinutes: 39, // 26 × 1.5
+			wantSource:  "p95",
+		},
+		{
+			name:        "p95 below spec → spec floor",
+			spec:        30 * time.Minute,
+			p95Samples:  []float64{10},
+			wantMinutes: 30,
+			wantSource:  "spec",
+		},
+		{
+			name:        "p95 over the ceiling → clamped to spec×2",
+			spec:        30 * time.Minute,
+			p95Samples:  []float64{50},
+			wantMinutes: 60, // 50 × 1.5 = 75 clamped to 60
+			wantSource:  "ceiling",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, _, au, _, _ := newImplementPromptServer(t)
+			runID, _, _, rn := seedRunWithStages(rr)
+			for _, m := range tc.p95Samples {
+				au.seedAll(runtimeObservedImplementEntry(runID, m))
+			}
+
+			got, source := s.resolvePlanGateBudget(context.Background(), rn.WorkflowID, tc.spec)
+			wantSecs := int(tc.wantMinutes * 60)
+			if int(got.Seconds()) != wantSecs {
+				t.Errorf("resolvePlanGateBudget = %v (%ds), want %v minutes (%ds)",
+					got, int(got.Seconds()), tc.wantMinutes, wantSecs)
+			}
+			if source != tc.wantSource {
+				t.Errorf("source = %q, want %q", source, tc.wantSource)
+			}
+		})
+	}
+}
+
 // TestResolveAgentTimeout_PlanStageNotWidened is the regression guard for
 // approval condition (1): the dynamic implement widening must not leak into
 // the plan stage's own agent_timeout_seconds. Even with a plan artifact that
