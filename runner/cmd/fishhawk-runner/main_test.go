@@ -2041,12 +2041,32 @@ type fakePusher struct {
 	gotArgs *gitops.CommitAndPushArgs
 	result  *gitops.CommitAndPushResult
 	err     error
+
+	// errSeq, when non-empty, takes precedence over err: call i returns
+	// errSeq[i] (the last entry repeats after the slice is exhausted); a nil
+	// entry falls through to result. The base-rebase-conflict re-invoke
+	// tests (#989) use it to fail the first CommitAndPush and succeed on the
+	// retry.
+	errSeq []error
+
+	// calls counts CommitAndPush invocations so tests can assert the retry
+	// is bounded.
+	calls int
 }
 
 func (f *fakePusher) CommitAndPush(_ context.Context, args gitops.CommitAndPushArgs) (*gitops.CommitAndPushResult, error) {
 	a := args
 	f.gotArgs = &a
-	if f.err != nil {
+	idx := f.calls
+	f.calls++
+	if len(f.errSeq) > 0 {
+		if idx >= len(f.errSeq) {
+			idx = len(f.errSeq) - 1
+		}
+		if err := f.errSeq[idx]; err != nil {
+			return nil, err
+		}
+	} else if f.err != nil {
 		return nil, f.err
 	}
 	if f.result != nil {
@@ -2086,6 +2106,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	origP, origO := newPusher, newPROpener
 	origCap, origRes := captureHead, restoreHead
 	origCheckout := checkoutFixupBase
+	origRunBranch := checkoutRunBranch
 	newPusher = func() pusher { return fp }
 	newPROpener = func(token string) prOpener {
 		fpr.gotToken = token
@@ -2108,12 +2129,17 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	checkoutFixupBase = func(_ context.Context, _, _, _ string) (string, error) {
 		return "fixup-branch-tip-sha", nil
 	}
+	// Stub the base-rebase-conflict re-checkout (#989) the same way: the
+	// re-invoke handler must never force-checkout the runner's own source
+	// repo in a fake-pusher run() test.
+	checkoutRunBranch = func(_ context.Context, _, _ string) error { return nil }
 	t.Cleanup(func() {
 		newPusher = origP
 		newPROpener = origO
 		captureHead = origCap
 		restoreHead = origRes
 		checkoutFixupBase = origCheckout
+		checkoutRunBranch = origRunBranch
 	})
 }
 
@@ -4341,15 +4367,18 @@ func TestRun_ImplementStage_CreatedOutOfScope_CategoryB(t *testing.T) {
 }
 
 // TestRun_ImplementStage_BaseRebaseConflict_CategoryB is the #866 analogue: when
-// the open-PR push path returns gitops.ErrBaseRebaseConflict (the fresh-fetch
-// base path could not reapply the agent's stashed edits onto the diverged
-// authoritative base), the implement stage must surface FAILED with category B
-// and report the failure via the /pull-request path (outcome=failed /
-// category=B, no PR artifact body), exercising the gitops-sentinel ->
-// FailureCategory classification seam.
+// the open-PR push path PERSISTENTLY returns gitops.ErrBaseRebaseConflict (the
+// fresh-fetch base path could not reapply the agent's stashed edits onto the
+// diverged authoritative base), the implement stage gets exactly ONE bounded
+// agent re-invoke on the fresh base (#989) and then surfaces FAILED with
+// category B unchanged, reporting the failure via the /pull-request path
+// (outcome=failed / category=B, no PR artifact body) — exercising both the
+// gitops-sentinel -> FailureCategory classification seam and the re-invoke's
+// boundedness.
 func TestRun_ImplementStage_BaseRebaseConflict_CategoryB(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fi := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fi)
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
 		StageID:    "22222222-3333-4444-5555-666666666666",
@@ -4376,6 +4405,18 @@ func TestRun_ImplementStage_BaseRebaseConflict_CategoryB(t *testing.T) {
 	if !strings.Contains(stderr.String(), `"category":"B"`) {
 		t.Errorf("expected category-B on base-rebase-conflict failure, got:\n%s", stderr.String())
 	}
+	// Bounded re-invoke (#989): the persistent conflict yields exactly ONE
+	// extra agent invocation (base + one re-invoke) and exactly TWO
+	// CommitAndPush attempts before the unchanged failure path.
+	if fi.callIdx != 2 {
+		t.Errorf("invoker called %d times, want 2 (base invoke + one bounded re-invoke)", fi.callIdx)
+	}
+	if fp.calls != 2 {
+		t.Errorf("CommitAndPush called %d times, want 2 (initial + one bounded retry)", fp.calls)
+	}
+	if !strings.Contains(stderr.String(), `"event":"base_rebase_conflict_reinvoke"`) {
+		t.Errorf("expected base_rebase_conflict_reinvoke event in the log, got:\n%s", stderr.String())
+	}
 	// The push failed before any PR could be opened — no fresh PR for a failed push.
 	if fpr.gotArgs != nil {
 		t.Error("OpenPR must not be called after a failed base-rebase push")
@@ -4390,6 +4431,311 @@ func TestRun_ImplementStage_BaseRebaseConflict_CategoryB(t *testing.T) {
 	}
 	if len(fu.gotPRArgs.Body) != 0 {
 		t.Errorf("failure report must not carry a PR artifact body, got %d bytes", len(fu.gotPRArgs.Body))
+	}
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeSucceeds is the #989
+// success regression for the issue's exact shape (run 8342436e / child
+// 4e595927): the first CommitAndPush fails with a typed
+// *BaseRebaseConflictError carrying realistic conflict context, the agent is
+// re-invoked exactly once with a prompt embedding that context, and the
+// second CommitAndPush succeeds — the stage exits OK and the push/PR/artifact
+// chain completes. This crosses the gitops error-production and runner
+// error-consumption layers: a typed error losing its Unwrap chain or its
+// context fields fails here even when each layer's units pass.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeSucceeds(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fi := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	conflict := &gitops.BaseRebaseConflictError{
+		ConflictPaths: []string{"registry.txt"},
+		ConflictHunks: "++<<<<<<< Updated upstream\n +child-one addition\n++=======\n+ child-two addition\n++>>>>>>> Stashed changes",
+		StashPatch:    "+child-two addition",
+	}
+	fp := &fakePusher{errSeq: []error{conflict, nil}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fi.callIdx != 2 {
+		t.Errorf("invoker called %d times, want 2 (base invoke + one re-invoke)", fi.callIdx)
+	}
+	if fp.calls != 2 {
+		t.Errorf("CommitAndPush called %d times, want 2 (conflict + successful retry)", fp.calls)
+	}
+	// The re-invoke prompt embeds the captured conflict context: the
+	// conflicted path and the agent's own stashed patch. gotInv records the
+	// LAST invocation — the re-invoke.
+	if fi.gotInv == nil {
+		t.Fatal("no invocation captured")
+	}
+	if !strings.Contains(fi.gotInv.Prompt, "registry.txt") {
+		t.Errorf("re-invoke prompt must name the conflicted path, got:\n%s", fi.gotInv.Prompt)
+	}
+	if !strings.Contains(fi.gotInv.Prompt, "child-two addition") {
+		t.Errorf("re-invoke prompt must embed the stashed patch, got:\n%s", fi.gotInv.Prompt)
+	}
+	if !strings.Contains(stderr.String(), `"event":"base_rebase_conflict_reinvoke"`) {
+		t.Errorf("expected base_rebase_conflict_reinvoke event in the log, got:\n%s", stderr.String())
+	}
+	// The retried push landed and the PR + artifact chain completed.
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR must be called after the successful retried push")
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (artifact) must be called after the successful retried push")
+	}
+	if fu.gotPRArgs.Outcome != "" || len(fu.gotPRArgs.Body) == 0 {
+		t.Errorf("artifact upload = {outcome:%q, body:%d bytes}, want a success-path artifact body",
+			fu.gotPRArgs.Outcome, len(fu.gotPRArgs.Body))
+	}
+}
+
+// TestRun_ImplementStage_Fixup_BaseRebaseConflict_NoReinvoke pins the #989
+// fix-up exclusion: a fix-up pass hitting the same conflict error must NOT
+// re-invoke the agent — it keeps the existing immediate category-B failure
+// whose /pull-request report drives the backend's #788 fix-up recovery.
+func TestRun_ImplementStage_Fixup_BaseRebaseConflict_NoReinvoke(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fi := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:     "22222222-3333-4444-5555-666666666666",
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: "fishhawk/run-11111111/stage-22222222",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: gitops.ErrBaseRebaseConflict}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if fi.callIdx != 1 {
+		t.Errorf("invoker called %d times, want 1 (no re-invoke on the fix-up path)", fi.callIdx)
+	}
+	if fp.calls != 1 {
+		t.Errorf("CommitAndPush called %d times, want 1 (no retry on the fix-up path)", fp.calls)
+	}
+	if strings.Contains(stderr.String(), `"event":"base_rebase_conflict_reinvoke"`) {
+		t.Errorf("fix-up path must not emit base_rebase_conflict_reinvoke, got:\n%s", stderr.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after a fix-up base-rebase failure")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Errorf("failure report = {outcome:%q, category:%q}, want {failed, B}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
+	}
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNotOK pins the #989
+// non-OK re-invoke result path: the re-invoked agent's invocation succeeds at
+// the transport level but the agent reports OK=false (declined / failed
+// semantically). The runner must NOT retry the push with a tree the agent did
+// not vouch for — it aborts the re-invoke (base_rebase_reinvoke_aborted) and
+// falls through to the unchanged category-B failure with the ORIGINAL
+// conflict error, after exactly ONE CommitAndPush attempt.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNotOK(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fi := &fakeInvoker{cannedSeq: []agent.Result{
+		{OK: true},
+		{OK: false, FailureCategory: "A", FailureReason: "agent declined the re-land"},
+	}}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: gitops.ErrBaseRebaseConflict}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if fi.callIdx != 2 {
+		t.Errorf("invoker called %d times, want 2 (base invoke + one re-invoke)", fi.callIdx)
+	}
+	// The non-OK re-invoke result must NOT earn a second push attempt.
+	if fp.calls != 1 {
+		t.Errorf("CommitAndPush called %d times, want 1 (no retry after a non-OK re-invoke)", fp.calls)
+	}
+	if !strings.Contains(stderr.String(), `"event":"base_rebase_reinvoke_aborted"`) {
+		t.Errorf("expected base_rebase_reinvoke_aborted event in the log, got:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "agent declined the re-land") {
+		t.Errorf("abort detail must carry the agent's failure reason, got:\n%s", stderr.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not be called after a failed base-rebase push")
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after the aborted re-invoke")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Errorf("failure report = {outcome:%q, category:%q}, want {failed, B}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
+	}
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_CheckoutFails pins the #989
+// checkout-failure degradation: when re-checking-out the run branch fails,
+// the re-invoke aborts BEFORE any agent invocation and the stage degrades to
+// the unchanged category-B failure with the original conflict error.
+func TestRun_ImplementStage_BaseRebaseConflict_CheckoutFails(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fi := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: gitops.ErrBaseRebaseConflict}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	// Swap in the failing checkout AFTER withFakeGitOps installs its no-op.
+	checkoutRunBranch = func(_ context.Context, _, _ string) error {
+		return errors.New("ref lock contention")
+	}
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if fi.callIdx != 1 {
+		t.Errorf("invoker called %d times, want 1 (checkout failed before any re-invoke)", fi.callIdx)
+	}
+	if fp.calls != 1 {
+		t.Errorf("CommitAndPush called %d times, want 1 (no retry after a checkout failure)", fp.calls)
+	}
+	if !strings.Contains(stderr.String(), `"event":"base_rebase_reinvoke_aborted"`) {
+		t.Errorf("expected base_rebase_reinvoke_aborted event in the log, got:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "checkout run branch") {
+		t.Errorf("abort detail must name the checkout failure, got:\n%s", stderr.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after the aborted re-invoke")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Errorf("failure report = {outcome:%q, category:%q}, want {failed, B}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
+	}
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeInfraExhausted pins the
+// #989 infra-exhaustion degradation: every re-invocation attempt fails at the
+// transport level. Each failed attempt emits base_rebase_reinvoke_error
+// (maxFixInvokeInfraRetries total, the #804 pattern), then the re-invoke
+// aborts (base_rebase_reinvoke_aborted) and the stage degrades to the
+// unchanged category-B failure with the original conflict error.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeInfraExhausted(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	// Call 1 (base invoke) succeeds; the trailing entry repeats, so every
+	// re-invocation attempt errors at the transport level.
+	fi := &fakeInvoker{
+		cannedSeq: []agent.Result{{OK: true}, {}},
+		errSeq:    []error{nil, errors.New("agent API 400: thinking block")},
+	}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: gitops.ErrBaseRebaseConflict}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure", got)
+	}
+	if want := 1 + maxFixInvokeInfraRetries; fi.callIdx != want {
+		t.Errorf("invoker called %d times, want %d (base invoke + %d infra-retried re-invoke attempts)",
+			fi.callIdx, want, maxFixInvokeInfraRetries)
+	}
+	if fp.calls != 1 {
+		t.Errorf("CommitAndPush called %d times, want 1 (no retry after infra exhaustion)", fp.calls)
+	}
+	if got := strings.Count(stderr.String(), `"event":"base_rebase_reinvoke_error"`); got != maxFixInvokeInfraRetries {
+		t.Errorf("base_rebase_reinvoke_error emitted %d times, want %d (one per failed attempt), got:\n%s",
+			got, maxFixInvokeInfraRetries, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"base_rebase_reinvoke_aborted"`) {
+		t.Errorf("expected base_rebase_reinvoke_aborted event in the log, got:\n%s", stderr.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failure report) must be called after infra exhaustion")
+	}
+	if fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Errorf("failure report = {outcome:%q, category:%q}, want {failed, B}",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.Category)
 	}
 }
 

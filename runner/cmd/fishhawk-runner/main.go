@@ -1012,7 +1012,36 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			if err := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, verifiedTreeSHA); err != nil {
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, verifiedTreeSHA)
+			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
+			// conflict means the base moved under the agent (a sibling's
+			// shared-branch commit, or an advanced origin/<base>) — often a
+			// trivially-resolvable overlap that previously killed the stage
+			// (and a decomposition's whole fan-out) category-B at commit time.
+			// Re-invoke the agent ONCE on the fresh base with the captured
+			// conflict context, then retry the commit+push chain. Structurally
+			// bounded: this block is linear, so a second conflict on the retry
+			// falls through to the unchanged category-B path below. Gated on
+			// the open-PR and decomposed-child push paths only — a fix-up pass
+			// keeps its existing #788 recovery semantics. Gate re-coverage for
+			// the re-landed tree needs no special handling: it differs from
+			// the gate-verified tree, so the #960 verified_tree_mismatch path
+			// runs its single strict re-verify and only an explicit pass
+			// reaches origin (#969 stamps the re-verified tree).
+			if prErr != nil && errors.Is(prErr, gitops.ErrBaseRebaseConflict) &&
+				(willOpenPR || willPushChild) {
+				if rerr := reinvokeOnBaseRebaseConflict(ctx, cfg, invoker, inv, &res, prErr, logSink); rerr == nil {
+					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, verifiedTreeSHA)
+				} else {
+					// Re-invoke infra exhaustion (or checkout failure): log and
+					// fall through to the unchanged category-B failure path
+					// with the ORIGINAL conflict error.
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"base_rebase_reinvoke_aborted","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+						cfg.runID, cfg.stageID, rerr.Error())
+				}
+			}
+			if err := prErr; err != nil {
 				res.OK = false
 				// Wrong-shaped output → category-B (parks the run for
 				// re-scope/re-plan). ErrPullRequestInvalid is the backend
@@ -2303,6 +2332,161 @@ will fail verification again. Make the smallest change that turns the command
 green.`, verifyCmd, output)
 }
 
+// baseRebaseConflictPrompt builds the re-invoke prompt fed to the agent when
+// its working-tree edits could not be reapplied onto the freshly-fetched base
+// (#989): a sibling's shared-branch commit (or an advanced origin/<base>)
+// landed lines the agent also touched, so the stash pop conflicted and was
+// cleanly aborted. The agent is re-invoked ONCE on the updated base — which
+// already contains the newer commits — with the captured conflict context.
+// detail may be nil (a plain ErrBaseRebaseConflict with no typed context, or
+// a capture-degraded error); the prompt then omits the context sections.
+func baseRebaseConflictPrompt(detail *gitops.BaseRebaseConflictError) string {
+	var b strings.Builder
+	b.WriteString(`Your previous edits did NOT land: the base branch moved while you worked —
+sibling or base commits landed after you started, and re-applying your changes
+onto the updated base produced a merge conflict. Your working tree is now
+checked out on the UPDATED base, which already contains those newer commits.
+
+Re-land your full original slice on top of the current tree:
+- Preserve the changes already committed on the current base (a sibling's
+  work). For additive conflicts where both sides added at the same place,
+  keep BOTH sides.
+- Never revert or overwrite committed work.
+- Stay within the approved scope.files — edit only the files you were already
+  allowed to change.
+`)
+	if detail == nil {
+		return b.String()
+	}
+	if len(detail.ConflictPaths) > 0 {
+		b.WriteString("\nConflicted paths:\n")
+		for _, p := range detail.ConflictPaths {
+			b.WriteString("- " + p + "\n")
+		}
+	}
+	if detail.ConflictHunks != "" {
+		b.WriteString("\nConflicting hunks (git diff of the aborted re-apply; the upstream side is the updated base, the stashed side is your previous edits):\n```\n")
+		b.WriteString(detail.ConflictHunks)
+		b.WriteString("\n```\n")
+	}
+	if detail.StashPatch != "" {
+		b.WriteString("\nYour previous (un-landed) changes as a patch:\n```\n")
+		b.WriteString(detail.StashPatch)
+		b.WriteString("\n```\n")
+	}
+	return b.String()
+}
+
+// reinvokeOnBaseRebaseConflict is the bounded single agent re-invoke on a
+// stash-reapply base conflict (#989, proposal 1). The first
+// openPRAndShipArtifact attempt failed with ErrBaseRebaseConflict: the agent's
+// edits were stashed (preserved on the stash stack), the half-applied pop was
+// cleanly aborted, and the local run-branch ref points at the freshly-fetched
+// base. This handler re-checks-out that branch and re-invokes the agent with
+// the captured conflict context so it re-lands its slice on top of the moved
+// base; the caller then retries openPRAndShipArtifact exactly once. The
+// re-landed tree differs from the gate-verified tree, so the #960
+// verified_tree_mismatch path runs its single strict re-verify on the retry —
+// only an explicit pass reaches origin (#969 stamps the re-verified tree).
+//
+// Returns nil when the agent re-invocation succeeded (events/tokens/model are
+// accumulated into res). A non-nil error — checkout failure, infra-retry
+// exhaustion (the maxFixInvokeInfraRetries pattern, #804), or the agent
+// completing with OK=false (it declined or failed semantically; its trace is
+// still accumulated) — means the re-invoke did not produce a usable re-land;
+// the caller falls through to the unchanged category-B failure path with the
+// ORIGINAL conflict error rather than retrying the push with a tree the agent
+// itself did not vouch for.
+func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, conflictErr error, logSink io.Writer) error {
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	routing, err := resolveImplementBranchRouting(ctx, cfg, repoDir, resolveImplementBaseRef(cfg))
+	if err != nil {
+		return err
+	}
+
+	// Extract the typed conflict context. Best-effort: a plain
+	// ErrBaseRebaseConflict with no typed wrapper still re-invokes, with the
+	// prompt's context sections omitted.
+	var detail *gitops.BaseRebaseConflictError
+	_ = errors.As(conflictErr, &detail)
+	var conflictPaths []string
+	if detail != nil {
+		conflictPaths = detail.ConflictPaths
+	}
+
+	const stashNote = "attempt 1's stashed edits remain on the stash stack (git stash list) for forensics; the re-invoke re-lands the slice as fresh working-tree edits"
+	pathsJSON, _ := json.Marshal(conflictPaths)
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"base_rebase_conflict_reinvoke","run_id":%q,"stage_id":%q,"branch":%q,"conflict_paths":%s,"note":%q}`+"\n",
+		cfg.runID, cfg.stageID, routing.branch, pathsJSON, stashNote)
+	res.Events = append(res.Events, agent.Event{
+		Kind: "base_rebase_conflict_reinvoke",
+		Payload: agent.MakePayload(map[string]any{
+			"branch":         routing.branch,
+			"conflict_paths": conflictPaths,
+			"note":           stashNote,
+		}),
+	})
+
+	// Put the agent on the fresh base: the run-branch ref already points at
+	// the fetched tip (see the function comment), so a plain forced checkout
+	// suffices — no fetch, no auth.
+	if err := checkoutRunBranch(ctx, repoDir, routing.branch); err != nil {
+		return fmt.Errorf("base-rebase re-invoke: checkout run branch %s: %w", routing.branch, err)
+	}
+
+	reinvokeInv := baseInv
+	reinvokeInv.Prompt = baseRebaseConflictPrompt(detail)
+
+	// Bounded infra-retry on the re-invocation, mirroring the verify-fix
+	// loop's maxFixInvokeInfraRetries pattern (#804): a transient agent-API/
+	// transport failure is retried in place, never silently — each failed
+	// attempt emits a base_rebase_reinvoke_error log line AND an auditable
+	// trace event. Only a successful invoke contributes events/tokens/model.
+	var (
+		reRes agent.Result
+		reErr error
+	)
+	for attempt := 1; attempt <= maxFixInvokeInfraRetries; attempt++ {
+		reRes, reErr = invoker.Invoke(ctx, reinvokeInv)
+		if reErr == nil {
+			break
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"base_rebase_reinvoke_error","run_id":%q,"stage_id":%q,"attempt":%d,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, attempt, reErr.Error())
+		res.Events = append(res.Events, agent.Event{
+			Kind: "base_rebase_reinvoke_error",
+			Payload: agent.MakePayload(map[string]any{
+				"attempt": attempt,
+				"detail":  reErr.Error(),
+			}),
+		})
+	}
+	if reErr != nil {
+		return fmt.Errorf("base-rebase re-invoke: agent invocation failed after %d attempts: %w",
+			maxFixInvokeInfraRetries, reErr)
+	}
+	res.Events = append(res.Events, reRes.Events...)
+	res.TokensUsed += reRes.TokensUsed
+	res.InputTokens += reRes.InputTokens
+	res.OutputTokens += reRes.OutputTokens
+	if reRes.Model != "" {
+		res.Model = reRes.Model
+	}
+	if !reRes.OK {
+		// The invocation completed but the agent reported failure (declined,
+		// errored mid-run, produced no usable re-land). Retrying the push on
+		// such a tree could ship partial or unchanged work — abort instead.
+		return fmt.Errorf("base-rebase re-invoke: agent completed without success (category %s): %s",
+			reRes.FailureCategory, reRes.FailureReason)
+	}
+	return nil
+}
+
 // runVerifyCommittedTree runs the verify command against the committed HEAD
 // SHA in an isolated git worktree (#651), reusing the #728/#800 worktree
 // pattern: `git worktree add --detach` checks out the committed scope-only
@@ -2535,6 +2719,17 @@ var (
 	// restoreHead: the fake-pusher run() tests default repoDir to "." and
 	// must never fetch + force-checkout the runner's own source repo.
 	checkoutFixupBase = gitops.CheckoutRemoteBranch
+
+	// checkoutRunBranch re-checks-out the run branch for the base-rebase-
+	// conflict re-invoke (#989). The local branch ref already points at the
+	// freshly-fetched base — CommitAndPush ran `checkout -B <branch>
+	// FETCH_HEAD` before the conflicted pop, and the restore defer only moved
+	// HEAD off the ref, never deleted it — so production reuses
+	// gitops.RestoreHead (`git checkout --force <ref>`); the tree is clean
+	// after popStash's reset --hard abort. A package-level var for the same
+	// reason as restoreHead: the fake-pusher run() tests default repoDir to
+	// "." and must never force-checkout the runner's own source repo.
+	checkoutRunBranch = gitops.RestoreHead
 )
 
 // compileDiagnosticMarkers are substrings that positively identify a
@@ -2910,6 +3105,76 @@ func touchedPackageArgs(diskPath string, scopeFiles []string) []string {
 	return args
 }
 
+// resolveImplementBaseRef resolves the PR base branch for the implement push
+// path: --base-branch flag > GITHUB_REF_NAME env > "main", the same
+// flag > env > default precedence as the repo lookup. Shared by
+// openPRAndShipArtifact and the base-rebase-conflict re-invoke handler (#989).
+func resolveImplementBaseRef(cfg config) string {
+	baseRef := cfg.baseBranch
+	if baseRef == "" {
+		baseRef = os.Getenv("GITHUB_REF_NAME")
+	}
+	if baseRef == "" {
+		baseRef = "main"
+	}
+	return baseRef
+}
+
+// implementBranchRouting is the resolved branch routing for an implement
+// push: which branch the stage commits to and which of the three mutually
+// exclusive paths (fix-up / decomposed child / standalone) it is on.
+// Factored out of openPRAndShipArtifact so the base-rebase-conflict
+// re-invoke handler (#989) can resolve the same run branch to re-checkout
+// without duplicating the routing logic.
+type implementBranchRouting struct {
+	branch       string
+	isDecomposed bool
+	isSubsequent bool
+	isFixup      bool
+	// freshFetchBase, when non-empty, makes CommitAndPush cut the run
+	// branch from a freshly-fetched origin/<base> instead of ambient HEAD
+	// (ADR-035 prevention, #861). Set in the standalone default case and on
+	// the decomposed-first-child case that creates the shared branch (#865).
+	freshFetchBase string
+}
+
+func resolveImplementBranchRouting(ctx context.Context, cfg config, repoDir, baseRef string) (implementBranchRouting, error) {
+	var r implementBranchRouting
+	switch {
+	case cfg.fixup:
+		// Fix-up pass (#762): commit onto the EXISTING PR branch and rebase
+		// it from the remote first (fetch + checkout + pull --rebase), the
+		// same shared-branch path subsequent decomposed children use. The
+		// open PR tracks this branch, so the pushed fix-up commit updates it
+		// — no OpenPR (a PR already exists for head→base), no fresh artifact.
+		r.isFixup = true
+		r.branch = cfg.fixupBranch
+		r.isSubsequent = true
+	case cfg.decomposedFromRunID != "":
+		r.isDecomposed = true
+		r.branch = "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
+		r.isSubsequent = remoteBranchExists(ctx, repoDir, r.branch)
+		if !r.isSubsequent {
+			// First child creates the shared decomposition branch: cut it from
+			// the freshly-fetched authoritative base so a foreign ambient-HEAD
+			// commit (#797) can't become the recorded fork point (ADR-035
+			// prevention, #865). Subsequent children leave this empty and rebase
+			// the existing shared branch from the remote instead.
+			r.freshFetchBase = baseRef
+		}
+	default:
+		r.branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
+		// Standalone single-writer run: cut the branch from the freshly-
+		// fetched authoritative base so a foreign ambient-HEAD commit (#797)
+		// can't become the recorded fork point (ADR-035 prevention, #861).
+		r.freshFetchBase = baseRef
+	}
+	if r.isFixup && r.branch == "" {
+		return r, errors.New("upload: fix-up pass requires a non-empty existing PR branch (fixup_branch)")
+	}
+	return r, nil
+}
+
 // openPRAndShipArtifact is the implement-stage post-processing
 // chain. It commits the agent's edits, pushes a fresh branch via
 // HTTPS, opens a PR via the GitHub REST API, and ships a
@@ -3021,13 +3286,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	}
 	// Base branch: --base-branch flag > GITHUB_REF_NAME env > "main"
 	// default. Same precedence pattern as the repo lookup above.
-	baseRef := cfg.baseBranch
-	if baseRef == "" {
-		baseRef = os.Getenv("GITHUB_REF_NAME")
-	}
-	if baseRef == "" {
-		baseRef = "main"
-	}
+	baseRef := resolveImplementBaseRef(cfg)
 
 	repoDir := cfg.workingDir
 	if repoDir == "" {
@@ -3069,49 +3328,15 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// Branch routing: a fix-up pass commits onto the existing PR branch;
 	// decomposed children share a single parent branch; standalone runs
 	// get a per-stage branch.
-	var (
-		branch       string
-		isDecomposed bool
-		isSubsequent bool
-		isFixup      bool
-		// freshFetchBase, when non-empty, makes CommitAndPush cut the run
-		// branch from a freshly-fetched origin/<base> instead of ambient HEAD
-		// (ADR-035 prevention, #861). Set in the standalone default case and on
-		// the decomposed-first-child case that creates the shared branch (#865).
-		freshFetchBase string
-	)
-	switch {
-	case cfg.fixup:
-		// Fix-up pass (#762): commit onto the EXISTING PR branch and rebase
-		// it from the remote first (fetch + checkout + pull --rebase), the
-		// same shared-branch path subsequent decomposed children use. The
-		// open PR tracks this branch, so the pushed fix-up commit updates it
-		// — no OpenPR (a PR already exists for head→base), no fresh artifact.
-		isFixup = true
-		branch = cfg.fixupBranch
-		isSubsequent = true
-	case cfg.decomposedFromRunID != "":
-		isDecomposed = true
-		branch = "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
-		isSubsequent = remoteBranchExists(ctx, repoDir, branch)
-		if !isSubsequent {
-			// First child creates the shared decomposition branch: cut it from
-			// the freshly-fetched authoritative base so a foreign ambient-HEAD
-			// commit (#797) can't become the recorded fork point (ADR-035
-			// prevention, #865). Subsequent children leave this empty and rebase
-			// the existing shared branch from the remote instead.
-			freshFetchBase = baseRef
-		}
-	default:
-		branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
-		// Standalone single-writer run: cut the branch from the freshly-
-		// fetched authoritative base so a foreign ambient-HEAD commit (#797)
-		// can't become the recorded fork point (ADR-035 prevention, #861).
-		freshFetchBase = baseRef
+	routing, err := resolveImplementBranchRouting(ctx, cfg, repoDir, baseRef)
+	if err != nil {
+		return err
 	}
-	if isFixup && branch == "" {
-		return errors.New("upload: fix-up pass requires a non-empty existing PR branch (fixup_branch)")
-	}
+	branch := routing.branch
+	isDecomposed := routing.isDecomposed
+	isSubsequent := routing.isSubsequent
+	isFixup := routing.isFixup
+	freshFetchBase := routing.freshFetchBase
 
 	title, body := prTitleAndBody(cfg, branch, logSink)
 	commitMessage := title + "\n\n" + body
