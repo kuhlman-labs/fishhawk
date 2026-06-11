@@ -26,15 +26,26 @@
 // (--enable-merge-reconciler) so a v0 deployment that doesn't need it
 // doesn't pay the poll cost.
 //
+// The tick doubles as the self-heal for the fishhawk_audit_complete
+// Check Run publish (#973): each parked review stage also gets a
+// recompute+republish via the optional AuditCheckRepublisher. The
+// publisher's dedup cache records only on a SUCCESSFUL publish, so the
+// sweep retries exactly the publishes a transient GitHub failure
+// dropped, and an already-published state dedups to a no-op.
+//
 // Rate-limit note (ADR-031 Phase 1, low severity): each tick makes one
 // synchronous GetPullRequest call per parked review stage with NO
 // per-stage cooldown — unlike reactionpoller's adaptive fast/slow
-// cadence. This is acceptable at v0 scale (a handful of concurrently
-// parked review stages), but an operator enabling this at scale should
-// tune --merge-reconciler-interval upward: N parked stages cost N REST
-// calls every interval, against GitHub's 5,000/hour per-installation
-// budget. A future phase may add adaptive cadence + a per-stage
-// last-polled gate (cf. reactionpoller) if the call volume warrants it.
+// cadence — plus, when AuditCheckRepublisher is wired, up to one MORE
+// GetPullRequest inside the audit-complete recompute (the auditcomplete
+// PRHead foreign-commit rule), roughly doubling the per-tick REST cost.
+// This is acceptable at v0 scale (a handful of concurrently parked
+// review stages), but an operator enabling this at scale should tune
+// --merge-reconciler-interval upward: N parked stages cost up to 2N
+// REST calls every interval, against GitHub's 5,000/hour
+// per-installation budget. A future phase may add adaptive cadence + a
+// per-stage last-polled gate (cf. reactionpoller) if the call volume
+// warrants it.
 package mergereconciler
 
 import (
@@ -83,6 +94,21 @@ type LineageReverifier interface {
 	ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prNumber int) (clean bool)
 }
 
+// AuditCheckRepublisher re-derives and republishes the
+// fishhawk_audit_complete Check Run for a run (#973). Satisfied by
+// *server.Server (RepublishAuditCheck). The implementation is
+// best-effort (failures log, never propagate) and dedups
+// already-published states, so calling it every tick for every parked
+// stage is cheap and idempotent.
+//
+// OPTIONAL — like LineageReverifier, not required by Run(). A nil
+// republisher preserves the pre-#973 behavior (no publish heal; the
+// Check Run is only published when an HTTP/webhook surface recomputes
+// it).
+type AuditCheckRepublisher interface {
+	RepublishAuditCheck(ctx context.Context, runID uuid.UUID)
+}
+
 // Ticker scans review stages parked in awaiting_approval and resolves
 // any whose PR has reached a terminal merge state. Run() blocks until
 // ctx is done.
@@ -107,6 +133,12 @@ type Ticker struct {
 	// merged PR leaves the run parked/flagged for #867 instead of
 	// resolving it succeeded.
 	LineageReverifier LineageReverifier
+
+	// AuditCheckRepublisher heals dropped fishhawk_audit_complete Check
+	// Run publishes (#973): invoked once per parked review stage per
+	// tick, BEFORE the PR poll so a GitHub poll failure cannot skip the
+	// heal. OPTIONAL: nil preserves the pre-#973 ticker behavior.
+	AuditCheckRepublisher AuditCheckRepublisher
 
 	// Logger receives structured warnings about transient errors.
 	// nil → slog.Default().
@@ -189,8 +221,10 @@ func (t *Ticker) Tick(ctx context.Context) {
 // PR URL, when the PR URL is malformed, or when the PR is still open.
 // Per-row errors log but don't propagate.
 //
-// Each call issues one synchronous GetPullRequest — see the package
-// doc's rate-limit note before enabling at scale.
+// Each call issues one synchronous GetPullRequest (two when the
+// optional AuditCheckRepublisher recompute consults the auditcomplete
+// PRHead rule) — see the package doc's rate-limit note before enabling
+// at scale.
 func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run.Stage) {
 	runRow, err := t.Runs.GetRun(ctx, s.RunID)
 	if err != nil {
@@ -218,6 +252,15 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 			slog.String("pr_url", prURL),
 			slog.String("error", err.Error()))
 		return
+	}
+
+	// Heal a dropped fishhawk_audit_complete publish (#973) before the
+	// merge poll: a GetPullRequest failure (the GitHub-outage shape that
+	// dropped the publish in the first place) must not also skip the
+	// retry. Idempotent — the publisher dedups an already-published
+	// state, so the steady-state cost is one recompute per parked stage.
+	if t.AuditCheckRepublisher != nil {
+		t.AuditCheckRepublisher.RepublishAuditCheck(ctx, s.RunID)
 	}
 
 	pr, err := t.PRGetter.GetPullRequest(ctx, *runRow.InstallationID, repo, number)

@@ -241,6 +241,19 @@ func (s *Server) recomputeAndPublishAuditComplete(ctx context.Context, runID uui
 	s.publishAuditCheck(ctx, runID, state, missing)
 }
 
+// RepublishAuditCheck re-derives a run's audit-complete state and republishes
+// the fishhawk_audit_complete Check Run (#973). Exported for the merge
+// reconciler's per-tick heal sweep — the same export-for-reconciler pattern as
+// ResolveReviewFromPollState / ReverifyBranchLineage. The publisher's dedup
+// cache records only on a SUCCESSFUL publish, so re-invoking this for every
+// parked review stage retries exactly the dropped publishes (a transient
+// GitHub failure heals within one tick after recovery) while an
+// already-published state dedups to a no-op. Best-effort, like the
+// recompute it delegates to.
+func (s *Server) RepublishAuditCheck(ctx context.Context, runID uuid.UUID) {
+	s.recomputeAndPublishAuditComplete(ctx, runID)
+}
+
 // prHeadFetcher returns the closure auditcomplete.Compute calls
 // for the foreign-commit rule (#282). Nil when no GitHub client is
 // wired — Compute then skips the rule cleanly. Production wires
