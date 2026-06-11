@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents working with code in this repository.
 
 ## Repo state
 
@@ -38,6 +38,8 @@ Per-module without the wrapper (still useful for `go build` and `golangci-lint`)
 go build ./backend/...
 golangci-lint run ./backend/...
 ```
+
+**Full-suite runs bound test-binary parallelism (#972):** `scripts/test` (default and `coverage`) passes `go test -p "${FISHHAWK_TEST_P:-4}"` so a developer-Mac Docker daemon isn't asked to start ~GOMAXPROCS testcontainers-Postgres instances at once (the "context deadline exceeded after 9 retries" start-timeout flake). Raise via `FISHHAWK_TEST_P` on high-core machines if wall-clock matters; `scripts/test single` is unbounded. The runner's committed-tree verify gates additionally absorb ONE such flake per stage (re-run the verify in place, `verify_infra_flake_retry` trace event) before failing.
 
 `.golangci.yml` is **v2 format** (`version: "2"` at top). Local install must be golangci-lint v2.x; v1 binaries reject this config.
 
@@ -120,6 +122,8 @@ Because `--all` always rebuilds `fishhawk-mcp`, the `/mcp` reconnect banner is *
 
 **ZERR diagnostic trap (`scripts/dev`, #631).** `up`/`reload` print a `up: starting` / `reload: starting` entry line first and install a zsh `TRAPZERR` (ZERR) trap that, on any command aborting under `set -e` in a non-tested context, prints `scripts/dev: command failed (exit <code>) at line <file:line>` to stderr — using `${funcfiletrace[1]}` for the error-site line, not the trap's own. So a top-level abort can never again exit 1 with zero output. The trap is silent in normal operation (ZERR does not fire for if/while/&&/||/! tested contexts). It is the permanent diagnostic for the intermittent #631 abort, whose root cause it pinned on the first recurrence: **`(( i++ ))` returns exit 1 when `i==0`** (post-increment yields the old value `0`, and `(( 0 ))` is false), aborting the wait loop under `set -e` — fixed by pre-increment `(( ++i ))`. When writing zsh under `set -e`, prefer `(( ++i ))` / `i=$(( i + 1 ))` over `(( i++ ))`, and the `if [[ cond ]]; then x=1; fi` form over `[[ cond ]] && x=1` (an assignment-RHS `&&` is a tested-context hazard). `scripts/test-dev` guards both regressions.
 
+**Local Kubernetes bring-up (`scripts/dev k8s` / `k8s-down`, #852).** `scripts/dev k8s` (alias `make k8s-up`) is the one-command operator path to run fishhawkd on Docker Desktop's Kubernetes: it `docker build`s the image into the host daemon as `ghcr.io/kuhlman-labs/fishhawkd:dev-local` (Docker-Desktop k8s shares the image store — no push / kind load), `helm upgrade --install`s the chart with `values-local.yaml` + `--set image.tag=dev-local --set image.pullPolicy=IfNotPresent`, waits for the rollout, then port-forwards `svc/fishhawk 8080:8080` and gates on `/healthz` (the authoritative readiness signal — the in-cluster migrate Job is a `post-install` hook, so rollout-status can go green before it finishes). `scripts/dev k8s-down` (`make k8s-down`) kills the tracked port-forward (`.fishhawk/k8s-pf.pid`) and `helm uninstall`s. The full image→install→healthz path is an operator smoke test against a Docker-Desktop cluster, NOT run in CI; `scripts/test-dev` covers the pure helpers + the readiness-gate body contract. Quickstart: `docs/deploy/kubernetes.md`.
+
 ## Adding a Go module
 
 1. `mkdir <name> && cd <name> && go mod init github.com/kuhlman-labs/fishhawk/<name>`
@@ -139,7 +143,7 @@ Because `--all` always rebuilds `fishhawk-mcp`, the `/mcp` reconnect banner is *
    - Spec or schema change → `docs/spec/<x>.md` + every embedded copy (CI's schema-sync diff fails otherwise).
    - HTTP API change → `docs/api/v0.openapi.yaml` (source of truth) + `docs/api/v0.md`.
    - Add / remove / rename an issue-comment surface (Notifier method or audit kind) → `docs/issue-comment-surfaces.md`.
-   - Voice/naming → `BRAND_FOUNDATIONS.md`. New trap / build workflow → `CLAUDE.md`. Autonomy convention → `METHODOLOGY.md`.
+   - Voice/naming → `BRAND_FOUNDATIONS.md`. New trap / build workflow → `AGENTS.md`. Autonomy convention → `METHODOLOGY.md`.
 5. **File issues for deferred work** before the PR opens. Any TODO, "follow-up PR", "deferred to E…", or obvious operability gap gets a tracking issue: title `[E<parent>.<n>]` (or `[ADR-NNN]`), same `area:*/autonomy:*/phase:*/type:*` labels as siblings, add to Project #7 with `Status=Backlog`, link from the parent epic's Children list, and reference from the PR body's `## Notes` so the deferral is reviewable.
 6. Open PR — body uses `## Summary` / `## Test plan` / optional `## Notes` / `Closes #<issue>`. Match #80, #81.
 7. After merge, walk the dependents:
@@ -189,4 +193,5 @@ Error messages: precise about what failed and how to fix. No generic apologies.
 - **Project #7 owner is `kuhlman-labs` as a `user`, not an `organization`** — the GraphQL queries that take an owner login must use `user(login:"kuhlman-labs")`, not `organization(...)`, or you get a NOT_FOUND. The repo lives under what looks like an org namespace but it's a user-owned account.
 - **Project #7 has > 100 items.** GraphQL caps `items(first:N)` at 100. To find an item ID for a known issue, query the issue's `projectItems(first:10)` and filter by `project.id` instead of paginating the project's items list — same answer in one round-trip with no cursors.
 - **jsdom rejects `__Host-` cookies under HTTP.** The default vitest jsdom URL is `http://localhost/`, but `__Host-` requires Secure, and tough-cookie won't honour it over HTTP. `frontend/vite.config.ts` sets `test.environmentOptions.jsdom.url = 'https://localhost/'` so cookie semantics in tests match production. Browsers treat `localhost` as a secure context anyway, so dev still works.
+- **`scripts/test` exports `GIT_CONFIG_GLOBAL=/dev/null` + `GIT_CONFIG_SYSTEM=/dev/null`** so temp-repo test commits never inherit the operator's global `commit.gpgsign` (#912). Without this, a global `commit.gpgsign=true` red-lines the verify gate when the SSH/GPG signing agent (e.g. 1Password op-ssh-sign) is down. No-op on CI (no signing config); in-repo git ops are unaffected because repo-local `.git/config commit.gpgsign=false` takes precedence over the now-absent global.
 - After **Day 21**, every change must flow through a Fishhawk workflow run (today: by convention; later: enforced by the product).
