@@ -122,12 +122,16 @@ Notes:
 - The cost-accounting audit kind — `cost_recorded` (#649), written by the
   trace upload handler (`trace.go::recordCost`) once per bundle receipt with
   payload `{model, input_tokens, output_tokens, usd, known_model,
-  pricing_as_of, estimated}` — is an **internal audit kind, not an
-  issue-comment surface**. Nothing in `issuecomment` posts it to the issue
-  thread. It is the canonical per-invocation cost ledger (the per-run rollup
-  on `runs.cost_usd_total` is a denormalized read of it); listed here only so
-  a future reader grepping the audit categories doesn't mistake it for a
-  comment surface.
+  known_usage, pricing_as_of, estimated}`, and by
+  `trace.go::recordReviewerCost` once per advisory reviewer invocation with
+  the same shape plus `{cached_input_tokens, total_input_tokens, turns,
+  source}` (#681/#995/#1010; `input_tokens` is the fresh cache-exclusive
+  count, `total_input_tokens` = fresh + cached) — is an **internal audit
+  kind, not an issue-comment surface**. Nothing in `issuecomment` posts it
+  to the issue thread. It is the canonical per-invocation cost ledger (the
+  per-run rollup on `runs.cost_usd_total` is a denormalized read of it);
+  listed here only so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
 - The spend-anomaly audit kind — `spend_alert` (#649), written by the trace
   upload handler (`trace.go::checkSpendAlert`) when the current hour's
   estimated model spend exceeds `FISHHAWKD_SPEND_ALERT_MULTIPLE` (default 3x)

@@ -28,8 +28,10 @@ func TestReviewer_HappyPath(t *testing.T) {
 	if model != "gpt-5-codex" {
 		t.Errorf("model = %q, want gpt-5-codex", model)
 	}
-	if !verdict.Usage.Known || verdict.Usage.InputTokens != 1234 || verdict.Usage.OutputTokens != 600 {
-		t.Errorf("Usage = %+v, want {1234 600 true}", verdict.Usage)
+	// Fresh input = raw 1234 - cached 100 = 1134, the #1010 cache-exclusive
+	// contract applied at the adapter boundary.
+	if !verdict.Usage.Known || verdict.Usage.InputTokens != 1134 || verdict.Usage.OutputTokens != 600 {
+		t.Errorf("Usage = %+v, want {1134 600 true}", verdict.Usage)
 	}
 	// The #995 instrumentation rides the same pass-through: cached split and
 	// turn count reach the server contract unmodified.

@@ -100,8 +100,9 @@ type cliEnvelope struct {
 // The cache fields were verified against a live `claude --print
 // --output-format json` envelope (#995): `input_tokens` EXCLUDES cache reads
 // and writes, which arrive as the separate `cache_read_input_tokens` /
-// `cache_creation_input_tokens` members. An envelope that omits them decodes
-// to 0 — harmless.
+// `cache_creation_input_tokens` members — so the envelope already satisfies
+// the normalized cache-EXCLUSIVE planreview.Usage contract (#1010) with no
+// boundary arithmetic. An envelope that omits them decodes to 0 — harmless.
 type cliUsage struct {
 	InputTokens              int `json:"input_tokens"`
 	OutputTokens             int `json:"output_tokens"`
@@ -218,10 +219,11 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	var usageOut planreview.Usage
 	if env.Usage != nil {
 		usageOut = planreview.Usage{
-			InputTokens: env.Usage.InputTokens,
-			// Unlike codex, the cached counts are ADDITIONAL to input_tokens
-			// here (Anthropic accounting); surfaced so the #995 comparison is
-			// like-for-like.
+			// The envelope's input_tokens is already cache-exclusive
+			// (Anthropic accounting), so it passes through unchanged as the
+			// normalized fresh count (#1010); the cache members sum into the
+			// ADDITIONAL CachedInputTokens split.
+			InputTokens:       env.Usage.InputTokens,
 			CachedInputTokens: env.Usage.CacheReadInputTokens + env.Usage.CacheCreationInputTokens,
 			OutputTokens:      env.Usage.OutputTokens,
 			Turns:             1, // single-shot --print: exactly one turn

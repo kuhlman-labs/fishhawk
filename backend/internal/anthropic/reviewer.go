@@ -86,7 +86,12 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 		// Attach token usage from the SDK envelope (not the agent-decoded
 		// JSON) so the server can record reviewer agent cost (#681). The SDK
 		// returns a Usage block on every successful Messages call, so Known is
-		// true here.
+		// true here. The Messages API usage.input_tokens already EXCLUDES
+		// cache reads/writes (they arrive as separate cache_read_input_tokens
+		// / cache_creation_input_tokens fields), so this adapter satisfies the
+		// normalized cache-exclusive Usage contract (#1010) as-is;
+		// CachedInputTokens stays 0 until the Messages client surfaces the
+		// cache fields.
 		return responseText, modelName, planreview.Usage{
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
