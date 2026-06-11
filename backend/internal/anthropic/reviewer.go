@@ -90,6 +90,7 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 		return responseText, modelName, planreview.Usage{
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
+			Turns:        1, // single Messages call: exactly one turn
 			Known:        true,
 		}, nil
 	}

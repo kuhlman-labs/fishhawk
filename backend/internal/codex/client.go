@@ -131,6 +131,7 @@ type codexItem struct {
 // runner executor adapter (runner/internal/agent/codex/codex.go).
 type usageBlock struct {
 	InputTokens           int `json:"input_tokens"`
+	CachedInputTokens     int `json:"cached_input_tokens"`
 	OutputTokens          int `json:"output_tokens"`
 	ReasoningOutputTokens int `json:"reasoning_output_tokens"`
 }
@@ -186,15 +187,35 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		cmdFn = exec.CommandContext
 	}
 
+	// Workspace bound (#995): run the child from a fresh EMPTY scratch
+	// directory. `codex exec` in non-interactive mode runs read-only shell
+	// commands without approval, so a reviewer that decides to explore its cwd
+	// reads whatever fishhawkd's inherited cwd holds (the repo checkout, in the
+	// dogfood loop) across many turns — each turn re-sending the full growing
+	// conversation (~400k input tokens per review). The prompt forbids tool use
+	// but cannot prevent it; an empty cwd makes exploration fruitless. Review
+	// invocations review the provided artifact and need no repo access —
+	// --skip-git-repo-check already pins the non-repo-cwd execution posture.
+	//
+	// FAIL CLOSED on MkdirTemp error: a review that silently regains an
+	// unbounded workspace defeats the bound, so the invocation errors instead
+	// (the #955 per-invocation failure path degrades the advisory review
+	// gracefully — terminal *_review_failed entry, loop continues).
+	scratchDir, err := os.MkdirTemp("", "fishhawk-codex-review-")
+	if err != nil {
+		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: create scratch workspace dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(scratchDir) }()
+
 	// Flag rationale (pinned against codex-cli 0.137.0):
 	//   exec                  — the non-interactive subcommand; reads the
 	//                           prompt from the positional argument.
 	//   --json                — emit one JSON event per line to stdout (the
 	//                           stream this adapter parses).
 	//   --skip-git-repo-check — Codex refuses to run outside a git repo by
-	//                           default; the backend has no checkout, so this is
-	//                           required. The inference-only review path executes
-	//                           no tools, so a real run returns cleanly without
+	//                           default; cmd.Dir is a fresh non-repo scratch
+	//                           dir (above), so this is required. A real run
+	//                           from a non-repo dir returns cleanly without
 	//                           the executor's --dangerously-bypass flags.
 	//   --model <model>       — overrides the host ~/.codex config's model;
 	//                           appended only when cfg.Model is set, so an empty
@@ -218,6 +239,7 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	}
 	args = append(args, prompt)
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
+	cmd.Dir = scratchDir
 	// Seed with os.Environ() when the Cmd builder left env nil (production), so
 	// the operator's existing OPENAI_API_KEY / ChatGPT-login auth and PATH are
 	// inherited. Then layer the configured API key on top. A subprocess's
@@ -284,7 +306,9 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 		haveMessage bool
 		haveUsage   bool
 		inputTokens int
+		cachedTok   int
 		outputTok   int
+		turns       int
 	)
 	for _, line := range bytes.Split(out, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)
@@ -306,10 +330,14 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 			}
 		case "turn.completed":
 			// Codex reports usage PER TURN, so SUM across turns rather than
-			// last-wins. input_tokens already includes cached_input_tokens;
-			// reasoning_output_tokens is added to the output side.
+			// last-wins. input_tokens already includes cached_input_tokens
+			// (which is summed separately so the cached split stays visible,
+			// #995); reasoning_output_tokens is added to the output side. The
+			// turn count makes a multi-turn agentic blowup observable.
+			turns++
 			if ev.Usage != nil {
 				inputTokens += ev.Usage.InputTokens
+				cachedTok += ev.Usage.CachedInputTokens
 				outputTok += ev.Usage.OutputTokens + ev.Usage.ReasoningOutputTokens
 				haveUsage = true
 			}
@@ -325,9 +353,11 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 	// guessing (#681/#682).
 	if haveUsage {
 		usage = planreview.Usage{
-			InputTokens:  inputTokens,
-			OutputTokens: outputTok,
-			Known:        true,
+			InputTokens:       inputTokens,
+			CachedInputTokens: cachedTok,
+			OutputTokens:      outputTok,
+			Turns:             turns,
+			Known:             true,
 		}
 	}
 	return verdictText, usage, nil

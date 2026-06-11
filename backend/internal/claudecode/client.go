@@ -97,9 +97,16 @@ type cliEnvelope struct {
 // pointer on cliEnvelope so a pre-usage / malformed envelope (no `usage`
 // key) decodes as nil and the adapter reports Known=false rather than a
 // spurious zero-token figure.
+// The cache fields were verified against a live `claude --print
+// --output-format json` envelope (#995): `input_tokens` EXCLUDES cache reads
+// and writes, which arrive as the separate `cache_read_input_tokens` /
+// `cache_creation_input_tokens` members. An envelope that omits them decodes
+// to 0 — harmless.
 type cliUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
 // Inference runs `claude --print --output-format json --model <model> -p
@@ -211,9 +218,14 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	var usageOut planreview.Usage
 	if env.Usage != nil {
 		usageOut = planreview.Usage{
-			InputTokens:  env.Usage.InputTokens,
-			OutputTokens: env.Usage.OutputTokens,
-			Known:        true,
+			InputTokens: env.Usage.InputTokens,
+			// Unlike codex, the cached counts are ADDITIONAL to input_tokens
+			// here (Anthropic accounting); surfaced so the #995 comparison is
+			// like-for-like.
+			CachedInputTokens: env.Usage.CacheReadInputTokens + env.Usage.CacheCreationInputTokens,
+			OutputTokens:      env.Usage.OutputTokens,
+			Turns:             1, // single-shot --print: exactly one turn
+			Known:             true,
 		}
 	}
 

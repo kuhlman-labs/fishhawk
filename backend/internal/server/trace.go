@@ -1350,6 +1350,14 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 	s.checkBudgetAlerts(ctx, runID, stageID)
 }
 
+// reviewerInputTokenWarnCeiling is the per-invocation known-input-token level
+// above which recordReviewerCost WARN-logs (#995). A review invocation reads
+// one server-composed prompt (plan/diff + instructions), so a six-figure
+// input count signals a context-assembly blowup (e.g. an agentic reviewer
+// exploring its cwd across many turns), not a big artifact. Observability
+// only — the cost is still priced and recorded.
+const reviewerInputTokenWarnCeiling = 100_000
+
 // recordReviewerCost prices and records the cost of one advisory reviewer
 // (plan-review / implement-review) agent invocation (#681). Unlike runner
 // stage agents, reviewer agents run server-side inside fishhawkd and never
@@ -1394,16 +1402,37 @@ func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUI
 		rec.USD = 0
 	}
 
+	// Context-assembly blowup tripwire (#995): a known input-token count past
+	// the ceiling is anomalous for a single composed review prompt. WARN so
+	// the next ~400k-token review is loud, not a silent ledger line.
+	if usage.Known && usage.InputTokens > reviewerInputTokenWarnCeiling {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"reviewer cost: input tokens exceed warn ceiling — possible context-assembly blowup",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("source", source),
+			slog.String("model", model),
+			slog.Int("input_tokens", usage.InputTokens),
+			slog.Int("turns", usage.Turns),
+			slog.Int("ceiling", reviewerInputTokenWarnCeiling))
+	}
+
+	// turns / cached_input_tokens are observability-only (#995): turns exposes
+	// a multi-turn agentic blowup, and the cached split makes codex
+	// (cached-inclusive input_tokens) comparable with the Anthropic-side
+	// adapters (cache-exclusive). Pricing is untouched.
 	payload, _ := json.Marshal(map[string]any{
-		"model":         rec.Model,
-		"input_tokens":  rec.InputTokens,
-		"output_tokens": rec.OutputTokens,
-		"usd":           rec.USD,
-		"known_model":   rec.KnownModel,
-		"known_usage":   usage.Known,
-		"pricing_as_of": rec.PricingAsOf,
-		"source":        source,
-		"estimated":     true,
+		"model":               rec.Model,
+		"input_tokens":        rec.InputTokens,
+		"output_tokens":       rec.OutputTokens,
+		"cached_input_tokens": usage.CachedInputTokens,
+		"turns":               usage.Turns,
+		"usd":                 rec.USD,
+		"known_model":         rec.KnownModel,
+		"known_usage":         usage.Known,
+		"pricing_as_of":       rec.PricingAsOf,
+		"source":              source,
+		"estimated":           true,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2338,6 +2367,9 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// (#984) ride on the authoritative audit payload; the concern
 			// store applies them below as a derived index.
 			ConcernResolutions: verdict.ConcernResolutions,
+			// Per-invocation token usage on the review surface (#995).
+			InputTokens:  verdict.Usage.InputTokens,
+			OutputTokens: verdict.Usage.OutputTokens,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
