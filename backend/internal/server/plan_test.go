@@ -1692,7 +1692,7 @@ func TestShipPlan_ReviewAgents_Advisory_ContextDetached(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Advisory → dispatches a detached goroutine and returns false.
-	if s.runPlanReviews(ctx, runID, stageID, body, nil, nil) {
+	if s.runPlanReviews(ctx, runID, stageID, body, nil, nil, nil) {
 		t.Fatal("advisory runPlanReviews returned true (advisory must never gate)")
 	}
 

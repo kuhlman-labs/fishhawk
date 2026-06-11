@@ -1484,6 +1484,90 @@ func TestBuild_PlanReview_GateEvidence_CleanResultsRenderExplicitly(t *testing.T
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_TestSweepRenders pins the test-sweep
+// block (#942): the advisory framing, the listing counters, the finding
+// line with its rule + truncation marker, and the reviewer-judged
+// scope_drift guidance.
+func TestBuild_PlanReview_GateEvidence_TestSweepRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			TestSweep: &TestSweepEvidence{
+				ScannedFiles: 3,
+				ListedDirs:   2,
+				Findings: []TestSweepFindingEvidence{
+					{
+						Rule:         "stem_sibling",
+						TriggerPath:  "backend/internal/server/upload.go",
+						MissingTests: []string{"backend/internal/server/upload_test.go"},
+					},
+					{
+						Rule:         "new_test_in_tested_package",
+						TriggerPath:  "backend/internal/server/feature_test.go",
+						MissingTests: []string{"backend/internal/server/a_test.go"},
+						OmittedCount: 3,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"Test sweep (existing *_test.go files adjacent to the planned change — heuristic ADVISORY, reviewer-judged, NOT an automatic concern):",
+		"- files scanned: 3",
+		"- directories listed: 2",
+		"- EXISTING TESTS NOT IN SCOPE (stem_sibling): backend/internal/server/upload.go is in scope but these existing test files are absent from scope.files: backend/internal/server/upload_test.go",
+		"- EXISTING TESTS NOT IN SCOPE (new_test_in_tested_package): backend/internal/server/feature_test.go is in scope but these existing test files are absent from scope.files: backend/internal/server/a_test.go (+3 more omitted)",
+		"these findings are advisories, not violations",
+		"the runner will scope_drift-exclude the agent's edits to them",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing test-sweep element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_TestSweepCleanAndNil verifies the
+// "checked and clean" line for an empty-findings test sweep and the
+// additive property: a nil TestSweep omits the block entirely.
+func TestBuild_PlanReview_GateEvidence_TestSweepCleanAndNil(t *testing.T) {
+	clean, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			TestSweep: &TestSweepEvidence{ScannedFiles: 2, ListedDirs: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(clean, "- findings: none (checked and clean)") {
+		t.Errorf("clean test sweep must render the explicit clean line:\n%s", clean)
+	}
+	if strings.Contains(clean, "scope_drift-exclude") {
+		t.Errorf("clean test sweep must omit the finding guidance:\n%s", clean)
+	}
+
+	withNil, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopePrecheck: &ScopePrecheckEvidence{ScannedFiles: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(withNil, "Test sweep") {
+		t.Errorf("Test sweep block must be absent when TestSweep is nil:\n%s", withNil)
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_BudgetCheckRenders pins the Budget
 // check block (#994): the resolved implement budget, its source, the
 // plan's prediction, and the within/over verdict line. A BudgetCheck

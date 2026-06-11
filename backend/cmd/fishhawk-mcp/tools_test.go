@@ -1862,6 +1862,104 @@ func TestGetPlan_SurfaceSweep_AbsentWhenNoEntry(t *testing.T) {
 	}
 }
 
+// seedTestSweepAudit marshals a SERVER-side TestSweepPayload and feeds it
+// back through the fake backend as a plan_test_sweep audit entry. Using
+// the real server type is the point of the seam test (#618): it exercises
+// the backend-write -> mcp-read JSON contract end to end, so a drift in
+// either side's struct tags fails here rather than silently in production.
+func seedTestSweepAudit(fb *fakeBackend, runID uuid.UUID, payload server.TestSweepPayload) {
+	raw, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(raw, &decoded)
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "plan_test_sweep",
+		Payload:  decoded,
+	})
+	fb.mu.Unlock()
+}
+
+func TestGetPlan_TestSweep_CrossBoundarySeam(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedTestSweepAudit(fb, runID, server.TestSweepPayload{
+		ScannedFiles: 3,
+		ListedDirs:   2,
+		Findings: []server.TestSweepFinding{
+			{
+				Rule:         "stem_sibling",
+				TriggerPath:  "backend/internal/server/upload.go",
+				MissingTests: []string{"backend/internal/server/upload_test.go"},
+			},
+			{
+				Rule:         "new_test_in_tested_package",
+				TriggerPath:  "backend/internal/server/feature_test.go",
+				MissingTests: []string{"backend/internal/server/a_test.go"},
+				OmittedCount: 3,
+			},
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.TestSweep == nil {
+		t.Fatal("TestSweep is nil; want populated")
+	}
+	if out.TestSweep.ScannedFiles != 3 || out.TestSweep.ListedDirs != 2 {
+		t.Errorf("ScannedFiles/ListedDirs = %d/%d, want 3/2", out.TestSweep.ScannedFiles, out.TestSweep.ListedDirs)
+	}
+	if got := len(out.TestSweep.Findings); got != 2 {
+		t.Fatalf("len(Findings) = %d, want 2", got)
+	}
+	f := out.TestSweep.Findings[0]
+	if f.Rule != "stem_sibling" || f.TriggerPath != "backend/internal/server/upload.go" {
+		t.Errorf("Findings[0] = %+v", f)
+	}
+	if len(f.MissingTests) != 1 || f.MissingTests[0] != "backend/internal/server/upload_test.go" {
+		t.Errorf("MissingTests = %v, want [upload_test.go]", f.MissingTests)
+	}
+	if f.OmittedCount != 0 {
+		t.Errorf("Findings[0].OmittedCount = %d, want 0", f.OmittedCount)
+	}
+	if out.TestSweep.Findings[1].OmittedCount != 3 {
+		t.Errorf("Findings[1].OmittedCount = %d, want 3", out.TestSweep.Findings[1].OmittedCount)
+	}
+}
+
+func TestGetPlan_TestSweep_AbsentWhenNoEntry(t *testing.T) {
+	// An older run predating the test sweep (or a fail-open no-op: non-
+	// GitHub trigger, no GitHub client) has no plan_test_sweep entry —
+	// TestSweep must be nil so the field is omitted.
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.TestSweep != nil {
+		t.Errorf("TestSweep should be nil with no entry; got %+v", out.TestSweep)
+	}
+}
+
 func TestGetPlan_ReviewAuditError_Surfaced(t *testing.T) {
 	// The per-run audit endpoint returns 500 → the error propagates
 	// through loadPlanReviews and surfaces as a getPlan error.

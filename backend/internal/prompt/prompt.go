@@ -357,6 +357,7 @@ type GatePolicyViolation struct {
 type PlanGateEvidence struct {
 	ScopePrecheck *ScopePrecheckEvidence
 	SurfaceSweep  *SurfaceSweepEvidence
+	TestSweep     *TestSweepEvidence
 	BudgetCheck   *BudgetCheckEvidence
 }
 
@@ -409,6 +410,28 @@ type SurfaceSweepFindingEvidence struct {
 	Pattern         string
 	TriggerPath     string
 	MissingSiblings []string
+}
+
+// TestSweepEvidence is the plan_test_sweep result (#942): the plan's
+// scope.files evaluated against the repository's existing *_test.go
+// files via the Contents API. Empty Findings means "checked and clean";
+// ListedDirs counts the directories actually listed (0 means every
+// listing failed open — findings may be incomplete).
+type TestSweepEvidence struct {
+	ScannedFiles int
+	ListedDirs   int
+	Findings     []TestSweepFindingEvidence
+}
+
+// TestSweepFindingEvidence is one test-sweep finding: the plan touches
+// TriggerPath but omits the existing test files MissingTests the named
+// Rule associates with it; OmittedCount is the number of additional
+// existing test files truncated from MissingTests.
+type TestSweepFindingEvidence struct {
+	Rule         string
+	TriggerPath  string
+	MissingTests []string
+	OmittedCount int
 }
 
 // PriorConcern is one previously recorded concern rendered into the
@@ -886,7 +909,7 @@ func buildPlanReview(t Trigger) string {
 // own text-level findings. Writes nothing when no gate produced a result,
 // so the no-evidence prompt stays byte-identical to the pre-#963 output.
 func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
-	if ev == nil || (ev.ScopePrecheck == nil && ev.SurfaceSweep == nil && ev.BudgetCheck == nil) {
+	if ev == nil || (ev.ScopePrecheck == nil && ev.SurfaceSweep == nil && ev.TestSweep == nil && ev.BudgetCheck == nil) {
 		return
 	}
 	b.WriteString("### Gate evidence (machine-verified — outranks text-level findings)\n\n")
@@ -926,6 +949,31 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 				fmt.Fprintf(b, "- MISSING SIBLINGS (%s): %s is in scope but the pattern's required sibling(s) are absent from scope.files: %s\n",
 					f.Pattern, f.TriggerPath, strings.Join(f.MissingSiblings, ", "))
 			}
+		}
+		b.WriteString("\n")
+	}
+
+	if ts := ev.TestSweep; ts != nil {
+		b.WriteString("Test sweep (existing *_test.go files adjacent to the planned change — heuristic ADVISORY, " +
+			"reviewer-judged, NOT an automatic concern):\n\n")
+		fmt.Fprintf(b, "- files scanned: %d\n", ts.ScannedFiles)
+		fmt.Fprintf(b, "- directories listed: %d\n", ts.ListedDirs)
+		if len(ts.Findings) == 0 {
+			b.WriteString("- findings: none (checked and clean)\n")
+		} else {
+			for _, f := range ts.Findings {
+				fmt.Fprintf(b, "- EXISTING TESTS NOT IN SCOPE (%s): %s is in scope but these existing test files are absent from scope.files: %s",
+					f.Rule, f.TriggerPath, strings.Join(f.MissingTests, ", "))
+				if f.OmittedCount > 0 {
+					fmt.Fprintf(b, " (+%d more omitted)", f.OmittedCount)
+				}
+				b.WriteString("\n")
+			}
+			b.WriteString("\nUnlike the gate results above, these findings are advisories, not violations: judge " +
+				"whether the changed behavior's tests or shared test harness live in the flagged existing files. " +
+				"If so, the plan must scope them or the runner will scope_drift-exclude the agent's edits to them " +
+				"— record a concern naming the files. If the flagged tests are unrelated to the changed behavior, " +
+				"no concern is needed.\n")
 		}
 		b.WriteString("\n")
 	}
