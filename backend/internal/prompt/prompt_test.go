@@ -1825,6 +1825,89 @@ func TestBuild_ImplementReview_AmendedScope_AbsentWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestBuild_ImplementReview_PriorConcerns_RendersAllStates(t *testing.T) {
+	// #984: a re-review prompt lists the stage's prior concerns with their
+	// lifecycle states. addressed_pending carries the mandatory
+	// concern_resolutions instruction; waived renders the operator's
+	// audited reason as not-re-litigable context; raised/reopened render
+	// for completeness. The verdict schema gains the concern_resolutions
+	// member only on this path.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		PriorConcerns: []PriorConcern{
+			{ID: "11111111-1111-1111-1111-111111111111", State: "addressed_pending", Severity: "high", Category: "correctness", Note: "unhandled error path"},
+			{ID: "22222222-2222-2222-2222-222222222222", State: "waived", Severity: "medium", Category: "scope", Note: "doc companion drift", StateReason: "accepted trade-off: doc lands in a follow-up"},
+			{ID: "33333333-3333-3333-3333-333333333333", State: "raised", Severity: "low", Category: "verification", Note: "missing edge-case test"},
+			{ID: "44444444-4444-4444-4444-444444444444", State: "reopened", Severity: "high", Category: "regression", Note: "fix did not land"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Prior concerns (delta verification)",
+		// The addressed_pending resolution mandate.
+		"For EVERY concern listed in state `addressed_pending`",
+		"you MUST emit exactly one entry in the verdict's `concern_resolutions` array",
+		"`confirmed` (the diff resolves it)",
+		// Waived: not re-litigable, with the audited reason verbatim.
+		"MUST NOT re-raise or re-litigate a waived concern absent genuinely new evidence",
+		"operator waive reason: accepted trade-off: doc lands in a follow-up",
+		// Never re-mint a listed concern.
+		"NEVER re-mint a concern already listed",
+		// Every state's row renders with its id.
+		"id: 11111111-1111-1111-1111-111111111111",
+		"state: addressed_pending",
+		"id: 22222222-2222-2222-2222-222222222222",
+		"state: waived",
+		"id: 33333333-3333-3333-3333-333333333333",
+		"state: raised",
+		"id: 44444444-4444-4444-4444-444444444444",
+		"state: reopened",
+		// The verdict schema's resolutions member.
+		"\"concern_resolutions\": [",
+		"\"resolution\": \"confirmed\" | \"reopened\" | \"superseded\"",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("prior-concerns prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_PriorConcerns_AbsentWhenEmpty(t *testing.T) {
+	// #984 additive property: an empty PriorConcerns leaves the review
+	// prompt byte-identical to omitting the field entirely, with neither
+	// the section nor the schema's concern_resolutions member present —
+	// a first review's prompt is unchanged from the pre-#984 output.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	withNil := base
+	withNil.PriorConcerns = nil
+
+	gotBase, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build base: %v", err)
+	}
+	gotNil, err := Build("implement_review", withNil)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	if strings.Contains(gotBase, "### Prior concerns (delta verification)") {
+		t.Errorf("prior-concerns section should be absent when PriorConcerns is empty:\n%s", gotBase)
+	}
+	if strings.Contains(gotBase, "concern_resolutions") {
+		t.Errorf("verdict schema must not mention concern_resolutions when PriorConcerns is empty:\n%s", gotBase)
+	}
+	if gotBase != gotNil {
+		t.Errorf("explicit-nil PriorConcerns must be byte-identical to omitting it")
+	}
+}
+
 func TestBuild_ImplementReview_WithPatch_RendersHunks(t *testing.T) {
 	patch := "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n" +
 		"@@ -1,3 +1,3 @@\n-old line\n+new line\n"

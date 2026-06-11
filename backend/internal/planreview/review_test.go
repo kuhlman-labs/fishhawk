@@ -2,6 +2,7 @@ package planreview_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -269,5 +270,65 @@ func TestReviewVerdict_UsageIsolatedFromAgentJSON(t *testing.T) {
 	}
 	if spoofed.Usage != (planreview.Usage{}) {
 		t.Errorf("spoofed Usage = %+v, want zero-value — json:\"-\" must reject a model-supplied usage key", spoofed.Usage)
+	}
+}
+
+// --- ConcernResolutions on the wire (#984) ---
+
+// TestImplementReviewedPayload_JSONRoundTrip_WithResolutions covers the
+// #984 delta-verification additions: concern_resolutions ride on the
+// authoritative implement_reviewed audit payload and round-trip intact.
+func TestImplementReviewedPayload_JSONRoundTrip_WithResolutions(t *testing.T) {
+	p := planreview.ImplementReviewedPayload{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-8",
+		Authority:     planreview.AuthorityAdvisory,
+		Verdict:       planreview.VerdictApprove,
+		ConcernResolutions: []planreview.ConcernResolution{
+			{ID: "11111111-1111-1111-1111-111111111111", Resolution: "confirmed", Note: "resolved by the fixup"},
+			{ID: "22222222-2222-2222-2222-222222222222", Resolution: "reopened"},
+		},
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(got.ConcernResolutions) != 2 {
+		t.Fatalf("ConcernResolutions = %d entries, want 2", len(got.ConcernResolutions))
+	}
+	if got.ConcernResolutions[0] != p.ConcernResolutions[0] || got.ConcernResolutions[1] != p.ConcernResolutions[1] {
+		t.Errorf("ConcernResolutions = %+v, want %+v", got.ConcernResolutions, p.ConcernResolutions)
+	}
+}
+
+// TestImplementReviewedPayload_NoResolutions_OmittedFromWire pins the
+// additive-field contract in both directions: a resolutions-free payload
+// marshals WITHOUT the concern_resolutions key (byte-identical to
+// pre-#984 entries), and an old stored payload (no key) unmarshals with
+// a nil slice.
+func TestImplementReviewedPayload_NoResolutions_OmittedFromWire(t *testing.T) {
+	p := planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent",
+		Authority:    planreview.AuthorityAdvisory,
+		Verdict:      planreview.VerdictApprove,
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(b), "concern_resolutions") {
+		t.Errorf("resolutions-free payload must omit the key (omitempty): %s", b)
+	}
+
+	var got planreview.ImplementReviewedPayload
+	if err := json.Unmarshal([]byte(`{"reviewer_kind":"agent","authority":"advisory","verdict":"approve"}`), &got); err != nil {
+		t.Fatalf("Unmarshal pre-#984 payload: %v", err)
+	}
+	if got.ConcernResolutions != nil {
+		t.Errorf("ConcernResolutions = %+v, want nil decoding a pre-#984 payload", got.ConcernResolutions)
 	}
 }

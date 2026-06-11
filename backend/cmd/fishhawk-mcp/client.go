@@ -387,6 +387,51 @@ func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []s
 	return &s, nil
 }
 
+// waiveConcernRequest mirrors the backend's
+// `POST /v0/concerns/{concern_id}/waive` body
+// (`backend/internal/server/waive.go::waiveConcernRequest`). Reason is
+// REQUIRED — the backend refuses an empty reason with 400.
+type waiveConcernRequest struct {
+	Reason string `json:"reason"`
+}
+
+// WaivedConcern mirrors the backend's waive 200 body: the updated
+// concern row, now in state waived with the operator's reason as
+// state_reason.
+type WaivedConcern struct {
+	ID          string `json:"id"`
+	RunID       string `json:"run_id"`
+	StageID     string `json:"stage_id"`
+	StageKind   string `json:"stage_kind"`
+	Severity    string `json:"severity"`
+	Category    string `json:"category"`
+	Note        string `json:"note"`
+	State       string `json:"state"`
+	StateReason string `json:"state_reason"`
+}
+
+// WaiveConcern transitions one open review concern to the terminal
+// waived state with a required, audited reason via
+// `POST /v0/concerns/{concern_id}/waive` (E22.X / #984). 4xx surfaces:
+//   - 400 validation_failed (empty reason)
+//   - 403 cross_run_waive (a run-bound token reaching another run's
+//     concern) or insufficient_scope
+//   - 404 concern_not_found
+//   - 422 concern_waive_conflict (the concern is not in an open state —
+//     already waived/superseded/addressed; details carry the from/to pair)
+//   - 503 concern_store_unconfigured
+func (c *apiClient) WaiveConcern(ctx context.Context, id uuid.UUID, reason string) (*WaivedConcern, error) {
+	body, err := json.Marshal(waiveConcernRequest{Reason: reason})
+	if err != nil {
+		return nil, fmt.Errorf("marshal waive: %w", err)
+	}
+	var out WaivedConcern
+	if err := c.do(ctx, http.MethodPost, "/v0/concerns/"+id.String()+"/waive", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // resetBranchRequest mirrors the backend's
 // `POST /v0/runs/{run_id}/reset-branch` body
 // (`backend/internal/server/reset_branch.go::resetBranchRequest`).

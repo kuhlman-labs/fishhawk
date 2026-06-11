@@ -167,3 +167,65 @@ func TestDecodeVerdict_UnicodeEscapeSurvivesSanitizer(t *testing.T) {
 		t.Errorf("FreeForm = %q, want it to contain literal \\-", verdict.FreeForm)
 	}
 }
+
+// TestDecodeVerdict_ConcernResolutions_StrictPath asserts a verdict
+// carrying the #984 concern_resolutions array decodes on the strict path
+// with every member intact — the delta-verification re-review's wire
+// shape.
+func TestDecodeVerdict_ConcernResolutions_StrictPath(t *testing.T) {
+	raw := []byte(`{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"scope","note":"new drift"}],"concern_resolutions":[{"id":"11111111-1111-1111-1111-111111111111","resolution":"confirmed","note":"fix lands"},{"id":"22222222-2222-2222-2222-222222222222","resolution":"reopened"}]}`)
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if len(verdict.ConcernResolutions) != 2 {
+		t.Fatalf("ConcernResolutions = %d entries, want 2", len(verdict.ConcernResolutions))
+	}
+	if verdict.ConcernResolutions[0].ID != "11111111-1111-1111-1111-111111111111" ||
+		verdict.ConcernResolutions[0].Resolution != "confirmed" ||
+		verdict.ConcernResolutions[0].Note != "fix lands" {
+		t.Errorf("first resolution = %+v, want confirmed with note", verdict.ConcernResolutions[0])
+	}
+	if verdict.ConcernResolutions[1].Resolution != "reopened" || verdict.ConcernResolutions[1].Note != "" {
+		t.Errorf("second resolution = %+v, want reopened with empty note", verdict.ConcernResolutions[1])
+	}
+	if len(verdict.Concerns) != 1 {
+		t.Errorf("Concerns = %d entries, want 1 (resolutions must not displace new findings)", len(verdict.Concerns))
+	}
+}
+
+// TestDecodeVerdict_ConcernResolutions_SurvivesFenceAndEscapeRepair
+// asserts the resolutions array rides through the fence-strip + escape
+// sanitize repair path unchanged — a fenced verdict with an illegal
+// escape elsewhere must not drop the #984 field.
+func TestDecodeVerdict_ConcernResolutions_SurvivesFenceAndEscapeRepair(t *testing.T) {
+	inner := `{"verdict":"approve","free_form":"matches \- here","concern_resolutions":[{"id":"33333333-3333-3333-3333-333333333333","resolution":"superseded"}]}`
+	raw := []byte("```json\n" + inner + "\n```")
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if len(verdict.ConcernResolutions) != 1 {
+		t.Fatalf("ConcernResolutions = %d entries, want 1", len(verdict.ConcernResolutions))
+	}
+	if verdict.ConcernResolutions[0].Resolution != "superseded" {
+		t.Errorf("resolution = %q, want superseded", verdict.ConcernResolutions[0].Resolution)
+	}
+}
+
+// TestDecodeVerdict_NoConcernResolutions_YieldsNil asserts a
+// resolutions-free verdict (every pre-#984 reviewer's output) decodes
+// with a nil ConcernResolutions — the additive-field contract.
+func TestDecodeVerdict_NoConcernResolutions_YieldsNil(t *testing.T) {
+	raw := []byte(`{"verdict":"approve","free_form":"clean"}`)
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.ConcernResolutions != nil {
+		t.Errorf("ConcernResolutions = %+v, want nil for a resolutions-free verdict", verdict.ConcernResolutions)
+	}
+}

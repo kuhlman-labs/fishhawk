@@ -272,6 +272,23 @@ Notes:
   Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
 
+- The concern-waiver audit kinds — `concern_waived` and its corrective
+  companion `concern_waive_failed` (#984) — are **internal audit kinds, not
+  issue-comment surfaces**. Nothing in `issuecomment` posts them; they have no
+  Notifier method. The waive handler (`server/waive.go::handleWaiveConcern`,
+  `POST /v0/concerns/{concern_id}/waive`) writes `concern_waived` with the
+  operator's `user` actor + subject and payload `{concern_id, prior_state,
+  reason, stage_kind, severity, category}` BEFORE the state transition — the
+  durable-record-first contract: append failure fails the request (500
+  `audit_append_failed`, no mutation), so a waive mutation can never exist
+  without this entry. When the transition then fails after the append (a
+  concurrent transition raced it), the handler appends the `system`-actor
+  `concern_waive_failed` corrective entry `{concern_id, intended_state,
+  actual_state, error}` (best-effort) so the chain shows intent + outcome in
+  every interleaving. The recorded `reason` is read back into later
+  implement-review prompts as the waived concern's not-re-litigable context.
+  Listed here only so a future reader grepping the audit categories doesn't
+  mistake them for comment surfaces.
 - The fix-up failure-recovery audit kind — `stage_fixup_recovered` (#788) — is an
   **internal, system-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. `server/fixup.go::maybeRecoverFixupFailure`
