@@ -8178,8 +8178,9 @@ func TestComputeAndEmitDiff_CategorizesScopeDrift(t *testing.T) {
 	// setupRepo builds a repo with one declared in-scope edit, one
 	// out-of-scope tracked-file edit (category A), and one out-of-scope
 	// created file (category B), then returns the decoded scope_drift
-	// policy_event computeAndEmitDiff emitted.
-	driftFor := func(t *testing.T, cfg config) driftEvent {
+	// policy_event computeAndEmitDiff emitted, plus its raw payload so
+	// callers can assert key absence (omitted vs. null/empty).
+	driftFor := func(t *testing.T, cfg config, logSink io.Writer) (driftEvent, []byte) {
 		t.Helper()
 		repo := t.TempDir()
 		runGit := func(args ...string) {
@@ -8217,7 +8218,7 @@ func TestComputeAndEmitDiff_CategorizesScopeDrift(t *testing.T) {
 		cfg.workingDir = repo
 		cfg.checkBaseRef = "main"
 		cfg.scopeFiles = []upload.ScopeFile{{Path: "declared.go", Operation: "modify"}}
-		_, events, err := computeAndEmitDiff(cfg, io.Discard)
+		_, events, err := computeAndEmitDiff(cfg, logSink)
 		if err != nil {
 			t.Fatalf("computeAndEmitDiff: %v", err)
 		}
@@ -8234,11 +8235,11 @@ func TestComputeAndEmitDiff_CategorizesScopeDrift(t *testing.T) {
 				t.Fatalf("decode policy_event: %v", err)
 			}
 			if w.Check == "scope_drift" && w.Outcome == "excluded" {
-				return w.driftEvent
+				return w.driftEvent, e.Payload
 			}
 		}
 		t.Fatal("no scope_drift policy_event emitted")
-		return driftEvent{}
+		return driftEvent{}, nil
 	}
 
 	assertCategorized := func(t *testing.T, got []driftPathEvidence, wantCreatedDisposition string) {
@@ -8258,7 +8259,7 @@ func TestComputeAndEmitDiff_CategorizesScopeDrift(t *testing.T) {
 	}
 
 	t.Run("standalone", func(t *testing.T) {
-		ev := driftFor(t, config{stageID: "s-standalone"})
+		ev, _ := driftFor(t, config{stageID: "s-standalone"}, io.Discard)
 		// The legacy list is untouched by categorization: both drift
 		// paths, exactly as today's consumers read them.
 		if len(ev.Undeclared) != 2 {
@@ -8271,8 +8272,42 @@ func TestComputeAndEmitDiff_CategorizesScopeDrift(t *testing.T) {
 		// First child of a fan-out (shared branch not yet pushed) so the
 		// policy base stays main; only the disposition routing differs.
 		withFakeRemoteBranchExists(t, false)
-		ev := driftFor(t, config{stageID: "s-child", decomposedFromRunID: "abcdef0123456789"})
+		ev, _ := driftFor(t, config{stageID: "s-child", decomposedFromRunID: "abcdef0123456789"}, io.Discard)
 		assertCategorized(t, ev.UndeclaredCategorized, "excluded_from_commit")
+	})
+
+	t.Run("categorize failure degrades to uncategorized", func(t *testing.T) {
+		// gitops.UntrackedPaths only fails when git ls-files itself
+		// fails, which this temp-repo setup cannot force while
+		// StageScoped succeeds in the same call — swap the seam to
+		// drive the best-effort degradation branch: a one-line
+		// scope_drift_categorize_failed log entry and today's
+		// uncategorized payload, never a stage failure.
+		orig := untrackedPaths
+		untrackedPaths = func(context.Context, string, []string) ([]string, error) {
+			return nil, errors.New("ls-files exploded")
+		}
+		t.Cleanup(func() { untrackedPaths = orig })
+
+		var log bytes.Buffer
+		ev, raw := driftFor(t, config{stageID: "s-degraded"}, &log)
+
+		if len(ev.Undeclared) != 2 {
+			t.Fatalf("undeclared = %v, want both drift paths", ev.Undeclared)
+		}
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &keys); err != nil {
+			t.Fatalf("decode payload keys: %v", err)
+		}
+		if _, ok := keys["undeclared_categorized"]; ok {
+			t.Errorf("payload = %s, want undeclared_categorized omitted after categorize failure", raw)
+		}
+		logged := log.String()
+		if !strings.Contains(logged, `"event":"scope_drift_categorize_failed"`) ||
+			!strings.Contains(logged, `"stage_id":"s-degraded"`) ||
+			!strings.Contains(logged, "ls-files exploded") {
+			t.Errorf("log = %q, want scope_drift_categorize_failed with stage_id and error detail", logged)
+		}
 	})
 }
 

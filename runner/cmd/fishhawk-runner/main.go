@@ -1609,7 +1609,7 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 // from the created-out-of-scope gate (a child may legitimately create
 // files a later child declares) and so get "excluded_from_commit".
 func categorizeDrift(ctx context.Context, repoDir string, drift []string, decomposedChild bool) ([]driftPathEvidence, error) {
-	created, err := gitops.UntrackedPaths(ctx, repoDir, drift)
+	created, err := untrackedPaths(ctx, repoDir, drift)
 	if err != nil {
 		return nil, err
 	}
@@ -2795,6 +2795,14 @@ type prOpener interface {
 // withFakeGitOps().
 var (
 	newPusher = func() pusher { return &gitops.Pusher{} }
+
+	// untrackedPaths is the gitops primitive categorizeDrift partitions
+	// drift with. Test seam: gitops.UntrackedPaths only fails when git
+	// ls-files itself fails, which a temp-repo test cannot force while
+	// StageScoped succeeds in the same computeAndEmitDiff call — tests
+	// swap in a failing function to exercise the categorize-failure
+	// degradation branch (log + fall back to the uncategorized payload).
+	untrackedPaths = gitops.UntrackedPaths
 
 	newPROpener = func(token string) prOpener {
 		return &gitops.OpenPRClient{Token: token}
