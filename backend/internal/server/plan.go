@@ -399,7 +399,9 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// precheck entry precedes any plan_reviewed entries in the audit
 	// sequence, and on the request context (cheap, synchronous, no external
 	// calls). Advisory + fail-open: never blocks or unwinds the upload.
-	s.runScopePrecheck(r.Context(), runID, stageID, body)
+	// The returned result (nil on fail-open) is threaded into the
+	// plan-review prompt's gate-evidence section below (#963).
+	precheck := s.runScopePrecheck(r.Context(), runID, stageID, body)
 
 	// Plan-gate surface sweep (#763): evaluate the plan's scope.files
 	// against the static surface registry and record an advisory
@@ -407,15 +409,18 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// must move in lockstep with (an @-mention render peer, or the
 	// mandated issue-comment-surfaces doc). Run it alongside the scope
 	// pre-check, before runPlanReviews. Advisory + fail-open: never
-	// blocks or unwinds the upload.
-	s.runSurfaceSweep(r.Context(), runID, stageID, body)
+	// blocks or unwinds the upload. Like the pre-check, the returned
+	// result feeds the plan-review prompt's gate-evidence section (#963).
+	sweep := s.runSurfaceSweep(r.Context(), runID, stageID, body)
 
 	// Plan review: invoke configured review agents after the artifact
-	// is stored and audited, before advancing the stage. Returns true
-	// when authority is gating and at least one verdict is reject;
-	// in that case the stage has been transitioned to failed-B and
-	// stage advancement is blocked.
-	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body)
+	// is stored and audited, before advancing the stage. The gate
+	// results computed above ride along so the review prompt carries
+	// the machine-verified evidence (#963). Returns true when authority
+	// is gating and at least one verdict is reject; in that case the
+	// stage has been transitioned to failed-B and stage advancement is
+	// blocked.
+	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body, precheck, sweep)
 
 	// Plan-stage terminal advancement (#603). With a valid plan artifact
 	// now stored, this handler is the authoritative driver of the plan
@@ -687,7 +692,12 @@ func deref(s *string) string {
 // All per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't fail the upload response — the plan artifact
 // is already durably stored.
-func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte) bool {
+//
+// precheck and sweep are the plan-gate results handleShipPlan's
+// synchronous checks computed (nil when a gate failed open); they are
+// threaded into the plan-review prompt's gate-evidence section (#963)
+// and never alter dispatch, authority, or verdict handling.
+func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte, precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload) bool {
 	// RunRepo is required to resolve the workflow spec; without it we
 	// can't tell whether agent review was even requested.
 	if s.cfg.RunRepo == nil {
@@ -759,8 +769,9 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// Build the plan_review prompt using the same trigger-context
 	// machinery as the agent prompt handler.
 	trig := prompt.Trigger{
-		Repo:         runRow.Repo,
-		ApprovedPlan: parsedPlan,
+		Repo:             runRow.Repo,
+		ApprovedPlan:     parsedPlan,
+		PlanGateEvidence: planGateEvidence(precheck, sweep),
 	}
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title
@@ -849,6 +860,47 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		return true
 	}
 	return false
+}
+
+// planGateEvidence maps the plan-gate result payloads handleShipPlan's
+// synchronous checks return into the prompt-side evidence struct (#963).
+// The server owns the mapping so the prompt package stays free of a
+// policy/server import — the same pattern the trace handler uses to map
+// bundle structs into prompt fields. Returns nil when neither gate
+// produced a result (both failed open) so the plan-review prompt stays
+// byte-identical to the pre-#963 output.
+func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload) *prompt.PlanGateEvidence {
+	if precheck == nil && sweep == nil {
+		return nil
+	}
+	ev := &prompt.PlanGateEvidence{}
+	if precheck != nil {
+		pc := &prompt.ScopePrecheckEvidence{
+			ImplementStageID: precheck.ImplementStageID,
+			ScannedFiles:     precheck.ScannedFiles,
+			MaxFilesChanged:  precheck.MaxFilesChanged,
+		}
+		for _, v := range precheck.Violations {
+			pc.Violations = append(pc.Violations, prompt.GateViolation{
+				Constraint: v.Constraint,
+				Detail:     v.Detail,
+				Files:      v.Files,
+			})
+		}
+		ev.ScopePrecheck = pc
+	}
+	if sweep != nil {
+		sw := &prompt.SurfaceSweepEvidence{ScannedFiles: sweep.ScannedFiles}
+		for _, f := range sweep.Findings {
+			sw.Findings = append(sw.Findings, prompt.SurfaceSweepFindingEvidence{
+				Pattern:         f.Pattern,
+				TriggerPath:     f.TriggerPath,
+				MissingSiblings: f.MissingSiblings,
+			})
+		}
+		ev.SurfaceSweep = sw
+	}
+	return ev
 }
 
 // emitReviewStarted appends a best-effort *_review_started audit entry at

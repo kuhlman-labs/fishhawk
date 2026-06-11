@@ -691,3 +691,219 @@ func TestExtractHeadSHA_RawAndRedactedVariantsMatch(t *testing.T) {
 		t.Errorf("raw head_sha %q != redacted head_sha %q", gotRaw, gotRedacted)
 	}
 }
+
+// gateEvidenceLine builds a runner-shaped gate_evidence event line (#963):
+// the exact JSON the runner's composeGateEvidence packs, so these tests pin
+// the lockstep wire contract field-by-field.
+func gateEvidenceLine(t *testing.T, seq int) Line {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"verify_runs": []map[string]any{
+			{
+				"command":        "scripts/test",
+				"head_sha":       "abc123",
+				"tree_sha":       "def456",
+				"exit_code":      2,
+				"outcome":        "failed",
+				"output_tail":    "FAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/foo [build failed]",
+				"tail_truncated": true,
+			},
+			{
+				"command":   "scripts/test",
+				"exit_code": -1,
+				"outcome":   "skipped",
+				// Skip paths carry the reason in the tail.
+				"output_tail": "stage_scoped: worktree busy",
+			},
+		},
+		"verify_summary": map[string]any{
+			"outcome":        "failed",
+			"iterations":     2,
+			"max_iterations": 3,
+			"detail":         "budget exhausted",
+		},
+		"flake_retries": 1,
+		"scope_facts": map[string]any{
+			"declared_files":   5,
+			"staged_files":     4,
+			"undeclared_paths": []string{"backend/internal/foo/foo_test.go"},
+		},
+		"policy_violations": []map[string]any{
+			{
+				"check":      "constraints",
+				"constraint": "forbidden_paths",
+				"detail":     "path matches forbidden glob",
+				"files":      []string{".github/workflows/ci.yml"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Line{Seq: seq, Kind: EventKindGateEvidence, Data: payload}
+}
+
+func TestExtractGateEvidence_HappyPath(t *testing.T) {
+	// Round-trip a runner-shaped gate_evidence payload (#963). Every json
+	// tag asserted here is the lockstep runner↔backend wire contract —
+	// a silent zero value below means the tags diverged from the composer.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+		gateEvidenceLine(t, 3),
+		{Seq: 4, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractGateEvidence(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if len(got.VerifyRuns) != 2 {
+		t.Fatalf("got %d verify runs, want 2", len(got.VerifyRuns))
+	}
+	vr := got.VerifyRuns[0]
+	if vr.Command != "scripts/test" || vr.ExitCode != 2 || vr.Outcome != "failed" {
+		t.Errorf("verify run 0 = %+v, want command=scripts/test exit=2 outcome=failed", vr)
+	}
+	if vr.HeadSHA != "abc123" || vr.TreeSHA != "def456" {
+		t.Errorf("verify run 0 SHAs = %q/%q, want abc123/def456", vr.HeadSHA, vr.TreeSHA)
+	}
+	if !strings.Contains(vr.OutputTail, "[build failed]") {
+		t.Errorf("verify run 0 tail %q missing [build failed]", vr.OutputTail)
+	}
+	if !vr.TailTruncated {
+		t.Error("verify run 0 TailTruncated = false, want true")
+	}
+	if got.VerifyRuns[1].Outcome != "skipped" || got.VerifyRuns[1].OutputTail != "stage_scoped: worktree busy" {
+		t.Errorf("verify run 1 = %+v, want skipped with skip reason in tail", got.VerifyRuns[1])
+	}
+	if got.VerifySummary == nil {
+		t.Fatal("VerifySummary = nil, want populated")
+	}
+	if got.VerifySummary.Outcome != "failed" || got.VerifySummary.Iterations != 2 ||
+		got.VerifySummary.MaxIterations != 3 || got.VerifySummary.Detail != "budget exhausted" {
+		t.Errorf("VerifySummary = %+v, want failed 2/3 with detail", got.VerifySummary)
+	}
+	if got.FlakeRetries != 1 {
+		t.Errorf("FlakeRetries = %d, want 1", got.FlakeRetries)
+	}
+	if got.ScopeFacts == nil {
+		t.Fatal("ScopeFacts = nil, want populated")
+	}
+	if got.ScopeFacts.DeclaredFiles != 5 {
+		t.Errorf("ScopeFacts.DeclaredFiles = %d, want 5", got.ScopeFacts.DeclaredFiles)
+	}
+	if got.ScopeFacts.StagedFiles == nil || *got.ScopeFacts.StagedFiles != 4 {
+		t.Errorf("ScopeFacts.StagedFiles = %v, want pointer to 4", got.ScopeFacts.StagedFiles)
+	}
+	if len(got.ScopeFacts.UndeclaredPaths) != 1 || got.ScopeFacts.UndeclaredPaths[0] != "backend/internal/foo/foo_test.go" {
+		t.Errorf("ScopeFacts.UndeclaredPaths = %v, want the drifted test path", got.ScopeFacts.UndeclaredPaths)
+	}
+	if len(got.PolicyViolations) != 1 {
+		t.Fatalf("got %d policy violations, want 1", len(got.PolicyViolations))
+	}
+	pv := got.PolicyViolations[0]
+	if pv.Check != "constraints" || pv.Constraint != "forbidden_paths" ||
+		pv.Detail != "path matches forbidden glob" ||
+		len(pv.Files) != 1 || pv.Files[0] != ".github/workflows/ci.yml" {
+		t.Errorf("PolicyViolations[0] = %+v, want the forbidden_paths entry", pv)
+	}
+}
+
+func TestExtractGateEvidence_NoEvent(t *testing.T) {
+	// A pre-#963 fixture bundle — manifest, git_diff, a raw verify_run,
+	// a scope_drift policy_event, but NO gate_evidence — is the ordinary
+	// older-bundle / no-gate case: zero value + ErrNoGateEvidence, never
+	// a hard error (fail-open, mirrors ErrNoHeadSHA).
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+		makeVerifyRunLine(t, 3, "abc123"),
+		{Seq: 4, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_drift","outcome":"excluded","undeclared":["a_test.go"]}`)},
+		{Seq: 5, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	_, err := ExtractGateEvidence(packLines(t, lines))
+	if !errors.Is(err, ErrNoGateEvidence) {
+		t.Errorf("err = %v, want ErrNoGateEvidence", err)
+	}
+}
+
+func TestExtractGateEvidence_BadGzip(t *testing.T) {
+	_, err := ExtractGateEvidence([]byte("not gzipped"))
+	if !errors.Is(err, ErrBadGzip) {
+		t.Errorf("err = %v, want ErrBadGzip", err)
+	}
+}
+
+func TestExtractGateEvidence_BadPayload(t *testing.T) {
+	// A gate_evidence payload whose verify_runs is a string, not an array
+	// → unmarshal fails. The trace handler WARN-degrades to nil evidence,
+	// but the extractor must surface the error rather than silently
+	// returning an empty digest.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: json.RawMessage(`{"verify_runs":"not-an-array"}`)},
+	}
+	_, err := ExtractGateEvidence(packLines(t, lines))
+	if err == nil || !strings.Contains(err.Error(), "parse gate_evidence payload") {
+		t.Errorf("err = %v, want a parse-payload error", err)
+	}
+}
+
+func TestGateEvidenceEvent_DoesNotPerturbOtherExtractors(t *testing.T) {
+	// Additive wire-format property (#963): every pre-change extractor
+	// filters by Kind, so a bundle that ALSO carries a gate_evidence event
+	// must return identical results from ExtractDiff / ExtractScopeDrift /
+	// ExtractHeadSHA / ExtractManifest as the same bundle without it.
+	base := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+		makeVerifyRunLine(t, 3, "abc123"),
+		{Seq: 4, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_drift","outcome":"excluded","undeclared":["a_test.go"]}`)},
+		{Seq: 5, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	withEvidence := append(append([]Line{}, base[:4]...), gateEvidenceLine(t, 5), base[4])
+
+	packedBase := packLines(t, base)
+	packedEvidence := packLines(t, withEvidence)
+
+	diffBase, err := ExtractDiff(packedBase)
+	if err != nil {
+		t.Fatalf("ExtractDiff(base): %v", err)
+	}
+	diffEv, err := ExtractDiff(packedEvidence)
+	if err != nil {
+		t.Fatalf("ExtractDiff(withEvidence): %v", err)
+	}
+	if len(diffEv.ChangedFiles) != len(diffBase.ChangedFiles) {
+		t.Errorf("ExtractDiff perturbed: %d files vs %d", len(diffEv.ChangedFiles), len(diffBase.ChangedFiles))
+	}
+
+	driftBase, _ := ExtractScopeDrift(packedBase)
+	driftEv, err := ExtractScopeDrift(packedEvidence)
+	if err != nil {
+		t.Fatalf("ExtractScopeDrift(withEvidence): %v", err)
+	}
+	if len(driftEv) != len(driftBase) || driftEv[0] != driftBase[0] {
+		t.Errorf("ExtractScopeDrift perturbed: %v vs %v", driftEv, driftBase)
+	}
+
+	shaBase, _ := ExtractHeadSHA(packedBase)
+	shaEv, err := ExtractHeadSHA(packedEvidence)
+	if err != nil {
+		t.Fatalf("ExtractHeadSHA(withEvidence): %v", err)
+	}
+	if shaEv != shaBase {
+		t.Errorf("ExtractHeadSHA perturbed: %q vs %q", shaEv, shaBase)
+	}
+
+	mBase, _ := ExtractManifest(packedBase)
+	mEv, err := ExtractManifest(packedEvidence)
+	if err != nil {
+		t.Fatalf("ExtractManifest(withEvidence): %v", err)
+	}
+	if mEv != mBase {
+		t.Errorf("ExtractManifest perturbed: %+v vs %+v", mEv, mBase)
+	}
+}

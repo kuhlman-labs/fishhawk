@@ -248,10 +248,13 @@ func TestScopePrecheck_NilSpecFailOpen(t *testing.T) {
 		{Path: ".github/workflows/ci.yml", Operation: plan.FileOpModify},
 	})
 
-	s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	got := s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
 
 	if n := countScopePrecheckEntries(au); n != 0 {
 		t.Fatalf("want no entry written for a nil-spec run; got %d", n)
+	}
+	if got != nil {
+		t.Fatalf("fail-open must return a nil result (#963); got %+v", got)
 	}
 }
 
@@ -275,10 +278,39 @@ workflows:
 		{Path: ".github/workflows/ci.yml", Operation: plan.FileOpModify},
 	})
 
-	s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	got := s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
 
 	if n := countScopePrecheckEntries(au); n != 0 {
 		t.Fatalf("want no entry written when there is no implement stage; got %d", n)
+	}
+	if got != nil {
+		t.Fatalf("fail-open must return a nil result (#963); got %+v", got)
+	}
+}
+
+// TestScopePrecheck_ReturnsComputedPayload pins the #963 return contract:
+// the function returns the same result payload it records in the audit
+// entry, so handleShipPlan can thread it into the plan-review prompt
+// without a read-back.
+func TestScopePrecheck_ReturnsComputedPayload(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: ".github/workflows/ci.yml", Operation: plan.FileOpModify},
+	})
+
+	got := s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result when the precheck ran")
+	}
+
+	recorded := lastScopePrecheckEntry(t, au)
+	gotJSON, _ := json.Marshal(got)
+	recordedJSON, _ := json.Marshal(recorded)
+	if string(gotJSON) != string(recordedJSON) {
+		t.Errorf("returned result diverges from the recorded audit payload:\nreturned: %s\nrecorded: %s", gotJSON, recordedJSON)
+	}
+	if !hasViolation(*got, "forbidden_paths") {
+		t.Errorf("returned result missing the forbidden_paths violation: %+v", got.Violations)
 	}
 }
 

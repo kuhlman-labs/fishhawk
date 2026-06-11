@@ -171,9 +171,15 @@ func pathMatches(scope map[string]bool, registryPath string) bool {
 // itself needs only the plan's scope.files, but gating on a resolvable run
 // keeps it from recording an orphan advisory entry against a run that
 // doesn't exist (legacy/not-found), exactly as the scope pre-check does.
-func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, planBody []byte) {
+//
+// Returns the computed result payload so handleShipPlan can thread it
+// into the plan-review prompt's gate-evidence section (#963); nil on
+// every fail-open path (no result was computed). An audit-append failure
+// still returns the computed result — the entry is observability, the
+// evaluation itself succeeded.
+func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, planBody []byte) *SurfaceSweepPayload {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
-		return
+		return nil
 	}
 
 	// Resolve the run first so the sweep only records against a real,
@@ -183,7 +189,7 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return
+		return nil
 	}
 
 	// Validation already passed in handleShipPlan; a parse failure here is
@@ -194,7 +200,7 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return
+		return nil
 	}
 
 	scopeFiles := make([]string, 0, len(parsedPlan.Scope.Files))
@@ -210,10 +216,11 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 		findings = []SurfaceSweepFinding{}
 	}
 
-	payload, _ := json.Marshal(SurfaceSweepPayload{
+	result := &SurfaceSweepPayload{
 		Findings:     findings,
 		ScannedFiles: len(scopeFiles),
-	})
+	}
+	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
@@ -229,4 +236,5 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 			slog.String("error", aerr.Error()),
 		)
 	}
+	return result
 }

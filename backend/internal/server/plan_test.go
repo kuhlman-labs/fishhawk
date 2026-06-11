@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -568,6 +569,34 @@ workflows:
         produces:
           - artifact: plan
             schema: standard_v1
+`)
+
+	// specGatingReviewersWithConstraints adds an implement stage with path
+	// constraints to the gating-reviewers shape, so the plan-gate scope
+	// pre-check produces a result the #963 gate-evidence threading test can
+	// observe in the review prompt.
+	specGatingReviewersWithConstraints = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 3
+          - forbidden_paths:
+              - ".github/workflows/**"
 `)
 )
 
@@ -1176,6 +1205,57 @@ func TestShipPlan_ReviewAgents_IssueCommentsReachReviewPrompt(t *testing.T) {
 	}
 }
 
+// TestShipPlan_ReviewAgents_GateEvidenceReachesReviewPrompt is the #963
+// seam check for the plan loop: the scope-precheck and surface-sweep
+// results handleShipPlan computes synchronously must flow through
+// runPlanReviews' trigger mapping into the rendered plan-review prompt.
+// This crosses the gate-evaluation → server trigger mapping → prompt
+// render seam the per-layer prompt-package tests cannot exercise.
+func TestShipPlan_ReviewAgents_GateEvidenceReachesReviewPrompt(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, _, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithConstraints)
+	priv, _ := sf.issue(t, runID)
+	// A scope that hits the implement stage's forbidden_paths constraint
+	// AND a surface-sweep pattern (notifier.go without the surfaces doc).
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: ".github/workflows/ci.yml", Operation: plan.FileOpModify},
+		{Path: "backend/internal/issuecomment/notifier.go", Operation: plan.FileOpModify},
+	})
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// Gating review (human: 0) runs synchronously, so the captured prompt
+	// is available as soon as the upload returns.
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		// Scope pre-check result: the forbidden_paths hit and the cap.
+		"VIOLATION forbidden_paths",
+		".github/workflows/ci.yml",
+		"- max_files_changed cap: 3",
+		// Surface-sweep result: notifier.go without the surfaces doc.
+		"MISSING SIBLINGS",
+		"docs/issue-comment-surfaces.md",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing gate-evidence element %q — threading seam broken:\n%s", want, got)
+		}
+	}
+}
+
 // TestShipPlan_ReviewAgents_GatingReject_StageFailedB verifies that in
 // gating mode (agent>0 && human==0) a reject verdict transitions the
 // stage to failed-B so trace-driven awaiting_approval is blocked.
@@ -1569,7 +1649,7 @@ func TestShipPlan_ReviewAgents_Advisory_ContextDetached(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Advisory → dispatches a detached goroutine and returns false.
-	if s.runPlanReviews(ctx, runID, stageID, body) {
+	if s.runPlanReviews(ctx, runID, stageID, body, nil, nil) {
 		t.Fatal("advisory runPlanReviews returned true (advisory must never gate)")
 	}
 

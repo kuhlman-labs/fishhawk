@@ -278,7 +278,9 @@ func TestRunSurfaceSweep_NilAuditRepoFailOpen(t *testing.T) {
 		{Path: "backend/internal/issuecomment/status_template.go", Operation: plan.FileOpModify},
 	})
 	// Must not panic; AuditRepo is nil so nothing is written.
-	s.runSurfaceSweep(context.Background(), uuid.New(), uuid.New(), body)
+	if got := s.runSurfaceSweep(context.Background(), uuid.New(), uuid.New(), body); got != nil {
+		t.Fatalf("fail-open must return a nil result (#963); got %+v", got)
+	}
 }
 
 // TestRunSurfaceSweep_UnparseablePlanFailOpen verifies fail-open: an
@@ -286,9 +288,38 @@ func TestRunSurfaceSweep_NilAuditRepoFailOpen(t *testing.T) {
 func TestRunSurfaceSweep_UnparseablePlanFailOpen(t *testing.T) {
 	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
 
-	s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, []byte("{not valid plan"))
+	got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, []byte("{not valid plan"))
 
 	if n := countSurfaceSweepEntries(au); n != 0 {
 		t.Fatalf("want no entry for an unparseable plan; got %d", n)
+	}
+	if got != nil {
+		t.Fatalf("fail-open must return a nil result (#963); got %+v", got)
+	}
+}
+
+// TestRunSurfaceSweep_ReturnsComputedPayload pins the #963 return
+// contract: the function returns the same result payload it records in
+// the audit entry, so handleShipPlan can thread it into the plan-review
+// prompt without a read-back.
+func TestRunSurfaceSweep_ReturnsComputedPayload(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/issuecomment/status_template.go", Operation: plan.FileOpModify},
+	})
+
+	got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result when the sweep ran")
+	}
+
+	recorded := lastSurfaceSweepEntry(t, au)
+	gotJSON, _ := json.Marshal(got)
+	recordedJSON, _ := json.Marshal(recorded)
+	if string(gotJSON) != string(recordedJSON) {
+		t.Errorf("returned result diverges from the recorded audit payload:\nreturned: %s\nrecorded: %s", gotJSON, recordedJSON)
+	}
+	if len(got.Findings) != 1 || got.Findings[0].Pattern != "actor @-mention render surfaces" {
+		t.Errorf("returned result missing the expected finding: %+v", got.Findings)
 	}
 }

@@ -1399,6 +1399,132 @@ func TestBuild_PlanReview_NoIssueContext_SectionAbsent(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_Renders pins the "### Gate evidence"
+// section (#963): with both gate results present, the prompt must carry
+// the outrank guidance, the scope pre-check violation with its files, the
+// cap line, and the surface-sweep missing-sibling finding.
+func TestBuild_PlanReview_GateEvidence_Renders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopePrecheck: &ScopePrecheckEvidence{
+				ImplementStageID: "implement",
+				ScannedFiles:     4,
+				MaxFilesChanged:  45,
+				Violations: []GateViolation{
+					{
+						Constraint: "forbidden_paths",
+						Detail:     "path matches forbidden pattern .github/workflows/**",
+						Files:      []string{".github/workflows/ci.yml"},
+					},
+				},
+			},
+			SurfaceSweep: &SurfaceSweepEvidence{
+				ScannedFiles: 4,
+				Findings: []SurfaceSweepFindingEvidence{
+					{
+						Pattern:         "audit kind requires surfaces doc",
+						TriggerPath:     "backend/internal/issuecomment/notifier.go",
+						MissingSiblings: []string{"docs/issue-comment-surfaces.md"},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"high-severity concern and named FIRST",
+		"A clean result does NOT certify plan quality",
+		"Scope pre-check",
+		"- files scanned: 4",
+		"- max_files_changed cap: 45",
+		"- VIOLATION forbidden_paths: path matches forbidden pattern .github/workflows/** [.github/workflows/ci.yml]",
+		"Surface sweep",
+		"- MISSING SIBLINGS (audit kind requires surfaces doc): backend/internal/issuecomment/notifier.go is in scope but the pattern's required sibling(s) are absent from scope.files: docs/issue-comment-surfaces.md",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing gate-evidence element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_CleanResultsRenderExplicitly verifies
+// the "checked and clean" rendering: empty violations/findings must show
+// as explicit clean lines, never as silently absent subsections, so the
+// reviewer can tell "checked and clean" apart from "never checked".
+func TestBuild_PlanReview_GateEvidence_CleanResultsRenderExplicitly(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopePrecheck: &ScopePrecheckEvidence{ScannedFiles: 2},
+			SurfaceSweep:  &SurfaceSweepEvidence{ScannedFiles: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"- violations: none (checked and clean)",
+		"- findings: none (checked and clean)",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing clean-result line %q:\n%s", w, got)
+		}
+	}
+	// No cap configured (0) must omit the cap line rather than print 0.
+	if strings.Contains(got, "max_files_changed cap") {
+		t.Errorf("cap line must be omitted when MaxFilesChanged is 0:\n%s", got)
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_AbsentWhenNil pins the #984-style
+// additive property: a nil (or empty) PlanGateEvidence leaves the
+// plan-review prompt byte-identical to omitting the field, with no
+// gate-evidence section rendered.
+func TestBuild_PlanReview_GateEvidence_AbsentWhenNil(t *testing.T) {
+	base := Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	}
+	gotBase, err := Build("plan_review", base)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	withNil := base
+	withNil.PlanGateEvidence = nil
+	gotNil, err := Build("plan_review", withNil)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// A non-nil evidence struct whose sub-results are both nil is the
+	// "every gate failed open" shape — it must also omit the section.
+	withEmpty := base
+	withEmpty.PlanGateEvidence = &PlanGateEvidence{}
+	gotEmpty, err := Build("plan_review", withEmpty)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if strings.Contains(gotBase, "### Gate evidence") {
+		t.Errorf("gate-evidence section should be absent when PlanGateEvidence is unset:\n%s", gotBase)
+	}
+	if gotNil != gotBase {
+		t.Errorf("explicit-nil PlanGateEvidence must be byte-identical to omitting it")
+	}
+	if gotEmpty != gotBase {
+		t.Errorf("PlanGateEvidence with both sub-results nil must be byte-identical to omitting it")
+	}
+}
+
 func TestBuild_PlanReview_ReviewCriteriaPresent(t *testing.T) {
 	got, err := Build("plan_review", Trigger{
 		Repo:         "x/y",
@@ -1905,6 +2031,115 @@ func TestBuild_ImplementReview_PriorConcerns_AbsentWhenEmpty(t *testing.T) {
 	}
 	if gotBase != gotNil {
 		t.Errorf("explicit-nil PriorConcerns must be byte-identical to omitting it")
+	}
+}
+
+// intPtr is the GateScopeFacts.StagedFiles literal helper (pointer so
+// "no git_diff event" stays distinguishable from a zero-file diff).
+func intPtr(n int) *int { return &n }
+
+func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
+	// #963: the Gate evidence section surfaces machine-verified gate
+	// results — verify outcomes with the bounded tail, skip reasons,
+	// summary, flake retries, declared-vs-staged scope counts, excluded
+	// paths, and constraint violations — with the binding outrank /
+	// shortcut guidance, and the non-goals preamble defers to it instead
+	// of asserting upstream gating.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			VerifyRuns: []GateVerifyRun{
+				{Command: "scripts/test", ExitCode: 2, Outcome: "failed",
+					OutputTail:    "FAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/foo [build failed]",
+					TailTruncated: true},
+				{Command: "scripts/test", ExitCode: -1, Outcome: "skipped",
+					OutputTail: "stage_scoped: worktree busy"},
+			},
+			VerifySummary: &GateVerifySummary{Outcome: "failed", Iterations: 2, MaxIterations: 3, Detail: "budget exhausted"},
+			FlakeRetries:  1,
+			ScopeFacts: &GateScopeFacts{
+				DeclaredFiles:   5,
+				StagedFiles:     intPtr(4),
+				UndeclaredPaths: []string{"backend/internal/foo/foo_test.go"},
+			},
+			PolicyViolations: []GatePolicyViolation{
+				{Check: "constraints", Constraint: "forbidden_paths",
+					Detail: "path matches forbidden glob", Files: []string{".github/workflows/ci.yml"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		// The binding outrank / shortcut / unverified / passed-is-not-quality rules.
+		"You MUST record it as a `high`-severity concern, name it FIRST in `concerns`",
+		"you MAY shortcut the remaining review lenses",
+		"A SKIPPED verify run means compile/test state is UNVERIFIED",
+		"does NOT certify test quality",
+		// Verify run facts including the bounded failing tail (with its
+		// truncation marker) and the skip reason.
+		"- command: scripts/test",
+		"outcome: failed (exit code 2)",
+		"output tail (bounded, pre-redacted, truncated):",
+		"[build failed]",
+		"skip reason / output tail (bounded, pre-redacted):",
+		"stage_scoped: worktree busy",
+		// Summary, flake retries, scope facts, policy violations.
+		"Verify summary: outcome=failed (iterations 2/3) — detail: budget exhausted",
+		"Infra-flake retries absorbed: 1",
+		"- declared scope.files: 5",
+		"- files staged into the commit: 4",
+		"backend/internal/foo/foo_test.go",
+		"- check: constraints (constraint: forbidden_paths) — path matches forbidden glob",
+		"files: .github/workflows/ci.yml",
+		// The softened non-goals preamble defers to the evidence section.
+		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section above",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("gate-evidence prompt missing %q:\n%s", w, got)
+		}
+	}
+	// The unconditional upstream-gating claim must be gone on this path —
+	// that text is what licensed the run-07bce059 reviewer to ignore the
+	// build truth the gates already knew.
+	if strings.Contains(got, "Mechanical correctness is already gated upstream") {
+		t.Errorf("evidence-present prompt must not assert unconditional upstream gating:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_GateEvidence_AbsentWhenNil(t *testing.T) {
+	// #963 additive property (the #984 pattern): a nil GateEvidence leaves
+	// the review prompt byte-identical to omitting the field entirely —
+	// no section, and the original non-goals preamble intact — so
+	// reviewer behavior on no-gate runs is unchanged.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	withNil := base
+	withNil.GateEvidence = nil
+
+	gotBase, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build base: %v", err)
+	}
+	gotNil, err := Build("implement_review", withNil)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	if strings.Contains(gotBase, "### Gate evidence") {
+		t.Errorf("gate-evidence section should be absent when GateEvidence is nil:\n%s", gotBase)
+	}
+	if !strings.Contains(gotBase, "Mechanical correctness is already gated upstream") {
+		t.Errorf("nil-evidence prompt must keep the original non-goals preamble:\n%s", gotBase)
+	}
+	if gotBase != gotNil {
+		t.Errorf("explicit-nil GateEvidence must be byte-identical to omitting it")
 	}
 }
 

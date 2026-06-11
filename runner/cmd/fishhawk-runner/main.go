@@ -858,6 +858,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			PushToSharedBranch: willPushChild,
 			PushFixup:          willPushFixup,
 		}
+		// Gate evidence (#963): fold the stage's verify / scope /
+		// constraint gate results into one bounded, pre-redacted
+		// gate_evidence event so review prompts see machine-verified
+		// truth. Appended before EITHER PackBytes so both variants
+		// carry it; pre-redacted because the implement review
+		// dispatches on the raw variant (#793). Nil when no gate ran.
+		if ev := composeGateEvidence(res.Events, len(scopePaths(cfg.scopeFiles))); ev != nil {
+			res.Events = append(res.Events, *ev)
+		}
+
 		bytesData, _, err := bundle.PackBytes(manifestRaw, res.Events)
 		if err != nil {
 			_, _ = fmt.Fprintf(logSink,
