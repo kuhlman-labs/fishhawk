@@ -261,6 +261,146 @@ func implementFixupBundleWithHeadSHA(t *testing.T, fileCount int, headSHA string
 	return gz.Bytes()
 }
 
+// implementDiffBundleWithGateEvidence builds a trace bundle carrying BOTH a
+// git_diff event and a runner-shaped gate_evidence event (#963) whose
+// verify_run digest FAILED with a [build failed] tail. Used by the
+// cross-boundary test proving the gate evidence reaches the reviewer prompt
+// end-to-end. The payload JSON here is the lockstep runner↔backend wire
+// contract — field names must match the runner's composeGateEvidence.
+func implementDiffBundleWithGateEvidence(t *testing.T, files []map[string]string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	manifest, _ := json.Marshal(map[string]any{"bundle_schema": "v1"})
+	manifestLine, _ := json.Marshal(map[string]any{"seq": 1, "kind": "manifest", "data": json.RawMessage(manifest)})
+	raw.Write(manifestLine)
+	raw.WriteByte('\n')
+
+	diffPayload, _ := json.Marshal(map[string]any{
+		"kind":      "name_status",
+		"base_ref":  "origin/main",
+		"files":     files,
+		"num_files": len(files),
+	})
+	diffLine, _ := json.Marshal(map[string]any{
+		"seq": 2, "kind": "git_diff", "data": json.RawMessage(diffPayload),
+	})
+	raw.Write(diffLine)
+	raw.WriteByte('\n')
+
+	evidencePayload, _ := json.Marshal(map[string]any{
+		"verify_runs": []map[string]any{
+			{
+				"command":     "scripts/test",
+				"head_sha":    "abc123",
+				"tree_sha":    "def456",
+				"exit_code":   2,
+				"outcome":     "failed",
+				"output_tail": "FAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/foo [build failed]",
+			},
+		},
+		"verify_summary": map[string]any{
+			"outcome": "failed", "iterations": 1, "max_iterations": 3,
+		},
+		"scope_facts": map[string]any{
+			"declared_files": 2, "staged_files": 1,
+			"undeclared_paths": []string{"backend/internal/foo/helper.go"},
+		},
+	})
+	evidenceLine, _ := json.Marshal(map[string]any{
+		"seq": 3, "kind": "gate_evidence", "data": json.RawMessage(evidencePayload),
+	})
+	raw.Write(evidenceLine)
+	raw.WriteByte('\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+// TestShipTrace_ImplementReview_GateEvidenceThreadedIntoPrompt is the
+// cross-boundary integration test for #963: a real trace bundle carrying a
+// gate_evidence event with a FAILING verify_run digest ships through
+// handleShipTrace (the raw-variant implement-review hook), and the captured
+// reviewer prompt renders the '### Gate evidence' section naming the
+// [build failed] tail with the binding outrank guidance — proving the
+// bundle-reader → trace-handler → prompt-render seam end-to-end (the run
+// 07bce059 gap: a reviewer producing a text-level verdict about a head the
+// gates already knew did not compile). Per-layer units miss this seam.
+func TestShipTrace_ImplementReview_GateEvidenceThreadedIntoPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundleWithGateEvidence(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"outcome: failed (exit code 2)",
+		"[build failed]",
+		"name it FIRST in `concerns`",
+		"Verify summary: outcome=failed (iterations 1/3)",
+		"- declared scope.files: 2",
+		"- files staged into the commit: 1",
+		"backend/internal/foo/helper.go",
+		// The softened non-goals preamble defers to the evidence section.
+		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section above",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q from threaded gate evidence:\n%s", want, got)
+		}
+	}
+}
+
+// TestShipTrace_ImplementReview_NoGateEvidence_PromptUnchanged asserts the
+// fail-open contract (#963): a bundle WITHOUT a gate_evidence event (every
+// pre-#963 bundle, every no-gate stage) dispatches the review with no Gate
+// evidence section and the original non-goals preamble — absent evidence
+// never blocks or alters the dispatch.
+func TestShipTrace_ImplementReview_NoGateEvidence_PromptUnchanged(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	if strings.Contains(got, "### Gate evidence") {
+		t.Errorf("no-evidence bundle must not render a Gate evidence section:\n%s", got)
+	}
+	if !strings.Contains(got, "Mechanical correctness is already gated upstream") {
+		t.Errorf("no-evidence prompt must keep the original non-goals preamble:\n%s", got)
+	}
+}
+
 // TestShipTrace_ImplementReview_ScopeDriftThreadedIntoPrompt is the
 // cross-boundary integration test for #695: a real trace bundle carrying
 // BOTH a git_diff event and a scope_drift policy_event ships through
@@ -952,7 +1092,7 @@ func TestShipTrace_ImplementReview_Advisory_ContextDetached(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Advisory → dispatches a detached goroutine and returns false.
-	if s.runImplementReviews(ctx, runRow.ID, implStage.ID, diff, nil, "") {
+	if s.runImplementReviews(ctx, runRow.ID, implStage.ID, diff, nil, "", nil) {
 		t.Fatal("advisory runImplementReviews returned true (advisory must never gate)")
 	}
 

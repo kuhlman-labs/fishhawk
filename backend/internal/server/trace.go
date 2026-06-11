@@ -483,7 +483,26 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 				}
 				headSHA = ""
 			}
-			if s.runImplementReviews(r.Context(), runID, stageID, diff, scopeDrift, headSHA) {
+			// Extract the runner's digested gate results (#963) so the
+			// reviewer sees machine-verified build/test/scope truth with
+			// outrank guidance instead of assuming gates passed. Best-effort
+			// with the same degradation contract as ExtractScopeDrift:
+			// ErrNoGateEvidence (older bundles, no gate ran) stays silent —
+			// the ordinary case — while any other error WARN-logs; both
+			// degrade to nil, which omits the prompt section and never
+			// blocks the review.
+			var gateEvidence *prompt.GateEvidence
+			if ev, geerr := bundle.ExtractGateEvidence(bundleBytes); geerr == nil {
+				gateEvidence = gateEvidenceForReview(ev)
+			} else if !errors.Is(geerr, bundle.ErrNoGateEvidence) {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"trace upload: extract gate evidence failed — proceeding with no evidence",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", geerr.Error()),
+				)
+			}
+			if s.runImplementReviews(r.Context(), runID, stageID, diff, scopeDrift, headSHA, gateEvidence) {
 				cat := run.FailureB
 				reason := implementReviewGatingRejectReason
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
@@ -2006,7 +2025,7 @@ func (s *Server) sumRunTokens(ctx context.Context, runID uuid.UUID) int64 {
 //
 // Per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't block the stage — the diff is already stored.
-func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA string) bool {
+func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA string, gateEvidence *prompt.GateEvidence) bool {
 	if s.cfg.RunRepo == nil {
 		return false
 	}
@@ -2101,6 +2120,10 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// (same stage_id, new head_sha per #797) finds the
 		// addressed_pending rows the fix-up trigger wrote.
 		PriorConcerns: s.priorConcernsForReview(ctx, runID, stageID),
+		// Machine-verified gate results from the bundle's gate_evidence
+		// event (#963), pre-redacted runner-side. Nil (older bundles,
+		// no gate ran, extraction error) keeps the prompt byte-identical.
+		GateEvidence: gateEvidence,
 	}
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title
@@ -2519,6 +2542,50 @@ func renderDiffForReview(diff policy.Diff) string {
 		fmt.Fprintf(&b, "- %s %s\n", f.Status, f.Path)
 	}
 	return b.String()
+}
+
+// gateEvidenceForReview maps the bundle's gate_evidence wire struct into
+// the prompt package's mirror (#963), keeping prompt free of a bundle
+// import — the same boundary pattern renderDiffForReview applies to
+// policy.Diff. Pure field copies; the runner already bounded and
+// redacted every free-text field before packing.
+func gateEvidenceForReview(ev bundle.GateEvidence) *prompt.GateEvidence {
+	out := &prompt.GateEvidence{
+		FlakeRetries: ev.FlakeRetries,
+	}
+	for _, vr := range ev.VerifyRuns {
+		out.VerifyRuns = append(out.VerifyRuns, prompt.GateVerifyRun{
+			Command:       vr.Command,
+			ExitCode:      vr.ExitCode,
+			Outcome:       vr.Outcome,
+			OutputTail:    vr.OutputTail,
+			TailTruncated: vr.TailTruncated,
+		})
+	}
+	if ev.VerifySummary != nil {
+		out.VerifySummary = &prompt.GateVerifySummary{
+			Outcome:       ev.VerifySummary.Outcome,
+			Iterations:    ev.VerifySummary.Iterations,
+			MaxIterations: ev.VerifySummary.MaxIterations,
+			Detail:        ev.VerifySummary.Detail,
+		}
+	}
+	if ev.ScopeFacts != nil {
+		out.ScopeFacts = &prompt.GateScopeFacts{
+			DeclaredFiles:   ev.ScopeFacts.DeclaredFiles,
+			StagedFiles:     ev.ScopeFacts.StagedFiles,
+			UndeclaredPaths: ev.ScopeFacts.UndeclaredPaths,
+		}
+	}
+	for _, pv := range ev.PolicyViolations {
+		out.PolicyViolations = append(out.PolicyViolations, prompt.GatePolicyViolation{
+			Check:      pv.Check,
+			Constraint: pv.Constraint,
+			Detail:     pv.Detail,
+			Files:      pv.Files,
+		})
+	}
+	return out
 }
 
 func sha256Hex(b []byte) string {

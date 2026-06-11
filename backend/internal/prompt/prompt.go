@@ -266,6 +266,77 @@ type Trigger struct {
 	// build) omits the section and keeps the prompt byte-identical to
 	// the pre-#984 output.
 	PriorConcerns []PriorConcern
+	// GateEvidence carries the machine-verified gate results for the
+	// implement-review prompt (#963): the runner's committed-tree verify
+	// outcomes, verify summary, infra-flake retries, scope-enforcement
+	// facts, and constraint violations, digested from the trace bundle's
+	// gate_evidence event by the trace handler (bundle.ExtractGateEvidence,
+	// mapped server-side so this package stays free of a bundle import).
+	// All free text inside it is pre-redacted by the runner. When non-nil,
+	// buildImplementReview renders a "### Gate evidence" section with
+	// binding outrank/shortcut guidance and softens the non-goals preamble
+	// to defer to it — a reviewer must never again produce a careful
+	// text-level verdict about a head the gates know does not compile
+	// (run 07bce059). Nil (older bundles, no gate ran, extraction error)
+	// omits the section and keeps the prompt byte-identical to today.
+	GateEvidence *GateEvidence
+}
+
+// GateEvidence is the prompt-side mirror of bundle.GateEvidence (#963):
+// the digested, machine-verified results of the stage's deterministic
+// gates. The server maps the bundle wire struct into this one (the same
+// pattern renderDiffForReview uses for policy.Diff) so the prompt
+// package has no bundle dependency. Free-text fields (verify output
+// tails, details) arrive pre-redacted from the runner.
+type GateEvidence struct {
+	VerifyRuns       []GateVerifyRun
+	VerifySummary    *GateVerifySummary
+	FlakeRetries     int
+	ScopeFacts       *GateScopeFacts
+	PolicyViolations []GatePolicyViolation
+}
+
+// GateVerifyRun is one committed-tree verify attempt: the command the
+// gate ran, its exit/outcome classification (passed | failed | skipped),
+// and a bounded, pre-redacted tail of its output (the skip reason on
+// the skipped paths).
+type GateVerifyRun struct {
+	Command    string
+	ExitCode   int
+	Outcome    string
+	OutputTail string
+	// TailTruncated marks a tail the runner cut to its line/byte bounds.
+	TailTruncated bool
+}
+
+// GateVerifySummary is the stage's once-per-stage verify summary:
+// terminal outcome, iterations used vs budget, and the abort/skip
+// detail when present.
+type GateVerifySummary struct {
+	Outcome       string
+	Iterations    int
+	MaxIterations int
+	Detail        string
+}
+
+// GateScopeFacts carries the scope-enforcement facts: declared
+// scope.files count, files actually staged into the commit (nil when
+// no git_diff event recorded a count — distinguishable from a real
+// zero-file diff), and the drift-excluded undeclared paths.
+type GateScopeFacts struct {
+	DeclaredFiles   int
+	StagedFiles     *int
+	UndeclaredPaths []string
+}
+
+// GatePolicyViolation is one constraint-violation policy event
+// (check/constraint identifiers, pre-redacted detail, violating files
+// when named).
+type GatePolicyViolation struct {
+	Check      string
+	Constraint string
+	Detail     string
+	Files      []string
 }
 
 // PriorConcern is one previously recorded concern rendered into the
@@ -818,6 +889,18 @@ func buildImplementReview(t Trigger) string {
 		b.WriteString("\n")
 	}
 
+	// Gate-evidence section (#963). The runner's deterministic gates
+	// (committed-tree verify, scope enforcement, constraint policy) already
+	// know machine-verified facts about the head under review — most
+	// importantly whether it compiles and tests green. Surfacing them with
+	// binding outrank guidance is what stops a reviewer producing a careful
+	// text-level verdict about a head the gates know does not build
+	// (run 07bce059). Nil omits the section (older bundles, no gate ran,
+	// extraction error), keeping the prompt byte-identical to today.
+	if t.GateEvidence != nil {
+		writeGateEvidence(&b, t.GateEvidence)
+	}
+
 	// Scope-amended-at-approval section (#829). Paths the operator authorized
 	// at approval time — via an approval condition (#730) or the structured
 	// add_scope_files fold (#824) — that are NOT in the plan's raw scope.files.
@@ -909,9 +992,22 @@ func buildImplementReview(t Trigger) string {
 	// Review criteria — what the agent should assess. The lens is aimed at
 	// what the deterministic gates CANNOT see (#703); see the non-goals below.
 	b.WriteString("### Review criteria\n\n")
-	b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is already gated " +
-		"upstream: the policy gate, the test suite the implement agent ran, build/lint, and CI all check that " +
-		"the change is present and well-formed. Therefore:\n")
+	if t.GateEvidence != nil {
+		// Deferral variant (#963): when gate evidence is present, the
+		// non-goals preamble must NOT assert that mechanical correctness
+		// "is already gated" — that unconditional claim is what licensed
+		// the run-07bce059 reviewer to ignore build truth. Point at the
+		// evidence section instead.
+		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is reported by " +
+			"the deterministic gates in the 'Gate evidence' section above — read THAT section for the actual " +
+			"build/test/scope state rather than assuming the gates passed. A failed or skipped gate there is " +
+			"ground truth and overrides any presumption that the change is well-formed. Beyond reading that " +
+			"section:\n")
+	} else {
+		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is already gated " +
+			"upstream: the policy gate, the test suite the implement agent ran, build/lint, and CI all check that " +
+			"the change is present and well-formed. Therefore:\n")
+	}
 	b.WriteString("- Do NOT re-verify plan adherence. Whether the diff mechanically implements the plan's approach " +
 		"steps is covered by the policy gate, the tests, and CI — re-stating it here adds no signal.\n")
 	b.WriteString("- Do NOT generic-bug-hunt. Hunting for arbitrary bugs overlaps the test suite and CI and is the " +
@@ -973,6 +1069,104 @@ func buildImplementReview(t Trigger) string {
 
 	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
 	return b.String()
+}
+
+// writeGateEvidence renders the "### Gate evidence" section of the
+// implement-review prompt (#963): the machine-verified gate results
+// digested from the trace bundle, with binding guidance that a failed
+// gate or a verified/staged divergence outranks text-level findings
+// and licenses shortcutting the remaining lenses. Free text inside ev
+// (output tails, details) is pre-redacted by the runner; tails render
+// indented rather than fenced so they cannot collide with the diff
+// section's code fences.
+func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
+	b.WriteString("### Gate evidence (machine-verified — outranks text-level findings)\n\n")
+	b.WriteString("The runner's deterministic gates produced the machine-verified results below. They are ground " +
+		"truth about the committed tree's compile/test state and the scope enforcement that shaped the diff — " +
+		"they outrank any text-level reading of the diff. These rules are BINDING:\n\n")
+	b.WriteString("- A FAILED verify run (e.g. a tail naming [build failed]) means the committed tree does NOT " +
+		"pass the named command. You MUST record it as a `high`-severity concern, name it FIRST in `concerns`, " +
+		"and you MAY shortcut the remaining review lenses — a head that does not build or test green cannot be " +
+		"salvaged by stylistic findings.\n")
+	b.WriteString("- A divergence between the declared and staged scope (counts below, or drift-excluded paths) " +
+		"likewise outranks stylistic findings — name it before them.\n")
+	b.WriteString("- A SKIPPED verify run means compile/test state is UNVERIFIED. Do NOT assume the change is " +
+		"CI-green; state the unverified status in a concern or in `free_form`.\n")
+	b.WriteString("- A PASSED verify run certifies ONLY that the named command exited 0 against the committed " +
+		"tree. It does NOT certify test quality — the test-vacuity and untested-path lenses still apply in " +
+		"full.\n\n")
+
+	if len(ev.VerifyRuns) > 0 {
+		b.WriteString("Verify runs (committed-tree gate):\n\n")
+		for _, vr := range ev.VerifyRuns {
+			fmt.Fprintf(b, "- command: %s\n", vr.Command)
+			fmt.Fprintf(b, "  outcome: %s (exit code %d)\n", vr.Outcome, vr.ExitCode)
+			if vr.OutputTail != "" {
+				truncNote := ""
+				if vr.TailTruncated {
+					truncNote = ", truncated"
+				}
+				if vr.Outcome == "skipped" {
+					fmt.Fprintf(b, "  skip reason / output tail (bounded, pre-redacted%s):\n", truncNote)
+				} else {
+					fmt.Fprintf(b, "  output tail (bounded, pre-redacted%s):\n", truncNote)
+				}
+				for _, line := range strings.Split(strings.TrimRight(vr.OutputTail, "\n"), "\n") {
+					fmt.Fprintf(b, "    %s\n", line)
+				}
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	if ev.VerifySummary != nil {
+		fmt.Fprintf(b, "Verify summary: outcome=%s (iterations %d/%d)",
+			ev.VerifySummary.Outcome, ev.VerifySummary.Iterations, ev.VerifySummary.MaxIterations)
+		if ev.VerifySummary.Detail != "" {
+			fmt.Fprintf(b, " — detail: %s", ev.VerifySummary.Detail)
+		}
+		b.WriteString("\n\n")
+	}
+
+	if ev.FlakeRetries > 0 {
+		fmt.Fprintf(b, "Infra-flake retries absorbed: %d (the retried verify result above is authoritative).\n\n",
+			ev.FlakeRetries)
+	}
+
+	if ev.ScopeFacts != nil {
+		b.WriteString("Scope enforcement:\n\n")
+		fmt.Fprintf(b, "- declared scope.files: %d\n", ev.ScopeFacts.DeclaredFiles)
+		if ev.ScopeFacts.StagedFiles != nil {
+			fmt.Fprintf(b, "- files staged into the commit: %d\n", *ev.ScopeFacts.StagedFiles)
+		} else {
+			b.WriteString("- files staged into the commit: (not recorded — no git_diff event)\n")
+		}
+		if len(ev.ScopeFacts.UndeclaredPaths) > 0 {
+			b.WriteString("- drift-excluded paths (dirtied by the stage but NOT in the commit):\n")
+			for _, p := range ev.ScopeFacts.UndeclaredPaths {
+				fmt.Fprintf(b, "  - %s\n", p)
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	if len(ev.PolicyViolations) > 0 {
+		b.WriteString("Constraint violations (policy gate):\n\n")
+		for _, pv := range ev.PolicyViolations {
+			fmt.Fprintf(b, "- check: %s", pv.Check)
+			if pv.Constraint != "" {
+				fmt.Fprintf(b, " (constraint: %s)", pv.Constraint)
+			}
+			if pv.Detail != "" {
+				fmt.Fprintf(b, " — %s", pv.Detail)
+			}
+			b.WriteString("\n")
+			if len(pv.Files) > 0 {
+				fmt.Fprintf(b, "  files: %s\n", strings.Join(pv.Files, ", "))
+			}
+		}
+		b.WriteString("\n")
+	}
 }
 
 // writePlanForReview renders a standard_v1 plan for the review-agent prompt.

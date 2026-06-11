@@ -1908,6 +1908,115 @@ func TestBuild_ImplementReview_PriorConcerns_AbsentWhenEmpty(t *testing.T) {
 	}
 }
 
+// intPtr is the GateScopeFacts.StagedFiles literal helper (pointer so
+// "no git_diff event" stays distinguishable from a zero-file diff).
+func intPtr(n int) *int { return &n }
+
+func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
+	// #963: the Gate evidence section surfaces machine-verified gate
+	// results — verify outcomes with the bounded tail, skip reasons,
+	// summary, flake retries, declared-vs-staged scope counts, excluded
+	// paths, and constraint violations — with the binding outrank /
+	// shortcut guidance, and the non-goals preamble defers to it instead
+	// of asserting upstream gating.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			VerifyRuns: []GateVerifyRun{
+				{Command: "scripts/test", ExitCode: 2, Outcome: "failed",
+					OutputTail:    "FAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/foo [build failed]",
+					TailTruncated: true},
+				{Command: "scripts/test", ExitCode: -1, Outcome: "skipped",
+					OutputTail: "stage_scoped: worktree busy"},
+			},
+			VerifySummary: &GateVerifySummary{Outcome: "failed", Iterations: 2, MaxIterations: 3, Detail: "budget exhausted"},
+			FlakeRetries:  1,
+			ScopeFacts: &GateScopeFacts{
+				DeclaredFiles:   5,
+				StagedFiles:     intPtr(4),
+				UndeclaredPaths: []string{"backend/internal/foo/foo_test.go"},
+			},
+			PolicyViolations: []GatePolicyViolation{
+				{Check: "constraints", Constraint: "forbidden_paths",
+					Detail: "path matches forbidden glob", Files: []string{".github/workflows/ci.yml"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		// The binding outrank / shortcut / unverified / passed-is-not-quality rules.
+		"You MUST record it as a `high`-severity concern, name it FIRST in `concerns`",
+		"you MAY shortcut the remaining review lenses",
+		"A SKIPPED verify run means compile/test state is UNVERIFIED",
+		"does NOT certify test quality",
+		// Verify run facts including the bounded failing tail (with its
+		// truncation marker) and the skip reason.
+		"- command: scripts/test",
+		"outcome: failed (exit code 2)",
+		"output tail (bounded, pre-redacted, truncated):",
+		"[build failed]",
+		"skip reason / output tail (bounded, pre-redacted):",
+		"stage_scoped: worktree busy",
+		// Summary, flake retries, scope facts, policy violations.
+		"Verify summary: outcome=failed (iterations 2/3) — detail: budget exhausted",
+		"Infra-flake retries absorbed: 1",
+		"- declared scope.files: 5",
+		"- files staged into the commit: 4",
+		"backend/internal/foo/foo_test.go",
+		"- check: constraints (constraint: forbidden_paths) — path matches forbidden glob",
+		"files: .github/workflows/ci.yml",
+		// The softened non-goals preamble defers to the evidence section.
+		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section above",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("gate-evidence prompt missing %q:\n%s", w, got)
+		}
+	}
+	// The unconditional upstream-gating claim must be gone on this path —
+	// that text is what licensed the run-07bce059 reviewer to ignore the
+	// build truth the gates already knew.
+	if strings.Contains(got, "Mechanical correctness is already gated upstream") {
+		t.Errorf("evidence-present prompt must not assert unconditional upstream gating:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_GateEvidence_AbsentWhenNil(t *testing.T) {
+	// #963 additive property (the #984 pattern): a nil GateEvidence leaves
+	// the review prompt byte-identical to omitting the field entirely —
+	// no section, and the original non-goals preamble intact — so
+	// reviewer behavior on no-gate runs is unchanged.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	withNil := base
+	withNil.GateEvidence = nil
+
+	gotBase, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build base: %v", err)
+	}
+	gotNil, err := Build("implement_review", withNil)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	if strings.Contains(gotBase, "### Gate evidence") {
+		t.Errorf("gate-evidence section should be absent when GateEvidence is nil:\n%s", gotBase)
+	}
+	if !strings.Contains(gotBase, "Mechanical correctness is already gated upstream") {
+		t.Errorf("nil-evidence prompt must keep the original non-goals preamble:\n%s", gotBase)
+	}
+	if gotBase != gotNil {
+		t.Errorf("explicit-nil GateEvidence must be byte-identical to omitting it")
+	}
+}
+
 func TestBuild_ImplementReview_WithPatch_RendersHunks(t *testing.T) {
 	patch := "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n" +
 		"@@ -1,3 +1,3 @@\n-old line\n+new line\n"

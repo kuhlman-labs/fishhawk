@@ -49,6 +49,15 @@ const EventKindPolicyEvent = "policy_event"
 // idempotency key.
 const EventKindVerifyRun = "verify_run"
 
+// EventKindGateEvidence is the kind the runner stamps on the single
+// synthesized gate-evidence event (#963): a bounded, pre-redacted
+// digest of the stage's deterministic gate results (verify runs,
+// verify summary, infra-flake retries, scope-enforcement facts,
+// constraint violations) composed by the runner's composeGateEvidence
+// immediately before packing, so both bundle variants carry it. Read
+// by ExtractGateEvidence for the implement-review prompt.
+const EventKindGateEvidence = "gate_evidence"
+
 // Manifest mirrors runner/internal/bundle.ManifestData. Backend
 // owns the read side; agreeing field-by-field with the runner is
 // the contract — there's no schema-sync CI for this format
@@ -134,6 +143,16 @@ var (
 	// never suppress the implement-review dispatch (#797). Mirrors
 	// ErrNoDiffEvent.
 	ErrNoHeadSHA = errors.New("bundle: no verify_run event with a head_sha found")
+
+	// ErrNoGateEvidence means the bundle parsed cleanly but carried no
+	// gate_evidence event — the ordinary case for older bundles (runners
+	// predating the emitter) and for stages where no gate ran (the runner
+	// composes nil when there is no verify_run/verify_summary/policy_event
+	// to digest). Returned by ExtractGateEvidence so the caller can fail
+	// open: an absent evidence event must never block or alter the
+	// implement-review dispatch, only omit the prompt's Gate evidence
+	// section. Mirrors ErrNoHeadSHA.
+	ErrNoGateEvidence = errors.New("bundle: no gate_evidence event found")
 )
 
 // Line is the on-the-wire envelope for one JSONL line. Mirrors
@@ -188,6 +207,85 @@ type scopeDriftPayload struct {
 // identical to the emitter.
 type verifyRunPayload struct {
 	HeadSHA string `json:"head_sha"`
+}
+
+// GateEvidence mirrors the runner's gate_evidence event payload
+// (composeGateEvidence in runner/cmd/fishhawk-runner/gateevidence.go).
+// Like gitDiffPayload this is a lockstep runner↔backend wire contract,
+// not a JSON Schema — every json tag here MUST stay identical to the
+// composer or ExtractGateEvidence silently reads zero values. All
+// free-text fields (verify output tails, summary/violation details)
+// are pre-redacted by the runner via redaction.RedactDefault before
+// the event is packed, so the evidence is safe to render into the
+// review prompt even from the RAW bundle variant (the raw variant is
+// what dispatches the implement review, before the redacted variant
+// exists).
+type GateEvidence struct {
+	// VerifyRuns digests each committed-tree verify_run attempt:
+	// command, exit, outcome classification, and a bounded output tail.
+	VerifyRuns []VerifyRunEvidence `json:"verify_runs,omitempty"`
+	// VerifySummary digests the once-per-stage verify_summary event.
+	// Nil when the stage emitted none.
+	VerifySummary *VerifySummaryEvidence `json:"verify_summary,omitempty"`
+	// FlakeRetries counts verify_infra_flake_retry absorbs (#972).
+	FlakeRetries int `json:"flake_retries,omitempty"`
+	// ScopeFacts carries declared-vs-staged scope counts and the
+	// drift-excluded path list. Nil when the runner had no scope data.
+	ScopeFacts *ScopeFactsEvidence `json:"scope_facts,omitempty"`
+	// PolicyViolations digests constraint-violation policy_events
+	// (check + detail), excluding scope_drift which ScopeFacts carries.
+	PolicyViolations []PolicyViolationEvidence `json:"policy_violations,omitempty"`
+}
+
+// VerifyRunEvidence is one digested verify_run attempt. Field names
+// follow the raw verify_run event payload (verifyRunEvent in
+// runner/cmd/fishhawk-runner/main.go); OutputTail is the composer's
+// bounded (last 30 lines, ~4KB cap), pre-redacted tail of the raw
+// event's output — the raw verify_run keeps the full unredacted
+// output for compliance, only this derived digest is prompt-bound.
+type VerifyRunEvidence struct {
+	Command  string `json:"command"`
+	HeadSHA  string `json:"head_sha,omitempty"`
+	TreeSHA  string `json:"tree_sha,omitempty"`
+	ExitCode int    `json:"exit_code"`
+	// Outcome is passed | failed | skipped, as classified by the gate.
+	// On the skipped paths the tail carries the skip reason.
+	Outcome    string `json:"outcome"`
+	OutputTail string `json:"output_tail,omitempty"`
+	// TailTruncated reports the composer cut the tail to its line/byte
+	// bounds — the prompt flags it so a reviewer knows the output is
+	// partial.
+	TailTruncated bool `json:"tail_truncated,omitempty"`
+}
+
+// VerifySummaryEvidence digests the verify_summary event (#804).
+type VerifySummaryEvidence struct {
+	Outcome       string `json:"outcome"`
+	Iterations    int    `json:"iterations"`
+	MaxIterations int    `json:"max_iterations"`
+	Detail        string `json:"detail,omitempty"`
+}
+
+// ScopeFactsEvidence carries the scope-enforcement facts: how many
+// files the approved plan declared, how many the runner staged into
+// the commit (a pointer so "no git_diff event ran" stays
+// distinguishable from a real zero-file diff), and the scope_drift
+// undeclared list (paths the agent dirtied that were EXCLUDED from
+// the commit).
+type ScopeFactsEvidence struct {
+	DeclaredFiles   int      `json:"declared_files"`
+	StagedFiles     *int     `json:"staged_files,omitempty"`
+	UndeclaredPaths []string `json:"undeclared_paths,omitempty"`
+}
+
+// PolicyViolationEvidence is one digested constraint-violation
+// policy_event (check/constraint identifiers, pre-redacted detail,
+// and the violating files when the event named them).
+type PolicyViolationEvidence struct {
+	Check      string   `json:"check"`
+	Constraint string   `json:"constraint,omitempty"`
+	Detail     string   `json:"detail,omitempty"`
+	Files      []string `json:"files,omitempty"`
 }
 
 // ReadEvents decompresses bundleBytes and returns every JSONL line
@@ -399,6 +497,45 @@ func ExtractHeadSHA(bundleBytes []byte) (string, error) {
 		}
 	}
 	return "", ErrNoHeadSHA
+}
+
+// ExtractGateEvidence returns the digested gate results carried in the
+// bundle's gate_evidence event (#963), or the zero value plus
+// ErrNoGateEvidence when the bundle parsed cleanly but carried none —
+// the ordinary case for older bundles and no-gate stages, NOT a hard
+// error (mirrors ErrNoHeadSHA's fail-open contract: absent evidence
+// only omits the review prompt's Gate evidence section, never blocks
+// the dispatch). Only a corrupt gzip frame / malformed line propagates
+// as a different error.
+//
+// The runner composes exactly one gate_evidence event per pack
+// (appended immediately before PackBytes, so raw and redacted variants
+// carry the identical event); the LAST one wins here for symmetry with
+// ExtractDiff's authoritative-is-last rule should that ever change.
+func ExtractGateEvidence(bundleBytes []byte) (GateEvidence, error) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return GateEvidence{}, err
+	}
+	var (
+		out   GateEvidence
+		found bool
+	)
+	for _, line := range lines {
+		if line.Kind != EventKindGateEvidence {
+			continue
+		}
+		var payload GateEvidence
+		if err := json.Unmarshal(line.Data, &payload); err != nil {
+			return GateEvidence{}, fmt.Errorf("bundle: parse gate_evidence payload: %w", err)
+		}
+		out = payload
+		found = true
+	}
+	if !found {
+		return GateEvidence{}, ErrNoGateEvidence
+	}
+	return out, nil
 }
 
 // byteReader is the smallest io.Reader over a []byte that
