@@ -104,8 +104,11 @@ type Deps struct {
 	OnDegraded func(ctx context.Context, runID uuid.UUID, headSHA string, attempts int, lastErr error)
 
 	// OnRecovered, when non-nil, is invoked after EVERY successful
-	// CreateCheckRun publish, carrying the in-process failure streak
-	// length the success cleared (0 when there was none). Whether a
+	// CreateCheckRun publish AND after every dedup no-op (a hit means
+	// the desired state is already live on GitHub — possibly posted by
+	// another run sharing the head commit), carrying the in-process
+	// failure streak length the success cleared (0 when there was
+	// none). Whether a
 	// recovered signal is actually due is the callee's decision from
 	// durable state (the run's audit chain), NOT this process's
 	// counter — so a daemon restart mid-episode can never orphan a
@@ -150,7 +153,10 @@ func New(d Deps) *Publisher {
 //   - The run lacks installation_id or a parseable repo (non-
 //     GitHub-triggered runs, e.g. CLI ad-hoc).
 //   - The most-recent published state for this (repo, head_sha)
-//     already matches — don't spam GitHub on every read.
+//     already matches — don't spam GitHub on every read. This path
+//     still clears the run's failure episode and fires OnRecovered:
+//     the state being live on GitHub ends the episode even when
+//     another run sharing the head commit published it.
 //
 // The bool return is "did we actually publish to GitHub on this
 // call." Useful for tests; production callers usually ignore it.
@@ -179,6 +185,19 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 	}
 
 	if !p.shouldPublish(repo, headSHA, state) {
+		// The dedup cache records only successful publishes, so a hit
+		// means this (repo, head_sha) already carries `state` on GitHub
+		// — posted by this run or by another run sharing the head
+		// commit. Either way the merge gate at this head is current, so
+		// any open failure episode for THIS run is over: clear it and
+		// fire OnRecovered. Without this, a run whose twin filled the
+		// dedup cache first would never close its episode (#993). The
+		// callee derives whether a recovered entry is actually due from
+		// the run's audit chain, so firing on every hit is idempotent.
+		attempts := p.clearEpisode(runID, headSHA)
+		if p.onRecovered != nil {
+			p.onRecovered(ctx, runID, headSHA, attempts)
+		}
 		return false, nil
 	}
 
@@ -237,13 +256,22 @@ func (p *Publisher) shouldPublish(repo githubclient.RepoRef, headSHA string, sta
 
 // recordPublished caches the published state for dedup and clears the
 // run's failure episode, returning the streak length the success ended
-// (0 when there was none). A dedup hit never needs episode handling:
-// the cache records only on success, so a hit implies this path
-// already cleared the episode.
+// (0 when there was none).
 func (p *Publisher) recordPublished(repo githubclient.RepoRef, runID uuid.UUID, headSHA string, state stagecheck.State) int {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.last[cacheKey(repo, headSHA)] = state
+	p.mu.Unlock()
+	return p.clearEpisode(runID, headSHA)
+}
+
+// clearEpisode deletes the (run, head_sha) failure episode, returning
+// the streak length it ended (0 when there was none). Called on a real
+// publish (recordPublished) AND on a dedup hit — the cache records
+// only successes, so either way the state is live on GitHub and the
+// episode is over.
+func (p *Publisher) clearEpisode(runID uuid.UUID, headSHA string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	key := episodeKey(runID, headSHA)
 	attempts := 0
 	if ep := p.episodes[key]; ep != nil {

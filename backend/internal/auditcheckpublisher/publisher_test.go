@@ -654,6 +654,84 @@ func TestPublish_EpisodesKeyedPerRun(t *testing.T) {
 	}
 }
 
+// TestPublish_DedupHit_ClosesOpenEpisode: run A publishes successfully
+// first and records the (repo, head_sha) dedup cache; run B — same
+// repo AND head, with an open degraded episode — then publishes the
+// same state. The dedup no-op must still clear B's episode and fire
+// OnRecovered with B's streak length, otherwise B's degraded entry
+// would never get its paired recovered entry.
+func TestPublish_DedupHit_ClosesOpenEpisode(t *testing.T) {
+	rec := &episodeCalls{}
+	runA, runB := uuid.New(), uuid.New()
+	implA, implB := uuid.New(), uuid.New()
+	const sharedSHA = "feedfeedfeedfeedfeedfeedfeedfeedfeedfeed"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{
+			runA: {ID: runA, Repo: "x/y", InstallationID: int64Ptr(42)},
+			runB: {ID: runB, Repo: "x/y", InstallationID: int64Ptr(42)},
+		},
+		stages: map[uuid.UUID][]*run.Stage{
+			runA: {{ID: implA, Type: run.StageTypeImplement, RunID: runA}},
+			runB: {{ID: implB, Type: run.StageTypeImplement, RunID: runB}},
+		},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implA: {prArtifact(implA, sharedSHA)},
+		implB: {prArtifact(implB, sharedSHA)},
+	}}
+	gh := &fakeGitHub{err: errors.New("boom")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+		OnDegraded:  rec.onDegraded,
+		OnRecovered: rec.onRecovered,
+	})
+
+	// Run B degrades against the shared head.
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold; i++ {
+		_, _ = pub.Publish(context.Background(), runB, stagecheck.StatePass, nil)
+	}
+	if got := len(rec.degradedCalls()); got != 1 {
+		t.Fatalf("degraded calls = %d, want 1", got)
+	}
+
+	// GitHub recovers; run A publishes clean first, filling the
+	// (repo, head_sha) dedup cache before B ever publishes itself.
+	gh.err = nil
+	if ok, err := pub.Publish(context.Background(), runA, stagecheck.StatePass, nil); err != nil || !ok {
+		t.Fatalf("run A publish: ok=%v err=%v", ok, err)
+	}
+	ghCalls := len(gh.calls)
+
+	// Run B's next publish is a dedup no-op — no GitHub call — but it
+	// must still close B's open episode.
+	published, err := pub.Publish(context.Background(), runB, stagecheck.StatePass, nil)
+	if err != nil || published {
+		t.Fatalf("run B dedup publish: published=%v err=%v", published, err)
+	}
+	if got := len(gh.calls); got != ghCalls {
+		t.Fatalf("dedup hit hit GitHub: calls = %d, want %d", got, ghCalls)
+	}
+	recovered := rec.recoveredCalls()
+	if len(recovered) != 2 {
+		t.Fatalf("recovered calls = %d, want 2 (run A clean + run B dedup)", len(recovered))
+	}
+	last := recovered[len(recovered)-1]
+	if last.runID != runB {
+		t.Errorf("recovered run_id = %s, want run B %s", last.runID, runB)
+	}
+	if last.attempts != auditcheckpublisher.DefaultDegradedThreshold {
+		t.Errorf("recovered attempts = %d, want %d (B's cleared streak)", last.attempts, auditcheckpublisher.DefaultDegradedThreshold)
+	}
+
+	// The episode is gone: a further dedup hit reports a zero streak.
+	_, _ = pub.Publish(context.Background(), runB, stagecheck.StatePass, nil)
+	recovered = rec.recoveredCalls()
+	if got := recovered[len(recovered)-1].attempts; got != 0 {
+		t.Errorf("post-close recovered attempts = %d, want 0 (episode not cleared)", got)
+	}
+}
+
 // TestPublish_NilCallbacks_Safe: a publisher without the optional
 // callbacks survives a full degrade → recover cycle untouched.
 func TestPublish_NilCallbacks_Safe(t *testing.T) {
