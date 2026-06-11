@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
@@ -2485,5 +2486,48 @@ func TestFailStageCategoryC_DuplicateReport_DoesNotAdvanceRun(t *testing.T) {
 	}
 	if got.State != run.StateRunning {
 		t.Errorf("run state = %q, want running (duplicate report must not complete the run)", got.State)
+	}
+}
+
+// TestGateEvidenceForReview_MapsUndeclaredCategorized pins the
+// bundle→prompt field mapping for the per-path drift categories (#991):
+// every DriftPathEvidence crosses gateEvidenceForReview into a
+// prompt.GateDriftPath verbatim, and a nil categorized slice stays nil
+// (the older-bundle tolerance the render's byte-identity contract
+// relies on).
+func TestGateEvidenceForReview_MapsUndeclaredCategorized(t *testing.T) {
+	staged := 2
+	ev := bundle.GateEvidence{
+		ScopeFacts: &bundle.ScopeFactsEvidence{
+			DeclaredFiles:   3,
+			StagedFiles:     &staged,
+			UndeclaredPaths: []string{"stray/a.go", "stray/b.go"},
+			UndeclaredCategorized: []bundle.DriftPathEvidence{
+				{Path: "stray/a.go", Category: "A", Disposition: "excluded_from_commit"},
+				{Path: "stray/b.go", Category: "B", Disposition: "would_fail_loud"},
+			},
+		},
+	}
+	got := gateEvidenceForReview(ev)
+	if got.ScopeFacts == nil {
+		t.Fatal("ScopeFacts = nil, want populated")
+	}
+	want := []prompt.GateDriftPath{
+		{Path: "stray/a.go", Category: "A", Disposition: "excluded_from_commit"},
+		{Path: "stray/b.go", Category: "B", Disposition: "would_fail_loud"},
+	}
+	if len(got.ScopeFacts.UndeclaredCategorized) != len(want) {
+		t.Fatalf("UndeclaredCategorized = %+v, want %+v", got.ScopeFacts.UndeclaredCategorized, want)
+	}
+	for i, w := range want {
+		if got.ScopeFacts.UndeclaredCategorized[i] != w {
+			t.Errorf("UndeclaredCategorized[%d] = %+v, want %+v", i, got.ScopeFacts.UndeclaredCategorized[i], w)
+		}
+	}
+
+	ev.ScopeFacts.UndeclaredCategorized = nil
+	if uncat := gateEvidenceForReview(ev); uncat.ScopeFacts.UndeclaredCategorized != nil {
+		t.Errorf("nil categorized input mapped to %+v, want nil",
+			uncat.ScopeFacts.UndeclaredCategorized)
 	}
 }

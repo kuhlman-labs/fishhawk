@@ -78,10 +78,30 @@ type verifySummaryEvidence struct {
 // StagedFiles is a pointer so "no git_diff event ran" (nil) stays
 // distinguishable from a real zero-file diff. UndeclaredPaths is the
 // scope_drift list of agent-touched paths excluded from the commit.
+// UndeclaredCategorized is the per-path A/B categorization of the same
+// list (#991); it is additive and may be absent (categorization is
+// best-effort at the emit site), so UndeclaredPaths stays the
+// authoritative drift list.
 type scopeFactsEvidence struct {
-	DeclaredFiles   int      `json:"declared_files"`
-	StagedFiles     *int     `json:"staged_files,omitempty"`
-	UndeclaredPaths []string `json:"undeclared_paths,omitempty"`
+	DeclaredFiles         int                 `json:"declared_files"`
+	StagedFiles           *int                `json:"staged_files,omitempty"`
+	UndeclaredPaths       []string            `json:"undeclared_paths,omitempty"`
+	UndeclaredCategorized []driftPathEvidence `json:"undeclared_categorized,omitempty"`
+}
+
+// driftPathEvidence is one categorized scope-drift path (#991).
+// Category "A" is an agent edit to a tracked file that was EXCLUDED
+// from the commit (the pushed head may be missing a required change);
+// category "B" is a file created out of scope (where the #818/#825
+// created-out-of-scope gate applies). Disposition records what the
+// enforcement did with the path: "excluded_from_commit" or
+// "would_fail_loud". The json tags MUST stay identical to the backend's
+// bundle.DriftPathEvidence mirror — same lockstep wire contract as the
+// parent payload.
+type driftPathEvidence struct {
+	Path        string `json:"path"`
+	Category    string `json:"category"`
+	Disposition string `json:"disposition,omitempty"`
 }
 
 // policyViolationEvidence is one policy_event with outcome
@@ -165,12 +185,13 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 			payload.FlakeRetries++
 		case "policy_event":
 			var w struct {
-				Check      string   `json:"check"`
-				Outcome    string   `json:"outcome"`
-				Undeclared []string `json:"undeclared"`
-				Constraint string   `json:"constraint"`
-				Detail     string   `json:"detail"`
-				Files      []string `json:"files"`
+				Check                 string              `json:"check"`
+				Outcome               string              `json:"outcome"`
+				Undeclared            []string            `json:"undeclared"`
+				UndeclaredCategorized []driftPathEvidence `json:"undeclared_categorized"`
+				Constraint            string              `json:"constraint"`
+				Detail                string              `json:"detail"`
+				Files                 []string            `json:"files"`
 			}
 			if json.Unmarshal(e.Payload, &w) != nil {
 				continue
@@ -179,6 +200,8 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 			case w.Check == "scope_drift" && w.Outcome == "excluded":
 				payload.ScopeFacts.UndeclaredPaths =
 					append(payload.ScopeFacts.UndeclaredPaths, w.Undeclared...)
+				payload.ScopeFacts.UndeclaredCategorized =
+					append(payload.ScopeFacts.UndeclaredCategorized, w.UndeclaredCategorized...)
 			case w.Outcome == "violation":
 				payload.PolicyViolations = append(payload.PolicyViolations, policyViolationEvidence{
 					Check:      w.Check,

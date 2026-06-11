@@ -8159,6 +8159,158 @@ func TestComputeAndEmitDiff_DecompositionChild_MeasuresIncrement(t *testing.T) {
 	}
 }
 
+// TestComputeAndEmitDiff_CategorizesScopeDrift proves the per-path A/B
+// drift categorization (#991) against a real git repo: an out-of-scope
+// MODIFIED tracked file is category A (edit excluded from the commit),
+// an out-of-scope CREATED file is category B (would fail the #818/#825
+// gate), and the legacy `undeclared` list still names both unchanged.
+// A decomposed child's B paths get excluded_from_commit instead —
+// children are exempt from the created-out-of-scope gate.
+func TestComputeAndEmitDiff_CategorizesScopeDrift(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	type driftEvent struct {
+		Undeclared            []string            `json:"undeclared"`
+		UndeclaredCategorized []driftPathEvidence `json:"undeclared_categorized"`
+	}
+	// setupRepo builds a repo with one declared in-scope edit, one
+	// out-of-scope tracked-file edit (category A), and one out-of-scope
+	// created file (category B), then returns the decoded scope_drift
+	// policy_event computeAndEmitDiff emitted, plus its raw payload so
+	// callers can assert key absence (omitted vs. null/empty).
+	driftFor := func(t *testing.T, cfg config, logSink io.Writer) (driftEvent, []byte) {
+		t.Helper()
+		repo := t.TempDir()
+		runGit := func(args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = repo
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+			}
+		}
+		runGit("init", "--initial-branch=main")
+		runGit("config", "user.name", "init")
+		runGit("config", "user.email", "init@example.com")
+		runGit("config", "commit.gpgsign", "false")
+
+		for _, name := range []string{"declared.go", "tracked.go"} {
+			if err := os.WriteFile(filepath.Join(repo, name), []byte("package x\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runGit("add", "-A")
+		runGit("commit", "-m", "base")
+
+		// In-scope edit, out-of-scope tracked edit (A), out-of-scope creation (B).
+		if err := os.WriteFile(filepath.Join(repo, "declared.go"), []byte("package x // edit\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "tracked.go"), []byte("package x // drift\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "created.go"), []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg.workingDir = repo
+		cfg.checkBaseRef = "main"
+		cfg.scopeFiles = []upload.ScopeFile{{Path: "declared.go", Operation: "modify"}}
+		_, events, err := computeAndEmitDiff(cfg, logSink)
+		if err != nil {
+			t.Fatalf("computeAndEmitDiff: %v", err)
+		}
+		for _, e := range events {
+			if e.Kind != "policy_event" {
+				continue
+			}
+			var w struct {
+				Check   string `json:"check"`
+				Outcome string `json:"outcome"`
+				driftEvent
+			}
+			if err := json.Unmarshal(e.Payload, &w); err != nil {
+				t.Fatalf("decode policy_event: %v", err)
+			}
+			if w.Check == "scope_drift" && w.Outcome == "excluded" {
+				return w.driftEvent, e.Payload
+			}
+		}
+		t.Fatal("no scope_drift policy_event emitted")
+		return driftEvent{}, nil
+	}
+
+	assertCategorized := func(t *testing.T, got []driftPathEvidence, wantCreatedDisposition string) {
+		t.Helper()
+		want := map[string]driftPathEvidence{
+			"tracked.go": {Path: "tracked.go", Category: "A", Disposition: "excluded_from_commit"},
+			"created.go": {Path: "created.go", Category: "B", Disposition: wantCreatedDisposition},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("undeclared_categorized = %+v, want entries for %v", got, want)
+		}
+		for _, dp := range got {
+			if w, ok := want[dp.Path]; !ok || dp != w {
+				t.Errorf("undeclared_categorized entry = %+v, want %+v", dp, w)
+			}
+		}
+	}
+
+	t.Run("standalone", func(t *testing.T) {
+		ev, _ := driftFor(t, config{stageID: "s-standalone"}, io.Discard)
+		// The legacy list is untouched by categorization: both drift
+		// paths, exactly as today's consumers read them.
+		if len(ev.Undeclared) != 2 {
+			t.Fatalf("undeclared = %v, want both drift paths", ev.Undeclared)
+		}
+		assertCategorized(t, ev.UndeclaredCategorized, "would_fail_loud")
+	})
+
+	t.Run("decomposed child", func(t *testing.T) {
+		// First child of a fan-out (shared branch not yet pushed) so the
+		// policy base stays main; only the disposition routing differs.
+		withFakeRemoteBranchExists(t, false)
+		ev, _ := driftFor(t, config{stageID: "s-child", decomposedFromRunID: "abcdef0123456789"}, io.Discard)
+		assertCategorized(t, ev.UndeclaredCategorized, "excluded_from_commit")
+	})
+
+	t.Run("categorize failure degrades to uncategorized", func(t *testing.T) {
+		// gitops.UntrackedPaths only fails when git ls-files itself
+		// fails, which this temp-repo setup cannot force while
+		// StageScoped succeeds in the same call — swap the seam to
+		// drive the best-effort degradation branch: a one-line
+		// scope_drift_categorize_failed log entry and today's
+		// uncategorized payload, never a stage failure.
+		orig := untrackedPaths
+		untrackedPaths = func(context.Context, string, []string) ([]string, error) {
+			return nil, errors.New("ls-files exploded")
+		}
+		t.Cleanup(func() { untrackedPaths = orig })
+
+		var log bytes.Buffer
+		ev, raw := driftFor(t, config{stageID: "s-degraded"}, &log)
+
+		if len(ev.Undeclared) != 2 {
+			t.Fatalf("undeclared = %v, want both drift paths", ev.Undeclared)
+		}
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &keys); err != nil {
+			t.Fatalf("decode payload keys: %v", err)
+		}
+		if _, ok := keys["undeclared_categorized"]; ok {
+			t.Errorf("payload = %s, want undeclared_categorized omitted after categorize failure", raw)
+		}
+		logged := log.String()
+		if !strings.Contains(logged, `"event":"scope_drift_categorize_failed"`) ||
+			!strings.Contains(logged, `"stage_id":"s-degraded"`) ||
+			!strings.Contains(logged, "ls-files exploded") {
+			t.Errorf("log = %q, want scope_drift_categorize_failed with stage_id and error detail", logged)
+		}
+	})
+}
+
 // TestDecompositionFanout_TrackingRefMaterialized_RoutesSubsequent crosses
 // the real gitops push -> tracking-ref -> production remoteBranchExists ->
 // routing seam end-to-end (#770). The bug lives in that seam: a decomposed

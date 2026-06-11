@@ -1527,13 +1527,27 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"scope_drift","stage_id":%q,"undeclared":%s}`+"\n",
 				cfg.stageID, driftJSON)
+			payload := map[string]any{
+				"check":      "scope_drift",
+				"outcome":    "excluded",
+				"undeclared": drift,
+			}
+			// Per-path A/B categorization (#991) rides alongside the
+			// `undeclared` list, which stays byte-for-byte unchanged for
+			// its existing consumers. Best-effort: categorization is
+			// advisory review evidence, never a gate — on error, log a
+			// degradation line and emit the uncategorized payload.
+			if categorized, cerr := categorizeDrift(context.Background(), repoDir, drift,
+				cfg.decomposedFromRunID != ""); cerr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"scope_drift_categorize_failed","stage_id":%q,"detail":%q}`+"\n",
+					cfg.stageID, cerr.Error())
+			} else {
+				payload["undeclared_categorized"] = categorized
+			}
 			events = append(events, agent.Event{
-				Kind: "policy_event",
-				Payload: agent.MakePayload(map[string]any{
-					"check":      "scope_drift",
-					"outcome":    "excluded",
-					"undeclared": drift,
-				}),
+				Kind:    "policy_event",
+				Payload: agent.MakePayload(payload),
 			})
 		}
 	} else {
@@ -1581,6 +1595,41 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	}
 	events = append(events, makeGitDiffEvent(baseRef, d, patch, truncated))
 	return d, events, nil
+}
+
+// categorizeDrift partitions a scope_drift list into per-path A/B
+// categories (#991) using gitops.UntrackedPaths — the same primitive
+// the #818/#825 created-out-of-scope gate uses, so the evidence's
+// category-B set and the gate's enforcement set agree by construction
+// (StageScoped's leading reset leaves created drift untracked at this
+// point). Untracked drift is category B (created out of scope); the
+// remainder (tracked modify/delete) is category A (edit excluded from
+// the commit). Disposition: A is always "excluded_from_commit"; B is
+// "would_fail_loud" except for decomposed children, which are exempt
+// from the created-out-of-scope gate (a child may legitimately create
+// files a later child declares) and so get "excluded_from_commit".
+func categorizeDrift(ctx context.Context, repoDir string, drift []string, decomposedChild bool) ([]driftPathEvidence, error) {
+	created, err := untrackedPaths(ctx, repoDir, drift)
+	if err != nil {
+		return nil, err
+	}
+	createdSet := make(map[string]bool, len(created))
+	for _, p := range created {
+		createdSet[p] = true
+	}
+	out := make([]driftPathEvidence, 0, len(drift))
+	for _, p := range drift {
+		if createdSet[p] {
+			disposition := "would_fail_loud"
+			if decomposedChild {
+				disposition = "excluded_from_commit"
+			}
+			out = append(out, driftPathEvidence{Path: p, Category: "B", Disposition: disposition})
+			continue
+		}
+		out = append(out, driftPathEvidence{Path: p, Category: "A", Disposition: "excluded_from_commit"})
+	}
+	return out, nil
 }
 
 // reemitScopedGitDiff recomputes the scope-only git_diff from the reconciled
@@ -2746,6 +2795,14 @@ type prOpener interface {
 // withFakeGitOps().
 var (
 	newPusher = func() pusher { return &gitops.Pusher{} }
+
+	// untrackedPaths is the gitops primitive categorizeDrift partitions
+	// drift with. Test seam: gitops.UntrackedPaths only fails when git
+	// ls-files itself fails, which a temp-repo test cannot force while
+	// StageScoped succeeds in the same computeAndEmitDiff call — tests
+	// swap in a failing function to exercise the categorize-failure
+	// degradation branch (log + fall back to the uncategorized payload).
+	untrackedPaths = gitops.UntrackedPaths
 
 	newPROpener = func(token string) prOpener {
 		return &gitops.OpenPRClient{Token: token}

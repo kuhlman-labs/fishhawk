@@ -333,10 +333,24 @@ type GateVerifySummary struct {
 // scope.files count, files actually staged into the commit (nil when
 // no git_diff event recorded a count — distinguishable from a real
 // zero-file diff), and the drift-excluded undeclared paths.
+// UndeclaredCategorized carries the per-path A/B drift categories
+// (#991) when the runner provided them; nil (older bundles) renders
+// the undeclared paths exactly as before.
 type GateScopeFacts struct {
-	DeclaredFiles   int
-	StagedFiles     *int
-	UndeclaredPaths []string
+	DeclaredFiles         int
+	StagedFiles           *int
+	UndeclaredPaths       []string
+	UndeclaredCategorized []GateDriftPath
+}
+
+// GateDriftPath is one categorized scope-drift path (#991): category
+// "A" (agent edit to a tracked file excluded from the commit) or "B"
+// (file created out of scope), plus the disposition enforcement
+// applied ("excluded_from_commit" | "would_fail_loud").
+type GateDriftPath struct {
+	Path        string
+	Category    string
+	Disposition string
 }
 
 // GatePolicyViolation is one constraint-violation policy event
@@ -1333,8 +1347,27 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		}
 		if len(ev.ScopeFacts.UndeclaredPaths) > 0 {
 			b.WriteString("- drift-excluded paths (dirtied by the stage but NOT in the commit):\n")
+			// Per-path A/B annotations (#991) when the runner categorized
+			// the drift; an entry without a category (older bundles, or a
+			// best-effort categorization miss) renders the bare path line.
+			byPath := make(map[string]GateDriftPath, len(ev.ScopeFacts.UndeclaredCategorized))
+			for _, dp := range ev.ScopeFacts.UndeclaredCategorized {
+				byPath[dp.Path] = dp
+			}
 			for _, p := range ev.ScopeFacts.UndeclaredPaths {
-				fmt.Fprintf(b, "  - %s\n", p)
+				switch dp := byPath[p]; dp.Category {
+				case "A":
+					fmt.Fprintf(b, "  - %s (category A: agent edit to a tracked file EXCLUDED from the commit — "+
+						"the pushed head may be missing a required change)\n", p)
+				case "B":
+					if dp.Disposition == "excluded_from_commit" {
+						fmt.Fprintf(b, "  - %s (category B: created out of scope — excluded from the commit)\n", p)
+					} else {
+						fmt.Fprintf(b, "  - %s (category B: created out of scope — net-new file rejected before push)\n", p)
+					}
+				default:
+					fmt.Fprintf(b, "  - %s\n", p)
+				}
 			}
 		}
 		b.WriteString("\n")

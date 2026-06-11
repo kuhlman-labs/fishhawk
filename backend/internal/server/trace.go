@@ -2608,6 +2608,13 @@ func gateEvidenceForReview(ev bundle.GateEvidence) *prompt.GateEvidence {
 			StagedFiles:     ev.ScopeFacts.StagedFiles,
 			UndeclaredPaths: ev.ScopeFacts.UndeclaredPaths,
 		}
+		for _, dp := range ev.ScopeFacts.UndeclaredCategorized {
+			out.ScopeFacts.UndeclaredCategorized = append(out.ScopeFacts.UndeclaredCategorized, prompt.GateDriftPath{
+				Path:        dp.Path,
+				Category:    dp.Category,
+				Disposition: dp.Disposition,
+			})
+		}
 	}
 	for _, pv := range ev.PolicyViolations {
 		out.PolicyViolations = append(out.PolicyViolations, prompt.GatePolicyViolation{

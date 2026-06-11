@@ -727,6 +727,9 @@ func gateEvidenceLine(t *testing.T, seq int) Line {
 			"declared_files":   5,
 			"staged_files":     4,
 			"undeclared_paths": []string{"backend/internal/foo/foo_test.go"},
+			"undeclared_categorized": []map[string]any{
+				{"path": "backend/internal/foo/foo_test.go", "category": "A", "disposition": "excluded_from_commit"},
+			},
 		},
 		"policy_violations": []map[string]any{
 			{
@@ -798,6 +801,12 @@ func TestExtractGateEvidence_HappyPath(t *testing.T) {
 	if len(got.ScopeFacts.UndeclaredPaths) != 1 || got.ScopeFacts.UndeclaredPaths[0] != "backend/internal/foo/foo_test.go" {
 		t.Errorf("ScopeFacts.UndeclaredPaths = %v, want the drifted test path", got.ScopeFacts.UndeclaredPaths)
 	}
+	wantDP := DriftPathEvidence{
+		Path: "backend/internal/foo/foo_test.go", Category: "A", Disposition: "excluded_from_commit",
+	}
+	if len(got.ScopeFacts.UndeclaredCategorized) != 1 || got.ScopeFacts.UndeclaredCategorized[0] != wantDP {
+		t.Errorf("ScopeFacts.UndeclaredCategorized = %+v, want [%+v]", got.ScopeFacts.UndeclaredCategorized, wantDP)
+	}
 	if len(got.PolicyViolations) != 1 {
 		t.Fatalf("got %d policy violations, want 1", len(got.PolicyViolations))
 	}
@@ -806,6 +815,33 @@ func TestExtractGateEvidence_HappyPath(t *testing.T) {
 		pv.Detail != "path matches forbidden glob" ||
 		len(pv.Files) != 1 || pv.Files[0] != ".github/workflows/ci.yml" {
 		t.Errorf("PolicyViolations[0] = %+v, want the forbidden_paths entry", pv)
+	}
+}
+
+func TestExtractGateEvidence_OlderBundleWithoutCategorizedDrift(t *testing.T) {
+	// Tolerant-decode contract (#991): a bundle from an older runner
+	// whose scope_facts has undeclared_paths but no undeclared_categorized
+	// key decodes with a nil categorized slice — UndeclaredPaths stays
+	// the authoritative list and downstream renders the uncategorized
+	// lines exactly as before.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: json.RawMessage(
+			`{"scope_facts":{"declared_files":3,"staged_files":2,"undeclared_paths":["stray.go"]}}`)},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractGateEvidence(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if got.ScopeFacts == nil {
+		t.Fatal("ScopeFacts = nil, want populated")
+	}
+	if len(got.ScopeFacts.UndeclaredPaths) != 1 || got.ScopeFacts.UndeclaredPaths[0] != "stray.go" {
+		t.Errorf("UndeclaredPaths = %v, want [stray.go]", got.ScopeFacts.UndeclaredPaths)
+	}
+	if got.ScopeFacts.UndeclaredCategorized != nil {
+		t.Errorf("UndeclaredCategorized = %+v, want nil on an older bundle", got.ScopeFacts.UndeclaredCategorized)
 	}
 }
 

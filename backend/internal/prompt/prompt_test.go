@@ -2236,7 +2236,11 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 			ScopeFacts: &GateScopeFacts{
 				DeclaredFiles:   5,
 				StagedFiles:     intPtr(4),
-				UndeclaredPaths: []string{"backend/internal/foo/foo_test.go"},
+				UndeclaredPaths: []string{"backend/internal/foo/foo_test.go", "backend/internal/foo/new.go"},
+				UndeclaredCategorized: []GateDriftPath{
+					{Path: "backend/internal/foo/foo_test.go", Category: "A", Disposition: "excluded_from_commit"},
+					{Path: "backend/internal/foo/new.go", Category: "B", Disposition: "would_fail_loud"},
+				},
 			},
 			PolicyViolations: []GatePolicyViolation{
 				{Check: "constraints", Constraint: "forbidden_paths",
@@ -2267,7 +2271,11 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 		"Infra-flake retries absorbed: 1",
 		"- declared scope.files: 5",
 		"- files staged into the commit: 4",
-		"backend/internal/foo/foo_test.go",
+		// Per-path A/B drift annotations (#991): the tracked-edit and
+		// created-out-of-scope forms.
+		"- backend/internal/foo/foo_test.go (category A: agent edit to a tracked file EXCLUDED from the commit — " +
+			"the pushed head may be missing a required change)",
+		"- backend/internal/foo/new.go (category B: created out of scope — net-new file rejected before push)",
 		"- check: constraints (constraint: forbidden_paths) — path matches forbidden glob",
 		"files: .github/workflows/ci.yml",
 		// The softened non-goals preamble defers to the evidence section.
@@ -2314,6 +2322,59 @@ func TestBuild_ImplementReview_GateEvidence_AbsentWhenNil(t *testing.T) {
 	}
 	if gotBase != gotNil {
 		t.Errorf("explicit-nil GateEvidence must be byte-identical to omitting it")
+	}
+}
+
+func TestBuild_ImplementReview_GateEvidence_UncategorizedDriftByteIdentical(t *testing.T) {
+	// #991 degradation contract: scope facts with UndeclaredPaths but a
+	// nil UndeclaredCategorized (an older bundle, or the runner's
+	// categorize-failed path) must render byte-identically to the
+	// pre-#991 output — bare path lines, no annotations. Rendering both
+	// variants and comparing pins the whole prompt, not just the section.
+	mk := func(categorized []GateDriftPath) string {
+		t.Helper()
+		got, err := Build("implement_review", Trigger{
+			Repo:         "kuhlman-labs/example",
+			ApprovedPlan: fixturePlan(),
+			Diff:         "- M pkg/bar/bar.go\n",
+			GateEvidence: &GateEvidence{
+				ScopeFacts: &GateScopeFacts{
+					DeclaredFiles:         3,
+					StagedFiles:           intPtr(2),
+					UndeclaredPaths:       []string{"stray/a.go", "stray/b.go"},
+					UndeclaredCategorized: categorized,
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	uncategorized := mk(nil)
+	for _, w := range []string{"  - stray/a.go\n", "  - stray/b.go\n"} {
+		if !strings.Contains(uncategorized, w) {
+			t.Errorf("uncategorized drift missing bare line %q:\n%s", w, uncategorized)
+		}
+	}
+	if strings.Contains(uncategorized, "category A") || strings.Contains(uncategorized, "category B") {
+		t.Errorf("uncategorized drift must not render category annotations:\n%s", uncategorized)
+	}
+	// A path the categorized list doesn't cover renders its bare line
+	// even when OTHER paths are annotated — per-path tolerance, not
+	// all-or-nothing.
+	partial := mk([]GateDriftPath{{Path: "stray/a.go", Category: "B", Disposition: "excluded_from_commit"}})
+	for _, w := range []string{
+		"  - stray/a.go (category B: created out of scope — excluded from the commit)\n",
+		"  - stray/b.go\n",
+	} {
+		if !strings.Contains(partial, w) {
+			t.Errorf("partially categorized drift missing %q:\n%s", w, partial)
+		}
+	}
+	if got := mk([]GateDriftPath{}); got != uncategorized {
+		t.Errorf("empty UndeclaredCategorized must render byte-identically to nil")
 	}
 }
 
