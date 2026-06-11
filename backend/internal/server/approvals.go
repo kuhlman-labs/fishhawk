@@ -52,6 +52,32 @@ type approvalRequest struct {
 	AddScopeFiles []string `json:"add_scope_files,omitempty"`
 }
 
+// approvalSubmitResponse is the 200 body for POST /v0/stages/{stage_id}/
+// approvals (#986). On a first submission the three duplicate fields are
+// omitted and the body is byte-identical to the bare Stage shape existing
+// clients decode. On a duplicate submission — same (stage, subject) pair —
+// they label the no-op honestly: the prior decision stands, the stage state
+// is unchanged, and no gates re-ran. prior_decision/prior_submitted_at come
+// from the EXISTING approval row, so they are authentic provenance, not
+// echoes of the new request.
+type approvalSubmitResponse struct {
+	stageResponse
+	DuplicateSubmission bool   `json:"duplicate_submission,omitempty"`
+	PriorDecision       string `json:"prior_decision,omitempty"`
+	PriorSubmittedAt    string `json:"prior_submitted_at,omitempty"`
+}
+
+// duplicateApprovalResponse labels a duplicate submission's 200 body with
+// the prior approval row's decision and timestamp.
+func duplicateApprovalResponse(stage *run.Stage, prior *approval.Approval) approvalSubmitResponse {
+	return approvalSubmitResponse{
+		stageResponse:       toStageResponse(stage),
+		DuplicateSubmission: true,
+		PriorDecision:       string(prior.Decision),
+		PriorSubmittedAt:    prior.SubmittedAt.UTC().Format(time.RFC3339),
+	}
+}
+
 // handleSubmitApproval implements POST /v0/stages/{stage_id}/approvals.
 //
 // Per the OpenAPI contract:
@@ -61,8 +87,10 @@ type approvalRequest struct {
 //     approval")
 //
 // Idempotency: a re-submission from the same authenticated subject
-// returns the existing approval and the current stage state with
-// a 200. The first decision wins for any_of-style gates.
+// returns the current stage state with a 200 labeled
+// duplicate_submission (#986) — prior_decision/prior_submitted_at
+// carry the existing row's provenance, no gates re-run, and no audit
+// entries are emitted. The first decision wins for any_of-style gates.
 func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriteScope(w, r, "write:approvals") {
 		return
@@ -150,6 +178,19 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Duplicate pre-check (#986): a re-submission from the same subject
+	// is answered BEFORE any plan gate runs — the labeled duplicate 200
+	// below — so a duplicate can never re-emit gate audit entries
+	// (e.g. plan_violates_budget) or 422 against a decision that already
+	// stands. Authoritative read of the approval row for (stage,
+	// subject); fail-open on a read error because Submit's
+	// Inserted=false path is the race-safe second layer producing the
+	// identical labeled response.
+	if prior := s.findPriorApproval(r.Context(), stageID, subject); prior != nil {
+		s.writeJSON(w, r, http.StatusOK, duplicateApprovalResponse(stage, prior))
+		return
+	}
+
 	// ADR-036 (#875): refuse a plan-stage approve while a configured
 	// agent plan review is still in-flight. Placed BEFORE
 	// ApprovalRepo.Submit (not in the res.Inserted block) so a refused
@@ -169,6 +210,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		// a retry after re-scope or with the override flows normally
 		// (post-Submit, the idempotent-first-wins retry would skip gates).
 		if !s.checkPlanScopeCap(w, r, stage, req.Comment, req.AddScopeFiles) {
+			return
+		}
+		// Budget gate (#986): refuse an approve whose plan predicts a
+		// runtime over the implement-stage budget, unless decomposition
+		// or --override-budget satisfies it. PRE-Submit for the same
+		// ADR-036 reason as its two siblings: a refused approval must
+		// insert no row so a retry with the override flows normally
+		// through Submit → advanceStage. Post-Submit (where this check
+		// used to live), the 422 left a row behind and the documented
+		// --override-budget retry dead-ended as an idempotent-first-wins
+		// duplicate, silently stranding the stage.
+		if !s.checkPlanBudget(w, r, stage, req.Comment) {
 			return
 		}
 	}
@@ -195,77 +248,95 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Only the FIRST submission for this approver triggers a stage
-	// transition. Subsequent submissions return the prior decision
-	// and the stage's current state.
-	if res.Inserted {
-		// Budget check: plan-stage approvals are gated on the plan's
-		// predicted runtime fitting within the spec-resolved implement-
-		// stage timeout. Decomposition or --override-budget bypasses
-		// the check; a bare over-budget plan returns 422.
-		if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
-			if !s.checkPlanBudget(w, r, stage, req.Comment) {
-				return
-			}
-		}
-
-		stage, err = s.advanceStage(r.Context(), stageID, decision)
-		if err != nil {
-			var inv run.InvalidTransitionError
-			if errors.As(err, &inv) {
-				s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
-					err.Error(),
-					map[string]any{"stage_id": stageID.String(),
-						"from": inv.From, "to": inv.To})
-				return
-			}
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"transition stage failed", map[string]any{"error": err.Error()})
-			return
-		}
-
-		s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles)
-
-		// Hand off to the orchestrator on both approve AND reject
-		// — approve dispatches the next stage; reject walks the
-		// run's state machine to terminal (pending → running →
-		// failed). Without the reject path the run would stay in
-		// pending forever once an approver rejected.
-		if s.cfg.Orchestrator != nil {
-			if _, err := s.cfg.Orchestrator.Advance(r.Context(), stage.RunID); err != nil {
-				// Don't fail the approval: the gate did pass /
-				// reject, the audit row is in place. Surface
-				// the orchestration failure in logs and let a
-				// follow-up call recover.
-				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
-					"orchestrator advance failed",
-					slog.String("run_id", stage.RunID.String()),
-					slog.String("stage_id", stage.ID.String()),
-					slog.String("error", err.Error()),
-				)
-			}
-		}
-
-		// Plan-comment re-render (#377): a plan-stage approve or
-		// reject re-fires the plan-on-issue hook, which edits the
-		// existing comment in place (when the spec opts in to
-		// `update_on_change`) and appends a `_Status:_` footer
-		// naming the actor. The retired NotifyPlanApproved
-		// broadcast (#274) used to live here; it duplicated what
-		// the plan-comment edit + sticky status comment already
-		// surface. Best-effort: notifyPlanReady logs but never
-		// unwinds the approval.
-		if stage.Type == run.StageTypePlan {
-			s.notifyPlanReady(r.Context(), stage.RunID, stage)
-		}
-
-		// Sticky status comment (E20.4 / #330). Every approval —
-		// approve or reject, plan stage or otherwise — changes the
-		// run's surface state and is worth surfacing in the issue
-		// thread.
-		s.notifyStatusUpdate(r.Context(), stage.RunID, "approval_submit")
+	// transition. A concurrent second submission that lost the race
+	// past the duplicate pre-check gets the same labeled duplicate
+	// 200 the pre-check produces.
+	if !res.Inserted {
+		s.writeJSON(w, r, http.StatusOK, duplicateApprovalResponse(stage, res.Approval))
+		return
 	}
 
+	stage, err = s.advanceStage(r.Context(), stageID, decision)
+	if err != nil {
+		var inv run.InvalidTransitionError
+		if errors.As(err, &inv) {
+			s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+				err.Error(),
+				map[string]any{"stage_id": stageID.String(),
+					"from": inv.From, "to": inv.To})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"transition stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles)
+
+	// Hand off to the orchestrator on both approve AND reject
+	// — approve dispatches the next stage; reject walks the
+	// run's state machine to terminal (pending → running →
+	// failed). Without the reject path the run would stay in
+	// pending forever once an approver rejected.
+	if s.cfg.Orchestrator != nil {
+		if _, err := s.cfg.Orchestrator.Advance(r.Context(), stage.RunID); err != nil {
+			// Don't fail the approval: the gate did pass /
+			// reject, the audit row is in place. Surface
+			// the orchestration failure in logs and let a
+			// follow-up call recover.
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+				"orchestrator advance failed",
+				slog.String("run_id", stage.RunID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+
+	// Plan-comment re-render (#377): a plan-stage approve or
+	// reject re-fires the plan-on-issue hook, which edits the
+	// existing comment in place (when the spec opts in to
+	// `update_on_change`) and appends a `_Status:_` footer
+	// naming the actor. The retired NotifyPlanApproved
+	// broadcast (#274) used to live here; it duplicated what
+	// the plan-comment edit + sticky status comment already
+	// surface. Best-effort: notifyPlanReady logs but never
+	// unwinds the approval.
+	if stage.Type == run.StageTypePlan {
+		s.notifyPlanReady(r.Context(), stage.RunID, stage)
+	}
+
+	// Sticky status comment (E20.4 / #330). Every approval —
+	// approve or reject, plan stage or otherwise — changes the
+	// run's surface state and is worth surfacing in the issue
+	// thread.
+	s.notifyStatusUpdate(r.Context(), stage.RunID, "approval_submit")
+
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(stage))
+}
+
+// findPriorApproval returns the existing approval row for (stageID,
+// subject), or nil when none exists. Read-only — the #986 duplicate
+// pre-check uses it to answer re-submissions before any plan gate
+// runs. Fail-open on a read error (WARN-log, return nil): the caller
+// falls through to Submit, whose Inserted=false result is the
+// race-safe second layer for the duplicate path.
+func (s *Server) findPriorApproval(ctx context.Context, stageID uuid.UUID, subject string) *approval.Approval {
+	existing, err := s.cfg.ApprovalRepo.ListForStage(ctx, stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"approval duplicate pre-check: list approvals failed",
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for _, a := range existing {
+		if a.ApproverSubject == subject {
+			return a
+		}
+	}
+	return nil
 }
 
 // advanceStage applies the state-machine transition for the

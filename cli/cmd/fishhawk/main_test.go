@@ -98,6 +98,10 @@ type fakeBackend struct {
 
 	// approvalResp returned by POST /v0/stages/{id}/approvals
 	approvalResp httpclient.Stage
+	// approvalRawResp, when set, is written verbatim on the approvals
+	// 200 — serves the #986 duplicate-labeled shape with the literal
+	// duplicate_submission/prior_decision/prior_submitted_at keys.
+	approvalRawResp string
 	// retryResp returned by POST /v0/stages/{id}/retry
 	retryResp httpclient.Stage
 	// retryErrCode lets a test request a 4xx response with a typed
@@ -230,6 +234,10 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 					"message": "stage is not awaiting_approval",
 				},
 			})
+			return
+		}
+		if fb.approvalRawResp != "" {
+			_, _ = w.Write([]byte(fb.approvalRawResp))
 			return
 		}
 		_ = json.NewEncoder(w).Encode(fb.approvalResp)
@@ -1130,6 +1138,91 @@ func TestPlanApprove_JSONOutput(t *testing.T) {
 	}
 	if decoded.State != "succeeded" {
 		t.Errorf("State = %q, want succeeded", decoded.State)
+	}
+}
+
+func TestPlanApprove_Duplicate_TextNoticeOnStderr(t *testing.T) {
+	// #986: a duplicate-labeled 200 prints an explicit stderr notice
+	// before the normal stage echo — a no-op must never render as a
+	// normal result. Exit stays 0 (the HTTP request succeeded).
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	planStageID := stages[0].ID
+	fb.stagesForRun[runID] = stages
+	fb.approvalRawResp = fmt.Sprintf(
+		`{"id":%q,"run_id":%q,"sequence":1,"type":"plan","state":"awaiting_approval","executor":{"kind":"agent","ref":"claude-code"},"duplicate_submission":true,"prior_decision":"approve","prior_submitted_at":"2026-06-10T12:00:00Z"}`,
+		planStageID, runID)
+
+	var stdout, stderr strings.Builder
+	got := run([]string{"plan", "approve", runID.String()}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK (duplicate keeps exit 0)", got)
+	}
+	if !strings.Contains(stderr.String(), "duplicate submission — prior approve decision (2026-06-10T12:00:00Z) stands; stage state unchanged") {
+		t.Errorf("stderr missing duplicate notice: %s", stderr.String())
+	}
+	// The normal stage echo still follows on stdout.
+	if !strings.Contains(stdout.String(), planStageID.String()) {
+		t.Errorf("stdout missing stage echo: %s", stdout.String())
+	}
+}
+
+func TestPlanApprove_Duplicate_JSONCarriesLabeledFields(t *testing.T) {
+	// #986: --output json includes the duplicate fields so scripts can
+	// branch on approval EFFECT rather than exit code.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	planStageID := stages[0].ID
+	fb.stagesForRun[runID] = stages
+	fb.approvalRawResp = fmt.Sprintf(
+		`{"id":%q,"run_id":%q,"sequence":1,"type":"plan","state":"awaiting_approval","executor":{"kind":"agent","ref":"claude-code"},"duplicate_submission":true,"prior_decision":"reject","prior_submitted_at":"2026-06-10T12:00:00Z"}`,
+		planStageID, runID)
+
+	var stdout strings.Builder
+	got := run([]string{"plan", "approve", "--output", "json", runID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d", got)
+	}
+	var decoded httpclient.ApprovalResult
+	if err := json.NewDecoder(strings.NewReader(stdout.String())).Decode(&decoded); err != nil {
+		t.Fatalf("decode json: %v\nstdout: %s", err, stdout.String())
+	}
+	if !decoded.DuplicateSubmission || decoded.PriorDecision != "reject" || decoded.PriorSubmittedAt == "" {
+		t.Errorf("duplicate fields = (%v, %q, %q), want (true, reject, set)",
+			decoded.DuplicateSubmission, decoded.PriorDecision, decoded.PriorSubmittedAt)
+	}
+}
+
+func TestPlanApprove_FirstSubmission_JSONOmitsDuplicateKeys(t *testing.T) {
+	// Additive-only contract: a first-submission 200 re-encodes
+	// without the #986 keys, so existing json consumers see today's
+	// shape unchanged.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	fb.stagesForRun[runID] = stages
+	fb.approvalResp = httpclient.Stage{
+		ID: stages[0].ID, RunID: runID, Sequence: 1, Type: "plan", State: "succeeded",
+		Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"},
+	}
+
+	var stdout, stderr strings.Builder
+	got := run([]string{"plan", "approve", "--output", "json", runID.String()}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("status = %d", got)
+	}
+	for _, k := range []string{"duplicate_submission", "prior_decision", "prior_submitted_at"} {
+		if strings.Contains(stdout.String(), k) {
+			t.Errorf("first-submission json must omit %q: %s", k, stdout.String())
+		}
+	}
+	if strings.Contains(stderr.String(), "duplicate submission") {
+		t.Errorf("unexpected duplicate notice on a first submission: %s", stderr.String())
 	}
 }
 

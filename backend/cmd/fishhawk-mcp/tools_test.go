@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -176,10 +177,15 @@ type fakeBackend struct {
 	// approvalsErrBody, when set, is written verbatim — drives the
 	// 404 / 422 error-path tests.
 	// approvalsCalledByID counts approval calls per stage id.
+	// approvalsRespBody, when set, is written verbatim on the 200 —
+	// used to serve the #986 duplicate-labeled shape with the literal
+	// duplicate_submission/prior_decision/prior_submitted_at keys so
+	// the client-decode seam is pinned from this side of the wire.
 	approvalsBody       approvalRequest
 	approvalsResp       map[uuid.UUID]Stage
 	approvalsStatus     int
 	approvalsErrBody    string
+	approvalsRespBody   string
 	approvalsCalledByID map[uuid.UUID]int
 
 	// Calibration fixtures: GET /v0/calibration.
@@ -261,11 +267,16 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.approvalsBody = body
 		status := fb.approvalsStatus
 		errBody := fb.approvalsErrBody
+		rawBody := fb.approvalsRespBody
 		resp, ok := fb.approvalsResp[id]
 		fb.mu.Unlock()
 		w.WriteHeader(status)
 		if errBody != "" {
 			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if rawBody != "" {
+			_, _ = w.Write([]byte(rawBody))
 			return
 		}
 		if !ok {
@@ -3295,6 +3306,112 @@ func TestRejectPlan_HappyPath_ResolvesAndPostsReject(t *testing.T) {
 	}
 	if fb.approvalsBody.Comment != "scope is too wide" {
 		t.Errorf("comment = %q, want 'scope is too wide'", fb.approvalsBody.Comment)
+	}
+}
+
+func TestApprovePlan_DuplicateSubmission_LabeledOutputAndLeadText(t *testing.T) {
+	// #986: a duplicate-labeled 200 must reach the tool output as
+	// duplicate_submission/prior_decision AND lead the result text with
+	// an explicit no-op banner — the operator loop must never mistake a
+	// duplicate for an effective approval.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	fb.approvalsRespBody = fmt.Sprintf(
+		`{"id":%q,"run_id":%q,"type":"plan","state":"succeeded","duplicate_submission":true,"prior_decision":"approve","prior_submitted_at":"2026-06-10T12:00:00Z"}`,
+		stageID.String(), runID.String())
+
+	res, out, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "second try without override",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !out.DuplicateSubmission {
+		t.Errorf("DuplicateSubmission = false, want true")
+	}
+	if out.PriorDecision != "approve" {
+		t.Errorf("PriorDecision = %q, want approve", out.PriorDecision)
+	}
+	if out.Stage.State != "succeeded" {
+		t.Errorf("State = %q, want succeeded (unchanged)", out.Stage.State)
+	}
+	if res == nil || len(res.Content) == 0 {
+		t.Fatal("expected a tool result carrying the duplicate banner; got nil/empty")
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("Content[0] = %T, want *mcp.TextContent", res.Content[0])
+	}
+	if !strings.HasPrefix(text.Text, "duplicate submission — your prior approve decision") {
+		t.Errorf("result text must lead with the duplicate banner, got %q", text.Text)
+	}
+	if !strings.Contains(text.Text, "gates were NOT re-run") {
+		t.Errorf("result text must state gates did not re-run, got %q", text.Text)
+	}
+}
+
+func TestRejectPlan_DuplicateSubmission_LabeledOutputAndLeadText(t *testing.T) {
+	// Same #986 labeling on the reject tool: the prior decision named
+	// in the banner is the EXISTING row's (approve), not this call's.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	fb.approvalsRespBody = fmt.Sprintf(
+		`{"id":%q,"run_id":%q,"type":"plan","state":"succeeded","duplicate_submission":true,"prior_decision":"approve","prior_submitted_at":"2026-06-10T12:00:00Z"}`,
+		stageID.String(), runID.String())
+
+	res, out, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
+		RunID:  runID.String(),
+		Reason: "changed my mind",
+	})
+	if err != nil {
+		t.Fatalf("rejectPlan: %v", err)
+	}
+	if !out.DuplicateSubmission || out.PriorDecision != "approve" {
+		t.Errorf("duplicate labeling = (%v, %q), want (true, approve)", out.DuplicateSubmission, out.PriorDecision)
+	}
+	if res == nil || len(res.Content) == 0 {
+		t.Fatal("expected a tool result carrying the duplicate banner; got nil/empty")
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("Content[0] = %T, want *mcp.TextContent", res.Content[0])
+	}
+	if !strings.HasPrefix(text.Text, "duplicate submission — your prior approve decision") {
+		t.Errorf("result text must lead with the duplicate banner, got %q", text.Text)
+	}
+}
+
+func TestApprovePlan_NonDuplicate_NoBannerNoFlags(t *testing.T) {
+	// The non-duplicate path is unchanged: a bare Stage 200 (no #986
+	// keys) decodes to zero-valued duplicate fields and, with gh
+	// resolving cleanly, a nil tool result.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	res, out, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if out.DuplicateSubmission || out.PriorDecision != "" {
+		t.Errorf("duplicate labeling = (%v, %q), want zero values on a first submission", out.DuplicateSubmission, out.PriorDecision)
+	}
+	if res != nil {
+		t.Errorf("tool result = %+v, want nil (no banner, no warning)", res)
 	}
 }
 

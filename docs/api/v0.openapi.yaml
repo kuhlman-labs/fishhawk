@@ -2565,10 +2565,45 @@ paths:
                     Honored only on `approve`; ignored on `reject`.
       responses:
         '200':
-          description: Approval recorded; stage state advanced.
+          description: |
+            Two distinct outcomes share this status (#986):
+
+            - **Approval recorded; stage state advanced.** The body is
+              the bare `Stage` shape; the three duplicate fields are
+              omitted.
+            - **Duplicate submission** — the same authenticated subject
+              already submitted a decision for this stage. The prior
+              decision stands, the stage state is unchanged, NO gates
+              (budget/scope-cap/review-settled) re-run, and no audit
+              entries are emitted. The body carries
+              `duplicate_submission: true` plus `prior_decision` and
+              `prior_submitted_at` from the EXISTING approval row
+              (authentic provenance, not echoes of the new request).
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Stage' }
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Stage'
+                  - type: object
+                    properties:
+                      duplicate_submission:
+                        type: boolean
+                        description: |
+                          Present (true) only when this submission was a
+                          no-op duplicate of an existing decision by the
+                          same subject. Omitted on a first submission.
+                      prior_decision:
+                        type: string
+                        enum: [approve, reject]
+                        description: |
+                          The existing approval row's decision. Only
+                          present alongside `duplicate_submission`.
+                      prior_submitted_at:
+                        type: string
+                        format: date-time
+                        description: |
+                          When the existing approval row was submitted.
+                          Only present alongside `duplicate_submission`.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -2625,7 +2660,10 @@ paths:
               `details` includes `predicted_minutes`, `budget_minutes`,
               and `timeout_source` (`stage_executor_timeout`,
               `workflow_policy_max_stage_runtime`, or
-              `backend_default`). To unblock: either re-plan with a
+              `backend_default`). Refused BEFORE any approval row is
+              recorded (#986), so the same subject's retry with the
+              override flows normally rather than dead-ending as an
+              idempotent duplicate. To unblock: either re-plan with a
               decomposition block, or re-submit the approval with
               `--override-budget` in the comment.
             - `plan_violates_scope_cap` — #983: the effective scope —

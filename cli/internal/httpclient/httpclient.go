@@ -284,19 +284,37 @@ type SubmitApprovalInput struct {
 	Comment  string           `json:"comment,omitempty"`
 }
 
+// ApprovalResult is the decoded 200 body of POST /v0/stages/{id}/
+// approvals (#986). On a first submission the duplicate fields are
+// absent (zero values) and Stage reflects the post-transition state.
+// On a duplicate — the same subject already decided this stage —
+// DuplicateSubmission is true, the prior decision stands, the stage
+// state is unchanged, and the backend ran no gates and emitted no
+// audit entries; PriorDecision/PriorSubmittedAt carry the EXISTING
+// approval row's provenance.
+// omitempty so `--output json` re-encodes a first submission without
+// the keys, matching the wire's additive-only contract.
+type ApprovalResult struct {
+	Stage
+	DuplicateSubmission bool   `json:"duplicate_submission,omitempty"`
+	PriorDecision       string `json:"prior_decision,omitempty"`
+	PriorSubmittedAt    string `json:"prior_submitted_at,omitempty"`
+}
+
 // SubmitApproval calls POST /v0/stages/{stage_id}/approvals.
 // The response is the updated Stage with state transitioned to
-// succeeded (approve) or failed (reject).
-func (c *Client) SubmitApproval(ctx context.Context, stageID uuid.UUID, in SubmitApprovalInput) (*Stage, error) {
+// succeeded (approve) or failed (reject), plus the #986 duplicate
+// labeling when the submission was a no-op re-submission.
+func (c *Client) SubmitApproval(ctx context.Context, stageID uuid.UUID, in SubmitApprovalInput) (*ApprovalResult, error) {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
-	var stage Stage
-	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/approvals", body, &stage); err != nil {
+	var res ApprovalResult
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/approvals", body, &res); err != nil {
 		return nil, err
 	}
-	return &stage, nil
+	return &res, nil
 }
 
 // AuditEntry is the CLI-side projection of the OpenAPI AuditEntry
