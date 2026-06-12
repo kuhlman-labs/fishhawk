@@ -26,6 +26,10 @@ workflows:
     description: >-
       Default workflow for feature work and non-trivial changes.
       Human approves plan and PR; agent does the implementation.
+    # Drive mode (#1023): fishhawkd auto-advances mechanical transitions
+    # (review settlement, fixup re-park, derived awaiting_merge) and
+    # surfaces next_action; judgment points still park for the human.
+    drive: true
     policy:
       max_stage_runtime: "30m"
     # Periodic cost ceiling (ADR-030 / #688). Advisory — emits a
