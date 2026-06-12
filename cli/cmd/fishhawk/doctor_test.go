@@ -480,6 +480,77 @@ func TestCheckBackendSHADrift_Unreachable(t *testing.T) {
 	}
 }
 
+// initGitRepoWithHead creates a git repo with one commit and returns its
+// path plus the full HEAD SHA, for drift tests that need a real
+// `git rev-parse HEAD` on the local side of the comparison.
+func initGitRepoWithHead(t *testing.T) (dir, headSHA string) {
+	t.Helper()
+	dir = t.TempDir()
+	git := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test",
+			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+		)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init")
+	git("commit", "--allow-empty", "-m", "init")
+	return dir, git("rev-parse", "HEAD")
+}
+
+// TestCheckBackendSHADrift_StampedShortSHA returns ok when the backend
+// reports the stamped short SHA of the same commit as the local full HEAD —
+// the scripts/dev clean-tree case. Exact equality would false-warn here.
+func TestCheckBackendSHADrift_StampedShortSHA(t *testing.T) {
+	dir, head := initGitRepoWithHead(t)
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK,
+			fmt.Sprintf(`{"status":"ok","git_sha":%q}`, head[:7])), nil
+	})
+	r := checkBackendSHADrift("http://localhost:8080", dir)
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok (short SHA prefix of local HEAD); detail: %s", r.status, r.detail)
+	}
+}
+
+// TestCheckBackendSHADrift_StampedDirtySHA returns ok and notes the dirty
+// tree when the backend reports the same commit with a -dirty suffix.
+func TestCheckBackendSHADrift_StampedDirtySHA(t *testing.T) {
+	dir, head := initGitRepoWithHead(t)
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK,
+			fmt.Sprintf(`{"status":"ok","git_sha":%q}`, head[:7]+"-dirty")), nil
+	})
+	r := checkBackendSHADrift("http://localhost:8080", dir)
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok (dirty-stamped same commit); detail: %s", r.status, r.detail)
+	}
+	if !strings.Contains(r.detail, "dirty tree at build") {
+		t.Errorf("detail = %q, want a 'dirty tree at build' note", r.detail)
+	}
+}
+
+// TestCheckBackendSHADrift_DifferentCommit still warns when the backend's
+// stamped SHA is from a genuinely different commit.
+func TestCheckBackendSHADrift_DifferentCommit(t *testing.T) {
+	dir, _ := initGitRepoWithHead(t)
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK,
+			`{"status":"ok","git_sha":"0000000-dirty"}`), nil
+	})
+	r := checkBackendSHADrift("http://localhost:8080", dir)
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn (different commit); detail: %s", r.status, r.detail)
+	}
+}
+
 // TestCheckRunnerSchemaDrift_RunnerNotFound returns warn when the runner
 // binary is not found (runner binary resolution fails).
 func TestCheckRunnerSchemaDrift_RunnerNotFound(t *testing.T) {

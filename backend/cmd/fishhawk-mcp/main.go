@@ -44,6 +44,8 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
 const (
@@ -71,6 +73,19 @@ const (
 	serverName    = "fishhawk-mcp"
 	serverVersion = "v0.1.0"
 )
+
+// handshakeVersion returns the version string advertised on the MCP
+// handshake: the manually-bumped serverVersion base, suffixed with the
+// build's git SHA when one was stamped (e.g. "v0.1.0+abc1234-dirty") so
+// an operator can tell which commit the connected server was built from.
+// serverInfo.version is informational in the MCP handshake — clients do
+// not parse or gate on it.
+func handshakeVersion(sha string) string {
+	if sha == "unknown" || sha == "" {
+		return serverVersion
+	}
+	return serverVersion + "+" + sha
+}
 
 func main() {
 	os.Exit(run(context.Background(), os.Args, os.Stderr))
@@ -189,6 +204,6 @@ func loadConfig(getenv func(string) string) (config, error) {
 func buildServer(_ config) *mcp.Server {
 	return mcp.NewServer(&mcp.Implementation{
 		Name:    serverName,
-		Version: serverVersion,
+		Version: handshakeVersion(version.GitSHA),
 	}, nil)
 }

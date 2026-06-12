@@ -15,3 +15,13 @@ package version
 // Version is the fishhawk-runner build version. Set at link time
 // for releases.
 var Version = "dev"
+
+// GitSHA is the git commit SHA the binary was built from. Overridden via:
+//
+//	go build -ldflags="-X github.com/kuhlman-labs/fishhawk/runner/internal/version.GitSHA=abc1234" \
+//	  ./cmd/fishhawk-runner
+//
+// scripts/dev stamps the short HEAD SHA (with a "-dirty" suffix on a dirty
+// tree) into dev builds; "unknown" means the binary was built outside
+// scripts/dev / without stamping.
+var GitSHA = "unknown"

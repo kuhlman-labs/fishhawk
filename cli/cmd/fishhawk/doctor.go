@@ -372,6 +372,11 @@ func checkGhCLI() checkResult {
 // checkBackendSHADrift compares the running backend's git_sha (from /healthz)
 // against the local HEAD commit. A mismatch warns the operator that they may
 // be running a backend built from a different commit.
+//
+// The comparison is prefix-wise after stripping a "-dirty" suffix: scripts/dev
+// stamps `git rev-parse --short HEAD` (plus "-dirty" on a dirty tree) into dev
+// builds, while the local side is the full HEAD SHA — exact equality would
+// false-warn on every stamped dev build.
 func checkBackendSHADrift(backendURL, workingDir string) checkResult {
 	label := "backend SHA drift"
 	req, err := http.NewRequest(http.MethodGet, backendURL+"/healthz", nil)
@@ -404,8 +409,14 @@ func checkBackendSHADrift(backendURL, workingDir string) checkResult {
 			remediate: "ensure --working-dir is inside a git repository"}
 	}
 	localSHA := strings.TrimSpace(string(out))
-	if localSHA == backendSHA {
-		return checkResult{label: label, detail: "in sync (" + shortSHA(backendSHA) + ")", status: "ok"}
+	normalizedBackend := strings.TrimSuffix(backendSHA, "-dirty")
+	builtDirty := normalizedBackend != backendSHA
+	if strings.HasPrefix(localSHA, normalizedBackend) || strings.HasPrefix(normalizedBackend, localSHA) {
+		detail := "in sync (" + shortSHA(normalizedBackend) + ")"
+		if builtDirty {
+			detail = "in sync (" + shortSHA(normalizedBackend) + ", dirty tree at build)"
+		}
+		return checkResult{label: label, detail: detail, status: "ok"}
 	}
 	return checkResult{
 		label:     label,

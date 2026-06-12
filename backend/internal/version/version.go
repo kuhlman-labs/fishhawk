@@ -9,8 +9,10 @@ package version
 // Version is the fishhawkd build version. Set at link time for releases.
 var Version = "dev"
 
-// GitSHA is the git commit SHA the binary was built from. Set at link time
-// for releases; "unknown" in development builds.
+// GitSHA is the git commit SHA the binary was built from. Set at link time:
+// releases stamp it via -ldflags, and scripts/dev stamps the short HEAD SHA
+// (with a "-dirty" suffix on a dirty tree) into dev builds. "unknown" means
+// the binary was built outside scripts/dev / without stamping.
 var GitSHA = "unknown"
 
 // MinRunnerVersion is the minimum fishhawk-runner version required to

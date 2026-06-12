@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
+	"github.com/kuhlman-labs/fishhawk/cli/internal/version"
 )
 
 func TestRun_Help(t *testing.T) {
@@ -40,6 +41,27 @@ func TestRun_Version(t *testing.T) {
 	}
 	if strings.TrimSpace(stdout.String()) == "" {
 		t.Error("version output empty")
+	}
+	// Unstamped builds (GitSHA "unknown") must print the bare version
+	// with no SHA parenthetical.
+	if strings.Contains(stdout.String(), "(") {
+		t.Errorf("unstamped build should print bare version, got %q", stdout.String())
+	}
+}
+
+func TestRun_Version_StampedSHA(t *testing.T) {
+	origSHA := version.GitSHA
+	version.GitSHA = "abc1234-dirty"
+	t.Cleanup(func() { version.GitSHA = origSHA })
+
+	var stdout strings.Builder
+	got := run([]string{"version"}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Errorf("status = %d, want exitOK", got)
+	}
+	want := version.Version + " (abc1234-dirty)"
+	if strings.TrimSpace(stdout.String()) != want {
+		t.Errorf("version output = %q, want %q", strings.TrimSpace(stdout.String()), want)
 	}
 }
 

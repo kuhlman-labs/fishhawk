@@ -112,6 +112,72 @@ else
   pass "_diff_touches_mcp stays quiet for runner-only delta"
 fi
 
+# 4b. _sha_with_dirty: pure dirty-suffix helper (#1007). Empty porcelain text
+# means a clean tree -> bare sha; any output means dirty -> '-dirty' suffix.
+out="$(_sha_with_dirty abc1234 "")"
+if [[ "$out" == "abc1234" ]]; then
+  pass "_sha_with_dirty leaves a clean-tree sha bare"
+else
+  fail "_sha_with_dirty should leave a clean-tree sha bare (got: $out)"
+fi
+out="$(_sha_with_dirty abc1234 " M scripts/dev")"
+if [[ "$out" == "abc1234-dirty" ]]; then
+  pass "_sha_with_dirty appends -dirty for non-empty porcelain"
+else
+  fail "_sha_with_dirty should append -dirty (got: $out)"
+fi
+
+# 4c. _build_ldflags: each binary stamps GitSHA into the right version package,
+# AND that package actually declares `var GitSHA` — load-bearing: -ldflags -X
+# on a package path without the var is a SILENT no-op, not a build error, so a
+# package move/rename must fail here instead of shipping unstamped binaries.
+typeset -A gitsha_pkg
+gitsha_pkg=(
+  fishhawkd        backend/internal/version
+  fishhawk-mcp     backend/internal/version
+  fishhawk-runner  runner/internal/version
+  fishhawk         cli/internal/version
+)
+for bin in fishhawkd fishhawk-mcp fishhawk-runner fishhawk; do
+  rel="${gitsha_pkg[$bin]}"
+  out="$(_build_ldflags "$bin" abc1234)"
+  if [[ "$out" == "-X github.com/kuhlman-labs/fishhawk/${rel}.GitSHA=abc1234" ]]; then
+    pass "_build_ldflags ${bin} -> ${rel}.GitSHA"
+  else
+    fail "_build_ldflags ${bin} should stamp ${rel}.GitSHA (got: $out)"
+  fi
+  if grep -q '^var GitSHA' "${REPO_ROOT}/${rel}/version.go"; then
+    pass "${rel}/version.go declares var GitSHA (-X target exists)"
+  else
+    fail "${rel}/version.go should declare var GitSHA — the ${bin} -X stamp is a silent no-op without it"
+  fi
+done
+if _build_ldflags no-such-binary abc1234 >/dev/null; then
+  fail "_build_ldflags should return non-zero for an unknown binary name"
+else
+  pass "_build_ldflags rejects an unknown binary name"
+fi
+
+# 4d. Wiring body-greps: _build_binary must stamp via _build_ldflags, and the
+# k8s image build must pass the sha through the GIT_SHA build arg.
+bb_body="$(typeset -f _build_binary)"
+if print -r -- "$bb_body" | grep -q '_build_ldflags'; then
+  pass "_build_binary applies _build_ldflags to go build"
+else
+  fail "_build_binary should pass _build_ldflags output to go build"
+fi
+if print -r -- "$bb_body" | grep -q '_dev_git_sha'; then
+  pass "_build_binary derives the sha via _dev_git_sha"
+else
+  fail "_build_binary should call _dev_git_sha"
+fi
+k8s_body="$(typeset -f cmd_k8s_up)"
+if print -r -- "$k8s_body" | grep -q -- '--build-arg GIT_SHA'; then
+  pass "cmd_k8s_up passes --build-arg GIT_SHA to docker build"
+else
+  fail "cmd_k8s_up should pass --build-arg GIT_SHA"
+fi
+
 # 5. _decide_mcp_signal: all three branches plus the reflog-unavailable fallback.
 # Args: <mcp_rebuilt> <force_all> <reflog_ok> <merge_diff_text>
 if [[ "$(_decide_mcp_signal 0 1 1 'backend/cmd/fishhawk-mcp/main.go')" == 0 ]]; then

@@ -137,6 +137,25 @@ func TestBuildServer_HandshakeReady(t *testing.T) {
 	}
 }
 
+func TestHandshakeVersion(t *testing.T) {
+	// Unstamped builds (GitSHA "unknown") advertise the bare base so the
+	// handshake string is unchanged from pre-stamping behavior; stamped
+	// builds append "+<sha>" including any -dirty suffix.
+	for _, tc := range []struct {
+		sha  string
+		want string
+	}{
+		{"unknown", serverVersion},
+		{"", serverVersion},
+		{"abc1234", serverVersion + "+abc1234"},
+		{"abc1234-dirty", serverVersion + "+abc1234-dirty"},
+	} {
+		if got := handshakeVersion(tc.sha); got != tc.want {
+			t.Errorf("handshakeVersion(%q) = %q, want %q", tc.sha, got, tc.want)
+		}
+	}
+}
+
 // envFunc returns a func(string) string backed by a literal map. We
 // don't use os.Setenv in tests because env state would leak across
 // parallel runs; loadConfig takes the getter as a parameter for
