@@ -857,6 +857,14 @@ type GetRunStatusOutput struct {
 	// operator sees which transitions advanced themselves and what
 	// the run waits on them for. Omitted for non-drive runs.
 	DriveStatus *DriveStatus `json:"drive_status,omitempty" jsonschema:"drive-mode read view (#1023): which transitions auto-advanced (auto_advanced, oldest first), the distilled operator next step (next_action), and the derived awaiting_merge presentation status when every gate is resolved and required checks are green. Omitted entirely for non-drive runs"`
+	// NextActions is the server-suggested next-action block (#1024): the
+	// classified run lifecycle state plus at least one legal next action
+	// for every non-terminal run, generalizing review_action_hint across
+	// the whole lifecycle. Computed entirely from the data fetched above
+	// (pure function — never fails the snapshot). Display-only, never
+	// gates the run. For drive-enabled runs the drive next_action is
+	// folded in as the first entry so the two surfaces agree.
+	NextActions *NextActions `json:"next_actions,omitempty" jsonschema:"server-suggested next actions (#1024): the classified run lifecycle state plus the legal next moves — each entry names the tool to call (with key params), its precondition, what it consumes (none, fixup_budget, retry_budget, approval_slot, new_run), and a one-line reason. Every non-terminal run carries at least one action; terminal runs carry the state with no actions. Display-only — never gates the run"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -940,6 +948,18 @@ distilled operator next step from the most recent auto-advance, and
 derived_status is "awaiting_merge" when every gate is resolved and the
 required PR checks are green — presentation-only, the run row's state
 stays running. Omitted entirely for non-drive runs.
+
+Also returns next_actions (#1024): the classified run lifecycle state
+plus at least one LEGAL next action for every non-terminal run — each
+entry names the tool to call (with key params), its precondition, what
+it consumes (none | fixup_budget | retry_budget | approval_slot |
+new_run), and a one-line reason. It generalizes review_action_hint
+across the lifecycle (plan dispatch/review/gate, implement failures by
+category, review pending, open concerns, the merge ritual, the
+#968-class wedge) and embeds the same hint computation for the
+concern state, so the two surfaces cannot disagree. On drive-enabled
+runs the drive next_action folds in as the first entry. Display-only —
+never gates the run.
 `),
 	}, resolver.getRunStatus)
 }
@@ -1011,6 +1031,11 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	planStageWaitStatus := stageWaitStatusFor(stages, "plan", runRow.State)
 	implementStageWaitStatus := stageWaitStatusFor(stages, "implement", runRow.State)
 
+	// Server-suggested next actions (#1024): a pure function over the
+	// run/stage/review/hint/drive data fetched above — no extra
+	// round-trip, never fails the snapshot.
+	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus())
+
 	return nil, GetRunStatusOutput{
 		Run:                      *runRow,
 		Stages:                   stages,
@@ -1024,6 +1049,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		ReviewActionHint:         reviewActionHint,
 		ImplementReviewMergeHint: implementReviewMergeHint(implementReviewStatus),
 		DriveStatus:              view.driveStatus(),
+		NextActions:              nextActions,
 	}, nil
 }
 

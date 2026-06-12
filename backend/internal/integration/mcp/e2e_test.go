@@ -504,3 +504,126 @@ func TestE2E_MCPLoop_OperatorWritePath_StartRun(t *testing.T) {
 		t.Errorf("DB row WorkflowSHA = %q, want deadbeef-mcp-e2e", got.WorkflowSHA)
 	}
 }
+
+// nextActionsView mirrors the MCP server's NextActions output shape so
+// the integration tests can decode it off the get_run_status response.
+type nextActionsView struct {
+	State   string `json:"state"`
+	Actions []struct {
+		Action       string            `json:"action"`
+		Params       map[string]string `json:"params"`
+		Precondition string            `json:"precondition"`
+		Consumes     string            `json:"consumes"`
+		Reason       string            `json:"reason"`
+	} `json:"actions"`
+}
+
+// getNextActions calls fishhawk_get_run_status and returns the decoded
+// next_actions block (nil when absent).
+func getNextActions(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) *nextActionsView {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_run_status",
+		Arguments: map[string]any{"run_id": runID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_get_run_status: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("get_run_status tool returned error: %s", toolContentString(t, result))
+	}
+	var out struct {
+		NextActions *nextActionsView `json:"next_actions"`
+	}
+	decodeStructured(t, result, &out)
+	return out.NextActions
+}
+
+// TestE2E_NextActions_PlanGateParkedAndMergeRitual asserts the #1024
+// next_actions block end-to-end (real MCP binary → real backend HTTP →
+// real Postgres) at two parked points of the driven lifecycle:
+//
+//   - plan stage parked at its approval gate → the block classifies
+//     plan_gate_parked and offers fishhawk_approve_plan (consuming an
+//     approval slot);
+//   - run succeeded with its PR open → the block classifies
+//     succeeded_pr_open and leads with the ordered merge ritual
+//     (approve_pr → merge_pr → post_merge).
+//
+// Per-layer units cover the classifier table; this drives the audit/API
+// → classifier seam against the real backend reads (#618 rule).
+func TestE2E_NextActions_PlanGateParkedAndMergeRitual(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// 1. Plan stage parked at the approval gate (no review configured, so
+	// the review status reads none — the approve/reject arm, not the
+	// await-verdicts arm).
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+
+	na := getNextActions(t, ctx, session, fx.runID)
+	if na == nil {
+		t.Fatal("next_actions absent at the parked plan gate; want plan_gate_parked")
+	}
+	if na.State != "plan_gate_parked" {
+		t.Errorf("next_actions.state = %q, want plan_gate_parked", na.State)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatal("next_actions.actions empty at a non-terminal state — the structural invariant is broken")
+	}
+	approve := na.Actions[0]
+	if approve.Action != "fishhawk_approve_plan" {
+		t.Errorf("actions[0] = %q, want fishhawk_approve_plan", approve.Action)
+	}
+	if approve.Consumes != "approval_slot" {
+		t.Errorf("approve consumes = %q, want approval_slot", approve.Consumes)
+	}
+	if approve.Params["run_id"] != fx.runID.String() {
+		t.Errorf("approve params.run_id = %q, want %s", approve.Params["run_id"], fx.runID)
+	}
+
+	// 2. Drive the run to succeeded with its PR stamped — the merge-ritual
+	// parked point.
+	if _, err := fx.runRepo.SetRunPullRequestURL(ctx, fx.runID, "https://github.com/kuhlman-labs/fishhawk/pull/4242"); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+	for _, to := range []runpkg.State{runpkg.StateRunning, runpkg.StateSucceeded} {
+		if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, to); err != nil {
+			t.Fatalf("TransitionRun → %s: %v", to, err)
+		}
+	}
+
+	na = getNextActions(t, ctx, session, fx.runID)
+	if na == nil {
+		t.Fatal("next_actions absent on the succeeded+PR-open run; want the merge ritual")
+	}
+	if na.State != "succeeded_pr_open" {
+		t.Errorf("next_actions.state = %q, want succeeded_pr_open", na.State)
+	}
+	wantRitual := []string{"approve_pr", "merge_pr", "post_merge"}
+	if len(na.Actions) != len(wantRitual) {
+		t.Fatalf("merge ritual actions = %+v, want %v in order", na.Actions, wantRitual)
+	}
+	for i, want := range wantRitual {
+		if na.Actions[i].Action != want {
+			t.Errorf("actions[%d] = %q, want %q (the ritual is ordered)", i, na.Actions[i].Action, want)
+		}
+	}
+	if na.Actions[0].Params["pr_url"] != "https://github.com/kuhlman-labs/fishhawk/pull/4242" {
+		t.Errorf("approve_pr params.pr_url = %q, want the stamped PR", na.Actions[0].Params["pr_url"])
+	}
+}

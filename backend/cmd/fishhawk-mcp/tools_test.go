@@ -2330,6 +2330,67 @@ func TestGetRunStatus_DriveStatus_PropagatesEndToEnd(t *testing.T) {
 	if out.Run.ID != runID.String() {
 		t.Errorf("Run.ID = %s, want %s", out.Run.ID, runID)
 	}
+	// #1024: the drive next_action folds into next_actions as the FIRST
+	// entry, so the two surfaces never point different ways.
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatalf("NextActions = %+v, want the drive action folded in", out.NextActions)
+	}
+	if out.NextActions.Actions[0].Action != "merge_pr" {
+		t.Errorf("next_actions.actions[0] = %q, want the drive merge_pr first", out.NextActions.Actions[0].Action)
+	}
+}
+
+// TestGetRunStatus_NextActions_PlanGateParked is the get_run_status half
+// of the #1024 wiring: the snapshot carries the next_actions block
+// computed from the same run/stage/review reads, here at the parked plan
+// gate (no review entries → review status none → approve/reject offered).
+func TestGetRunStatus_NextActions_PlanGateParked(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "awaiting_approval"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "pending"},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.NextActions == nil {
+		t.Fatal("NextActions is nil; want the #1024 block on every run")
+	}
+	if out.NextActions.State != "plan_gate_parked" {
+		t.Errorf("next_actions.state = %q, want plan_gate_parked", out.NextActions.State)
+	}
+	names := make([]string, 0, len(out.NextActions.Actions))
+	for _, a := range out.NextActions.Actions {
+		names = append(names, a.Action)
+	}
+	if len(names) != 2 || names[0] != "fishhawk_approve_plan" || names[1] != "fishhawk_reject_plan" {
+		t.Errorf("next_actions.actions = %v, want [fishhawk_approve_plan fishhawk_reject_plan]", names)
+	}
+}
+
+// TestGetRunStatus_NextActions_TerminalRunNamesState pins the terminal
+// shape: the block is still present naming the state, with no actions.
+func TestGetRunStatus_NextActions_TerminalRunNamesState(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "cancelled"}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.NextActions == nil || out.NextActions.State != "cancelled" {
+		t.Fatalf("NextActions = %+v, want a block naming the terminal state cancelled", out.NextActions)
+	}
+	if len(out.NextActions.Actions) != 0 {
+		t.Errorf("terminal run carries actions %+v, want none", out.NextActions.Actions)
+	}
 }
 
 // TestGetRunStatus_NonDriveRun_OmitsDriveStatus is the control: a run

@@ -308,3 +308,56 @@ func TestImplementReviewMergeHint(t *testing.T) {
 		})
 	}
 }
+
+// TestReviewActionHint_SuggestedActions pins the hint → next_actions
+// translation (#1024): the concern-arm entries derive FROM the computed
+// hint value, so each budget branch maps to a fixed action set and the
+// two surfaces cannot disagree on the remaining budget.
+func TestReviewActionHint_SuggestedActions(t *testing.T) {
+	run := &Run{ID: uuid.NewString(), State: "running"}
+	stageID := uuid.NewString()
+
+	t.Run("below budget -> fixup first, consuming fixup_budget", func(t *testing.T) {
+		h := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
+		actions := h.suggestedActions(run, stageID)
+		if len(actions) != 2 || actions[0].Action != "fishhawk_fixup_stage" || actions[1].Action != "merge_and_file_follow_up" {
+			t.Fatalf("actions = %+v, want [fishhawk_fixup_stage merge_and_file_follow_up]", actions)
+		}
+		if actions[0].Consumes != consumesFixupBudget {
+			t.Errorf("fixup consumes = %q, want fixup_budget", actions[0].Consumes)
+		}
+		if actions[0].Params["stage_id"] != stageID {
+			t.Errorf("fixup params.stage_id = %q, want %s", actions[0].Params["stage_id"], stageID)
+		}
+		// The remaining-budget number rides on the reason — the figure the
+		// integration test cross-checks against the hint itself.
+		if !strings.Contains(actions[0].Reason, "1 normal fix-up pass") {
+			t.Errorf("fixup reason should carry the remaining budget; got %q", actions[0].Reason)
+		}
+		if _, forced := actions[0].Params["force_additional_pass"]; forced {
+			t.Error("below-budget fixup action must not carry force_additional_pass")
+		}
+	})
+
+	t.Run("budget spent, override available -> forced fixup offered", func(t *testing.T) {
+		h := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 0, OverrideAvailable: true}
+		actions := h.suggestedActions(run, stageID)
+		if len(actions) != 2 || actions[0].Action != "merge_and_file_follow_up" || actions[1].Action != "fishhawk_fixup_stage" {
+			t.Fatalf("actions = %+v, want [merge_and_file_follow_up fishhawk_fixup_stage]", actions)
+		}
+		if actions[1].Params["force_additional_pass"] != "true" {
+			t.Errorf("override fixup params = %v, want force_additional_pass=true", actions[1].Params)
+		}
+	})
+
+	t.Run("ceiling reached -> merge-with-follow-up or fresh run", func(t *testing.T) {
+		h := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 0, OverrideAvailable: false}
+		actions := h.suggestedActions(run, stageID)
+		if len(actions) != 2 || actions[0].Action != "merge_and_file_follow_up" || actions[1].Action != "fishhawk_start_run" {
+			t.Fatalf("actions = %+v, want [merge_and_file_follow_up fishhawk_start_run]", actions)
+		}
+		if actions[1].Consumes != consumesNewRun {
+			t.Errorf("fresh-run consumes = %q, want new_run", actions[1].Consumes)
+		}
+	})
+}
