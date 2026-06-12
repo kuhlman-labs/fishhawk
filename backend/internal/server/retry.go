@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -41,6 +42,13 @@ const CategoryStageOverrideRetried = "stage_override_retried"
 type retryRequest struct {
 	Override bool   `json:"override"`
 	Reason   string `json:"reason"`
+	// Delegated opts the retry into the ADR-040 delegated-action path
+	// (#1026): checkDelegation re-evaluates the operator_agent may_retry
+	// condition (infra_flake) server-side at action time — 403
+	// delegation_not_configured / delegation_condition_unmet on refusal,
+	// `delegated: "<rule>"` on the retry audit payload when met. Absent
+	// → behavior byte-identical to today.
+	Delegated bool `json:"delegated"`
 }
 
 // handleRetryStage implements POST /v0/stages/{stage_id}/retry.
@@ -169,6 +177,20 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Delegated-action enforcement (ADR-040 / #1026): a delegated:true
+	// retry must hold the may_retry condition (infra_flake) against
+	// CURRENT run state, re-evaluated server-side before any state
+	// change. The condition requires a category-A infra-flake failure,
+	// so a delegated category-B override can never pass it.
+	var delegatedRule string
+	if reqBody.Delegated {
+		rule, ok := s.checkDelegation(w, r, stage.RunID, delegation.ActionRetry)
+		if !ok {
+			return
+		}
+		delegatedRule = rule
+	}
+
 	dec, err := run.RetryStage(r.Context(), s.cfg.RunRepo, stageID, run.RetryOptions{OverrideB: reqBody.Override})
 	if err != nil {
 		switch {
@@ -213,7 +235,7 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	if dec.Overridden {
 		s.writeOverrideRetryAudit(r, dec, reqBody.Reason)
 	} else {
-		s.writeRetryAudit(r, dec, runRow)
+		s.writeRetryAudit(r, dec, runRow, delegatedRule)
 	}
 
 	// Un-terminal the run (failed → running) before the orchestrator
@@ -279,9 +301,11 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 
 // writeRetryAudit appends a stage_retried entry capturing the
 // prior failure category + reason, the retry receipt fields, and
-// the actor that triggered the retry. Best-effort — the transition
+// the actor that triggered the retry. When delegatedRule is non-empty
+// the retry landed via the ADR-040 delegated path (#1026) and the
+// payload records `delegated: "<rule>"`. Best-effort — the transition
 // is already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow *run.Run) {
+func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow *run.Run, delegatedRule string) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -309,6 +333,9 @@ func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow
 			remaining = 0
 		}
 		fields["remaining_budget"] = remaining
+	}
+	if delegatedRule != "" {
+		fields["delegated"] = delegatedRule
 	}
 
 	payload, _ := json.Marshal(fields)

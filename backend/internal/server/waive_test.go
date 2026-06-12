@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // waiveServer wires the audit + concern fakes the waive handler needs
@@ -348,5 +349,120 @@ func TestWaiveConcern_NilConcernRepoReturns503(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "concern_store_unconfigured") {
 		t.Errorf("body missing concern_store_unconfigured: %s", w.Body.String())
+	}
+}
+
+// --- Delegated waive (ADR-040 / #1026) --------------------------------------
+
+// delegatedWaiveServer adds the RunRepo the delegation evaluator
+// needs on top of the waive handler's own audit + concern stores.
+func delegatedWaiveServer(t *testing.T) (*Server, *approvalRunRepo, *auditFake, *fakeConcernRepo) {
+	t.Helper()
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     repo,
+		AuditRepo:   au,
+		ConcernRepo: cr,
+	})
+	return s, repo, au, cr
+}
+
+// seedLowConcernRow inserts one open low-severity concern row — the
+// solo_low shape (seedConcernRow hardcodes medium).
+func seedLowConcernRow(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID) *concern.Concern {
+	t.Helper()
+	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID:                runID,
+		StageID:              stageID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: 1,
+		Concerns:             []concern.RaisedConcern{{Severity: "low", Category: "style", Note: "nit"}},
+	})
+	if err != nil {
+		t.Fatalf("seed low concern: %v", err)
+	}
+	return rows[0]
+}
+
+// TestWaiveConcern_Delegated_SoloLowMet: with exactly one open concern
+// of low severity, the delegated waive proceeds and the concern_waived
+// payload records `delegated: "solo_low"`.
+func TestWaiveConcern_Delegated_SoloLowMet(t *testing.T) {
+	s, repo, au, cr := delegatedWaiveServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedLowConcernRow(t, cr, runID, stageID)
+	repo.seedRun(&run.Run{
+		ID:           runID,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(delegatedActionSpecYAML),
+	})
+
+	w := postWaive(t, s, row.ID.String(), waiveConcernRequest{Reason: "style nit, not blocking", Delegated: true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if row.State != concern.StateWaived {
+		t.Errorf("concern state = %q, want waived", row.State)
+	}
+	if rule := delegatedAuditRule(t, au, CategoryConcernWaived); rule != "solo_low" {
+		t.Errorf("audit delegated = %q, want solo_low", rule)
+	}
+}
+
+// TestWaiveConcern_Delegated_MediumUnmet: solo_low requires the single
+// open concern to be LOW severity — a delegated waive of a medium
+// concern is refused with the named predicate, appending no intent
+// entry and mutating nothing.
+func TestWaiveConcern_Delegated_MediumUnmet(t *testing.T) {
+	s, repo, au, cr := delegatedWaiveServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 1, "out-of-scope edit")
+	repo.seedRun(&run.Run{
+		ID:           runID,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(delegatedActionSpecYAML),
+	})
+
+	w := postWaive(t, s, row.ID.String(), waiveConcernRequest{Reason: "want it gone", Delegated: true})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	errBody := decodeErrorEnvelope(t, w)
+	reason, _ := errBody.Details["unmet_reason"].(string)
+	if errBody.Code != "delegation_condition_unmet" ||
+		!strings.Contains(reason, "severity is medium") {
+		t.Errorf("error = %+v, want delegation_condition_unmet naming the severity", errBody)
+	}
+	if row.State != concern.StateRaised {
+		t.Errorf("concern state = %q, want raised (no mutation on refusal)", row.State)
+	}
+	if idx := auditEntriesByCategory(au, CategoryConcernWaived); len(idx) != 0 {
+		t.Errorf("concern_waived entries = %d after refusal, want 0 (refusal precedes the intent append)", len(idx))
+	}
+}
+
+// TestWaiveConcern_Delegated_NotConfigured pins fail-closed: the plain
+// waive server has no RunRepo wired, so a delegated waive cannot
+// resolve any operator_agent block and refuses outright.
+func TestWaiveConcern_Delegated_NotConfigured(t *testing.T) {
+	s, _, cr := waiveServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedLowConcernRow(t, cr, runID, stageID)
+
+	w := postWaive(t, s, row.ID.String(), waiveConcernRequest{Reason: "nit", Delegated: true})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if errBody := decodeErrorEnvelope(t, w); errBody.Code != "delegation_not_configured" {
+		t.Errorf("code = %q, want delegation_not_configured", errBody.Code)
+	}
+	if row.State != concern.StateRaised {
+		t.Errorf("concern state = %q, want raised (no mutation on refusal)", row.State)
 	}
 }

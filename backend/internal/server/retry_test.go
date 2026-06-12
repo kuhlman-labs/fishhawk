@@ -688,3 +688,85 @@ func payloadKeys(m map[string]any) []string {
 	}
 	return keys
 }
+
+// --- Delegated retry (ADR-040 / #1026) --------------------------------------
+
+// delegatedRetryServer wires the auditFake + concern fake the
+// delegation evaluator reads (the plain retryServer's
+// approvalAuditFake and missing concern store would fail-close every
+// delegated request).
+func delegatedRetryServer(t *testing.T) (*Server, *approvalRunRepo, *auditFake) {
+	t.Helper()
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     repo,
+		AuditRepo:   au,
+		ConcernRepo: newFakeConcernRepo(),
+	})
+	return s, repo, au
+}
+
+// TestRetryStage_Delegated_InfraFlakeMet: a category-A failure whose
+// recorded reason carries the testcontainers infra-flake signature
+// satisfies may_retry's infra_flake condition — the delegated retry
+// proceeds and the stage_retried payload records the rule.
+func TestRetryStage_Delegated_InfraFlakeMet(t *testing.T) {
+	s, repo, au := delegatedRetryServer(t)
+	stage := seedFailedStage(repo, run.FailureA,
+		`verify command "scripts/test" still failing after 9 iteration(s):\n`+
+			`failed to start container: context deadline exceeded after 9 retries`)
+	seedDelegatedRun(repo, stage)
+
+	w := postRetryBody(t, s, stage.ID, `{"delegated":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if rule := delegatedAuditRule(t, au, CategoryStageRetried); rule != "infra_flake" {
+		t.Errorf("audit delegated = %q, want infra_flake", rule)
+	}
+}
+
+// TestRetryStage_Delegated_CategoryBUnmet: infra_flake requires a
+// category-A failure — a delegated retry of a category-B (policy)
+// failure is refused with the named predicate before any state change.
+func TestRetryStage_Delegated_CategoryBUnmet(t *testing.T) {
+	s, repo, au := delegatedRetryServer(t)
+	stage := seedFailedStage(repo, run.FailureB, "forbidden_paths violated")
+	seedDelegatedRun(repo, stage)
+
+	w := postRetryBody(t, s, stage.ID, `{"delegated":true}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	errBody := decodeErrorEnvelope(t, w)
+	reason, _ := errBody.Details["unmet_reason"].(string)
+	if errBody.Code != "delegation_condition_unmet" ||
+		!strings.Contains(reason, "failed stage category is B") {
+		t.Errorf("error = %+v, want delegation_condition_unmet naming the category", errBody)
+	}
+	if stage.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed (no state change on refusal)", stage.State)
+	}
+	if idx := auditEntriesByCategory(au, CategoryStageRetried); len(idx) != 0 {
+		t.Errorf("stage_retried entries = %d after refusal, want 0", len(idx))
+	}
+}
+
+// TestRetryStage_Delegated_NotConfigured pins fail-closed: a run whose
+// cached spec is absent refuses a delegated retry outright.
+func TestRetryStage_Delegated_NotConfigured(t *testing.T) {
+	s, repo, _ := delegatedRetryServer(t)
+	stage := seedFailedStage(repo, run.FailureA,
+		"failed to start container: context deadline exceeded")
+	repo.seedRun(&run.Run{ID: stage.RunID, State: run.StateRunning})
+
+	w := postRetryBody(t, s, stage.ID, `{"delegated":true}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if errBody := decodeErrorEnvelope(t, w); errBody.Code != "delegation_not_configured" {
+		t.Errorf("code = %q, want delegation_not_configured", errBody.Code)
+	}
+}

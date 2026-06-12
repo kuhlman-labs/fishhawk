@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -51,6 +52,17 @@ type approvalRequest struct {
 	// the #730 prose fold remains as a fallback. Declared here so the
 	// DisallowUnknownFields decode accepts it; callers omit it (omitempty).
 	AddScopeFiles []string `json:"add_scope_files,omitempty"`
+	// Delegated opts the submission into the ADR-040 delegated-action
+	// path (#1026): the operator agent asserts it acts under the
+	// workflow's operator_agent.may_approve knob. The server NEVER
+	// trusts that assertion — checkDelegation re-evaluates the named
+	// condition against current run state at action time, refusing with
+	// 403 delegation_not_configured (no effective block / knob,
+	// fail-closed) or delegation_condition_unmet (named failed
+	// predicate). When met, the approval's audit payload records
+	// `delegated: "<condition>"`. Requests without the field are
+	// byte-identical to today.
+	Delegated bool `json:"delegated,omitempty"`
 }
 
 // approvalSubmitResponse is the 200 body for POST /v0/stages/{stage_id}/
@@ -192,6 +204,28 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Delegated-action enforcement (ADR-040 / #1026): a delegated:true
+	// submission must hold the may_approve condition against CURRENT run
+	// state, re-evaluated server-side — never trusted from the client's
+	// read of GET /v0/runs/{id}'s advisory delegation block. Placed
+	// PRE-Submit like the plan gates so a refusal inserts no approval
+	// row. Delegation covers the approve verb only: a reject is the
+	// reviewer_reject judgment that always pages the human.
+	var delegatedRule string
+	if req.Delegated {
+		if decision != approval.DecisionApprove {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"delegated submissions support decision 'approve' only; rejection is a human judgment (reviewer_reject pages the human)",
+				map[string]any{"field": "delegated", "decision": req.Decision})
+			return
+		}
+		rule, ok := s.checkDelegation(w, r, stage.RunID, delegation.ActionApprove)
+		if !ok {
+			return
+		}
+		delegatedRule = rule
+	}
+
 	// ADR-036 (#875): refuse a plan-stage approve while a configured
 	// agent plan review is still in-flight. Placed BEFORE
 	// ApprovalRepo.Submit (not in the res.Inserted block) so a refused
@@ -272,7 +306,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles)
+	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles, delegatedRule)
 
 	// Hand off to the orchestrator on both approve AND reject
 	// — approve dispatches the next stage; reject walks the
@@ -564,7 +598,12 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // `approver` field is left as the token subject so the audit row keeps
 // the true acting identity — the resolved login never overwrites
 // provenance.
-func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string) {
+//
+// When delegatedRule is non-empty the approval landed via the ADR-040
+// delegated path (#1026) and the payload records `delegated: "<rule>"`
+// — the condition checkDelegation re-evaluated and found met. Token-
+// subject attribution for the operator agent is #1027's scope.
+func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, delegatedRule string) {
 	systemKind := audit.ActorKind("user")
 	auditPayload := map[string]any{
 		"stage_id": stage.ID.String(),
@@ -589,6 +628,9 @@ func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *appr
 	// the prompt builder reads this back via loadApprovalAddScopeFiles.
 	if app.Decision == approval.DecisionApprove && len(addScopeFiles) > 0 {
 		auditPayload["add_scope_files"] = addScopeFiles
+	}
+	if delegatedRule != "" {
+		auditPayload["delegated"] = delegatedRule
 	}
 	payload, _ := json.Marshal(auditPayload)
 
@@ -993,4 +1035,95 @@ func (s *Server) appendPlanReviewBackstopElapsed(ctx context.Context, stage *run
 		s.cfg.Logger.Error("audit append failed for plan_review_backstop_elapsed",
 			"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
 	}
+}
+
+// checkDelegation enforces the ADR-040 delegated-action path (#1026),
+// shared by the approval, fix-up, retry, and waive handlers. When a
+// request opts in with delegated:true, the named action must be
+// delegated by the run's effective operator_agent block AND its
+// condition must hold against CURRENT run state — re-evaluated here at
+// action time through the same backend/internal/delegation code that
+// computes GET /v0/runs/{id}'s advisory block, never trusted from a
+// client-supplied verdict.
+//
+// Fail-closed, unlike the human-path gates' fail-open posture: a spec
+// that resolves no effective operator_agent block, a block with no knob
+// for this action, a legacy run with no cached spec, or missing
+// repository wiring all refuse with 403 delegation_not_configured;
+// a configured knob whose condition is unmet refuses with 403
+// delegation_condition_unmet, details naming the exact failed
+// predicate. Repository read failures are 500 internal_error — still a
+// refusal, reported honestly. Returns the met condition name (the rule
+// the caller stamps into its audit payload as `delegated: "<rule>"`)
+// and true to proceed.
+func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID uuid.UUID, action string) (string, bool) {
+	if s.cfg.RunRepo == nil || s.cfg.ConcernRepo == nil || s.cfg.AuditRepo == nil {
+		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
+			"delegated actions require run, concern, and audit repositories; nothing is delegated on this deployment (fail-closed)",
+			map[string]any{"action": action})
+		return "", false
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get run for delegation check failed", map[string]any{"error": err.Error()})
+		return "", false
+	}
+	if len(runRow.WorkflowSpec) == 0 {
+		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
+			"the run carries no cached workflow spec, so no operator_agent block can govern it; nothing is delegated (fail-closed)",
+			map[string]any{"action": action, "run_id": runID.String()})
+		return "", false
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
+			"the run's cached workflow spec does not parse, so no operator_agent block can be resolved; nothing is delegated (fail-closed)",
+			map[string]any{"action": action, "error": err.Error()})
+		return "", false
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
+			"the run's workflow is not in its cached spec, so no operator_agent block can be resolved; nothing is delegated (fail-closed)",
+			map[string]any{"action": action, "workflow_id": runRow.WorkflowID})
+		return "", false
+	}
+	ev := &delegation.Evaluator{
+		Stages:   s.cfg.RunRepo,
+		Concerns: s.cfg.ConcernRepo,
+		Audit:    s.cfg.AuditRepo,
+	}
+	res, err := ev.Evaluate(r.Context(), runRow, &wf)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"delegation condition evaluation failed", map[string]any{"action": action, "error": err.Error()})
+		return "", false
+	}
+	if res == nil {
+		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
+			"the run's workflow declares no effective operator_agent block; nothing is delegated (fail-closed)",
+			map[string]any{"action": action})
+		return "", false
+	}
+	for _, d := range res.Actions {
+		if d.Action != action {
+			continue
+		}
+		if !d.Met {
+			s.writeError(w, r, http.StatusForbidden, "delegation_condition_unmet",
+				"the delegated action's condition is not satisfied by current run state",
+				map[string]any{
+					"action":       action,
+					"condition":    string(d.Condition),
+					"unmet_reason": d.UnmetReason,
+				})
+			return "", false
+		}
+		return string(d.Condition), true
+	}
+	s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
+		"the effective operator_agent block does not delegate this action (fail-closed)",
+		map[string]any{"action": action})
+	return "", false
 }
