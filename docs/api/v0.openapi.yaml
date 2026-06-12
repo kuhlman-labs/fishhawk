@@ -307,9 +307,9 @@ components:
             spec's `drive` default overridden by the request's `drive`
             field — and snapshotted on the row so a spec edit mid-run
             doesn't change an in-flight run's behavior. `false` for
-            legacy rows (migration 0031). Persisted but not yet
-            consumed; the drive engine lands in a sibling slice of
-            #1023.
+            legacy rows (migration 0031). The recorded transitions
+            surface on `GET /v0/runs/{run_id}` as `auto_advanced` +
+            `next_action` + `derived_status`.
           example: false
         issue_context:
           $ref: '#/components/schemas/IssueContext'
@@ -348,6 +348,45 @@ components:
             `GET /v0/runs/{run_id}` ONLY — the list endpoint omits it
             (no per-row concern query) — and omitted when the run has
             no open concerns.
+        derived_status:
+          type: string
+          enum: [awaiting_merge]
+          description: |
+            Presentation-only drive-mode status (#1023):
+            `awaiting_merge` while a non-terminal drive run with an
+            open PR has `checks_green_awaiting_merge` as its latest
+            recorded auto-advance — every gate resolved, required
+            checks green, merge (a judgment point) parked for the
+            operator. Never a persisted run state: `state` stays
+            `running` while parked here, and the transition table in
+            `backend/internal/run/transition.go` is unchanged. Emitted
+            by `GET /v0/runs/{run_id}` ONLY (distilled from
+            `run_auto_advanced` audit entries, same single-read posture
+            as `concerns`); omitted on non-drive runs, terminal runs,
+            and whenever a later transition superseded the
+            checks-green park.
+        next_action:
+          $ref: '#/components/schemas/RunNextAction'
+          description: |
+            Distilled operator next step (#1023) from the run's most
+            recent `run_auto_advanced` audit entry — what (if
+            anything) the drive run is waiting on the operator for.
+            Emitted by `GET /v0/runs/{run_id}` ONLY; omitted on
+            non-drive runs, terminal runs (the recorded step is
+            history, not an instruction), and when the latest
+            auto-advance carries no next action.
+        auto_advanced:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunAutoAdvance'
+          description: |
+            The run's auto-advanced (or parked-with-next-action)
+            transitions (#1023), distilled oldest-first from its
+            `run_auto_advanced` audit entries so the operator sees
+            which transitions advanced themselves. Emitted by
+            `GET /v0/runs/{run_id}` ONLY — the list endpoint omits it
+            (no per-row audit query) — and omitted when no drive
+            transitions were recorded.
         created_at:
           type: string
           format: date-time
@@ -416,6 +455,67 @@ components:
             operator-reachable via `POST /v0/concerns/{concern_id}/waive`
             (#984); `addressed`/`reopened`/`superseded` are reached by
             reviewer `concern_resolutions` on a re-review.
+
+    RunNextAction:
+      type: object
+      description: |
+        The distilled operator next step on a drive run (#1023),
+        recorded by the drive engine alongside an auto-advance or a
+        park. Mirrors the `next_action` payload inside
+        `run_auto_advanced` audit entries.
+      required: [action]
+      properties:
+        action:
+          type: string
+          description: |
+            Machine-readable next step. Current values:
+            `run_implement_stage` (runner_kind `local` — dispatch the
+            implement stage from the operator host) and `merge_pr`
+            (all gates resolved, required checks green).
+          example: merge_pr
+        detail:
+          type: string
+          description: One-line elaboration of the action.
+        pr_url:
+          type: string
+          description: The pull request the action refers to, when relevant.
+          example: https://github.com/kuhlman-labs/fishhawk/pull/123
+
+    RunAutoAdvance:
+      type: object
+      description: |
+        One drive-engine transition (#1023), distilled from a
+        `run_auto_advanced` audit entry: the named rule that fired and
+        the from/to edge it stamps. Rule names are a closed set
+        (`backend/internal/drive`): `plan_approved_dispatch`,
+        `reviews_settled_gate`, `fixup_rereview_repark`,
+        `checks_green_awaiting_merge`.
+      required: [rule, from, to, ts]
+      properties:
+        rule:
+          type: string
+          description: The named drive rule that fired.
+          example: plan_approved_dispatch
+        from:
+          type: string
+          description: The transition's from edge.
+          example: "plan:approved"
+        to:
+          type: string
+          description: The transition's to edge.
+          example: "implement:dispatched"
+        parked:
+          type: boolean
+          description: |
+            True when the mechanical rule could not be
+            backend-executed (the runner_kind `local` dispatch — the
+            runner is host-spawned per ADR-024) and the entry records
+            a park-with-next-action instead of an executed advance.
+            Absent/false for executed advances.
+        ts:
+          type: string
+          format: date-time
+          description: When the transition was recorded.
 
     WaivedConcern:
       type: object

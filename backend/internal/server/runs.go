@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -58,6 +60,46 @@ type runResponse struct {
 	// per-row concern query (N+1). Omitted when the run has no open
 	// concerns (or no concern store is configured).
 	Concerns *runConcernsPayload `json:"concerns,omitempty"`
+	// DerivedStatus is the presentation-only drive-mode status (#1023):
+	// "awaiting_merge" while a non-terminal drive run with an open PR has
+	// a checks_green_awaiting_merge auto-advance as its latest recorded
+	// transition. Never a persisted run.State — the state machine in
+	// run/transition.go is untouched. Populated by handleGetRun ONLY
+	// (distilled from run_auto_advanced audit entries, same single-read
+	// posture as Concerns); omitted everywhere else.
+	DerivedStatus string `json:"derived_status,omitempty"`
+	// NextAction is the distilled operator next step from the most
+	// recent run_auto_advanced audit entry (#1023): what (if anything)
+	// the drive run is waiting on the operator for. Populated by
+	// handleGetRun ONLY; omitted on non-drive runs, terminal runs, and
+	// when the latest auto-advance carries no next action.
+	NextAction *runNextActionPayload `json:"next_action,omitempty"`
+	// AutoAdvanced lists the run's auto-advanced (or parked-with-next-
+	// action) transitions distilled from run_auto_advanced audit entries
+	// (#1023), oldest first. Populated by handleGetRun ONLY; omitted
+	// when no drive transitions were recorded.
+	AutoAdvanced []runAutoAdvancePayload `json:"auto_advanced,omitempty"`
+}
+
+// runNextActionPayload mirrors drive.NextAction on the wire. Kept
+// distinct from the domain type so a payload-shape change in the audit
+// trail can't silently leak through the API surface.
+type runNextActionPayload struct {
+	Action string `json:"action"`
+	Detail string `json:"detail,omitempty"`
+	PRURL  string `json:"pr_url,omitempty"`
+}
+
+// runAutoAdvancePayload is one distilled drive transition: the rule
+// that fired, the from/to edge it stamps, whether the mechanical rule
+// parked instead of executing (runner_kind local dispatch), and when
+// the audit entry landed.
+type runAutoAdvancePayload struct {
+	Rule      string    `json:"rule"`
+	From      string    `json:"from"`
+	To        string    `json:"to"`
+	Parked    bool      `json:"parked,omitempty"`
+	Timestamp time.Time `json:"ts"`
 }
 
 // runConcernsPayload summarizes a run's OPEN review concerns (#964).
@@ -625,7 +667,73 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			resp.Concerns = buildRunConcernsPayload(open)
 		}
 	}
+	// Drive read surfaces (#1023): auto_advanced + next_action +
+	// derived_status, distilled from the run's run_auto_advanced audit
+	// entries. Single-run read ONLY (same posture as Concerns — no
+	// per-row audit query on the list endpoint), gated on the run's
+	// Drive flag so non-drive runs never pay the audit read. Best-
+	// effort: a read failure warn-logs and the fields are omitted
+	// rather than failing the run read.
+	if got.Drive && s.cfg.AuditRepo != nil {
+		entries, derr := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, drive.Category)
+		if derr != nil {
+			s.cfg.Logger.Warn("list run_auto_advanced failed; omitting drive surfaces",
+				"run_id", runID.String(), "error", derr.Error())
+		} else {
+			applyDriveSurfaces(&resp, got, entries)
+		}
+	}
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// applyDriveSurfaces distills run_auto_advanced audit entries into the
+// single-run read's drive fields (#1023): the full auto_advanced
+// transition list (oldest first), the most recent entry's next_action,
+// and the derived awaiting_merge presentation status. next_action and
+// derived_status are suppressed on terminal runs — once the run
+// completes, the recorded next step is history, not an instruction.
+// awaiting_merge additionally requires an open PR on the row, mirroring
+// the {gates resolved, checks green, PR open} derivation the
+// checks_green_awaiting_merge stamp encodes at emission time. Corrupt
+// payloads are skipped: the surface degrades to the readable entries.
+func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Entry) {
+	if len(entries) == 0 {
+		return
+	}
+	// Defensive sort; the postgres repository already returns the
+	// per-run chain sequence-ascending. Stable so fakes that surface
+	// unsequenced entries keep their append order.
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].Sequence < entries[j].Sequence
+	})
+	var latest *drive.Advance
+	for _, e := range entries {
+		var adv drive.Advance
+		if json.Unmarshal(e.Payload, &adv) != nil {
+			continue
+		}
+		resp.AutoAdvanced = append(resp.AutoAdvanced, runAutoAdvancePayload{
+			Rule:      string(adv.Rule),
+			From:      adv.From,
+			To:        adv.To,
+			Parked:    adv.Parked,
+			Timestamp: e.Timestamp,
+		})
+		latest = &adv
+	}
+	if latest == nil || runRow.State.IsTerminal() {
+		return
+	}
+	if latest.NextAction != nil {
+		resp.NextAction = &runNextActionPayload{
+			Action: latest.NextAction.Action,
+			Detail: latest.NextAction.Detail,
+			PRURL:  latest.NextAction.PRURL,
+		}
+	}
+	if latest.Rule == drive.RuleChecksGreenAwaitingMerge && runRow.PullRequestURL != nil {
+		resp.DerivedStatus = "awaiting_merge"
+	}
 }
 
 // buildRunConcernsPayload renders the open-concern summary for the
