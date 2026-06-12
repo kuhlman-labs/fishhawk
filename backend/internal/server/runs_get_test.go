@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -785,5 +786,256 @@ func TestDriveRun_EndToEnd_NonDriveControl(t *testing.T) {
 	stages := repo.stagesFor(runID)
 	if stages[1].State != run.StageStateDispatched {
 		t.Errorf("implement state = %q, want dispatched (legacy path unchanged)", stages[1].State)
+	}
+}
+
+// --- Delegation read surface (ADR-040 / #1026) ------------------------------
+
+// delegationSpecYAML is gatedSpecYAML plus a workflow-level
+// operator_agent block (version 0.5) delegating approve and waive, and
+// advisory plan reviewers (agent:2, human:1) so clean_dual_approval has
+// verdicts to count.
+const delegationSpecYAML = `version: "0.5"
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+workflows:
+  feature_change:
+    operator_agent:
+      may_approve: clean_dual_approval
+      may_waive: solo_low
+      must_page_human: [reviewer_reject]
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 2
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// newDelegationServer wires the run + audit + concern fakes the
+// delegation evaluator reads. driveE2ERepo supplies the working
+// ListStagesForRun the base fakeRepo deliberately errors on.
+func newDelegationServer(t *testing.T) (*Server, *driveE2ERepo, *auditFake, *fakeConcernRepo) {
+	t.Helper()
+	repo := &driveE2ERepo{fakeRepo: newFakeRepo()}
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, ConcernRepo: cr})
+	return s, repo, au, cr
+}
+
+// seedReviewEntry appends one payload-carrying review audit entry to
+// the fake's seeded history at the given per-run sequence.
+func seedReviewEntry(t *testing.T, au *auditFake, runID uuid.UUID, seq int64, category string, payload any) {
+	t.Helper()
+	b, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal %s payload: %v", category, err)
+	}
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Sequence: seq, Category: category,
+		Payload: b, Timestamp: time.Now().UTC(),
+	})
+}
+
+// delegationAction returns the named action's entry from the response's
+// delegation block.
+func delegationAction(t *testing.T, resp runResponse, action string) runDelegationActionPayload {
+	t.Helper()
+	if resp.Delegation == nil {
+		t.Fatal("delegation block missing")
+	}
+	for _, a := range resp.Delegation.Actions {
+		if a.Action == action {
+			return a
+		}
+	}
+	t.Fatalf("no %q action in delegation block: %+v", action, resp.Delegation.Actions)
+	return runDelegationActionPayload{}
+}
+
+// TestGetRun_Delegation_SpecToWire_EndToEnd is the cross-boundary seam
+// test the plan requires: POST /v0/runs caches a workflow spec carrying
+// an operator_agent block, reviewer verdicts and concerns land through
+// the (fake) repos, and GET /v0/runs/{id} advertises the evaluated
+// conditions — clean_dual_approval unmet while verdicts are missing or
+// a concern is open, met once both verdicts are approve and the concern
+// is closed.
+func TestGetRun_Delegation_SpecToWire_EndToEnd(t *testing.T) {
+	s, repo, au, cr := newDelegationServer(t)
+	runID, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+
+	// Phase 1: gate pending, review round not dispatched.
+	resp, _ := getRunResponse(t, s, runID)
+	approve := delegationAction(t, resp, "approve")
+	if approve.Condition != "clean_dual_approval" || approve.Met {
+		t.Fatalf("approve = %+v, want unmet clean_dual_approval", approve)
+	}
+	if !strings.Contains(approve.UnmetReason, "0 of 2 reviewer verdicts") {
+		t.Errorf("unmet_reason = %q, want the undisputed not-dispatched predicate", approve.UnmetReason)
+	}
+	if got := resp.Delegation.MustPageHuman; len(got) != 1 || got[0] != "reviewer_reject" {
+		t.Errorf("must_page_human = %v, want [reviewer_reject]", got)
+	}
+
+	// Phase 2: one of two verdicts in, one concern open.
+	seedReviewEntry(t, au, runID, 1, "plan_review_started",
+		planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed",
+		planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	openRow := seedConcernRow(t, cr, runID, planStage.ID, "plan", 2, "tighten the integration test")
+
+	resp, _ = getRunResponse(t, s, runID)
+	approve = delegationAction(t, resp, "approve")
+	if approve.Met || !strings.Contains(approve.UnmetReason, "1 of 2 reviewer verdicts received") {
+		t.Errorf("approve = %+v, want unmet on the verdict count", approve)
+	}
+	waive := delegationAction(t, resp, "waive")
+	if waive.Met || !strings.Contains(waive.UnmetReason, "severity is medium") {
+		t.Errorf("waive = %+v, want unmet solo_low naming the severity", waive)
+	}
+
+	// Phase 3: second approve verdict lands; the concern stays open.
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed",
+		planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	resp, _ = getRunResponse(t, s, runID)
+	approve = delegationAction(t, resp, "approve")
+	if approve.Met || !strings.Contains(approve.UnmetReason, "1 open concern(s)") {
+		t.Errorf("approve = %+v, want unmet on the open concern", approve)
+	}
+
+	// Phase 4: concern closed — the condition is met, no unmet_reason.
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{openRow.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	if _, err := cr.ApplyResolution(context.Background(), openRow.ID, concern.StateAddressed, "confirmed"); err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+	resp, raw := getRunResponse(t, s, runID)
+	approve = delegationAction(t, resp, "approve")
+	if !approve.Met || approve.UnmetReason != "" {
+		t.Errorf("approve = %+v, want met with no unmet_reason", approve)
+	}
+	if _, present := raw["delegation"]; !present {
+		t.Error("delegation key missing from the raw body")
+	}
+}
+
+// TestGetRun_Delegation_NoBlock_Omitted is the fail-closed control: a
+// spec without an operator_agent block yields a response with no
+// delegation key at all — byte-identical to today.
+func TestGetRun_Delegation_NoBlock_Omitted(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": gatedSpecYAML,
+	})
+	_, raw := getRunResponse(t, s, runID)
+	if _, present := raw["delegation"]; present {
+		t.Errorf("delegation key present on a spec with no operator_agent block:\n%v", raw)
+	}
+}
+
+// TestGetRun_Delegation_LegacyEmptySpec_Omitted: a legacy row with no
+// cached workflow spec omits the field without erroring.
+func TestGetRun_Delegation_LegacyEmptySpec_Omitted(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	legacy, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	_, raw := getRunResponse(t, s, legacy.ID)
+	if _, present := raw["delegation"]; present {
+		t.Error("delegation key present on a legacy row with no cached spec")
+	}
+}
+
+// TestGetRun_Delegation_TerminalRun_Omitted: terminal runs carry no
+// delegation block — the conditions are instructions, not history.
+func TestGetRun_Delegation_TerminalRun_Omitted(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+	row, err := repo.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	row.State = run.StateSucceeded
+
+	_, raw := getRunResponse(t, s, runID)
+	if _, present := raw["delegation"]; present {
+		t.Error("delegation key present on a terminal run")
+	}
+}
+
+// TestGetRun_Delegation_EvaluationFailure_Omitted: best-effort — an
+// audit-store failure omits the block, never fails the read (the same
+// degradation posture as Concerns and the drive surfaces).
+func TestGetRun_Delegation_EvaluationFailure_Omitted(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+	au.listByCategoryErr = errors.New("store down")
+
+	_, raw := getRunResponse(t, s, runID)
+	if _, present := raw["delegation"]; present {
+		t.Error("delegation key present despite the audit read failure")
+	}
+}
+
+// TestListRuns_OmitsDelegation pins the list-path posture (mirrors the
+// concerns and drive controls): the list endpoint never pays the
+// per-row evaluation, so its items carry no delegation key.
+func TestListRuns_OmitsDelegation(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs", nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(resp.Items))
+	}
+	if _, present := resp.Items[0]["delegation"]; present {
+		t.Error("list item carries a delegation key — the list path must stay free of the per-row evaluation")
 	}
 }

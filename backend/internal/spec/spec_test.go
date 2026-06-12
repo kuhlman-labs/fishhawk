@@ -1168,6 +1168,190 @@ workflows:
 	}
 }
 
+// --- operator_agent delegation knobs (ADR-040 / #1026) ---
+
+func TestParse_OperatorAgent_RoundTrip(t *testing.T) {
+	// The fixture declares a workflow-level block and a per-gate
+	// override on the plan stage's approval gate; the implement
+	// stage's gate has no block. Exercises both placements plus the
+	// EffectiveOperatorAgent precedence (gate wins wholesale, else
+	// workflow, else nil).
+	s, err := spec.ParseBytes(readFixture(t, "valid/operator-agent.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Version != "0.5" {
+		t.Errorf("version = %q, want 0.5", s.Version)
+	}
+	wf, ok := s.Workflows["feature_change"]
+	if !ok {
+		t.Fatal(`workflows["feature_change"] missing`)
+	}
+	wfBlock := wf.OperatorAgent
+	if wfBlock == nil {
+		t.Fatal("workflow-level OperatorAgent should be non-nil")
+	}
+	if wfBlock.MayApprove != spec.ConditionCleanDualApproval {
+		t.Errorf("workflow MayApprove = %q, want clean_dual_approval", wfBlock.MayApprove)
+	}
+	if wfBlock.MayRouteFixup != spec.ConditionConvergentConcerns {
+		t.Errorf("workflow MayRouteFixup = %q, want convergent_concerns", wfBlock.MayRouteFixup)
+	}
+	if wfBlock.MayRetry != spec.ConditionInfraFlake {
+		t.Errorf("workflow MayRetry = %q, want infra_flake", wfBlock.MayRetry)
+	}
+	if wfBlock.MayMerge != spec.ConditionGatesResolvedCIGreen {
+		t.Errorf("workflow MayMerge = %q, want gates_resolved_ci_green", wfBlock.MayMerge)
+	}
+	if wfBlock.MayWaive != "" {
+		t.Errorf("workflow MayWaive = %q, want empty (not delegated)", wfBlock.MayWaive)
+	}
+	wantPage := []string{spec.PageEventReviewerReject, spec.PageEventBudgetOverride}
+	if len(wfBlock.MustPageHuman) != 2 || wfBlock.MustPageHuman[0] != wantPage[0] || wfBlock.MustPageHuman[1] != wantPage[1] {
+		t.Errorf("workflow MustPageHuman = %v, want %v", wfBlock.MustPageHuman, wantPage)
+	}
+
+	planGate := &wf.Stages[0].Gates[0]
+	if planGate.OperatorAgent == nil {
+		t.Fatal("plan gate OperatorAgent should be non-nil")
+	}
+	eff := wf.EffectiveOperatorAgent(planGate)
+	if eff != planGate.OperatorAgent {
+		t.Errorf("EffectiveOperatorAgent(plan gate) = %+v, want the gate-level block", eff)
+	}
+	if eff.MayWaive != spec.ConditionSoloLow {
+		t.Errorf("gate MayWaive = %q, want solo_low", eff.MayWaive)
+	}
+	// The gate block wins WHOLESALE — knobs the gate omits are not
+	// inherited from the workflow block. The workflow delegates
+	// may_retry; the gate block doesn't, so the effective view must
+	// not carry it.
+	if eff.MayRetry != "" {
+		t.Errorf("gate-effective MayRetry = %q, want empty (no cross-level merge)", eff.MayRetry)
+	}
+
+	implGate := &wf.Stages[1].Gates[0]
+	if implGate.OperatorAgent != nil {
+		t.Fatalf("implement gate OperatorAgent = %+v, want nil", implGate.OperatorAgent)
+	}
+	if got := wf.EffectiveOperatorAgent(implGate); got != wf.OperatorAgent {
+		t.Errorf("EffectiveOperatorAgent(implement gate) = %+v, want the workflow-level block", got)
+	}
+	if got := wf.EffectiveOperatorAgent(nil); got != wf.OperatorAgent {
+		t.Errorf("EffectiveOperatorAgent(nil) = %+v, want the workflow-level block", got)
+	}
+}
+
+func TestParse_OperatorAgent_Absent_Nil(t *testing.T) {
+	// No operator_agent block anywhere → nil at every level, and the
+	// precedence helper resolves to nil. Nil is load-bearing:
+	// fail-closed, nothing is delegated.
+	s, err := spec.ParseBytes(readFixture(t, "valid/minimal.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf := s.Workflows["trivial"]
+	if wf.OperatorAgent != nil {
+		t.Errorf("OperatorAgent = %+v, want nil for an absent block", wf.OperatorAgent)
+	}
+	if got := wf.EffectiveOperatorAgent(nil); got != nil {
+		t.Errorf("EffectiveOperatorAgent = %+v, want nil (fail-closed)", got)
+	}
+}
+
+func TestParse_OperatorAgent_UnknownCondition_Rejected(t *testing.T) {
+	// Each knob is a closed single-value enum; an unknown condition is
+	// refused at parse with a JSON Pointer into the offending knob.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      may_approve: anything_goes
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	if !strings.Contains(se.Path, "operator_agent/may_approve") {
+		t.Errorf("Path = %q, want a JSON Pointer into operator_agent/may_approve", se.Path)
+	}
+}
+
+func TestParse_OperatorAgent_UnknownKnob_Rejected(t *testing.T) {
+	// additionalProperties: false closes the knob set — a knob the
+	// backend can't evaluate must never parse.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      may_deploy: anything
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+func TestParse_OperatorAgent_UnknownPageEvent_Rejected(t *testing.T) {
+	// must_page_human items are a closed enum too.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      must_page_human: [solar_flare]
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+func TestParse_OperatorAgent_OnCheckGate_Rejected(t *testing.T) {
+	// operator_agent lives on the approval branch of the gate oneOf
+	// only; unevaluatedProperties rejects it on a check gate.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor: { human: true }
+        gates:
+          - type: check
+            operator_agent:
+              may_merge: gates_resolved_ci_green
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
 // --- Parse via io.Reader ---
 
 func TestParse_ReaderRoundTrip(t *testing.T) {

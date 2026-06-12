@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 )
 
 // CategoryConcernWaived is the audit-log category for the entry the
@@ -41,6 +42,13 @@ const CategoryConcernWaiveFailed = "concern_waive_failed"
 // re-review prompt reads exactly this text.
 type waiveConcernRequest struct {
 	Reason string `json:"reason"`
+	// Delegated opts the waive into the ADR-040 delegated-action path
+	// (#1026): checkDelegation re-evaluates the operator_agent may_waive
+	// condition (solo_low) server-side at action time — 403
+	// delegation_not_configured / delegation_condition_unmet on refusal,
+	// `delegated: "<rule>"` on the concern_waived payload when met.
+	// Absent → behavior byte-identical to today.
+	Delegated bool `json:"delegated"`
 }
 
 // waiveConcernResponse is the 200 body: the updated concern row.
@@ -155,6 +163,19 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Delegated-action enforcement (ADR-040 / #1026): a delegated:true
+	// waive must hold the may_waive condition (solo_low) against CURRENT
+	// run state, re-evaluated server-side before the intent entry is
+	// appended.
+	var delegatedRule string
+	if reqBody.Delegated {
+		rule, ok := s.checkDelegation(w, r, row.RunID, delegation.ActionWaive)
+		if !ok {
+			return
+		}
+		delegatedRule = rule
+	}
+
 	// Durable-record-first: append the concern_waived intent entry BEFORE
 	// the state mutation. Append failure is request failure — no
 	// mutation may occur without the audit record.
@@ -163,14 +184,18 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 		subject = "anonymous"
 	}
 	actorKind := audit.ActorUser
-	payload, _ := json.Marshal(map[string]any{
+	waivedFields := map[string]any{
 		"concern_id":  row.ID.String(),
 		"prior_state": string(row.State),
 		"reason":      reqBody.Reason,
 		"stage_kind":  row.StageKind,
 		"severity":    row.Severity,
 		"category":    row.Category,
-	})
+	}
+	if delegatedRule != "" {
+		waivedFields["delegated"] = delegatedRule
+	}
+	payload, _ := json.Marshal(waivedFields)
 	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        row.RunID,
 		StageID:      &row.StageID,

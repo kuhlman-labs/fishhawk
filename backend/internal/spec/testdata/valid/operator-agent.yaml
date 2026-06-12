@@ -1,0 +1,49 @@
+# operator_agent delegation knobs (ADR-040 / #1026, version 0.5).
+# Exercises both placement levels: a workflow-level default block and
+# a per-gate override on the plan stage's approval gate. The implement
+# stage's gate carries no block, so it falls back to the workflow
+# default (EffectiveOperatorAgent precedence).
+version: "0.5"
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: "Delegation knobs at workflow level with a per-gate override."
+    operator_agent:
+      may_approve: clean_dual_approval
+      may_route_fixup: convergent_concerns
+      may_retry: infra_flake
+      may_merge: gates_resolved_ci_green
+      must_page_human: [reviewer_reject, budget_override]
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+            operator_agent:
+              may_approve: clean_dual_approval
+              may_waive: solo_low
+              must_page_human:
+                - plan_rejection
+                - scope_amendment
+                - policy_override
+                - exception_request
+                - requirement_arbitration
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]

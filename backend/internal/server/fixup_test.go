@@ -1501,3 +1501,134 @@ func TestFixupStage_Drive_StampsReparkRule(t *testing.T) {
 		t.Error("Parked = true, want false: the re-park IS the mechanical advance into a fresh review round")
 	}
 }
+
+// --- Delegated fix-up (ADR-040 / #1026) -------------------------------------
+
+// delegatedActionSpecYAML is a version-0.5 spec whose workflow-level
+// operator_agent block delegates the three action-handler knobs this
+// package enforces (route_fixup / retry / waive). Shared by the
+// delegated fix-up, retry, and waive tests.
+const delegatedActionSpecYAML = `version: "0.5"
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+workflows:
+  feature_change:
+    operator_agent:
+      may_route_fixup: convergent_concerns
+      may_retry: infra_flake
+      may_waive: solo_low
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// seedDelegatedRun stamps the delegated-action spec onto a stage's run
+// row so checkDelegation can resolve the operator_agent block.
+func seedDelegatedRun(repo *approvalRunRepo, stage *run.Stage) {
+	repo.seedRun(&run.Run{
+		ID:           stage.RunID,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(delegatedActionSpecYAML),
+	})
+}
+
+// TestFixupStage_Delegated_MetStampsAudit: with the implement review
+// round settled (all verdicts in, none reject) and one open concern,
+// a delegated fix-up proceeds and the stage_fixup_triggered payload
+// records `delegated: "convergent_concerns"`.
+func TestFixupStage_Delegated_MetStampsAudit(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := repo.seedGatelessStage(run.StageStateAwaitingApproval)
+	seedDelegatedRun(repo, stage)
+	seedReviewEntry(t, au, stage.RunID, 1, "implement_review_started",
+		planreview.ReviewStartedPayload{ConfiguredAgents: 1})
+	seedReviewEntry(t, au, stage.RunID, 2, "implement_reviewed",
+		planreview.ImplementReviewedPayload{
+			ReviewerKind: "agent",
+			Authority:    planreview.AuthorityAdvisory,
+			Verdict:      planreview.VerdictApproveWithConcerns,
+		})
+	row := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 2, "tighten the test")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs: []string{row.ID.String()},
+		Reason:     "route it back",
+		Delegated:  true,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if rule := delegatedAuditRule(t, au, CategoryStageFixupTriggered); rule != "convergent_concerns" {
+		t.Errorf("audit delegated = %q, want convergent_concerns", rule)
+	}
+}
+
+// TestFixupStage_Delegated_UnmetReturns403: with no implement review
+// round recorded the condition is unmet — refused with the named
+// predicate, no state change, no audit entry.
+func TestFixupStage_Delegated_UnmetReturns403(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := repo.seedGatelessStage(run.StageStateAwaitingApproval)
+	seedDelegatedRun(repo, stage)
+	row := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 2, "tighten the test")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs: []string{row.ID.String()},
+		Delegated:  true,
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	errBody := decodeErrorEnvelope(t, w)
+	reason, _ := errBody.Details["unmet_reason"].(string)
+	if errBody.Code != "delegation_condition_unmet" ||
+		!strings.Contains(reason, "no implement review round recorded") {
+		t.Errorf("error = %+v, want delegation_condition_unmet naming the missing review round", errBody)
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no state change on refusal)", stage.State)
+	}
+	if idx := auditEntriesByCategory(au, CategoryStageFixupTriggered); len(idx) != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d after refusal, want 0", len(idx))
+	}
+}
+
+// TestFixupStage_Delegated_NotConfigured pins fail-closed: a run with
+// no cached workflow spec (so no operator_agent block can govern it)
+// refuses a delegated fix-up with delegation_not_configured.
+func TestFixupStage_Delegated_NotConfigured(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	row := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 2, "tighten the test")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs: []string{row.ID.String()},
+		Delegated:  true,
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if errBody := decodeErrorEnvelope(t, w); errBody.Code != "delegation_not_configured" {
+		t.Errorf("code = %q, want delegation_not_configured", errBody.Code)
+	}
+	if idx := auditEntriesByCategory(au, CategoryStageFixupTriggered); len(idx) != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d after refusal, want 0", len(idx))
+	}
+}

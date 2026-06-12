@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -79,6 +81,15 @@ type runResponse struct {
 	// (#1023), oldest first. Populated by handleGetRun ONLY; omitted
 	// when no drive transitions were recorded.
 	AutoAdvanced []runAutoAdvancePayload `json:"auto_advanced,omitempty"`
+	// Delegation is the evaluated operator_agent delegation surface
+	// (ADR-040 / #1026): per-knob condition evaluations plus the
+	// must_page_human list, so the operator agent never re-derives a
+	// condition client-side. Populated by handleGetRun ONLY (same
+	// single-read posture as Concerns); omitted when the run's cached
+	// workflow spec declares no effective operator_agent block
+	// (fail-closed — today's responses byte-identical), on terminal
+	// runs, and best-effort on any evaluation failure.
+	Delegation *runDelegationPayload `json:"delegation,omitempty"`
 }
 
 // runNextActionPayload mirrors drive.NextAction on the wire. Kept
@@ -119,6 +130,26 @@ type runConcernPayload struct {
 	Severity  string    `json:"severity"`
 	Category  string    `json:"category"`
 	State     string    `json:"state"`
+}
+
+// runDelegationPayload is the operator_agent delegation surface on the
+// wire (ADR-040 / #1026): one entry per configured may_* knob, each
+// carrying the named condition and whether current run state satisfies
+// it, plus the effective block's must_page_human event list. Kept
+// distinct from delegation.Result per the domain/wire separation the
+// drive payloads follow.
+type runDelegationPayload struct {
+	Actions       []runDelegationActionPayload `json:"actions"`
+	MustPageHuman []string                     `json:"must_page_human,omitempty"`
+}
+
+// runDelegationActionPayload is one knob's evaluation on the wire.
+// unmet_reason names the exact failed predicate when met is false.
+type runDelegationActionPayload struct {
+	Action      string `json:"action"`
+	Condition   string `json:"condition"`
+	Met         bool   `json:"met"`
+	UnmetReason string `json:"unmet_reason,omitempty"`
 }
 
 // issueContextPayload mirrors run.IssueContext on the wire. Kept
@@ -683,7 +714,68 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			applyDriveSurfaces(&resp, got, entries)
 		}
 	}
+	// Delegation surface (ADR-040 / #1026): evaluated on the single-run
+	// read ONLY, same posture as Concerns. Omitted (nil) when the run's
+	// spec declares no operator_agent block, on terminal runs, and
+	// best-effort on any evaluation failure.
+	resp.Delegation = s.buildDelegationPayload(r.Context(), got)
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// buildDelegationPayload evaluates the run's operator_agent delegation
+// conditions (ADR-040 / #1026) for the single-run read. Returns nil —
+// the field is omitted — when the run is terminal, carries no cached
+// workflow spec (legacy rows), resolves no effective operator_agent
+// block (fail-closed: nothing is delegated), the evaluator's
+// repositories aren't wired, or the evaluation fails (best-effort,
+// mirroring the Concerns / drive-surfaces degradation: warn-log and
+// omit, never fail the read).
+func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *runDelegationPayload {
+	if runRow.State.IsTerminal() || len(runRow.WorkflowSpec) == 0 {
+		return nil
+	}
+	if s.cfg.RunRepo == nil || s.cfg.ConcernRepo == nil || s.cfg.AuditRepo == nil {
+		return nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.Warn("delegation: parse workflow spec failed; omitting delegation block",
+			"run_id", runRow.ID.String(), "error", err.Error())
+		return nil
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		s.cfg.Logger.Warn("delegation: workflow not in cached spec; omitting delegation block",
+			"run_id", runRow.ID.String(), "workflow_id", runRow.WorkflowID)
+		return nil
+	}
+	ev := &delegation.Evaluator{
+		Stages:   s.cfg.RunRepo,
+		Concerns: s.cfg.ConcernRepo,
+		Audit:    s.cfg.AuditRepo,
+	}
+	res, err := ev.Evaluate(ctx, runRow, &wf)
+	if err != nil {
+		s.cfg.Logger.Warn("delegation: evaluate failed; omitting delegation block",
+			"run_id", runRow.ID.String(), "error", err.Error())
+		return nil
+	}
+	if res == nil {
+		return nil
+	}
+	out := &runDelegationPayload{
+		Actions:       make([]runDelegationActionPayload, 0, len(res.Actions)),
+		MustPageHuman: res.MustPageHuman,
+	}
+	for _, d := range res.Actions {
+		out.Actions = append(out.Actions, runDelegationActionPayload{
+			Action:      d.Action,
+			Condition:   string(d.Condition),
+			Met:         d.Met,
+			UnmetReason: d.UnmetReason,
+		})
+	}
+	return out
 }
 
 // applyDriveSurfaces distills run_auto_advanced audit entries into the

@@ -68,6 +68,35 @@ Applies to:
 
 ---
 
+## Autonomy tiers as operator_agent knob presets
+
+The tiers above map onto the workflow spec's `operator_agent` delegation
+block (ADR-040 / #1026; `docs/spec/workflow-v0.md`). Each `may_*` knob
+delegates one operator verb under one named, backend-evaluable
+condition; everything not delegated pages the human (fail-closed). The
+preset names align with the operator-role overlay's reserved
+`knob_presets` key (#1025 / #1042 — soft dependency; the overlay may
+reference these presets once it ships).
+
+| Tier | Preset | `operator_agent` block |
+|---|---|---|
+| Low | `low` | No block at all. Nothing is delegated; every judgment — approval, fix-up routing, waiver, retry, merge — pages the human. This is also the default for any spec that predates the block. |
+| Medium | `medium` | `may_approve: clean_dual_approval`, `may_retry: infra_flake`, `may_route_fixup: convergent_concerns`, with the full v0 `must_page_human` event list (`reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`). The operator agent advances mechanical judgments whose evidence is unambiguous; waivers and merges stay human. |
+| High | `high` | All five knobs delegated: the medium set plus `may_waive: solo_low` and `may_merge: gates_resolved_ci_green`. `must_page_human` still carries the full event list — high autonomy delegates clean-path verbs, never disagreement arbitration. |
+
+Two invariants hold at every tier (ADR-027 authority unchanged):
+
+- A delegated action is **condition-gated, not trust-gated**: the
+  backend re-evaluates the named condition against current run state at
+  action time and refuses with the exact failed predicate otherwise.
+  The delegation never widens what the action itself may do.
+- `must_page_human` events are non-delegable. A reviewer reject, a plan
+  rejection, a scope amendment, any budget/policy override, an
+  exception request, or a requirement arbitration always reaches the
+  human, regardless of preset.
+
+---
+
 ## What "agents do the work, humans approve the work" means here
 
 Fishhawk's product thesis is that humans setting direction and approving outcomes is the durable model — not transitional scaffolding. The autonomy tiers above reflect that. Even at high autonomy, humans authored the workflow that decided what the agent could do; the workflow itself is reviewed and approved by humans. Accountability never disappears, even when the keystrokes do.

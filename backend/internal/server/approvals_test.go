@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -2683,4 +2684,217 @@ func TestSubmitApproval_Drive_Reject_NoStamp(t *testing.T) {
 	if advances := driveAdvanceFor(t, au); len(advances) != 0 {
 		t.Errorf("run_auto_advanced entries = %+v, want none on reject", advances)
 	}
+}
+
+// --- Delegated approval (ADR-040 / #1026) -----------------------------------
+
+// newDelegatedApprovalServer wires the full stack the delegated
+// approval path reads: the drive-capable repo (working
+// ListStagesForRun), audit + concern fakes for the delegation
+// evaluator, the approval repo, and the orchestrator for the
+// post-approve dispatch.
+func newDelegatedApprovalServer(t *testing.T) (*Server, *driveE2ERepo, *auditFake, *fakeConcernRepo, *fakeApprovalRepo) {
+	t.Helper()
+	repo := &driveE2ERepo{fakeRepo: newFakeRepo()}
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	ar := newFakeApprovalRepo()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    au,
+		ConcernRepo:  cr,
+		ApprovalRepo: ar,
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+	})
+	return s, repo, au, cr, ar
+}
+
+// decodeErrorEnvelope unmarshals a non-2xx response body.
+func decodeErrorEnvelope(t *testing.T, w *httptest.ResponseRecorder) errorBody {
+	t.Helper()
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal error envelope: %v\n%s", err, w.Body.String())
+	}
+	return env.Error
+}
+
+// delegatedAuditRule extracts the `delegated` payload field from the
+// single appended entry of the given category, or "" when absent.
+func delegatedAuditRule(t *testing.T, au *auditFake, category string) string {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var match *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == category {
+			if match != nil {
+				t.Fatalf("more than one %s entry appended", category)
+			}
+			match = &au.appended[i]
+		}
+	}
+	if match == nil {
+		t.Fatalf("no %s entry appended", category)
+	}
+	var payload struct {
+		Delegated string `json:"delegated"`
+	}
+	if err := json.Unmarshal(match.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal %s payload: %v", category, err)
+	}
+	return payload.Delegated
+}
+
+// TestSubmitApproval_Delegated_EndToEnd is the slice's required
+// cross-boundary test: a run whose cached workflow spec carries an
+// operator_agent block (may_approve: clean_dual_approval) refuses a
+// delegated approval while the condition is unmet — naming the exact
+// failed predicate, inserting no approval row — and accepts it once
+// every reviewer verdict is an approve and no concern is open, stamping
+// `delegated: "clean_dual_approval"` into the approval_submitted audit
+// payload.
+func TestSubmitApproval_Delegated_EndToEnd(t *testing.T) {
+	s, repo, au, cr, ar := newDelegatedApprovalServer(t)
+	runID, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+
+	// Phase 1: no reviewer verdicts yet — refused, predicate named.
+	w := submitApproval(t, s, planStage.ID, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	errBody := decodeErrorEnvelope(t, w)
+	if errBody.Code != "delegation_condition_unmet" {
+		t.Fatalf("code = %q, want delegation_condition_unmet", errBody.Code)
+	}
+	reason, _ := errBody.Details["unmet_reason"].(string)
+	if !strings.Contains(reason, "clean_dual_approval") || !strings.Contains(reason, "0 of 2 reviewer verdicts") {
+		t.Errorf("unmet_reason = %q, want the named verdict-count predicate", reason)
+	}
+	if rows, _ := ar.ListForStage(context.Background(), planStage.ID); len(rows) != 0 {
+		t.Fatalf("approval rows = %d after refusal, want 0 (a refused delegation must insert no row)", len(rows))
+	}
+
+	// Phase 2: both verdicts in, but a concern is open — still refused.
+	seedReviewEntry(t, au, runID, 1, "plan_review_started",
+		planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed",
+		planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed",
+		planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	openRow := seedConcernRow(t, cr, runID, planStage.ID, "plan", 2, "tighten the integration test")
+
+	w = submitApproval(t, s, planStage.ID, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	errBody = decodeErrorEnvelope(t, w)
+	reason, _ = errBody.Details["unmet_reason"].(string)
+	if errBody.Code != "delegation_condition_unmet" || !strings.Contains(reason, "1 open concern(s)") {
+		t.Errorf("error = %+v, want delegation_condition_unmet on the open concern", errBody)
+	}
+
+	// Phase 3: concern resolved — the delegated approval proceeds and
+	// the audit payload carries the rule.
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{openRow.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	if _, err := cr.ApplyResolution(context.Background(), openRow.ID, concern.StateAddressed, "confirmed"); err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+	w = submitApproval(t, s, planStage.ID, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var got stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != string(run.StageStateSucceeded) {
+		t.Errorf("stage state = %q, want succeeded", got.State)
+	}
+	if rule := delegatedAuditRule(t, au, "approval_submitted"); rule != "clean_dual_approval" {
+		t.Errorf("audit delegated = %q, want clean_dual_approval", rule)
+	}
+}
+
+// TestSubmitApproval_Delegated_NotConfigured pins fail-closed: a spec
+// with NO operator_agent block refuses a delegated approval outright
+// with delegation_not_configured, even though a plain human approval of
+// the same stage would proceed.
+func TestSubmitApproval_Delegated_NotConfigured(t *testing.T) {
+	s, repo, _, _, ar := newDelegatedApprovalServer(t)
+	_, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": gatedSpecYAML,
+	})
+
+	w := submitApproval(t, s, planStage.ID, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if errBody := decodeErrorEnvelope(t, w); errBody.Code != "delegation_not_configured" {
+		t.Errorf("code = %q, want delegation_not_configured", errBody.Code)
+	}
+	if rows, _ := ar.ListForStage(context.Background(), planStage.ID); len(rows) != 0 {
+		t.Errorf("approval rows = %d after refusal, want 0", len(rows))
+	}
+}
+
+// TestSubmitApproval_Delegated_RejectRefused: delegation covers the
+// approve verb only — a delegated reject is a contradiction
+// (reviewer_reject pages the human) and is a 400 before any
+// evaluation.
+func TestSubmitApproval_Delegated_RejectRefused(t *testing.T) {
+	s, repo, _, _, _ := newDelegatedApprovalServer(t)
+	_, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+
+	w := submitApproval(t, s, planStage.ID, `{"decision":"reject","delegated":true,"comment":"no"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if errBody := decodeErrorEnvelope(t, w); errBody.Code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", errBody.Code)
+	}
+}
+
+// TestSubmitApproval_NoDelegatedField_Unchanged pins the opt-in
+// contract: without `delegated`, a human approval on a
+// delegation-configured spec proceeds exactly as today — no delegation
+// evaluation gates it (the condition is UNMET here: no verdicts) and
+// the audit payload carries no `delegated` key.
+func TestSubmitApproval_NoDelegatedField_Unchanged(t *testing.T) {
+	s, repo, au, _, _ := newDelegatedApprovalServer(t)
+	_, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+
+	w := submitApproval(t, s, planStage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category != "approval_submitted" {
+			continue
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(e.Payload, &raw); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if _, present := raw["delegated"]; present {
+			t.Errorf("delegated key present on a non-delegated approval payload: %s", e.Payload)
+		}
+		return
+	}
+	t.Fatal("no approval_submitted entry appended")
 }

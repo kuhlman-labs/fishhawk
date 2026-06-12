@@ -11,8 +11,8 @@
   "properties": {
     "version": {
       "type": "string",
-      "enum": ["0.3", "0.4"],
-      "description": "Spec syntax version. 0.4 adds workflow.budgets — periodic per-workflow cost ceilings (ADR-030 / #688), additive within workflow-v0.x. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
+      "enum": ["0.3", "0.4", "0.5"],
+      "description": "Spec syntax version. 0.5 adds operator_agent — delegation knobs for the operator agent, declarable at workflow level and per approval gate (ADR-040 / #1026), additive within workflow-v0.x. 0.4 adds workflow.budgets — periodic per-workflow cost ceilings (ADR-030 / #688), additive within workflow-v0.x. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
     },
     "roles": {
       "type": "object",
@@ -74,7 +74,8 @@
           "type": "array",
           "description": "Periodic per-workflow cost ceilings (ADR-030 / #688). Each entry caps total USD spend across all runs of this workflow within a calendar period, resetting at the period boundary. Distinct from the per-stage `budget` ($defs/budget: token/runtime caps on one stage execution). Requires version 0.4+.",
           "items": { "$ref": "#/$defs/periodic_budget" }
-        }
+        },
+        "operator_agent": { "$ref": "#/$defs/operator_agent" }
       }
     },
 
@@ -366,7 +367,8 @@
             "sla": {
               "type": "string",
               "description": "SLA before timeout fires a category-D failure (e.g. '4_business_hours', '24_hours')."
-            }
+            },
+            "operator_agent": { "$ref": "#/$defs/operator_agent" }
           }
         },
         {
@@ -377,6 +379,56 @@
           }
         }
       ]
+    },
+
+    "operator_agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Delegation knobs for the operator agent (ADR-040 / #1026). Each may_* knob names the single backend-evaluable condition under which the operator agent may take that action without paging the human; the per-knob enums are a closed set — the backend must be able to answer every condition from run state. Absent block (and absent knob) = fail-closed: nothing is delegated, every judgment pages the human. Declarable at workflow level (default for all gates) and on an approval gate (per-gate override; a gate-level block wins WHOLESALE over the workflow block — knobs are not merged). Authority semantics (ADR-027) are unchanged: delegation changes who may act, not what gates exist. Requires version 0.5+.",
+      "properties": {
+        "may_approve": {
+          "type": "string",
+          "enum": ["clean_dual_approval"],
+          "description": "The operator agent may approve a gate when every configured reviewer for the gated stage returned an approve verdict and zero concerns are open."
+        },
+        "may_route_fixup": {
+          "type": "string",
+          "enum": ["convergent_concerns"],
+          "description": "The operator agent may route review concerns to a fixup when all reviewer verdicts are in, at least one concern is open, and no reviewer rejected."
+        },
+        "may_waive": {
+          "type": "string",
+          "enum": ["solo_low"],
+          "description": "The operator agent may waive a concern when it is the only open concern and its severity is low."
+        },
+        "may_retry": {
+          "type": "string",
+          "enum": ["infra_flake"],
+          "description": "The operator agent may retry a failed stage when the latest stage failure is classified as an infrastructure flake."
+        },
+        "may_merge": {
+          "type": "string",
+          "enum": ["gates_resolved_ci_green"],
+          "description": "The operator agent may merge when no gate approvals are pending, zero concerns are open, the PR is open, and required checks are green. Evaluated and surfaced in v0; merge itself happens on GitHub, so backend enforcement attaches once a merge action surface exists."
+        },
+        "must_page_human": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "Events that always page the human regardless of the may_* knobs. Closed v0 set; an event listed here is never absorbed by a delegation.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "reviewer_reject",
+              "plan_rejection",
+              "scope_amendment",
+              "budget_override",
+              "policy_override",
+              "exception_request",
+              "requirement_arbitration"
+            ]
+          }
+        }
+      }
     },
 
     "approvers": {

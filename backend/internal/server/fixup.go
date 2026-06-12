@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -84,6 +85,13 @@ type fixupRequest struct {
 	// passes per stage. The forced pass is audited (a `forced` flag plus
 	// the operator reason). Default false preserves the prior behaviour.
 	ForceAdditionalPass bool `json:"force_additional_pass"`
+	// Delegated opts the fix-up into the ADR-040 delegated-action path
+	// (#1026): checkDelegation re-evaluates the operator_agent
+	// may_route_fixup condition server-side at action time — 403
+	// delegation_not_configured / delegation_condition_unmet on refusal,
+	// `delegated: "<rule>"` on the stage_fixup_triggered payload when
+	// met. Absent → behavior byte-identical to today.
+	Delegated bool `json:"delegated"`
 }
 
 // validateAllowCreate normalizes and validates the fix-up allow-create
@@ -246,6 +254,18 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Delegated-action enforcement (ADR-040 / #1026): a delegated:true
+	// fix-up must hold the may_route_fixup condition against CURRENT run
+	// state, re-evaluated server-side before any state change.
+	var delegatedRule string
+	if reqBody.Delegated {
+		rule, ok := s.checkDelegation(w, r, stage.RunID, delegation.ActionRouteFixup)
+		if !ok {
+			return
+		}
+		delegatedRule = rule
+	}
+
 	// Resolve the selected concerns. The primary path addresses them by
 	// stable ID against the durable concern store (#964); the deprecated
 	// fallback resolves positional indices against the flattened
@@ -364,7 +384,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// Audit first so the fix-up intent (and the selected concerns the
 	// prompt renderer reads back) is recorded even if the orchestrator
 	// handoff below fails. Same posture as the retry handler.
-	s.writeFixupAudit(r, dec, selected, concernIDs, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses)
+	s.writeFixupAudit(r, dec, selected, concernIDs, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses, delegatedRule)
 
 	// Mark the routed concerns addressed_pending in the durable store
 	// (#964), recording the operator's reason. AFTER the audit append so
@@ -588,9 +608,11 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // prompt renderer delivers them as binding instructions), the operator
 // reason, the declared allow-create paths (#823, folded into the
 // effective scope.files for the fix-up dispatch), and the bounded-pass
-// receipt fields. Best-effort: the transition is already committed, so
-// a failure here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int) {
+// receipt fields. When delegatedRule is non-empty the fix-up landed via
+// the ADR-040 delegated path (#1026) and the payload records
+// `delegated: "<rule>"`. Best-effort: the transition is already
+// committed, so a failure here logs but doesn't unwind.
+func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -634,6 +656,9 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 	// full state change (and downstream tooling can correlate the gate).
 	if dec.ReparkedReview != nil {
 		fields["reparked_review_stage_id"] = dec.ReparkedReview.ID.String()
+	}
+	if delegatedRule != "" {
+		fields["delegated"] = delegatedRule
 	}
 
 	payload, _ := json.Marshal(fields)

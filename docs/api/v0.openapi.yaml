@@ -387,6 +387,23 @@ components:
             `GET /v0/runs/{run_id}` ONLY — the list endpoint omits it
             (no per-row audit query) — and omitted when no drive
             transitions were recorded.
+        delegation:
+          $ref: '#/components/schemas/RunDelegation'
+          description: |
+            Evaluated `operator_agent` delegation surface (ADR-040 /
+            #1026): one entry per configured `may_*` knob with whether
+            current run state satisfies its named condition, plus the
+            effective block's `must_page_human` list — so the operator
+            agent reads its envelope from the server instead of
+            re-deriving conditions client-side. Emitted by
+            `GET /v0/runs/{run_id}` ONLY (no per-row evaluation on the
+            list endpoint); omitted entirely when the run's workflow
+            spec resolves no effective `operator_agent` block
+            (fail-closed: nothing is delegated), on terminal runs, on
+            legacy rows with no cached spec, and best-effort on any
+            evaluation failure. Advisory on this read — the delegated
+            action endpoints re-evaluate the condition server-side at
+            action time and never trust a client-supplied verdict.
         created_at:
           type: string
           format: date-time
@@ -516,6 +533,71 @@ components:
           type: string
           format: date-time
           description: When the transition was recorded.
+
+    RunDelegation:
+      type: object
+      description: |
+        The run's evaluated `operator_agent` delegation envelope
+        (ADR-040 / #1026). The effective block resolves per the spec's
+        precedence — the pending approval gate's block when one is
+        declared, else the workflow-level block, never merged — and
+        each configured knob is evaluated against current run state by
+        `backend/internal/delegation`.
+      required: [actions]
+      properties:
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunDelegationAction'
+          description: |
+            One entry per configured `may_*` knob, in knob order
+            (approve, route_fixup, waive, retry, merge). Knobs the
+            block leaves unset are absent — fail-closed, those actions
+            are not delegated.
+        must_page_human:
+          type: array
+          items:
+            type: string
+          description: |
+            The effective block's `must_page_human` event list —
+            events that always page the human regardless of the
+            `may_*` knobs (closed set per the workflow-v0 schema, e.g.
+            `reviewer_reject`, `plan_rejection`).
+          example: [reviewer_reject, budget_override]
+
+    RunDelegationAction:
+      type: object
+      description: One delegation knob's evaluation.
+      required: [action, condition, met]
+      properties:
+        action:
+          type: string
+          enum: [approve, route_fixup, waive, retry, merge]
+          description: The delegable operator verb the knob governs.
+        condition:
+          type: string
+          enum:
+            - clean_dual_approval
+            - convergent_concerns
+            - solo_low
+            - infra_flake
+            - gates_resolved_ci_green
+          description: |
+            The named backend-evaluable condition the knob delegates
+            under (one per knob in v0, closed set per the workflow-v0
+            schema).
+        met:
+          type: boolean
+          description: |
+            Whether current run state satisfies the condition. `met:
+            true` here is advisory — the delegated action endpoints
+            re-evaluate server-side at action time.
+        unmet_reason:
+          type: string
+          description: |
+            The exact failed predicate when `met` is false, prefixed
+            with the condition name. Omitted when met.
+          example: "clean_dual_approval: 1 of 2 reviewer verdicts received"
 
     WaivedConcern:
       type: object
@@ -2839,6 +2921,30 @@ paths:
                     policy gate: a folded path matching `forbidden_paths`
                     still fails category-B against the produced diff.
                     Honored only on `approve`; ignored on `reject`.
+                delegated:
+                  type: boolean
+                  default: false
+                  description: |
+                    Opts the submission into the ADR-040 delegated-action
+                    path (#1026): the caller (the operator agent) asserts
+                    it acts under the workflow's
+                    `operator_agent.may_approve` knob. The server NEVER
+                    trusts the assertion — it re-evaluates the knob's
+                    condition (`clean_dual_approval`) against current run
+                    state at action time. Refusals are 403:
+                    `delegation_not_configured` when no effective
+                    `operator_agent` block delegates the approve action
+                    (fail-closed — including legacy runs with no cached
+                    spec), `delegation_condition_unmet` with the named
+                    failed predicate in `details.unmet_reason` otherwise.
+                    A refusal inserts no approval row, so a later retry
+                    flows normally. When met, the approval proceeds and
+                    its `approval_submitted` audit payload records
+                    `delegated: "clean_dual_approval"`. Only valid with
+                    `decision: approve` — a delegated reject is 400
+                    (rejection is a human judgment; `reviewer_reject`
+                    pages the human). Omitted → behavior byte-identical
+                    to a human submission.
       responses:
         '200':
           description: |
@@ -2881,7 +2987,27 @@ paths:
                           When the existing approval row was submitted.
                           Only present alongside `duplicate_submission`.
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            Possible error codes:
+
+            - `approver_not_authorized` — a RoleResolver is configured
+              and the subject is not in the gate's approvers list.
+            - `delegation_not_configured` — the request carried
+              `delegated: true` but no effective `operator_agent` block
+              delegates the approve action (ADR-040 / #1026,
+              fail-closed): the spec declares no block, the block has no
+              `may_approve` knob, or the run has no cached workflow
+              spec.
+            - `delegation_condition_unmet` — `delegated: true` and the
+              `may_approve` knob is configured, but its condition is not
+              satisfied by current run state. `details` carries
+              `action`, `condition`, and `unmet_reason` naming the exact
+              failed predicate (e.g. `clean_dual_approval: 1 of 2
+              reviewer verdicts received`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
@@ -3035,6 +3161,22 @@ paths:
                     Operator justification, recorded in the
                     `stage_override_retried` audit entry. Required when
                     `override` is true.
+                delegated:
+                  type: boolean
+                  default: false
+                  description: |
+                    Opts the retry into the ADR-040 delegated-action path
+                    (#1026). The server re-evaluates the
+                    `operator_agent.may_retry` condition (`infra_flake`)
+                    against current run state at action time: 403
+                    `delegation_not_configured` when no effective block
+                    delegates the retry action (fail-closed), 403
+                    `delegation_condition_unmet` with the named failed
+                    predicate when the latest failure is not a
+                    category-A infra flake. When met, the retry proceeds
+                    and the `stage_retried` payload records
+                    `delegated: "infra_flake"`. Omitted → behavior
+                    byte-identical to today.
       responses:
         '200':
           description: Stage re-opened; refreshed Stage row in body.
@@ -3051,12 +3193,17 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            One of two cases: (1) bearer token lacks both `write:stages`
+            Possible error codes: (1) bearer token lacks both `write:stages`
             and `write:retries` scope — body `error` is `insufficient_scope`;
             (2) caller is an mcp token whose run scope does not match the
             target stage's `run_id` — body `error` is `cross_run_retry`.
             MCP tokens (subject `mcp:run:<uuid>`) may only retry stages
-            within their own run.
+            within their own run. (3) `delegated: true` refusals
+            (ADR-040 / #1026): `delegation_not_configured` when no
+            effective `operator_agent` block delegates the retry action
+            (fail-closed), `delegation_condition_unmet` when the
+            `infra_flake` condition is not satisfied — `details` names
+            the exact failed predicate in `unmet_reason`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -3229,6 +3376,23 @@ paths:
                     ceiling even a forced attempt returns 422
                     (`fixup_ceiling_reached`). Default `false` preserves the
                     prior single-pass behaviour.
+                delegated:
+                  type: boolean
+                  default: false
+                  description: |
+                    Opts the fix-up into the ADR-040 delegated-action
+                    path (#1026). The server re-evaluates the
+                    `operator_agent.may_route_fixup` condition
+                    (`convergent_concerns`) against current run state at
+                    action time: 403 `delegation_not_configured` when no
+                    effective block delegates the route_fixup action
+                    (fail-closed), 403 `delegation_condition_unmet` with
+                    the named failed predicate when the implement-review
+                    round is unsettled, a reviewer rejected, or no
+                    concern is open. When met, the fix-up proceeds and
+                    the `stage_fixup_triggered` payload records
+                    `delegated: "convergent_concerns"`. Omitted →
+                    behavior byte-identical to today.
       responses:
         '200':
           description: Stage re-opened for the fix-up pass; refreshed Stage row in body.
@@ -3247,12 +3411,17 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            One of two cases: (1) bearer token lacks both `write:stages` and
-            `write:fixups` scope — body `error` is `insufficient_scope`;
+            Possible error codes: (1) bearer token lacks both `write:stages`
+            and `write:fixups` scope — body `error` is `insufficient_scope`;
             (2) caller is an mcp token (subject `mcp:run:<uuid>`) whose run
             scope does not match the target stage's `run_id` — body `error`
             is `cross_run_fixup`. MCP tokens may only fix up stages within
-            their own run.
+            their own run. (3) `delegated: true` refusals (ADR-040 /
+            #1026): `delegation_not_configured` when no effective
+            `operator_agent` block delegates the route_fixup action
+            (fail-closed), `delegation_condition_unmet` when the
+            `convergent_concerns` condition is not satisfied — `details`
+            names the exact failed predicate in `unmet_reason`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -3330,6 +3499,23 @@ paths:
                     `state_reason`, and shown verbatim to later
                     re-reviews as the waive context — make it
                     self-contained.
+                delegated:
+                  type: boolean
+                  default: false
+                  description: |
+                    Opts the waive into the ADR-040 delegated-action
+                    path (#1026). The server re-evaluates the
+                    `operator_agent.may_waive` condition (`solo_low`)
+                    against current run state at action time, BEFORE the
+                    `concern_waived` intent entry is appended: 403
+                    `delegation_not_configured` when no effective block
+                    delegates the waive action (fail-closed), 403
+                    `delegation_condition_unmet` with the named failed
+                    predicate unless exactly one concern is open and its
+                    severity is low. When met, the waive proceeds and
+                    the `concern_waived` payload records
+                    `delegated: "solo_low"`. Omitted → behavior
+                    byte-identical to today.
       responses:
         '200':
           description: Concern waived; updated concern row in body.
@@ -3346,11 +3532,17 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            One of two cases: (1) bearer token lacks both `write:stages`
+            Possible error codes: (1) bearer token lacks both `write:stages`
             and `write:fixups` scope — body `error` is
             `insufficient_scope`; (2) caller is an mcp token (subject
             `mcp:run:<uuid>`) whose run scope does not match the
             concern's `run_id` — body `error` is `cross_run_waive`.
+            (3) `delegated: true` refusals (ADR-040 / #1026):
+            `delegation_not_configured` when no effective
+            `operator_agent` block delegates the waive action
+            (fail-closed), `delegation_condition_unmet` when the
+            `solo_low` condition is not satisfied — `details` names the
+            exact failed predicate in `unmet_reason`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
