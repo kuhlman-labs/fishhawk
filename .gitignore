@@ -82,3 +82,4 @@ verifier/fishhawk-verify
 # they never leak into a scope-bounded commit as drift (#581). The
 # tracked .fishhawk/workflows.yaml is unaffected (not a .pid file).
 .fishhawk/*.pid
+.fishhawk/dev.nonce
