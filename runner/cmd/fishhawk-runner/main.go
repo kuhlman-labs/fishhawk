@@ -599,6 +599,60 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			cfg.runID, cfg.stageID, cfg.fixupBranch, tipSHA, preAgentRef)
 	}
 
+	// Subsequent-child base establishment (#1036): once a prior sibling has
+	// pushed the shared parent branch, a decomposed child's declared policy
+	// base is that branch (#765) — but the agent ran against the operator's
+	// incidental checkout (typically main), so a slice depending on a prior
+	// sibling's code saw a tree without its dependency and could not compile.
+	// Before invoking the agent, fetch + checkout the shared branch so the
+	// working tree IS the declared base, mirroring the fix-up flow's #967
+	// discipline above. The first child legitimately runs against the base
+	// branch (no shared branch on the remote yet), so the block no-ops when
+	// remoteBranchExists is false; a sibling push landing between this read
+	// and the push-time routing read is exactly the pre-fix shape, handled by
+	// the unchanged stash-transplant + #989 conflict machinery. In the common
+	// case that machinery's stash is now cut from and reapplied onto the same
+	// tip — a content no-op. The restore defer fires BEFORE the #953
+	// stage-wide net (LIFO), whose moved-HEAD guard then sees HEAD already
+	// restored and no-ops — the same double-fire-safe construction as the
+	// fixup block above.
+	if stageType == "implement" && cfg.decomposedFromRunID != "" && !cfg.fixup {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		sharedBranch := "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
+		if remoteBranchExists(ctx, repoDir, sharedBranch) {
+			childCheckoutMoved := false
+			if preAgentCaptured {
+				defer func() {
+					if !childCheckoutMoved {
+						return
+					}
+					if rerr := restoreHead(ctx, repoDir, preAgentRef); rerr != nil {
+						_, _ = fmt.Fprintf(logSink,
+							`{"event":"working_tree_restore_failed","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t,"detail":%q}`+"\n",
+							cfg.runID, cfg.stageID, preAgentRef, preAgentDetached, rerr.Error())
+						return
+					}
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"working_tree_restored","run_id":%q,"stage_id":%q,"original_ref":%q,"detached":%t}`+"\n",
+						cfg.runID, cfg.stageID, preAgentRef, preAgentDetached)
+				}()
+			}
+			tipSHA, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, sharedBranch)
+			if coErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"child_base_checkout","detail":%q}`+"\n", coErr.Error())
+				return exitFailure
+			}
+			childCheckoutMoved = true
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"child_base_established","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"original_ref":%q}`+"\n",
+				cfg.runID, cfg.stageID, sharedBranch, tipSHA, preAgentRef)
+		}
+	}
+
 	invokeStart := time.Now()
 	for {
 		res, invokeErr = invoker.Invoke(ctx, inv)
@@ -2869,6 +2923,16 @@ var (
 	// must never fetch + force-checkout the runner's own source repo.
 	checkoutFixupBase = gitops.CheckoutRemoteBranch
 
+	// checkoutChildBase is the subsequent-decomposed-child base-establishment
+	// seam (#1036), the decomposition analogue of checkoutFixupBase:
+	// production fetches the shared parent branch from the named remote and
+	// checks the working tree out onto the fetched tip so the agent runs
+	// against its declared policy base (#765), returning that tip SHA for the
+	// child_base_established record. A package-level var for the same reason
+	// as checkoutFixupBase: the fake-pusher run() tests default repoDir to
+	// "." and must never fetch + force-checkout the runner's own source repo.
+	checkoutChildBase = gitops.CheckoutRemoteBranch
+
 	// checkoutRunBranch re-checks-out the run branch for the base-rebase-
 	// conflict re-invoke (#989). The local branch ref already points at the
 	// freshly-fetched base — CommitAndPush ran `checkout -B <branch>
@@ -3802,6 +3866,26 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				`{"event":"implement_fixup_no_changes_reported","run_id":%q,"stage_id":%q,"branch":%q,"base_sha":%q}`+"\n",
 				cfg.runID, cfg.stageID, branch, cap.BaseSHA,
 			)
+			return nil
+		}
+		// Decomposed-child no-changes (#1036): the push_to_shared_branch trace
+		// gate (#771) left this child stage in `running`, deferring its
+		// terminal transition to a child-push report a bare return would never
+		// send — the stage hangs until the SLA watchdog reaps it. Report the
+		// existing `failed` outcome (category C, retryable) so the backend
+		// terminalizes the stage, mirroring the standalone no_diff_captured
+		// semantics (#691/#692) with no new backend surface. With the
+		// pre-invoke shared-branch checkout in place a genuine no-changes
+		// child is overwhelmingly a planning/decomposition error; category C
+		// keeps it operator-retryable rather than dooming the fan-out parent
+		// on an un-redrivable B.
+		if isDecomposed {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"implement_child_no_changes","run_id":%q,"stage_id":%q,"shared_branch":%q,"base_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, branch, cap.BaseSHA,
+			)
+			reportPullRequestFailure(ctx, cfg, logSink, client, issued, "C",
+				"child_no_changes: decomposition child implement stage produced no changes; stage terminalized retryable (#1036)")
 			return nil
 		}
 		// Non-fix-up no-changes (first implement pass, no forward gate): no PR to
