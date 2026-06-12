@@ -1621,6 +1621,10 @@ paths:
 
         `Idempotency-Key` shares the `(repo, key)` keyspace with
         `POST /v0/runs`: a replay returns the existing run with 200.
+        Replay is honored BEFORE the budget gate — a network retry of
+        a successful recovery returns the existing run even when the
+        blocking budget tripped between the two calls (replay is not
+        new spend).
 
         **Authorization.** Requires `write:runs` (same as
         `POST /v0/runs`).

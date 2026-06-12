@@ -105,11 +105,13 @@ func (r *recoverRepo) GetRunByIdempotencyKey(_ context.Context, repo, key string
 }
 
 // recoverAuditRepo serves pre-seeded entries via feedbackAuditRepo's
-// ListForRunByCategory and additionally records AppendChained calls
-// so tests can assert the plan_reused_from provenance entry.
+// ListForRunByCategory and additionally records AppendChained and
+// AppendGlobalChained calls so tests can assert the plan_reused_from
+// provenance entry and the budget-gate audit entries.
 type recoverAuditRepo struct {
 	feedbackAuditRepo
-	appended []audit.ChainAppendParams
+	appended       []audit.ChainAppendParams
+	globalAppended []audit.GlobalChainAppendParams
 }
 
 func (a *recoverAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
@@ -117,6 +119,74 @@ func (a *recoverAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendP
 	rid := p.RunID
 	return &audit.Entry{ID: uuid.New(), RunID: &rid, Category: p.Category, Payload: p.Payload}, nil
 }
+
+func (a *recoverAuditRepo) AppendGlobalChained(_ context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	a.globalAppended = append(a.globalAppended, p)
+	return &audit.Entry{ID: uuid.New(), Category: p.Category, Payload: p.Payload}, nil
+}
+
+func (a *recoverAuditRepo) countGlobal(category string) int {
+	n := 0
+	for _, p := range a.globalAppended {
+		if p.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// budgetRecoverRepo adds the SumWorkflowCostInRange capability
+// (webhook.CostSummer) to recoverRepo so the recovery handler's
+// blocking-budget admission gate has a cost source to evaluate.
+type budgetRecoverRepo struct {
+	*recoverRepo
+	spent float64
+}
+
+func (r *budgetRecoverRepo) SumWorkflowCostInRange(_ context.Context, _, _ string, _, _ time.Time) (float64, error) {
+	return r.spent, nil
+}
+
+// recoverBudgetSpecYAML mirrors gatedSpecYAML's plan+implement shape
+// with one weekly blocking budget (limit $50) so recovery tests can
+// drive the admission gate.
+const recoverBudgetSpecYAML = `version: "0.4"
+workflows:
+  feature_change:
+    budgets:
+      - period: weekly
+        limit_usd: 50
+        enforcement: blocking
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// planOnlySpecYAML defines a workflow with no non-plan stages, so a
+// recovery against it has nothing to re-create.
+const planOnlySpecYAML = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
 
 // seedRecoverableParent seeds a parent run with a cached workflow
 // spec, a succeeded plan stage, and an implement stage failed with
@@ -417,6 +487,42 @@ func TestRecoverRun_GateMatrix(t *testing.T) {
 		assertErrorCode(t, w, "recovery_unsupported")
 	})
 
+	t.Run("unparseable workflow spec", func(t *testing.T) {
+		s, rr, _, _ := newRecoverServer(t)
+		parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+		parent.WorkflowSpec = []byte("workflows: [unclosed")
+		w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "recovery_unsupported")
+		assertNoRunMinted(t, rr)
+	})
+
+	t.Run("workflow_id not in spec", func(t *testing.T) {
+		s, rr, _, _ := newRecoverServer(t)
+		parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+		parent.WorkflowID = "not_in_spec"
+		w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "recovery_unsupported")
+		assertNoRunMinted(t, rr)
+	})
+
+	t.Run("no non-plan stages", func(t *testing.T) {
+		s, rr, _, _ := newRecoverServer(t)
+		parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+		parent.WorkflowSpec = []byte(planOnlySpecYAML)
+		w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "recovery_unsupported")
+		assertNoRunMinted(t, rr)
+	})
+
 	t.Run("bad paths", func(t *testing.T) {
 		s, rr, _, _ := newRecoverServer(t)
 		parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
@@ -494,6 +600,118 @@ func TestRecoverRun_IdempotencyKeyReplay(t *testing.T) {
 	}
 	if first.ID != second.ID {
 		t.Errorf("replay minted a second run: %s vs %s", first.ID, second.ID)
+	}
+}
+
+func newRecoverBudgetServer(t *testing.T, spent float64) (*Server, *budgetRecoverRepo, *recoverAuditRepo) {
+	t.Helper()
+	rr := &budgetRecoverRepo{recoverRepo: newRecoverRepo(), spent: spent}
+	au := &recoverAuditRepo{}
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: newFakeScopeAmendmentRepo(),
+		AuditRepo:          au,
+	})
+	return s, rr, au
+}
+
+// TestRecoverRun_BlockingBudget covers the recovery-specific wiring of
+// the #688 admission gate: recovery is new spend, so an exhausted
+// blocking budget refuses with 402 (no run minted), and
+// budget_override forces past it exactly like POST /v0/runs.
+func TestRecoverRun_BlockingBudget(t *testing.T) {
+	t.Run("exhausted refused", func(t *testing.T) {
+		s, rr, au := newRecoverBudgetServer(t, 100) // over the 50 limit
+		parent, _, _ := seedRecoverableParent(rr.recoverRepo, run.StageStateFailed, failureCat(run.FailureB))
+		parent.WorkflowSpec = []byte(recoverBudgetSpecYAML)
+
+		w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+		if w.Code != http.StatusPaymentRequired {
+			t.Fatalf("status = %d, want 402:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "budget_exhausted")
+		if n := au.countGlobal("run_rejected_budget"); n != 1 {
+			t.Errorf("run_rejected_budget audits = %d, want 1", n)
+		}
+		assertNoRunMinted(t, rr.recoverRepo)
+	})
+
+	t.Run("override admitted", func(t *testing.T) {
+		s, rr, au := newRecoverBudgetServer(t, 100)
+		parent, _, _ := seedRecoverableParent(rr.recoverRepo, run.StageStateFailed, failureCat(run.FailureB))
+		parent.WorkflowSpec = []byte(recoverBudgetSpecYAML)
+
+		w := postRecover(t, s, parent.ID.String(), `{"budget_override":true}`, nil)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		var resp runResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.ParentRunID == nil || *resp.ParentRunID != parent.ID {
+			t.Errorf("ParentRunID = %v, want %s", resp.ParentRunID, parent.ID)
+		}
+		if n := au.countGlobal("run_admitted_budget_override"); n != 1 {
+			t.Errorf("run_admitted_budget_override audits = %d, want 1", n)
+		}
+		if n := au.countGlobal("run_rejected_budget"); n != 0 {
+			t.Errorf("run_rejected_budget audits = %d, want 0 on override", n)
+		}
+	})
+}
+
+// TestRecoverRun_IdempotencyKeyReplay_BudgetExhaustedBetweenCalls pins
+// the replay contract under changed budget state: a successful
+// recovery followed by a network retry must return the existing run
+// with 200 even when the blocking budget tripped between the two
+// calls — replay is honored BEFORE the budget gate because it is not
+// new spend.
+func TestRecoverRun_IdempotencyKeyReplay_BudgetExhaustedBetweenCalls(t *testing.T) {
+	s, rr, au := newRecoverBudgetServer(t, 10) // under the 50 limit
+	parent, _, _ := seedRecoverableParent(rr.recoverRepo, run.StageStateFailed, failureCat(run.FailureB))
+	parent.WorkflowSpec = []byte(recoverBudgetSpecYAML)
+
+	headers := map[string]string{"Idempotency-Key": "recover-then-exhaust"}
+	w1 := postRecover(t, s, parent.ID.String(), `{}`, headers)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first call status = %d, want 201:\n%s", w1.Code, w1.Body.String())
+	}
+	var first runResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rr.spent = 100 // budget now blocking
+
+	w2 := postRecover(t, s, parent.ID.String(), `{}`, headers)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 (replay wins over the budget gate):\n%s",
+			w2.Code, w2.Body.String())
+	}
+	var second runResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if first.ID != second.ID {
+		t.Errorf("replay returned a different run: %s vs %s", first.ID, second.ID)
+	}
+	if n := au.countGlobal("run_rejected_budget"); n != 0 {
+		t.Errorf("run_rejected_budget audits = %d, want 0 (replay never reaches the gate)", n)
+	}
+}
+
+// assertNoRunMinted asserts the store holds only the seeded parent —
+// a refusing guard must fire before CreateRun.
+func assertNoRunMinted(t *testing.T, rr *recoverRepo) {
+	t.Helper()
+	rows, err := rr.ListRuns(context.Background(), run.ListRunsFilter{})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("runs = %d, want 1 (the parent only)", len(rows))
 	}
 }
 

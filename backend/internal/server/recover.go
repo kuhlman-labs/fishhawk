@@ -206,16 +206,13 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Blocking periodic-budget admission gate (#688 / ADR-030):
-	// recovery is new spend. checkBlockingBudget writes the error
-	// response (and the audit) on refusal.
-	if !s.checkBlockingBudget(w, r, parent.Repo, parent.WorkflowID, workflowDef.Budgets, req.BudgetOverride) {
-		return
-	}
-
 	// Idempotency-Key (E8.2): replay returns the existing run with
 	// 200 so a network-hiccup re-call can't mint two recovery runs.
-	// Same (repo, key) keyspace as POST /v0/runs.
+	// Same (repo, key) keyspace as POST /v0/runs. Replay is honored
+	// BEFORE the budget gate: a successful recovery followed by a
+	// network retry must return the existing run even when the
+	// blocking budget tripped between the two calls — replay is not
+	// new spend.
 	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if idempKey != "" {
 		existing, err := s.cfg.RunRepo.GetRunByIdempotencyKey(r.Context(), parent.Repo, idempKey)
@@ -230,6 +227,13 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 				"idempotency lookup failed", map[string]any{"error": err.Error()})
 			return
 		}
+	}
+
+	// Blocking periodic-budget admission gate (#688 / ADR-030):
+	// recovery is new spend. checkBlockingBudget writes the error
+	// response (and the audit) on refusal.
+	if !s.checkBlockingBudget(w, r, parent.Repo, parent.WorkflowID, workflowDef.Budgets, req.BudgetOverride) {
+		return
 	}
 
 	// Mint the recovery run, mirroring handleCIFailureRetry's
