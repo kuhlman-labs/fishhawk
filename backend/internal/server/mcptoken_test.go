@@ -619,6 +619,80 @@ func TestHandleIssueMCPToken_SucceededPlanPendingImplementGrantsScopeAmendments(
 	}
 }
 
+// --- #1030 fallback × agent_self_retry (direct pins, PR #1032 concern 4f13d8b2) ---
+
+func TestHandleIssueMCPToken_PendingImplementSelfRetryGrantsWriteRetries(t *testing.T) {
+	// Decomposition-child shape: the run's ONLY stage is a still-
+	// pending implement stage whose spec stage opts into
+	// executor.agent_self_retry. The #1030 fallback must resolve the
+	// pending stage so the token carries write:retries. Workflow key
+	// matches seedRun's WorkflowID ("w"); resolveAgentSelfRetry looks
+	// the spec stage up by sequence, so the implement-only spec mirrors
+	// the implement-only stage row.
+	s, sf, mt, runRow := scopeAmendmentTokenServerSeeded(t,
+		stageSeed{run.StageTypeImplement, run.StageStatePending})
+	runRow.WorkflowSpec = []byte(`
+version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_self_retry: true
+        produces:
+          - artifact: pull_request
+`)
+
+	scopes := issuedScopes(t, s, sf, mt, runRow)
+	found := false
+	for _, sc := range scopes {
+		if sc == "write:retries" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("pending-implement self-retry child token missing write:retries: %v", scopes)
+	}
+}
+
+func TestHandleIssueMCPToken_PlanFirstSelfRetryOmitsWriteRetries(t *testing.T) {
+	// Plan-first run with the implement stage opted into
+	// agent_self_retry: the fallback stops at the FIRST non-terminal
+	// stage (the plan stage), which does not opt in, so write:retries
+	// must stay off the token.
+	s, sf, mt, runRow := scopeAmendmentTokenServerSeeded(t,
+		stageSeed{run.StageTypePlan, run.StageStatePending},
+		stageSeed{run.StageTypeImplement, run.StageStatePending})
+	runRow.WorkflowSpec = []byte(`
+version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_self_retry: true
+        produces:
+          - artifact: pull_request
+`)
+
+	for _, sc := range issuedScopes(t, s, sf, mt, runRow) {
+		if sc == "write:retries" {
+			t.Errorf("plan-first token granted write:retries")
+		}
+	}
+}
+
 // TestHandleIssueMCPToken_TokenCanReadOwnRunAmendments is the
 // end-to-end auth check the #961 plan names: a freshly issued
 // implement-stage agent token GETs its own run's scope amendments

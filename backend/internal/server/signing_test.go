@@ -696,6 +696,149 @@ workflows:
 	}
 }
 
+// signingTTLSpec60m resolves a 60m budget for every stage via
+// policy.max_stage_runtime, so budget + buffer = 65m > DefaultTTL.
+var signingTTLSpec60m = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    policy:
+      max_stage_runtime: "60m"
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+
+// issueAndDecodeTTL issues a signing key for runID against a server
+// wired to runRepo and returns the response's ExpiresAt - IssuedAt.
+func issueAndDecodeTTL(t *testing.T, runRepo *fakeOIDCRunRepo, runID uuid.UUID) time.Duration {
+	t.Helper()
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: newFakeSigningRepo(),
+		RunRepo:     runRepo,
+	})
+	w := issueRequest(t, s, runID, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got signingKeyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return got.ExpiresAt.Sub(got.IssuedAt)
+}
+
+func TestIssueSigningKey_TTLPendingFirstImplement(t *testing.T) {
+	// Decomposition-child shape (#1033, run d816e58a): the run's ONLY
+	// stage is a still-pending implement stage — local-runner stages
+	// stay `pending` for their whole execution, so the pre-fix
+	// dispatched/running-only loop resolved no stage and issued
+	// DefaultTTL (30m), expiring the key under a 31m implement stage.
+	// The #1030 active-or-next fallback resolves the pending stage:
+	// TTL = 60m budget + 5m buffer.
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{
+		runRow: &run.Run{
+			ID:           runID,
+			Repo:         "kuhlman-labs/example",
+			WorkflowID:   "feature_change",
+			WorkflowSpec: signingTTLSpec60m,
+		},
+		stages: []*run.Stage{
+			{
+				ID:       uuid.New(),
+				RunID:    runID,
+				Sequence: 1,
+				Type:     run.StageTypeImplement,
+				State:    run.StageStatePending,
+			},
+		},
+	}
+	want := 65 * time.Minute
+	if ttl := issueAndDecodeTTL(t, runRepo, runID); ttl != want {
+		t.Errorf("TTL = %v, want %v (budget + buffer, not DefaultTTL %v)", ttl, want, signing.DefaultTTL)
+	}
+}
+
+func TestIssueSigningKey_TTLSucceededPlanPendingImplement(t *testing.T) {
+	// Post-approval local gap: plan succeeded, implement still pending
+	// (no orchestrator dispatch under a local runner) — terminal stages
+	// are skipped and the implement stage's budget resolves.
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{
+		runRow: &run.Run{
+			ID:           runID,
+			Repo:         "kuhlman-labs/example",
+			WorkflowID:   "feature_change",
+			WorkflowSpec: signingTTLSpec60m,
+		},
+		stages: []*run.Stage{
+			{
+				ID:       uuid.New(),
+				RunID:    runID,
+				Sequence: 1,
+				Type:     run.StageTypePlan,
+				State:    run.StageStateSucceeded,
+			},
+			{
+				ID:       uuid.New(),
+				RunID:    runID,
+				Sequence: 2,
+				Type:     run.StageTypeImplement,
+				State:    run.StageStatePending,
+			},
+		},
+	}
+	want := 65 * time.Minute
+	if ttl := issueAndDecodeTTL(t, runRepo, runID); ttl != want {
+		t.Errorf("TTL = %v, want %v (implement budget + buffer)", ttl, want)
+	}
+}
+
+func TestIssueSigningKey_TTLAllTerminalFallsBackToDefault(t *testing.T) {
+	// Every stage terminal → activeOrNextStage returns nil and the
+	// resolver still degrades to DefaultTTL.
+	runID := uuid.New()
+	runRepo := &fakeOIDCRunRepo{
+		runRow: &run.Run{
+			ID:           runID,
+			Repo:         "kuhlman-labs/example",
+			WorkflowID:   "feature_change",
+			WorkflowSpec: signingTTLSpec60m,
+		},
+		stages: []*run.Stage{
+			{
+				ID:       uuid.New(),
+				RunID:    runID,
+				Sequence: 1,
+				Type:     run.StageTypePlan,
+				State:    run.StageStateSucceeded,
+			},
+			{
+				ID:       uuid.New(),
+				RunID:    runID,
+				Sequence: 2,
+				Type:     run.StageTypeImplement,
+				State:    run.StageStateSucceeded,
+			},
+		},
+	}
+	if ttl := issueAndDecodeTTL(t, runRepo, runID); ttl != signing.DefaultTTL {
+		t.Errorf("TTL = %v, want %v (DefaultTTL)", ttl, signing.DefaultTTL)
+	}
+}
+
 func TestIssueSigningKey_NoSpecFallsBackToDefault(t *testing.T) {
 	// WorkflowSpec=nil → DefaultTTL regardless of stage state.
 	runID := uuid.New()

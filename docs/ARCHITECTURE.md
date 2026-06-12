@@ -310,7 +310,7 @@ The frontend (`/frontend`, planned) is its own npm workspace; it talks to the ba
 | Web UI (CSRF) | `__Host-csrf` cookie + `X-CSRF-Token` header | Tied to session row | With session |
 | CLI / programmatic API | `Authorization: Bearer <opaque-token>` | `api_tokens` row with scopes | Immediate (mark revoked) |
 | Runner → backend | GitHub OIDC token (verified per request) | Stateless | TTL ~10min from GitHub |
-| Runner trace upload | Ed25519 signature with per-run key | `signing_keys` row | TTL = max(30m, resolved stage budget + 5m); budget sourced from `spec.ResolveStageTimeout` so timed-out stages retain a valid key long enough to upload their trace |
+| Runner trace upload | Ed25519 signature with per-run key | `signing_keys` row | TTL = max(30m, resolved stage budget + 5m); the stage resolves via the active-or-next rule (#1030 fallback: first dispatched/running, else first non-terminal), so a local-runner first-stage run (decomposition child) gets budget + buffer rather than the 30m default; budget sourced from `spec.ResolveStageTimeout` so timed-out stages retain a valid key long enough to upload their trace |
 
 GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. Approvers in the workflow spec resolve to GitHub team members via the GitHub App's installation token (E4.4 / #50).
 
