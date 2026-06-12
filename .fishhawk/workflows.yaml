@@ -11,7 +11,7 @@
 # When the product can execute this spec, the syntax may be revised to
 # match the frozen v0 schema. The intent expressed here will not change.
 
-version: "0.4"
+version: "0.5"
 
 roles:
   founder:
@@ -30,6 +30,21 @@ workflows:
     # (review settlement, fixup re-park, derived awaiting_merge) and
     # surfaces next_action; judgment points still park for the human.
     drive: true
+    # Operator-agent delegation (ADR-040 D2 / #1026, dogfood #1028):
+    # the medium autonomy preset per METHODOLOGY.md — approve/fixup/retry
+    # delegated under their named conditions; waive and merge stay human.
+    operator_agent:
+      may_approve: clean_dual_approval
+      may_route_fixup: convergent_concerns
+      may_retry: infra_flake
+      must_page_human:
+        - reviewer_reject
+        - plan_rejection
+        - scope_amendment
+        - budget_override
+        - policy_override
+        - exception_request
+        - requirement_arbitration
     policy:
       max_stage_runtime: "30m"
     # Periodic cost ceiling (ADR-030 / #688). Advisory — emits a

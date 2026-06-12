@@ -1,0 +1,12 @@
+# Per-repo operator role overlay (ADR-040 D1, #1028 dogfood).
+# Thin by design: knob preset selection, local conventions, and the
+# work-management pointer ONLY. Procedure lives in the product's
+# shipped role spec (docs/spec/operator-role-default.yaml).
+spec_version: operator-role-v0
+knob_presets:
+  autonomy: medium
+conventions:
+  escalation_contact: "page the human in the driving session; issue-comment fallback for unattended runs"
+  merge_ritual_local: "checks green -> operator approving review -> CLEAN -> squash merge -> scripts/dev post-merge -> daemon pid check; delete run branches after merge"
+  base_commit_exceptions: ".fishhawk config and one-line environmental fixes only, signed, audited (vouch path pending #1044)"
+work_management: "github-project:kuhlman-labs/7"
