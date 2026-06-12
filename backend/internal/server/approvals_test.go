@@ -2093,7 +2093,7 @@ func TestSubmitApproval_Delegated_FooterNamesRoleAndRule(t *testing.T) {
 		t.Fatalf("re-marshal payload: %v", err)
 	}
 	footer := issuecomment.PlanStatusFooterForAuditPayload(raw)
-	want := "_Status: approved by the operator agent (`operator-agent/operator-role-v0`, delegated: clean_dual_approval) · implementing now_"
+	want := "_Status: approved by the operator agent (`operator-agent/operator-role-v0`, delegated: `clean_dual_approval`) · implementing now_"
 	if footer != want {
 		t.Errorf("delegated footer = %q, want %q", footer, want)
 	}

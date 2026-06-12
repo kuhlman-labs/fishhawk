@@ -640,9 +640,14 @@ func renderPlanStatusFooter(s *planStatus) string {
 //     mention path, unchanged).
 //  2. An operator-agent token subject (operatorrole.IsTokenSubject,
 //     ADR-040 / #1027) → "the operator agent (`<subject>`, delegated:
-//     <rule>)", naming the delegation rule when the audit payload
-//     recorded one (#1026); without a rule the parenthetical carries
-//     the subject alone.
+//     `<rule>`)", naming the delegation rule when the audit payload
+//     recorded one (#1026); without a rule (or when the rule
+//     sanitizes to empty) the parenthetical carries the subject
+//     alone. The rule passes through the same sanitizer as the
+//     subject and sits inside its own code span — it is read from
+//     the audit payload, so it gets the identical no-markdown,
+//     no-mention containment even though today's writer only ever
+//     stamps a workflow-spec rule identifier.
 //  3. Any other non-empty, non-"anonymous" subject → the subject
 //     verbatim inside a markdown code span (sanitized; no `@` prefix,
 //     so GitHub cannot ping a real user — the #751 stop-the-ping
@@ -657,8 +662,8 @@ func renderApproverIdentity(subject, delegatedRule string) string {
 		return "@" + subject
 	}
 	if operatorrole.IsTokenSubject(subject) {
-		if delegatedRule != "" {
-			return fmt.Sprintf("the operator agent (`%s`, delegated: %s)", sanitizeSubjectForCodeSpan(subject), delegatedRule)
+		if rule := sanitizeSubjectForCodeSpan(delegatedRule); rule != "" {
+			return fmt.Sprintf("the operator agent (`%s`, delegated: `%s`)", sanitizeSubjectForCodeSpan(subject), rule)
 		}
 		return fmt.Sprintf("the operator agent (`%s`)", sanitizeSubjectForCodeSpan(subject))
 	}
@@ -675,8 +680,10 @@ func renderApproverIdentity(subject, delegatedRule string) string {
 // pathological token subject can't balloon the issue comment.
 const maxRenderedSubjectRunes = 64
 
-// sanitizeSubjectForCodeSpan prepares a non-login subject for verbatim
-// display inside a single-backtick markdown code span. Backticks are
+// sanitizeSubjectForCodeSpan prepares a non-login subject (or the
+// delegated rule name, which renderApproverIdentity contains the same
+// way) for verbatim display inside a single-backtick markdown code
+// span. Backticks are
 // replaced (with "'") rather than stripped BEFORE wrapping, so no
 // subject can close the span and re-enable markdown or an @-mention;
 // control characters (including newlines, which also break a code

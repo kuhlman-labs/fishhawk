@@ -518,12 +518,38 @@ func TestPlanStatusFooterForAuditPayload_IdentityForms(t *testing.T) {
 				"approver":  "operator-agent/operator-role-v0",
 				"delegated": "clean_dual_approval",
 			},
-			wantActor: "the operator agent (`operator-agent/operator-role-v0`, delegated: clean_dual_approval)",
+			wantActor: "the operator agent (`operator-agent/operator-role-v0`, delegated: `clean_dual_approval`)",
 		},
 		{
 			name: "operator-agent subject without delegated field",
 			payload: map[string]any{
 				"approver": "operator-agent/operator-role-v0",
+			},
+			wantActor: "the operator agent (`operator-agent/operator-role-v0`)",
+		},
+		{
+			// The delegated rule comes from the audit payload; even
+			// though writeApprovalAudit only ever stamps a workflow-spec
+			// rule identifier, the render must contain a hostile value
+			// the same way it contains the subject — backticks replaced,
+			// newlines dropped, leading `@` stripped, all inside one
+			// code span — so the rule clause can never re-enable
+			// markdown or an @-mention.
+			name: "delegated rule with backticks, newline, and mention sanitized into its own code span",
+			payload: map[string]any{
+				"approver":  "operator-agent/operator-role-v0",
+				"delegated": "rule`@kuhlman-labs\n**bold**",
+			},
+			wantActor: "the operator agent (`operator-agent/operator-role-v0`, delegated: `rule'@kuhlman-labs**bold**`)",
+		},
+		{
+			// A rule that sanitizes to empty (only control characters)
+			// falls back to the no-rule parenthetical rather than
+			// rendering an empty code span.
+			name: "delegated rule that sanitizes to empty drops the rule clause",
+			payload: map[string]any{
+				"approver":  "operator-agent/operator-role-v0",
+				"delegated": "\n\t\x07",
 			},
 			wantActor: "the operator agent (`operator-agent/operator-role-v0`)",
 		},
@@ -546,6 +572,21 @@ func TestPlanStatusFooterForAuditPayload_IdentityForms(t *testing.T) {
 			name:      "subject that is only backticks stays one literal span",
 			payload:   map[string]any{"approver": "```"},
 			wantActor: "`'''`",
+		},
+		{
+			// Sanitizing can yield "" (every rune dropped); the caller
+			// must fall back to "an approver" rather than render an
+			// empty code span.
+			name:      "subject that is only control characters falls back to an approver",
+			payload:   map[string]any{"approver": "\n\t\x07\x1b"},
+			wantActor: "an approver",
+		},
+		{
+			// A pathological subject is capped at maxRenderedSubjectRunes
+			// (64) so it can't balloon the comment.
+			name:      "over-long subject is capped at 64 runes",
+			payload:   map[string]any{"approver": strings.Repeat("a", 70)},
+			wantActor: "`" + strings.Repeat("a", 64) + "`",
 		},
 		{
 			name:      "empty subject",
