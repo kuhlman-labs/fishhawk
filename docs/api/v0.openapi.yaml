@@ -387,6 +387,23 @@ components:
             `GET /v0/runs/{run_id}` ONLY — the list endpoint omits it
             (no per-row audit query) — and omitted when no drive
             transitions were recorded.
+        delegation:
+          $ref: '#/components/schemas/RunDelegation'
+          description: |
+            Evaluated `operator_agent` delegation surface (ADR-040 /
+            #1026): one entry per configured `may_*` knob with whether
+            current run state satisfies its named condition, plus the
+            effective block's `must_page_human` list — so the operator
+            agent reads its envelope from the server instead of
+            re-deriving conditions client-side. Emitted by
+            `GET /v0/runs/{run_id}` ONLY (no per-row evaluation on the
+            list endpoint); omitted entirely when the run's workflow
+            spec resolves no effective `operator_agent` block
+            (fail-closed: nothing is delegated), on terminal runs, on
+            legacy rows with no cached spec, and best-effort on any
+            evaluation failure. Advisory on this read — the delegated
+            action endpoints re-evaluate the condition server-side at
+            action time and never trust a client-supplied verdict.
         created_at:
           type: string
           format: date-time
@@ -516,6 +533,71 @@ components:
           type: string
           format: date-time
           description: When the transition was recorded.
+
+    RunDelegation:
+      type: object
+      description: |
+        The run's evaluated `operator_agent` delegation envelope
+        (ADR-040 / #1026). The effective block resolves per the spec's
+        precedence — the pending approval gate's block when one is
+        declared, else the workflow-level block, never merged — and
+        each configured knob is evaluated against current run state by
+        `backend/internal/delegation`.
+      required: [actions]
+      properties:
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunDelegationAction'
+          description: |
+            One entry per configured `may_*` knob, in knob order
+            (approve, route_fixup, waive, retry, merge). Knobs the
+            block leaves unset are absent — fail-closed, those actions
+            are not delegated.
+        must_page_human:
+          type: array
+          items:
+            type: string
+          description: |
+            The effective block's `must_page_human` event list —
+            events that always page the human regardless of the
+            `may_*` knobs (closed set per the workflow-v0 schema, e.g.
+            `reviewer_reject`, `plan_rejection`).
+          example: [reviewer_reject, budget_override]
+
+    RunDelegationAction:
+      type: object
+      description: One delegation knob's evaluation.
+      required: [action, condition, met]
+      properties:
+        action:
+          type: string
+          enum: [approve, route_fixup, waive, retry, merge]
+          description: The delegable operator verb the knob governs.
+        condition:
+          type: string
+          enum:
+            - clean_dual_approval
+            - convergent_concerns
+            - solo_low
+            - infra_flake
+            - gates_resolved_ci_green
+          description: |
+            The named backend-evaluable condition the knob delegates
+            under (one per knob in v0, closed set per the workflow-v0
+            schema).
+        met:
+          type: boolean
+          description: |
+            Whether current run state satisfies the condition. `met:
+            true` here is advisory — the delegated action endpoints
+            re-evaluate server-side at action time.
+        unmet_reason:
+          type: string
+          description: |
+            The exact failed predicate when `met` is false, prefixed
+            with the condition name. Omitted when met.
+          example: "clean_dual_approval: 1 of 2 reviewer verdicts received"
 
     WaivedConcern:
       type: object
