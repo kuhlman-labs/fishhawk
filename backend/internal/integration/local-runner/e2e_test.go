@@ -92,6 +92,26 @@ func cannedPlanJSON(t *testing.T) []byte {
 
 func newLocalRunnerFixture(t *testing.T) *localRunnerFixture {
 	t.Helper()
+	return newLocalRunnerFixtureWithTokenProvider(t, false)
+}
+
+// newLocalRunnerFixtureWithTokenProvider is newLocalRunnerFixture with the
+// installation-token endpoint's GitHubTokens provider optionally wired.
+//
+// Default (false): the endpoint 503s installation_token_unconfigured, which
+// the runner surfaces as a generic token-fetch failure WITHOUT consulting the
+// gh-CLI fallback (#713). The push-failure tests depend on this: it is what
+// keeps them hermetic on a developer machine, where `gh auth token` can
+// resolve real keychain credentials even with GH_CONFIG_DIR pointed at an
+// empty dir — wiring the provider fixture-wide once routed those tests
+// through the fallback and pushed real branches to the real repo.
+//
+// withTokenProvider=true: runs without an InstallationID get the documented
+// 400 no_installation_for_run (→ the runner's ErrNoInstallation → gh-CLI
+// fallback). Only safe for tests that ALSO shim `gh` on PATH so the fallback
+// can never reach real credentials.
+func newLocalRunnerFixtureWithTokenProvider(t *testing.T, withTokenProvider bool) *localRunnerFixture {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
@@ -141,7 +161,7 @@ func newLocalRunnerFixture(t *testing.T) *localRunnerFixture {
 	signingRepo := signing.NewPostgresRepository(pool)
 	auditRepo := audit.NewPostgresRepository(pool)
 	artifactRepo := artifact.NewPostgresRepository(pool)
-	srv := server.New(server.Config{
+	srvCfg := server.Config{
 		Addr:         "127.0.0.1:0",
 		RunRepo:      runRepo,
 		SigningRepo:  signingRepo,
@@ -153,7 +173,17 @@ func newLocalRunnerFixture(t *testing.T) *localRunnerFixture {
 		// CLI-triggered runs with no issue ref, so the nil tokens never
 		// touch the wire.
 		GitHub: githubclient.New(nil),
-	})
+	}
+	if withTokenProvider {
+		// A never-called token provider satisfies the installation-token
+		// endpoint's configured guard so runs WITHOUT an installation get
+		// the documented 400 no_installation_for_run. No fixture run
+		// carries an InstallationID, so the no-installation check always
+		// fires before Token could be reached. See the function doc for
+		// why this is opt-in.
+		srvCfg.GitHubTokens = unreachableTokenProvider{}
+	}
+	srv := server.New(srvCfg)
 	httpSrv := httptest.NewServer(srv.Handler())
 	t.Cleanup(httpSrv.Close)
 
@@ -196,6 +226,16 @@ func newLocalRunnerFixture(t *testing.T) *localRunnerFixture {
 		runnerBinary: binary,
 		fakeAgentDir: fakeDir,
 	}
+}
+
+// unreachableTokenProvider satisfies githubapp.TokenProvider for the
+// installation-token endpoint's configured guard. The fixture never stamps
+// an InstallationID on a run, so the handler's no_installation_for_run check
+// rejects every request before Token is reached.
+type unreachableTokenProvider struct{}
+
+func (unreachableTokenProvider) Token(context.Context, int64) (string, error) {
+	return "", errors.New("unreachable: no fixture run carries an installation_id")
 }
 
 func runnerBinaryName() string {
@@ -896,6 +936,169 @@ func TestE2E_LocalRunner_DecomposedChildPushFailure_NoZombie(t *testing.T) {
 	// see the function doc — the sweeper only consolidates terminal-succeeded
 	// children and is not wired into this fixture, so asserting parent state
 	// here would be vacuous.
+}
+
+// TestE2E_LocalRunner_DecomposedChildNoChanges_TerminalizesFailedC is the
+// #1036 no-changes cross-boundary test: a decomposed child whose agent
+// produces ZERO edits used to bare-return from the runner's NoChanges
+// short-circuit, leaving the implement stage wedged in `running` — the
+// push_to_shared_branch trace gate (#771) defers the terminal transition to
+// a child-push report that never came. The runner now reports
+// {outcome:"failed", category:"C"} and the backend's existing failed-outcome
+// handler drives the stage terminal. This drives a real decomposed-child
+// implement stage whose fake agent writes nothing and asserts the stage
+// lands `failed` category C (retryable) end to end — runner report wire →
+// backend handler → stage state machine — rather than wedged in `running`.
+//
+// Unlike the push-failure test above, the gh-CLI token fallback (#713) is
+// SATISFIED via a fake `gh` shim: the runner must get past the token step to
+// reach CommitAndPush's NoChanges short-circuit, which probes the working
+// tree (`status --porcelain`) before any remote access, so the remote-less
+// temp repo never sees a network call.
+func TestE2E_LocalRunner_DecomposedChildNoChanges_TerminalizesFailedC(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available; skipping decomposed-child no-changes E2E")
+	}
+	// Token provider wired so the run gets 400 no_installation_for_run and
+	// the runner takes the gh-CLI fallback — satisfied below by a fake `gh`
+	// shim, never the operator's real credentials.
+	fx := newLocalRunnerFixtureWithTokenProvider(t, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	parent, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef-childnochanges-parent",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun parent: %v", err)
+	}
+
+	child, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef-childnochanges-child",
+		TriggerSource:  runpkg.TriggerCLI,
+		RunnerKind:     runpkg.RunnerKindLocal,
+		DecomposedFrom: &parent.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun child: %v", err)
+	}
+
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: child.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := fx.artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       scopedPlanJSON(t, "added.txt"),
+		ContentHash:   "childnochanges-e2e",
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: child.ID, Sequence: 2, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code", RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+
+	// Working tree: a git repo on `main` with one base commit. The fake agent
+	// writes NOTHING, so the tree stays clean — the no-changes shape.
+	workDir := t.TempDir()
+	gitRepoInit(t, workDir)
+
+	fakeDir := t.TempDir()
+	fakeScript := filepath.Join(fakeDir, "claude")
+	if runtime.GOOS == "windows" {
+		fakeScript = filepath.Join(fakeDir, "claude.bat")
+	}
+	scriptBody := "#!/bin/sh\nprintf '{\"type\":\"result\"}\\n'\n"
+	if err := os.WriteFile(fakeScript, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	// Fake gh shim: the gh-CLI token fallback must SUCCEED so the runner
+	// reaches CommitAndPush (which short-circuits NoChanges before any
+	// remote access — the canned token never touches the wire).
+	fakeGh := filepath.Join(fakeDir, "gh")
+	if runtime.GOOS == "windows" {
+		fakeGh = filepath.Join(fakeDir, "gh.bat")
+	}
+	if err := os.WriteFile(fakeGh, []byte("#!/bin/sh\necho fake-token\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+
+	ghConfigDir := t.TempDir()
+
+	cmd := exec.CommandContext(ctx, fx.runnerBinary,
+		"--run-id", child.ID.String(),
+		"--backend-url", fx.url,
+		"--workflow", "feature_change",
+		"--stage", "implement",
+		"--stage-id", implStage.ID.String(),
+		"--fetch-prompt",
+		"--upload-trace",
+		"--working-dir", workDir,
+		"--check-base-ref", "main",
+		"--github-repo", "kuhlman-labs/fishhawk",
+		"--base-branch", "main",
+	)
+	runnerEnv := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		switch {
+		case strings.HasPrefix(e, "PATH="):
+			e = "PATH=" + fakeDir + ":" + strings.TrimPrefix(e, "PATH=")
+		case strings.HasPrefix(e, "GH_TOKEN="), strings.HasPrefix(e, "GITHUB_TOKEN="), strings.HasPrefix(e, "GH_CONFIG_DIR="):
+			continue
+		}
+		runnerEnv = append(runnerEnv, e)
+	}
+	runnerEnv = append(runnerEnv, "GH_TOKEN=", "GITHUB_TOKEN=", "GH_CONFIG_DIR="+ghConfigDir)
+	cmd.Env = runnerEnv
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	// The runner exits 0: the no-changes report is the deliberate outcome of
+	// a successful runner pass, not a runner-side failure.
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("runner exited non-zero: %v\noutput:\n%s", err, out.String())
+	}
+
+	// The child implement stage must land FAILED with category C — never
+	// wedged in `running` (the pre-#1036 shape: the push_to_shared_branch
+	// gate deferred the terminal transition to a report that never came).
+	got, err := fx.runRepo.GetStage(ctx, implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State == runpkg.StageStateRunning {
+		t.Fatalf("child implement stage wedged in running (the #1036 shape)\nrunner output:\n%s", out.String())
+	}
+	if got.State != runpkg.StageStateFailed {
+		t.Fatalf("child implement stage State = %q, want failed\nrunner output:\n%s", got.State, out.String())
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != runpkg.FailureC {
+		t.Errorf("FailureCategory = %v, want C (retryable)\nrunner output:\n%s", got.FailureCategory, out.String())
+	}
+	if !runpkg.ValidStageRetryTransition(got.State, runpkg.StageStatePending) {
+		t.Errorf("category-C failed stage should permit retry (failed → pending)")
+	}
+	if !strings.Contains(out.String(), `"event":"implement_child_no_changes"`) {
+		t.Errorf("missing implement_child_no_changes log line:\n%s", out.String())
+	}
 }
 
 // gitRepoInit makes dir a git repo on branch `main` with a single base

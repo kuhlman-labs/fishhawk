@@ -2107,6 +2107,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	origP, origO := newPusher, newPROpener
 	origCap, origRes := captureHead, restoreHead
 	origCheckout := checkoutFixupBase
+	origChildCheckout := checkoutChildBase
 	origRunBranch := checkoutRunBranch
 	origDirty, origClean, origResPres := dirtyPaths, cleanDriftPaths, restoreHeadPreserving
 	newPusher = func() pusher { return fp }
@@ -2131,6 +2132,12 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	checkoutFixupBase = func(_ context.Context, _, _, _ string) (string, error) {
 		return "fixup-branch-tip-sha", nil
 	}
+	// Stub the subsequent-child base establishment (#1036) the same way: a
+	// decomposed-child run() test with the shared branch on the remote must
+	// never fetch + force-checkout the runner's own source repo.
+	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+		return "shared-branch-tip-sha", nil
+	}
 	// Stub the base-rebase-conflict re-checkout (#989) the same way: the
 	// re-invoke handler must never force-checkout the runner's own source
 	// repo in a fake-pusher run() test.
@@ -2149,6 +2156,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 		captureHead = origCap
 		restoreHead = origRes
 		checkoutFixupBase = origCheckout
+		checkoutChildBase = origChildCheckout
 		checkoutRunBranch = origRunBranch
 		dirtyPaths = origDirty
 		cleanDriftPaths = origClean
@@ -3395,6 +3403,258 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	}
 	if fu.gotPRArgs.Branch != wantBranch {
 		t.Errorf("child-push report Branch = %q, want %q", fu.gotPRArgs.Branch, wantBranch)
+	}
+}
+
+// decomposedChildPromptResp returns a FetchedPrompt for a decomposed-child
+// implement stage minted from the canonical parent run ID the tests share.
+func decomposedChildPromptResp() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:             "22222222-3333-4444-5555-666666666666",
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		DecomposedFromRunID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}
+}
+
+// runDecomposedChildStage drives run() with the canonical decomposed-child
+// implement-stage flag set the sibling tests share.
+func runDecomposedChildStage(t *testing.T, stderr *strings.Builder) int {
+	t.Helper()
+	return run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, stderr)
+}
+
+// TestRun_DecomposedSubsequentChild_EstablishesBaseBeforeAgentInvoke is the
+// #1036 regression: a subsequent decomposed child's declared policy base is
+// the shared parent branch (#765), so the runner must fetch + checkout that
+// branch BEFORE the agent is invoked — never run the agent against the
+// operator's incidental checkout, where a slice depending on a prior
+// sibling's code cannot compile — and restore the operator's original ref
+// afterwards, mirroring the fix-up flow's #967 discipline.
+func TestRun_DecomposedSubsequentChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeRemoteBranchExists(t, true) // subsequent child: branch already on remote
+
+	// Ordered spy: the agent invocation must observe the checkout already
+	// requested.
+	var order []string
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			order = append(order, "invoke")
+		},
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	// The operator's tree sits on main — the exact run-d816e58a shape. Both
+	// restore seams record into restoredRefs: run()'s child defer calls
+	// restoreHead, openPRAndShipArtifact's defer calls restoreHeadPreserving.
+	var restoredRefs []string
+	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutChildBase
+	origResPres := restoreHeadPreserving
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return "main", false, nil
+	}
+	restoreHead = func(_ context.Context, _, ref string) error {
+		restoredRefs = append(restoredRefs, ref)
+		return nil
+	}
+	restoreHeadPreserving = func(_ context.Context, _, ref string, _ []string) error {
+		restoredRefs = append(restoredRefs, ref)
+		return nil
+	}
+	var gotBranch, gotRemote string
+	checkoutChildBase = func(_ context.Context, _, remote, branch string) (string, error) {
+		order = append(order, "checkout")
+		gotRemote = remote
+		gotBranch = branch
+		return "shared-branch-tip-sha", nil
+	}
+	t.Cleanup(func() {
+		captureHead = origCap
+		restoreHead = origRes
+		checkoutChildBase = origCheckout
+		restoreHeadPreserving = origResPres
+	})
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if len(order) < 2 || order[0] != "checkout" || order[1] != "invoke" {
+		t.Errorf("order = %v, want the shared-branch checkout BEFORE the agent invocation", order)
+	}
+	if gotBranch != "fishhawk/run-aaaaaaaa" {
+		t.Errorf("checkout branch = %q, want the shared parent branch", gotBranch)
+	}
+	if gotRemote != gitops.DefaultRemote {
+		t.Errorf("checkout remote = %q, want %q", gotRemote, gitops.DefaultRemote)
+	}
+	for _, want := range []string{
+		`"event":"child_base_established"`,
+		`"branch":"fishhawk/run-aaaaaaaa"`,
+		`"head_sha":"shared-branch-tip-sha"`,
+		`"original_ref":"main"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in child_base_established emission:\n%s", want, stderr.String())
+		}
+	}
+	// Both restore defers fired; every restore targets the ORIGINAL ref and
+	// the double restore is error-free.
+	if len(restoredRefs) != 2 {
+		t.Errorf("restore seams called %d times, want 2 (run()-level + openPRAndShipArtifact defers)", len(restoredRefs))
+	}
+	for i, ref := range restoredRefs {
+		if ref != "main" {
+			t.Errorf("restoredRefs[%d] = %q, want %q (the operator's original ref)", i, ref, "main")
+		}
+	}
+	if strings.Contains(stderr.String(), `"event":"working_tree_restore_failed"`) {
+		t.Errorf("double restore emitted a restore-failure event:\n%s", stderr.String())
+	}
+}
+
+// TestRun_DecomposedFirstChild_SkipsChildBaseCheckout: the first child has no
+// shared branch on the remote yet and legitimately runs against the operator's
+// base-branch checkout — the pre-invoke checkout must not fire at all.
+func TestRun_DecomposedFirstChild_SkipsChildBaseCheckout(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeRemoteBranchExists(t, false) // first child: branch not yet on remote
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	checkoutCalled := false
+	origCheckout := checkoutChildBase
+	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+		checkoutCalled = true
+		return "shared-branch-tip-sha", nil
+	}
+	t.Cleanup(func() { checkoutChildBase = origCheckout })
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if checkoutCalled {
+		t.Error("checkoutChildBase called for the FIRST child — no shared branch exists, the checkout must be skipped")
+	}
+	if strings.Contains(stderr.String(), `"event":"child_base_established"`) {
+		t.Errorf("first child emitted child_base_established:\n%s", stderr.String())
+	}
+}
+
+// TestRun_DecomposedSubsequentChild_CheckoutFailure_FailsBeforeAgentInvoke:
+// a shared-branch checkout failure (fetch auth, force-checkout error) must
+// fail the runner fast — the agent is NEVER invoked, no agent turns are
+// spent, and the failure names the child_base_checkout reason.
+func TestRun_DecomposedSubsequentChild_CheckoutFailure_FailsBeforeAgentInvoke(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeRemoteBranchExists(t, true)
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	var restoredRefs []string
+	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutChildBase
+	captureHead = func(_ context.Context, _ string) (string, bool, error) {
+		return "main", false, nil
+	}
+	restoreHead = func(_ context.Context, _, ref string) error {
+		restoredRefs = append(restoredRefs, ref)
+		return nil
+	}
+	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+		return "", errors.New("fetch origin fishhawk/run-aaaaaaaa: auth failed")
+	}
+	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; checkoutChildBase = origCheckout })
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStage(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on a child-base checkout failure:\n%s", got, stderr.String())
+	}
+	if inv.gotInv != nil {
+		t.Error("agent was invoked despite the child-base checkout failure — must fail fast BEFORE any invocation")
+	}
+	for _, want := range []string{
+		`"event":"runner_failed"`,
+		`"reason":"child_base_checkout"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in checkout-failure emission:\n%s", want, stderr.String())
+		}
+	}
+	// The checkout failed before HEAD moved (childCheckoutMoved stays false),
+	// so the child restore defer must not fire a checkout.
+	if len(restoredRefs) != 0 {
+		t.Errorf("restoredRefs = %v, want none (HEAD never moved)", restoredRefs)
+	}
+}
+
+// TestRun_ImplementStage_DecomposedChild_NoChanges_ReportsFailedCategoryC is
+// the #1036 no-changes half: a decomposed child whose agent produced no
+// changes must NOT bare-return — the push_to_shared_branch trace gate (#771)
+// left the stage in `running`, so a bare return wedges it until the SLA
+// watchdog reaps it. It must report {outcome:"failed", category:"C"} so the
+// backend terminalizes the stage retryable, mirroring the standalone
+// no_diff_captured semantics (#691/#692).
+func TestRun_ImplementStage_DecomposedChild_NoChanges_ReportsFailedCategoryC(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, false)
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR should not be called for a no-changes decomposed child")
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failed report) must be called — a no-changes decomposed child must not bare-return (#1036)")
+	}
+	if fu.gotPRArgs.Outcome != "failed" {
+		t.Errorf("report outcome = %q, want %q", fu.gotPRArgs.Outcome, "failed")
+	}
+	if fu.gotPRArgs.Category != "C" {
+		t.Errorf("report category = %q, want %q (retryable)", fu.gotPRArgs.Category, "C")
+	}
+	if !strings.Contains(fu.gotPRArgs.Reason, "child_no_changes") {
+		t.Errorf("report reason = %q, want it to name child_no_changes", fu.gotPRArgs.Reason)
+	}
+	for _, want := range []string{
+		`"event":"implement_child_no_changes"`,
+		`"shared_branch":"fishhawk/run-aaaaaaaa"`,
+		`"base_sha":"base"`,
+		`"event":"pull_request_failure_reported"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in child no-changes emission:\n%s", want, stderr.String())
+		}
 	}
 }
 
