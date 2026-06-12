@@ -957,11 +957,24 @@ func (s *Server) planBudgetEvidence(ctx context.Context, runRow *run.Run, parsed
 	}
 	specBudget := spec.ResolveStageTimeout(wf, specStage, spec.DefaultStageTimeout)
 	budget, source := s.resolvePlanGateBudget(ctx, runRow.WorkflowID, specBudget)
-	return &prompt.BudgetCheckEvidence{
+	ev := &prompt.BudgetCheckEvidence{
 		ResolvedBudgetMinutes: int(budget.Minutes()),
 		BudgetSource:          source,
 		PredictedMinutes:      parsedPlan.PredictedRuntimeMinutes,
+		// Same predicate checkPlanBudget evaluates at the approval gate
+		// (#1029): any non-nil decomposition satisfies the over-budget
+		// branch, so the rendered verdict must agree by construction.
+		Decomposed: parsedPlan.Decomposition != nil,
 	}
+	if parsedPlan.Decomposition != nil {
+		for _, sp := range parsedPlan.Decomposition.SubPlans {
+			ev.SubPlans = append(ev.SubPlans, prompt.BudgetSubPlanEvidence{
+				Title:            sp.Title,
+				PredictedMinutes: sp.PredictedRuntimeMinutes,
+			})
+		}
+	}
+	return ev
 }
 
 // emitReviewStarted appends a best-effort *_review_started audit entry at
