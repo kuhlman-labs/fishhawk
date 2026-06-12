@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/operator-role-v0.schema.json",
+  "title": "Fishhawk operator role spec v0",
+  "description": "Schema for the operator role spec (ADR-040 D1). The base role spec is a product artifact: the shipped default (docs/spec/operator-role-default.yaml) is versioned with the product and validated against this schema. Per-repo customization happens only through the thin overlay at .fishhawk/operator.yaml, validated against operator-role-overlay.schema.json. Breaking behavior changes bump to operator-role-v1; old role specs stay readable forever.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["role", "spec_version", "mission", "gate_procedures", "escalation", "forbidden"],
+
+  "properties": {
+    "role": {
+      "const": "operator",
+      "description": "Role identity. v0 defines exactly one role; future roles get their own spec surfaces."
+    },
+    "spec_version": {
+      "type": "string",
+      "enum": ["operator-role-v0"],
+      "description": "Role spec version. Single-value enum per the docs/spec versioning rules; a breaking behavior change goes to operator-role-v1 in a new schema file."
+    },
+    "mission": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the role is for, in prose. Defines behavior posture (distill, don't relay; act only within the workflow's operator_agent delegation), not authority — authority lives in the workflow spec's operator_agent knobs (ADR-040 D2)."
+    },
+    "gate_procedures": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pre_flight", "plan_gate", "implement_review_gate", "merge_ritual", "recovery"],
+      "description": "The playbook: ordered procedure steps per gate of the run lifecycle. The five keys are the closed v0 set. Procedure lives ONLY here — an overlay that tries to add or extend procedure fails the thinness rule.",
+      "properties": {
+        "pre_flight": { "$ref": "#/$defs/procedure" },
+        "plan_gate": { "$ref": "#/$defs/procedure" },
+        "implement_review_gate": { "$ref": "#/$defs/procedure" },
+        "merge_ritual": { "$ref": "#/$defs/procedure" },
+        "recovery": { "$ref": "#/$defs/procedure" }
+      }
+    },
+    "escalation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["always_page", "page_format"],
+      "description": "When and how the role pages the human. Posture is fail-closed: anything not explicitly delegated pages.",
+      "properties": {
+        "always_page": {
+          "$ref": "#/$defs/string_or_list",
+          "description": "Conditions that always page the human. Either a passthrough reference to the workflow spec's operator_agent.must_page_human list, or an explicit list of condition names."
+        },
+        "page_format": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The shape of a page: what the human receives instead of raw run state."
+        }
+      }
+    },
+    "conventions": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Named working conventions (snake_case key, prose value). This is the section a repo overlay merges into: local merge-ritual specifics and escalation contacts/channels belong here, never in gate_procedures.",
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": { "type": "string", "minLength": 1 }
+      }
+    },
+    "forbidden": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Actions the role must never take, regardless of delegation."
+    }
+  },
+
+  "$defs": {
+    "procedure": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Ordered list of procedure steps; each step is a non-empty prose instruction."
+    },
+    "string_or_list": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      ]
+    }
+  }
+}

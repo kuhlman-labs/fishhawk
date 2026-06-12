@@ -14,10 +14,18 @@ for schema in "$REPO_ROOT"/docs/spec/*.schema.json; do
       cp "$schema" "$REPO_ROOT/backend/internal/spec/schemas/$base"
       cp "$schema" "$REPO_ROOT/cli/internal/spec/schemas/$base"
       ;;
+    operator-role*.schema.json)
+      cp "$schema" "$REPO_ROOT/backend/internal/operatorrole/schemas/$base"
+      ;;
     *)
       echo "sync-schemas: unrecognized schema file '$base' — skipping (add a case to route it)" >&2
       ;;
   esac
 done
+
+# The shipped default operator role spec (ADR-040 D1) is a product
+# artifact synced like the schemas, not just an example.
+cp "$REPO_ROOT/docs/spec/operator-role-default.yaml" \
+  "$REPO_ROOT/backend/internal/operatorrole/defaults/operator-role-default.yaml"
 
 echo "schemas synced from docs/spec/"

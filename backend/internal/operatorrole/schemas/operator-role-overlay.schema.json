@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/operator-role-overlay-v0.schema.json",
+  "title": "Fishhawk operator role overlay v0 (.fishhawk/operator.yaml)",
+  "description": "Schema for the per-repo operator role overlay (ADR-040 D1). The overlay is thin by design: it may only select knob presets, set local conventions (merge-ritual specifics, escalation contacts/channels), and point at the repo's work-management config. It cannot define procedure — procedure added per-repo is definitionally a product gap; file an issue. The procedure fields below are declared with always-failing subschemas so a violation names the thinness rule.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spec_version"],
+
+  "properties": {
+    "role": {
+      "const": "operator",
+      "description": "Optional role identity, for symmetry with the base spec."
+    },
+    "spec_version": {
+      "type": "string",
+      "enum": ["operator-role-v0"],
+      "description": "The base role spec version this overlay targets. Single-value enum per the docs/spec versioning rules."
+    },
+    "knob_presets": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "description": "Named preset selection (snake_case key, preset name value). Reserves the key shape only; preset values and their evaluation against the workflow spec's operator_agent knobs are #1026's scope and may tighten this additively within v0.",
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": { "type": "string", "minLength": 1 }
+      }
+    },
+    "conventions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "description": "Local conventions merged into the base spec's conventions section: merge-ritual specifics, escalation contacts/channels. Prose values only — a convention that reads like a procedure step belongs in the product.",
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": { "type": "string", "minLength": 1 }
+      }
+    },
+    "work_management": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque pointer to the repo's work-management config (#1005/#1012). Resolution is the consumer's concern; this schema only reserves the key."
+    },
+    "mission": {
+      "not": {
+        "$comment": "thinness rule (ADR-040 D1): overlays cannot define procedure — per-repo procedure is a product gap; file an issue"
+      }
+    },
+    "gate_procedures": {
+      "not": {
+        "$comment": "thinness rule (ADR-040 D1): overlays cannot define procedure — per-repo procedure is a product gap; file an issue"
+      }
+    },
+    "escalation": {
+      "not": {
+        "$comment": "thinness rule (ADR-040 D1): overlays cannot define procedure — per-repo procedure is a product gap; file an issue (escalation contacts/channels go under conventions)"
+      }
+    },
+    "forbidden": {
+      "not": {
+        "$comment": "thinness rule (ADR-040 D1): overlays cannot define procedure — per-repo procedure is a product gap; file an issue"
+      }
+    }
+  }
+}
