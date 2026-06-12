@@ -167,6 +167,48 @@ knob_presets:
 	}
 }
 
+// TestValidateOverlayMultiDocument locks the multi-document bypass: a
+// stream whose first document is valid must not smuggle anything —
+// least of all procedure fields — in trailing documents. The whole
+// stream is rejected as a *YAMLError telling the operator the file
+// must be a single document.
+func TestValidateOverlayMultiDocument(t *testing.T) {
+	cases := map[string]string{
+		"procedure field in second document": `
+spec_version: operator-role-v0
+---
+gate_procedures:
+  extra_gate:
+    - a smuggled per-repo procedure step
+`,
+		"valid second document": `
+spec_version: operator-role-v0
+---
+spec_version: operator-role-v0
+`,
+		"malformed second document": `
+spec_version: operator-role-v0
+---
+spec_version: [unclosed
+`,
+	}
+	for name, overlay := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateOverlay(strings.NewReader(overlay))
+			if err == nil {
+				t.Fatal("ValidateOverlay accepted a multi-document stream")
+			}
+			var yerr *YAMLError
+			if !errors.As(err, &yerr) {
+				t.Fatalf("error = %v (%T), want *YAMLError", err, err)
+			}
+			if !strings.Contains(err.Error(), "single document") {
+				t.Errorf("error message %q does not name the single-document requirement", err.Error())
+			}
+		})
+	}
+}
+
 func TestValidateOverlayYAMLErrors(t *testing.T) {
 	cases := map[string]string{
 		"empty document":  "",

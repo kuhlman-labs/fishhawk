@@ -48,6 +48,8 @@ Procedure fields (`mission`, `gate_procedures`, `escalation`, `forbidden`) are s
 
 Escalation **contacts and channels** are conventions and go under `conventions`; the `escalation` section itself (paging conditions and format) is procedure and stays in the product.
 
+`.fishhawk/operator.yaml` must be a **single YAML document**: `ValidateOverlay` rejects a multi-document stream outright, since only the first document is schema-validated and a trailing document could otherwise carry procedure fields past the thinness rule.
+
 ## Versioning
 
 - `spec_version` is a required, single-value enum (`operator-role-v0`), matching the `version` / `plan_version` convention.

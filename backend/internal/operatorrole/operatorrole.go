@@ -171,10 +171,13 @@ func (e *SchemaError) Error() string {
 }
 
 // ValidateOverlay reads a .fishhawk/operator.yaml document from r and
-// validates it against the embedded overlay schema. A procedure field
-// in the overlay returns a *ThinnessError naming the field; other
-// structural violations return a *SchemaError; unparseable input
-// returns a *YAMLError. Use errors.As to distinguish them.
+// validates it against the embedded overlay schema. The input must be
+// a single YAML document: a multi-document stream is rejected with a
+// *YAMLError, since trailing documents would otherwise bypass
+// validation entirely. A procedure field in the overlay returns a
+// *ThinnessError naming the field; other structural violations return
+// a *SchemaError; unparseable input returns a *YAMLError. Use
+// errors.As to distinguish them.
 func ValidateOverlay(r io.Reader) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -192,6 +195,13 @@ func ValidateOverlay(r io.Reader) error {
 			return &YAMLError{Msg: "empty document"}
 		}
 		return &YAMLError{Msg: err.Error(), Cause: err}
+	}
+
+	// Only the first document is validated below, so any trailing
+	// document would escape the schema (and the thinness rule)
+	// entirely. Reject the stream outright instead.
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return &YAMLError{Msg: "multiple YAML documents in input: .fishhawk/operator.yaml must be a single document"}
 	}
 
 	if err := overlaySchema.Validate(raw); err != nil {
