@@ -1090,6 +1090,17 @@ paths:
                     example:
                       plan-standard-v1: "abc123..."
                       workflow-v0: "def456..."
+                  start_nonce:
+                    type: string
+                    description: |
+                      Per-start opaque identity token, echoed verbatim from the
+                      operator-supplied FISHHAWKD_START_NONCE env var /
+                      --start-nonce flag. Present only when the operator set
+                      one; omitted otherwise. scripts/dev generates a nonce per
+                      spawn and requires it to round-trip here, proving the
+                      listener on the port is the daemon it started even
+                      across OS pid reuse.
+                    example: "9f86d081884c7d65"
         '503':
           description: Process is shutting down or otherwise not ready.
           content:

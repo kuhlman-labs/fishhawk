@@ -52,6 +52,13 @@ type Config struct {
 	// drain before forcing closure.
 	ShutdownTimeout time.Duration
 
+	// StartNonce is a per-start opaque identity token echoed by
+	// GET /healthz as start_nonce; empty omits the field. scripts/dev
+	// sets one per spawn so its readiness gate and down port-fallback
+	// can prove the listener on the port is the daemon it started,
+	// surviving OS pid reuse (#1018).
+	StartNonce string
+
 	// RunRepo persists workflow runs and stages. Wired by the
 	// /v0/runs handlers; nil leaves those handlers returning 503.
 	// Tests inject in-memory fakes; production wires the Postgres

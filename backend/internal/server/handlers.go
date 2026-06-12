@@ -67,11 +67,14 @@ type healthResponse struct {
 	GitSHA           string            `json:"git_sha"`
 	MinRunnerVersion string            `json:"min_runner_version"`
 	Schemas          map[string]string `json:"schemas"`
+	StartNonce       string            `json:"start_nonce,omitempty"`
 }
 
 // handleHealth answers liveness probes with a small JSON payload that
 // also exposes the running version. Operators rely on the version
-// field to confirm a deploy reached this instance.
+// field to confirm a deploy reached this instance. start_nonce echoes
+// Config.StartNonce verbatim (omitted when unset) so scripts/dev can
+// prove the listener on the port is the daemon it spawned (#1018).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{
 		Status:           "ok",
@@ -82,6 +85,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"plan-standard-v1": plan.EmbeddedSchemaHash(),
 			"workflow-v0":      spec.EmbeddedSchemaHash(),
 		},
+		StartNonce: s.cfg.StartNonce,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

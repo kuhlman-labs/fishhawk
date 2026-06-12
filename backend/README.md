@@ -64,6 +64,7 @@ Override the listen address with `--addr` or `FISHHAWKD_ADDR`.
 
 Optional flags:
 
+- `--start-nonce` (or `FISHHAWKD_START_NONCE`) — per-start opaque identity token echoed by `GET /healthz` as `start_nonce`; unset omits the field. `scripts/dev` sets one per spawn and requires the round-trip in its readiness gate (and consults it in `down`'s port fallback), so it can prove the listener on the port is the daemon it started even across OS pid reuse (#1018).
 - `--enable-sla-timer` (or `FISHHAWKD_ENABLE_SLA_TIMER=true`) — start the background goroutine that times out `awaiting_approval` stages past their gate SLA, transitioning them to failed with category D. Off by default so dev runs aren't racing the timer.
 - `--sla-interval` — scan interval; defaults to `60s`. Hour-grained SLAs need no finer cadence.
 - `--enable-merge-reconciler` (or `FISHHAWKD_ENABLE_MERGE_RECONCILER=true`) — start the merge-status reconciler (ADR-031 Phase 1). It resolves a run's review gate on a verified PR merge state when the `pull_request.closed` webhook was missed — `merged → succeeded`, `closed-unmerged → cancelled`, through the same idempotent path the webhook uses. Each tick also heals dropped `fishhawk_audit_complete` Check Run publishes (#973): every review stage parked in `awaiting_approval` gets a recompute+republish, so a publish lost to a transient GitHub failure lands within one tick of recovery (already-published states dedup to a no-op). Without this flag the publish stays one-shot best-effort. Off by default; requires a GitHub App wired.

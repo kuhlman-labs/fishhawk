@@ -554,6 +554,206 @@ else
   fail "scripts/dev should guard lsof usage with 'command -v lsof'"
 fi
 
+# 14. Start-nonce listener identity (#1018) — pure helpers.
+nonce1="$(_generate_start_nonce)"
+nonce2="$(_generate_start_nonce)"
+if [[ -n "$nonce1" ]]; then
+  pass "_generate_start_nonce emits a non-empty nonce"
+else
+  fail "_generate_start_nonce should emit a non-empty nonce"
+fi
+if print -r -- "$nonce1" | grep -qE '^[0-9a-f]+$'; then
+  pass "_generate_start_nonce emits hex-only output"
+else
+  fail "_generate_start_nonce should be hex-only (got: $nonce1)"
+fi
+if [[ "$nonce1" != "$nonce2" ]]; then
+  pass "_generate_start_nonce differs across calls"
+else
+  fail "_generate_start_nonce should differ across calls (got twice: $nonce1)"
+fi
+
+# _nonce_from_healthz_body: the compact Go-marshaled body shape (no whitespace
+# around the colon — the exact bytes TestHandleHealth_StartNonce pins on the
+# backend side of the seam), the field-absent case, and a full healthz body.
+if [[ "$(_nonce_from_healthz_body '{"status":"ok","start_nonce":"cafe1234"}')" == "cafe1234" ]]; then
+  pass "_nonce_from_healthz_body extracts the nonce from a compact body"
+else
+  fail "_nonce_from_healthz_body should extract cafe1234 (got: $(_nonce_from_healthz_body '{"status":"ok","start_nonce":"cafe1234"}'))"
+fi
+full_body='{"status":"ok","version":"dev","git_sha":"unknown","min_runner_version":"dev","schemas":{"plan-standard-v1":"abc","workflow-v0":"def"},"start_nonce":"feedbeef"}'
+if [[ "$(_nonce_from_healthz_body "$full_body")" == "feedbeef" ]]; then
+  pass "_nonce_from_healthz_body extracts the nonce from a full healthz body"
+else
+  fail "_nonce_from_healthz_body should extract feedbeef (got: $(_nonce_from_healthz_body "$full_body"))"
+fi
+if [[ -z "$(_nonce_from_healthz_body '{"status":"ok","version":"dev"}')" ]]; then
+  pass "_nonce_from_healthz_body prints nothing when the field is absent"
+else
+  fail "_nonce_from_healthz_body should print nothing for a nonce-less body (got: $(_nonce_from_healthz_body '{"status":"ok","version":"dev"}'))"
+fi
+
+# 14b. _verify_healthz_nonce against a REAL curl + one-shot fake responder.
+# macOS/BSD nc without -k serves exactly one connection then exits, so each
+# assertion gets its own responder instance (same fixture family as section 13).
+_find_free_port() {
+  local cand
+  for _try in 1 2 3 4 5; do
+    cand=$(( 20000 + (RANDOM % 40000) ))
+    if [[ -z "$(_port_listeners "$cand")" ]]; then print "$cand"; return 0; fi
+  done
+  return 1
+}
+# Serve one canned HTTP 200 with <body> on <port>; sets responder_pid. Waits
+# for the bind (up to ~2s) so the caller's curl can't race the listener.
+_serve_healthz_once() {
+  local port="$1"
+  local body="$2"
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' "${#body}" "$body" | nc -l 127.0.0.1 "$port" >/dev/null 2>&1 &
+  responder_pid=$!
+  local i=0
+  while (( i < 20 )); do
+    if [[ -n "$(_port_listeners "$port")" ]]; then break; fi
+    sleep 0.1
+    (( ++i ))
+  done
+}
+
+nonce_log="$(mktemp -t test-dev-noncelog.XXXXXX)"
+print "bind: address already in use (nonce fixture marker)" > "$nonce_log"
+
+# Mismatch: responder echoes 'aaaa', we expect 'bbbb' → rc=1 and a #628-shaped
+# diagnostic naming BOTH nonces plus the log tail.
+np="$(_find_free_port)"
+if [[ -z "$np" ]]; then
+  fail "could not find a free port for the nonce-mismatch responder"
+else
+  _serve_healthz_once "$np" '{"status":"ok","start_nonce":"aaaa"}'
+  nvout="$(_verify_healthz_nonce "http://localhost:${np}/healthz" "bbbb" "$nonce_log" 2>&1)"
+  nvrc=$?
+  if (( nvrc == 1 )); then
+    pass "_verify_healthz_nonce returns 1 on a nonce mismatch"
+  else
+    fail "_verify_healthz_nonce should return 1 on mismatch (got rc=$nvrc)"
+  fi
+  if [[ "$nvout" == *aaaa* && "$nvout" == *bbbb* ]]; then
+    pass "_verify_healthz_nonce diagnostic names both the actual and expected nonce"
+  else
+    fail "_verify_healthz_nonce diagnostic should name aaaa and bbbb (got: $nvout)"
+  fi
+  if [[ "$nvout" == *"address already in use"* ]]; then
+    pass "_verify_healthz_nonce tails the log on mismatch"
+  else
+    fail "_verify_healthz_nonce should emit the log tail (got: $nvout)"
+  fi
+  wait "$responder_pid" 2>/dev/null
+fi
+
+# Degraded path: a body WITHOUT start_nonce (pre-#1018 binary) → rc=2, so
+# cmd_up falls back to the #965 pid identity check instead of failing.
+np="$(_find_free_port)"
+if [[ -z "$np" ]]; then
+  fail "could not find a free port for the nonce-less responder"
+else
+  _serve_healthz_once "$np" '{"status":"ok","version":"dev"}'
+  _verify_healthz_nonce "http://localhost:${np}/healthz" "bbbb" "$nonce_log" >/dev/null 2>&1
+  nvrc=$?
+  if (( nvrc == 2 )); then
+    pass "_verify_healthz_nonce returns 2 when the body carries no start_nonce"
+  else
+    fail "_verify_healthz_nonce should return 2 for a nonce-less body (got rc=$nvrc)"
+  fi
+  wait "$responder_pid" 2>/dev/null
+fi
+
+# 14c. _down_port_fallback nonce ladder (#1018 / approval amendment): the nonce
+# only UPGRADES confidence, never blocks the #965 path.
+nonce_dir="$(mktemp -d -t test-dev-nonce.XXXXXX)"
+print "bbbb" > "$nonce_dir/dev.nonce"
+
+# No start_nonce in the body while our nonce file exists → must DEGRADE to the
+# comm-basename heuristic (which reports/refuses the foreign listener), not a
+# nonce-specific refuse leg.
+np="$(_find_free_port)"
+if [[ -z "$np" ]]; then
+  fail "could not find a free port for the degraded down-fallback responder"
+else
+  _serve_healthz_once "$np" '{"status":"ok","version":"dev"}'
+  dnout="$(_down_port_fallback "$np" "$nonce_dir/unused.pid" "$nonce_dir/dev.nonce" 2>&1)"
+  dnrc=$?
+  if (( dnrc != 0 )); then
+    pass "_down_port_fallback (no start_nonce in body) refuses success via the comm route"
+  else
+    fail "_down_port_fallback should return non-zero for a nonce-less foreign listener (got rc=$dnrc)"
+  fi
+  if [[ "$dnout" == *"not fishhawkd"* ]]; then
+    pass "_down_port_fallback (no start_nonce in body) takes the comm-heuristic route"
+  else
+    fail "_down_port_fallback should report via the comm heuristic ('not fishhawkd') (got: $dnout)"
+  fi
+  wait "$responder_pid" 2>/dev/null
+fi
+
+# Exact nonce match → proven ours: the kill leg is taken with nonce-verified
+# provenance (the one-shot responder has already exited by then, so the TERM
+# is a no-op — the assertion is on the route, not the kill outcome).
+np="$(_find_free_port)"
+if [[ -z "$np" ]]; then
+  fail "could not find a free port for the nonce-match down-fallback responder"
+else
+  _serve_healthz_once "$np" '{"status":"ok","start_nonce":"bbbb"}'
+  dnout="$(_down_port_fallback "$np" "$nonce_dir/unused.pid" "$nonce_dir/dev.nonce" 2>&1)"
+  dnrc=$?
+  if (( dnrc == 0 )); then
+    pass "_down_port_fallback (nonce match) reports a clean takedown"
+  else
+    fail "_down_port_fallback should return 0 on a nonce-verified takedown (got rc=$dnrc, out: $dnout)"
+  fi
+  if [[ "$dnout" == *"nonce-verified"* ]]; then
+    pass "_down_port_fallback (nonce match) takes the nonce-verified kill leg"
+  else
+    fail "_down_port_fallback should report 'nonce-verified' on an exact match (got: $dnout)"
+  fi
+  wait "$responder_pid" 2>/dev/null
+fi
+rm -f "$nonce_log"
+rm -rf "$nonce_dir"
+
+# 14d. Call-site wiring (#1018) — body-greps in the section-13b style.
+if print -r -- "$up_body" | grep -q '_generate_start_nonce'; then
+  pass "cmd_up generates a per-spawn start nonce"
+else
+  fail "cmd_up should call _generate_start_nonce before the spawn"
+fi
+if print -r -- "$up_body" | grep -q '_verify_healthz_nonce'; then
+  pass "cmd_up verifies the start_nonce round-trip"
+else
+  fail "cmd_up should call _verify_healthz_nonce after the readiness gate"
+fi
+await_line="$(print -r -- "$up_body" | grep -n '_await_healthz' | head -n 1 | cut -d: -f1)"
+nonce_line="$(print -r -- "$up_body" | grep -n '_verify_healthz_nonce' | head -n 1 | cut -d: -f1)"
+if [[ -n "$await_line" && -n "$nonce_line" ]] && (( await_line < nonce_line )); then
+  pass "cmd_up runs _verify_healthz_nonce AFTER the _await_healthz gate"
+else
+  fail "cmd_up should order _await_healthz before _verify_healthz_nonce (await=$await_line nonce=$nonce_line)"
+fi
+if print -r -- "$up_body" | grep -q '_verify_listener_identity'; then
+  pass "cmd_up retains the #965 pid-check fallback (_verify_listener_identity)"
+else
+  fail "cmd_up should keep _verify_listener_identity as the rc=2 degraded fallback"
+fi
+dpf_body="$(typeset -f _down_port_fallback)"
+if print -r -- "$dpf_body" | grep -q '_nonce_from_healthz_body'; then
+  pass "_down_port_fallback consults the nonce before comm matching"
+else
+  fail "_down_port_fallback should call _nonce_from_healthz_body"
+fi
+if print -r -- "$down_body" | grep -qE 'rm -f .*NONCE_FILE'; then
+  pass "cmd_down removes the nonce file on teardown"
+else
+  fail "cmd_down should rm the NONCE_FILE"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"
