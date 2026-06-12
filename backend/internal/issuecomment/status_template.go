@@ -146,7 +146,8 @@ func renderActivityLine(e *audit.Entry) string {
 		return "Plan posted"
 	case "approval_submitted":
 		// Prefer the resolved GitHub login (#751); never @-mention the raw
-		// token subject (#755) — approverMention falls back to "an approver".
+		// token subject (#755) — approverMention renders the three-form
+		// identity convention (#1053) instead.
 		return fmt.Sprintf("%s %s the plan", approverMention(e), approvalDecisionVerb(e.Payload))
 	case "plan_approved_via_reaction":
 		return fmt.Sprintf("%s approved on GitHub (reaction)", actor)
@@ -188,33 +189,53 @@ func actorMention(actor *string) string {
 
 // approverMention renders the approver for an approval_submitted activity
 // row, preferring the resolved GitHub login the MCP loop threads through
-// (#751, approver_github_login) and falling back to the acting subject
-// only when it is itself a valid login; otherwise "an approver" — so a
-// non-login token subject is never `@`-mentioned (#755). Mirrors the
-// plan-status footer's renderApproverHandle preference order.
+// (#751, approver_github_login); otherwise the acting subject (the
+// payload's `approver`, falling back to the row's actor_subject) goes
+// through the shared renderApproverIdentity three-form convention
+// (notifier.go, #1053): login mention / operator-agent role + delegation
+// rule / verbatim code span — so a non-login token subject is never
+// `@`-mentioned (#755) yet keeps its identity. Mirrors the plan-status
+// footer exactly.
 func approverMention(e *audit.Entry) string {
-	if login := approverGithubLogin(e.Payload); validApproverLogin(login) {
-		return "@" + login
+	id := decodeApproverIdentity(e.Payload)
+	if validApproverLogin(id.githubLogin) {
+		return "@" + id.githubLogin
 	}
-	if e.ActorSubject != nil && validApproverLogin(*e.ActorSubject) {
-		return "@" + *e.ActorSubject
+	subject := id.approver
+	if subject == "" && e.ActorSubject != nil {
+		subject = *e.ActorSubject
 	}
-	return "an approver"
+	return renderApproverIdentity(subject, id.delegated)
 }
 
-// approverGithubLogin extracts the resolved GitHub login (#751) from an
-// approval_submitted payload; "" when absent or unparseable.
-func approverGithubLogin(payload json.RawMessage) string {
+// approverIdentity carries the identity fields of an approval_submitted
+// payload that approverMention renders.
+type approverIdentity struct {
+	approver    string
+	githubLogin string
+	delegated   string
+}
+
+// decodeApproverIdentity extracts the acting subject, the resolved
+// GitHub login (#751), and the ADR-040 delegation rule (#1026) from an
+// approval_submitted payload; zero value when absent or unparseable.
+func decodeApproverIdentity(payload json.RawMessage) approverIdentity {
 	if len(payload) == 0 {
-		return ""
+		return approverIdentity{}
 	}
 	var p struct {
+		Approver            string `json:"approver"`
 		ApproverGithubLogin string `json:"approver_github_login"`
+		Delegated           string `json:"delegated"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
-		return ""
+		return approverIdentity{}
 	}
-	return p.ApproverGithubLogin
+	return approverIdentity{
+		approver:    p.Approver,
+		githubLogin: p.ApproverGithubLogin,
+		delegated:   p.Delegated,
+	}
 }
 
 func approvalDecisionVerb(payload json.RawMessage) string {

@@ -1993,9 +1993,10 @@ func submitApprovalAs(t *testing.T, s *Server, stageID uuid.UUID, subject, body 
 // `approver_github_login`, and (b) render the issue-thread status
 // footer with the resolved login's `@`-mention — not the token
 // subject. It also pins the stop-the-ping guarantee: an approval with
-// only the bare token subject (no resolved login) renders "an
-// approver", never an `@`-mention. The seam crossed is HTTP body →
-// handler → approval_submitted audit payload → notifier footer render.
+// only the bare token subject (no resolved login) renders the subject
+// verbatim inside a code span (#1053) — never an `@`-mention. The seam
+// crossed is HTTP body → handler → approval_submitted audit payload →
+// notifier footer render.
 func TestSubmitApproval_ApproverGithubLogin_CrossBoundary(t *testing.T) {
 	const tokenSubject = "brett@local-mcp"
 
@@ -2046,8 +2047,55 @@ func TestSubmitApproval_ApproverGithubLogin_CrossBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-marshal bare payload: %v", err)
 	}
-	if got := issuecomment.PlanStatusFooterForAuditPayload(rawBare); got != "_Status: approved by an approver · implementing now_" {
-		t.Errorf("bare-subject footer = %q, want \"an approver\" (no ping)", got)
+	if got := issuecomment.PlanStatusFooterForAuditPayload(rawBare); got != "_Status: approved by `brett@local-mcp` · implementing now_" {
+		t.Errorf("bare-subject footer = %q, want the verbatim code-span form (no ping, #1053)", got)
+	}
+}
+
+// TestSubmitApproval_Delegated_FooterNamesRoleAndRule extends the
+// wire→handler→audit-payload→render seam (#751 shape) to the ADR-040
+// delegated path (#1053): a delegated approval submitted under the
+// operator-agent token subject must render the plan-status footer
+// naming the role instance AND the delegation rule from the exact
+// `approval_submitted` payload the handler wrote — not the anonymous
+// "an approver" reduction that motivated the issue.
+func TestSubmitApproval_Delegated_FooterNamesRoleAndRule(t *testing.T) {
+	s, repo, au, _, _ := newDelegatedApprovalServer(t)
+	runID, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+
+	// Satisfy clean_dual_approval: every configured verdict is an
+	// approve and no concern is open.
+	seedReviewEntry(t, au, runID, 1, "plan_review_started",
+		planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed",
+		planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed",
+		planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+
+	const subject = "operator-agent/operator-role-v0"
+	w := submitApprovalAs(t, s, planStage.ID, subject, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if got := payload["approver"]; got != subject {
+		t.Errorf("audit approver = %v, want %q", got, subject)
+	}
+	if got := payload["delegated"]; got != "clean_dual_approval" {
+		t.Errorf("audit delegated = %v, want clean_dual_approval", got)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("re-marshal payload: %v", err)
+	}
+	footer := issuecomment.PlanStatusFooterForAuditPayload(raw)
+	want := "_Status: approved by the operator agent (`operator-agent/operator-role-v0`, delegated: clean_dual_approval) · implementing now_"
+	if footer != want {
+		t.Errorf("delegated footer = %q, want %q", footer, want)
 	}
 }
 

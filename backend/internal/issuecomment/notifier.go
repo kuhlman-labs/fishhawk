@@ -38,12 +38,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -318,9 +320,11 @@ func (n *Notifier) latestPlanApproval(ctx context.Context, runID, planStageID uu
 
 // decodeApprovalStatus decodes an `approval_submitted` audit payload
 // into a planStatus: the decision, the provenance `approver` (the
-// acting token subject), and the resolved `approver_github_login` the
-// MCP loop threads through (#751). ApproverGithubLogin is absent on
-// SPA/CLI approvals, where `approver` is itself a GitHub login.
+// acting token subject), the resolved `approver_github_login` the
+// MCP loop threads through (#751), and the `delegated` rule name the
+// handler stamps on ADR-040 delegated approvals (#1026).
+// ApproverGithubLogin is absent on SPA/CLI approvals, where `approver`
+// is itself a GitHub login; Delegated is absent on human approvals.
 // Returns nil when the payload is malformed so callers treat a corrupt
 // row as "no status yet".
 func decodeApprovalStatus(payload []byte) *planStatus {
@@ -328,6 +332,7 @@ func decodeApprovalStatus(payload []byte) *planStatus {
 		Decision            string `json:"decision"`
 		Approver            string `json:"approver"`
 		ApproverGithubLogin string `json:"approver_github_login"`
+		Delegated           string `json:"delegated"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return nil
@@ -336,6 +341,7 @@ func decodeApprovalStatus(payload []byte) *planStatus {
 		decision:    approval.Decision(p.Decision),
 		approver:    p.Approver,
 		githubLogin: p.ApproverGithubLogin,
+		delegated:   p.Delegated,
 	}
 }
 
@@ -513,6 +519,10 @@ type planStatus struct {
 	// when it is a syntactically-valid login; empty on SPA/CLI
 	// approvals, where approver itself is the GitHub login.
 	githubLogin string
+	// delegated names the ADR-040 delegation rule (e.g.
+	// "clean_dual_approval") when the approval landed via the
+	// delegated path (#1026); empty on every human approval.
+	delegated string
 }
 
 // renderFullPlanBody renders the entire standard_v1 plan as a
@@ -606,13 +616,13 @@ func renderPlanStatusFooter(s *planStatus) string {
 	if s == nil {
 		return ""
 	}
-	// Prefer the resolved GitHub login (#751) when present and valid;
-	// otherwise fall back to the acting subject, which renderApproverHandle
-	// reduces to "an approver" when it isn't a real login (e.g. the MCP
-	// token subject brett@local-mcp, or the "anonymous" placeholder).
-	actor := renderApproverHandle(s.approver)
+	// Prefer the resolved GitHub login (#751) when present and valid —
+	// a human MCP approval renders `@<login>` with no delegated clause.
+	// Otherwise renderApproverIdentity picks the three-form identity
+	// rendering for the acting subject (#1053).
+	actor := renderApproverIdentity(s.approver, s.delegated)
 	if validApproverLogin(s.githubLogin) {
-		actor = renderApproverHandle(s.githubLogin)
+		actor = renderApproverIdentity(s.githubLogin, "")
 	}
 	switch s.decision {
 	case approval.DecisionApprove:
@@ -623,16 +633,75 @@ func renderPlanStatusFooter(s *planStatus) string {
 	return ""
 }
 
-// renderApproverHandle picks the human-facing form of the audit
-// row's subject: `@<login>` for real GitHub logins, "an approver"
-// for the literal "anonymous" or empty (matches the convention the
-// retired renderPlanApprovedBody used so the issue thread never
-// leaks `@anonymous`).
-func renderApproverHandle(subject string) string {
+// renderApproverIdentity picks the human-facing form of an approval
+// audit row's subject (#1053). Three forms, in preference order:
+//
+//  1. A syntactically-valid GitHub login → `@<login>` (the #751
+//     mention path, unchanged).
+//  2. An operator-agent token subject (operatorrole.IsTokenSubject,
+//     ADR-040 / #1027) → "the operator agent (`<subject>`, delegated:
+//     <rule>)", naming the delegation rule when the audit payload
+//     recorded one (#1026); without a rule the parenthetical carries
+//     the subject alone.
+//  3. Any other non-empty, non-"anonymous" subject → the subject
+//     verbatim inside a markdown code span (sanitized; no `@` prefix,
+//     so GitHub cannot ping a real user — the #751 stop-the-ping
+//     guarantee holds).
+//
+// "an approver" is reserved strictly for the empty subject and the
+// literal "anonymous" placeholder (matches the convention the retired
+// renderPlanApprovedBody used so the issue thread never leaks
+// `@anonymous`).
+func renderApproverIdentity(subject, delegatedRule string) string {
 	if validApproverLogin(subject) {
 		return "@" + subject
 	}
+	if operatorrole.IsTokenSubject(subject) {
+		if delegatedRule != "" {
+			return fmt.Sprintf("the operator agent (`%s`, delegated: %s)", sanitizeSubjectForCodeSpan(subject), delegatedRule)
+		}
+		return fmt.Sprintf("the operator agent (`%s`)", sanitizeSubjectForCodeSpan(subject))
+	}
+	if subject == "" || subject == "anonymous" {
+		return "an approver"
+	}
+	if s := sanitizeSubjectForCodeSpan(subject); s != "" {
+		return "`" + s + "`"
+	}
 	return "an approver"
+}
+
+// maxRenderedSubjectRunes caps the verbatim-subject form so a
+// pathological token subject can't balloon the issue comment.
+const maxRenderedSubjectRunes = 64
+
+// sanitizeSubjectForCodeSpan prepares a non-login subject for verbatim
+// display inside a single-backtick markdown code span. Backticks are
+// replaced (with "'") rather than stripped BEFORE wrapping, so no
+// subject can close the span and re-enable markdown or an @-mention;
+// control characters (including newlines, which also break a code
+// span) are dropped; a leading "@" is stripped; length is capped at
+// maxRenderedSubjectRunes. May return "" (e.g. a subject that is only
+// control characters) — callers fall back to "an approver".
+func sanitizeSubjectForCodeSpan(subject string) string {
+	subject = strings.TrimPrefix(subject, "@")
+	var b strings.Builder
+	n := 0
+	for _, r := range subject {
+		if n >= maxRenderedSubjectRunes {
+			break
+		}
+		switch {
+		case r == '`':
+			b.WriteByte('\'')
+		case unicode.IsControl(r):
+			continue
+		default:
+			b.WriteRune(r)
+		}
+		n++
+	}
+	return b.String()
 }
 
 // truncateForGitHubComment caps body at MaxIssueCommentBodyBytes,
@@ -1468,8 +1537,10 @@ var githubLoginPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A
 // anything that isn't a real login, such as the MCP loop's token
 // subject brett@local-mcp. This defensive filter works independently
 // of the gh-login resolution: even if no resolved login is threaded
-// through, a non-login subject renders "an approver" rather than
-// pinging an unrelated GitHub user.
+// through, a non-login subject is never `@`-mentioned —
+// renderApproverIdentity renders it as the operator-agent form or a
+// verbatim code span instead (#1053), so it cannot ping an unrelated
+// GitHub user.
 func validApproverLogin(s string) bool {
 	if s == "" || s == "anonymous" {
 		return false
