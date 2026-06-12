@@ -23,6 +23,22 @@ import (
 // run is allowed to have placed on its branch.
 var lineageLedgerCategories = []string{"pull_request_opened", "child_pushed", "fixup_pushed"}
 
+// lineageChildLedgerCategories are the audit categories read from a
+// decomposition CHILD run's chain when building the PARENT's ledger
+// (#1038). Children push onto the shared parent branch (child_pushed)
+// and fix up onto that same branch (the decomposed fixup branch is
+// fishhawk/run-<shortID(decomposedFromRunID)> — see FixupBranch in
+// prompt.go), so both head reports belong in the parent's ledger.
+// pull_request_opened is deliberately absent: children never open PRs
+// (ADR-032/#714).
+var lineageChildLedgerCategories = []string{"child_pushed", "fixup_pushed"}
+
+// lineageChildRunsLimit caps the decomposition-child enumeration when
+// building the reported-head ledger. run.ListRunsFilter requires
+// Limit > 0; this is set far above any realistic sub_plans fan-out
+// (single digits) so truncation cannot silently shrink the ledger.
+const lineageChildRunsLimit = 200
+
 // verifyBranchLineage enforces ADR-035's detect-and-halt contract
 // (#858): every commit on the run branch must be attributable to one
 // of THIS run's own reported head SHAs. A non-attributable ("foreign")
@@ -104,6 +120,12 @@ func (s *Server) verifyBranchLineage(ctx context.Context, runID uuid.UUID,
 // (unresolvable anchor, incomplete ledger, CompareCommits error) so a
 // transient GitHub failure never produces a false verdict.
 //
+// The ledger is decomposition-aware (#1038): for a decomposition parent
+// it includes the heads reported on each child run's chain, so sibling
+// child commits on the shared fan-out branch attribute cleanly instead
+// of false-flagging (and wedging the parent at merge resolution). A
+// commit with no child provenance still violates.
+//
 // ledgerSeedSHA is the critical out-of-band knob (see
 // buildReportedHeadLedger): the report-boundary caller seeds with the
 // current head; the merge-resolution caller seeds with "" so the live
@@ -119,7 +141,7 @@ func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Ru
 		return "", false
 	}
 
-	ledger, complete := s.buildReportedHeadLedger(ctx, runRow.ID, ledgerSeedSHA)
+	ledger, complete := s.buildReportedHeadLedger(ctx, runRow, ledgerSeedSHA)
 	if !complete {
 		// Could not build the COMPLETE set of this run's legitimate head
 		// SHAs (an audit read failed). Enforcing against a partial ledger
@@ -185,7 +207,7 @@ func (s *Server) resolveLastRunAuthoredHead(ctx context.Context, runRow *run.Run
 		return "", "", false, false
 	}
 
-	ledger, complete := s.buildReportedHeadLedger(ctx, runRow.ID, "")
+	ledger, complete := s.buildReportedHeadLedger(ctx, runRow, "")
 	if !complete {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch reset: reported-head ledger incomplete; refusing (fail-closed)",
@@ -416,42 +438,94 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 // tip is NOT auto-whitelisted into the ledger it is being checked against;
 // otherwise a foreign tip would whitelist itself and defeat the check.
 //
-// It returns complete=false if a read error on ANY ledger category
-// prevented building the full set. The caller MUST fail open on an
-// incomplete ledger rather than enforce membership against it: a partial
-// ledger missing a legitimate prior-push head would false-flag that
-// commit as foreign on a multi-push run. complete=true means every
-// category was read successfully and the ledger is authoritative.
-func (s *Server) buildReportedHeadLedger(ctx context.Context, runID uuid.UUID, ledgerSeedSHA string) (ledger map[string]struct{}, complete bool) {
+// Decomposition-awareness (#1038): a decomposition fan-out shares ONE
+// branch, but each child's child_pushed/fixup_pushed entries land on the
+// CHILD's audit chain (succeedChildPushStage appends with the reporting
+// child's run ID), not the parent's. The parent's own chain therefore
+// only ever sees the consolidated-PR head (the branch tip), so a
+// parent-side check built from the own chain alone false-flags every
+// earlier sibling commit as foreign — the wedged-parent shape: the merge
+// reconciler's re-check refuses to terminalize a cleanly merged fan-out
+// forever. To attribute sibling commits correctly, the ledger also unions
+// in the heads reported by this run's decomposition children (runs with
+// decomposed_from = this run ID), read from each child's chain. Commits
+// WITHOUT that provenance still violate.
+//
+// It returns complete=false if a read error on ANY ledger category, the
+// child enumeration, or ANY per-child chain read prevented building the
+// full set. The caller MUST fail open on an incomplete ledger rather than
+// enforce membership against it: a partial ledger missing a legitimate
+// prior-push or sibling-child head would false-flag that commit as
+// foreign. complete=true means every read succeeded and the ledger is
+// authoritative.
+func (s *Server) buildReportedHeadLedger(ctx context.Context, runRow *run.Run, ledgerSeedSHA string) (ledger map[string]struct{}, complete bool) {
 	ledger = map[string]struct{}{}
 	if ledgerSeedSHA != "" {
 		ledger[ledgerSeedSHA] = struct{}{}
 	}
 	complete = true
 	for _, cat := range lineageLedgerCategories {
-		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
 		if err != nil {
 			complete = false
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"branch lineage: list audit entries failed; ledger incomplete (guard fails open)",
-				slog.String("run_id", runID.String()),
+				slog.String("run_id", runRow.ID.String()),
 				slog.String("category", cat),
 				slog.String("error", err.Error()))
 			continue
 		}
-		for _, e := range entries {
-			var payload struct {
-				HeadSHA string `json:"head_sha"`
-			}
-			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		addReportedHeads(ledger, entries)
+	}
+
+	// Union in the heads reported by this run's decomposition children.
+	// A standalone run (and every child run itself) has no children, so
+	// this is a no-op and standalone behavior is unchanged.
+	children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &runRow.ID,
+		Limit:          lineageChildRunsLimit,
+	})
+	if err != nil {
+		complete = false
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch lineage: list decomposition children failed; ledger incomplete (guard fails open)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return ledger, complete
+	}
+	for _, child := range children {
+		for _, cat := range lineageChildLedgerCategories {
+			entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, child.ID, cat)
+			if err != nil {
+				complete = false
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"branch lineage: list child audit entries failed; ledger incomplete (guard fails open)",
+					slog.String("run_id", runRow.ID.String()),
+					slog.String("child_run_id", child.ID.String()),
+					slog.String("category", cat),
+					slog.String("error", err.Error()))
 				continue
 			}
-			if payload.HeadSHA != "" {
-				ledger[payload.HeadSHA] = struct{}{}
-			}
+			addReportedHeads(ledger, entries)
 		}
 	}
 	return ledger, complete
+}
+
+// addReportedHeads adds every non-empty head_sha payload field from the
+// given audit entries to the ledger.
+func addReportedHeads(ledger map[string]struct{}, entries []*audit.Entry) {
+	for _, e := range entries {
+		var payload struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.HeadSHA != "" {
+			ledger[payload.HeadSHA] = struct{}{}
+		}
+	}
 }
 
 // recordForeignCommitViolation fails the stage category-B, writes the
