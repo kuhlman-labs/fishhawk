@@ -401,3 +401,83 @@ func TestCreateRun_RunnerKind_RejectsUnknown(t *testing.T) {
 		t.Errorf("body should reference runner_kind: %s", w.Body.String())
 	}
 }
+
+// --- Drive mode (#1023) ---
+
+// driveSpecYAML opts the workflow into drive mode at the spec level so
+// the resolution tests can assert spec-default vs per-run override.
+const driveSpecYAML = `version: "0.3"
+workflows:
+  trivial:
+    drive: true
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestCreateRun_Drive_Resolution covers the create-time resolution
+// table: the request's `drive` field (tri-state via pointer) wins over
+// the workflow spec's default; absent everywhere resolves false.
+func TestCreateRun_Drive_Resolution(t *testing.T) {
+	cases := []struct {
+		name string
+		body map[string]any
+		want bool
+	}{
+		{
+			name: "absent_no_spec_defaults_false",
+			body: map[string]any{},
+			want: false,
+		},
+		{
+			name: "request_true_no_spec",
+			body: map[string]any{"drive": true},
+			want: true,
+		},
+		{
+			name: "spec_default_true_no_override",
+			body: map[string]any{"workflow_spec": driveSpecYAML},
+			want: true,
+		},
+		{
+			name: "request_false_overrides_spec_true",
+			body: map[string]any{"workflow_spec": driveSpecYAML, "drive": false},
+			want: false,
+		},
+		{
+			name: "request_true_overrides_spec_absent",
+			body: map[string]any{"workflow_spec": minimalSpecYAML, "drive": true},
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeRepo()
+			s := newServer(t, repo)
+			body := map[string]any{
+				"repo":           "x/y",
+				"workflow_id":    "trivial",
+				"workflow_sha":   "abc",
+				"trigger_source": "cli",
+			}
+			for k, v := range tc.body {
+				body[k] = v
+			}
+			raw, _ := json.Marshal(body)
+			req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(string(raw)))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			s.handleCreateRun(w, withAuth(req))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			if got := repo.lastCreateRunParams.Drive; got != tc.want {
+				t.Errorf("CreateRunParams.Drive = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

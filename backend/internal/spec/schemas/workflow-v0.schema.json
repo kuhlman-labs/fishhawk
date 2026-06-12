@@ -66,6 +66,10 @@
         },
         "on_ci_failure": { "$ref": "#/$defs/on_ci_failure" },
         "policy": { "$ref": "#/$defs/policy" },
+        "drive": {
+          "type": "boolean",
+          "description": "Opt-in drive mode (#1023 / #996 theme 1): when true, fishhawkd auto-advances the run's mechanical transitions (plan-approved dispatch, review-verdict settlement, fixup re-park, checks-green awaiting_merge) and records a run_auto_advanced audit entry per advance. Judgment points (gate approvals, concern routing, merge) always park. Default false preserves operator-driven advancement. Overridable per-run via POST /v0/runs `drive`. Additive within workflow-v0.x."
+        },
         "budgets": {
           "type": "array",
           "description": "Periodic per-workflow cost ceilings (ADR-030 / #688). Each entry caps total USD spend across all runs of this workflow within a calendar period, resetting at the period boundary. Distinct from the per-stage `budget` ($defs/budget: token/runtime caps on one stage execution). Requires version 0.4+.",

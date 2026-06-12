@@ -87,6 +87,7 @@ type Run struct {
 	DecomposedFrom         *uuid.UUID         `json:"decomposed_from"`
 	CostUsdTotal           float64            `json:"cost_usd_total"`
 	ResolvedModel          string             `json:"resolved_model"`
+	Drive                  bool               `json:"drive"`
 }
 
 type Session struct {

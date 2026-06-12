@@ -211,7 +211,7 @@ components:
         table in `backend/internal/run/transition.go`.
       required:
         [id, repo, workflow_id, workflow_sha, trigger_source, state,
-         retry_attempt, max_retries_snapshot, runner_kind,
+         retry_attempt, max_retries_snapshot, runner_kind, drive,
          cost_usd_total, resolved_model, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
@@ -296,6 +296,21 @@ components:
             pre-pluggable-backends view via
             `GET /v0/runs?runner_kind=github_actions`.
           example: github_actions
+        drive:
+          type: boolean
+          description: |
+            Drive-mode opt-in (#1023 / #996 theme 1): when true,
+            fishhawkd auto-advances the run's mechanical transitions
+            and records a `run_auto_advanced` audit entry per advance;
+            judgment points (gate approvals, concern routing, merge)
+            always park. Resolved at run-create time — the workflow
+            spec's `drive` default overridden by the request's `drive`
+            field — and snapshotted on the row so a spec edit mid-run
+            doesn't change an in-flight run's behavior. `false` for
+            legacy rows (migration 0031). Persisted but not yet
+            consumed; the drive engine lands in a sibling slice of
+            #1023.
+          example: false
         issue_context:
           $ref: '#/components/schemas/IssueContext'
           description: |
@@ -1500,6 +1515,17 @@ paths:
                     Webhook-dispatched runs leave this empty and
                     the backend falls back to the existing
                     GitHub-fetch path.
+                drive:
+                  type: boolean
+                  description: |
+                    Optional. Per-run drive-mode override (#1023 /
+                    #996 theme 1). When present, wins over the
+                    workflow spec's `drive` default; when omitted,
+                    the run inherits the spec value (false when the
+                    spec doesn't set one or no spec is resolved).
+                    The resolved flag is snapshotted on the run row
+                    at create time and echoed back as `drive` on the
+                    Run resource.
                 budget_override:
                   type: boolean
                   description: |

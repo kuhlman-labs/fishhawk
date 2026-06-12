@@ -116,6 +116,12 @@ type Workflow struct {
 	OnCIFailure *OnCIFailure     `json:"on_ci_failure,omitempty" yaml:"on_ci_failure,omitempty"`
 	Policy      *Policy          `json:"policy,omitempty" yaml:"policy,omitempty"`
 	Budgets     []PeriodicBudget `json:"budgets,omitempty" yaml:"budgets,omitempty"`
+	// Drive opts the workflow's runs into auto-advancement of
+	// mechanical transitions (#1023 / #996 theme 1). Default false.
+	// The workflow-level value is the per-run default; POST /v0/runs
+	// accepts a per-run override that wins, and the resolved flag is
+	// snapshotted onto the run row at create time.
+	Drive bool `json:"drive,omitempty" yaml:"drive,omitempty"`
 }
 
 // PeriodicBudget is a workflow-level recurring cost ceiling (ADR-030).

@@ -25,20 +25,23 @@ import (
 // `Run` schema exactly so there's never a translation step between
 // the OpenAPI doc and the wire format.
 type runResponse struct {
-	ID                 uuid.UUID            `json:"id"`
-	Repo               string               `json:"repo"`
-	WorkflowID         string               `json:"workflow_id"`
-	WorkflowSHA        string               `json:"workflow_sha"`
-	TriggerSource      string               `json:"trigger_source"`
-	TriggerRef         *string              `json:"trigger_ref"`
-	State              string               `json:"state"`
-	ParentRunID        *uuid.UUID           `json:"parent_run_id,omitempty"`
-	DecomposedFrom     *uuid.UUID           `json:"decomposed_from,omitempty"`
-	PullRequestURL     *string              `json:"pull_request_url,omitempty"`
-	RetryAttempt       int                  `json:"retry_attempt"`
-	MaxRetriesSnapshot int                  `json:"max_retries_snapshot"`
-	RunnerKind         string               `json:"runner_kind"`
-	IssueContext       *issueContextPayload `json:"issue_context,omitempty"`
+	ID                 uuid.UUID  `json:"id"`
+	Repo               string     `json:"repo"`
+	WorkflowID         string     `json:"workflow_id"`
+	WorkflowSHA        string     `json:"workflow_sha"`
+	TriggerSource      string     `json:"trigger_source"`
+	TriggerRef         *string    `json:"trigger_ref"`
+	State              string     `json:"state"`
+	ParentRunID        *uuid.UUID `json:"parent_run_id,omitempty"`
+	DecomposedFrom     *uuid.UUID `json:"decomposed_from,omitempty"`
+	PullRequestURL     *string    `json:"pull_request_url,omitempty"`
+	RetryAttempt       int        `json:"retry_attempt"`
+	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
+	RunnerKind         string     `json:"runner_kind"`
+	// Drive echoes the run's persisted drive-mode flag (#1023).
+	// Always emitted; false for legacy rows (migration 0031).
+	Drive        bool                 `json:"drive"`
+	IssueContext *issueContextPayload `json:"issue_context,omitempty"`
 	// CostUSDTotal is the rolled estimated USD cost of the run's model
 	// usage from signed manifest token counts (#649). Always emitted (0
 	// for legacy rows that predate the rollup).
@@ -113,6 +116,7 @@ func toRunResponse(r *run.Run) runResponse {
 		RetryAttempt:       r.RetryAttempt,
 		MaxRetriesSnapshot: r.MaxRetriesSnapshot,
 		RunnerKind:         r.RunnerKind,
+		Drive:              r.Drive,
 		CostUSDTotal:       r.CostUSDTotal,
 		ResolvedModel:      r.ResolvedModel,
 		CreatedAt:          r.CreatedAt,
@@ -178,6 +182,13 @@ type createRunRequest struct {
 	// trigger_source=github_issue; ignored otherwise so the
 	// shape can't be abused to attach prose to non-issue runs.
 	IssueContext *issueContextPayload `json:"issue_context,omitempty"`
+	// Drive is the per-run drive-mode override (#1023 / #996 theme
+	// 1). A pointer so absence is distinguishable from an explicit
+	// false: nil inherits the workflow spec's `drive` default (false
+	// when the spec doesn't set one or no spec is resolved); set, it
+	// wins over the spec value. The resolved flag is snapshotted on
+	// the run row at create time.
+	Drive *bool `json:"drive,omitempty"`
 	// BudgetOverride lets an operator force a run past a blocking
 	// periodic budget that is over its limit for the current period
 	// (#688 / ADR-030). When true and a blocking budget would
@@ -513,6 +524,12 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		// either the inline-spec or the GitHub-fetch path above.
 		createParams.WorkflowSpec = specBytes
 		createParams.MaxRetriesSnapshot = maxRetriesSnap
+		// Drive default from the workflow spec (#1023); the
+		// per-run override below wins when present.
+		createParams.Drive = workflowDef.Drive
+	}
+	if req.Drive != nil {
+		createParams.Drive = *req.Drive
 	}
 	if req.IssueContext != nil {
 		createParams.IssueContext = &run.IssueContext{
