@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -2567,5 +2568,119 @@ func TestSubmitApproval_ScopeCap_NoPlanArtifact_FailsOpen(t *testing.T) {
 		if e.Category == "plan_violates_scope_cap" {
 			t.Errorf("unexpected plan_violates_scope_cap on fail-open")
 		}
+	}
+}
+
+// driveAdvanceFor decodes the run_auto_advanced entries from the audit
+// fake's appended params, asserting the drive payload shape (#1023).
+func driveAdvanceFor(t *testing.T, au *approvalAuditFake) []drive.Advance {
+	t.Helper()
+	var out []drive.Advance
+	for _, e := range au.appended {
+		if e.Category != drive.Category {
+			continue
+		}
+		var adv drive.Advance
+		if err := json.Unmarshal(e.Payload, &adv); err != nil {
+			t.Fatalf("run_auto_advanced payload unmarshal: %v", err)
+		}
+		out = append(out, adv)
+	}
+	return out
+}
+
+// TestSubmitApproval_Drive_GitHubActions_StampsAutoAdvance pins the
+// plan_approved_dispatch stamp (#1023): a plan-gate approval on a
+// drive-enabled github_actions run records the auto-advance the
+// orchestrator handoff performs.
+func TestSubmitApproval_Drive_GitHubActions_StampsAutoAdvance(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.seedRun(&run.Run{ID: stage.RunID, Drive: true, RunnerKind: run.RunnerKindGitHubActions})
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := driveAdvanceFor(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %d, want 1 (%+v)", len(advances), advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RulePlanApprovedDispatch {
+		t.Errorf("Rule = %q, want plan_approved_dispatch", adv.Rule)
+	}
+	if adv.Parked {
+		t.Error("Parked = true, want false: github_actions dispatch is the auto-advance")
+	}
+	if adv.To != "implement:dispatched" {
+		t.Errorf("To = %q, want implement:dispatched", adv.To)
+	}
+	if adv.NextAction != nil {
+		t.Errorf("NextAction = %+v, want nil", adv.NextAction)
+	}
+}
+
+// TestSubmitApproval_Drive_Local_ParksWithNextAction pins the
+// runner_kind local branch: the backend cannot spawn the host-side
+// runner (ADR-024), so the stamp records a park with a ready-to-run
+// next action instead of an executed dispatch.
+func TestSubmitApproval_Drive_Local_ParksWithNextAction(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.seedRun(&run.Run{ID: stage.RunID, Drive: true, RunnerKind: run.RunnerKindLocal})
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := driveAdvanceFor(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %d, want 1 (%+v)", len(advances), advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RulePlanApprovedDispatch {
+		t.Errorf("Rule = %q, want plan_approved_dispatch", adv.Rule)
+	}
+	if !adv.Parked {
+		t.Error("Parked = false, want true for runner_kind local")
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "run_implement_stage" {
+		t.Fatalf("NextAction = %+v, want action run_implement_stage", adv.NextAction)
+	}
+}
+
+// TestSubmitApproval_NonDrive_NoAutoAdvanceStamp is the control: the
+// same approval on a drive:false run leaves the audit trail exactly
+// as before #1023 — no run_auto_advanced entry.
+func TestSubmitApproval_NonDrive_NoAutoAdvanceStamp(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.seedRun(&run.Run{ID: stage.RunID, Drive: false, RunnerKind: run.RunnerKindGitHubActions})
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if advances := driveAdvanceFor(t, au); len(advances) != 0 {
+		t.Errorf("run_auto_advanced entries = %+v, want none on a non-drive run", advances)
+	}
+}
+
+// TestSubmitApproval_Drive_Reject_NoStamp asserts a rejection never
+// stamps plan_approved_dispatch — only an approve is the transition.
+func TestSubmitApproval_Drive_Reject_NoStamp(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.seedRun(&run.Run{ID: stage.RunID, Drive: true, RunnerKind: run.RunnerKindGitHubActions})
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if advances := driveAdvanceFor(t, au); len(advances) != 0 {
+		t.Errorf("run_auto_advanced entries = %+v, want none on reject", advances)
 	}
 }

@@ -159,6 +159,19 @@ func ResolveAuthority(r spec.ReviewersConfig) AuthorityMode {
 	}
 }
 
+// Settled reports whether a stage's configured agent reviews have all
+// reached a terminal state: at least configuredAgents terminal review
+// entries (plan_reviewed/implement_reviewed, *_review_failed,
+// *_review_skipped each count, so a timed-out or skipped reviewer
+// never strands the detection). Zero configured agents never settle —
+// there is nothing to wait for, and the caller's gateless branch owns
+// that case. This is the N-of-N detection the drive engine's
+// reviews_settled_gate rule (#1023) and the ADR-036 plan-approval
+// completion gate share.
+func Settled(configuredAgents, terminalEntries int) bool {
+	return configuredAgents > 0 && terminalEntries >= configuredAgents
+}
+
 // ReviewSkippedPayload is the JSON payload stored in an audit
 // entry with category "plan_review_skipped" (#574). It records that
 // the stage's reviewers config requested agent review (agent > 0) but

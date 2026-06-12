@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1456,5 +1457,47 @@ func TestFixupStage_LegacyIndices_StillWork(t *testing.T) {
 	}
 	if c.State != concern.StateRaised {
 		t.Errorf("stored concern state = %q, want raised (legacy path never marks rows)", c.State)
+	}
+}
+
+// TestFixupStage_Drive_StampsReparkRule pins the fixup_rereview_repark
+// drive stamp (#1023): on a drive-enabled run, the push_and_open_pr
+// re-park lands a run_auto_advanced entry keyed to the re-parked
+// REVIEW stage, alongside the existing stage_fixup_triggered entry.
+func TestFixupStage_Drive_StampsReparkRule(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	impl, review := seedPushOpenPRStages(repo, run.StageStateAwaitingApproval)
+	repo.seedRun(&run.Run{ID: impl.RunID, State: run.StateRunning, Drive: true})
+	seedConcernsReview(au, impl,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "out-of-scope file"},
+	)
+
+	w := postFixup(t, s, impl.ID, fixupRequest{Concerns: []int{0}, Reason: "address scope drift"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var advances []drive.Advance
+	for _, e := range au.appended {
+		if e.Category != drive.Category {
+			continue
+		}
+		var adv drive.Advance
+		if err := json.Unmarshal(e.Payload, &adv); err != nil {
+			t.Fatalf("run_auto_advanced payload unmarshal: %v", err)
+		}
+		if e.StageID == nil || *e.StageID != review.ID {
+			t.Errorf("run_auto_advanced keyed to stage %v, want re-parked review %s", e.StageID, review.ID)
+		}
+		advances = append(advances, adv)
+	}
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %d, want 1", len(advances))
+	}
+	if advances[0].Rule != drive.RuleFixupRereviewRepark {
+		t.Errorf("Rule = %q, want fixup_rereview_repark", advances[0].Rule)
+	}
+	if advances[0].Parked {
+		t.Error("Parked = true, want false: the re-park IS the mechanical advance into a fresh review round")
 	}
 }

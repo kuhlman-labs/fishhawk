@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -293,6 +294,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Drive (#1023): a plan-gate approval on a drive-enabled run is the
+	// plan_approved_dispatch transition point — the orchestrator handoff
+	// above IS the auto-advance (workflow_dispatch for runner_kind
+	// github_actions), so stamp the run_auto_advanced entry that makes
+	// it attributable; runner_kind local parks with a ready-to-run next
+	// action instead (ADR-024: the runner is host-spawned, the backend
+	// has no execution channel to it). After the orchestrator block so
+	// the entry documents an advance that was actually attempted.
+	if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
+		s.recordDrivePlanApproved(r.Context(), stage)
+	}
+
 	// Plan-comment re-render (#377): a plan-stage approve or
 	// reject re-fires the plan-on-issue hook, which edits the
 	// existing comment in place (when the spec opts in to
@@ -313,6 +326,37 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	s.notifyStatusUpdate(r.Context(), stage.RunID, "approval_submit")
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(stage))
+}
+
+// recordDrivePlanApproved stamps the drive engine's
+// plan_approved_dispatch rule (#1023) after a plan-gate approval.
+// No-ops for non-drive runs, when no engine is wired, or on a run
+// read failure (best-effort: the approval already landed; a missing
+// stamp degrades attribution, never the run). The entry is keyed to
+// the approved plan stage.
+func (s *Server) recordDrivePlanApproved(ctx context.Context, stage *run.Stage) {
+	if s.drive == nil || s.cfg.RunRepo == nil {
+		return
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil || !runRow.Drive {
+		return
+	}
+	out := drive.EvaluatePlanApproved(runRow.RunnerKind)
+	adv := drive.Advance{
+		Rule: drive.RulePlanApprovedDispatch,
+		From: "plan:approved",
+	}
+	if out.Advance {
+		adv.To = "implement:dispatched"
+		adv.Event = "plan gate approved; orchestrator dispatched implement via workflow_dispatch"
+	} else {
+		adv.To = "implement:ready"
+		adv.Event = "plan gate approved; runner_kind local parks for a host-side dispatch"
+		adv.Parked = true
+		adv.NextAction = out.NextAction
+	}
+	s.drive.Record(ctx, stage.RunID, &stage.ID, adv)
 }
 
 // findPriorApproval returns the existing approval row for (stageID,

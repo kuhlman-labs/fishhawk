@@ -332,3 +332,29 @@ func TestImplementReviewedPayload_NoResolutions_OmittedFromWire(t *testing.T) {
 		t.Errorf("ConcernResolutions = %+v, want nil decoding a pre-#984 payload", got.ConcernResolutions)
 	}
 }
+
+// TestSettled pins the N-of-N verdicts-settled detection (#1023) for
+// the configurations the dogfood loop runs: 1-of-1 (single reviewer)
+// and 2-of-2 (heterogeneous dual review, live since 2026-06-09).
+func TestSettled(t *testing.T) {
+	cases := []struct {
+		name                 string
+		configured, terminal int
+		want                 bool
+	}{
+		{"1-of-1 pending", 1, 0, false},
+		{"1-of-1 settled", 1, 1, true},
+		{"2-of-2 one landed", 2, 1, false},
+		{"2-of-2 settled", 2, 2, true},
+		{"zero configured never settles", 0, 0, false},
+		{"zero configured ignores stray entries", 0, 3, false},
+		{"extra terminal entries still settled", 2, 3, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planreview.Settled(tc.configured, tc.terminal); got != tc.want {
+				t.Errorf("Settled(%d, %d) = %v, want %v", tc.configured, tc.terminal, got, tc.want)
+			}
+		})
+	}
+}
