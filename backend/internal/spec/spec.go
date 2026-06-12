@@ -122,6 +122,83 @@ type Workflow struct {
 	// accepts a per-run override that wins, and the resolved flag is
 	// snapshotted onto the run row at create time.
 	Drive bool `json:"drive,omitempty" yaml:"drive,omitempty"`
+	// OperatorAgent is the workflow-level delegation default for the
+	// operator agent (ADR-040 / #1026). Nil means nothing is delegated
+	// — fail-closed, every judgment pages the human. A gate-level
+	// block overrides it wholesale; see EffectiveOperatorAgent.
+	OperatorAgent *OperatorAgent `json:"operator_agent,omitempty" yaml:"operator_agent,omitempty"`
+}
+
+// DelegationCondition names a backend-evaluable predicate under which
+// the operator agent may take a delegated action (ADR-040 / #1026).
+// v0 ships exactly one condition per knob; the schema's per-knob
+// enums enforce the closed set, so an unknown condition never reaches
+// this type.
+type DelegationCondition string
+
+// v0 delegation conditions, one per operator_agent knob.
+const (
+	// ConditionCleanDualApproval (may_approve): every configured
+	// reviewer for the gated stage returned an approve verdict and
+	// zero concerns are open.
+	ConditionCleanDualApproval DelegationCondition = "clean_dual_approval"
+	// ConditionConvergentConcerns (may_route_fixup): all reviewer
+	// verdicts are in, at least one concern is open, no reviewer
+	// rejected.
+	ConditionConvergentConcerns DelegationCondition = "convergent_concerns"
+	// ConditionSoloLow (may_waive): exactly one open concern and its
+	// severity is low.
+	ConditionSoloLow DelegationCondition = "solo_low"
+	// ConditionInfraFlake (may_retry): the latest stage failure is
+	// classified as an infrastructure flake.
+	ConditionInfraFlake DelegationCondition = "infra_flake"
+	// ConditionGatesResolvedCIGreen (may_merge): no pending gate
+	// approvals, zero open concerns, PR open, required checks green.
+	ConditionGatesResolvedCIGreen DelegationCondition = "gates_resolved_ci_green"
+)
+
+// must_page_human events — the closed v0 set of events that always
+// page the human regardless of the may_* knobs.
+const (
+	PageEventReviewerReject         = "reviewer_reject"
+	PageEventPlanRejection          = "plan_rejection"
+	PageEventScopeAmendment         = "scope_amendment"
+	PageEventBudgetOverride         = "budget_override"
+	PageEventPolicyOverride         = "policy_override"
+	PageEventExceptionRequest       = "exception_request"
+	PageEventRequirementArbitration = "requirement_arbitration"
+)
+
+// OperatorAgent holds the delegation knobs for the operator agent
+// (ADR-040 / #1026). Each may_* knob names the single condition under
+// which the corresponding action is delegated; an empty knob means
+// that action is not delegated. MustPageHuman lists events that always
+// page the human regardless of the knobs. Declared at workflow level
+// (default) or on an approval gate (override; wins wholesale — knobs
+// are never merged across levels).
+type OperatorAgent struct {
+	MayApprove    DelegationCondition `json:"may_approve,omitempty" yaml:"may_approve,omitempty"`
+	MayRouteFixup DelegationCondition `json:"may_route_fixup,omitempty" yaml:"may_route_fixup,omitempty"`
+	MayWaive      DelegationCondition `json:"may_waive,omitempty" yaml:"may_waive,omitempty"`
+	MayRetry      DelegationCondition `json:"may_retry,omitempty" yaml:"may_retry,omitempty"`
+	MayMerge      DelegationCondition `json:"may_merge,omitempty" yaml:"may_merge,omitempty"`
+	MustPageHuman []string            `json:"must_page_human,omitempty" yaml:"must_page_human,omitempty"`
+}
+
+// EffectiveOperatorAgent resolves the operator_agent block that
+// governs a gate: the gate-level block when present (it wins wholesale
+// — knobs from the two levels are never merged), else the
+// workflow-level block, else nil. Nil means fail-closed: nothing is
+// delegated and every judgment pages the human. g may be nil for
+// callers evaluating outside any gate context (workflow-level only).
+func (w *Workflow) EffectiveOperatorAgent(g *Gate) *OperatorAgent {
+	if g != nil && g.OperatorAgent != nil {
+		return g.OperatorAgent
+	}
+	if w != nil {
+		return w.OperatorAgent
+	}
+	return nil
 }
 
 // PeriodicBudget is a workflow-level recurring cost ceiling (ADR-030).
@@ -368,6 +445,11 @@ type Gate struct {
 	Type      GateType   `json:"type" yaml:"type"`
 	Approvers *Approvers `json:"approvers,omitempty" yaml:"approvers,omitempty"`
 	SLA       string     `json:"sla,omitempty" yaml:"sla,omitempty"`
+	// OperatorAgent is the per-gate delegation override (ADR-040 /
+	// #1026, approval gates only — the schema rejects it on check
+	// gates). When non-nil it wins wholesale over the workflow-level
+	// block; resolve via Workflow.EffectiveOperatorAgent.
+	OperatorAgent *OperatorAgent `json:"operator_agent,omitempty" yaml:"operator_agent,omitempty"`
 }
 
 // GateType is approval or check.

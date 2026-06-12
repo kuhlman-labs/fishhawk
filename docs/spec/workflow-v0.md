@@ -15,7 +15,7 @@ Reference for `.fishhawk/workflows.yaml`. The canonical schema is [`workflow-v0.
 ## Top-level shape
 
 ```yaml
-version: "0.3" # required; "0.3" or "0.4" (0.4 adds workflow.budgets)
+version: "0.3" # required; "0.3", "0.4" (adds workflow.budgets), or "0.5" (adds operator_agent)
 roles: # optional; named groups referenced by gates
   <role_id>:
     members: ["@org/team", "@user"]
@@ -26,6 +26,7 @@ workflows: # required; at least one workflow
       max_retries: 1 # default when the block is absent
     budgets: [...] # optional; periodic per-workflow cost ceilings (ADR-030, v0.4+)
     drive: false # optional; auto-advance mechanical transitions (#1023)
+    operator_agent: {...} # optional; delegation knobs for the operator agent (ADR-040, v0.5+)
     stages: [...]
 ```
 
@@ -239,6 +240,7 @@ Two types:
   approvers:
     any_of: [tech_lead, senior_engineer] # or all_of
   sla: 4_business_hours # optional; D-category timeout
+  operator_agent: {...} # optional; per-gate delegation override (ADR-040, v0.5+; see ## Operator agent delegation)
 
 # Check gate — placeholder for workflows that delegate to GitHub branch
 # protection. Carries no spec-level fields in 0.2 (#254 / ADR-017).
@@ -336,11 +338,59 @@ Opt-in auto-advancement of mechanical run transitions (#1023 / #996 theme 1). Wh
 - **Additive within workflow-v0.x** — optional field, no version bump; specs without it parse unchanged.
 - The flag is persisted-but-inert until the drive engine lands (`backend/internal/drive`, sibling slice of #1023): nothing consumes it at the spec layer beyond parsing and run-create resolution.
 
+## Operator agent delegation (v0.5+)
+
+Delegation knobs for the operator agent (ADR-040 / #1026). Each `may_*` knob names the **single backend-evaluable condition** under which the operator agent may take that action without paging the human. The per-knob values are closed single-entry enums in v0 — a condition exists only if the backend can answer it from run state.
+
+```yaml
+workflows:
+  feature_change:
+    operator_agent: # workflow-level default for every gate
+      may_approve: clean_dual_approval
+      may_route_fixup: convergent_concerns
+      may_waive: solo_low
+      may_retry: infra_flake
+      may_merge: gates_resolved_ci_green
+      must_page_human: [reviewer_reject, budget_override]
+    stages:
+      - id: plan
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers: { any_of: [founder] }
+            operator_agent: # per-gate override; wins WHOLESALE over the workflow block
+              may_approve: clean_dual_approval
+```
+
+**Per-knob conditions** (closed v0 set):
+
+| Knob | Condition | Met when |
+|---|---|---|
+| `may_approve` | `clean_dual_approval` | every configured reviewer for the gated stage returned an approve verdict AND zero concerns are open |
+| `may_route_fixup` | `convergent_concerns` | all reviewer verdicts are in, at least one concern is open, no reviewer rejected |
+| `may_waive` | `solo_low` | exactly one open concern and its severity is low |
+| `may_retry` | `infra_flake` | the latest stage failure is classified as an infrastructure flake |
+| `may_merge` | `gates_resolved_ci_green` | no pending gate approvals, zero open concerns, PR open, required checks green |
+
+**Fail-closed default.** An absent `operator_agent` block delegates nothing: every judgment pages the human, exactly as before v0.5. Likewise an absent knob within a block — only the named knobs are delegated. Specs without the block behave byte-identically to today.
+
+**Precedence.** A gate-level block (approval gates only — the schema rejects `operator_agent` on `check` gates) overrides the workflow-level block **wholesale**: knobs are never merged across levels, so a gate block that omits `may_retry` does not inherit the workflow's `may_retry`. Resolution lives in `spec.Workflow.EffectiveOperatorAgent(gate)`: gate block if present, else workflow block, else nil.
+
+**`must_page_human`.** Events that always page the human regardless of the `may_*` knobs (closed set: `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`). An event listed here is never absorbed by a delegation.
+
+**Authority unchanged (ADR-027).** Delegation changes *who* may act at a gate, not what gates exist or how reviewer authority resolves. The condition evaluation, API surfacing, and delegated-action enforcement are backend follow-ups (#1026 sibling slices); v0.5 of the schema defines the authoring surface and the parsed types.
+
+- `may_merge` is evaluated and surfaced but has no backend merge endpoint to enforce in v0 — merge happens on GitHub; enforcement attaches when a merge action surface exists.
+
 ## Identifier namespaces
 
 | Field                       | Pattern / values                                                             | Notes                                                                                               |
 | --------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `version`                   | `"0.3"` \| `"0.4"`                                                          | 0.4 adds workflow-level `budgets` (ADR-030 / #688); 0.3 adds `on_ci_failure.max_retries` (#277); 0.2 dropped `blocking_checks` |
+| `version`                   | `"0.3"` \| `"0.4"` \| `"0.5"`                                               | 0.5 adds `operator_agent` (ADR-040 / #1026); 0.4 adds workflow-level `budgets` (ADR-030 / #688); 0.3 adds `on_ci_failure.max_retries` (#277); 0.2 dropped `blocking_checks` |
 | `budgets[].period`          | `weekly` \| `monthly`                                                        | workflow-level periodic budget reset cadence (v0.4+)                                                |
 | `budgets[].enforcement`     | `advisory` \| `blocking`                                                     | advisory warns; blocking refuses a new run at admission                                             |
 | Role / workflow / stage IDs | `^[a-z][a-z0-9_]*$`                                                          | snake_case                                                                                          |
@@ -362,6 +412,8 @@ Opt-in auto-advancement of mechanical run transitions (#1023 / #996 theme 1). Wh
 | Budget enforcement          | `advisory` \| `blocking`                                                     | v0 ships advisory only                                                                              |
 | Gate `type`                 | `approval` \| `check`                                                        | closed set                                                                                          |
 | Approvers shape             | `any_of: [<role_id>...]` xor `all_of: [<role_id>...]`                        | one shape per gate                                                                                  |
+| `operator_agent.may_*`      | one closed condition per knob (see ## Operator agent delegation)             | v0.5+; workflow level + approval-gate override (gate wins wholesale); absent → fail-closed          |
+| `operator_agent.must_page_human` | `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration` | closed set; always pages the human regardless of `may_*` knobs |
 
 ## Validation rules beyond the schema
 
