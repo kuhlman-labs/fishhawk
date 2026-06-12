@@ -1566,3 +1566,48 @@ func TestRunStage_OmitsBudgetWhenNoBudget(t *testing.T) {
 		t.Errorf("expected no budget block; got %+v", out.Budget)
 	}
 }
+
+// TestRunStage_NextActions_SurfacedAfterStage is the run_stage half of
+// the #1024 wiring: after the runner exits, the handler computes
+// next_actions from the post-stage fetches (run row + stage list +
+// review statuses) so a terminal run_stage call hands the operator the
+// legal next move directly. A plan stage parked at its gate with no
+// review entries classifies as plan_gate_parked → approve/reject.
+func TestRunStage_NextActions_SurfacedAfterStage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.mu.Unlock()
+	seedStage(fb, runID, stageID, "awaiting_approval")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.NextActions == nil {
+		t.Fatal("NextActions is nil; want the #1024 block on the run-terminal result")
+	}
+	if out.NextActions.State != "plan_gate_parked" {
+		t.Errorf("next_actions.state = %q, want plan_gate_parked", out.NextActions.State)
+	}
+	var sawApprove bool
+	for _, a := range out.NextActions.Actions {
+		if a.Action == "fishhawk_approve_plan" {
+			sawApprove = true
+		}
+	}
+	if !sawApprove {
+		t.Errorf("next_actions should offer fishhawk_approve_plan at the parked plan gate; got %+v", out.NextActions.Actions)
+	}
+}

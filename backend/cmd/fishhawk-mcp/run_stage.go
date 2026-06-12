@@ -171,6 +171,14 @@ type RunStageOutput struct {
 	// nothing to act on — never gates the stage. Plan stages and start_run
 	// are intentionally excluded.
 	ReviewActionHint *ReviewActionHint `json:"review_action_hint,omitempty" jsonschema:"display-only next-action pointer after an implement stage whose review returned unresolved approve_with_concerns concerns and a non-spent fix-up budget; points at fishhawk_fixup_stage vs approving to merge. Omitted for non-implement stages and when there is nothing to act on. Never gates the stage"`
+
+	// NextActions is the server-suggested next-action block (#1024),
+	// computed after the post-stage fetches (run row + drive view, stage
+	// list, review statuses, hint) so a terminal run_stage call hands the
+	// operator the legal next move directly. Same classifier as
+	// fishhawk_get_run_status. Best-effort: omitted when the post-run run
+	// fetch failed. Display-only, never gates the stage.
+	NextActions *NextActions `json:"next_actions,omitempty" jsonschema:"server-suggested next actions (#1024): the classified run lifecycle state plus the legal next moves after this stage ran — each entry names the tool to call (with key params), its precondition, what it consumes (none, fixup_budget, retry_budget, approval_slot, new_run), and a one-line reason. Omitted when the post-run fetches failed. Display-only — never gates the stage"`
 }
 
 // RunnerEvent wraps an unstructured runner event. Each event is the
@@ -298,6 +306,13 @@ unavailable):
                       synchronous return the stage is normally already
                       terminal (poll_interval_seconds omitted); poll
                       fishhawk_get_run_status to await a non-terminal stage.
+  - next_actions    — server-suggested next actions (#1024): the
+                      classified run lifecycle state plus the legal next
+                      moves after this stage ran, each naming the tool to
+                      call, its precondition, what it consumes (none /
+                      fixup_budget / retry_budget / approval_slot /
+                      new_run), and a one-line reason. Same classifier as
+                      fishhawk_get_run_status; display-only, never gates.
 
 Cancellation: cancelling the tool call sends SIGTERM (then SIGKILL
 after a 30s grace) to the runner. Graceful cleanup requires the
@@ -545,6 +560,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// here doesn't fail the tool — the audit log has the canonical
 	// transition record.
 	stageState := ""
+	var postStages []Stage
 	if fetchErr := func() error {
 		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -552,6 +568,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		if ferr != nil {
 			return ferr
 		}
+		postStages = stages
 		for _, s := range stages {
 			if s.ID == stageUUID.String() {
 				stageState = s.State
@@ -633,29 +650,56 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		warnings = append(warnings, budgetWarn)
 	}
 
+	// Post-run run row + drive view (#1023/#1024), fetched once
+	// best-effort: it feeds the hint's terminal suppression (#968), the
+	// drive fold, and the next_actions classifier. Same GET
+	// /v0/runs/{run_id} the old per-hint GetRun hit. Nil on a fetch
+	// error — never fails the stage.
+	var runView *runDriveView
+	if v, verr := r.fetchRunDriveView(ctx, runUUID); verr == nil {
+		runView = v
+	} else {
+		warnings = append(warnings, fmt.Sprintf("post-run run fetch failed (next_actions omitted): %v", verr))
+	}
+
+	// Review statuses (best-effort): the implement status feeds both the
+	// #777 hint and the next_actions classifier; the plan status feeds the
+	// classifier's plan-gate arms. A fetch error appends a warning and
+	// leaves the field nil — never fails the stage.
+	implementReviewStatus, irsErr := r.reviewStatusFor(ctx, runUUID, "implement")
+	if irsErr != nil {
+		implementReviewStatus = nil
+		warnings = append(warnings, fmt.Sprintf("implement review status unavailable: %v", irsErr))
+	}
+	planReviewStatus, prsErr := r.reviewStatusFor(ctx, runUUID, "plan")
+	if prsErr != nil {
+		planReviewStatus = nil
+		warnings = append(warnings, fmt.Sprintf("plan review status unavailable: %v", prsErr))
+	}
+
 	// Best-effort review-action hint (#777), only for implement stages —
-	// plan and review stages have no implement review to act on. Query the
-	// implement review status here (run_stage has no pre-computed status)
-	// and feed it in. A fetch error appends a warning and leaves the field
-	// nil — never fails the stage. start_run is excluded by construction.
+	// plan and review stages have no implement review to act on.
+	// start_run is excluded by construction.
 	var reviewActionHint *ReviewActionHint
-	if in.Stage == "implement" {
-		// Run state for the hint's terminal suppression (#968). Best-effort:
-		// a fetch error leaves it "" (non-terminal), so the hint computes as
-		// before rather than failing the stage.
+	if in.Stage == "implement" && irsErr == nil {
 		runState := ""
-		if runRow, rerr := r.api.GetRun(ctx, runUUID); rerr == nil && runRow != nil {
-			runState = runRow.State
+		if runView != nil {
+			runState = runView.State
 		}
-		implementReviewStatus, hintErr := r.reviewStatusFor(ctx, runUUID, "implement")
+		var hintErr error
+		reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus)
 		if hintErr != nil {
 			warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
-		} else {
-			reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus)
-			if hintErr != nil {
-				warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
-			}
 		}
+	}
+
+	// Server-suggested next actions (#1024): the same classifier
+	// fishhawk_get_run_status uses, computed from the post-stage fetches
+	// above so a terminal run_stage call hands the operator the legal
+	// next move directly. Omitted when the run fetch failed.
+	var nextActions *NextActions
+	if runView != nil {
+		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus())
 	}
 
 	out := RunStageOutput{
@@ -675,6 +719,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		FixupNoChanges:   summary.FixupNoChanges,
 		Budget:           budgetStatus,
 		ReviewActionHint: reviewActionHint,
+		NextActions:      nextActions,
 	}
 
 	// Return-cancellation signal: if the parent ctx was the reason

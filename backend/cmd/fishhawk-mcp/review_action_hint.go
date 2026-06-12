@@ -81,6 +81,73 @@ func implementReviewMergeHint(implementStatus *ReviewStatus) string {
 	return "the implement-stage agent review has not landed yet — the PR is NOT safe to merge or resolve. The required fishhawk_audit_complete check is held pending on this review and flips green automatically once the verdict lands. Re-poll fishhawk_get_run_status on the advertised poll_interval_seconds until implement_review_status is terminal."
 }
 
+// suggestedActions translates the computed hint into the next_actions
+// concern-arm entries (#1024). Deriving the entries FROM the hint value —
+// rather than re-deriving the budget state from audit — is what keeps
+// review_action_hint and next_actions agreeing by construction: the
+// budget/ceiling branch conditions live once, in reviewActionHintFor, and
+// this method only reads the result (RemainingFixupBudget /
+// OverrideAvailable carry the branch).
+func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) []SuggestedAction {
+	fixupParams := map[string]string{
+		"stage_id":    implementStageID,
+		"concern_ids": "run.concerns.items[].id",
+	}
+	mergeWithFollowUp := SuggestedAction{
+		Action:       "merge_and_file_follow_up",
+		Params:       prParams(run),
+		Precondition: "the remaining concerns are acceptable to land",
+		Consumes:     consumesNone,
+		Reason:       fmt.Sprintf("%d open concern(s) — approve the PR with an operator verdict, merge, and file a follow-up issue for what was not routed back", h.Concerns),
+	}
+
+	// Below the normal budget: route the concerns back, or approve to merge.
+	if h.RemainingFixupBudget > 0 {
+		return []SuggestedAction{
+			{
+				Action:       "fishhawk_fixup_stage",
+				Params:       fixupParams,
+				Precondition: "the implement stage is parked at its review gate (or succeeded with the PR open); checkout the run branch first",
+				Consumes:     consumesFixupBudget,
+				Reason:       fmt.Sprintf("%d open concern(s) from the implement review; %d normal fix-up pass(es) remain", h.Concerns, h.RemainingFixupBudget),
+			},
+			mergeWithFollowUp,
+		}
+	}
+
+	// Budget spent, ceiling open: merge-with-follow-up or the bounded
+	// operator override (#860).
+	if h.OverrideAvailable {
+		forcedParams := map[string]string{
+			"stage_id":              implementStageID,
+			"concern_ids":           "run.concerns.items[].id",
+			"force_additional_pass": "true",
+		}
+		return []SuggestedAction{
+			mergeWithFollowUp,
+			{
+				Action:       "fishhawk_fixup_stage",
+				Params:       forcedParams,
+				Precondition: fmt.Sprintf("the normal fix-up budget is spent but the hard ceiling of %d total passes is not reached", fixupCeiling),
+				Consumes:     consumesFixupBudget,
+				Reason:       fmt.Sprintf("%d open concern(s) remain after the budget is spent; ONE bounded operator override pass is still available", h.Concerns),
+			},
+		}
+	}
+
+	// Hard ceiling reached: merge-with-follow-up or a fresh run.
+	return []SuggestedAction{
+		mergeWithFollowUp,
+		{
+			Action:       "fishhawk_start_run",
+			Params:       nil,
+			Precondition: fmt.Sprintf("the hard fix-up ceiling of %d total passes is reached — no override left", fixupCeiling),
+			Consumes:     consumesNewRun,
+			Reason:       "address the remaining concerns in a fresh run instead of this one",
+		},
+	}
+}
+
 // reviewActionHintFor computes the display-only review-action hint for a run's
 // implement stage from audit data (#777, #860). It returns nil (no hint) when:
 //

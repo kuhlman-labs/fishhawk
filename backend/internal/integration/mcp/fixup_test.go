@@ -1248,6 +1248,24 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
 		t.Errorf("review_action_hint.message should point at fishhawk_fixup_stage; got %q", hint.Message)
 	}
 
+	// #1024: the next_actions concern arm derives FROM the same hint
+	// computation, so the two surfaces must agree on the remaining-budget
+	// number before the fix-up pass.
+	na := getNextActions(t, ctx, session, fx.runID)
+	if na == nil || na.State != "implement_concerns_open" {
+		t.Fatalf("next_actions = %+v, want state implement_concerns_open alongside the hint", na)
+	}
+	fixupAction := na.Actions[0]
+	if fixupAction.Action != "fishhawk_fixup_stage" || fixupAction.Consumes != "fixup_budget" {
+		t.Fatalf("actions[0] = %+v, want fishhawk_fixup_stage consuming fixup_budget below budget", fixupAction)
+	}
+	if want := fmt.Sprintf("%d normal fix-up pass(es) remain", hint.RemainingFixupBudget); !strings.Contains(fixupAction.Reason, want) {
+		t.Errorf("next_actions fixup reason %q disagrees with review_action_hint remaining budget %d", fixupAction.Reason, hint.RemainingFixupBudget)
+	}
+	if fixupAction.Params["stage_id"] != stage.ID.String() {
+		t.Errorf("fixup action params.stage_id = %q, want %s", fixupAction.Params["stage_id"], stage.ID)
+	}
+
 	// callFixup drives one fix-up through the real MCP binary; force toggles
 	// the bounded operator override (#860). Re-parks the stage at the gate
 	// first so only the budget/ceiling decision gates the pass.
@@ -1292,6 +1310,11 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
 	// 5. Direction D: the re-review lands a fresh concern AFTER the fix-up.
 	// With the normal budget spent but the hard ceiling still open, the hint
 	// must NOT suppress — it surfaces the exhaustion with OverrideAvailable.
+	// Re-park the stage at its gate first (the shape the redispatched
+	// fix-up's re-review leaves): the post-trigger `pending` interlude is a
+	// dispatch state, not a concern state, and next_actions classifies it
+	// as such.
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
 	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "the re-review still sees drift"})
 	hint = getReviewActionHint(t, ctx, session, fx.runID)
@@ -1303,6 +1326,29 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
 	}
 	if !hint.OverrideAvailable {
 		t.Errorf("review_action_hint.override_available = false, want true (below the hard ceiling)")
+	}
+
+	// #1024 agreement, post-fix-up: with the normal budget spent and the
+	// override open, next_actions must mirror the SAME hint state — the
+	// forced fixup option plus merge-with-follow-up, no normal-budget pass.
+	na = getNextActions(t, ctx, session, fx.runID)
+	if na == nil || na.State != "implement_concerns_open" {
+		t.Fatalf("post-fix-up next_actions = %+v, want state implement_concerns_open", na)
+	}
+	var sawForced, sawMergeFollowUp bool
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_fixup_stage" {
+			if a.Params["force_additional_pass"] != "true" {
+				t.Errorf("budget-spent fixup action must carry force_additional_pass=true; params = %v", a.Params)
+			}
+			sawForced = true
+		}
+		if a.Action == "merge_and_file_follow_up" {
+			sawMergeFollowUp = true
+		}
+	}
+	if !sawForced || !sawMergeFollowUp {
+		t.Errorf("post-budget next_actions = %+v, want the forced-override fixup AND merge_and_file_follow_up (agreeing with override_available=%v)", na.Actions, hint.OverrideAvailable)
 	}
 
 	// 6. The operator override admits ONE pass beyond the budget, audited as
