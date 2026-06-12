@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -1465,6 +1466,113 @@ func TestSubmitApproval_BudgetCheck_WithinBudget_Proceeds(t *testing.T) {
 		if e.Category == "plan_violates_budget" || e.Category == "plan_budget_override_acknowledged" {
 			t.Errorf("unexpected budget audit entry when within budget: %s", e.Category)
 		}
+	}
+}
+
+// TestSubmitApproval_BudgetCheck_EvidenceVerdictMatchesGate is the #1029
+// contract test: across every budget scenario, the plan-review prompt's
+// rendered Budget-check verdict must agree with checkPlanBudget's outcome
+// at the approval gate. Each case drives the real approval endpoint (the
+// gate leg) AND the real evidence-build + prompt-render path (the
+// evidence leg) on the same plan artifact, so the two surfaces cannot
+// drift apart silently (#618 cross-boundary rule; same drift class as
+// #994). In particular: a decomposition with an oversized slice still
+// satisfies the gate — the gate checks only presence — so the evidence
+// must claim "gate satisfied", never refusal.
+func TestSubmitApproval_BudgetCheck_EvidenceVerdictMatchesGate(t *testing.T) {
+	// Budget resolves to the 15m backend default (seedRun carries no
+	// workflow spec), matching the other budget-check tests.
+	cases := []struct {
+		name string
+		plan *plan.Plan
+		// wantRefused: the gate 422s plan_violates_budget AND the rendered
+		// verdict says "will be refused".
+		wantRefused bool
+		// wantDecompSatisfied: the gate proceeds on the decomposition
+		// branch AND the rendered verdict says "gate satisfied".
+		wantDecompSatisfied bool
+	}{
+		{
+			name: "under",
+			plan: &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 10},
+		},
+		{
+			name: "over_decomposed",
+			plan: &plan.Plan{
+				PlanVersion:             "standard_v1",
+				PredictedRuntimeMinutes: 20,
+				Decomposition: &plan.Decomposition{
+					Rationale: "too big",
+					SubPlans: []plan.SubPlanSummary{
+						{Title: "part1", PredictedRuntimeMinutes: 10},
+						{Title: "part2", PredictedRuntimeMinutes: 10},
+					},
+				},
+			},
+			wantDecompSatisfied: true,
+		},
+		{
+			name:        "over_undecomposed",
+			plan:        &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 20},
+			wantRefused: true,
+		},
+		{
+			name: "over_oversized_slice",
+			plan: &plan.Plan{
+				PlanVersion:             "standard_v1",
+				PredictedRuntimeMinutes: 20,
+				Decomposition: &plan.Decomposition{
+					Rationale: "too big",
+					SubPlans: []plan.SubPlanSummary{
+						{Title: "big slice", PredictedRuntimeMinutes: 18},
+						{Title: "small slice", PredictedRuntimeMinutes: 4},
+					},
+				},
+			},
+			wantDecompSatisfied: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			art := newFakeArtifactRepo()
+			s, rr, _, _ := newBudgetCheckServer(t, art)
+			r, stage := seedBudgetRun(t, rr, art, tc.plan)
+
+			// Gate leg: drive the real approval endpoint.
+			w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+			gateRefused := w.Code == http.StatusUnprocessableEntity &&
+				strings.Contains(w.Body.String(), `"plan_violates_budget"`)
+			if gateRefused != tc.wantRefused {
+				t.Fatalf("gate refused = %v (status %d), want refused = %v:\n%s",
+					gateRefused, w.Code, tc.wantRefused, w.Body.String())
+			}
+			if !tc.wantRefused && w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (gate proceeds):\n%s", w.Code, w.Body.String())
+			}
+
+			// Evidence leg: the same server builds the budget evidence and
+			// the prompt package renders it — the path runPlanReviews
+			// dispatches to the reviewer.
+			ev := s.planBudgetEvidence(context.Background(), r, tc.plan)
+			if ev == nil {
+				t.Fatal("planBudgetEvidence = nil, want evidence (no spec resolves to the backend default)")
+			}
+			rendered, err := prompt.Build("plan_review", prompt.Trigger{
+				Repo:             r.Repo,
+				PlanGateEvidence: &prompt.PlanGateEvidence{BudgetCheck: ev},
+			})
+			if err != nil {
+				t.Fatalf("prompt.Build: %v", err)
+			}
+			if got := strings.Contains(rendered, "will be refused"); got != tc.wantRefused {
+				t.Errorf("rendered verdict claims refusal = %v, gate refused = %v — evidence and gate disagree (#1029):\n%s",
+					got, tc.wantRefused, rendered)
+			}
+			if got := strings.Contains(rendered, "gate satisfied"); got != tc.wantDecompSatisfied {
+				t.Errorf("rendered verdict claims gate-satisfied-by-decomposition = %v, want %v:\n%s",
+					got, tc.wantDecompSatisfied, rendered)
+			}
+		})
 	}
 }
 

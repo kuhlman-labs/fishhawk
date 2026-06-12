@@ -15,6 +15,7 @@ package prompt
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -385,6 +386,23 @@ type BudgetCheckEvidence struct {
 	ResolvedBudgetMinutes int
 	BudgetSource          string
 	PredictedMinutes      int
+	// Decomposed reports whether the plan carries a decomposition block
+	// (#1029). It MUST be derived from the exact predicate checkPlanBudget
+	// evaluates at the approval gate (plan.Decomposition != nil) — never
+	// from len(SubPlans) — so the rendered verdict and the gate agree by
+	// construction even for degenerate decomposition shapes.
+	Decomposed bool
+	// SubPlans carries the decomposition's sub-plan summaries in
+	// sub_plans order: minutes for the verdict arithmetic, title so an
+	// oversized slice can be named in the flag line.
+	SubPlans []BudgetSubPlanEvidence
+}
+
+// BudgetSubPlanEvidence is one decomposition sub-plan's contribution to
+// the Budget check verdict.
+type BudgetSubPlanEvidence struct {
+	Title            string
+	PredictedMinutes int
 }
 
 // ScopePrecheckEvidence is the plan_scope_precheck result: the plan's
@@ -996,10 +1014,39 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		b.WriteString("Budget check (plan prediction vs the resolved implement-stage budget the approval gate enforces):\n\n")
 		fmt.Fprintf(b, "- resolved implement budget: %d minutes (source: %s)\n", bc.ResolvedBudgetMinutes, bc.BudgetSource)
 		fmt.Fprintf(b, "- plan predicted_runtime_minutes: %d\n", bc.PredictedMinutes)
-		if bc.PredictedMinutes > bc.ResolvedBudgetMinutes {
-			b.WriteString("- verdict: over budget (approval will be refused without decomposition or --override-budget)\n")
-		} else {
+		switch {
+		case bc.PredictedMinutes <= bc.ResolvedBudgetMinutes:
 			b.WriteString("- verdict: within budget\n")
+		case !bc.Decomposed:
+			b.WriteString("- verdict: over budget (approval will be refused without decomposition or --override-budget)\n")
+		default:
+			// Over budget with a decomposition: checkPlanBudget is satisfied
+			// by the decomposition's presence alone (#1029), so the refusal
+			// wording must never appear on this branch — the reviewer judges
+			// the slices, not a phantom refusal.
+			mins := make([]string, len(bc.SubPlans))
+			maxMinutes := 0
+			var oversized []BudgetSubPlanEvidence
+			for i, sp := range bc.SubPlans {
+				mins[i] = strconv.Itoa(sp.PredictedMinutes)
+				if sp.PredictedMinutes > maxMinutes {
+					maxMinutes = sp.PredictedMinutes
+				}
+				if sp.PredictedMinutes > bc.ResolvedBudgetMinutes {
+					oversized = append(oversized, sp)
+				}
+			}
+			if len(oversized) == 0 {
+				fmt.Fprintf(b, "- verdict: over budget, decomposed into %d sub-plans (%s min, max %d <= budget %d) — gate satisfied without override\n",
+					len(bc.SubPlans), strings.Join(mins, "/"), maxMinutes, bc.ResolvedBudgetMinutes)
+			} else {
+				fmt.Fprintf(b, "- verdict: over budget, decomposed into %d sub-plans (%s min) — gate satisfied without override (the gate checks only that a decomposition exists)\n",
+					len(bc.SubPlans), strings.Join(mins, "/"))
+				for _, sp := range oversized {
+					fmt.Fprintf(b, "- OVERSIZED SUB-PLAN: %q predicts %d minutes, over the %d-minute budget — judge whether this slice must be re-split\n",
+						sp.Title, sp.PredictedMinutes, bc.ResolvedBudgetMinutes)
+				}
+			}
 		}
 		b.WriteString("\n")
 	}

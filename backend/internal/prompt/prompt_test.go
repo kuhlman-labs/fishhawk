@@ -1619,6 +1619,84 @@ func TestBuild_PlanReview_GateEvidence_BudgetCheckRenders(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_BudgetCheckDecomposedSatisfied pins
+// the #1029 fix: an over-budget plan that carries a decomposition renders
+// a gate-accurate "gate satisfied without override" verdict with the
+// sub-plan count and per-slice minutes — never the refusal wording, which
+// checkPlanBudget would not actually apply.
+func TestBuild_PlanReview_GateEvidence_BudgetCheckDecomposedSatisfied(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			BudgetCheck: &BudgetCheckEvidence{
+				ResolvedBudgetMinutes: 30,
+				BudgetSource:          "spec",
+				PredictedMinutes:      45,
+				Decomposed:            true,
+				SubPlans: []BudgetSubPlanEvidence{
+					{Title: "Part A", PredictedMinutes: 20},
+					{Title: "Part B", PredictedMinutes: 15},
+					{Title: "Part C", PredictedMinutes: 10},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	want := "- verdict: over budget, decomposed into 3 sub-plans (20/15/10 min, max 20 <= budget 30) — gate satisfied without override"
+	if !strings.Contains(got, want) {
+		t.Errorf("plan_review prompt missing decomposed gate-satisfied verdict %q:\n%s", want, got)
+	}
+	if strings.Contains(got, "will be refused") {
+		t.Errorf("refusal wording must not appear when the plan is decomposed (the gate is satisfied):\n%s", got)
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_BudgetCheckOversizedSlice pins the
+// #1029 oversized-slice branch: a decomposition whose sub-plan itself
+// exceeds the budget still satisfies the gate (checkPlanBudget checks
+// only presence), so the verdict stays gate-satisfied — but each
+// oversized slice is flagged by title and minutes for the reviewer to
+// judge whether it must be re-split.
+func TestBuild_PlanReview_GateEvidence_BudgetCheckOversizedSlice(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			BudgetCheck: &BudgetCheckEvidence{
+				ResolvedBudgetMinutes: 30,
+				BudgetSource:          "spec",
+				PredictedMinutes:      45,
+				Decomposed:            true,
+				SubPlans: []BudgetSubPlanEvidence{
+					{Title: "Part A", PredictedMinutes: 35},
+					{Title: "Part B", PredictedMinutes: 12},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"- verdict: over budget, decomposed into 2 sub-plans (35/12 min) — gate satisfied without override (the gate checks only that a decomposition exists)",
+		`- OVERSIZED SUB-PLAN: "Part A" predicts 35 minutes, over the 30-minute budget — judge whether this slice must be re-split`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing oversized-slice element %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "will be refused") {
+		t.Errorf("refusal wording must not appear when the plan is decomposed (the gate is satisfied):\n%s", got)
+	}
+	if strings.Contains(got, `"Part B" predicts`) {
+		t.Errorf("within-budget slice must not be flagged as oversized:\n%s", got)
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_NilBudgetCheckByteIdentical verifies
 // the additive property for the #994 block: evidence carrying only the
 // pre-existing sub-results renders byte-identically with BudgetCheck nil,

@@ -1299,6 +1299,54 @@ func TestShipPlan_ReviewAgents_BudgetEvidenceReachesReviewPrompt(t *testing.T) {
 	}
 }
 
+// TestShipPlan_ReviewAgents_BudgetEvidenceDecomposedReachesReviewPrompt
+// is the #1029 seam check: a decomposed over-budget plan must reach the
+// dispatched reviewer prompt with the gate-accurate "gate satisfied
+// without override" verdict — including the sub-plan count and per-slice
+// minutes, so the reviewer sees the decomposition in the authoritative
+// evidence line rather than rejecting on a phantom refusal.
+// planfixture.Decomposed() predicts 20 over the 15m spec-default budget
+// with two 10-minute sub-plans.
+func TestShipPlan_ReviewAgents_BudgetEvidenceDecomposedReachesReviewPrompt(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, _, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithConstraints)
+	priv, _ := sf.issue(t, runID)
+	body, err := json.Marshal(planfixture.Decomposed())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	wants := []string{
+		"Budget check (plan prediction vs the resolved implement-stage budget the approval gate enforces):",
+		"- resolved implement budget: 15 minutes (source: spec)",
+		"- plan predicted_runtime_minutes: 20",
+		"- verdict: over budget, decomposed into 2 sub-plans (10/10 min, max 10 <= budget 15) — gate satisfied without override",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing decomposed budget-evidence element %q — threading seam broken:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "will be refused") {
+		t.Errorf("dispatched prompt claims refusal for a decomposed plan — phantom refusal (#1029):\n%s", got)
+	}
+}
+
 // TestShipPlan_ReviewAgents_GatingReject_StageFailedB verifies that in
 // gating mode (agent>0 && human==0) a reject verdict transitions the
 // stage to failed-B so trace-driven awaiting_approval is blocked.
