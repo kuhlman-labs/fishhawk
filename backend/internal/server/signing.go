@@ -49,10 +49,15 @@ const (
 const signingKeyTTLBuffer = 5 * time.Minute
 
 // resolveSigningKeyTTL returns the TTL to use when issuing a signing
-// key for runID. It resolves the active stage's budget via
-// resolveAgentTimeout and returns max(DefaultTTL, budget + buffer).
-// Falls back to DefaultTTL when RunRepo is unconfigured, the run
-// cannot be fetched, the spec is absent, or no active stage is found.
+// key for runID. It resolves the stage via the active-or-next rule
+// (first dispatched/running stage, else first non-terminal — the
+// #1030 local-runner first-stage fallback, so a run whose first
+// stage is a still-pending implement stage resolves that stage's
+// budget instead of the default), then resolves that stage's budget
+// via resolveAgentTimeout and returns max(DefaultTTL, budget +
+// buffer). Falls back to DefaultTTL when RunRepo is unconfigured,
+// the run cannot be fetched, the spec is absent, or every stage is
+// terminal.
 func (s *Server) resolveSigningKeyTTL(ctx context.Context, runID uuid.UUID) time.Duration {
 	if s.cfg.RunRepo == nil {
 		return signing.DefaultTTL
@@ -65,13 +70,7 @@ func (s *Server) resolveSigningKeyTTL(ctx context.Context, runID uuid.UUID) time
 	if err != nil {
 		return signing.DefaultTTL
 	}
-	var activeStage *run.Stage
-	for _, st := range stages {
-		if st.State == run.StageStateDispatched || st.State == run.StageStateRunning {
-			activeStage = st
-			break
-		}
-	}
+	activeStage := activeOrNextStage(stages)
 	if activeStage == nil {
 		return signing.DefaultTTL
 	}
