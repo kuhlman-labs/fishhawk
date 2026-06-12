@@ -345,6 +345,88 @@ func TestRequestScopeAmendment_NoExecutingImplementStage409(t *testing.T) {
 	}
 }
 
+// TestRequestScopeAmendment_PendingImplementChildRun_EndToEnd is the
+// #1030 cross-boundary check: issue a REAL signed MCP token for a
+// run whose ONLY stage is a PENDING implement stage (decomposition-
+// child shape under a local runner), then POST the amendment through
+// the full s.Handler() chain with that bearer. This crosses token
+// issuance → bearer-auth middleware → amendment handler → repo — the
+// seam the live 403 (run 8b0282a2) broke, where fixing only the
+// token grant would still 409.
+func TestRequestScopeAmendment_PendingImplementChildRun_EndToEnd(t *testing.T) {
+	sf := newSigningFake()
+	mt := newFakeMCPTokenRepo()
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 1, run.StageStatePending)
+	stage.Type = run.StageTypeImplement
+	sa := newFakeScopeAmendmentRepo()
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		SigningRepo:        sf,
+		MCPTokenRepo:       mt,
+		AuditRepo:          &auditCapture{},
+		ScopeAmendmentRepo: sa,
+	})
+	priv, _ := sf.issue(t, runRow.ID)
+
+	resp := signedMCPTokenRequest(t, s, runRow.ID, priv, []byte{})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("issue status = %d; body = %s", resp.Code, resp.Body.String())
+	}
+	var issued mcpTokenResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &issued); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/runs/"+runRow.ID.String()+"/scope-amendments",
+		strings.NewReader(validAmendmentBody))
+	req.Header.Set("Authorization", "Bearer "+issued.Token)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+	var amResp scopeAmendmentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &amResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if amResp.StageID != stage.ID {
+		t.Errorf("amendment stage_id = %s, want the pending implement stage %s", amResp.StageID, stage.ID)
+	}
+	if n, _ := sa.CountByStage(context.Background(), stage.ID); n != 1 {
+		t.Errorf("rows on pending implement stage = %d, want 1", n)
+	}
+}
+
+func TestRequestScopeAmendment_PlanFirstPendingRun409(t *testing.T) {
+	// The #1030 fallback must not loosen the plan-stage gate: when the
+	// run's first non-terminal stage is a pending PLAN stage (with the
+	// implement stage pending behind it), the POST still 409s.
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	rr.seedStage(runRow.ID, 1, run.StageStatePending) // plan (seedStage default type)
+	impl := rr.seedStage(runRow.ID, 2, run.StageStatePending)
+	impl.Type = run.StageTypeImplement
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: newFakeScopeAmendmentRepo(),
+		AuditRepo:          &auditCapture{},
+	})
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "stage_not_implement") {
+		t.Errorf("body: %s", w.Body.String())
+	}
+}
+
 func TestRequestScopeAmendment_InvalidPaths400(t *testing.T) {
 	s, _, _, _, runRow, _ := scopeAmendmentServer(t)
 	agent := func(r *http.Request) *http.Request {

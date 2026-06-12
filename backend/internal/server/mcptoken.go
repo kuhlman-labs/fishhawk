@@ -220,11 +220,38 @@ func (s *Server) writeMCPTokenIssuedAudit(r *http.Request, runID uuid.UUID, tok 
 	}
 }
 
+// activeOrNextStage resolves the stage a runner-side request is
+// acting for: the first dispatched/running stage in the (sequence-
+// ordered) slice, or — when none exists — the first NON-TERMINAL
+// stage. The fallback covers the local-runner first-stage gap
+// (#1030): local-runner stages stay `pending` for their whole
+// execution (they only walk pending→dispatched→running at trace-
+// upload time), so a run whose FIRST stage is implement (a
+// decomposition child) has no dispatched/running stage at token-
+// issuance time. Non-terminal — not merely pending — keeps earlier
+// gates authoritative: an awaiting_approval plan stage blocks the
+// fallback from reaching a later pending implement stage. Returns
+// nil when every stage is terminal.
+func activeOrNextStage(stages []*run.Stage) *run.Stage {
+	for _, st := range stages {
+		if st.State == run.StageStateDispatched || st.State == run.StageStateRunning {
+			return st
+		}
+	}
+	for _, st := range stages {
+		if !st.State.IsTerminal() {
+			return st
+		}
+	}
+	return nil
+}
+
 // resolveExecutingStageType returns the type of the run's currently
-// dispatched/running stage, or "" when none is resolvable. Unlike
-// resolveAgentSelfRetry it needs no workflow spec — the stage row's
-// own type is the signal — so the write:scope-amendments grant is
-// independent of spec parseability.
+// dispatched/running stage, falling back to the run's next non-
+// terminal stage (the local-runner first-stage gap, #1030), or ""
+// when none is resolvable. Unlike resolveAgentSelfRetry it needs no
+// workflow spec — the stage row's own type is the signal — so the
+// write:scope-amendments grant is independent of spec parseability.
 func (s *Server) resolveExecutingStageType(r *http.Request, runRow *run.Run) run.StageType {
 	if s.cfg.RunRepo == nil {
 		return ""
@@ -237,15 +264,16 @@ func (s *Server) resolveExecutingStageType(r *http.Request, runRow *run.Run) run
 			slog.String("error", err.Error()))
 		return ""
 	}
-	for _, st := range stages {
-		if st.State == run.StageStateDispatched || st.State == run.StageStateRunning {
-			return st.Type
-		}
+	st := activeOrNextStage(stages)
+	if st == nil {
+		return ""
 	}
-	return ""
+	return st.Type
 }
 
-// resolveAgentSelfRetry looks up the active stage for runRow and
+// resolveAgentSelfRetry looks up the active-or-next stage for runRow
+// (same #1030 fallback as resolveExecutingStageType, so a
+// decomposition child's still-pending first stage resolves) and
 // checks whether executor.agent_self_retry is true in the workflow
 // spec. Returns false on any error (nil spec, missing stage, parse
 // failure) — the token is issued with baseline mcp:read scopes.
@@ -261,13 +289,7 @@ func (s *Server) resolveAgentSelfRetry(r *http.Request, runRow *run.Run) bool {
 			slog.String("error", err.Error()))
 		return false
 	}
-	var activeStage *run.Stage
-	for _, st := range stages {
-		if st.State == run.StageStateDispatched || st.State == run.StageStateRunning {
-			activeStage = st
-			break
-		}
-	}
+	activeStage := activeOrNextStage(stages)
 	if activeStage == nil {
 		return false
 	}

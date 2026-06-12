@@ -3817,8 +3817,12 @@ paths:
         equal the token's run — a cross-run request is 403
         (`cross_run_scope_amendment`). Operator tokens/sessions are
         rejected (403 `agent_token_required`): operators decide,
-        they don't request. The run's currently-executing stage must
-        be an implement stage (409 `stage_not_implement` otherwise).
+        they don't request. The run's resolved active stage — the
+        currently dispatched/running stage, or when none exists
+        (e.g. an implement-only decomposition child whose stage is
+        still `pending` under a local runner, #1030) the run's first
+        non-terminal stage in sequence order — must be an implement
+        stage (409 `stage_not_implement` otherwise).
 
         Budget: at most **2 requests per stage**, counted on rows so
         a denied request still consumes budget (the cap bounds
@@ -3885,8 +3889,9 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            `stage_not_implement` — no implement stage is currently
-            executing on the run.
+            `stage_not_implement` — the run's resolved active stage
+            (dispatched/running, else first non-terminal) is not an
+            implement stage.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

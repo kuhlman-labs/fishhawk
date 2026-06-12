@@ -513,6 +513,112 @@ func TestHandleIssueMCPToken_PlanStageOmitsScopeAmendments(t *testing.T) {
 	}
 }
 
+// --- #1030: local-runner first-stage fallback ---
+
+// stageSeed is one stage to seed for the fallback contract tests;
+// slice order is sequence order.
+type stageSeed struct {
+	typ   run.StageType
+	state run.StageState
+}
+
+// scopeAmendmentTokenServerSeeded is scopeAmendmentTokenServer with
+// caller-controlled stage shapes, for the #1030 fallback contracts:
+// local-runner stages stay `pending` for their whole execution, so
+// the grant must resolve runs with NO dispatched/running stage.
+func scopeAmendmentTokenServerSeeded(t *testing.T, seeds ...stageSeed) (*Server, *signingFake, *fakeMCPTokenRepo, *run.Run) {
+	t.Helper()
+	sf := newSigningFake()
+	mt := newFakeMCPTokenRepo()
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	for i, seed := range seeds {
+		st := rr.seedStage(runRow.ID, i+1, seed.state)
+		st.Type = seed.typ
+	}
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		SigningRepo:        sf,
+		MCPTokenRepo:       mt,
+		AuditRepo:          &auditCapture{},
+		ScopeAmendmentRepo: newFakeScopeAmendmentRepo(),
+	})
+	return s, sf, mt, runRow
+}
+
+func issuedScopes(t *testing.T, s *Server, sf *signingFake, mt *fakeMCPTokenRepo, runRow *run.Run) []string {
+	t.Helper()
+	priv, _ := sf.issue(t, runRow.ID)
+	resp := signedMCPTokenRequest(t, s, runRow.ID, priv, []byte{})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("issue status = %d; body = %s", resp.Code, resp.Body.String())
+	}
+	if len(mt.issued) != 1 {
+		t.Fatalf("Issue calls = %d, want 1", len(mt.issued))
+	}
+	return mt.issued[0].Scopes
+}
+
+func TestHandleIssueMCPToken_PendingImplementOnlyGrantsScopeAmendments(t *testing.T) {
+	// Decomposition-child shape (#1030, run 8b0282a2): the run's ONLY
+	// stage is a still-pending implement stage. Fails on the pre-fix
+	// dispatched/running-only gate.
+	s, sf, mt, runRow := scopeAmendmentTokenServerSeeded(t,
+		stageSeed{run.StageTypeImplement, run.StageStatePending})
+
+	scopes := issuedScopes(t, s, sf, mt, runRow)
+	found := false
+	for _, sc := range scopes {
+		if sc == "write:scope-amendments" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("pending-implement child token missing write:scope-amendments: %v", scopes)
+	}
+}
+
+func TestHandleIssueMCPToken_PlanFirstOmitsScopeAmendments(t *testing.T) {
+	// The fallback stops at the FIRST non-terminal stage: a plan stage
+	// ahead of the pending implement stage keeps the scope off the
+	// token — pending AND awaiting_approval (non-terminal, must not be
+	// skipped) both block.
+	for _, planState := range []run.StageState{run.StageStatePending, run.StageStateAwaitingApproval} {
+		t.Run(string(planState), func(t *testing.T) {
+			s, sf, mt, runRow := scopeAmendmentTokenServerSeeded(t,
+				stageSeed{run.StageTypePlan, planState},
+				stageSeed{run.StageTypeImplement, run.StageStatePending})
+
+			for _, sc := range issuedScopes(t, s, sf, mt, runRow) {
+				if sc == "write:scope-amendments" {
+					t.Errorf("plan-first token granted write:scope-amendments")
+				}
+			}
+		})
+	}
+}
+
+func TestHandleIssueMCPToken_SucceededPlanPendingImplementGrantsScopeAmendments(t *testing.T) {
+	// Post-approval local gap: plan succeeded, implement still pending
+	// (no orchestrator dispatch under a local runner) — terminal
+	// stages are skipped and the implement stage resolves.
+	s, sf, mt, runRow := scopeAmendmentTokenServerSeeded(t,
+		stageSeed{run.StageTypePlan, run.StageStateSucceeded},
+		stageSeed{run.StageTypeImplement, run.StageStatePending})
+
+	scopes := issuedScopes(t, s, sf, mt, runRow)
+	found := false
+	for _, sc := range scopes {
+		if sc == "write:scope-amendments" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("succeeded-plan/pending-implement token missing write:scope-amendments: %v", scopes)
+	}
+}
+
 // TestHandleIssueMCPToken_TokenCanReadOwnRunAmendments is the
 // end-to-end auth check the #961 plan names: a freshly issued
 // implement-stage agent token GETs its own run's scope amendments
