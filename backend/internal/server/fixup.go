@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -398,11 +399,42 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Drive (#1023): the push_and_open_pr re-park (review gate
+	// awaiting_approval → pending, #780) is the fixup_rereview_repark
+	// transition point on a drive-enabled run — stamp it so the
+	// re-review round the re-park triggers is attributable to a named
+	// rule. Keyed to the re-parked REVIEW stage (the stage whose state
+	// changed), not the implement stage being re-opened.
+	if dec.ReparkedReview != nil {
+		s.recordDriveFixupRepark(r.Context(), dec)
+	}
+
 	// Sticky status comment (E20.4 / #330): a fix-up flips the stage back
 	// to pending / dispatched; the status comment should reflect that.
 	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "stage_fixup")
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+}
+
+// recordDriveFixupRepark stamps the drive engine's
+// fixup_rereview_repark rule (#1023) after a fix-up re-parked the
+// review gate. No-ops for non-drive runs, when no engine is wired, or
+// on a run read failure — best-effort like every drive stamp: the
+// re-park already happened, a missing entry degrades attribution only.
+func (s *Server) recordDriveFixupRepark(ctx context.Context, dec *run.FixupDecision) {
+	if s.drive == nil || s.cfg.RunRepo == nil || dec.ReparkedReview == nil {
+		return
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, dec.Stage.RunID)
+	if err != nil || !runRow.Drive {
+		return
+	}
+	s.drive.Record(ctx, dec.Stage.RunID, &dec.ReparkedReview.ID, drive.Advance{
+		Rule:  drive.RuleFixupRereviewRepark,
+		From:  "review:awaiting_approval",
+		To:    "review:pending",
+		Event: fmt.Sprintf("fix-up re-opened implement stage %s; review gate re-parked for a fresh round", dec.Stage.ID),
+	})
 }
 
 // concernSelectionError marks a concern_ids selection problem the

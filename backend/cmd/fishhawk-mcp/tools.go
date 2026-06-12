@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -718,6 +719,74 @@ const auditLimitDefault = 5
 // fishhawk_list_audit tool (E19.6 / #346).
 const auditLimitMax = 50
 
+// RunNextAction mirrors GET /v0/runs/{run_id}'s next_action object
+// (#1023): the distilled operator next step from the run's most recent
+// run_auto_advanced audit entry.
+type RunNextAction struct {
+	Action string `json:"action" jsonschema:"the distilled operator next step, e.g. run_implement_stage (dispatch the implement stage from the operator host) or merge_pr (review and merge the PR)"`
+	Detail string `json:"detail,omitempty" jsonschema:"one-line elaboration of the action"`
+	PRURL  string `json:"pr_url,omitempty" jsonschema:"the pull request the action refers to, when relevant"`
+}
+
+// RunAutoAdvance mirrors one entry of GET /v0/runs/{run_id}'s
+// auto_advanced list (#1023): a transition the drive engine
+// auto-advanced (or parked with a next action), distilled from the
+// run's run_auto_advanced audit trail.
+type RunAutoAdvance struct {
+	Rule      string    `json:"rule" jsonschema:"the named drive rule that fired: plan_approved_dispatch, reviews_settled_gate, fixup_rereview_repark, or checks_green_awaiting_merge"`
+	From      string    `json:"from" jsonschema:"the transition's from edge"`
+	To        string    `json:"to" jsonschema:"the transition's to edge"`
+	Parked    bool      `json:"parked,omitempty" jsonschema:"true when the mechanical rule could not be backend-executed (runner_kind local dispatch, ADR-024) and recorded a park-with-next-action instead of an executed advance"`
+	Timestamp time.Time `json:"ts" jsonschema:"when the transition was recorded"`
+}
+
+// DriveStatus is the drive-mode read view (#1023) the get_run_status
+// tool surfaces for drive-enabled runs: which transitions advanced
+// themselves and what (if anything) the run is waiting on the operator
+// for. Omitted entirely for non-drive runs.
+type DriveStatus struct {
+	Drive         bool             `json:"drive" jsonschema:"always true — the block is omitted entirely for non-drive runs"`
+	DerivedStatus string           `json:"derived_status,omitempty" jsonschema:"presentation-only status: awaiting_merge when every gate is resolved and required PR checks are green on an open PR. Never a persisted run state — run.state stays running while parked here"`
+	NextAction    *RunNextAction   `json:"next_action,omitempty" jsonschema:"the distilled operator next step from the most recent auto-advance; omitted on terminal runs and when nothing waits on the operator"`
+	AutoAdvanced  []RunAutoAdvance `json:"auto_advanced,omitempty" jsonschema:"the run's auto-advanced (or parked-with-next-action) transitions, oldest first"`
+}
+
+// runDriveView decodes GET /v0/runs/{run_id} into the thin Run mirror
+// plus the drive read surfaces (#1023) the client.go Run shape does
+// not carry. Local to the get_run_status tool — its only consumer.
+type runDriveView struct {
+	Run
+	Drive         bool             `json:"drive"`
+	DerivedStatus string           `json:"derived_status"`
+	NextAction    *RunNextAction   `json:"next_action"`
+	AutoAdvanced  []RunAutoAdvance `json:"auto_advanced"`
+}
+
+// driveStatus distills the view into the tool's drive_status block.
+// nil (field omitted) for non-drive runs, so the block never claims
+// drive semantics on a legacy run.
+func (v *runDriveView) driveStatus() *DriveStatus {
+	if !v.Drive {
+		return nil
+	}
+	return &DriveStatus{
+		Drive:         true,
+		DerivedStatus: v.DerivedStatus,
+		NextAction:    v.NextAction,
+		AutoAdvanced:  v.AutoAdvanced,
+	}
+}
+
+// fetchRunDriveView reads the single-run endpoint once, decoding both
+// the Run mirror and the drive surfaces from the same response body.
+func (r *runResolver) fetchRunDriveView(ctx context.Context, runID uuid.UUID) (*runDriveView, error) {
+	var v runDriveView
+	if err := r.api.do(ctx, http.MethodGet, "/v0/runs/"+runID.String(), nil, &v); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
 // GetRunStatusInput is the tool's input schema.
 type GetRunStatusInput struct {
 	RunID      string `json:"run_id" jsonschema:"the Fishhawk run UUID"`
@@ -782,6 +851,12 @@ type GetRunStatusOutput struct {
 	// Omitted once the implement review reaches a terminal status. Display-only,
 	// never gates the run (no MCP merge tool; the operator merges on GitHub).
 	ImplementReviewMergeHint string `json:"implement_review_merge_hint,omitempty" jsonschema:"display-only merge-readiness warning while the implement-stage agent review is pending (dispatched but no verdict yet): the PR is NOT safe to merge/resolve because the required fishhawk_audit_complete check is held pending on this review (it flips green automatically once the verdict lands). Omitted once the implement review is terminal. Never gates the run"`
+	// DriveStatus is the drive-mode read view (#1023): drive flag,
+	// the auto_advanced transition list, the distilled next_action,
+	// and the derived awaiting_merge presentation status — so the
+	// operator sees which transitions advanced themselves and what
+	// the run waits on them for. Omitted for non-drive runs.
+	DriveStatus *DriveStatus `json:"drive_status,omitempty" jsonschema:"drive-mode read view (#1023): which transitions auto-advanced (auto_advanced, oldest first), the distilled operator next step (next_action), and the derived awaiting_merge presentation status when every gate is resolved and required checks are green. Omitted entirely for non-drive runs"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -856,6 +931,15 @@ warning that the PR is NOT safe to merge/resolve because the required
 fishhawk_audit_complete check is held pending on that review (#947). It
 flips green automatically once the verdict lands; omitted once the
 implement review is terminal. Never gates the run.
+
+Also returns drive_status for drive-enabled runs (#1023): auto_advanced
+lists the transitions the backend advanced itself (rule + from/to +
+timestamp, oldest first; parked marks a runner_kind-local dispatch that
+recorded a ready-to-run next action instead), next_action is the
+distilled operator next step from the most recent auto-advance, and
+derived_status is "awaiting_merge" when every gate is resolved and the
+required PR checks are green — presentation-only, the run row's state
+stays running. Omitted entirely for non-drive runs.
 `),
 	}, resolver.getRunStatus)
 }
@@ -869,10 +953,13 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 
 	limit := clampAuditLimit(in.AuditLimit)
 
-	runRow, err := r.api.GetRun(ctx, runID)
+	// One read serves both the Run mirror and the drive surfaces
+	// (#1023) — they come off the same GET /v0/runs/{run_id} body.
+	view, err := r.fetchRunDriveView(ctx, runID)
 	if err != nil {
 		return nil, GetRunStatusOutput{}, fmt.Errorf("get run: %w", err)
 	}
+	runRow := &view.Run
 
 	stages, err := r.api.ListRunStages(ctx, runID)
 	if err != nil {
@@ -936,6 +1023,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		Budget:                   budgetStatus,
 		ReviewActionHint:         reviewActionHint,
 		ImplementReviewMergeHint: implementReviewMergeHint(implementReviewStatus),
+		DriveStatus:              view.driveStatus(),
 	}, nil
 }
 

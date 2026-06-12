@@ -319,6 +319,65 @@ workflows:
 	}
 }
 
+// --- Drive mode (#1023) ---
+
+func TestParse_Drive(t *testing.T) {
+	// `drive` is an optional workflow-level boolean, default false.
+	// Absent and explicit-false are indistinguishable on the struct
+	// (both false) — by design: unlike on_ci_failure there is no
+	// nil-vs-zero distinction to preserve, the per-run override at
+	// POST /v0/runs is a separate knob.
+	const tmpl = `
+version: "0.3"
+workflows:
+  feature_change:
+    description: "x"
+%s    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+	cases := []struct {
+		name  string
+		drive string // injected workflow-level line; "" = absent
+		want  bool
+	}{
+		{name: "absent_defaults_false", drive: "", want: false},
+		{name: "explicit_false", drive: "    drive: false\n", want: false},
+		{name: "explicit_true", drive: "    drive: true\n", want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := spec.ParseBytes([]byte(strings.ReplaceAll(tmpl, "%s", tc.drive)))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if got := s.Workflows["feature_change"].Drive; got != tc.want {
+				t.Errorf("Drive = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParse_Drive_NonBoolean_Rejected(t *testing.T) {
+	// The schema types `drive` as boolean; a string is a schema error.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.3"
+workflows:
+  feature_change:
+    drive: "yes"
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
 // --- YAML errors ---
 
 func TestParse_EmptyDocument(t *testing.T) {

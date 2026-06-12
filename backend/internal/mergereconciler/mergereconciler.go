@@ -94,6 +94,22 @@ type LineageReverifier interface {
 	ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prNumber int) (clean bool)
 }
 
+// DriveObserver evaluates one parked review stage of a drive-enabled
+// run against the poll-driven mechanical drive rules (#1023):
+// reviews_settled_gate and the derived checks_green_awaiting_merge.
+// Satisfied by *server.Server (ObserveParkedReviewForDrive). The
+// implementation is best-effort and idempotent (each rule is stamped
+// at most once per stage), so calling it every tick is cheap.
+//
+// OPTIONAL — like LineageReverifier, not required by Run(). When the
+// field is nil the ticker upgrades the Resolver via a type assertion,
+// so the production wiring (Resolver: *server.Server) gets the
+// observer for free; a Resolver that doesn't implement it preserves
+// the pre-#1023 behavior (open PRs are left parked silently).
+type DriveObserver interface {
+	ObserveParkedReviewForDrive(ctx context.Context, stage *run.Stage, prURL string)
+}
+
 // AuditCheckRepublisher re-derives and republishes the
 // fishhawk_audit_complete Check Run for a run (#973). Satisfied by
 // *server.Server (RepublishAuditCheck). The implementation is
@@ -139,6 +155,13 @@ type Ticker struct {
 	// tick, BEFORE the PR poll so a GitHub poll failure cannot skip the
 	// heal. OPTIONAL: nil preserves the pre-#973 ticker behavior.
 	AuditCheckRepublisher AuditCheckRepublisher
+
+	// DriveObserver evaluates parked review stages of drive-enabled
+	// runs on the open-PR branch of each tick (#1023). OPTIONAL: when
+	// nil, Tick upgrades the Resolver via a type assertion (production
+	// wires *server.Server as Resolver, which implements it); tests can
+	// inject a stub explicitly.
+	DriveObserver DriveObserver
 
 	// Logger receives structured warnings about transient errors.
 	// nil → slog.Default().
@@ -194,6 +217,16 @@ func (t *Ticker) Tick(ctx context.Context) {
 	logger := t.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+
+	// Resolver-upgrade default for the drive observer (#1023): the
+	// production Resolver is *server.Server, which implements
+	// DriveObserver — asserting here means fishhawkd's ticker wiring
+	// needs no new field while tests keep explicit injection.
+	if t.DriveObserver == nil {
+		if obs, ok := t.Resolver.(DriveObserver); ok {
+			t.DriveObserver = obs
+		}
 	}
 
 	stages, err := t.Runs.ListReviewStagesAwaitingApproval(ctx)
@@ -296,6 +329,16 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 	default:
 		// Open PR (or any non-terminal state) — leave parked. No
 		// force-succeed: the merge/close event is what advances the stage.
+		// Drive (#1023): a drive-enabled run's parked-open tick is where
+		// the poll-driven mechanical rules are evaluated —
+		// reviews_settled_gate when every configured implement review is
+		// terminal, and the derived awaiting_merge stamp when the review
+		// evidence is complete AND required checks are green. The observer
+		// emits audit entries only; the stage stays parked and the merge
+		// remains a judgment point.
+		if t.DriveObserver != nil && runRow.Drive {
+			t.DriveObserver.ObserveParkedReviewForDrive(ctx, s, prURL)
+		}
 	}
 }
 

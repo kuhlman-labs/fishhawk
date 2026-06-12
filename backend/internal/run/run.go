@@ -256,9 +256,17 @@ type Run struct {
 	// same agent model in v0). Empty for legacy rows and runs whose
 	// runner didn't stamp a model.
 	ResolvedModel string
-	State         State
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// Drive opts the run into backend auto-advancement of mechanical
+	// transitions (#1023 / #996 theme 1). Resolved at run-create time
+	// — the workflow spec's `drive` default overridden by the per-run
+	// POST /v0/runs field — and snapshotted here so a spec edit
+	// mid-run can't change an in-flight run's advancement behavior.
+	// Defaults to false for legacy rows (migration 0031). Persisted
+	// but not yet consumed; the drive engine lands in a sibling slice.
+	Drive     bool
+	State     State
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

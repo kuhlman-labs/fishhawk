@@ -8,6 +8,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -33,6 +35,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -360,6 +363,13 @@ type Server struct {
 	// httptest fake of api.github.com. nil in production; the resolver
 	// then falls through to cfg.GitHub.
 	appIdentityGetterOverride appIdentityGetter
+
+	// drive emits the run_auto_advanced audit trail for drive-enabled
+	// runs (#1023). Built at New from AuditRepo; nil when no audit
+	// repository is wired, in which case every drive hook no-ops. The
+	// hooks themselves gate on the run row's Drive flag, so the engine
+	// is inert for non-drive runs.
+	drive *drive.Engine
 }
 
 // soleReviewerSet adapts the Config.PlanReviewer single-reviewer convenience
@@ -398,6 +408,9 @@ func New(cfg Config) *Server {
 	s := &Server{cfg: cfg, p95Cache: map[string]p95CacheEntry{}}
 	if s.nowFunc == nil {
 		s.nowFunc = time.Now
+	}
+	if cfg.AuditRepo != nil {
+		s.drive = &drive.Engine{Audit: cfg.AuditRepo, Logger: cfg.Logger}
 	}
 	if cfg.GitHub != nil {
 		s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
@@ -505,4 +518,153 @@ func (s *Server) buildHandler() http.Handler {
 	h = requestID(h)
 	h = recovery(s.cfg.Logger)(h)
 	return h
+}
+
+// ObserveParkedReviewForDrive evaluates one parked review stage of a
+// drive-enabled run against the poll-driven mechanical rules (#1023):
+// reviews_settled_gate when every configured implement reviewer
+// reached a terminal verdict, and checks_green_awaiting_merge when the
+// review evidence is complete AND every required PR check is green —
+// the derived awaiting_merge presentation status with a distilled
+// merge next action. It satisfies mergereconciler.DriveObserver, which
+// invokes it on the open-PR branch of each tick.
+//
+// awaiting_merge is presentation-only: this method emits audit entries
+// and never transitions the stage — the merge itself stays a judgment
+// point (drive.RuleMerge), resolved by the webhook/poll once GitHub
+// performs it. Best-effort and idempotent: every read failure skips
+// quietly (the next tick retries) and each rule is recorded at most
+// once per stage via Engine.Recorded.
+func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Stage, prURL string) {
+	if s.drive == nil || s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil || stage == nil {
+		return
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil || !runRow.Drive {
+		return
+	}
+
+	configured, terminal, started, ok := s.implementReviewRound(ctx, runRow)
+	if !ok {
+		return
+	}
+
+	settled := started && planreview.Settled(configured, terminal)
+	if settled && !s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleReviewsSettledGate) {
+		s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+			Rule:  drive.RuleReviewsSettledGate,
+			From:  "implement_reviews:in_flight",
+			To:    "review_gate:decision_ready",
+			Event: fmt.Sprintf("%d of %d implement reviews terminal", terminal, configured),
+			NextAction: &drive.NextAction{
+				Action: "review_pr",
+				Detail: "all configured implement reviews are terminal; read the verdicts and review the PR",
+				PRURL:  prURL,
+			},
+		})
+	}
+
+	// Review evidence is complete when nothing was dispatched to wait
+	// for (mirrors checkPlanReviewSettled's configured-but-not-dispatched
+	// posture) or the dispatched round settled.
+	if started && !settled {
+		return
+	}
+	if !s.reviewChecksGreen(ctx, runRow, stage) {
+		return
+	}
+	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) {
+		return
+	}
+	s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+		Rule:  drive.RuleChecksGreenAwaitingMerge,
+		From:  "review:awaiting_approval",
+		To:    "awaiting_merge",
+		Event: "review evidence terminal and required PR checks green",
+		NextAction: &drive.NextAction{
+			Action: "merge_pr",
+			Detail: "all gates resolved and required checks are green; review and merge the PR",
+			PRURL:  prURL,
+		},
+	})
+}
+
+// implementReviewRound reports the run's LATEST implement-review
+// round: whether one was dispatched (an implement_review_started entry
+// exists), how many agents it was configured with, and how many
+// terminal entries (implement_reviewed / _failed / _skipped) landed
+// after it. Rounds are delimited by started entries — a fix-up re-park
+// dispatches a fresh round whose started entry supersedes the prior
+// one, so a settled FIRST round can never satisfy the gate while the
+// re-review is still in flight. ok=false on any audit read failure
+// (the poll-driven caller skips and retries next tick).
+func (s *Server) implementReviewRound(ctx context.Context, runRow *run.Run) (configured, terminal int, started, ok bool) {
+	startedEntries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, "implement_review_started")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "drive: list implement_review_started failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return 0, 0, false, false
+	}
+	if len(startedEntries) == 0 {
+		return 0, 0, false, true
+	}
+	latest := startedEntries[0]
+	for _, e := range startedEntries {
+		if e.Sequence > latest.Sequence {
+			latest = e
+		}
+	}
+
+	var startedPayload planreview.ReviewStartedPayload
+	if uerr := json.Unmarshal(latest.Payload, &startedPayload); uerr == nil {
+		configured = startedPayload.ConfiguredAgents
+	}
+	if configured == 0 {
+		// Pre-#600-payload or malformed entry: fall back to the spec.
+		if cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement); cfg != nil {
+			configured = cfg.AgentCount()
+		}
+	}
+
+	for _, cat := range []string{"implement_reviewed", "implement_review_failed", "implement_review_skipped"} {
+		entries, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
+		if lerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "drive: list terminal implement-review entries failed",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("category", cat),
+				slog.String("error", lerr.Error()))
+			return 0, 0, false, false
+		}
+		for _, e := range entries {
+			if e.Sequence > latest.Sequence {
+				terminal++
+			}
+		}
+	}
+	return configured, terminal, true, true
+}
+
+// reviewChecksGreen reports whether every required check from the
+// run's create-time snapshot (#251) has a green latest state recorded
+// against the review stage — the stage the check_run ingest path
+// writes rows for. An empty snapshot is vacuously green: no required
+// checks were declared, and branch protection (when any) still
+// enforces at merge time. Conservative on any gap: an unwired
+// StageCheckRepo, a missing row, or a non-pass state all report not
+// green, so the derived awaiting_merge can never overstate readiness.
+func (s *Server) reviewChecksGreen(ctx context.Context, runRow *run.Run, stage *run.Stage) bool {
+	if runRow.RequiredChecksSnapshot == nil || len(runRow.RequiredChecksSnapshot.Contexts) == 0 {
+		return true
+	}
+	if s.cfg.StageCheckRepo == nil {
+		return false
+	}
+	for _, name := range runRow.RequiredChecksSnapshot.Contexts {
+		check, err := s.cfg.StageCheckRepo.LatestForStageAndName(ctx, stage.ID, name)
+		if err != nil || check.State != stagecheck.StatePass {
+			return false
+		}
+	}
+	return true
 }

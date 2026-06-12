@@ -95,6 +95,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		RunnerKind:             runnerKind,
 		IssueContext:           issueContextBytes,
 		DecomposedFrom:         p.DecomposedFrom,
+		Drive:                  p.Drive,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -577,6 +578,7 @@ func rowToRun(r rundb.Run) *Run {
 	out.DecomposedFrom = r.DecomposedFrom
 	out.CostUSDTotal = r.CostUsdTotal
 	out.ResolvedModel = r.ResolvedModel
+	out.Drive = r.Drive
 	return out
 }
 

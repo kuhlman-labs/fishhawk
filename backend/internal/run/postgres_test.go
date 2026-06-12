@@ -171,6 +171,40 @@ func TestPostgres_CreateAndGetRun(t *testing.T) {
 	}
 }
 
+// TestPostgres_Drive_RoundTrip exercises migration 0031: a run created
+// with Drive=true reads back true, and the default path (params zero
+// value) reads back false — the legacy-row semantics.
+func TestPostgres_Drive_RoundTrip(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+
+	driven, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+		Drive:         true,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if !driven.Drive {
+		t.Errorf("created Drive = false, want true")
+	}
+	got, err := repo.GetRun(context.Background(), driven.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if !got.Drive {
+		t.Errorf("read-back Drive = false, want true")
+	}
+
+	plain := makeRun(t, repo)
+	if plain.Drive {
+		t.Errorf("default Drive = true, want false")
+	}
+}
+
 func TestPostgres_GetRun_NotFound(t *testing.T) {
 	pool := startPostgres(t)
 	repo := run.NewPostgresRepository(pool)

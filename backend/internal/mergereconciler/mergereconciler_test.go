@@ -581,3 +581,108 @@ func TestParsePRURL(t *testing.T) {
 		}
 	}
 }
+
+// stubDriveObserver records ObserveParkedReviewForDrive calls (#1023).
+type stubDriveObserver struct {
+	calls []resolveCall
+}
+
+func (s *stubDriveObserver) ObserveParkedReviewForDrive(_ context.Context, stage *run.Stage, prURL string) {
+	s.calls = append(s.calls, resolveCall{runID: stage.RunID, prURL: prURL})
+}
+
+// resolverWithObserver embeds the resolver stub and implements
+// DriveObserver, modeling production's *server.Server (which is both)
+// so the Resolver-upgrade default path is pinned.
+type resolverWithObserver struct {
+	stubResolver
+	stubDriveObserver
+}
+
+func TestTick_OpenPR_DriveRun_ObserverInvoked(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	r.Drive = true
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open"}}
+	res := &stubResolver{}
+	obs := &stubDriveObserver{}
+	tk := newTicker(repo, pg, res)
+	tk.DriveObserver = obs
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (PR open, stage stays parked)", len(res.calls))
+	}
+	if len(obs.calls) != 1 {
+		t.Fatalf("observer calls = %d, want 1", len(obs.calls))
+	}
+	if obs.calls[0].runID != r.ID || obs.calls[0].prURL != "https://github.com/x/y/pull/42" {
+		t.Errorf("observer call = %+v", obs.calls[0])
+	}
+}
+
+func TestTick_OpenPR_NonDriveRun_ObserverNotInvoked(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open"}}
+	obs := &stubDriveObserver{}
+	tk := newTicker(repo, pg, &stubResolver{})
+	tk.DriveObserver = obs
+	tk.Tick(context.Background())
+
+	if len(obs.calls) != 0 {
+		t.Errorf("observer calls = %d, want 0 on a drive:false run", len(obs.calls))
+	}
+}
+
+func TestTick_MergedPR_DriveRun_ObserverNotInvoked(t *testing.T) {
+	// The observer only evaluates PARKED-open stages; a terminal PR
+	// resolves through the normal path with no drive evaluation.
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	r.Drive = true
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	obs := &stubDriveObserver{}
+	tk := newTicker(repo, pg, res)
+	tk.DriveObserver = obs
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 1 {
+		t.Errorf("resolve calls = %d, want 1", len(res.calls))
+	}
+	if len(obs.calls) != 0 {
+		t.Errorf("observer calls = %d, want 0 on a terminal PR", len(obs.calls))
+	}
+}
+
+func TestTick_ResolverUpgrade_DefaultsDriveObserver(t *testing.T) {
+	// Production wires *server.Server as Resolver; the ticker must
+	// upgrade it to DriveObserver with no explicit field set.
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	r.Drive = true
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open"}}
+	res := &resolverWithObserver{}
+	tk := &Ticker{Runs: repo, PRGetter: pg, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.stubDriveObserver.calls) != 1 {
+		t.Fatalf("observer calls = %d, want 1 via the Resolver type-assertion upgrade", len(res.stubDriveObserver.calls))
+	}
+}
+
+func TestTick_PlainResolver_NoObserver_NoPanic(t *testing.T) {
+	// A Resolver that does NOT implement DriveObserver (pre-#1023
+	// shape) leaves drive runs parked silently.
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	r.Drive = true
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open"}}
+	res := &stubResolver{}
+	newTicker(repo, pg, res).Tick(context.Background())
+
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0", len(res.calls))
+	}
+}

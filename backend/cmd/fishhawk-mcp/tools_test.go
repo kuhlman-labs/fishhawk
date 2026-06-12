@@ -42,6 +42,12 @@ type fakeBackend struct {
 	getResp    Run
 	getStatus  int
 
+	// getRunExtraByID overlays extra top-level JSON fields onto a
+	// keyed getRunByID response — response fields the thin client.go
+	// Run mirror doesn't carry, like the drive read surfaces (#1023)
+	// runDriveView decodes from the same body.
+	getRunExtraByID map[uuid.UUID]map[string]any
+
 	// Per-call response overrides keyed by query string for tests
 	// that exercise multiple resolution paths in one server.
 	listByQuery map[string]listRunsResult
@@ -226,6 +232,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		perRunAuditStatus:        http.StatusOK,
 		listByQuery:              map[string]listRunsResult{},
 		getRunByID:               map[uuid.UUID]Run{},
+		getRunExtraByID:          map[uuid.UUID]map[string]any{},
 		stagesByRun:              map[uuid.UUID][]Stage{},
 		artifactsByStage:         map[uuid.UUID][]Artifact{},
 		stagesCalledByID:         map[uuid.UUID]int{},
@@ -534,9 +541,22 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		fb.mu.Lock()
 		row, ok := fb.getRunByID[id]
+		extra := fb.getRunExtraByID[id]
 		fb.mu.Unlock()
 		w.WriteHeader(fb.getStatus)
 		if ok {
+			if len(extra) > 0 {
+				// Overlay the extra top-level fields the typed Run
+				// mirror can't express (drive read surfaces, #1023).
+				b, _ := json.Marshal(row)
+				var m map[string]any
+				_ = json.Unmarshal(b, &m)
+				for k, v := range extra {
+					m[k] = v
+				}
+				_ = json.NewEncoder(w).Encode(m)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(row)
 			return
 		}
@@ -2250,6 +2270,106 @@ func TestGetRunStatus_StageWaitStatus_RunTerminalBackstop(t *testing.T) {
 	}
 	if out.ImplementStageWaitStatus.PollIntervalSeconds != 0 {
 		t.Errorf("poll_interval_seconds = %d, want 0 (run terminal -> backstop drops it)", out.ImplementStageWaitStatus.PollIntervalSeconds)
+	}
+}
+
+// TestGetRunStatus_DriveStatus_PropagatesEndToEnd drives the full
+// getRunStatus handler against the fake backend to cover the
+// cross-layer seam (#1023, cf. #618): backend drive read surfaces
+// (drive / derived_status / next_action / auto_advanced on
+// GET /v0/runs/{id}) -> runDriveView decode -> drive_status rendering,
+// as one flow.
+func TestGetRunStatus_DriveStatus_PropagatesEndToEnd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.getRunExtraByID[runID] = map[string]any{
+		"drive":          true,
+		"derived_status": "awaiting_merge",
+		"next_action": map[string]any{
+			"action": "merge_pr",
+			"detail": "all gates resolved and required checks are green",
+			"pr_url": "https://github.com/x/y/pull/42",
+		},
+		"auto_advanced": []map[string]any{
+			{"rule": "plan_approved_dispatch", "from": "plan:approved", "to": "implement:dispatched", "ts": "2026-06-12T10:00:00Z"},
+			{"rule": "checks_green_awaiting_merge", "from": "review:awaiting_approval", "to": "awaiting_merge", "ts": "2026-06-12T10:30:00Z"},
+		},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+
+	ds := out.DriveStatus
+	if ds == nil {
+		t.Fatal("DriveStatus is nil, want the drive read view")
+	}
+	if !ds.Drive {
+		t.Error("DriveStatus.Drive = false, want true")
+	}
+	if ds.DerivedStatus != "awaiting_merge" {
+		t.Errorf("derived_status = %q, want awaiting_merge", ds.DerivedStatus)
+	}
+	if ds.NextAction == nil || ds.NextAction.Action != "merge_pr" || ds.NextAction.PRURL != "https://github.com/x/y/pull/42" {
+		t.Errorf("next_action = %+v, want merge_pr with the PR URL", ds.NextAction)
+	}
+	if len(ds.AutoAdvanced) != 2 {
+		t.Fatalf("auto_advanced = %+v, want 2 entries", ds.AutoAdvanced)
+	}
+	if ds.AutoAdvanced[0].Rule != "plan_approved_dispatch" || ds.AutoAdvanced[1].Rule != "checks_green_awaiting_merge" {
+		t.Errorf("auto_advanced rules = [%q %q], want oldest-first order preserved",
+			ds.AutoAdvanced[0].Rule, ds.AutoAdvanced[1].Rule)
+	}
+	if ds.AutoAdvanced[0].Timestamp.IsZero() {
+		t.Error("auto_advanced[0].ts is zero, want the backend timestamp decoded")
+	}
+	// The Run mirror still rides along untouched.
+	if out.Run.ID != runID.String() {
+		t.Errorf("Run.ID = %s, want %s", out.Run.ID, runID)
+	}
+}
+
+// TestGetRunStatus_NonDriveRun_OmitsDriveStatus is the control: a run
+// without drive surfaces (legacy / drive:false) renders no
+// drive_status block at all.
+func TestGetRunStatus_NonDriveRun_OmitsDriveStatus(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.DriveStatus != nil {
+		t.Errorf("DriveStatus = %+v, want nil on a non-drive run", out.DriveStatus)
+	}
+}
+
+// TestGetRunStatus_DriveRun_NoAdvancesYet pins the early-run shape: a
+// drive:true run with no recorded transitions still gets the block
+// (drive:true) with the lists empty — the operator can tell drive is
+// armed before anything has advanced.
+func TestGetRunStatus_DriveRun_NoAdvancesYet(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.getRunExtraByID[runID] = map[string]any{"drive": true}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.DriveStatus == nil || !out.DriveStatus.Drive {
+		t.Fatalf("DriveStatus = %+v, want drive:true with empty surfaces", out.DriveStatus)
+	}
+	if out.DriveStatus.NextAction != nil || len(out.DriveStatus.AutoAdvanced) != 0 || out.DriveStatus.DerivedStatus != "" {
+		t.Errorf("DriveStatus = %+v, want empty surfaces before any advance", out.DriveStatus)
 	}
 }
 

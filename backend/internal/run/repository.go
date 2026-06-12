@@ -71,6 +71,14 @@ type CreateRunParams struct {
 	// DecomposedFrom, when non-nil, identifies the parent run that
 	// minted this child run during orchestrator fanout (#455).
 	DecomposedFrom *uuid.UUID
+	// Drive opts the run into backend auto-advancement of mechanical
+	// transitions (#1023 / #996 theme 1). Resolved by the API handler
+	// at run-create time — the workflow spec's `drive` default
+	// overridden by the per-run POST /v0/runs field — and snapshotted
+	// on the row (migration 0031) so a spec edit mid-run can't change
+	// an in-flight run's advancement behavior. False means
+	// operator-driven (the default at every layer).
+	Drive bool
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

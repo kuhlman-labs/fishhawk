@@ -25,6 +25,7 @@ workflows: # required; at least one workflow
     on_ci_failure: # optional; auto-retry policy (#276)
       max_retries: 1 # default when the block is absent
     budgets: [...] # optional; periodic per-workflow cost ceilings (ADR-030, v0.4+)
+    drive: false # optional; auto-advance mechanical transitions (#1023)
     stages: [...]
 ```
 
@@ -319,6 +320,21 @@ Per-workflow auto-retry policy (#276 / E16). When a required CI check fails on t
 - **Trigger predicate**: only the closed set of failing conclusions in `stagecheck.DeriveState` (`failure`, `timed_out`, `cancelled`, `action_required`, `stale`, `startup_failure`) fires a retry. `success` / `neutral` / `skipped` are no-ops.
 - **`fishhawk_audit_complete` failures are excluded** from the retry trigger. Retrying won't fix Fishhawk's own audit gaps; that's #229's job.
 - **Required-check scoping**: only failures of checks in the run's branch-protection snapshot (#251) count. A failing third-party non-required check doesn't trigger retries.
+
+## Drive mode
+
+```yaml
+workflows:
+  feature_change:
+    drive: true # optional; default false
+    stages: […]
+```
+
+Opt-in auto-advancement of mechanical run transitions (#1023 / #996 theme 1). When `drive: true`, fishhawkd advances the transitions that carry no judgment content — plan-approved → implement dispatch, review verdicts settling a gate, fixup-pushed re-review re-park, all-gates-resolved + checks-green parking at a derived `awaiting_merge` — and records a `run_auto_advanced` audit entry naming the transition rule for each advance. Judgment points (gate approvals, concern routing, merge) always park for the operator.
+
+- **`drive`** — boolean, default `false`. The workflow-level value is the default for every run of the workflow; `POST /v0/runs` accepts a per-run `drive` override that wins over the spec value. The resolved flag is persisted on the run row (`runs.drive`) at create time, so a spec edit mid-run doesn't change an in-flight run's behavior.
+- **Additive within workflow-v0.x** — optional field, no version bump; specs without it parse unchanged.
+- The flag is persisted-but-inert until the drive engine lands (`backend/internal/drive`, sibling slice of #1023): nothing consumes it at the spec layer beyond parsing and run-create resolution.
 
 ## Identifier namespaces
 
