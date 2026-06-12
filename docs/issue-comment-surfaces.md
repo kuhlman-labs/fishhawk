@@ -263,8 +263,10 @@ Notes:
   Nothing in `issuecomment` posts it to the issue thread; it has no Notifier
   method. The retry handler (`server/retry.go::handleRetryStage`,
   `POST /v0/stages/{stage_id}/retry` with `{override: true, reason: "..."}`)
-  writes it once on a successful override, with the operator's `user` actor +
-  subject and payload `{stage_id, prior_category (always B), prior_reason,
+  writes it once on a successful override, with the acting token's subject and
+  a kind selected from it (`user` for a human token, `agent` for an
+  `operator-agent/<role-spec-version>` token — ADR-040 D4, #1027) and payload
+  `{stage_id, prior_category (always B), prior_reason,
   prior_failure_class, override_reason, retry_ordinal, override_effect,
   admissibility_reason}`. It is kept DISTINCT from the ordinary `stage_retried`
   receipt so the explicit operator escape hatch (who/why) stays separable in
@@ -279,7 +281,9 @@ Notes:
   `issuecomment` posts it to the issue thread; it has no Notifier method. The
   fix-up handler (`server/fixup.go::handleFixupStage`,
   `POST /v0/stages/{stage_id}/fixup`) writes it once on a successful re-open,
-  with the operator's `user` actor + subject and payload `{stage_id,
+  with the acting token's subject and a kind selected from it (`user` for a
+  human token, `agent` for an `operator-agent/<role-spec-version>` token —
+  ADR-040 D4, #1027) and payload `{stage_id,
   prior_state, selected_indices, concerns, reason, pass_ordinal, max_passes,
   remaining_budget, admissibility_reason}`. It serves double duty: the canonical
   receipt of who routed which advisory implement-review concerns back to the
@@ -300,7 +304,9 @@ Notes:
   issue-comment surfaces**. Nothing in `issuecomment` posts them; they have no
   Notifier method. The waive handler (`server/waive.go::handleWaiveConcern`,
   `POST /v0/concerns/{concern_id}/waive`) writes `concern_waived` with the
-  operator's `user` actor + subject and payload `{concern_id, prior_state,
+  acting token's subject and a kind selected from it (`user` for a human
+  token, `agent` for an `operator-agent/<role-spec-version>` token —
+  ADR-040 D4, #1027) and payload `{concern_id, prior_state,
   reason, stage_kind, severity, category}` BEFORE the state transition — the
   durable-record-first contract: append failure fails the request (500
   `audit_append_failed`, no mutation), so a waive mutation can never exist

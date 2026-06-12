@@ -311,7 +311,7 @@ func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow
 	if subject == "" {
 		subject = "anonymous"
 	}
-	actorKind := audit.ActorUser
+	actorKind := actorKindForSubject(subject)
 
 	ordinal := dec.Stage.SelfRetryCount
 
@@ -372,7 +372,7 @@ func (s *Server) writeOverrideRetryAudit(r *http.Request, dec *run.RetryDecision
 	if subject == "" {
 		subject = "anonymous"
 	}
-	actorKind := audit.ActorUser
+	actorKind := actorKindForSubject(subject)
 
 	fields := map[string]any{
 		"stage_id":            dec.Stage.ID.String(),

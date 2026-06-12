@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -856,5 +857,62 @@ func TestShipPullRequest_BearerInsufficientScope_401(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "signature_or_bearer_required") {
 		t.Errorf("body missing signature_or_bearer_required:\n%s", w.Body.String())
+	}
+}
+
+// TestShipPullRequest_BearerActorKindClosedSet is the #1027 regression
+// for the bearer-auth branch, which used to stamp the literal
+// "operator" — outside the DB CHECK (migration 0002: agent/user/system)
+// and the OpenAPI actor_kind enum; fakes never enforced the constraint,
+// so it shipped unnoticed. The recorded kind must come from the token
+// subject and stay within the closed set: user for a plain subject,
+// agent for an operator-agent subject (ADR-040 D4).
+func TestShipPullRequest_BearerActorKindClosedSet(t *testing.T) {
+	closedSet := map[audit.ActorKind]bool{
+		audit.ActorAgent: true, audit.ActorUser: true, audit.ActorSystem: true,
+	}
+	cases := []struct {
+		name    string
+		subject string
+		want    audit.ActorKind
+	}{
+		{"plain operator subject records user", "operator:test", audit.ActorUser},
+		{"operator-agent subject records agent", operatorAgentSubject, audit.ActorAgent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, _, _, au, _ := newPRServer(t, runID, stageID)
+
+			url := fmt.Sprintf("/v0/runs/%s/pull-request?stage_id=%s", runID, stageID)
+			req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(validPRBytes(t)))
+			req.Header.Set("Content-Type", "application/json")
+			req.SetPathValue("run_id", runID.String())
+			req.SetPathValue("stage_id", stageID.String())
+			ctx := context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+				Subject: tc.subject,
+				TokenID: "tok-abc",
+				Scopes:  []string{"write:runs"},
+			})
+			w := httptest.NewRecorder()
+			s.handleShipPullRequest(w, req.WithContext(ctx))
+
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			if len(au.appended) != 1 {
+				t.Fatalf("audit entries = %d, want 1", len(au.appended))
+			}
+			entry := au.appended[0]
+			if entry.ActorKind == nil || !closedSet[*entry.ActorKind] {
+				t.Fatalf("ActorKind = %v, want a member of the closed set {agent,user,system}", entry.ActorKind)
+			}
+			if *entry.ActorKind != tc.want {
+				t.Errorf("ActorKind = %q, want %q", *entry.ActorKind, tc.want)
+			}
+			if entry.ActorSubject == nil || *entry.ActorSubject != tc.subject {
+				t.Errorf("ActorSubject = %v, want %q", entry.ActorSubject, tc.subject)
+			}
+		})
 	}
 }

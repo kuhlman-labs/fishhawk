@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -768,5 +769,32 @@ func TestRetryStage_Delegated_NotConfigured(t *testing.T) {
 	}
 	if errBody := decodeErrorEnvelope(t, w); errBody.Code != "delegation_not_configured" {
 		t.Errorf("code = %q, want delegation_not_configured", errBody.Code)
+	}
+}
+
+// TestRetryStage_OperatorAgentActorAttribution: a retry triggered under
+// an operator-agent token records actor_kind=agent with the full token
+// subject on the stage_retried entry (ADR-040 D4, #1027).
+func TestRetryStage_OperatorAgentActorAttribution(t *testing.T) {
+	s, repo, au := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureD, "sla_timeout: 5h elapsed (deadline 4h)")
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/"+stage.ID.String()+"/retry", nil)
+	req.SetPathValue("stage_id", stage.ID.String())
+	w := httptest.NewRecorder()
+	s.handleRetryStage(w, withOperatorAgentAuth(req))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageRetried {
+		t.Fatalf("audit entries = %+v, want one stage_retried", au.appended)
+	}
+	entry := au.appended[0]
+	if entry.ActorKind == nil || *entry.ActorKind != audit.ActorAgent {
+		t.Errorf("ActorKind = %v, want agent", entry.ActorKind)
+	}
+	if entry.ActorSubject == nil || *entry.ActorSubject != operatorAgentSubject {
+		t.Errorf("ActorSubject = %v, want %q", entry.ActorSubject, operatorAgentSubject)
 	}
 }

@@ -618,7 +618,7 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 	if subject == "" {
 		subject = "anonymous"
 	}
-	actorKind := audit.ActorUser
+	actorKind := actorKindForSubject(subject)
 
 	passOrdinal := priorPasses + 1
 	admissibilityReason := fmt.Sprintf("fix-up pass %d of %d; %d concern(s) routed back; via %s",

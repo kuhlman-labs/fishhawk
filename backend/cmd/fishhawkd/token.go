@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tokenmigrate"
 )
@@ -58,7 +59,7 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""),
 		"postgres URL")
 	subject := fs.String("subject", "",
-		"identity the token is bound to (e.g. \"github:42\" or \"bootstrap\")")
+		"identity the token is bound to (e.g. \"github:42\", \"bootstrap\", or \"operator-agent/<role-spec-version>\" for an operator-agent role instance)")
 	scopesCSV := fs.String("scopes", "",
 		"comma-separated scope list (optional)")
 	if err := fs.Parse(args); err != nil {
@@ -70,6 +71,13 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 	}
 	if *subject == "" {
 		_, _ = fmt.Fprintln(logSink, "fishhawkd token issue: --subject required")
+		return exitUsage
+	}
+	// ADR-040 D4 (#1027): an operator-agent subject must name a
+	// recognized role-spec version so audit attribution can tie the
+	// token's actions to a concrete role contract.
+	if err := operatorrole.ValidateTokenSubject(*subject); err != nil {
+		_, _ = fmt.Fprintf(logSink, "fishhawkd token issue: %v\n", err)
 		return exitUsage
 	}
 

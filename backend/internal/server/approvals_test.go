@@ -2898,3 +2898,56 @@ func TestSubmitApproval_NoDelegatedField_Unchanged(t *testing.T) {
 	}
 	t.Fatal("no approval_submitted entry appended")
 }
+
+// TestSubmitApproval_OperatorAgentActorAttribution is the ADR-040 D4
+// done-means clause (#1027): a decision taken under an operator-agent
+// token and one taken by a human on the SAME run must be
+// distinguishable on the audit chain — actor_kind=agent vs user, with
+// actor_subject carrying the full token subject in both cases.
+// Exercised across the wire → handler → audit-repo seam.
+func TestSubmitApproval_OperatorAgentActorAttribution(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	agentStage := rr.seedStage(run.StageStateAwaitingApproval)
+	humanStage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	humanStage.RunID = agentStage.RunID
+	humanStage.Sequence = 1
+	rr.mu.Unlock()
+
+	// Decision by the role instance, via its bearer token.
+	url := fmt.Sprintf("/v0/stages/%s/approvals", agentStage.ID)
+	req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(`{"decision":"approve"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("stage_id", agentStage.ID.String())
+	w := httptest.NewRecorder()
+	s.handleSubmitApproval(w, withOperatorAgentAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("agent-token approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// Decision by a human on the same run.
+	w = submitApproval(t, s, humanStage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("human approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	if len(au.appended) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(au.appended))
+	}
+	agentEntry, humanEntry := au.appended[0], au.appended[1]
+	if agentEntry.RunID != humanEntry.RunID {
+		t.Fatalf("entries landed on different runs: %s vs %s", agentEntry.RunID, humanEntry.RunID)
+	}
+	if agentEntry.ActorKind == nil || *agentEntry.ActorKind != audit.ActorAgent {
+		t.Errorf("agent-token entry ActorKind = %v, want agent", agentEntry.ActorKind)
+	}
+	if agentEntry.ActorSubject == nil || *agentEntry.ActorSubject != operatorAgentSubject {
+		t.Errorf("agent-token entry ActorSubject = %v, want %q", agentEntry.ActorSubject, operatorAgentSubject)
+	}
+	if humanEntry.ActorKind == nil || *humanEntry.ActorKind != audit.ActorUser {
+		t.Errorf("human entry ActorKind = %v, want user", humanEntry.ActorKind)
+	}
+	if humanEntry.ActorSubject == nil || *humanEntry.ActorSubject != testOperatorIdentity().Subject {
+		t.Errorf("human entry ActorSubject = %v, want %q", humanEntry.ActorSubject, testOperatorIdentity().Subject)
+	}
+}

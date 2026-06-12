@@ -50,6 +50,18 @@ Escalation **contacts and channels** are conventions and go under `conventions`;
 
 `.fishhawk/operator.yaml` must be a **single YAML document**: `ValidateOverlay` rejects a multi-document stream outright, since only the first document is schema-validated and a trailing document could otherwise carry procedure fields past the thinness rule.
 
+## Identity and token issuance (D4)
+
+A deployed operator-agent role instance acts under its own API token, never a human's. The token subject follows the convention:
+
+```
+operator-agent/<role-spec-version>      e.g. operator-agent/operator-role-v0
+```
+
+- **Issuance**: `fishhawkd token issue --subject operator-agent/operator-role-v0`. The default operator scope set (#526: `read:runs`, `read:audit`, `write:runs`, `write:approvals`, `write:stages`) applies unchanged — the subject carries no `mcp:` prefix and the convention introduces no new scopes. Authority remains entirely in the workflow spec's `operator_agent` delegation knobs.
+- **Pattern validation**: issuance rejects a subject carrying the `operator-agent/` prefix (or the bare string `operator-agent`) whose suffix is not a recognized role-spec version (currently exactly `operator-role-v0`, the same single-value set the schema's `spec_version` enum pins). Non-prefixed subjects are unaffected. Validation is issuance-time only — no read path validates subjects, so a version bump strands no existing token. Go implementation: `operatorrole.ValidateTokenSubject` / `operatorrole.IsTokenSubject`.
+- **Audit attribution**: every delegated-action audit entry (`approval_submitted`, `stage_fixup_triggered`, `concern_waived`, `stage_retried`, `stage_override_retried`, and the bearer-auth PR-report appends) records `actor_subject` = the acting token subject, and selects `actor_kind` from it: `agent` when the subject carries the `operator-agent/` prefix, `user` for every other subject (human tokens, GitHub logins). A role-instance action and a human action on the same run are therefore distinguishable on the chain. The `delegated: "<rule>"` payload field (#1026) is an independent signal — it names the condition that authorized a delegated action, while `actor_kind` names who acted; a non-delegated action by the role token still records `agent`.
+
 ## Versioning
 
 - `spec_version` is a required, single-value enum (`operator-role-v0`), matching the `version` / `plan_version` convention.

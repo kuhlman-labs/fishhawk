@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -104,6 +105,60 @@ func (s *StringList) UnmarshalJSON(b []byte) error {
 // package init. Callers must treat the returned value as read-only:
 // the slices and map are shared.
 func Default() RoleSpec { return defaultSpec }
+
+// TokenSubjectPrefix is the subject convention for API tokens issued to
+// an operator-agent role instance (ADR-040 D4, #1027). The suffix names
+// the role-spec version the instance runs under, so audit attribution
+// can tie a delegated action back to a concrete role contract:
+// "operator-agent/operator-role-v0".
+const TokenSubjectPrefix = "operator-agent/"
+
+// recognizedTokenVersions is the closed set of role-spec versions a
+// token subject may name — the same single-value set the schema's
+// spec_version enum pins. Grows when a new spec version ships.
+var recognizedTokenVersions = map[string]bool{
+	"operator-role-v0": true,
+}
+
+// IsTokenSubject reports whether subject follows the operator-agent
+// token convention. It matches on the prefix only — validation of the
+// version suffix is issuance-time work (ValidateTokenSubject); read
+// paths classify any prefixed subject as the role instance acting.
+func IsTokenSubject(subject string) bool {
+	return strings.HasPrefix(subject, TokenSubjectPrefix)
+}
+
+// ValidateTokenSubject enforces the operator-agent subject convention
+// at token issuance. Subjects carrying the prefix (or the bare string
+// "operator-agent") must name a recognized role-spec version as the
+// suffix; any other subject passes untouched — the convention is
+// opt-in and existing subject shapes are unaffected.
+func ValidateTokenSubject(subject string) error {
+	if subject != "operator-agent" && !IsTokenSubject(subject) {
+		return nil
+	}
+	version := strings.TrimPrefix(subject, TokenSubjectPrefix)
+	if subject == "operator-agent" || version == "" {
+		return fmt.Errorf(
+			"operator-agent subject must be %q followed by a role-spec version (e.g. %q); recognized versions: %s",
+			TokenSubjectPrefix, TokenSubjectPrefix+"operator-role-v0", recognizedVersionList())
+	}
+	if !recognizedTokenVersions[version] {
+		return fmt.Errorf(
+			"operator-agent subject names unrecognized role-spec version %q; recognized versions: %s",
+			version, recognizedVersionList())
+	}
+	return nil
+}
+
+func recognizedVersionList() string {
+	versions := make([]string, 0, len(recognizedTokenVersions))
+	for v := range recognizedTokenVersions {
+		versions = append(versions, v)
+	}
+	sort.Strings(versions)
+	return strings.Join(versions, ", ")
+}
 
 // EmbeddedSchemaHash returns the hex-encoded SHA-256 of the canonical
 // JSON bytes of the embedded operator-role-v0 schema (the full role

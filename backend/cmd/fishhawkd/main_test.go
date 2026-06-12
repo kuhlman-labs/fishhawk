@@ -428,3 +428,32 @@ func TestResolvePlanReviewers(t *testing.T) {
 		}
 	})
 }
+
+// TestRun_TokenIssueMalformedOperatorAgentSubject pins the ADR-040 D4
+// issuance gate: an operator-agent subject naming an unrecognized
+// role-spec version is rejected before any database dial (the dummy
+// --db URL is never connected to), with the recognized versions named.
+func TestRun_TokenIssueMalformedOperatorAgentSubject(t *testing.T) {
+	cases := []struct {
+		name    string
+		subject string
+	}{
+		{"unknown version", "operator-agent/operator-role-v9"},
+		{"bare prefix", "operator-agent/"},
+		{"missing version", "operator-agent"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out strings.Builder
+			got := run([]string{"token", "issue",
+				"--db", "postgres://x:y@nowhere/db",
+				"--subject", tc.subject}, &out)
+			if got != exitUsage {
+				t.Errorf("exit = %d, want %d:\n%s", got, exitUsage, out.String())
+			}
+			if !strings.Contains(out.String(), "operator-role-v0") {
+				t.Errorf("output does not name the recognized versions: %s", out.String())
+			}
+		})
+	}
+}
