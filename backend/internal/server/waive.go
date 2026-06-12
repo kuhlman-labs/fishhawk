@@ -183,7 +183,7 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 	if subject == "" {
 		subject = "anonymous"
 	}
-	actorKind := audit.ActorUser
+	actorKind := actorKindForSubject(subject)
 	waivedFields := map[string]any{
 		"concern_id":  row.ID.String(),
 		"prior_state": string(row.State),

@@ -294,3 +294,60 @@ func TestStringListUnmarshal(t *testing.T) {
 		t.Error("UnmarshalJSON(42) = nil, want error")
 	}
 }
+
+// TestValidateTokenSubject covers the ADR-040 D4 issuance-time subject
+// convention: prefixed subjects must name a recognized role-spec
+// version; everything else passes untouched.
+func TestValidateTokenSubject(t *testing.T) {
+	cases := []struct {
+		name    string
+		subject string
+		wantErr string // substring; "" means valid
+	}{
+		{"valid versioned subject", "operator-agent/operator-role-v0", ""},
+		{"bare prefix without version", "operator-agent/", "followed by a role-spec version"},
+		{"bare name without slash", "operator-agent", "followed by a role-spec version"},
+		{"unknown version", "operator-agent/operator-role-v9", `unrecognized role-spec version "operator-role-v9"`},
+		{"github subject unaffected", "github:42", ""},
+		{"bootstrap subject unaffected", "bootstrap", ""},
+		{"mcp subject unaffected", "mcp:run:00000000-0000-0000-0000-000000000001", ""},
+		{"prefix-adjacent name unaffected", "operator-agents/x", ""},
+		{"empty subject unaffected", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateTokenSubject(tc.subject)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateTokenSubject(%q) = %v, want nil", tc.subject, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ValidateTokenSubject(%q) = nil, want error containing %q", tc.subject, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want substring %q", err.Error(), tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), "operator-role-v0") {
+				t.Errorf("error %q does not name the recognized versions", err.Error())
+			}
+		})
+	}
+}
+
+// TestIsTokenSubject pins the prefix-match classification read paths
+// key actor attribution on.
+func TestIsTokenSubject(t *testing.T) {
+	if !IsTokenSubject("operator-agent/operator-role-v0") {
+		t.Error("IsTokenSubject(operator-agent/operator-role-v0) = false, want true")
+	}
+	if !IsTokenSubject("operator-agent/") {
+		t.Error("IsTokenSubject(operator-agent/) = false, want true (prefix match only)")
+	}
+	for _, s := range []string{"operator-agent", "github:42", "", "agent/operator-role-v0"} {
+		if IsTokenSubject(s) {
+			t.Errorf("IsTokenSubject(%q) = true, want false", s)
+		}
+	}
+}

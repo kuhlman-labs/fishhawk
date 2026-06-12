@@ -111,6 +111,8 @@ fishhawkd token issue --subject github:42 --scopes runs:read,runs:write
 
 The plaintext is printed to stdout exactly once (suitable for `... | head -n1`); only the sha256 hash is stored. Subsequent tokens can be minted via `POST /v0/tokens` once you have one bearer in hand.
 
+A token for an operator-agent role instance (ADR-040 D4) uses the subject convention `operator-agent/<role-spec-version>` — e.g. `fishhawkd token issue --subject operator-agent/operator-role-v0` — and gets the same default operator scope set. Issuance rejects an `operator-agent/` subject naming an unrecognized role-spec version; delegated-action audit entries written under such a token record `actor_kind=agent` with the full subject. See `docs/spec/operator-role.md` "Identity and token issuance".
+
 ## Container image
 
 `fishhawkd` ships as a distroless static-binary image at

@@ -262,7 +262,10 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		actorKind = audit.ActorKind("system")
 	case !id.IsAnonymous() && hasScope(id, "write:runs"):
 		authMethod = "bearer"
-		actorKind = audit.ActorKind("operator")
+		// ADR-040 D4 (#1027): kind from the token subject — user or agent,
+		// both within the DB CHECK and OpenAPI enum. The previous literal
+		// "operator" was outside the closed set {agent,user,system}.
+		actorKind = actorKindForSubject(id.Subject)
 		subj := id.Subject
 		actorSubject = &subj
 	default:

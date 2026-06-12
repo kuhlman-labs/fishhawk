@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -464,5 +465,36 @@ func TestWaiveConcern_Delegated_NotConfigured(t *testing.T) {
 	}
 	if row.State != concern.StateRaised {
 		t.Errorf("concern state = %q, want raised (no mutation on refusal)", row.State)
+	}
+}
+
+// TestWaiveConcern_OperatorAgentActorAttribution: a waive recorded under
+// an operator-agent token records actor_kind=agent with the full token
+// subject on the concern_waived entry (ADR-040 D4, #1027).
+func TestWaiveConcern_OperatorAgentActorAttribution(t *testing.T) {
+	s, au, cr := waiveServer(t)
+	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 100, "naming nit")
+
+	raw, _ := json.Marshal(waiveConcernRequest{Reason: "accepted trade-off"})
+	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+row.ID.String()+"/waive", bytes.NewReader(raw))
+	req.SetPathValue("concern_id", row.ID.String())
+	w := httptest.NewRecorder()
+	s.handleWaiveConcern(w, withOperatorAgentAuth(req))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	waived := auditEntriesByCategory(au, CategoryConcernWaived)
+	if len(waived) != 1 {
+		t.Fatalf("concern_waived entries = %d, want 1", len(waived))
+	}
+	au.mu.Lock()
+	entry := au.appended[waived[0]]
+	au.mu.Unlock()
+	if entry.ActorKind == nil || *entry.ActorKind != audit.ActorAgent {
+		t.Errorf("ActorKind = %v, want agent", entry.ActorKind)
+	}
+	if entry.ActorSubject == nil || *entry.ActorSubject != operatorAgentSubject {
+		t.Errorf("ActorSubject = %v, want %q", entry.ActorSubject, operatorAgentSubject)
 	}
 }

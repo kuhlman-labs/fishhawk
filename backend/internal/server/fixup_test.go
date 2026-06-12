@@ -1632,3 +1632,34 @@ func TestFixupStage_Delegated_NotConfigured(t *testing.T) {
 		t.Errorf("stage_fixup_triggered entries = %d after refusal, want 0", len(idx))
 	}
 }
+
+// TestFixupStage_OperatorAgentActorAttribution: a fix-up routed under
+// an operator-agent token records actor_kind=agent with the full token
+// subject on the stage_fixup_triggered entry (ADR-040 D4, #1027).
+func TestFixupStage_OperatorAgentActorAttribution(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	raw, _ := json.Marshal(fixupRequest{Concerns: []int{0}, Reason: "route the drift back"})
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/"+stage.ID.String()+"/fixup", bytes.NewReader(raw))
+	req.SetPathValue("stage_id", stage.ID.String())
+	w := httptest.NewRecorder()
+	s.handleFixupStage(w, withOperatorAgentAuth(req))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageFixupTriggered {
+		t.Fatalf("audit entries = %+v, want one stage_fixup_triggered", au.appended)
+	}
+	entry := au.appended[0]
+	if entry.ActorKind == nil || *entry.ActorKind != audit.ActorAgent {
+		t.Errorf("ActorKind = %v, want agent", entry.ActorKind)
+	}
+	if entry.ActorSubject == nil || *entry.ActorSubject != operatorAgentSubject {
+		t.Errorf("ActorSubject = %v, want %q", entry.ActorSubject, operatorAgentSubject)
+	}
+}

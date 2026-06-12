@@ -604,7 +604,10 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // — the condition checkDelegation re-evaluated and found met. Token-
 // subject attribution for the operator agent is #1027's scope.
 func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, delegatedRule string) {
-	systemKind := audit.ActorKind("user")
+	// ADR-040 D4 (#1027): the acting subject selects the kind — an
+	// operator-agent token records agent, every other subject (human
+	// tokens, GitHub logins from the PR-review-event path) stays user.
+	actorKind := actorKindForSubject(app.ApproverSubject)
 	auditPayload := map[string]any{
 		"stage_id": stage.ID.String(),
 		"decision": string(app.Decision),
@@ -640,7 +643,7 @@ func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *appr
 		StageID:      &stage.ID,
 		Timestamp:    time.Now().UTC(),
 		Category:     "approval_submitted",
-		ActorKind:    &systemKind,
+		ActorKind:    &actorKind,
 		ActorSubject: &approver,
 		Payload:      payload,
 	}); err != nil {
