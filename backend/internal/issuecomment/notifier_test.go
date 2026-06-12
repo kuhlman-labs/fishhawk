@@ -463,8 +463,8 @@ func TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Reject(t *testing.T) {
 // a resolved approver_github_login, the footer `@`-mentions THAT login
 // even though the provenance `approver` is the raw MCP token subject
 // (brett@local-mcp). Without the resolved login, the bare token
-// subject falls back to "an approver" rather than `@`-mentioning an
-// unrelated GitHub user.
+// subject renders verbatim inside a code span (#1053) — never as an
+// `@`-mention of an unrelated GitHub user.
 func TestPlanStatusFooterForAuditPayload_PrefersGithubLogin(t *testing.T) {
 	withLogin := mustJSON(t, map[string]any{
 		"decision":              "approve",
@@ -481,8 +481,146 @@ func TestPlanStatusFooterForAuditPayload_PrefersGithubLogin(t *testing.T) {
 		"approver": "brett@local-mcp",
 	})
 	got = issuecomment.PlanStatusFooterForAuditPayload(bareSubject)
-	if got != "_Status: approved by an approver · implementing now_" {
-		t.Errorf("with bare token subject, footer = %q, want \"an approver\" (no ping)", got)
+	if got != "_Status: approved by `brett@local-mcp` · implementing now_" {
+		t.Errorf("with bare token subject, footer = %q, want verbatim code-span form (no ping)", got)
+	}
+}
+
+// TestPlanStatusFooterForAuditPayload_IdentityForms pins the #1053
+// three-form identity convention on BOTH approve and reject footer
+// branches: resolved login → `@`-mention; operator-agent token subject
+// → role instance named, plus the ADR-040 delegation rule when the
+// payload recorded one; any other non-login subject → verbatim inside
+// a code span with no bare leading `@` (the #751 stop-the-ping
+// guarantee); "an approver" strictly for empty / "anonymous". The
+// backtick cases pin the security amendment: a subject containing
+// backticks (single, double run, or only backticks) must stay inside
+// one literal code span — backticks are replaced before wrapping, so
+// the subject can never close the span and re-enable markdown or an
+// @-mention.
+func TestPlanStatusFooterForAuditPayload_IdentityForms(t *testing.T) {
+	cases := []struct {
+		name      string
+		payload   map[string]any
+		wantActor string
+	}{
+		{
+			name: "resolved login",
+			payload: map[string]any{
+				"approver":              "brett@local-mcp",
+				"approver_github_login": "kuhlman-labs",
+			},
+			wantActor: "@kuhlman-labs",
+		},
+		{
+			name: "operator-agent subject with delegated rule",
+			payload: map[string]any{
+				"approver":  "operator-agent/operator-role-v0",
+				"delegated": "clean_dual_approval",
+			},
+			wantActor: "the operator agent (`operator-agent/operator-role-v0`, delegated: `clean_dual_approval`)",
+		},
+		{
+			name: "operator-agent subject without delegated field",
+			payload: map[string]any{
+				"approver": "operator-agent/operator-role-v0",
+			},
+			wantActor: "the operator agent (`operator-agent/operator-role-v0`)",
+		},
+		{
+			// The delegated rule comes from the audit payload; even
+			// though writeApprovalAudit only ever stamps a workflow-spec
+			// rule identifier, the render must contain a hostile value
+			// the same way it contains the subject — backticks replaced,
+			// newlines dropped, leading `@` stripped, all inside one
+			// code span — so the rule clause can never re-enable
+			// markdown or an @-mention.
+			name: "delegated rule with backticks, newline, and mention sanitized into its own code span",
+			payload: map[string]any{
+				"approver":  "operator-agent/operator-role-v0",
+				"delegated": "rule`@kuhlman-labs\n**bold**",
+			},
+			wantActor: "the operator agent (`operator-agent/operator-role-v0`, delegated: `rule'@kuhlman-labs**bold**`)",
+		},
+		{
+			// A rule that sanitizes to empty (only control characters)
+			// falls back to the no-rule parenthetical rather than
+			// rendering an empty code span.
+			name: "delegated rule that sanitizes to empty drops the rule clause",
+			payload: map[string]any{
+				"approver":  "operator-agent/operator-role-v0",
+				"delegated": "\n\t\x07",
+			},
+			wantActor: "the operator agent (`operator-agent/operator-role-v0`)",
+		},
+		{
+			name:      "other non-login subject renders verbatim in a code span",
+			payload:   map[string]any{"approver": "brett@local-mcp"},
+			wantActor: "`brett@local-mcp`",
+		},
+		{
+			name:      "single backtick replaced inside the span",
+			payload:   map[string]any{"approver": "evil`name"},
+			wantActor: "`evil'name`",
+		},
+		{
+			name:      "double backtick run replaced inside the span",
+			payload:   map[string]any{"approver": "evil``@kuhlman-labs"},
+			wantActor: "`evil''@kuhlman-labs`",
+		},
+		{
+			name:      "subject that is only backticks stays one literal span",
+			payload:   map[string]any{"approver": "```"},
+			wantActor: "`'''`",
+		},
+		{
+			// Sanitizing can yield "" (every rune dropped); the caller
+			// must fall back to "an approver" rather than render an
+			// empty code span.
+			name:      "subject that is only control characters falls back to an approver",
+			payload:   map[string]any{"approver": "\n\t\x07\x1b"},
+			wantActor: "an approver",
+		},
+		{
+			// A pathological subject is capped at maxRenderedSubjectRunes
+			// (64) so it can't balloon the comment.
+			name:      "over-long subject is capped at 64 runes",
+			payload:   map[string]any{"approver": strings.Repeat("a", 70)},
+			wantActor: "`" + strings.Repeat("a", 64) + "`",
+		},
+		{
+			name:      "empty subject",
+			payload:   map[string]any{"approver": ""},
+			wantActor: "an approver",
+		},
+		{
+			name:      "anonymous placeholder",
+			payload:   map[string]any{"approver": "anonymous"},
+			wantActor: "an approver",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for decision, want := range map[string]string{
+				"approve": fmt.Sprintf("_Status: approved by %s · implementing now_", tc.wantActor),
+				"reject":  fmt.Sprintf("_Status: rejected by %s_", tc.wantActor),
+			} {
+				payload := map[string]any{"decision": decision}
+				for k, v := range tc.payload {
+					payload[k] = v
+				}
+				got := issuecomment.PlanStatusFooterForAuditPayload(mustJSON(t, payload))
+				if got != want {
+					t.Errorf("%s footer = %q, want %q", decision, got, want)
+				}
+				// Stop-the-ping (#751): no bare leading `@` outside a
+				// code span — every rendered `@` must be the resolved
+				// login mention or sit inside backticks.
+				if tc.wantActor != "@kuhlman-labs" && strings.Contains(got, " @") {
+					t.Errorf("%s footer %q carries a bare @-prefix (mention risk)", decision, got)
+				}
+			}
+		})
 	}
 }
 

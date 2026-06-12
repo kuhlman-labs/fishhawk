@@ -307,17 +307,56 @@ func TestRenderStatusBody_ApproverMention_PrefersGithubLogin(t *testing.T) {
 		}
 	})
 
-	t.Run("non-login subject with no resolved login falls back to an approver", func(t *testing.T) {
+	t.Run("non-login subject with no resolved login renders verbatim in a code span", func(t *testing.T) {
 		entries := []*audit.Entry{
 			auditEntry(runID, 1, "approval_submitted", "brett@local-mcp", now.Add(-1*time.Minute),
 				map[string]any{"decision": "approve"}),
 		}
 		body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
-		if !strings.Contains(body, "an approver approved the plan") {
-			t.Errorf("expected \"an approver\" fallback\n---\n%s", body)
+		if !strings.Contains(body, "`brett@local-mcp` approved the plan") {
+			t.Errorf("expected the verbatim code-span form (#1053)\n---\n%s", body)
 		}
 		if strings.Contains(body, "@brett") {
 			t.Errorf("must NOT @-mention a non-login subject (#755)\n---\n%s", body)
+		}
+	})
+
+	t.Run("operator-agent subject names the role and the delegation rule", func(t *testing.T) {
+		entries := []*audit.Entry{
+			auditEntry(runID, 1, "approval_submitted", "operator-agent/operator-role-v0", now.Add(-1*time.Minute),
+				map[string]any{
+					"decision":  "approve",
+					"approver":  "operator-agent/operator-role-v0",
+					"delegated": "clean_dual_approval",
+				}),
+		}
+		body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+		want := "the operator agent (`operator-agent/operator-role-v0`, delegated: `clean_dual_approval`) approved the plan"
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q (#1053 / ADR-040 attribution)\n---\n%s", want, body)
+		}
+	})
+
+	t.Run("hostile delegated rule is contained in its own code span", func(t *testing.T) {
+		// The rule is read from the audit payload; even though the
+		// server only writes workflow-spec rule identifiers, the
+		// activity line must sanitize it like the subject so the
+		// delegated clause can't re-enable markdown or a mention.
+		entries := []*audit.Entry{
+			auditEntry(runID, 1, "approval_submitted", "operator-agent/operator-role-v0", now.Add(-1*time.Minute),
+				map[string]any{
+					"decision":  "approve",
+					"approver":  "operator-agent/operator-role-v0",
+					"delegated": "rule`@kuhlman-labs\n**bold**",
+				}),
+		}
+		body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+		want := "the operator agent (`operator-agent/operator-role-v0`, delegated: `rule'@kuhlman-labs**bold**`) approved the plan"
+		if !strings.Contains(body, want) {
+			t.Errorf("expected sanitized rule clause\n---\n%s", body)
+		}
+		if strings.Contains(body, " @kuhlman-labs") {
+			t.Errorf("delegated rule leaked a bare @-mention\n---\n%s", body)
 		}
 	})
 }

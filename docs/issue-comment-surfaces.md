@@ -29,7 +29,16 @@ Notes:
   back to a fresh create.
 - The plan-on-issue full surface's `_Status:_` footer is driven by the
   latest `approval_submitted` audit row for the plan stage
-  (`latestPlanApproval`); pre-approval the footer is omitted.
+  (`latestPlanApproval`); pre-approval the footer is omitted. Approver
+  identity renders in three forms (#1053, shared with the sticky status
+  comment's activity line): a valid GitHub login → `@<login>` mention
+  (resolved `approver_github_login` preferred, #751); an operator-agent
+  token subject → "the operator agent (`<subject>`, delegated: `<rule>`)"
+  naming the ADR-040 delegation rule when recorded — the rule is
+  sanitized and code-span-wrapped like the subject, so a payload value
+  can never re-enable markdown or a mention; any other non-login
+  subject → verbatim inside a sanitized code span (never `@`-mentioned);
+  "an approver" only for an empty or "anonymous" subject.
 - The sticky status comment is the *only* surface that follows a run
   end-to-end; everything else is event-scoped.
 - The run-rejected surface (`NotifyRunRejected`, #599) is *runless*: the
