@@ -337,6 +337,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | Autonomy tier of a change | `docs/METHODOLOGY.md` |
 | Workflow spec grammar | `docs/spec/workflow-v0.md` + `docs/spec/workflow-v0.schema.json` |
 | Plan artifact structure | `docs/spec/plan-standard-v1.md` + `docs/spec/plan-standard-v1.schema.json` |
+| Operator role contract (ADR-040: shipped default, `.fishhawk/operator.yaml` overlay + thinness rule) | `docs/spec/operator-role.md` + `docs/spec/operator-role.schema.json` / `operator-role-overlay.schema.json`; Go validation in `backend/internal/operatorrole/` |
 | HTTP API contract (endpoints, auth, errors) | `docs/api/v0.openapi.yaml` (source of truth) + `docs/api/v0.md` (companion) |
 | Trace bundle wire format (`*.jsonl.gz`) | `runner/internal/bundle/bundle.go` (pack + open) — implements ADR-007 (#71) |
 | Runner → backend trace upload | `runner/internal/upload/` (HTTP client, retries, signing) — wired into runner main behind `--upload-trace` |

@@ -17,6 +17,9 @@ check docs/spec/workflow-v0.schema.json backend/internal/spec/schemas/workflow-v
 check docs/spec/workflow-v0.schema.json cli/internal/spec/schemas/workflow-v0.schema.json
 check docs/spec/plan-standard-v1.schema.json backend/internal/plan/schemas/plan-standard-v1.schema.json
 check docs/spec/plan-standard-v1.schema.json runner/internal/plan/schemas/plan-standard-v1.schema.json
+check docs/spec/operator-role.schema.json backend/internal/operatorrole/schemas/operator-role.schema.json
+check docs/spec/operator-role-overlay.schema.json backend/internal/operatorrole/schemas/operator-role-overlay.schema.json
+check docs/spec/operator-role-default.yaml backend/internal/operatorrole/defaults/operator-role-default.yaml
 
 if [ "$FAIL" -eq 1 ]; then
   echo "Run scripts/sync-schemas to mirror the canonical copies, then re-stage." >&2

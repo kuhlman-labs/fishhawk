@@ -1,0 +1,13 @@
+# Example per-repo operator role overlay (.fishhawk/operator.yaml,
+# ADR-040 D1). The overlay is thin by design: knob presets, local
+# conventions, and the work-management pointer only. Procedure
+# (mission, gate_procedures, escalation, forbidden) belongs in the
+# product's shipped role spec — adding it here fails validation with
+# the thinness rule.
+spec_version: operator-role-v0
+knob_presets:
+  autonomy: medium
+conventions:
+  escalation_contact: "page @kuhlman-labs in the driving session first"
+  merge_ritual_local: squash merges only; delete the run branch after merge
+work_management: github-project:kuhlman-labs/7
