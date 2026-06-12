@@ -135,9 +135,11 @@ func runBoundTokenRunID(id Identity) (uuid.UUID, bool) {
 //
 // Auth: a run-bound fhm_ token carrying write:scope-amendments, ONLY.
 // The path run_id must equal the token's run (cross-run → 403), and
-// the run's currently-executing stage must be an implement stage —
-// amendments exist so the implement agent can widen its effective
-// scope.files mid-stage, nothing else.
+// the run's active-or-next stage (currently dispatched/running, or —
+// the local-runner first-stage gap, #1030 — the first non-terminal
+// stage) must be an implement stage — amendments exist so the
+// implement agent can widen its effective scope.files mid-stage,
+// nothing else.
 func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.ScopeAmendmentRepo == nil || s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "scope_amendment_unconfigured",
@@ -449,9 +451,13 @@ func (s *Server) handleDecideScopeAmendment(w http.ResponseWriter, r *http.Reque
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
-// resolveExecutingImplementStage returns the run's currently-executing
-// (dispatched/running) implement stage, nil when no such stage exists.
-// run.ErrNotFound when the run itself doesn't exist.
+// resolveExecutingImplementStage returns the run's active-or-next
+// stage (first dispatched/running, else first non-terminal — the
+// local-runner first-stage gap, #1030) when it is implement-typed;
+// nil otherwise. A plan-first run resolves its plan stage and still
+// 409s stage_not_implement, while a decomposition child's pending
+// implement stage is accepted. run.ErrNotFound when the run itself
+// doesn't exist.
 func (s *Server) resolveExecutingImplementStage(r *http.Request, runID uuid.UUID) (*run.Stage, error) {
 	if _, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err != nil {
 		return nil, err
@@ -460,15 +466,11 @@ func (s *Server) resolveExecutingImplementStage(r *http.Request, runID uuid.UUID
 	if err != nil {
 		return nil, err
 	}
-	for _, st := range stages {
-		if st.Type != run.StageTypeImplement {
-			continue
-		}
-		if st.State == run.StageStateDispatched || st.State == run.StageStateRunning {
-			return st, nil
-		}
+	st := activeOrNextStage(stages)
+	if st == nil || st.Type != run.StageTypeImplement {
+		return nil, nil
 	}
-	return nil, nil
+	return st, nil
 }
 
 // writeScopeAmendmentRequestedAudit appends the scope_amendment_requested
