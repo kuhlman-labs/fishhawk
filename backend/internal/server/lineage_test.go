@@ -848,6 +848,238 @@ func TestReverifyBranchLineage_Idempotent(t *testing.T) {
 	}
 }
 
+// seedDecompositionChild registers a decomposition child run (DecomposedFrom
+// = parentID) in the run repo and seeds an audit entry of the given category
+// (child_pushed / fixup_pushed) carrying headSHA on the CHILD's chain — the
+// real placement (#1038 root cause): succeedChildPushStage appends with the
+// reporting child's run ID, never the parent's.
+func seedDecompositionChild(rr *promptRunRepo, au *auditFake, parentID uuid.UUID,
+	category, headSHA string) uuid.UUID {
+	childID := uuid.New()
+	parent := parentID
+	rr.getRuns[childID] = &run.Run{ID: childID, Repo: "x/y", DecomposedFrom: &parent}
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &childID,
+		Category: category,
+		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, headSHA)),
+	})
+	return childID
+}
+
+// TestReverifyBranchLineage_DecompositionFanOutClean is the #1038 regression
+// (the wedge/self-heal test): a decomposition parent whose shared branch
+// carries three sibling child commits, each reported as child_pushed on the
+// CHILD's own chain, while the parent's own chain holds only the
+// consolidated-PR head (the branch tip). Pre-fix the parent-side
+// merge-resolution re-check saw only the tip in the ledger and false-flagged
+// the earlier siblings as foreign, parking the run forever. With the
+// decomposition-aware ledger the fan-out re-verifies clean=true — exactly
+// the verdict that lets the reconciler's resolve path terminalize the parked
+// parent. A previously-recorded violation entry (the false positive already
+// on the wedged run's chain) is seeded to prove a now-clean verdict is not
+// suppressed by prior contamination history.
+func TestReverifyBranchLineage_DecompositionFanOutClean(t *testing.T) {
+	runID := uuid.New()
+	const c1 = "1111111111111111111111111111111111111111" // slice 1 child commit
+	const c2 = "2222222222222222222222222222222222222222" // slice 2 child commit
+	const c3 = "3333333333333333333333333333333333333333" // slice 3 child commit = branch tip
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {c1, c2, c3}},
+	}
+	gh := newReverifyGitHubClient(t, stub, c3)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, rr := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	// The parent's OWN chain carries only the consolidated-PR head (the tip).
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "pull_request_opened",
+		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, c3)),
+	})
+	seedDecompositionChild(rr, au, runID, "child_pushed", c1)
+	seedDecompositionChild(rr, au, runID, "child_pushed", c2)
+	seedDecompositionChild(rr, au, runID, "child_pushed", c3)
+	// The false positive a pre-fix tick already recorded on the wedged run.
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: invariantmonitor.CategoryInvariantViolation,
+		Payload: json.RawMessage(fmt.Sprintf(
+			`{"kind":%q,"offending_sha":%q,"head_sha":%q}`,
+			invariantmonitor.KindForeignCommitOnBranch, c1, c3)),
+	})
+
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+		t.Fatal("expected clean=true for a fan-out whose commits all carry child provenance")
+	}
+	if got := foreignViolationCount(au); got != 0 {
+		t.Fatalf("clean fan-out emitted %d foreign_commit_on_branch entries, want 0", got)
+	}
+}
+
+// TestReverifyBranchLineage_NoProvenanceCommitStillFlags is the load-bearing
+// negative: the decomposition-aware ledger must not whitelist the branch
+// wholesale. A commit with NO child_pushed/fixup_pushed provenance riding the
+// shared fan-out branch (the real #797/#856 class) still fires
+// foreign_commit_on_branch with that SHA.
+func TestReverifyBranchLineage_NoProvenanceCommitStillFlags(t *testing.T) {
+	runID := uuid.New()
+	const c1 = "1111111111111111111111111111111111111111"
+	const c2 = "2222222222222222222222222222222222222222"
+	const foreign = "ffffffffffffffffffffffffffffffffffffffff" // no provenance anywhere
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {c1, foreign, c2}},
+	}
+	gh := newReverifyGitHubClient(t, stub, c2)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, rr := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	seedDecompositionChild(rr, au, runID, "child_pushed", c1)
+	seedDecompositionChild(rr, au, runID, "child_pushed", c2)
+
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); clean {
+		t.Fatal("expected clean=false for a no-provenance commit on the fan-out branch")
+	}
+	v := foreignViolation(au)
+	if v == nil {
+		t.Fatal("expected a foreign_commit_on_branch invariant_violation audit entry, got none")
+	}
+	var payload struct {
+		OffendingSHA string `json:"offending_sha"`
+	}
+	if err := json.Unmarshal(v.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal violation payload: %v", err)
+	}
+	if payload.OffendingSHA != foreign {
+		t.Errorf("offending_sha = %q, want %q", payload.OffendingSHA, foreign)
+	}
+}
+
+// TestReverifyBranchLineage_ChildFixupHeadAccepted: a decomposed child's
+// fix-up pushes onto the same shared parent branch (the decomposed fixup
+// branch is fishhawk/run-<shortID(decomposedFromRunID)>), so a child
+// fixup_pushed head must attribute cleanly in the parent's ledger.
+func TestReverifyBranchLineage_ChildFixupHeadAccepted(t *testing.T) {
+	runID := uuid.New()
+	const c1 = "1111111111111111111111111111111111111111" // child implement commit
+	const f1 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" // child fix-up commit = tip
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {c1, f1}},
+	}
+	gh := newReverifyGitHubClient(t, stub, f1)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, rr := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	childID := seedDecompositionChild(rr, au, runID, "child_pushed", c1)
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &childID,
+		Category: "fixup_pushed",
+		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, f1)),
+	})
+
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+		t.Fatal("expected clean=true when the tip is a child fixup_pushed head")
+	}
+	if got := foreignViolationCount(au); got != 0 {
+		t.Fatalf("child-fixup fan-out emitted %d violations, want 0", got)
+	}
+}
+
+// TestLineage_ChildEnumerationErrorAsymmetry pins the error-path asymmetry
+// when the decomposition-child enumeration (ListRuns) fails: the detect path
+// (ReverifyBranchLineage) FAILS OPEN — clean=true, no emit, never a false
+// block on a lookup error — while the reset classifier
+// (resolveLastRunAuthoredHead) FAILS CLOSED — ok=false, so an uncertain
+// ledger can never drive a destructive force-update.
+func TestLineage_ChildEnumerationErrorAsymmetry(t *testing.T) {
+	runID := uuid.New()
+	const head = "1111111111111111111111111111111111111111" // tip with no ledger entry
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {head}},
+	}
+	gh := newReverifyGitHubClient(t, stub, head)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, rr := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	rr.listRunsErr = errors.New("list children boom")
+
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+		t.Error("detect path: child enumeration error should fail open (clean=true)")
+	}
+	if got := foreignViolationCount(au); got != 0 {
+		t.Errorf("detect path emitted %d violations on a lookup error, want 0", got)
+	}
+
+	repo := githubclient.RepoRef{Owner: "x", Name: "y"}
+	if _, _, _, ok := s.resolveLastRunAuthoredHead(context.Background(), runRow, 99, repo, head, 42); ok {
+		t.Error("reset classifier: child enumeration error should fail closed (ok=false)")
+	}
+}
+
+// childChainErrAudit wraps auditFake to fail ListForRunByCategory for ONE
+// run ID (a child's chain) while delegating every other run's reads to the
+// embedded fake — so a test can fail JUST a per-child ledger read (#1038)
+// while the parent's own chain stays readable.
+type childChainErrAudit struct {
+	*auditFake
+	errRunID uuid.UUID
+	err      error
+}
+
+func (c *childChainErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if runID == c.errRunID {
+		return nil, c.err
+	}
+	return c.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestReverifyBranchLineage_ChildChainReadErrorFailsOpen: a read error on a
+// CHILD's audit chain marks the ledger incomplete, so the detect path fails
+// open (clean=true, no emit) — a partial child ledger would false-flag the
+// unreadable child's legitimate commit as foreign, exactly the false block
+// this guard must never produce. The parent's own chain reads fine, proving
+// the per-child branch (not the own-chain degrade) drives the verdict.
+func TestReverifyBranchLineage_ChildChainReadErrorFailsOpen(t *testing.T) {
+	runID := uuid.New()
+	const c1 = "1111111111111111111111111111111111111111" // readable child's commit
+	const c2 = "2222222222222222222222222222222222222222" // unreadable child's commit
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {c1, c2}},
+	}
+	gh := newReverifyGitHubClient(t, stub, c2)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, rr := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	seedDecompositionChild(rr, au, runID, "child_pushed", c1)
+	unreadable := seedDecompositionChild(rr, au, runID, "child_pushed", c2)
+	s.cfg.AuditRepo = &childChainErrAudit{
+		auditFake: au,
+		errRunID:  unreadable,
+		err:       errors.New("child chain read boom"),
+	}
+
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+		t.Error("child chain read error should fail open (clean=true)")
+	}
+	if got := foreignViolationCount(au); got != 0 {
+		t.Errorf("child chain read-error path emitted %d violations, want 0", got)
+	}
+}
+
 func TestParsePRNumberFromURL(t *testing.T) {
 	n := "https://github.com/x/y/pull/42"
 	cases := []struct {

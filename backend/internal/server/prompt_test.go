@@ -29,10 +29,15 @@ import (
 // promptRunRepo is a run.Repository fake that supports GetStage +
 // GetRun. Other methods panic to make accidental calls loud.
 type promptRunRepo struct {
-	stage                *run.Stage
-	stageErr             error
-	runRow               *run.Run
-	runErr               error
+	stage    *run.Stage
+	stageErr error
+	runRow   *run.Run
+	runErr   error
+	// listRunsErr, when set, makes ListRuns return an error. The
+	// decomposition-aware lineage ledger (#1038) enumerates child runs
+	// via ListRuns and must treat a lookup error as an incomplete
+	// ledger; this lets a test exercise that path.
+	listRunsErr          error
 	getStages            map[uuid.UUID]*run.Stage
 	getRuns              map[uuid.UUID]*run.Run
 	setPRURLCalls        []promptSetPRURLCall
@@ -117,8 +122,28 @@ func (r *promptRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Ru
 func (r *promptRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
 	return nil, run.ErrNotFound
 }
-func (r *promptRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
-	return nil, errors.New("not used")
+
+// ListRuns honors the DecomposedFrom filter (scanning getRuns) so lineage
+// tests can register decomposition children (#1038). It mirrors the repo
+// contract that Limit must be > 0 by returning nothing on a zero limit.
+// Filters the fake doesn't model return empty, preserving existing call
+// sites.
+func (r *promptRunRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	if r.listRunsErr != nil {
+		return nil, r.listRunsErr
+	}
+	var out []*run.Run
+	if f.DecomposedFrom != nil && f.Limit > 0 {
+		for _, rn := range r.getRuns {
+			if rn.DecomposedFrom != nil && *rn.DecomposedFrom == *f.DecomposedFrom {
+				out = append(out, rn)
+				if len(out) >= f.Limit {
+					break
+				}
+			}
+		}
+	}
+	return out, nil
 }
 func (r *promptRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
