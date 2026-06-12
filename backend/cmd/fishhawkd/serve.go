@@ -272,6 +272,9 @@ func runServe(args []string, logSink io.Writer) int {
 	fs := flag.NewFlagSet("fishhawkd serve", flag.ContinueOnError)
 	fs.SetOutput(logSink)
 	addr := fs.String("addr", envOr("FISHHAWKD_ADDR", ":8080"), "listen address")
+	startNonce := fs.String("start-nonce", envOr("FISHHAWKD_START_NONCE", ""),
+		"per-start opaque identity token echoed by GET /healthz as start_nonce; empty omits the field. "+
+			"scripts/dev sets one per spawn to prove listener identity across pid reuse (#1018)")
 	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""),
 		"postgres URL; when empty, /v0/runs endpoints respond 503")
 	webhookSecret := fs.String("github-webhook-secret",
@@ -454,7 +457,7 @@ func runServe(args []string, logSink io.Writer) int {
 		slog.Duration("cap", reviewBudget.Cap),
 		slog.String("ref", "#747"))
 
-	cfg := server.Config{Addr: *addr, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget}
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a

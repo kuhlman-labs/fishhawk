@@ -4,6 +4,7 @@ set -euo pipefail
 
 REPO_ROOT="${0:A:h:h}"
 PID_FILE="${REPO_ROOT}/.fishhawk/dev.pid"
+NONCE_FILE="${REPO_ROOT}/.fishhawk/dev.nonce"
 K8S_PF_PID_FILE="${REPO_ROOT}/.fishhawk/k8s-pf.pid"
 K8S_JAEGER_PF_PID_FILE="${REPO_ROOT}/.fishhawk/k8s-jaeger-pf.pid"
 LOG_DIR="${REPO_ROOT}/logs"
@@ -127,18 +128,80 @@ _verify_listener_identity() {
   return 1
 }
 
+# Per-spawn opaque identity token (#1018): 16 random bytes, hex-encoded. The
+# daemon echoes it back in the /healthz body, so a round-trip match proves the
+# listener IS the spawn we started — surviving OS pid reuse, which the #965
+# pid comparison cannot. Pure (od/tr are POSIX; no scripts/dev state) so
+# scripts/test-dev can assert shape + uniqueness directly.
+_generate_start_nonce() {
+  od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# Extract the start_nonce value from a /healthz JSON body; prints the nonce or
+# nothing when the field is absent. Matches the compact `"key":"value"` shape
+# Go's encoding/json emits (no whitespace around the colon) — the backend test
+# TestHandleHealth_StartNonce pins that exact byte shape from the other side
+# of the seam. Always returns 0 (the grep miss is if-tested) so callers can
+# command-substitute it in non-tested contexts under set -e.
+_nonce_from_healthz_body() {
+  local body="$1"
+  local match=""
+  if match="$(print -r -- "$body" | grep -Eo '"start_nonce":"[^"]*"' | head -n 1)"; then
+    print -r -- "$match" | cut -d'"' -f4
+  fi
+}
+
+# Nonce round-trip identity check (#1018) — the primary post-gate listener
+# identity proof. Curls <url> (same flags as _await_healthz) and compares the
+# echoed start_nonce against <expected_nonce>. Returns:
+#   0  exact match — the listener is provably the daemon we spawned
+#   1  mismatch or curl failure — #628 fail-loud contract: diagnostic naming
+#      expected vs actual nonce, `tail -n 15` of <log_file>, to stderr
+#   2  body carries no start_nonce field (pre-nonce fishhawkd binary) — the
+#      caller degrades to the #965 pid identity check
+_verify_healthz_nonce() {
+  local url="$1"
+  local expected="$2"
+  local log_file="$3"
+
+  local body=""
+  if ! body="$(curl --silent --fail --max-time 2 "$url" 2>/dev/null)"; then
+    print -u2 "error: could not fetch ${url} for the start_nonce identity check (expected nonce ${expected}) (#1018)"
+    print -u2 "last ${log_file} lines:"
+    tail -n 15 "$log_file" >&2
+    return 1
+  fi
+
+  if [[ "$body" != *'"start_nonce"'* ]]; then
+    return 2
+  fi
+
+  local actual=""
+  actual="$(_nonce_from_healthz_body "$body")"
+  if [[ "$actual" == "$expected" ]]; then
+    return 0
+  fi
+
+  print -u2 "error: /healthz start_nonce is '${actual}', not the spawned fishhawkd's '${expected}' — the listener is not the daemon we started (#1018)"
+  print -u2 "last ${log_file} lines:"
+  tail -n 15 "$log_file" >&2
+  return 1
+}
+
 # cmd_down port fallback (#965): after the pid-file kill (or when the pid file
 # is missing), the port must actually be free — 'down succeeded but a daemon
 # still serves the port' is the exact false-success shape. If <port> is still
-# bound: a listener whose command is fishhawkd is a stale orphan (lost pid
-# file) — kill it TERM→5s→KILL, report it, and remove <pid_file>; anything
-# else is reported to stderr and the function returns non-zero, refusing to
-# claim success (another tool may legitimately hold the port; killing it from
-# a stack-teardown script would be destructive). lsof missing degrades to a
-# warning + success (no port check, today's behavior).
+# bound: a listener proven ours by the start_nonce round-trip (#1018), or one
+# whose command is fishhawkd, is a stale orphan (lost pid file) — kill it
+# TERM→5s→KILL, report it, and remove <pid_file>; anything else is reported to
+# stderr and the function returns non-zero, refusing to claim success (another
+# tool may legitimately hold the port; killing it from a stack-teardown script
+# would be destructive). lsof missing degrades to a warning + success (no port
+# check, today's behavior).
 _down_port_fallback() {
   local port="$1"
   local pid_file="$2"
+  local nonce_file="${3:-}"
 
   if ! command -v lsof &>/dev/null; then
     print "warning: lsof not found — skipping port ${port} squatter check"
@@ -150,12 +213,31 @@ _down_port_fallback() {
     return 0
   fi
 
+  # Nonce upgrade (#1018): when this stack's nonce file exists and the
+  # listener's /healthz echoes EXACTLY that nonce, the listener is proven to
+  # be our stale fishhawkd — take the kill leg with that provenance. ANY other
+  # outcome (no nonce file, healthz unreachable / non-HTTP listener, a body
+  # without start_nonce — a pre-nonce binary, or a DIFFERENT nonce — an older
+  # spawn's orphan) degrades to the comm-basename heuristic below UNCHANGED:
+  # the nonce only upgrades confidence, it never blocks the #965 path.
+  local nonce_verified=0
+  if [[ -n "$nonce_file" && -f "$nonce_file" ]]; then
+    local expected="" body="" actual=""
+    expected="$(cat "$nonce_file")"
+    if body="$(curl --silent --fail --max-time 2 "http://localhost:${port}/healthz" 2>/dev/null)"; then
+      actual="$(_nonce_from_healthz_body "$body")"
+      if [[ -n "$expected" && "$actual" == "$expected" ]]; then
+        nonce_verified=1
+      fi
+    fi
+  fi
+
   local lpid comm rc=0
   while IFS= read -r lpid; do
     if [[ -z "$lpid" ]]; then continue; fi
     comm="?"
     if ! comm="$(ps -p "$lpid" -o comm= 2>/dev/null)"; then comm="?"; fi
-    if [[ "${comm:t}" == "fishhawkd" ]]; then
+    if (( nonce_verified )) || [[ "${comm:t}" == "fishhawkd" ]]; then
       kill -TERM "$lpid" 2>/dev/null || true
       local i=0
       while kill -0 "$lpid" 2>/dev/null && (( i < 5 )); do
@@ -165,7 +247,11 @@ _down_port_fallback() {
       if kill -0 "$lpid" 2>/dev/null; then
         kill -KILL "$lpid" 2>/dev/null || true
       fi
-      print "killed stale fishhawkd squatter (pid ${lpid}) on port ${port}"
+      if (( nonce_verified )); then
+        print "killed nonce-verified stale fishhawkd (pid ${lpid}) on port ${port} (#1018)"
+      else
+        print "killed stale fishhawkd squatter (pid ${lpid}) on port ${port}"
+      fi
       rm -f "$pid_file"
     else
       print -u2 "error: port ${port} is still held by pid ${lpid} (${comm:t}) — not fishhawkd; refusing to report a clean shutdown"
@@ -547,9 +633,15 @@ cmd_up() {
   print "applying migrations..."
   "$BIN" migrate up
 
-  # Spawn
+  # Spawn. The per-spawn start nonce (#1018) is handed to the child via
+  # FISHHAWKD_START_NONCE (env-prefix form scopes it to the child only) and
+  # persisted to NONCE_FILE so cmd_down's port fallback can later prove a
+  # stale listener is ours.
   mkdir -p "${REPO_ROOT}/.fishhawk"
-  "${BIN}" serve >> "$LOG_FILE" 2>&1 &
+  local start_nonce
+  start_nonce="$(_generate_start_nonce)"
+  print "$start_nonce" > "$NONCE_FILE"
+  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve >> "$LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"
@@ -563,17 +655,34 @@ cmd_up() {
     print -u2 "error: fishhawkd did not become healthy within 10s"
     print -u2 "last ${LOG_FILE} lines:"
     tail -n 15 "$LOG_FILE" >&2
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$NONCE_FILE"
     exit 1
   fi
 
-  # Listener-identity check (#965): the gate above proves the port answers and
-  # the spawned pid is alive — not that the spawned pid IS the listener. A
-  # squatter that raced in between preflight and bind (or a child that died
-  # right after the poll) fails here, loud, per the #628 contract.
-  if ! _verify_listener_identity "$pid" "$hport" "$LOG_FILE"; then
+  # Listener-identity check: the gate above proves the port answers and the
+  # spawned pid is alive — not that the spawned pid IS the listener. Primary
+  # proof is the start_nonce round-trip (#1018), which survives OS pid reuse;
+  # a body without the field (pre-nonce binary) degrades with a warning to the
+  # #965 pid comparison (_verify_listener_identity). A mismatch or unreachable
+  # /healthz fails loud per the #628 contract.
+  local nonce_rc=0
+  if _verify_healthz_nonce "$(_healthz_url)" "$start_nonce" "$LOG_FILE"; then
+    nonce_rc=0
+  else
+    nonce_rc=$?
+  fi
+  if (( nonce_rc == 0 )); then
+    print "listener identity nonce-verified (start_nonce round-trip, #1018)"
+  elif (( nonce_rc == 2 )); then
+    print "warning: /healthz body carries no start_nonce (pre-#1018 fishhawkd binary?) — degrading to the #965 pid identity check"
+    if ! _verify_listener_identity "$pid" "$hport" "$LOG_FILE"; then
+      kill "$pid" 2>/dev/null || true
+      rm -f "$PID_FILE" "$NONCE_FILE"
+      exit 1
+    fi
+  else
     kill "$pid" 2>/dev/null || true
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$NONCE_FILE"
     exit 1
   fi
 
@@ -628,10 +737,14 @@ cmd_down() {
   _clean_stray_pid_files "${PID_FILE:h}"
 
   # Port fallback (#965): kill a stale fishhawkd squatter (orphaned by a lost
-  # pid file), or report a foreign listener and refuse to claim success.
-  if ! _down_port_fallback "$(_healthz_port)" "$PID_FILE"; then
+  # pid file), or report a foreign listener and refuse to claim success. The
+  # nonce file lets the fallback prove a stale listener is ours (#1018), so it
+  # is removed only AFTER the fallback ran — but on every teardown path.
+  if ! _down_port_fallback "$(_healthz_port)" "$PID_FILE" "$NONCE_FILE"; then
+    rm -f "$NONCE_FILE"
     exit 1
   fi
+  rm -f "$NONCE_FILE"
 }
 
 # One-step post-merge command: stop fishhawkd (if running), rebuild ALL four

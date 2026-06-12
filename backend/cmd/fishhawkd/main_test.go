@@ -117,6 +117,26 @@ func TestEnvOr(t *testing.T) {
 	})
 }
 
+// TestEnvOr_StartNonce pins the FISHHAWKD_START_NONCE env name the
+// --start-nonce flag default resolves through envOr (#1018), so the env
+// name scripts/dev exports for the spawned child can't silently drift
+// from the flag wiring in runServe.
+func TestEnvOr_StartNonce(t *testing.T) {
+	const key = "FISHHAWKD_START_NONCE"
+	t.Run("unset resolves to empty (field omitted)", func(t *testing.T) {
+		t.Setenv(key, "")
+		if got := envOr(key, ""); got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+	t.Run("set env resolves the nonce verbatim", func(t *testing.T) {
+		t.Setenv(key, "cafe1234")
+		if got := envOr(key, ""); got != "cafe1234" {
+			t.Errorf("got %q, want cafe1234", got)
+		}
+	})
+}
+
 // TestEnvOrInt_PlanReviewMaxRetries covers the FISHHAWKD_PLAN_REVIEW_MAX_RETRIES
 // resolution through envOrInt: unset->default, explicit "0"->0 (the retry-
 // disable path, NOT treated as empty), a positive value, and a non-integer
