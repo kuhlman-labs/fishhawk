@@ -1578,6 +1578,142 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /v0/runs/{run_id}/recover:
+    post:
+      operationId: recoverRun
+      summary: Recover a category-B-failed run against its approved plan
+      description: |
+        Operator-initiated category-B recovery (#978). Mints a NEW
+        plan-stage-less child run that re-executes against the parent
+        run's approved plan — the same inheritance shape as the
+        CI-failure auto-retry, but operator-triggered and exempt from
+        the `on_ci_failure` cap: the child carries the parent's
+        `retry_attempt` UNCHANGED, with `parent_run_id` as provenance.
+
+        **Eligibility.** The parent's plan stage must be `succeeded`
+        AND its implement stage `failed` with failure category `B`
+        (scope/constraint violation). Anything else is refused 409
+        `recovery_not_eligible` with `details` naming
+        `{plan_state, implement_state, failure_category}`. The
+        stage-level retry endpoint keeps refusing category B —
+        recovery is a NEW run, not a retry of the terminal one.
+
+        **Scope amendments.** Optional `add_scope_files` paths land as
+        a PRE-APPROVED #961 scope-amendment row on the child's
+        implement stage (visible via the scope-amendments list, folded
+        by the prompt fetch and the runner's pre-commit refresh).
+        `operation: create` entries flow into the net-new-file gates
+        like any approved amendment. Note the fold deliberately no-ops
+        when the reused plan declares an empty `scope.files` (the
+        `git add -A` guard) — category-B failures presuppose a
+        declared scope, so this is a documented edge, not a refusal.
+
+        **Provenance.** A `plan_reused_from` audit entry is appended
+        on the child with
+        `{parent_run_id, parent_failure_category, added_paths, source,
+        reason}`; the approved amendment row is the second surface.
+
+        No `workflow_dispatch` is fired — identical to `POST /v0/runs`:
+        local-runner runs sit pending for the local loop to drive. The
+        implement stage's prompt resolves the parent's plan via the
+        existing `parent_run_id` walk; the parent's binding approval
+        conditions and approval-time `add_scope_files` are inherited.
+
+        `Idempotency-Key` shares the `(repo, key)` keyspace with
+        `POST /v0/runs`: a replay returns the existing run with 200.
+        Replay is honored BEFORE the budget gate — a network retry of
+        a successful recovery returns the existing run even when the
+        blocking budget tripped between the two calls (replay is not
+        new spend).
+
+        **Authorization.** Requires `write:runs` (same as
+        `POST /v0/runs`).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema:
+            type: string
+            description: |
+              Opaque caller-chosen string, shared keyspace with
+              `POST /v0/runs`. Same key + same repo = the existing
+              run is returned (200).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                add_scope_files:
+                  type: array
+                  description: |
+                    Operator-named paths folded into the recovery run's
+                    effective scope as a pre-approved scope amendment.
+                    Repo-relative; absolute, empty, and `..`-containing
+                    paths are refused 400.
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [path]
+                    properties:
+                      path:
+                        type: string
+                        example: docs/companion.md
+                      operation:
+                        type: string
+                        enum: [modify, create]
+                        default: modify
+                reason:
+                  type: string
+                  description: |
+                    Why the recovery (and each added path) is needed;
+                    recorded on the amendment row and the
+                    `plan_reused_from` audit entry.
+                budget_override:
+                  type: boolean
+                  description: |
+                    Force the recovery past a blocking periodic budget
+                    that is over its limit (#688); ignored when no
+                    blocking budget is over.
+      responses:
+        '201':
+          description: Recovery run created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '200':
+          description: Idempotent replay — existing run returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `recovery_not_eligible` — the parent's plan stage is not
+            `succeeded` and/or its implement stage is not `failed`
+            category-B. `details` carries
+            `{plan_state, implement_state, failure_category}`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `recovery_unsupported` — the parent run has no cached
+            workflow spec (legacy row), its cached spec no longer
+            parses or defines the workflow, or the workflow has no
+            non-plan stages. Start a fresh run instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
   /v0/runs/{run_id}/redrive:
     post:
       operationId: redriveChild

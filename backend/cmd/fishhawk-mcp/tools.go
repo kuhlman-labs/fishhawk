@@ -41,6 +41,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerAwaitReview(srv, resolver)
 	registerListAudit(srv, resolver)
 	registerStartRun(srv, resolver)
+	registerResumeRun(srv, resolver)
 	registerCancelRun(srv, resolver)
 	registerResetRunBranch(srv, resolver)
 	registerRetryStage(srv, resolver)

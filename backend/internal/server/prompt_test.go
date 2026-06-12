@@ -3466,3 +3466,141 @@ func TestGetStagePrompt_Implement_ApprovedScopeAmendmentsFolded(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveApprovalConditions_ParentRunIDFallback covers the #978
+// single-level ParentRunID fallback: a CI-retry / category-B recovery
+// child (ParentRunID set, DecomposedFrom nil) has no plan gate of its
+// own, so the parent's binding approve-with-conditions text must reach
+// its implement prompt. Own-run entries win; the DecomposedFrom branch
+// keeps precedence over ParentRunID; nil when neither yields anything.
+func TestResolveApprovalConditions_ParentRunIDFallback(t *testing.T) {
+	parentID := uuid.New()
+	decompParentID := uuid.New()
+	const ownCondition = "own: keep the adapter."
+	const parentCondition = "parent: keep the recover endpoint idempotent."
+	const decompCondition = "decomp: split per module."
+
+	newSrv := func(byRun map[uuid.UUID][]*audit.Entry) *Server {
+		return New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{byRunID: byRun}})
+	}
+
+	t.Run("own entries win over parent", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			runID:    {makeApproveWithCommentEntry(runID, ownCondition)},
+			parentID: {makeApproveWithCommentEntry(parentID, parentCondition)},
+		})
+		got := s.resolveApprovalConditions(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID})
+		if got == nil || *got != ownCondition {
+			t.Errorf("got %v, want own condition", got)
+		}
+	})
+
+	t.Run("parent inherited when own absent", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			parentID: {makeApproveWithCommentEntry(parentID, parentCondition)},
+		})
+		got := s.resolveApprovalConditions(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID})
+		if got == nil || *got != parentCondition {
+			t.Errorf("got %v, want parent condition", got)
+		}
+	})
+
+	t.Run("DecomposedFrom precedence preserved", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			decompParentID: {makeApproveWithCommentEntry(decompParentID, decompCondition)},
+			parentID:       {makeApproveWithCommentEntry(parentID, parentCondition)},
+		})
+		got := s.resolveApprovalConditions(context.Background(), &run.Run{
+			ID: runID, ParentRunID: &parentID, DecomposedFrom: &decompParentID,
+		})
+		if got == nil || *got != decompCondition {
+			t.Errorf("got %v, want decomposition parent's condition", got)
+		}
+		// A decomposed child whose decomposition parent has no
+		// conditions does NOT fall through to ParentRunID — the
+		// decomposition branch terminates the lookup.
+		s = newSrv(map[uuid.UUID][]*audit.Entry{
+			parentID: {makeApproveWithCommentEntry(parentID, parentCondition)},
+		})
+		got = s.resolveApprovalConditions(context.Background(), &run.Run{
+			ID: runID, ParentRunID: &parentID, DecomposedFrom: &decompParentID,
+		})
+		if got != nil {
+			t.Errorf("got %v, want nil (decomposition branch terminates)", got)
+		}
+	})
+
+	t.Run("nil when neither", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{})
+		if got := s.resolveApprovalConditions(context.Background(), &run.Run{ID: runID}); got != nil {
+			t.Errorf("standalone run with no entries: got %v, want nil", got)
+		}
+		if got := s.resolveApprovalConditions(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID}); got != nil {
+			t.Errorf("parented run with no entries anywhere: got %v, want nil", got)
+		}
+	})
+}
+
+// TestResolveApprovalAddScopeFiles_ParentRunIDFallback mirrors the
+// conditions fallback test for the #824 structured add_scope_files
+// slice across the #978 ParentRunID boundary.
+func TestResolveApprovalAddScopeFiles_ParentRunIDFallback(t *testing.T) {
+	parentID := uuid.New()
+	decompParentID := uuid.New()
+	ownPaths := []string{"own/a.go"}
+	parentPaths := []string{"parent/b.go", "parent/c.md"}
+	decompPaths := []string{"decomp/d.go"}
+
+	newSrv := func(byRun map[uuid.UUID][]*audit.Entry) *Server {
+		return New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{byRunID: byRun}})
+	}
+
+	t.Run("own entries win over parent", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			runID:    {makeApproveWithScopeFilesEntry(runID, ownPaths)},
+			parentID: {makeApproveWithScopeFilesEntry(parentID, parentPaths)},
+		})
+		got := s.resolveApprovalAddScopeFiles(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID})
+		if !reflect.DeepEqual(got, ownPaths) {
+			t.Errorf("got %v, want own paths %v", got, ownPaths)
+		}
+	})
+
+	t.Run("parent inherited when own absent", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			parentID: {makeApproveWithScopeFilesEntry(parentID, parentPaths)},
+		})
+		got := s.resolveApprovalAddScopeFiles(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID})
+		if !reflect.DeepEqual(got, parentPaths) {
+			t.Errorf("got %v, want parent paths %v", got, parentPaths)
+		}
+	})
+
+	t.Run("DecomposedFrom precedence preserved", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			decompParentID: {makeApproveWithScopeFilesEntry(decompParentID, decompPaths)},
+			parentID:       {makeApproveWithScopeFilesEntry(parentID, parentPaths)},
+		})
+		got := s.resolveApprovalAddScopeFiles(context.Background(), &run.Run{
+			ID: runID, ParentRunID: &parentID, DecomposedFrom: &decompParentID,
+		})
+		if !reflect.DeepEqual(got, decompPaths) {
+			t.Errorf("got %v, want decomposition parent's paths %v", got, decompPaths)
+		}
+	})
+
+	t.Run("nil when neither", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{})
+		if got := s.resolveApprovalAddScopeFiles(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID}); got != nil {
+			t.Errorf("got %v, want nil", got)
+		}
+	})
+}
