@@ -1067,10 +1067,13 @@ paths:
                   git_sha:
                     type: string
                     description: |
-                      Git commit SHA the binary was built from. "unknown" for
-                      development builds. Operators use this to confirm a deploy
-                      matches the expected commit.
-                    example: unknown
+                      Git commit SHA the binary was built from. scripts/dev
+                      stamps the short HEAD SHA into dev builds, with a
+                      "-dirty" suffix when the tree had uncommitted changes at
+                      build time. "unknown" only for unstamped builds (built
+                      outside scripts/dev without -ldflags). Operators use
+                      this to confirm a deploy matches the expected commit.
+                    example: abc1234
                   min_runner_version:
                     type: string
                     description: |

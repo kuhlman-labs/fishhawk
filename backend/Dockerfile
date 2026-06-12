@@ -46,12 +46,16 @@ COPY verifier ./verifier
 COPY pricing ./pricing
 
 ARG VERSION=dev
+# GIT_SHA defaults to "unknown" so builds that don't pass it (today: the
+# release workflow) are byte-identical to the pre-arg behavior. scripts/dev
+# k8s passes the short HEAD SHA (with -dirty on a dirty tree).
+ARG GIT_SHA=unknown
 
 # CGO_ENABLED=0 produces a fully static binary — required by the
 # distroless/static base image (no libc).
 RUN cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
         -trimpath \
-        -ldflags="-s -w -X github.com/kuhlman-labs/fishhawk/backend/internal/version.Version=${VERSION}" \
+        -ldflags="-s -w -X github.com/kuhlman-labs/fishhawk/backend/internal/version.Version=${VERSION} -X github.com/kuhlman-labs/fishhawk/backend/internal/version.GitSHA=${GIT_SHA}" \
         -o /out/fishhawkd \
         ./cmd/fishhawkd
 

@@ -172,6 +172,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	if len(args) > 0 && args[0] == "version" {
 		out, _ := json.Marshal(map[string]string{
 			"version":          runnerVersion(),
+			"git_sha":          runnerGitSHA(),
 			"plan_schema_hash": plan.EmbeddedSchemaHash(),
 		})
 		_, _ = fmt.Fprintf(os.Stdout, "%s\n", out)
@@ -1375,8 +1376,8 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 
 func logStartup(w io.Writer, cfg config) {
 	_, _ = fmt.Fprintf(w,
-		`{"event":"runner_started","run_id":%q,"workflow":%q,"stage":%q,"backend_url":%q,"version":%q,"prompt_file":%q}`+"\n",
-		cfg.runID, cfg.workflow, cfg.stage, cfg.backendURL, runnerVersion(), cfg.promptFile,
+		`{"event":"runner_started","run_id":%q,"workflow":%q,"stage":%q,"backend_url":%q,"version":%q,"git_sha":%q,"prompt_file":%q}`+"\n",
+		cfg.runID, cfg.workflow, cfg.stage, cfg.backendURL, runnerVersion(), runnerGitSHA(), cfg.promptFile,
 	)
 }
 

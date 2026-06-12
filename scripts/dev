@@ -370,6 +370,56 @@ _detect_rebuild_set() {
   done <<< "$changed_files"
 }
 
+# Pure: append "-dirty" to a short SHA iff the porcelain text is non-empty.
+# `git status --porcelain` emits empty output iff the working tree is clean
+# (untracked files count as dirty — deliberate: they can affect the build).
+# Git-free so scripts/test-dev can drive it with crafted input.
+_sha_with_dirty() {
+  local sha="$1"
+  local porcelain="$2"
+  if [[ -n "$porcelain" ]]; then
+    print -r -- "${sha}-dirty"
+  else
+    print -r -- "$sha"
+  fi
+}
+
+# Pure: map a binary name to the -ldflags string stamping GitSHA into its
+# version package. CAUTION: -ldflags -X on a package path that doesn't declare
+# the var is a SILENT no-op, not a build error — scripts/test-dev body-greps
+# each path here against the `var GitSHA` declaration in the matching
+# version.go so a package move/rename fails the suite instead of silently
+# producing unstamped binaries. Git-free so scripts/test-dev can drive it.
+_build_ldflags() {
+  local name="$1"
+  local sha="$2"
+  local pkg
+  case "$name" in
+    fishhawkd|fishhawk-mcp) pkg="github.com/kuhlman-labs/fishhawk/backend/internal/version" ;;
+    fishhawk-runner)        pkg="github.com/kuhlman-labs/fishhawk/runner/internal/version" ;;
+    fishhawk)               pkg="github.com/kuhlman-labs/fishhawk/cli/internal/version" ;;
+    *)                      return 1 ;;
+  esac
+  print -r -- "-X ${pkg}.GitSHA=${sha}"
+}
+
+# Impure: the short HEAD SHA with a -dirty suffix on a dirty tree, degrading
+# to "unknown" (with a warning) when git fails. Callers cache the result in
+# DEV_GIT_SHA so an up/reload pass runs git once, not once per binary.
+_dev_git_sha() {
+  local sha porcelain
+  if ! sha="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null)"; then
+    print -u2 "warning: git rev-parse HEAD failed — stamping GitSHA=unknown"
+    print -r -- "unknown"
+    return
+  fi
+  porcelain="$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null || true)"
+  _sha_with_dirty "$sha" "$porcelain"
+}
+
+# Per-pass GitSHA cache for _build_binary (set on first build of the pass).
+DEV_GIT_SHA=""
+
 # Build one binary. Returns 1 (skipped) when source dir is absent; exits 1 on
 # build failure; returns 0 and prints a status line on success.
 _build_binary() {
@@ -390,7 +440,10 @@ _build_binary() {
     return 1
   fi
 
-  (cd "${REPO_ROOT}" && go build -o "bin/${name}" "${src}") || exit 1
+  if [[ -z "$DEV_GIT_SHA" ]]; then
+    DEV_GIT_SHA="$(_dev_git_sha)"
+  fi
+  (cd "${REPO_ROOT}" && go build -ldflags "$(_build_ldflags "$name" "$DEV_GIT_SHA")" -o "bin/${name}" "${src}") || exit 1
 
   case "$trigger" in
     __baseline__) print "${name}: rebuilt (baseline)" ;;
@@ -833,7 +886,7 @@ cmd_k8s_up() {
   local pf_port=8080
 
   print "building image $(_k8s_image_ref)..."
-  (cd "${REPO_ROOT}" && docker build -t "$(_k8s_image_ref)" -f backend/Dockerfile .)
+  (cd "${REPO_ROOT}" && docker build --build-arg GIT_SHA="$(_dev_git_sha)" -t "$(_k8s_image_ref)" -f backend/Dockerfile .)
 
   print "helm upgrade --install fishhawk..."
   helm upgrade --install fishhawk "${REPO_ROOT}/deploy/helm/fishhawk" \

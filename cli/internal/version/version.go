@@ -7,3 +7,12 @@ package version
 //
 //	go build -ldflags "-X github.com/kuhlman-labs/fishhawk/cli/internal/version.Version=v0.1.0"
 var Version = "dev"
+
+// GitSHA is the git commit SHA the binary was built from. Overridden via:
+//
+//	go build -ldflags "-X github.com/kuhlman-labs/fishhawk/cli/internal/version.GitSHA=abc1234"
+//
+// scripts/dev stamps the short HEAD SHA (with a "-dirty" suffix on a dirty
+// tree) into dev builds; "unknown" means the binary was built outside
+// scripts/dev / without stamping.
+var GitSHA = "unknown"

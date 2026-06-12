@@ -326,6 +326,7 @@ func TestRun_HappyPath(t *testing.T) {
 		`"run_id":"11111111-2222-3333-4444-555555555555"`,
 		`"workflow":"feature_change"`,
 		`"stage":"plan"`,
+		`"git_sha":"unknown"`,
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("startup log missing %s:\n%s", want, out.String())
@@ -7087,6 +7088,9 @@ func TestRun_VersionSubcommand(t *testing.T) {
 	}
 	if body["version"] == "" {
 		t.Error("version field must not be empty")
+	}
+	if body["git_sha"] == "" {
+		t.Error("git_sha field must not be empty")
 	}
 	if len(body["plan_schema_hash"]) != 64 {
 		t.Errorf("plan_schema_hash = %q, want 64-char hex", body["plan_schema_hash"])

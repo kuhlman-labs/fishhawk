@@ -190,3 +190,8 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 // internal/version. Wrapped as a var so tests can override it to
 // simulate version mismatches without rebuilding the binary.
 var runnerVersion = func() string { return version.Version }
+
+// runnerGitSHA returns the build commit SHA pulled from
+// internal/version. Wrapped as a var so tests can override it
+// without rebuilding the binary, mirroring runnerVersion.
+var runnerGitSHA = func() string { return version.GitSHA }

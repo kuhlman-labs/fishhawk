@@ -66,7 +66,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "doctor":
 		return runDoctor(rest, stdout, stderr)
 	case "version", "--version":
-		_, _ = fmt.Fprintln(stdout, version.Version)
+		if version.GitSHA != "unknown" {
+			_, _ = fmt.Fprintf(stdout, "%s (%s)\n", version.Version, version.GitSHA)
+		} else {
+			_, _ = fmt.Fprintln(stdout, version.Version)
+		}
 		return exitOK
 	case "-h", "--help", "help":
 		printUsage(stdout)
