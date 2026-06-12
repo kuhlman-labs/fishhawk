@@ -365,6 +365,195 @@ else
   fail "rewritten if-form aborted under set -e (a false condition should be safe)"
 fi
 
+# 11. _healthz_port: the shared port derivation up's gate/preflight and down's
+# port fallback consume — default 8080 plus the same FISHHAWKD_ADDR override
+# matrix _healthz_url has.
+unset FISHHAWKD_ADDR
+if [[ "$(_healthz_port)" == "8080" ]]; then
+  pass "_healthz_port defaults to 8080 when FISHHAWKD_ADDR unset"
+else
+  fail "_healthz_port should default to 8080 (got: $(_healthz_port))"
+fi
+FISHHAWKD_ADDR=':9090'
+if [[ "$(_healthz_port)" == "9090" ]]; then
+  pass "_healthz_port respects ':9090' override"
+else
+  fail "_healthz_port should yield 9090 for ':9090' (got: $(_healthz_port))"
+fi
+FISHHAWKD_ADDR='127.0.0.1:9091'
+if [[ "$(_healthz_port)" == "9091" ]]; then
+  pass "_healthz_port respects '127.0.0.1:9091' override"
+else
+  fail "_healthz_port should yield 9091 for '127.0.0.1:9091' (got: $(_healthz_port))"
+fi
+unset FISHHAWKD_ADDR
+
+# 12. _clean_stray_pid_files: tempdir fixture — only the numbered 'dev N.pid'
+# strays (#965 shapes) are removed, never dev.pid itself.
+stray_dir="$(mktemp -d -t test-dev-strays.XXXXXX)"
+touch "$stray_dir/dev.pid" "$stray_dir/dev 2.pid" "$stray_dir/dev 3.pid"
+sweep_out="$(_clean_stray_pid_files "$stray_dir")"
+if [[ -f "$stray_dir/dev.pid" ]]; then
+  pass "_clean_stray_pid_files preserves dev.pid"
+else
+  fail "_clean_stray_pid_files must never remove dev.pid"
+fi
+if [[ ! -f "$stray_dir/dev 2.pid" && ! -f "$stray_dir/dev 3.pid" ]]; then
+  pass "_clean_stray_pid_files removes the numbered strays"
+else
+  fail "_clean_stray_pid_files should remove 'dev 2.pid' and 'dev 3.pid'"
+fi
+if [[ "$sweep_out" == *"dev 2.pid"* && "$sweep_out" == *"dev 3.pid"* ]]; then
+  pass "_clean_stray_pid_files prints a notice per removal"
+else
+  fail "_clean_stray_pid_files should print a notice naming each removed stray (got: $sweep_out)"
+fi
+
+# 13. Listener-identity contract (#965), driven behaviorally with a REAL
+# squatter: an `nc -l` background listener on a random high port. lsof only
+# inspects (never connects), so nc stays listening for the section's duration.
+squat_port=""
+for _try in 1 2 3 4 5; do
+  cand=$(( 20000 + (RANDOM % 20000) ))
+  if [[ -z "$(_port_listeners "$cand")" ]]; then squat_port="$cand"; break; fi
+done
+free_port=""
+for _try in 1 2 3 4 5; do
+  cand=$(( 40001 + (RANDOM % 20000) ))
+  if [[ "$cand" != "$squat_port" && -z "$(_port_listeners "$cand")" ]]; then free_port="$cand"; break; fi
+done
+if [[ -z "$squat_port" || -z "$free_port" ]]; then
+  fail "could not find two free high ports for the squatter fixture"
+else
+  nc -l 127.0.0.1 "$squat_port" >/dev/null 2>&1 &
+  nc_pid=$!
+  # Wait for the bind (up to ~2s); the assertions below fail if nc never binds.
+  i=0
+  while (( i < 20 )); do
+    if [[ -n "$(_port_listeners "$squat_port")" ]]; then break; fi
+    sleep 0.1
+    (( ++i ))
+  done
+
+  if [[ "$(_port_listeners "$squat_port")" == *"$nc_pid"* ]]; then
+    pass "_port_listeners finds the nc squatter pid on its port"
+  else
+    fail "_port_listeners should print the nc pid ${nc_pid} for port ${squat_port} (got: $(_port_listeners "$squat_port"))"
+  fi
+  if [[ -z "$(_port_listeners "$free_port")" ]]; then
+    pass "_port_listeners prints nothing for a free port"
+  else
+    fail "_port_listeners should be empty for free port ${free_port} (got: $(_port_listeners "$free_port"))"
+  fi
+
+  # Expected-pid mismatch: the function must return non-zero, name the actual
+  # squatter pid AND the expected pid, and tail the log (the bind-error line).
+  squat_log="$(mktemp -t test-dev-squatlog.XXXXXX)"
+  print "bind: address already in use (fixture marker)" > "$squat_log"
+  vout="$(_verify_listener_identity "$$" "$squat_port" "$squat_log" 2>&1)"
+  vrc=$?
+  if (( vrc != 0 )); then
+    pass "_verify_listener_identity returns non-zero on an expected-pid mismatch"
+  else
+    fail "_verify_listener_identity should return non-zero when the listener is not the expected pid"
+  fi
+  if [[ "$vout" == *"$nc_pid"* ]]; then
+    pass "_verify_listener_identity diagnostic names the actual squatter pid"
+  else
+    fail "_verify_listener_identity should name squatter pid ${nc_pid} (got: $vout)"
+  fi
+  if [[ "$vout" == *"expected pid $$"* ]]; then
+    pass "_verify_listener_identity diagnostic names the expected pid"
+  else
+    fail "_verify_listener_identity should name expected pid $$ (got: $vout)"
+  fi
+  if [[ "$vout" == *"address already in use"* ]]; then
+    pass "_verify_listener_identity tails the log on mismatch"
+  else
+    fail "_verify_listener_identity should emit the log tail (got: $vout)"
+  fi
+
+  # Matching pid: the squatter itself as the expected pid must pass.
+  if _verify_listener_identity "$nc_pid" "$squat_port" "$squat_log" >/dev/null 2>&1; then
+    pass "_verify_listener_identity returns 0 when the listener IS the expected pid"
+  else
+    fail "_verify_listener_identity should return 0 for the matching pid ${nc_pid}"
+  fi
+
+  # cmd_down port-fallback refuse-success leg: a non-fishhawkd listener (nc) is
+  # reported, never killed, and the function returns non-zero.
+  dout="$(_down_port_fallback "$squat_port" "$stray_dir/unused.pid" 2>&1)"
+  drc=$?
+  if (( drc != 0 )); then
+    pass "_down_port_fallback refuses success for a non-fishhawkd squatter"
+  else
+    fail "_down_port_fallback should return non-zero when a foreign process holds the port"
+  fi
+  if [[ "$dout" == *"$nc_pid"* ]]; then
+    pass "_down_port_fallback names the foreign squatter pid"
+  else
+    fail "_down_port_fallback should name pid ${nc_pid} (got: $dout)"
+  fi
+  if kill -0 "$nc_pid" 2>/dev/null; then
+    pass "_down_port_fallback did not kill the non-fishhawkd listener"
+  else
+    fail "_down_port_fallback must never kill a non-fishhawkd process"
+  fi
+  if _down_port_fallback "$free_port" "$stray_dir/unused.pid" >/dev/null 2>&1; then
+    pass "_down_port_fallback returns 0 for a free port"
+  else
+    fail "_down_port_fallback should return 0 when the port is free"
+  fi
+
+  kill "$nc_pid" 2>/dev/null
+  wait "$nc_pid" 2>/dev/null
+  rm -f "$squat_log"
+fi
+rm -rf "$stray_dir"
+
+# 13b. Call-site wiring (#965) — body-greps only; the control flow itself is
+# behaviorally covered above. cmd_up must run the pre-spawn preflight
+# (_port_listeners) and the post-gate identity check; cmd_down must compose
+# _down_port_fallback and keep the refuse-success exit; both sweep strays.
+if print -r -- "$up_body" | grep -q '_port_listeners'; then
+  pass "cmd_up runs the pre-spawn port preflight (_port_listeners)"
+else
+  fail "cmd_up should preflight the port via _port_listeners before spawning"
+fi
+if print -r -- "$up_body" | grep -q '_verify_listener_identity'; then
+  pass "cmd_up runs the post-gate listener-identity check"
+else
+  fail "cmd_up should call _verify_listener_identity after _await_healthz"
+fi
+if print -r -- "$up_body" | grep -q '_clean_stray_pid_files'; then
+  pass "cmd_up sweeps stray pid files"
+else
+  fail "cmd_up should call _clean_stray_pid_files"
+fi
+down_body="$(typeset -f cmd_down)"
+if print -r -- "$down_body" | grep -q '_down_port_fallback'; then
+  pass "cmd_down composes the port fallback (_down_port_fallback)"
+else
+  fail "cmd_down should call _down_port_fallback"
+fi
+if print -r -- "$down_body" | grep -q 'exit 1'; then
+  pass "cmd_down exits non-zero when the port fallback refuses success"
+else
+  fail "cmd_down should exit 1 on a refused port fallback"
+fi
+if print -r -- "$down_body" | grep -q '_clean_stray_pid_files'; then
+  pass "cmd_down sweeps stray pid files"
+else
+  fail "cmd_down should call _clean_stray_pid_files"
+fi
+# lsof-missing degraded mode: the identity layer must guard on `command -v
+# lsof` (warn-and-degrade, never a broken up/down on a host without it).
+if grep -q 'command -v lsof' "${REPO_ROOT}/scripts/dev"; then
+  pass "scripts/dev guards the lsof-based checks on 'command -v lsof'"
+else
+  fail "scripts/dev should guard lsof usage with 'command -v lsof'"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"

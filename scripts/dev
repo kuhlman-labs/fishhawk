@@ -56,16 +56,137 @@ _minio_ready() {
   curl --silent --fail --max-time 3 "${endpoint}/minio/health/live" &>/dev/null
 }
 
-# Derive the fishhawkd health endpoint from FISHHAWKD_ADDR (default ':8080').
+# Derive the fishhawkd listen port from FISHHAWKD_ADDR (default ':8080').
 # FISHHAWKD_ADDR may be ':8080' or '127.0.0.1:8080'; take the port after the
-# last colon, defaulting to 8080 when unset/portless. Emits the /healthz URL so
-# the readiness gate stays correct if the operator overrides the listen address
-# in .env (.env.example documents FISHHAWKD_ADDR defaulting to :8080).
-_healthz_url() {
+# last colon, defaulting to 8080 when unset/portless. Single source of truth
+# for up's readiness gate/preflight and down's port fallback, so all of them
+# stay correct if the operator overrides the listen address in .env
+# (.env.example documents FISHHAWKD_ADDR defaulting to :8080).
+_healthz_port() {
   local addr="${FISHHAWKD_ADDR:-:8080}"
   local port="${addr##*:}"
   if [[ -z "$port" || "$port" == "$addr" ]]; then port=8080; fi
-  print "http://localhost:${port}/healthz"
+  print "$port"
+}
+
+# Health endpoint URL for the port _healthz_port derives.
+_healthz_url() {
+  print "http://localhost:$(_healthz_port)/healthz"
+}
+
+# Pid(s) holding a LISTEN socket on TCP <port>, one per line; prints nothing
+# (and exits non-zero, lsof's no-match status) when the port is free. -t emits
+# pids only, -sTCP:LISTEN filters to listening state, -nP skips name lookups.
+# Callers must guard on `command -v lsof` (warn-and-degrade, never abort) and
+# invoke this in a tested context so the free-port non-zero exit stays
+# set -e / TRAPZERR quiet (#631 discipline).
+_port_listeners() {
+  local port="$1"
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null
+}
+
+# Post-gate listener-identity check (#965): a healthy /healthz proves only that
+# SOMETHING answers the port — a stale daemon squatting there satisfies the
+# gate while the freshly spawned fishhawkd dies on 'bind: address already in
+# use'. Require the pid listening on <port> to be the spawned <expected_pid>;
+# on mismatch (a squatter raced in, or the child died right after the poll)
+# follow the #628 fail-loud contract: diagnostic naming expected vs actual
+# pid(s), `tail -n 15` of <log_file> (which carries the bind error), non-zero
+# return. With lsof unavailable, warn and return 0 (degraded: no identity
+# check, today's behavior).
+_verify_listener_identity() {
+  local expected_pid="$1"
+  local port="$2"
+  local log_file="$3"
+
+  if ! command -v lsof &>/dev/null; then
+    print "warning: lsof not found — skipping listener-identity check on port ${port}"
+    return 0
+  fi
+
+  local listeners=""
+  if ! listeners="$(_port_listeners "$port")"; then
+    listeners=""
+  fi
+
+  local -a lpids=()
+  local lpid
+  for lpid in "${(f)listeners}"; do
+    if [[ -n "$lpid" ]]; then lpids+=("$lpid"); fi
+  done
+
+  if (( ${lpids[(Ie)$expected_pid]} )); then
+    return 0
+  fi
+
+  local actual="${(j:, :)lpids}"
+  if [[ -z "$actual" ]]; then actual="none"; fi
+  print -u2 "error: port ${port} listener is pid(s) ${actual}, not the spawned fishhawkd (expected pid ${expected_pid}) — stale-daemon squatter (#965)"
+  print -u2 "last ${log_file} lines:"
+  tail -n 15 "$log_file" >&2
+  return 1
+}
+
+# cmd_down port fallback (#965): after the pid-file kill (or when the pid file
+# is missing), the port must actually be free — 'down succeeded but a daemon
+# still serves the port' is the exact false-success shape. If <port> is still
+# bound: a listener whose command is fishhawkd is a stale orphan (lost pid
+# file) — kill it TERM→5s→KILL, report it, and remove <pid_file>; anything
+# else is reported to stderr and the function returns non-zero, refusing to
+# claim success (another tool may legitimately hold the port; killing it from
+# a stack-teardown script would be destructive). lsof missing degrades to a
+# warning + success (no port check, today's behavior).
+_down_port_fallback() {
+  local port="$1"
+  local pid_file="$2"
+
+  if ! command -v lsof &>/dev/null; then
+    print "warning: lsof not found — skipping port ${port} squatter check"
+    return 0
+  fi
+
+  local listeners=""
+  if ! listeners="$(_port_listeners "$port")"; then
+    return 0
+  fi
+
+  local lpid comm rc=0
+  while IFS= read -r lpid; do
+    if [[ -z "$lpid" ]]; then continue; fi
+    comm="?"
+    if ! comm="$(ps -p "$lpid" -o comm= 2>/dev/null)"; then comm="?"; fi
+    if [[ "${comm:t}" == "fishhawkd" ]]; then
+      kill -TERM "$lpid" 2>/dev/null || true
+      local i=0
+      while kill -0 "$lpid" 2>/dev/null && (( i < 5 )); do
+        sleep 1
+        (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
+      done
+      if kill -0 "$lpid" 2>/dev/null; then
+        kill -KILL "$lpid" 2>/dev/null || true
+      fi
+      print "killed stale fishhawkd squatter (pid ${lpid}) on port ${port}"
+      rm -f "$pid_file"
+    else
+      print -u2 "error: port ${port} is still held by pid ${lpid} (${comm:t}) — not fishhawkd; refusing to report a clean shutdown"
+      rc=1
+    fi
+  done <<< "$listeners"
+  return $rc
+}
+
+# Sweep numbered duplicate pid files ('dev 2.pid' … — the shapes observed in
+# #965; never dev.pid itself) so strays can't accumulate or be mistaken for
+# the live pid file. Parameterized on the directory so scripts/test-dev can
+# drive it against a tempdir. (N) makes the glob expand to nothing when there
+# are no strays.
+_clean_stray_pid_files() {
+  local dir="$1"
+  local f
+  for f in "${dir}"/dev\ *.pid(N); do
+    rm -f "$f"
+    print "removed stray pid file: ${f:t}"
+  done
 }
 
 # Local image tag the Docker-Desktop Kubernetes bring-up builds and the chart is
@@ -302,6 +423,30 @@ cmd_up() {
     print "warning: .env not found — using current shell environment"
   fi
 
+  # Pre-spawn port preflight (#965): a listener already on the fishhawkd port
+  # means the spawn below would bind-fail and die while the squatter keeps
+  # answering /healthz — the false-success shape. Fail loud, naming each
+  # squatting pid and its command, before any further work. Runs after the
+  # .env load so FISHHAWKD_ADDR overrides are in effect.
+  local hport
+  hport="$(_healthz_port)"
+  if command -v lsof &>/dev/null; then
+    local squatters=""
+    if ! squatters="$(_port_listeners "$hport")"; then squatters=""; fi
+    if [[ -n "$squatters" ]]; then
+      local spid scomm sdesc=""
+      while IFS= read -r spid; do
+        if [[ -z "$spid" ]]; then continue; fi
+        scomm="?"
+        if ! scomm="$(ps -p "$spid" -o comm= 2>/dev/null)"; then scomm="?"; fi
+        sdesc+="pid ${spid} (${scomm:t}) "
+      done <<< "$squatters"
+      _die "port ${hport} already has a listener: ${sdesc}— run 'scripts/dev down', or kill the pid, then retry"
+    fi
+  else
+    print "warning: lsof not found — skipping port preflight and listener-identity check (degraded)"
+  fi
+
   # TCC preflight (macOS Full Disk Access)
   if ! stat -- "${REPO_ROOT}/README.md" >/dev/null 2>/tmp/_dev_stat_err; then
     if grep -q 'Operation not permitted' /tmp/_dev_stat_err 2>/dev/null; then
@@ -408,6 +553,7 @@ cmd_up() {
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"
+  _clean_stray_pid_files "${PID_FILE:h}"
 
   # Readiness gate: the spawn above is fire-and-forget — without confirming the
   # process is alive and listening, a silent no-op reads as a false 'started'
@@ -421,6 +567,16 @@ cmd_up() {
     exit 1
   fi
 
+  # Listener-identity check (#965): the gate above proves the port answers and
+  # the spawned pid is alive — not that the spawned pid IS the listener. A
+  # squatter that raced in between preflight and bind (or a child that died
+  # right after the poll) fails here, loud, per the #628 contract.
+  if ! _verify_listener_identity "$pid" "$hport" "$LOG_FILE"; then
+    kill "$pid" 2>/dev/null || true
+    rm -f "$PID_FILE"
+    exit 1
+  fi
+
   print "fishhawkd started (pid ${pid}) — logs: ${LOG_FILE}"
 
   # Last line(s): tell the operator whether a /mcp reconnect is required.
@@ -428,36 +584,54 @@ cmd_up() {
 }
 
 cmd_down() {
+  # .env parity with up (guarded): FISHHAWKD_ADDR may be set only in .env, and
+  # the port fallback below must check the same port up's gate derives.
+  if [[ -f "${REPO_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.env"
+    set +a
+  fi
+
+  # The missing-pid-file and already-stopped paths no longer return success
+  # immediately — every path falls through to the port fallback below, so
+  # 'down succeeded but a daemon still serves the port' is impossible (#965).
   if [[ ! -f "$PID_FILE" ]]; then
     print "fishhawkd is not running (no pid file)"
-    return 0
-  fi
-
-  local pid
-  pid="$(cat "$PID_FILE")"
-
-  if ! kill -0 "$pid" 2>/dev/null; then
-    print "fishhawkd already stopped"
-    rm -f "$PID_FILE"
-    return 0
-  fi
-
-  kill -TERM "$pid"
-
-  local i=0
-  while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
-    sleep 1
-    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (the #631 trigger)
-  done
-
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid"
-    print "fishhawkd killed (SIGKILL after 5s)"
   else
-    print "fishhawkd stopped"
+    local pid
+    pid="$(cat "$PID_FILE")"
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+      print "fishhawkd already stopped"
+      rm -f "$PID_FILE"
+    else
+      kill -TERM "$pid"
+
+      local i=0
+      while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
+        sleep 1
+        (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (the #631 trigger)
+      done
+
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid"
+        print "fishhawkd killed (SIGKILL after 5s)"
+      else
+        print "fishhawkd stopped"
+      fi
+
+      rm -f "$PID_FILE"
+    fi
   fi
 
-  rm -f "$PID_FILE"
+  _clean_stray_pid_files "${PID_FILE:h}"
+
+  # Port fallback (#965): kill a stale fishhawkd squatter (orphaned by a lost
+  # pid file), or report a foreign listener and refuse to claim success.
+  if ! _down_port_fallback "$(_healthz_port)" "$PID_FILE"; then
+    exit 1
+  fi
 }
 
 # One-step post-merge command: stop fishhawkd (if running), rebuild ALL four
