@@ -1399,7 +1399,7 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 
 	// Step 7: create stages — skip plan. The retry's implement
 	// stage prompt walks ParentRunID to find the original plan.
-	retryStages := filterOutPlanStages(workflow.Stages)
+	retryStages := FilterOutPlanStages(workflow.Stages)
 	if len(retryStages) == 0 {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
 			"ci_failure_retry: no non-plan stages to retry against",
@@ -1633,11 +1633,13 @@ func (*Dispatcher) resolveRetryPolicy(_ context.Context, parent *run.Run) (spec.
 	return wf, max, true
 }
 
-// filterOutPlanStages returns the stages list with all `plan` types
+// FilterOutPlanStages returns the stages list with all `plan` types
 // removed. Retry runs inherit the parent's plan via parent_run_id
 // (resolved in server/prompt.go::loadApprovedPlanForRun) so the
-// retry doesn't need its own plan stage row.
-func filterOutPlanStages(in []spec.Stage) []spec.Stage {
+// retry doesn't need its own plan stage row. Exported so the
+// server's category-B recovery handler (#978) creates its
+// plan-stage-less child with the same filter the CI-retry path uses.
+func FilterOutPlanStages(in []spec.Stage) []spec.Stage {
 	out := make([]spec.Stage, 0, len(in))
 	for _, s := range in {
 		if s.Type == spec.StageTypePlan {

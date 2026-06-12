@@ -1940,19 +1940,36 @@ func (s *Server) loadApprovalConditions(ctx context.Context, runID uuid.UUID) *s
 // → exactly loadApprovalConditions(runRow.ID)) and future-proofs the case
 // where a child ever gains its own gate: its own conditions win over the
 // parent's.
+//
+// Runs minted by the CI-retry or category-B recovery paths (#978) carry
+// ParentRunID instead of DecomposedFrom; they execute the parent's plan,
+// so the parent's binding conditions fall through to them too —
+// single-level only, mirroring the decomposition fallback (the deeper
+// walk stays loadApprovedPlanForRun's plan-side mechanism).
 func (s *Server) resolveApprovalConditions(ctx context.Context, runRow *run.Run) *string {
 	if cond := s.loadApprovalConditions(ctx, runRow.ID); cond != nil {
 		return cond
 	}
-	if runRow.DecomposedFrom == nil {
+	if runRow.DecomposedFrom != nil {
+		cond := s.loadApprovalConditions(ctx, *runRow.DecomposedFrom)
+		if cond != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: inherited approval conditions from decomposition parent",
+				slog.String("child_run_id", runRow.ID.String()),
+				slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+			)
+		}
+		return cond
+	}
+	if runRow.ParentRunID == nil {
 		return nil
 	}
-	cond := s.loadApprovalConditions(ctx, *runRow.DecomposedFrom)
+	cond := s.loadApprovalConditions(ctx, *runRow.ParentRunID)
 	if cond != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"prompt: inherited approval conditions from decomposition parent",
+			"prompt: inherited approval conditions from retry/recovery parent",
 			slog.String("child_run_id", runRow.ID.String()),
-			slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+			slog.String("parent_run_id", runRow.ParentRunID.String()),
 		)
 	}
 	return cond
@@ -2000,19 +2017,35 @@ func (s *Server) loadApprovalAddScopeFiles(ctx context.Context, runID uuid.UUID)
 // run's own approval_submitted entries first; for a decomposed child with no
 // gate of its own that yields nil, so it falls back to the PARENT run's paths
 // so folded paths reach implement-only decomposed children.
+//
+// CI-retry / category-B recovery children (#978) carry ParentRunID instead
+// of DecomposedFrom and get the same single-level fallback: the parent's
+// folded paths were part of its effective scope and must reach the
+// recovery implement stage too.
 func (s *Server) resolveApprovalAddScopeFiles(ctx context.Context, runRow *run.Run) []string {
 	if paths := s.loadApprovalAddScopeFiles(ctx, runRow.ID); len(paths) > 0 {
 		return paths
 	}
-	if runRow.DecomposedFrom == nil {
+	if runRow.DecomposedFrom != nil {
+		paths := s.loadApprovalAddScopeFiles(ctx, *runRow.DecomposedFrom)
+		if len(paths) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: inherited add_scope_files from decomposition parent",
+				slog.String("child_run_id", runRow.ID.String()),
+				slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+			)
+		}
+		return paths
+	}
+	if runRow.ParentRunID == nil {
 		return nil
 	}
-	paths := s.loadApprovalAddScopeFiles(ctx, *runRow.DecomposedFrom)
+	paths := s.loadApprovalAddScopeFiles(ctx, *runRow.ParentRunID)
 	if len(paths) > 0 {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"prompt: inherited add_scope_files from decomposition parent",
+			"prompt: inherited add_scope_files from retry/recovery parent",
 			slog.String("child_run_id", runRow.ID.String()),
-			slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+			slog.String("parent_run_id", runRow.ParentRunID.String()),
 		)
 	}
 	return paths

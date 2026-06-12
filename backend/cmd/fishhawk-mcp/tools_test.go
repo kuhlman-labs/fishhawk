@@ -98,6 +98,15 @@ type fakeBackend struct {
 	createRunStatus   int
 	createRunErrBody  string
 
+	// #978 fixtures: POST /v0/runs/{run_id}/recover. Same shape as the
+	// createRun fixtures; recoverParentID captures the path run_id.
+	recoverBody     recoverRunRequest
+	recoverParentID uuid.UUID
+	recoverIdempKey string
+	recoverResp     Run
+	recoverStatus   int
+	recoverErrBody  string
+
 	// E22.2 fixtures: POST /v0/runs/{id}/cancel.
 	// cancelResp lets a test seed the post-cancel Run body. When
 	// empty the fake echoes the run from getRunByID (if seeded) or
@@ -227,6 +236,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		perRunAuditNextByRun:     map[uuid.UUID]string{},
 		perRunAuditLastQueryByID: map[uuid.UUID]string{},
 		createRunStatus:          http.StatusCreated,
+		recoverStatus:            http.StatusCreated,
 		cancelResp:               map[uuid.UUID]Run{},
 		cancelStatus:             http.StatusOK,
 		cancelCalledByID:         map[uuid.UUID]int{},
@@ -462,6 +472,40 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if resp.WorkflowID == "" {
 			resp.WorkflowID = body.WorkflowID
+		}
+		if resp.State == "" {
+			resp.State = "pending"
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/recover", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body recoverRunRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.recoverBody = body
+		fb.recoverParentID = id
+		fb.recoverIdempKey = r.Header.Get("Idempotency-Key")
+		status := fb.recoverStatus
+		errBody := fb.recoverErrBody
+		resp := fb.recoverResp
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if resp.ID == "" {
+			resp.ID = uuid.NewString()
+		}
+		if resp.ParentRunID == nil {
+			pid := id.String()
+			resp.ParentRunID = &pid
 		}
 		if resp.State == "" {
 			resp.State = "pending"
@@ -948,7 +992,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 20
+	const wantToolCount = 21
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

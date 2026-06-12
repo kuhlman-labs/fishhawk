@@ -1,0 +1,358 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
+)
+
+// CategoryPlanReusedFrom is the audit-log category for the provenance
+// entry the recovery handler appends on the NEW run (E22.X / #978).
+// Payload carries {parent_run_id, parent_failure_category, added_paths,
+// source, reason}. Internal audit kind — NOT an issue-comment surface.
+const CategoryPlanReusedFrom = "plan_reused_from"
+
+// recoverRunRequest is the JSON body of POST /v0/runs/{run_id}/recover.
+// All fields are optional — an empty body recovers against the parent's
+// approved plan with no scope amendment.
+type recoverRunRequest struct {
+	// AddScopeFiles are the operator-named paths folded into the
+	// recovery run's effective scope via a pre-approved #961 scope
+	// amendment row. Operation defaults to modify when omitted.
+	AddScopeFiles []scopeamendment.PathEntry `json:"add_scope_files,omitempty"`
+	// Reason rides on both the amendment row and the plan_reused_from
+	// provenance entry.
+	Reason string `json:"reason,omitempty"`
+	// BudgetOverride forces the recovery past a blocking periodic
+	// budget that is over its limit, mirroring POST /v0/runs (#688).
+	BudgetOverride bool `json:"budget_override,omitempty"`
+}
+
+// handleRecoverRun implements POST /v0/runs/{run_id}/recover (#978):
+// operator-initiated category-B recovery. It mints a plan-stage-less
+// child run that executes against the parent run's approved plan —
+// the same inheritance shape as the CI-failure retry path
+// (webhook.handleCIFailureRetry), reused rather than duplicated — with
+// the operator's add_scope_files folded via a pre-approved #961 scope
+// amendment row on the new implement stage.
+//
+// Eligibility is gated to parents whose plan stage succeeded and whose
+// implement stage failed category-B: recovery is a NEW run against an
+// already-approved plan, not a retry of the terminal one
+// (fishhawk_retry_stage keeps refusing B).
+//
+// RetryAttempt is carried UNCHANGED from the parent — operator
+// recovery is not an auto-retry and must not consume the
+// on_ci_failure cap; ParentRunID threading is the provenance.
+func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWriteScope(w, r, "write:runs") {
+		return
+	}
+	if s.cfg.RunRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
+			"recover endpoint requires a configured run repository", nil)
+		return
+	}
+	if s.cfg.AuditRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "audit_repo_unconfigured",
+			"recover endpoint requires a configured audit repository", nil)
+		return
+	}
+
+	parentID, err := uuid.Parse(r.PathValue("run_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"run_id must be a valid UUID",
+			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
+		return
+	}
+
+	var req recoverRunRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"request body is not valid JSON or contains unknown fields",
+			map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Validate + normalize the operator's paths up front — same
+	// repo-relative containment contract as the mid-stage amendment
+	// request (#961/#823). Operation defaults to modify.
+	var amendPaths []scopeamendment.PathEntry
+	if len(req.AddScopeFiles) > 0 {
+		entries := make([]scopeamendment.PathEntry, len(req.AddScopeFiles))
+		for i, e := range req.AddScopeFiles {
+			if e.Operation == "" {
+				e.Operation = scopeamendment.OperationModify
+			}
+			entries[i] = e
+		}
+		amendPaths, err = scopeamendment.ValidatePaths(entries)
+		if err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				err.Error(), map[string]any{"field": "add_scope_files"})
+			return
+		}
+		// Fail before creating the run rather than minting a recovery
+		// that silently drops the amendment.
+		if s.cfg.ScopeAmendmentRepo == nil {
+			s.writeError(w, r, http.StatusServiceUnavailable, "scope_amendment_unconfigured",
+				"add_scope_files requires a configured scope-amendment repository", nil)
+			return
+		}
+	}
+
+	parent, err := s.cfg.RunRepo.GetRun(r.Context(), parentID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "run_not_found",
+				"no run with that id", map[string]any{"run_id": parentID.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get run failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Legacy rows without a cached spec can't recover — there is no
+	// stage list to re-create. Start a fresh run instead.
+	if len(parent.WorkflowSpec) == 0 {
+		s.writeError(w, r, http.StatusUnprocessableEntity, "recovery_unsupported",
+			"parent run has no cached workflow spec; start a fresh run instead",
+			map[string]any{"run_id": parentID.String()})
+		return
+	}
+
+	// Eligibility gate: plan stage succeeded AND implement stage
+	// failed category-B.
+	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), parentID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list stages failed", map[string]any{"error": err.Error()})
+		return
+	}
+	var planStage, implementStage *run.Stage
+	for _, st := range stages {
+		switch st.Type {
+		case run.StageTypePlan:
+			if planStage == nil {
+				planStage = st
+			}
+		case run.StageTypeImplement:
+			if implementStage == nil {
+				implementStage = st
+			}
+		}
+	}
+	planState := ""
+	if planStage != nil {
+		planState = string(planStage.State)
+	}
+	implementState := ""
+	failureCategory := ""
+	if implementStage != nil {
+		implementState = string(implementStage.State)
+		if implementStage.FailureCategory != nil {
+			failureCategory = string(*implementStage.FailureCategory)
+		}
+	}
+	eligible := planStage != nil && planStage.State == run.StageStateSucceeded &&
+		implementStage != nil && implementStage.State == run.StageStateFailed &&
+		implementStage.FailureCategory != nil && *implementStage.FailureCategory == run.FailureB
+	if !eligible {
+		s.writeError(w, r, http.StatusConflict, "recovery_not_eligible",
+			"recovery requires a succeeded plan stage and an implement stage failed category-B",
+			map[string]any{
+				"plan_state":       planState,
+				"implement_state":  implementState,
+				"failure_category": failureCategory,
+			})
+		return
+	}
+
+	parsed, err := spec.ParseBytes(parent.WorkflowSpec)
+	if err != nil {
+		s.writeError(w, r, http.StatusUnprocessableEntity, "recovery_unsupported",
+			"parent run's cached workflow spec failed to parse",
+			map[string]any{"error": err.Error()})
+		return
+	}
+	workflowDef, ok := parsed.Workflows[parent.WorkflowID]
+	if !ok {
+		s.writeError(w, r, http.StatusUnprocessableEntity, "recovery_unsupported",
+			"workflow_id not defined in parent run's cached workflow spec",
+			map[string]any{"workflow_id": parent.WorkflowID})
+		return
+	}
+	recoveryStages := webhook.FilterOutPlanStages(workflowDef.Stages)
+	if len(recoveryStages) == 0 {
+		s.writeError(w, r, http.StatusUnprocessableEntity, "recovery_unsupported",
+			"workflow has no non-plan stages to recover against",
+			map[string]any{"workflow_id": parent.WorkflowID})
+		return
+	}
+
+	// Blocking periodic-budget admission gate (#688 / ADR-030):
+	// recovery is new spend. checkBlockingBudget writes the error
+	// response (and the audit) on refusal.
+	if !s.checkBlockingBudget(w, r, parent.Repo, parent.WorkflowID, workflowDef.Budgets, req.BudgetOverride) {
+		return
+	}
+
+	// Idempotency-Key (E8.2): replay returns the existing run with
+	// 200 so a network-hiccup re-call can't mint two recovery runs.
+	// Same (repo, key) keyspace as POST /v0/runs.
+	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempKey != "" {
+		existing, err := s.cfg.RunRepo.GetRunByIdempotencyKey(r.Context(), parent.Repo, idempKey)
+		switch {
+		case err == nil:
+			s.writeJSON(w, r, http.StatusOK, toRunResponse(existing))
+			return
+		case errors.Is(err, run.ErrNotFound):
+			// First call with this key — fall through to create.
+		default:
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"idempotency lookup failed", map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	// Mint the recovery run, mirroring handleCIFailureRetry's
+	// inheritance — except RetryAttempt, carried UNCHANGED so
+	// operator recovery never consumes the on_ci_failure cap.
+	pid := parent.ID
+	createParams := run.CreateRunParams{
+		Repo:                   parent.Repo,
+		WorkflowID:             parent.WorkflowID,
+		WorkflowSHA:            parent.WorkflowSHA,
+		TriggerSource:          parent.TriggerSource,
+		TriggerRef:             parent.TriggerRef,
+		InstallationID:         parent.InstallationID,
+		ParentRunID:            &pid,
+		RequiredChecksSnapshot: parent.RequiredChecksSnapshot,
+		WorkflowSpec:           parent.WorkflowSpec,
+		RetryAttempt:           parent.RetryAttempt,
+		MaxRetriesSnapshot:     parent.MaxRetriesSnapshot,
+		RunnerKind:             parent.RunnerKind,
+		IssueContext:           parent.IssueContext,
+	}
+	if idempKey != "" {
+		k := idempKey
+		createParams.IdempotencyKey = &k
+	}
+	child, err := s.cfg.RunRepo.CreateRun(r.Context(), createParams)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"create recovery run failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Create stages — skip plan. The recovery's implement stage prompt
+	// walks ParentRunID to the parent's approved plan
+	// (loadApprovedPlanForRun), exactly like a CI retry. No
+	// workflow_dispatch is fired — identical to handleCreateRun:
+	// local-runner runs sit pending for fishhawk_run_stage.
+	createdStages, err := webhook.CreateStagesFromSpec(r.Context(), s.cfg.RunRepo, child.ID, recoveryStages)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"create recovery stages failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	id := IdentityFrom(r.Context())
+
+	// Fold the operator's scope amendment as a pre-approved #961 row
+	// on the new implement stage — exactly what
+	// mergeApprovedScopeAmendments and the runner's pre-commit
+	// refresh already consume; the operation=create entries flow into
+	// the #818/#825 net-new-file gates like any approved amendment.
+	if len(amendPaths) > 0 {
+		var newImplement *run.Stage
+		for _, st := range createdStages {
+			if st.Type == run.StageTypeImplement {
+				newImplement = st
+				break
+			}
+		}
+		if newImplement == nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"recovery run has no implement stage to attach the scope amendment to", nil)
+			return
+		}
+		reason := strings.TrimSpace(req.Reason)
+		if reason == "" {
+			reason = "operator-named scope amendment at category-B recovery of run " + parent.ID.String()
+		}
+		amendment, err := s.cfg.ScopeAmendmentRepo.Create(r.Context(), scopeamendment.CreateParams{
+			RunID:   child.ID,
+			StageID: newImplement.ID,
+			Paths:   amendPaths,
+			Reason:  reason,
+		})
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"create scope amendment failed", map[string]any{"error": err.Error()})
+			return
+		}
+		if _, err := s.cfg.ScopeAmendmentRepo.Decide(r.Context(), scopeamendment.DecideParams{
+			ID:        amendment.ID,
+			Status:    scopeamendment.StatusApproved,
+			Reason:    "pre-approved by the recovering operator",
+			DecidedBy: id.Subject,
+		}); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"approve scope amendment failed", map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	// Provenance: plan_reused_from on the NEW run. Best-effort — the
+	// child's ParentRunID and the approved amendment row are the
+	// durable records; a failed append warn-logs rather than
+	// unwinding the created run.
+	s.writePlanReusedFromAudit(r, child, parent, amendPaths, req.Reason, id.Subject)
+
+	s.writeJSON(w, r, http.StatusCreated, toRunResponse(child))
+}
+
+// writePlanReusedFromAudit appends the plan_reused_from chain entry on
+// the recovery run.
+func (s *Server) writePlanReusedFromAudit(r *http.Request, child, parent *run.Run, addedPaths []scopeamendment.PathEntry, reason, subject string) {
+	actorKind := audit.ActorUser
+	payload, _ := json.Marshal(map[string]any{
+		"parent_run_id":           parent.ID.String(),
+		"parent_failure_category": string(run.FailureB),
+		"added_paths":             addedPaths,
+		"source":                  "operator_recovery",
+		"reason":                  reason,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        child.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryPlanReusedFrom,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan_reused_from audit append failed",
+			slog.String("run_id", child.ID.String()),
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.String("error", err.Error()))
+	}
+}

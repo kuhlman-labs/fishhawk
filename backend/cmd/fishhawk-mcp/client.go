@@ -551,6 +551,63 @@ func (c *apiClient) StartRun(ctx context.Context, p StartRunParams) (*Run, bool,
 	return &run, status == http.StatusOK, nil
 }
 
+// RecoverScopePath is one operator-named path on a recovery request
+// (#978). Operation is "modify" or "create"; the backend defaults an
+// empty value to modify.
+type RecoverScopePath struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation,omitempty"`
+}
+
+// recoverRunRequest mirrors `server/recover.go::recoverRunRequest`.
+type recoverRunRequest struct {
+	AddScopeFiles  []RecoverScopePath `json:"add_scope_files,omitempty"`
+	Reason         string             `json:"reason,omitempty"`
+	BudgetOverride bool               `json:"budget_override,omitempty"`
+}
+
+// RecoverRunParams bundles the inputs to RecoverRun. IdempotencyKey
+// travels in the HTTP header per the backend's E8.2 contract, same
+// keyspace as StartRun.
+type RecoverRunParams struct {
+	ParentRunID    uuid.UUID
+	AddScopeFiles  []RecoverScopePath
+	Reason         string
+	BudgetOverride bool
+	IdempotencyKey string
+}
+
+// RecoverRun mints a category-B recovery run via
+// `POST /v0/runs/{run_id}/recover` (#978). Returns the created (or
+// replayed) child run plus an `idempotent` flag mirroring StartRun.
+// 4xx surfaces as *apiError; the tool layer maps the codes:
+//   - 404 run_not_found
+//   - 409 recovery_not_eligible (plan not succeeded / implement not
+//     failed category-B)
+//   - 422 recovery_unsupported (no cached workflow spec)
+func (c *apiClient) RecoverRun(ctx context.Context, p RecoverRunParams) (*Run, bool, error) {
+	body, err := json.Marshal(recoverRunRequest{
+		AddScopeFiles:  p.AddScopeFiles,
+		Reason:         p.Reason,
+		BudgetOverride: p.BudgetOverride,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal recover_run: %w", err)
+	}
+	headers := map[string]string{}
+	if p.IdempotencyKey != "" {
+		headers["Idempotency-Key"] = p.IdempotencyKey
+	}
+	var run Run
+	status, err := c.doWithStatus(ctx, http.MethodPost,
+		"/v0/runs/"+p.ParentRunID.String()+"/recover", body, headers, &run)
+	if err != nil {
+		return nil, false, err
+	}
+	// 200 = idempotent replay; 201 = newly created. Both are success.
+	return &run, status == http.StatusOK, nil
+}
+
 // Stage mirrors the wire shape. The fields cover both get_plan's
 // "find the plan stage" use case and get_run_status's "tell me
 // what's happening" view: type/state for the lifecycle, sequence
