@@ -823,11 +823,11 @@ func TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge(t *testing.T) {
 	apiRepo := apitoken.NewPostgresRepository(pool)
 
 	o := &orchestrator.Orchestrator{
-		Runs:      runRepo,
-		Artifacts: artifactRepo,
-		Audit:     auditRepo,
+		Runs:       runRepo,
+		Artifacts:  artifactRepo,
+		Audit:      auditRepo,
 		DefaultRef: "main",
-		Logger:    slog.Default(),
+		Logger:     slog.Default(),
 	}
 
 	// Compare-endpoint stub: the consolidated base...head diff GitHub
