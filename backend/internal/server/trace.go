@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -644,6 +645,14 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// short-circuits for non-issue triggers; for issue triggers it
 	// edits the seeded comment in place.
 	s.notifyStatusUpdate(r.Context(), runID, "trace_handler")
+
+	// Page-class ping (#1054): a stage parking at a human approval gate is
+	// a moment the operator must act on, but the anchor's in-place edit is
+	// silent to GitHub watchers. Post a one-line ping — suppressed when the
+	// operator agent is delegated to approve this gate itself.
+	if terminal == run.StageStateAwaitingApproval {
+		s.notifyGateAwaitingApproval(r.Context(), runID, stageID)
+	}
 }
 
 // planArtifactExists reports whether a valid standard_v1 plan artifact
@@ -844,6 +853,90 @@ func (s *Server) notifyStatusUpdate(ctx context.Context, runID uuid.UUID, source
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// notifyPagePing emits a page-class ping comment (#1054) — a one-line NEW
+// comment linking the run's anchor. The anchor is edited in place on every
+// transition and GitHub never notifies on an edit, so the moments that
+// genuinely need a human in the loop (a gate parking for approval, a
+// reviewer reject) post a fresh comment that re-enters the watcher's
+// notification stream. Best-effort: the notifier dedups per (stage, event)
+// and short-circuits non-issue triggers; here we just log a failure. The
+// state machine stays authoritative.
+func (s *Server) notifyPagePing(ctx context.Context, runID uuid.UUID, p issuecomment.PagePing) {
+	if s.issueNotifier == nil {
+		return
+	}
+	if err := s.issueNotifier.NotifyPagePing(ctx, runID, p); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"page ping failed",
+			slog.String("run_id", runID.String()),
+			slog.String("event", p.Event),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// notifyGateAwaitingApproval pages the human when a stage parks at a human
+// approval gate (#1054) — UNLESS the run's effective ADR-040 delegation
+// would let the operator agent approve it right now (may_approve delegated
+// AND its condition met). In that delegated-and-met case no human needs
+// paging: the operator agent will act and the anchor reflects it. A run
+// with no operator_agent block (delegation nil) always pages, preserving
+// the human-gated default. Best-effort throughout.
+func (s *Server) notifyGateAwaitingApproval(ctx context.Context, runID, stageID uuid.UUID) {
+	if s.issueNotifier == nil {
+		return
+	}
+	if s.operatorAgentWillApprove(ctx, runID) {
+		return
+	}
+	sid := stageID
+	s.notifyPagePing(ctx, runID, issuecomment.PagePing{
+		Event:   issuecomment.PageEventGateAwaitingApproval,
+		StageID: &sid,
+		Summary: "A stage is awaiting your approval",
+	})
+}
+
+// operatorAgentWillApprove reports whether the run's effective delegation
+// block delegates `approve` AND its condition is met right now — i.e. the
+// operator agent can clear the gate without a human. Reuses
+// buildDelegationPayload so the page-suppression decision evaluates the
+// exact same ADR-040 conditions the GET /v0/runs/{id} delegation block
+// surfaces. Fail-closed: any unavailability returns false (page the human).
+func (s *Server) operatorAgentWillApprove(ctx context.Context, runID uuid.UUID) bool {
+	if s.cfg.RunRepo == nil {
+		return false
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		return false
+	}
+	dp := s.buildDelegationPayload(ctx, runRow)
+	if dp == nil {
+		return false
+	}
+	for _, a := range dp.Actions {
+		if a.Action == delegation.ActionApprove && a.Met {
+			return true
+		}
+	}
+	return false
+}
+
+// notifyReviewerReject pages the human when a reviewer returns a reject
+// verdict on a plan or implement review (#1054). reviewer_reject is in the
+// closed ADR-040 must_page_human set — it always pages regardless of the
+// may_* knobs — so this fires unconditionally; the notifier's per-(stage,
+// event) dedup collapses two reviewers both rejecting into one page.
+func (s *Server) notifyReviewerReject(ctx context.Context, runID, stageID uuid.UUID, stageKind string) {
+	sid := stageID
+	s.notifyPagePing(ctx, runID, issuecomment.PagePing{
+		Event:   issuecomment.PageEventReviewerReject,
+		StageID: &sid,
+		Summary: fmt.Sprintf("A reviewer rejected the %s", stageKind),
+	})
 }
 
 // reEvaluatePolicy is the backend's source-of-truth re-evaluation
@@ -2446,6 +2539,10 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 
 		if verdict.Verdict == planreview.VerdictReject {
 			hasRejection = true
+			// Page the human: reviewer_reject is an ADR-040 must_page_human
+			// event (#1054). Deduped per (stage, event) so two rejecting
+			// reviewers page once.
+			s.notifyReviewerReject(ctx, runID, stageID, "implementation")
 		}
 	}
 

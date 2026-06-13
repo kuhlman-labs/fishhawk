@@ -5,42 +5,88 @@ Inventory of every comment Fishhawk posts to a triggering GitHub issue. The
 quick map of *what's live* so future work doesn't have to grep-reconstruct
 it.
 
+Since #1054 the model is **one living anchor comment per run, plus a small
+set of page-class pings**. The anchor is a single comment, edited in place on
+every transition, that projects the whole run — header + "what now" line,
+event timeline (stage transitions, gate decisions with approver identity,
+reviewer verdicts with severity counts, failures with category), the current
+plan as an expandable section, and superseded plan versions collapsed with
+their rejection reason. Because GitHub never notifies subscribers when a
+comment is *edited*, the moments that genuinely need a human — a gate parking
+for approval, a reviewer reject, a CI-failure retry — each ALSO post a
+one-line **page-class ping**, a NEW comment that links back to the anchor so
+the watcher's notification stream still surfaces them. Everything else is
+edit-only on the anchor.
+
 ## Active surfaces
 
 | Surface | Audit category | Audit kind | Caller (production) | First posted | Edits in place? |
 |---|---|---|---|---|---|
-| Sticky status | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition) | run dispatch | Yes — every transition edits the same comment id |
-| Plan-on-issue (full) | `issue_commented` | `plan_full` first, `plan_updated` on edits | `Server.notifyPlanReady` from trace + plan handlers; re-fired from approval handlers (#377) | plan-stage terminal | Yes — when the spec's `produces.persistence` has `update_on_change: true` |
-| Plan-on-issue (summary) | `issue_commented` | `plan` | `Server.notifyPlanReady` | plan-stage terminal | No (legacy path; chosen when the spec opts out of full-plan rendering) |
-| CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
+| Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` → `Notifier.NotifyStatusUpdateForRun` (every stage transition); `Notifier.NotifyPlanReady` (plan terminal, now an anchor refresh) | run dispatch | Yes — every transition rebuilds and edits the same comment id |
+| Page-class ping | `issue_commented` | `page_ping` | `Notifier.NotifyPagePing` from `Server.notifyGateAwaitingApproval` / `notifyReviewerReject` (#1054) | first page-class event (gate awaiting human approval, reviewer reject, must_page_human) | No (one NEW comment per `(stage_id, event)`, deduped) |
+| CI-failure retry (page-class) | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` → `NotifyCIRetry` (#279, anchor-linked #1054) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688) | warn_at / 100% crossing of an advisory periodic budget | No (per-`(period_start, tier)` dedup; the warn comment and the 100% comment each post once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 
+### Page-class pings (#1054)
+
+GitHub fires a notification for a NEW comment but not for an *edit*. The
+anchor is edited in place, so the page-class moments each post a one-line
+ping (`👋 <summary> — see the [run status](<anchor comment permalink>)`) that
+re-enters the watcher's notification stream and links back to the anchor.
+The four event classes and how they fire:
+
+| Event (`payload.event`) | Fired by | Condition |
+|---|---|---|
+| `gate_awaiting_approval` | `Server.notifyGateAwaitingApproval` (trace terminal transition) | A stage parks at `awaiting_approval` **and** the run's effective ADR-040 delegation does NOT let the operator agent approve it right now (`may_approve` delegated AND met). A run with no `operator_agent` block always pages — the human-gated default. |
+| `reviewer_reject` | `Server.notifyReviewerReject` (plan- and implement-review verdict loops) | A reviewer returns a `reject` verdict. `reviewer_reject` is in the closed ADR-040 `must_page_human` set, so it pages unconditionally; the dedup collapses two rejecting reviewers into one page. |
+| `must_page_human` | (realized by the events above) | ADR-040 `must_page_human` events always page regardless of the `may_*` knobs. The v0 set's `reviewer_reject` is realized by the always-on reviewer-reject ping; other listed events (`plan_rejection`, `scope_amendment`, …) are human-driven actions, not auto-handled moments to ping. |
+| `ci_failure` | `Dispatcher.handleCIFailureRetry` → `NotifyCIRetry` | A CI check failed and a retry run was dispatched. The legacy `ci_retry` comment is the CI-failure ping, now reframed with an anchor link to the retry run; it keeps its own per-attempt dedup (so it is NOT routed through `NotifyPagePing`'s `(stage, event)` dedup). |
+
+Dedup: `NotifyPagePing` writes a `page_ping` `issue_commented` row keyed on
+`(stage_id, event)` (a `run` sentinel for run-level events), so a webhook
+redelivery or a projection retry for the same moment finds the row and
+skips. Where reviewer-reject and `must_page_human` name the same moment, the
+single row absorbs both.
+
 Notes:
-- The reaction-polling worker (#360) is a *read-side* concern that reads
-  Fishhawk-posted plan comments rather than writing new surfaces; it records
-  observed reactions under the separate `plan_reaction_observed` audit
-  category and forwards approval-shaped reactions through the same handler
-  the typed-reply path uses. Not a surface in its own right.
-- The plan-on-issue full surface chooses between create + edit by reading the
-  most-recent `plan_full` or `plan_updated` row in the run's audit log
-  (`findPlanCommentID`). 404 on edit (operator deleted the comment) falls
-  back to a fresh create.
-- The plan-on-issue full surface's `_Status:_` footer is driven by the
-  latest `approval_submitted` audit row for the plan stage
-  (`latestPlanApproval`); pre-approval the footer is omitted. Approver
-  identity renders in three forms (#1053, shared with the sticky status
-  comment's activity line): a valid GitHub login → `@<login>` mention
-  (resolved `approver_github_login` preferred, #751); an operator-agent
-  token subject → "the operator agent (`<subject>`, delegated: `<rule>`)"
-  naming the ADR-040 delegation rule when recorded — the rule is
-  sanitized and code-span-wrapped like the subject, so a payload value
-  can never re-enable markdown or a mention; any other non-login
-  subject → verbatim inside a sanitized code span (never `@`-mentioned);
-  "an approver" only for an empty or "anonymous" subject.
-- The sticky status comment is the *only* surface that follows a run
-  end-to-end; everything else is event-scoped.
+- The reaction-polling worker (#360) is a *read-side* concern that reads the
+  Fishhawk-authored anchor comment rather than writing new surfaces; it
+  records observed reactions under the separate `plan_reaction_observed`
+  audit category and forwards approval-shaped reactions through the same
+  handler the typed-reply path uses. Since #1054 it resolves the anchor via
+  the latest `status_comment_posted` row, falling back to the legacy
+  `plan_full` / `plan_updated` rows for in-flight pre-#1054 runs. Not a
+  surface in its own right.
+- The anchor is rebuilt from scratch from a fresh audit-chain read on every
+  update — there is no text patching — so concurrent writers each emit a
+  complete, at-least-as-fresh projection (last-writer-wins is safe). The body
+  is held under GitHub's 65,536-byte cap by a degradation ladder that sheds
+  the oldest timeline entries, then the stage list, then superseded plans,
+  then the current plan body, always retaining the header, the what-now line,
+  the current-plan summary, and the dashboard deep-link.
+- Approver identity in the anchor's timeline renders in three forms (#1053):
+  a valid GitHub login → `@<login>` mention (resolved `approver_github_login`
+  preferred, #751); an operator-agent token subject → "the operator agent
+  (`<subject>`, delegated: `<rule>`)" naming the ADR-040 delegation rule when
+  recorded — the rule is sanitized and code-span-wrapped like the subject, so
+  a payload value can never re-enable markdown or a mention; any other
+  non-login subject → verbatim inside a sanitized code span (never
+  `@`-mentioned); "an approver" only for an empty or "anonymous" subject.
+- The anchor is the *only* surface that follows a run end-to-end; every ping
+  is event-scoped.
+- The retired plan-on-issue surfaces — `plan_full`, `plan_updated`, and the
+  legacy summary `plan` (#337 / #234) — are **no longer posted**. The plan is
+  now a section of the anchor (current plan expandable, superseded versions
+  collapsed with their rejection reason), so the standalone plan comment and
+  its `_Status:_` footer were deleted wholesale (`renderFullPlanBody`,
+  `renderPlanBody`, `findPlanCommentID`, `latestPlanApproval`,
+  `PlanStatusFooterForAuditPayload`). The `plan_full` / `plan_updated` /
+  `plan` audit kinds are **kept read-only** for two reasons: pre-#1054 runs
+  carry those rows, and the reaction poller falls back to them when a run has
+  no `status_comment_posted` anchor row. They are historical audit kinds, not
+  live comment surfaces.
 - The run-rejected surface (`NotifyRunRejected`, #599) is *runless*: the
   dispatcher's plan-review wiring guard (#577) fires before `CreateRun`, so
   there is no run row to scope a comment to. Like the slash-command reply it
@@ -488,17 +534,25 @@ flow doesn't go through a GitHub App webhook), so `contextForStatus` returns
 early. Comment posting moves to the CLI side, where the operator's authed
 `gh` is available.
 
-**Edit-in-place sticky comment (#428).** Every CLI verb that changes run or
-stage state calls `ghcomment.PostOrEditStatusComment`, which:
+**Edit-in-place anchor comment (#428, #1054).** Every CLI verb that changes
+run or stage state calls `ghcomment.PostOrEditStatusComment`, which:
 
 1. `GET /v0/runs/{run_id}/status-comment` — fetches the rendered body (server
-   calls `issuecomment.RenderStatusBody`) and the stored `github_comment_id`.
+   calls `issuecomment.RenderAnchorBody` — the local-runner flow inherits the
+   anchor projection for free; the endpoint and JSON shape are unchanged) and
+   the stored `github_comment_id`.
 2. `EditOrCreate(repo, issueNumber, githubCommentID, body)` — shells to
    `gh api` to edit the existing comment (if `github_comment_id > 0`) or
    create a new one. Falls back to create on HTTP 404 (deleted comment).
 3. `POST /v0/runs/{run_id}/status-comment` — records the returned comment ID
    in the run's audit log (`status_comment_posted` category) so the next call
    can edit in place.
+
+The local-runner CLI does not currently emit the page-class pings — the
+backend `NotifyPagePing` path is gated on an `installation_id` the local run
+lacks. Local runs surface page-class moments only through the edited anchor
+(and the agent-authored CI-retry comment below); a CLI ping verb is a
+possible follow-up.
 
 | CLI verb | Sticky comment updated when |
 |---|---|

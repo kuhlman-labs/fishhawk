@@ -355,7 +355,16 @@ func (n *Notifier) NotifyCIRetry(ctx context.Context, runID uuid.UUID, parentRun
 	if err != nil || !ok {
 		return err
 	}
-	body := renderCIRetryBody(ctxv, parentRunID, checkName, attempt, max, n.externalURL)
+	// The CI-failure comment is the page-class ping for a CI failure
+	// (#1054): reframe it with a link to the child run's anchor comment so
+	// the labeler can jump to the living status. Per-attempt dedup stays in
+	// contextForCIRetry. The anchor id is best-effort — a CI retry that
+	// races ahead of the first anchor projection falls back to the run page.
+	anchorID, err := n.findStatusCommentID(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: lookup anchor comment: %w", err)
+	}
+	body := renderCIRetryBody(ctxv, parentRunID, checkName, attempt, max, n.externalURL, anchorID)
 	return n.postCIRetry(ctx, ctxv, attempt, body)
 }
 
@@ -873,13 +882,18 @@ func extractGithubCommentID(payload []byte) int64 {
 // renderCIRetryBody renders the CI-failure auto-retry comment.
 // Names the failing check and the attempt budget so the labeler
 // can predict whether a second failure will trigger another retry.
-func renderCIRetryBody(c commentContext, parentRunID uuid.UUID, checkName string, attempt, max int, externalURL string) string {
+func renderCIRetryBody(c commentContext, parentRunID uuid.UUID, checkName string, attempt, max int, externalURL string, anchorCommentID int64) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CI check `%s` failed on Run [`%s`](%s/runs/%s) — Fishhawk dispatched a retry as Run [`%s`](%s).\n\n",
 		checkName,
 		shortID(parentRunID), externalURL, parentRunID.String(),
 		shortID(c.run.ID), c.runURL)
 	fmt.Fprintf(&b, "Retry attempt %d of %d.\n", attempt, max)
+	// Link the retry run's living anchor (#1054) when one already exists,
+	// so the labeler can follow the retry's progress in place.
+	if link := anchorCommentURL(c, anchorCommentID); link != "" {
+		fmt.Fprintf(&b, "\nSee the [run status](%s).\n", link)
+	}
 	return b.String()
 }
 
