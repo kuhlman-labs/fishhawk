@@ -735,7 +735,7 @@ type RunNextAction struct {
 // auto-advanced (or parked with a next action), distilled from the
 // run's run_auto_advanced audit trail.
 type RunAutoAdvance struct {
-	Rule      string    `json:"rule" jsonschema:"the named drive rule that fired: plan_approved_dispatch, reviews_settled_gate, fixup_rereview_repark, or checks_green_awaiting_merge"`
+	Rule      string    `json:"rule" jsonschema:"the named drive rule that fired: plan_approved_dispatch, reviews_settled_gate, fixup_rereview_repark, checks_green_awaiting_merge, or ci_failed (its negative mirror: a required PR check concluded red)"`
 	From      string    `json:"from" jsonschema:"the transition's from edge"`
 	To        string    `json:"to" jsonschema:"the transition's to edge"`
 	Parked    bool      `json:"parked,omitempty" jsonschema:"true when the mechanical rule could not be backend-executed (runner_kind local dispatch, ADR-024) and recorded a park-with-next-action instead of an executed advance"`
@@ -748,7 +748,7 @@ type RunAutoAdvance struct {
 // for. Omitted entirely for non-drive runs.
 type DriveStatus struct {
 	Drive         bool             `json:"drive" jsonschema:"always true — the block is omitted entirely for non-drive runs"`
-	DerivedStatus string           `json:"derived_status,omitempty" jsonschema:"presentation-only status: awaiting_merge when every gate is resolved and required PR checks are green on an open PR. Never a persisted run state — run.state stays running while parked here"`
+	DerivedStatus string           `json:"derived_status,omitempty" jsonschema:"presentation-only status: awaiting_merge when every gate is resolved and required PR checks are green on an open PR, or ci_failed when a required PR check concluded red (its negative mirror). Never a persisted run state — run.state stays running while parked here"`
 	NextAction    *RunNextAction   `json:"next_action,omitempty" jsonschema:"the distilled operator next step from the most recent auto-advance; omitted on terminal runs and when nothing waits on the operator"`
 	AutoAdvanced  []RunAutoAdvance `json:"auto_advanced,omitempty" jsonschema:"the run's auto-advanced (or parked-with-next-action) transitions, oldest first"`
 }
@@ -948,8 +948,9 @@ timestamp, oldest first; parked marks a runner_kind-local dispatch that
 recorded a ready-to-run next action instead), next_action is the
 distilled operator next step from the most recent auto-advance, and
 derived_status is "awaiting_merge" when every gate is resolved and the
-required PR checks are green — presentation-only, the run row's state
-stays running. Omitted entirely for non-drive runs.
+required PR checks are green, or "ci_failed" when a required PR check
+concluded red (its negative mirror, #1045) — presentation-only, the run
+row's state stays running. Omitted entirely for non-drive runs.
 
 Also returns next_actions (#1024): the classified run lifecycle state
 plus at least one LEGAL next action for every non-terminal run — each

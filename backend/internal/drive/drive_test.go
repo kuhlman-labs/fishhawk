@@ -54,6 +54,7 @@ func TestMechanical_RuleTable(t *testing.T) {
 		RuleReviewsSettledGate,
 		RuleFixupRereviewRepark,
 		RuleChecksGreenAwaitingMerge,
+		RuleCIFailed,
 	} {
 		if !Mechanical(rule) {
 			t.Errorf("Mechanical(%q) = false, want true", rule)

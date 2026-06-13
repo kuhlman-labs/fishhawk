@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -600,6 +601,29 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		return
 	}
 	if !s.reviewChecksGreen(ctx, runRow, stage) {
+		// Negative mirror (#1045): review evidence is complete but a
+		// required check concluded red → park in the derived ci_failed
+		// state with a classify next action naming the failed check(s). A
+		// merely-pending check (none failed) returns silently — only a
+		// terminal red trips ci_failed, so a still-running check can never
+		// over-claim a failure.
+		if failed := s.reviewChecksFailed(ctx, runRow, stage); len(failed) > 0 {
+			if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleCIFailed) {
+				return
+			}
+			names := strings.Join(failed, ", ")
+			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+				Rule:  drive.RuleCIFailed,
+				From:  "review:awaiting_approval",
+				To:    "ci_failed",
+				Event: "required PR checks red: " + names,
+				NextAction: &drive.NextAction{
+					Action: "classify_ci_failure",
+					Detail: "required PR checks concluded red (" + names + "); classify the failure and route per the next_actions arms",
+					PRURL:  prURL,
+				},
+			})
+		}
 		return
 	}
 	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) {
@@ -706,4 +730,31 @@ func (s *Server) reviewChecksGreen(ctx context.Context, runRow *run.Run, stage *
 		}
 	}
 	return true
+}
+
+// reviewChecksFailed returns the required-check contexts whose latest
+// state recorded against the review stage is stagecheck.StateFail — the
+// red mirror of reviewChecksGreen (#1045). Only StateFail counts as
+// red: a StatePending (in-flight) or StateNotTracked (no row) check is
+// not failed, so a still-running check can never trip ci_failed.
+// Conservative on any gap: an empty snapshot or an unwired
+// StageCheckRepo returns nil, so ci_failed can never be over-claimed.
+func (s *Server) reviewChecksFailed(ctx context.Context, runRow *run.Run, stage *run.Stage) []string {
+	if runRow.RequiredChecksSnapshot == nil || len(runRow.RequiredChecksSnapshot.Contexts) == 0 {
+		return nil
+	}
+	if s.cfg.StageCheckRepo == nil {
+		return nil
+	}
+	var failed []string
+	for _, name := range runRow.RequiredChecksSnapshot.Contexts {
+		check, err := s.cfg.StageCheckRepo.LatestForStageAndName(ctx, stage.ID, name)
+		if err != nil {
+			continue
+		}
+		if check.State == stagecheck.StateFail {
+			failed = append(failed, name)
+		}
+	}
+	return failed
 }

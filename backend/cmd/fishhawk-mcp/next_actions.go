@@ -68,6 +68,19 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	if run == nil {
 		return nil
 	}
+	// ci_failed (#1045) is decided ahead of the general table: it is a
+	// drive-derived presentation status (a red required check on the open
+	// PR), not a stage state the table arms key on. Open concerns route to
+	// fix-up; zero open concerns is structurally unroutable and names the
+	// operator commit+vouch remediation arm (#1044).
+	if drive != nil && drive.DerivedStatus == "ci_failed" {
+		na := ciFailedNextActions(run, stages, hint)
+		if drive.NextAction != nil {
+			na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
+		}
+		return na
+	}
+
 	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint)
 
 	if drive != nil && drive.NextAction != nil {
@@ -320,6 +333,74 @@ func implementFailedNextActions(run *Run, plan, impl *Stage) *NextActions {
 				},
 			},
 		}
+	}
+}
+
+// ciFailedNextActions covers the drive-derived ci_failed state (#1045):
+// a required PR check concluded red on the open PR while the review
+// evidence is settled. Routing splits on open-concern presence (the
+// same ReviewActionHint signal implementStageNextActions reads, so the
+// two surfaces agree by construction):
+//
+//   - hint != nil (open concerns): ci_failed_routable — route the
+//     concerns back with fishhawk_fixup_stage first (a red check is
+//     usually the same defect the concerns name), plus a checks re-run
+//     for a suspected flake.
+//   - hint == nil (no open concerns): ci_failed_unroutable — there is no
+//     agent-routable concern, so the fix is the operator's: commit it on
+//     the run branch then fishhawk_vouch_commit (#1044), a checks re-run
+//     for a flake, or page a human for an unclassifiable failure.
+func ciFailedNextActions(run *Run, stages []Stage, hint *ReviewActionHint) *NextActions {
+	rerun := SuggestedAction{
+		Action:       "rerun_ci_checks",
+		Params:       prParams(run),
+		Precondition: "the red check is a suspected flake (infra, not a real defect)",
+		Consumes:     consumesNone,
+		Reason:       "re-run the failed required checks on the PR; a genuine flake goes green on the retry without spending a fix-up pass",
+	}
+	if hint != nil {
+		// Open concerns: the red check is most likely the defect the
+		// concerns name — route them back with fishhawk_fixup_stage first,
+		// then offer the flake re-run. The merge-with-follow-up ladder that
+		// hint.suggestedActions otherwise leads with is deliberately NOT
+		// reused here: a red required check is not mergeable.
+		fixupParams := map[string]string{"concern_ids": "run.concerns.items[].id"}
+		if impl := stageByType(stages, "implement"); impl != nil {
+			fixupParams["stage_id"] = impl.ID
+		}
+		return &NextActions{
+			State: "ci_failed_routable",
+			Actions: []SuggestedAction{
+				{
+					Action:       "fishhawk_fixup_stage",
+					Params:       fixupParams,
+					Precondition: "open implement-review concerns exist and a required PR check is red; checkout the run branch first",
+					Consumes:     consumesFixupBudget,
+					Reason:       fmt.Sprintf("%d open concern(s) with a red required check — route them back so the fix-up addresses the defect and re-greens the checks", hint.Concerns),
+				},
+				rerun,
+			},
+		}
+	}
+	return &NextActions{
+		State: "ci_failed_unroutable",
+		Actions: []SuggestedAction{
+			{
+				Action:       "commit_and_vouch",
+				Params:       prParams(run),
+				Precondition: "the review is settled with no open concerns, so there is nothing to route back; the fix is yours to make",
+				Consumes:     consumesNone,
+				Reason:       "commit the fix on the run branch, then fishhawk_vouch_commit so the operator-authored commit clears the run's sole-writer lineage gate (#1044)",
+			},
+			rerun,
+			{
+				Action:       "page_human",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "the failure is neither a flake nor operator-remediable",
+				Consumes:     consumesNone,
+				Reason:       "the red required check is unclassifiable or non-remediable here — escalate to a human for a judgment call",
+			},
+		},
 	}
 }
 

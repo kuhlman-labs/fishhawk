@@ -493,6 +493,55 @@ func TestGetRun_Drive_SupersededChecksGreen_OmitsDerivedStatus(t *testing.T) {
 	}
 }
 
+// TestGetRun_Drive_CIFailed_SurfacesDerivedStatus pins the negative
+// mirror (#1045): when the latest run_auto_advanced rule is ci_failed on
+// a non-terminal run with an open PR, derived_status is ci_failed.
+func TestGetRun_Drive_CIFailed_SurfacesDerivedStatus(t *testing.T) {
+	s, _, au, seeded := newDriveGetServer(t)
+	pr := "https://github.com/x/y/pull/7"
+	seeded.PullRequestURL = &pr
+
+	seedAutoAdvance(t, au, seeded.ID, 9, time.Now().UTC(), drive.Advance{
+		Rule: drive.RuleCIFailed, From: "review:awaiting_approval", To: "ci_failed",
+		Event:      "required PR checks red: ci_pass",
+		NextAction: &drive.NextAction{Action: "classify_ci_failure", PRURL: pr},
+	})
+
+	resp, _ := getRunResponse(t, s, seeded.ID)
+	if resp.DerivedStatus != "ci_failed" {
+		t.Errorf("derived_status = %q, want ci_failed", resp.DerivedStatus)
+	}
+	if resp.NextAction == nil || resp.NextAction.Action != "classify_ci_failure" {
+		t.Errorf("next_action = %+v, want classify_ci_failure", resp.NextAction)
+	}
+}
+
+// TestGetRun_Drive_CIFailedSuperseded_FlipsDerivedStatus pins both
+// supersession directions on the ci_failed mirror: a later checks_green
+// stamp after a ci_failed stamp flips derived_status to awaiting_merge —
+// only the LATEST entry derives the presentation status, so a re-greened
+// run no longer reads as ci_failed.
+func TestGetRun_Drive_CIFailedSuperseded_FlipsDerivedStatus(t *testing.T) {
+	s, _, au, seeded := newDriveGetServer(t)
+	pr := "https://github.com/x/y/pull/7"
+	seeded.PullRequestURL = &pr
+
+	t0 := time.Now().UTC().Add(-5 * time.Minute)
+	seedAutoAdvance(t, au, seeded.ID, 5, t0, drive.Advance{
+		Rule: drive.RuleCIFailed, From: "review:awaiting_approval", To: "ci_failed",
+		NextAction: &drive.NextAction{Action: "classify_ci_failure", PRURL: pr},
+	})
+	seedAutoAdvance(t, au, seeded.ID, 8, t0.Add(2*time.Minute), drive.Advance{
+		Rule: drive.RuleChecksGreenAwaitingMerge, From: "review:awaiting_approval", To: "awaiting_merge",
+		NextAction: &drive.NextAction{Action: "merge_pr", PRURL: pr},
+	})
+
+	resp, _ := getRunResponse(t, s, seeded.ID)
+	if resp.DerivedStatus != "awaiting_merge" {
+		t.Errorf("derived_status = %q, want awaiting_merge (checks_green supersedes the earlier ci_failed)", resp.DerivedStatus)
+	}
+}
+
 // TestGetRun_Drive_CorruptPayloadSkipped: a corrupt run_auto_advanced
 // payload degrades to the readable entries, never a 500.
 func TestGetRun_Drive_CorruptPayloadSkipped(t *testing.T) {

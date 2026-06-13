@@ -56,6 +56,14 @@ const (
 	// presentation status with a distilled merge next action. The
 	// merge itself stays a judgment point (RuleMerge).
 	RuleChecksGreenAwaitingMerge Rule = "checks_green_awaiting_merge"
+	// RuleCIFailed is the negative mirror of
+	// RuleChecksGreenAwaitingMerge: all review evidence terminal but a
+	// required PR check concluded red → the derived ci_failed
+	// presentation status, parking the run with a classify-next-action.
+	// Detection only (ADR-040 bucket 1, zero judgment): it parks and
+	// never advances — the remediation (fix-up, an operator commit +
+	// vouch, or a checks re-run) stays the operator's call.
+	RuleCIFailed Rule = "ci_failed"
 )
 
 // Judgment points — never auto-advanced, drive or not. Enumerated so
@@ -78,6 +86,7 @@ var mechanical = map[Rule]bool{
 	RuleReviewsSettledGate:       true,
 	RuleFixupRereviewRepark:      true,
 	RuleChecksGreenAwaitingMerge: true,
+	RuleCIFailed:                 true,
 	RuleGateApproval:             false,
 	RuleConcernRouting:           false,
 	RuleMerge:                    false,
