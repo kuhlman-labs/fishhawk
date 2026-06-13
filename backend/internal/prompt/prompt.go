@@ -211,8 +211,11 @@ type Trigger struct {
 	// ApprovalConditions carries the operator's approve-with-notes text for
 	// the current run's plan stage. When non-nil, buildImplement injects a
 	// binding section after the SCOPE CONSTRAINT block (if any) and before
-	// the approved-plan section. Nil means no conditions were given (section
-	// omitted).
+	// the approved-plan section, and buildImplementReview renders the same
+	// conditions with win-on-conflict framing immediately before the
+	// approved-plan section so the reviewer judges the diff against the
+	// amended plan, not the superseded plan text (#1021). Nil means no
+	// conditions were given (section omitted in both prompts).
 	ApprovalConditions *string
 	// FixupConcerns carries the operator-selected implement-review concerns
 	// for a bounded fix-up pass (#762). Each entry is one rendered concern
@@ -1200,6 +1203,29 @@ func buildImplementReview(t Trigger) string {
 			}
 		}
 		b.WriteString("\n")
+	}
+
+	// Approval-conditions section (#1021). The operator's approve-with-notes
+	// text AMENDS the plan (#558) and the implement agent is bound to follow
+	// it, so the reviewer must judge the diff against the amended plan —
+	// without this section a diff correctly implementing a condition that
+	// superseded the plan text reads as a plan deviation (runs 338d6b0f,
+	// 256032f6). Placed immediately before the approved-plan section so the
+	// conditions sit adjacent to the plan text they amend. Nil omits the
+	// section, keeping the prompt byte-identical to today.
+	if t.ApprovalConditions != nil {
+		ac := *t.ApprovalConditions
+		const maxConditionBytes = 4000
+		if len(ac) > maxConditionBytes {
+			ac = ac[:maxConditionBytes] + "...[truncated]"
+		}
+		b.WriteString("### Approval conditions (binding — AMEND the plan, win on conflict)\n\n")
+		b.WriteString("The operator approved the plan with the conditions below. They AMEND the plan, are MANDATORY " +
+			"for the implement agent, and WIN on conflict with the plan text. When the diff implements one of these " +
+			"conditions in a way that contradicts the original plan text, that is NOT a plan deviation — the condition " +
+			"is the controlling instruction; do not record a concern or reject for following it.\n\n")
+		b.WriteString(ac)
+		b.WriteString("\n\n")
 	}
 
 	// Approved plan section — what the diff is being measured against.

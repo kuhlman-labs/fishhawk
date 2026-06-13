@@ -2286,6 +2286,94 @@ func TestBuild_ImplementReview_PriorConcerns_AbsentWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestBuild_ImplementReview_ApprovalConditions_Rendered(t *testing.T) {
+	// #1021: the operator's binding approval conditions (#558 amendments)
+	// render in the review prompt with win-on-conflict framing so a diff
+	// implementing a condition that superseded the plan text is NOT judged
+	// a plan deviation.
+	cond := "also rename the flag to --check-base-ref"
+	got, err := Build("implement_review", Trigger{
+		Repo:               "kuhlman-labs/example",
+		ApprovedPlan:       fixturePlan(),
+		Diff:               "- M pkg/bar/bar.go\n",
+		ApprovalConditions: &cond,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Approval conditions (binding — AMEND the plan, win on conflict)",
+		"AMEND the plan",
+		"MANDATORY",
+		"WIN on conflict with the plan text",
+		"that is NOT a plan deviation",
+		"do not record a concern or reject for following it",
+		cond,
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("approval-conditions review prompt missing %q:\n%s", w, got)
+		}
+	}
+	// Conditions must sit immediately before the plan artifact they amend so
+	// the reviewer reads the controlling instruction adjacent to the plan text.
+	condIdx := strings.Index(got, "### Approval conditions")
+	planIdx := strings.Index(got, "### Plan artifact")
+	if condIdx < 0 || planIdx < 0 || condIdx > planIdx {
+		t.Errorf("approval conditions should appear before the plan artifact (condIdx=%d planIdx=%d):\n%s",
+			condIdx, planIdx, got)
+	}
+}
+
+func TestBuild_ImplementReview_ApprovalConditions_AbsentWhenNil(t *testing.T) {
+	// #1021 additive property: a nil ApprovalConditions leaves the review
+	// prompt byte-identical to omitting the field entirely — a run approved
+	// without conditions gets today's prompt unchanged.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	withNil := base
+	withNil.ApprovalConditions = nil
+
+	gotBase, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build base: %v", err)
+	}
+	gotNil, err := Build("implement_review", withNil)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	if strings.Contains(gotBase, "### Approval conditions") {
+		t.Errorf("approval-conditions section should be absent when ApprovalConditions is nil:\n%s", gotBase)
+	}
+	if gotBase != gotNil {
+		t.Errorf("explicit-nil ApprovalConditions must be byte-identical to omitting it")
+	}
+}
+
+func TestBuild_ImplementReview_ApprovalConditions_Truncated(t *testing.T) {
+	// A condition over the 4000-byte cap is truncated with the suffix,
+	// mirroring buildImplement's cap, so a pathological approval note can't
+	// blow the review prompt.
+	cond := strings.Repeat("y", 4100)
+	got, err := Build("implement_review", Trigger{
+		Repo:               "kuhlman-labs/example",
+		ApprovedPlan:       fixturePlan(),
+		Diff:               "- M pkg/bar/bar.go\n",
+		ApprovalConditions: &cond,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "...[truncated]") {
+		t.Errorf("expected truncation marker for oversized condition:\n%s", got)
+	}
+	if strings.Contains(got, cond) {
+		t.Errorf("untruncated long condition appeared in review prompt")
+	}
+}
+
 // intPtr is the GateScopeFacts.StagedFiles literal helper (pointer so
 // "no git_diff event" stays distinguishable from a zero-file diff).
 func intPtr(n int) *int { return &n }
