@@ -918,6 +918,7 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 				Pattern:         f.Pattern,
 				TriggerPath:     f.TriggerPath,
 				MissingSiblings: f.MissingSiblings,
+				SubPlanTitle:    f.SubPlanTitle,
 			})
 		}
 		ev.SurfaceSweep = sw
@@ -933,6 +934,7 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 				TriggerPath:  f.TriggerPath,
 				MissingTests: f.MissingTests,
 				OmittedCount: f.OmittedCount,
+				SubPlanTitle: f.SubPlanTitle,
 			})
 		}
 		ev.TestSweep = ts

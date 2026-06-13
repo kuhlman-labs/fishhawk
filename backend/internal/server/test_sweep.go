@@ -88,11 +88,16 @@ const testSweepMaxDirs = 10
 // but omits existing test files (MissingTests) the named Rule associates
 // with it. OmittedCount carries the number of additional existing test
 // files truncated from MissingTests (rule 2's cap).
+//
+// SubPlanTitle attributes the finding to a decomposition sub-plan when the
+// trigger came from that sub-plan's own scope.files rather than the flat
+// parent scope (#1077). Empty for parent-scope findings.
 type TestSweepFinding struct {
 	Rule         string   `json:"rule"`
 	TriggerPath  string   `json:"trigger_path"`
 	MissingTests []string `json:"missing_tests"`
 	OmittedCount int      `json:"omitted_count,omitempty"`
+	SubPlanTitle string   `json:"sub_plan_title,omitempty"`
 }
 
 // TestSweepPayload is the audit-payload shape for a plan_test_sweep
@@ -326,14 +331,29 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 	// cap below is deterministic. Repo-root .go files are skipped: the
 	// Contents API addresses the root as the empty path, which
 	// ListDirectory rejects, and no registered module keeps Go files there.
+	// Collect directories from the parent scope AND every decomposition
+	// sub-plan scope (#1077): an under-scoped slice's directory must be
+	// listed so its coupling gaps surface at the parent plan gate. The
+	// migration_walk path-trigger rule needs no listing, but the
+	// stem-sibling / new-test rules do.
 	dirSet := map[string]bool{}
-	for _, f := range parsedPlan.Scope.Files {
-		p := filepath.ToSlash(f.Path)
-		if !strings.HasSuffix(p, ".go") {
-			continue
+	collectDirs := func(files []plan.ScopeFile) {
+		for _, f := range files {
+			p := filepath.ToSlash(f.Path)
+			if !strings.HasSuffix(p, ".go") {
+				continue
+			}
+			if dir := path.Dir(p); dir != "." {
+				dirSet[dir] = true
+			}
 		}
-		if dir := path.Dir(p); dir != "." {
-			dirSet[dir] = true
+	}
+	collectDirs(parsedPlan.Scope.Files)
+	if parsedPlan.Decomposition != nil {
+		for _, sp := range parsedPlan.Decomposition.SubPlans {
+			if sp.Scope != nil {
+				collectDirs(sp.Scope.Files)
+			}
 		}
 	}
 	dirs := make([]string, 0, len(dirSet))
@@ -388,6 +408,23 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 	}
 
 	findings := evaluateTestSweep(parsedPlan.Scope.Files, dirListings)
+
+	// Evaluate each decomposition sub-plan's own scope against the shared
+	// dirListings (#1077), tagging findings with the sub-plan title. The
+	// migration_walk rule is scope-set-only, so a migration slice fires
+	// here automatically with no new rule.
+	if parsedPlan.Decomposition != nil {
+		for _, sp := range parsedPlan.Decomposition.SubPlans {
+			if sp.Scope == nil {
+				continue
+			}
+			for _, f := range evaluateTestSweep(sp.Scope.Files, dirListings) {
+				f.SubPlanTitle = sp.Title
+				findings = append(findings, f)
+			}
+		}
+	}
+
 	if findings == nil {
 		// Marshal an empty array rather than null so the audit payload's
 		// "checked and clean" state is explicit (a missing entry means

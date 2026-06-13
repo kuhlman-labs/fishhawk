@@ -2273,3 +2273,108 @@ func TestPlanReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
 		t.Errorf("ReviewerModel = %v, want gpt-5.5", row.ReviewerModel)
 	}
 }
+
+// TestShipPlan_SubPlanCoupling_EndToEnd is the #1077 cross-boundary check:
+// a decomposed plan whose sub-plans under-scope a migration (one slice) and
+// a canonical schema's cli mirror (another slice) is POSTed through
+// handleShipPlan, and the FULL path is asserted end to end — the persisted
+// plan_surface_sweep / plan_test_sweep audit payloads carry the
+// sub-plan-attributed findings, AND the SAME findings are consumed by
+// planGateEvidence and rendered into the captured plan-review prompt with
+// the "(sub-plan: <title>)" prefix. This covers the audit-persist →
+// planGateEvidence → prompt-render consumer boundary so the SubPlanTitle
+// threading cannot silently drop between persistence and render.
+func TestShipPlan_SubPlanCoupling_EndToEnd(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithConstraints)
+	// The parent scope's only directory; listed clean so no parent finding
+	// competes with the sub-plan-attributed ones.
+	cf := &contentsFake{dirs: map[string][]string{
+		"backend/internal/server": {"upload.go"},
+	}}
+	instID := int64(42)
+	rr.getRuns[runID].InstallationID = &instID
+	s.cfg.GitHub = newTestSweepGitHub(t, cf)
+	priv, _ := sf.issue(t, runID)
+
+	body := decomposedScopePlanBody(t,
+		[]plan.ScopeFile{{Path: "backend/internal/server/upload.go", Operation: plan.FileOpModify}},
+		[]subPlanScope{
+			{
+				title: "migration slice",
+				files: []plan.ScopeFile{{Path: "backend/internal/postgres/migrations/0032_x.up.sql", Operation: plan.FileOpCreate}},
+			},
+			{
+				title: "schema slice",
+				files: []plan.ScopeFile{
+					{Path: "docs/spec/workflow-v0.schema.json", Operation: plan.FileOpModify},
+					{Path: "backend/internal/spec/schemas/workflow-v0.schema.json", Operation: plan.FileOpModify},
+				},
+			},
+		},
+	)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) the surface-sweep audit entry carries the schema-slice finding.
+	surface := lastSurfaceSweepEntry(t, au)
+	var surfaceFinding *SurfaceSweepFinding
+	for i := range surface.Findings {
+		if surface.Findings[i].SubPlanTitle == "schema slice" {
+			surfaceFinding = &surface.Findings[i]
+		}
+	}
+	if surfaceFinding == nil {
+		t.Fatalf("surface sweep payload missing the schema-slice finding: %+v", surface.Findings)
+	}
+	if surfaceFinding.Pattern != "workflow schema requires every mirror" ||
+		len(surfaceFinding.MissingSiblings) != 1 ||
+		surfaceFinding.MissingSiblings[0] != "cli/internal/spec/schemas/workflow-v0.schema.json" {
+		t.Errorf("surface finding = %+v", surfaceFinding)
+	}
+
+	// (b) the test-sweep audit entry carries the migration-slice finding.
+	test := lastTestSweepEntry(t, au)
+	var testFinding *TestSweepFinding
+	for i := range test.Findings {
+		if test.Findings[i].SubPlanTitle == "migration slice" {
+			testFinding = &test.Findings[i]
+		}
+	}
+	if testFinding == nil {
+		t.Fatalf("test sweep payload missing the migration-slice finding: %+v", test.Findings)
+	}
+	if testFinding.Rule != testSweepRuleMigrationWalk ||
+		len(testFinding.MissingTests) != 1 ||
+		testFinding.MissingTests[0] != "backend/internal/postgres/postgres_test.go" {
+		t.Errorf("test finding = %+v", testFinding)
+	}
+
+	// (c) the SAME findings are consumed by planGateEvidence and rendered
+	// into the captured plan-review prompt with the sub-plan prefix — the
+	// audit-persist → planGateEvidence → prompt-render consumer boundary.
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	wants := []string{
+		"(sub-plan: schema slice) MISSING SIBLINGS (workflow schema requires every mirror)",
+		"cli/internal/spec/schemas/workflow-v0.schema.json",
+		"(sub-plan: migration slice) EXISTING TESTS NOT IN SCOPE (migration_walk)",
+		"backend/internal/postgres/postgres_test.go",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing sub-plan-attributed element %q — persist→evidence→render seam broken:\n%s", want, got)
+		}
+	}
+}

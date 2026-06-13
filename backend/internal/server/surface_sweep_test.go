@@ -12,7 +12,56 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 )
+
+// subPlanScope is one decomposition sub-plan's title + own scope.files for
+// the decomposed-plan-body test helper (#1077).
+type subPlanScope struct {
+	title string
+	files []plan.ScopeFile
+}
+
+// decomposedScopePlanBody builds a schema-valid decomposed standard_v1 plan
+// body: the flat parent scope.files plus a decomposition whose sub-plans
+// each carry their own scope.files. Used by the #1077 per-sub-plan sweep
+// tests. Sub-plan titles must be distinct and their scopes disjoint (the
+// schema + semantic checks reject duplicates / cross-slice shared files).
+func decomposedScopePlanBody(t *testing.T, parentFiles []plan.ScopeFile, subs []subPlanScope) []byte {
+	t.Helper()
+	toMaps := func(files []plan.ScopeFile) []any {
+		fm := make([]any, 0, len(files))
+		for _, f := range files {
+			fm = append(fm, map[string]any{"path": f.Path, "operation": string(f.Operation)})
+		}
+		return fm
+	}
+	subMaps := make([]any, 0, len(subs))
+	for _, sp := range subs {
+		subMaps = append(subMaps, map[string]any{
+			"title":                        sp.title,
+			"scope_hint":                   sp.title + " slice",
+			"scope":                        map[string]any{"files": toMaps(sp.files)},
+			"predicted_runtime_minutes":    10,
+			"predicted_runtime_confidence": "medium",
+		})
+	}
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": toMaps(parentFiles)}
+	})
+	m["decomposition"] = map[string]any{
+		"rationale": "scope exceeded single-stage budget",
+		"sub_plans": subMaps,
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal decomposed plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture decomposed plan does not validate: %v", err)
+	}
+	return body
+}
 
 // TestSurfacePatternsExistOnDisk is binding condition 1: every Trigger and
 // Sibling path in the static registry must exist on disk. The registry
@@ -145,6 +194,32 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 			name:  "mcp count test alone no finding",
 			scope: []string{mcpToolsTest},
 			want:  nil,
+		},
+		{
+			// #1077: a canonical workflow schema edited with its backend
+			// mirror but not the cli mirror flags the missing cli copy.
+			name: "workflow schema without cli mirror flags it",
+			scope: []string{
+				"docs/spec/workflow-v0.schema.json",
+				"backend/internal/spec/schemas/workflow-v0.schema.json",
+			},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "workflow schema requires every mirror",
+					TriggerPath:     "docs/spec/workflow-v0.schema.json",
+					MissingSiblings: []string{"cli/internal/spec/schemas/workflow-v0.schema.json"},
+				},
+			},
+		},
+		{
+			// All three mirrors of a schema family present: no finding.
+			name: "plan-standard schema all mirrors no finding",
+			scope: []string{
+				"docs/spec/plan-standard-v1.schema.json",
+				"backend/internal/plan/schemas/plan-standard-v1.schema.json",
+				"runner/internal/plan/schemas/plan-standard-v1.schema.json",
+			},
+			want: nil,
 		},
 		{
 			name:  "unrelated files no finding",
@@ -321,5 +396,56 @@ func TestRunSurfaceSweep_ReturnsComputedPayload(t *testing.T) {
 	}
 	if len(got.Findings) != 1 || got.Findings[0].Pattern != "actor @-mention render surfaces" {
 		t.Errorf("returned result missing the expected finding: %+v", got.Findings)
+	}
+}
+
+// TestRunSurfaceSweep_SubPlanScopeAttributed covers #1077: a decomposition
+// sub-plan that scopes a canonical schema without its cli mirror yields a
+// SubPlanTitle-attributed surface-sweep finding, while the flat parent
+// scope (unrelated files) stays clean.
+func TestRunSurfaceSweep_SubPlanScopeAttributed(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := decomposedScopePlanBody(t,
+		[]plan.ScopeFile{{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify}},
+		[]subPlanScope{
+			{
+				title: "schema slice",
+				files: []plan.ScopeFile{
+					{Path: "docs/spec/workflow-v0.schema.json", Operation: plan.FileOpModify},
+					{Path: "backend/internal/spec/schemas/workflow-v0.schema.json", Operation: plan.FileOpModify},
+				},
+			},
+			{
+				title: "unrelated slice",
+				files: []plan.ScopeFile{{Path: "backend/internal/bar/bar.go", Operation: plan.FileOpModify}},
+			},
+		},
+	)
+
+	s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+
+	got := lastSurfaceSweepEntry(t, au)
+	if got.ScannedFiles != 1 {
+		t.Errorf("ScannedFiles = %d, want 1 (parent scope unchanged)", got.ScannedFiles)
+	}
+	var found *SurfaceSweepFinding
+	for i := range got.Findings {
+		if got.Findings[i].SubPlanTitle == "" {
+			t.Errorf("unexpected parent-scope finding: %+v", got.Findings[i])
+			continue
+		}
+		if got.Findings[i].SubPlanTitle == "schema slice" {
+			found = &got.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("want a finding attributed to the schema sub-plan; got %+v", got.Findings)
+	}
+	if found.Pattern != "workflow schema requires every mirror" {
+		t.Errorf("Pattern = %q", found.Pattern)
+	}
+	wantMissing := "cli/internal/spec/schemas/workflow-v0.schema.json"
+	if len(found.MissingSiblings) != 1 || found.MissingSiblings[0] != wantMissing {
+		t.Errorf("MissingSiblings = %v, want [%s]", found.MissingSiblings, wantMissing)
 	}
 }
