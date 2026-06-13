@@ -354,20 +354,57 @@ func (t *Ticker) handleNewReaction(
 	}
 }
 
-// planCommentMeta walks the run's `issue_commented` audit rows for
-// the latest `plan_full` or `plan_updated` entry and returns the
-// (comment id, posted-at) pair. Returns ok=false when no plan
-// comment exists yet (the legacy summary path or the pre-#337
-// stage of an in-progress run).
+// planCommentMeta resolves the comment the poller watches for plan-gate
+// reactions and returns its (comment id, posted-at) pair. Returns
+// ok=false when no Fishhawk comment exists yet.
+//
+// Since #1054 the plan lives on the living anchor comment (the
+// status_comment_posted surface), so the poller prefers the latest
+// anchor comment id. For in-flight runs whose anchor predates this
+// change it falls back to the retired plan_full / plan_updated rows.
 func (t *Ticker) planCommentMeta(ctx context.Context, runID uuid.UUID) (int64, time.Time, bool) {
+	if id, ts, ok := t.anchorCommentMeta(ctx, runID); ok {
+		return id, ts, true
+	}
+	return t.legacyPlanCommentMeta(ctx, runID)
+}
+
+// anchorCommentMeta returns the (comment id, posted-at) of the run's
+// living anchor comment from the latest status_comment_posted audit row
+// (#1054). First-write wins for posted-at; latest-write wins for the id
+// (the edit-in-place path keeps the same id).
+func (t *Ticker) anchorCommentMeta(ctx context.Context, runID uuid.UUID) (int64, time.Time, bool) {
+	entries, err := t.Audit.ListForRunByCategory(ctx, runID, issuecomment.CategoryStatusCommentPosted)
+	if err != nil || len(entries) == 0 {
+		return 0, time.Time{}, false
+	}
+	var firstTimestamp time.Time
+	var latestID int64
+	for _, e := range entries {
+		id := extractCommentID(e.Payload)
+		if id == 0 {
+			continue
+		}
+		if firstTimestamp.IsZero() {
+			firstTimestamp = e.Timestamp
+		}
+		latestID = id
+	}
+	if latestID == 0 {
+		return 0, time.Time{}, false
+	}
+	return latestID, firstTimestamp, true
+}
+
+// legacyPlanCommentMeta is the pre-#1054 fallback: it walks the run's
+// `issue_commented` audit rows for the latest `plan_full` or
+// `plan_updated` entry. Kept so in-flight runs whose plan comment landed
+// before the anchor migration still get their reactions polled.
+func (t *Ticker) legacyPlanCommentMeta(ctx context.Context, runID uuid.UUID) (int64, time.Time, bool) {
 	entries, err := t.Audit.ListForRunByCategory(ctx, runID, issuecomment.CategoryIssueCommented)
 	if err != nil || len(entries) == 0 {
 		return 0, time.Time{}, false
 	}
-	// First-write wins for posted-at; latest-write wins for the
-	// comment id (the edit-in-place path keeps the same id). Walk
-	// once forward to capture the first plan-shaped row, then once
-	// in reverse for the latest id.
 	var firstTimestamp time.Time
 	var latestID int64
 	for _, e := range entries {

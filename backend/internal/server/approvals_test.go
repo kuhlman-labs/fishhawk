@@ -2018,14 +2018,15 @@ func TestSubmitApproval_ApproverGithubLogin_CrossBoundary(t *testing.T) {
 		t.Errorf("audit approver_github_login = %v, want kuhlman-labs", got)
 	}
 
-	// Render the footer from the exact audit payload the handler wrote.
+	// Render the anchor timeline from the exact audit payload the handler
+	// wrote — the approval surface that replaced the standalone plan-status
+	// footer (#1054). The resolved login renders as an `@`-mention.
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("re-marshal payload: %v", err)
 	}
-	footer := issuecomment.PlanStatusFooterForAuditPayload(raw)
-	if footer != "_Status: approved by @kuhlman-labs · implementing now_" {
-		t.Errorf("footer = %q, want @kuhlman-labs mention", footer)
+	if line := renderApprovalAnchorBody(t, raw); !strings.Contains(line, "@kuhlman-labs approved the plan") {
+		t.Errorf("anchor approval line = %q, want @kuhlman-labs mention", line)
 	}
 
 	// (2) Stop-the-ping path: bare token subject, no resolved login.
@@ -2047,8 +2048,8 @@ func TestSubmitApproval_ApproverGithubLogin_CrossBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-marshal bare payload: %v", err)
 	}
-	if got := issuecomment.PlanStatusFooterForAuditPayload(rawBare); got != "_Status: approved by `brett@local-mcp` · implementing now_" {
-		t.Errorf("bare-subject footer = %q, want the verbatim code-span form (no ping, #1053)", got)
+	if line := renderApprovalAnchorBody(t, rawBare); !strings.Contains(line, "`brett@local-mcp` approved the plan") {
+		t.Errorf("bare-subject anchor line = %q, want the verbatim code-span form (no ping, #1053)", line)
 	}
 }
 
@@ -2092,11 +2093,27 @@ func TestSubmitApproval_Delegated_FooterNamesRoleAndRule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-marshal payload: %v", err)
 	}
-	footer := issuecomment.PlanStatusFooterForAuditPayload(raw)
-	want := "_Status: approved by the operator agent (`operator-agent/operator-role-v0`, delegated: `clean_dual_approval`) · implementing now_"
-	if footer != want {
-		t.Errorf("delegated footer = %q, want %q", footer, want)
+	want := "the operator agent (`operator-agent/operator-role-v0`, delegated: `clean_dual_approval`) approved the plan"
+	if line := renderApprovalAnchorBody(t, raw); !strings.Contains(line, want) {
+		t.Errorf("delegated anchor line = %q, want substring %q", line, want)
 	}
+}
+
+// renderApprovalAnchorBody renders the living anchor body (#1054) from a
+// one-entry audit chain holding the given approval_submitted payload and
+// returns it, so the wire→handler→audit-payload→render seam tests can
+// assert the approver-identity rendering on the surface that replaced the
+// retired plan-status footer.
+func renderApprovalAnchorBody(t *testing.T, raw []byte) string {
+	t.Helper()
+	e := &audit.Entry{
+		Category:  "approval_submitted",
+		Payload:   raw,
+		Timestamp: time.Now(),
+		Sequence:  1,
+	}
+	runRow := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", State: run.StateRunning}
+	return issuecomment.RenderAnchorBody(runRow, nil, nil, []*audit.Entry{e}, "https://fishhawk.example", time.Now())
 }
 
 // findApprovalSubmittedPayload returns the decoded payload of the

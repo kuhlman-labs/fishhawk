@@ -619,7 +619,17 @@ func (s *Server) handleGetStatusComment(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	body := issuecomment.RenderStatusBody(runRow, stages, auditEntries, s.cfg.ExternalURL, time.Now())
+	// Render the living anchor projection (#1054) — the same body the
+	// notifier edits in place — so the local-runner CLI flow inherits the
+	// anchor (plan sections, verdicts, timeline) for free. Plan versions
+	// load best-effort: a nil ArtifactRepo degrades to a plan-less anchor.
+	planVersions, err := issuecomment.LoadPlanVersions(r.Context(), s.cfg.ArtifactRepo, stages)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"load plan versions failed", map[string]any{"error": err.Error()})
+		return
+	}
+	body := issuecomment.RenderAnchorBody(runRow, stages, planVersions, auditEntries, s.cfg.ExternalURL, time.Now())
 
 	var issueNumber int
 	if runRow.IssueContext != nil {

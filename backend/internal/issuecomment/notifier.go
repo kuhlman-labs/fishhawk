@@ -35,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -42,13 +43,12 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // CategoryIssueCommented is the audit-log category the notifier writes
@@ -138,15 +138,21 @@ type Notifier struct {
 	github      IssueCommenter
 	runs        run.Repository
 	audit       audit.Repository
+	artifacts   artifact.Repository
 	externalURL string
 	now         func() time.Time
 }
 
 // Deps groups the dependencies New needs.
 type Deps struct {
-	GitHub      IssueCommenter
-	Runs        run.Repository
-	Audit       audit.Repository
+	GitHub IssueCommenter
+	Runs   run.Repository
+	Audit  audit.Repository
+	// Artifacts loads the run's plan-artifact versions for the anchor
+	// projection (#1054). Optional: a nil repo renders the anchor with
+	// no plan sections rather than failing — minimal configs without an
+	// artifact repo keep posting status anchors, just plan-less.
+	Artifacts   artifact.Repository
 	ExternalURL string
 	// Now is the clock used for audit timestamps; defaults to
 	// time.Now. Overridable for deterministic tests.
@@ -173,57 +179,29 @@ func New(d Deps) *Notifier {
 		github:      d.GitHub,
 		runs:        d.Runs,
 		audit:       d.Audit,
+		artifacts:   d.Artifacts,
 		externalURL: strings.TrimRight(d.ExternalURL, "/"),
 		now:         now,
 	}
 }
 
-// NotifyPlanReady posts the plan-ready comment after the plan stage
-// transitions terminally. `planStage` is the plan stage row;
-// `planArtifact` is the typed `*plan.Plan` from its standard_v1
-// artifact. Both are required — if either is nil the call skips.
+// NotifyPlanReady refreshes the run's living anchor comment after the
+// plan stage transitions terminally (#1054). The plan content is no
+// longer a standalone comment — every plan upload / re-upload now flows
+// through the same anchor projection (RenderAnchorBody), which renders
+// the current plan as an expandable section and any superseded versions
+// collapsed with their rejection reason. So this is a plain anchor
+// refresh; the retired full-plan / summary posting paths are gone.
 //
-// Two surfaces today (E17.2 / #337):
-//
-//   - **Full-plan-as-comment**: when the workflow spec declares the
-//     plan stage's `produces.persistence` with
-//     `target: originating_issue, mode: rendered_comment`, the call
-//     renders the whole standard_v1 plan as a markdown document and
-//     posts it on the issue. If `update_on_change: true` is also set
-//     and a prior full-plan comment exists for the run, the call
-//     edits the existing comment in place via UpdateIssueComment.
-//     Per ADR-020 / #321 this is the canonical plan-review surface.
-//
-//   - **Summary-only**: when the spec opts out (no
-//     originating_issue persistence), the legacy path posts a short
-//     summary comment that links to the SPA's plan-document page.
-//     Behavior unchanged from #234.
-//
-// The comment routes to the approval-surface URL when the plan
-// stage requires approval (v0's typical workflow); to the run page
-// otherwise (`routine_change`-style flows).
+// `planStage` and `planArtifact` are kept in the signature (and gate the
+// skip) so existing call sites stay byte-stable, but the body is built
+// from the run's full artifact + audit state by NotifyStatusUpdateForRun,
+// not from these arguments.
 func (n *Notifier) NotifyPlanReady(ctx context.Context, runID uuid.UUID, planStage *run.Stage, planArtifact *plan.Plan) error {
 	if n == nil || planStage == nil || planArtifact == nil {
 		return nil
 	}
-	runRow, err := n.runs.GetRun(ctx, runID)
-	if err != nil {
-		return fmt.Errorf("issuecomment: get run: %w", err)
-	}
-	// Per-stage persistence config lives on the cached workflow
-	// spec (the dispatcher snapshotted it onto the run row per
-	// #283). Read once; nil means "use the legacy summary path".
-	persistence := planOriginatingIssuePersistence(runRow.WorkflowSpec, runRow.WorkflowID, planStage)
-	if persistence != nil && persistence.Mode == spec.ModeRenderedComment {
-		return n.notifyFullPlan(ctx, runID, planStage, planArtifact, *persistence)
-	}
-	// Legacy path: summary post with audit-log dedup.
-	ctxv, ok, err := n.contextFor(ctx, runID, KindPlan)
-	if err != nil || !ok {
-		return err
-	}
-	body := renderPlanBody(ctxv, planStage, planArtifact, n.externalURL)
-	return n.post(ctx, ctxv, KindPlan, body)
+	return n.NotifyStatusUpdateForRun(ctx, runID)
 }
 
 // MaxIssueCommentBodyBytes mirrors GitHub's per-comment body cap.
@@ -233,405 +211,6 @@ func (n *Notifier) NotifyPlanReady(ctx context.Context, runID uuid.UUID, planSta
 // cap is 65,536 characters; we treat the limit as bytes since UTF-8
 // payloads can be longer than rune counts.
 const MaxIssueCommentBodyBytes = 65_536
-
-// notifyFullPlan is the post-or-edit path for the full-plan-on-issue
-// surface (E17.2 / #337). Resolves the plan-comment id from the
-// audit log; CreateIssueComment when none exists, UpdateIssueComment
-// when one does AND update_on_change is set, no-op when one exists
-// but update_on_change is unset (the post is one-shot in that mode).
-func (n *Notifier) notifyFullPlan(ctx context.Context, runID uuid.UUID, planStage *run.Stage, planArtifact *plan.Plan, persistence spec.Persistence) error {
-	ctxv, ok, err := n.contextForStatus(ctx, runID)
-	if err != nil || !ok {
-		return err
-	}
-
-	existingID, err := n.findPlanCommentID(ctx, runID)
-	if err != nil {
-		return fmt.Errorf("issuecomment: lookup plan comment: %w", err)
-	}
-
-	// Plan-status footer (#377): drives the `_Status: approved by
-	// @x · implementing now_` / rejected line at the bottom of the
-	// comment so subscribers see the approval result without a
-	// second broadcast. Nil status = no approval row yet (the
-	// awaiting-approval first post).
-	status, err := n.latestPlanApproval(ctx, runID, planStage.ID)
-	if err != nil {
-		return fmt.Errorf("issuecomment: lookup plan approval: %w", err)
-	}
-
-	// Scope-cap headroom line (#983), best-effort: absent precheck entry
-	// (older runs) or no configured cap renders nothing — byte-identical
-	// to the pre-#983 body.
-	precheck := n.latestScopePrecheck(ctx, runID)
-
-	body := renderFullPlanBody(ctxv, planStage, planArtifact, n.externalURL, status, precheck)
-
-	if existingID > 0 {
-		if !persistence.UpdateOnChange {
-			// First plan post is the final post for this surface;
-			// re-fires shouldn't re-edit. Skip silently.
-			return nil
-		}
-		got, updErr := n.github.UpdateIssueComment(ctx, *ctxv.run.InstallationID,
-			ctxv.repo, existingID, body)
-		switch {
-		case updErr == nil:
-			return n.appendPlanCommentAudit(ctx, ctxv, got.ID, KindPlanUpdated)
-		case errors.Is(updErr, githubclient.ErrNotFound):
-			// Operator deleted the comment; fall through to create.
-		default:
-			return fmt.Errorf("issuecomment: update plan comment: %w", updErr)
-		}
-	}
-
-	created, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID,
-		ctxv.repo, ctxv.issueNumber, body)
-	if err != nil {
-		return fmt.Errorf("issuecomment: create plan comment: %w", err)
-	}
-	return n.appendPlanCommentAudit(ctx, ctxv, created.ID, KindPlanFull)
-}
-
-// latestPlanApproval walks the run's `approval_submitted` audit
-// rows newest-first and returns the latest one scoped to the plan
-// stage. Returns (nil, nil) when no row exists yet (the
-// awaiting-approval first post). #377.
-func (n *Notifier) latestPlanApproval(ctx context.Context, runID, planStageID uuid.UUID) (*planStatus, error) {
-	entries, err := n.audit.ListForRunByCategory(ctx, runID, "approval_submitted")
-	if err != nil {
-		return nil, err
-	}
-	for i := len(entries) - 1; i >= 0; i-- {
-		e := entries[i]
-		if e.StageID == nil || *e.StageID != planStageID {
-			continue
-		}
-		st := decodeApprovalStatus(e.Payload)
-		if st == nil {
-			// Defensive: a malformed row shouldn't block the
-			// comment render. Treat as no-status-yet.
-			continue
-		}
-		return st, nil
-	}
-	return nil, nil
-}
-
-// decodeApprovalStatus decodes an `approval_submitted` audit payload
-// into a planStatus: the decision, the provenance `approver` (the
-// acting token subject), the resolved `approver_github_login` the
-// MCP loop threads through (#751), and the `delegated` rule name the
-// handler stamps on ADR-040 delegated approvals (#1026).
-// ApproverGithubLogin is absent on SPA/CLI approvals, where `approver`
-// is itself a GitHub login; Delegated is absent on human approvals.
-// Returns nil when the payload is malformed so callers treat a corrupt
-// row as "no status yet".
-func decodeApprovalStatus(payload []byte) *planStatus {
-	var p struct {
-		Decision            string `json:"decision"`
-		Approver            string `json:"approver"`
-		ApproverGithubLogin string `json:"approver_github_login"`
-		Delegated           string `json:"delegated"`
-	}
-	if err := json.Unmarshal(payload, &p); err != nil {
-		return nil
-	}
-	return &planStatus{
-		decision:    approval.Decision(p.Decision),
-		approver:    p.Approver,
-		githubLogin: p.ApproverGithubLogin,
-		delegated:   p.Delegated,
-	}
-}
-
-// PlanStatusFooterForAuditPayload renders the issue-thread plan-status
-// footer from a raw `approval_submitted` audit payload — the same
-// decode + render the live notifier applies when editing the
-// plan-on-issue comment. Exported so a cross-package caller (the #751
-// integration test in the server package) can assert the
-// wire→handler→audit-payload→render seam end to end without
-// reconstructing the full comment-post path. Returns "" when the
-// payload doesn't decode or carries no terminal decision.
-func PlanStatusFooterForAuditPayload(payload []byte) string {
-	return renderPlanStatusFooter(decodeApprovalStatus(payload))
-}
-
-// findPlanCommentID returns the most-recent github_comment_id from
-// the run's audit log across KindPlanFull and KindPlanUpdated rows.
-// Returns 0 when none exists (the first-post case).
-func (n *Notifier) findPlanCommentID(ctx context.Context, runID uuid.UUID) (int64, error) {
-	entries, err := n.audit.ListForRunByCategory(ctx, runID, CategoryIssueCommented)
-	if err != nil {
-		return 0, err
-	}
-	// ListForRunByCategory returns ascending-by-sequence; walk from
-	// the end so the latest comment id wins.
-	for i := len(entries) - 1; i >= 0; i-- {
-		k := extractKind(entries[i].Payload)
-		if k != KindPlanFull && k != KindPlanUpdated {
-			continue
-		}
-		if id := extractGithubCommentID(entries[i].Payload); id > 0 {
-			return id, nil
-		}
-	}
-	return 0, nil
-}
-
-// appendPlanCommentAudit records a full-plan create/update on the
-// issue_commented category. Payload carries the kind + comment id +
-// issue/repo for compliance consumers that index on intent.
-func (n *Notifier) appendPlanCommentAudit(ctx context.Context, ctxv commentContext, commentID int64, kind Kind) error {
-	systemKind := audit.ActorSystem
-	payload, _ := json.Marshal(map[string]any{
-		"kind":              string(kind),
-		"issue_number":      ctxv.issueNumber,
-		"repo":              ctxv.repo.String(),
-		"github_comment_id": commentID,
-	})
-	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
-		RunID:     ctxv.run.ID,
-		Timestamp: n.now().UTC(),
-		Category:  CategoryIssueCommented,
-		ActorKind: &systemKind,
-		Payload:   payload,
-	}); err != nil {
-		return fmt.Errorf("issuecomment: audit append: %w", err)
-	}
-	return nil
-}
-
-// planOriginatingIssuePersistence pulls the plan stage's
-// originating_issue persistence config out of the cached workflow
-// spec. Returns nil when the spec opts out — that's the signal for
-// NotifyPlanReady to use the legacy summary-post path.
-//
-// The lookup walks the workflow named by `workflowID` (the run's
-// WorkflowID column, which is the dispatcher-resolved key into the
-// spec's Workflows map) and finds the first stage of type plan.
-// v0 workflows have at most one plan stage per workflow.
-//
-// Best-effort: a parse failure falls through to the legacy path.
-// The spec was validated at dispatch time per #283, so this is
-// defensive against future shape drift.
-func planOriginatingIssuePersistence(workflowSpec []byte, workflowID string, planStage *run.Stage) *spec.Persistence {
-	if len(workflowSpec) == 0 || planStage == nil || workflowID == "" {
-		return nil
-	}
-	parsed, err := spec.ParseBytes(workflowSpec)
-	if err != nil {
-		return nil
-	}
-	wf, ok := parsed.Workflows[workflowID]
-	if !ok {
-		return nil
-	}
-	for i := range wf.Stages {
-		if string(wf.Stages[i].Type) != string(planStage.Type) {
-			continue
-		}
-		for _, p := range wf.Stages[i].Produces {
-			if p.Artifact != spec.ArtifactPlan {
-				continue
-			}
-			for _, ps := range p.Persistence {
-				if ps.Target == spec.PersistenceOriginatingIssue {
-					pp := ps
-					return &pp
-				}
-			}
-		}
-		// First plan stage wins; later plan stages (if a future
-		// workflow shape allows them) would need a more specific
-		// match — file a follow-up if that happens.
-		return nil
-	}
-	return nil
-}
-
-// scopePrecheckSummary carries the bits of the newest
-// plan_scope_precheck audit payload (#658/#983) the plan-comment
-// renderer needs: the scanned scope.files count, the implement stage's
-// resolved max_files_changed cap, and whether the precheck recorded a
-// max_files_changed violation. Decoded into this package-local struct
-// rather than importing the server package's ScopePrecheckPayload —
-// issuecomment must not import server (import cycle).
-type scopePrecheckSummary struct {
-	scannedFiles    int
-	maxFilesChanged int
-	overCap         bool
-}
-
-// latestScopePrecheck fetches the run's newest plan_scope_precheck
-// audit entry and decodes the fields the **Scope** cap line renders.
-// Returns nil — and the renderer omits the line entirely — when no
-// entry exists (older runs), the payload doesn't decode, or no cap is
-// configured (max_files_changed 0, including pre-#983 payloads that
-// lack the field). Best-effort: a list failure logs nothing and
-// renders nothing; the cap line is advisory, never load-bearing.
-func (n *Notifier) latestScopePrecheck(ctx context.Context, runID uuid.UUID) *scopePrecheckSummary {
-	entries, err := n.audit.ListForRunByCategory(ctx, runID, "plan_scope_precheck")
-	if err != nil {
-		return nil
-	}
-	// Ascending-by-sequence; walk from the end so the newest entry wins.
-	for i := len(entries) - 1; i >= 0; i-- {
-		var p struct {
-			Violations []struct {
-				Constraint string `json:"constraint"`
-			} `json:"violations"`
-			ScannedFiles    int `json:"scanned_files"`
-			MaxFilesChanged int `json:"max_files_changed"`
-		}
-		if err := json.Unmarshal(entries[i].Payload, &p); err != nil {
-			continue
-		}
-		if p.MaxFilesChanged <= 0 {
-			return nil
-		}
-		s := &scopePrecheckSummary{
-			scannedFiles:    p.ScannedFiles,
-			maxFilesChanged: p.MaxFilesChanged,
-		}
-		for _, v := range p.Violations {
-			if v.Constraint == "max_files_changed" {
-				s.overCap = true
-				break
-			}
-		}
-		return s
-	}
-	return nil
-}
-
-// planStatus carries the latest approval state for the plan stage,
-// used by renderFullPlanBody to render the `_Status:_` footer
-// introduced in #377. Nil status renders as "awaiting approval";
-// approve / reject render named after the actor.
-type planStatus struct {
-	decision approval.Decision
-	// approver is the provenance identity — the acting token subject
-	// recorded server-side (e.g. brett@local-mcp for the MCP loop).
-	approver string
-	// githubLogin is the resolved GitHub login the MCP loop threads
-	// through for `@`-mention rendering (#751). Preferred over approver
-	// when it is a syntactically-valid login; empty on SPA/CLI
-	// approvals, where approver itself is the GitHub login.
-	githubLogin string
-	// delegated names the ADR-040 delegation rule (e.g.
-	// "clean_dual_approval") when the approval landed via the
-	// delegated path (#1026); empty on every human approval.
-	delegated string
-}
-
-// renderFullPlanBody renders the entire standard_v1 plan as a
-// markdown document for the issue thread (E17.2 / #337). Sections:
-//
-//	**Fishhawk plan** (header + run + workflow link)
-//	**Summary**: <plan.Summary>
-//	**Scope**: bullet list of plan.Scope.Files
-//	**Approach**:
-//	  1. step 1
-//	  2. step 2
-//	**Verification**:
-//	  Test strategy: ...
-//	  Rollback plan: ...
-//	**Risks & assumptions**: bullets
-//	[Approve in the dashboard →](url) | [Reject →](url)
-//	_Status: …_  (when status is non-nil; #377)
-//
-// When the rendered body exceeds MaxIssueCommentBodyBytes the
-// renderer truncates at a safe rune boundary and appends a
-// "View full plan →" link to the SPA's plan-document page so the
-// reviewer can see the untruncated body.
-func renderFullPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, externalURL string, status *planStatus, precheck *scopePrecheckSummary) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "**Fishhawk plan** for Run [`%s`](%s)\n\n", shortID(c.run.ID), c.runURL)
-	fmt.Fprintf(&b, "Workflow: `%s`\n\n", c.run.WorkflowID)
-
-	if p.Summary != "" {
-		fmt.Fprintf(&b, "**Summary**\n\n%s\n\n", p.Summary)
-	}
-	if files := renderFileList(p.Scope.Files, len(p.Scope.Files)); files != "" {
-		b.WriteString("**Scope**\n\n")
-		b.WriteString(files)
-		// Cap headroom line (#983): rendered only when the plan-gate
-		// scope precheck recorded a configured max_files_changed.
-		if precheck != nil {
-			fmt.Fprintf(&b, "\n_%d files in scope; implement-stage cap %d (headroom %d)._\n",
-				precheck.scannedFiles, precheck.maxFilesChanged,
-				precheck.maxFilesChanged-precheck.scannedFiles)
-			if precheck.overCap {
-				b.WriteString("\n⚠ This plan exceeds the implement stage's max_files_changed and cannot pass as scoped.\n")
-			}
-		}
-		b.WriteString("\n")
-	}
-	if len(p.Approach) > 0 {
-		b.WriteString("**Approach**\n\n")
-		for _, s := range p.Approach {
-			fmt.Fprintf(&b, "%d. %s\n", s.Step, s.Description)
-		}
-		b.WriteString("\n")
-	}
-	if p.Verification.TestStrategy != "" || p.Verification.RollbackPlan != "" {
-		b.WriteString("**Verification**\n\n")
-		if p.Verification.TestStrategy != "" {
-			fmt.Fprintf(&b, "- **Test strategy**: %s\n", p.Verification.TestStrategy)
-		}
-		if p.Verification.RollbackPlan != "" {
-			fmt.Fprintf(&b, "- **Rollback plan**: %s\n", p.Verification.RollbackPlan)
-		}
-		b.WriteString("\n")
-	}
-	if len(p.RisksAndAssumptions) > 0 {
-		b.WriteString("**Risks & assumptions**\n\n")
-		for _, r := range p.RisksAndAssumptions {
-			fmt.Fprintf(&b, "- %s\n", r)
-		}
-		b.WriteString("\n")
-	}
-
-	if planStage.RequiresApproval {
-		fmt.Fprintf(&b, "[Approve in the dashboard →](%s/runs/%s/stages/%s)\n",
-			externalURL, c.run.ID.String(), planStage.ID.String())
-	} else {
-		fmt.Fprintf(&b, "[View run →](%s)\n", c.runURL)
-	}
-	b.WriteString("\n_Or approve from this thread by replying " + "`+1`" + " / " + "`lgtm`" + "; reply " + "`/fishhawk reject <reason>`" + " to block with a rationale._\n")
-	if footer := renderPlanStatusFooter(status); footer != "" {
-		b.WriteString("\n")
-		b.WriteString(footer)
-		b.WriteString("\n")
-	}
-	return truncateForGitHubComment(b.String(), c.runURL, planStage.ID.String(), externalURL, c.run.ID.String())
-}
-
-// renderPlanStatusFooter returns the italic status line appended to
-// the plan-on-issue comment, naming the actor that cleared or
-// blocked the gate. Empty when no approval audit row exists yet
-// (the comment first lands awaiting approval).
-func renderPlanStatusFooter(s *planStatus) string {
-	if s == nil {
-		return ""
-	}
-	// Prefer the resolved GitHub login (#751) when present and valid —
-	// a human MCP approval renders `@<login>` with no delegated clause.
-	// Otherwise renderApproverIdentity picks the three-form identity
-	// rendering for the acting subject (#1053).
-	actor := renderApproverIdentity(s.approver, s.delegated)
-	if validApproverLogin(s.githubLogin) {
-		actor = renderApproverIdentity(s.githubLogin, "")
-	}
-	switch s.decision {
-	case approval.DecisionApprove:
-		return fmt.Sprintf("_Status: approved by %s · implementing now_", actor)
-	case approval.DecisionReject:
-		return fmt.Sprintf("_Status: rejected by %s_", actor)
-	}
-	return ""
-}
 
 // renderApproverIdentity picks the human-facing form of an approval
 // audit row's subject (#1053). Three forms, in preference order:
@@ -1080,12 +659,18 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 	return n.appendStatusAudit(ctx, ctxv, created.ID)
 }
 
-// NotifyStatusUpdateForRun is the convenience entry point transition-
-// point callers use (E20.4 / #330). It loads the run, its stages, and
-// the audit chain for the run, renders the body via RenderStatusBody,
-// and dispatches to NotifyStatusUpdate. Returns nil silently for
-// non-issue triggers so callers at every transition point don't need
-// to branch on TriggerSource.
+// NotifyStatusUpdateForRun is the anchor projector every transition-point
+// caller uses (E20.4 / #330, evolved by #1054). It loads the run, its
+// stages, the FULL run audit chain, and every plan-artifact version for
+// the run, renders the living anchor body via RenderAnchorBody, and
+// dispatches to NotifyStatusUpdate (which create-or-edits the comment id
+// tracked by CategoryStatusCommentPosted, 404-fallback kept). Returns nil
+// silently for non-issue triggers so callers don't branch on
+// TriggerSource.
+//
+// The body is rebuilt from scratch on every call — there is no text
+// patching — so concurrent writers each emit a complete, at-least-as-fresh
+// projection (last-writer-wins is safe).
 //
 // Best-effort: load failures return wrapped errors the caller can
 // log; the post itself follows NotifyStatusUpdate's own best-effort
@@ -1110,8 +695,82 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	if err != nil {
 		return fmt.Errorf("issuecomment: list audit: %w", err)
 	}
-	body := RenderStatusBody(runRow, stages, entries, n.externalURL, n.now())
+	planVersions, err := LoadPlanVersions(ctx, n.artifacts, stages)
+	if err != nil {
+		return fmt.Errorf("issuecomment: load plan versions: %w", err)
+	}
+	body := RenderAnchorBody(runRow, stages, planVersions, entries, n.externalURL, n.now())
 	return n.NotifyStatusUpdate(ctx, runID, body)
+}
+
+// LoadPlanVersions reads every standard_v1 plan artifact attached to the
+// run's plan stages and returns them as ordered PlanVersions for the
+// anchor projection (#1054). Versions are numbered oldest-to-newest by
+// artifact creation time across all plan stages; the newest is the
+// current plan (Superseded == false) and every earlier one is superseded.
+// A malformed plan artifact is skipped rather than stranding the anchor.
+//
+// Returns (nil, nil) when artifacts is nil (minimal config) or no plan
+// artifact exists yet, so the anchor simply renders without plan sections.
+// Exported so the server's status-comment read handler can build the same
+// projection without re-deriving the plan-load logic.
+func LoadPlanVersions(ctx context.Context, artifacts artifact.Repository, stages []*run.Stage) ([]PlanVersion, error) {
+	if artifacts == nil {
+		return nil, nil
+	}
+	type collected struct {
+		plan             *plan.Plan
+		stageID          uuid.UUID
+		requiresApproval bool
+		createdAt        time.Time
+	}
+	var all []collected
+	for _, s := range stages {
+		if s == nil || s.Type != run.StageTypePlan {
+			continue
+		}
+		arts, err := artifacts.ListForStage(ctx, s.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list artifacts for stage %s: %w", s.ID, err)
+		}
+		for _, a := range arts {
+			if a.Kind != artifact.KindPlan {
+				continue
+			}
+			if a.SchemaVersion == nil || *a.SchemaVersion != "standard_v1" {
+				continue
+			}
+			// Lenient decode (matches the implement-prompt loader,
+			// prompt.go::tryLoadPlanForRun): the anchor is a display
+			// surface, so a plan that drifts from strict standard_v1
+			// validation must still render rather than strand the anchor.
+			var parsed plan.Plan
+			if err := json.Unmarshal(a.Content, &parsed); err != nil {
+				continue
+			}
+			all = append(all, collected{
+				plan:             &parsed,
+				stageID:          s.ID,
+				requiresApproval: s.RequiresApproval,
+				createdAt:        a.CreatedAt,
+			})
+		}
+	}
+	// Oldest-first across all plan stages so the newest upload is current.
+	sort.SliceStable(all, func(i, j int) bool {
+		return all[i].createdAt.Before(all[j].createdAt)
+	})
+	out := make([]PlanVersion, 0, len(all))
+	for i, c := range all {
+		out = append(out, PlanVersion{
+			Plan:             c.plan,
+			Version:          i + 1,
+			StageID:          c.stageID,
+			RequiresApproval: c.requiresApproval,
+			Superseded:       i < len(all)-1,
+		})
+	}
+	return out, nil
 }
 
 // contextForStatus is the status-comment variant of contextFor — it
@@ -1410,120 +1069,6 @@ type commentContext struct {
 	repo        githubclient.RepoRef
 	issueNumber int
 	runURL      string
-}
-
-// contextFor returns (ctx, true) when the run is eligible for a
-// comment of `kind`, or (zero, false) when it should be skipped.
-// The error return is non-nil only on transient I/O failures the
-// caller should retry; logical "skip" cases return (zero, false,
-// nil).
-func (n *Notifier) contextFor(ctx context.Context, runID uuid.UUID, kind Kind) (commentContext, bool, error) {
-	runRow, err := n.runs.GetRun(ctx, runID)
-	if err != nil {
-		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
-	}
-	if runRow.TriggerSource != run.TriggerGitHubIssue {
-		return commentContext{}, false, nil
-	}
-	if runRow.InstallationID == nil {
-		return commentContext{}, false, nil
-	}
-	if runRow.TriggerRef == nil {
-		return commentContext{}, false, nil
-	}
-	number, ok := parseIssueRef(*runRow.TriggerRef)
-	if !ok {
-		return commentContext{}, false, nil
-	}
-	repo, err := parseRepo(runRow.Repo)
-	if err != nil {
-		return commentContext{}, false, nil
-	}
-
-	already, err := n.alreadyPosted(ctx, runID, kind)
-	if err != nil {
-		return commentContext{}, false, fmt.Errorf("issuecomment: dedup check: %w", err)
-	}
-	if already {
-		return commentContext{}, false, nil
-	}
-
-	return commentContext{
-		run:         runRow,
-		repo:        repo,
-		issueNumber: number,
-		runURL:      n.externalURL + "/runs/" + runID.String(),
-	}, true, nil
-}
-
-// alreadyPosted returns true when an issue_commented audit entry
-// for this run already records a post of the given kind. Reads
-// the run's audit log filtered to the category — the kind lives
-// inside the JSON payload because two posts share one category.
-func (n *Notifier) alreadyPosted(ctx context.Context, runID uuid.UUID, kind Kind) (bool, error) {
-	entries, err := n.audit.ListForRunByCategory(ctx, runID, CategoryIssueCommented)
-	if err != nil {
-		return false, err
-	}
-	for _, e := range entries {
-		if extractKind(e.Payload) == kind {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// post fires the GitHub call and writes the audit entry. The order
-// matters: comment first, audit entry second. If the comment fails
-// we never write the audit entry, so a retry will try again. If the
-// audit append fails after a successful comment, we log but treat
-// the comment as posted — the next NotifyXxx call would re-post
-// (rare; the audit log is highly available).
-func (n *Notifier) post(ctx context.Context, ctxv commentContext, kind Kind, body string) error {
-	if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
-		return fmt.Errorf("issuecomment: create comment: %w", err)
-	}
-	systemKind := audit.ActorSystem
-	payload, _ := json.Marshal(map[string]any{
-		"kind":         string(kind),
-		"issue_number": ctxv.issueNumber,
-		"repo":         ctxv.repo.String(),
-	})
-	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
-		RunID:     ctxv.run.ID,
-		Timestamp: n.now().UTC(),
-		Category:  CategoryIssueCommented,
-		ActorKind: &systemKind,
-		Payload:   payload,
-	}); err != nil {
-		return fmt.Errorf("issuecomment: audit append: %w", err)
-	}
-	return nil
-}
-
-func renderPlanBody(c commentContext, planStage *run.Stage, p *plan.Plan, externalURL string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Plan ready for Run [`%s`](%s):\n\n", shortID(c.run.ID), c.runURL)
-
-	summary := truncate(p.Summary, 280)
-	if summary != "" {
-		fmt.Fprintf(&b, "**Summary**: %s\n\n", summary)
-	}
-
-	if files := renderFileList(p.Scope.Files, 10); files != "" {
-		fmt.Fprintf(&b, "**Files in scope**:\n%s\n", files)
-	}
-
-	if planStage.RequiresApproval {
-		// SPA route is /runs/:runId/stages/:stageId — there's no
-		// top-level /stages/<id> route, so pre-#273 this URL 404'd
-		// for every plan-ready comment that landed (#273).
-		fmt.Fprintf(&b, "\n[Approve in the dashboard →](%s/runs/%s/stages/%s)\n",
-			externalURL, c.run.ID.String(), planStage.ID.String())
-	} else {
-		fmt.Fprintf(&b, "\n[View run →](%s)\n", c.runURL)
-	}
-	return b.String()
 }
 
 // githubLoginPattern matches a syntactically-valid GitHub login:

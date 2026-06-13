@@ -57,11 +57,13 @@ func TestNotifyPlanReady_FiresNotifierOnPlanStageTransition(t *testing.T) {
 		AuditRepo: au, ArtifactRepo: arts,
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
-	// Wire a real issuecomment.Notifier with the fake GitHub.
+	// Wire a real issuecomment.Notifier with the fake GitHub. Artifacts
+	// is wired so the anchor projection (#1054) can render plan versions.
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{
 		GitHub:      gh,
 		Runs:        rr,
 		Audit:       au,
+		Artifacts:   arts,
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
 
@@ -78,8 +80,13 @@ func TestNotifyPlanReady_FiresNotifierOnPlanStageTransition(t *testing.T) {
 	if c.issueNumber != 42 {
 		t.Errorf("issueNumber = %d", c.issueNumber)
 	}
-	if !strings.Contains(c.body, "Plan ready") {
-		t.Errorf("body should reference plan ready: %q", c.body)
+	// The anchor projects the plan as an expandable "Plan v1" section with
+	// the summary visible and the scope file listed (#1054).
+	if !strings.Contains(c.body, "Plan v1") {
+		t.Errorf("body should project the plan version: %q", c.body)
+	}
+	if !strings.Contains(c.body, "add a feature") {
+		t.Errorf("body should include the plan summary: %q", c.body)
 	}
 	if !strings.Contains(c.body, "/stages/"+planStage.ID.String()) {
 		t.Errorf("body should link to approval surface: %q", c.body)
@@ -133,7 +140,7 @@ func TestNotifyPlanReady_RealRunnerOrder_TracePrecedesPlan(t *testing.T) {
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: rr, Audit: au,
+		GitHub: gh, Runs: rr, Audit: au, Artifacts: arts,
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
 	req := httptest.NewRequest("POST", "/", nil)
@@ -160,8 +167,8 @@ func TestNotifyPlanReady_RealRunnerOrder_TracePrecedesPlan(t *testing.T) {
 	if got := gh.calls(); len(got) != 1 {
 		t.Fatalf("plan-upload hook should have posted one comment; got %d calls", len(got))
 	}
-	if !strings.Contains(gh.calls()[0].body, "Plan ready") {
-		t.Errorf("comment body should reference plan-ready: %q", gh.calls()[0].body)
+	if !strings.Contains(gh.calls()[0].body, "add a feature") {
+		t.Errorf("comment body should project the plan summary: %q", gh.calls()[0].body)
 	}
 
 	// Step 3: re-fire (e.g. runner retries the plan upload, hits
@@ -354,8 +361,16 @@ func (f *planReadyAuditFake) ListAll(context.Context, audit.ListAllParams) ([]*a
 func (f *planReadyAuditFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errPlanReadyFakeNotImpl
 }
-func (f *planReadyAuditFake) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, error) {
-	return nil, errPlanReadyFakeNotImpl
+func (f *planReadyAuditFake) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []*audit.Entry{}
+	for _, e := range f.entries {
+		if e.RunID != nil && *e.RunID == runID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 func (f *planReadyAuditFake) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errPlanReadyFakeNotImpl

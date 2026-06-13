@@ -507,6 +507,62 @@ func TestTick_PlanUpdatedRow_TreatedSameAsPlanFull(t *testing.T) {
 	}
 }
 
+// seedAnchorAudit appends a status_comment_posted (anchor) audit row
+// carrying the run's living-anchor comment id (#1054).
+func seedAnchorAudit(aud *fakeAudit, runID uuid.UUID, commentID int64, postedAt time.Time) {
+	r := runID
+	payload, _ := json.Marshal(map[string]any{
+		"kind":              string(issuecomment.KindStatusUpdate),
+		"issue_number":      42,
+		"repo":              "x/y",
+		"github_comment_id": commentID,
+	})
+	aud.seed(&audit.Entry{
+		ID: uuid.New(), RunID: &r,
+		Category:  issuecomment.CategoryStatusCommentPosted,
+		Payload:   payload,
+		Timestamp: postedAt,
+	})
+}
+
+// TestTick_AnchorCommentIDPreferredOverLegacy pins the #1054 repoint: the
+// poller watches the living anchor comment (status_comment_posted) in
+// preference to the retired plan_full/plan_updated rows. A reaction on the
+// anchor comment id forwards an approval even though a legacy plan comment
+// with a DIFFERENT id is also recorded on the run.
+func TestTick_AnchorCommentIDPreferredOverLegacy(t *testing.T) {
+	fx := newFixture(t) // fixture seeds a legacy plan_full row at fx.commentID
+	const anchorID = int64(9999)
+	seedAnchorAudit(fx.audit, fx.runID, anchorID, fx.commentAt.Add(time.Minute))
+	// Reaction lands on the ANCHOR comment, not the legacy one.
+	fx.reactions.byComment[anchorID] = []githubclient.IssueCommentReaction{
+		reaction(21, githubclient.ReactPlusOne, "carol"),
+	}
+
+	fx.ticker.Tick(context.Background())
+
+	if got := len(fx.approvals.calls); got != 1 {
+		t.Fatalf("expected approval forwarded from the anchor comment id; got %d", got)
+	}
+	if got := fx.approvals.calls[0].SenderLogin; got != "carol" {
+		t.Errorf("SenderLogin = %q, want carol (the anchor reaction)", got)
+	}
+}
+
+// TestTick_LegacyFallback_WhenNoAnchorRow pins the backward-compat path:
+// an in-flight run whose plan comment predates #1054 has only plan_full
+// rows and no anchor row, and the poller still resolves the legacy id.
+func TestTick_LegacyFallback_WhenNoAnchorRow(t *testing.T) {
+	fx := newFixture(t) // only a plan_full row; no status_comment_posted row
+	fx.seedReactions(reaction(31, githubclient.ReactPlusOne, "dave"))
+
+	fx.ticker.Tick(context.Background())
+
+	if got := len(fx.approvals.calls); got != 1 {
+		t.Fatalf("expected approval forwarded via legacy plan_full fallback; got %d", got)
+	}
+}
+
 func TestRun_RejectsMissingDeps(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
