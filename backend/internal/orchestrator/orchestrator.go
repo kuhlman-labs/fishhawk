@@ -60,6 +60,18 @@ type GitHubAPI interface {
 		repo githubclient.RepoRef, headBranch, base string) ([]githubclient.PullRequest, error)
 }
 
+// ConsolidatedReviewDispatcher dispatches the gating agent implement
+// review against a decomposed parent's consolidated PR diff (#1060) after
+// Advance dispatches the parent's review stage. It is implemented
+// server-side (*server.Server): the review machinery depends on the
+// orchestrator, so calling it from here directly would close an import
+// cycle. The dispatch is best-effort and idempotent — the implementation
+// dedups on its own started-key and no-ops for non-decomposed runs — so
+// the orchestrator fires it fire-and-forget.
+type ConsolidatedReviewDispatcher interface {
+	DispatchConsolidatedReview(ctx context.Context, parentRunID uuid.UUID, base, head string)
+}
+
 // Orchestrator wires the run repository to a GitHub client to
 // advance a run's stages. Construct directly via the public fields;
 // every dependency is required (the orchestrator no-ops if any is
@@ -88,6 +100,13 @@ type Orchestrator struct {
 	// ActionsWorkflowFile is the customer-side .github/workflows/
 	// file. Defaults to "fishhawk.yml" at use time.
 	ActionsWorkflowFile string
+
+	// ConsolidatedReview, when wired, dispatches the gating consolidated
+	// implement review for a decomposed parent run after Advance
+	// dispatches the parent's review stage with the consolidated PR
+	// present (#1060). Nil disables the dispatch — ordinary (non-
+	// decomposed) runs and the CLI/dev posture are unaffected.
+	ConsolidatedReview ConsolidatedReviewDispatcher
 }
 
 // Outcome describes what Advance did. Useful for telemetry and
@@ -217,8 +236,8 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// present and reconciles on the consolidated PR's merge. This gate
 	// covers BOTH settle paths because the sweeper's resolveParent and
 	// maybeAdvanceDecomposedParent both finish by calling Advance.
-	if next.Type == run.StageTypeReview && r.DecomposedFrom == nil &&
-		(r.PullRequestURL == nil || *r.PullRequestURL == "") {
+	isParentReviewGate := next.Type == run.StageTypeReview && r.DecomposedFrom == nil
+	if isParentReviewGate && (r.PullRequestURL == nil || *r.PullRequestURL == "") {
 		updated, err := o.maybeOpenConsolidatedPR(ctx, r, next)
 		if err != nil {
 			return OutcomeNoOp, fmt.Errorf("orchestrator: open consolidated pr: %w", err)
@@ -226,7 +245,29 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		r = updated
 	}
 
-	return o.dispatchStage(ctx, r, next)
+	out, err := o.dispatchStage(ctx, r, next)
+
+	// ADR-032 / #1060: once the decomposed parent's review stage is
+	// dispatched WITH the consolidated PR present, dispatch the gating
+	// implement review against the whole consolidated diff (the diff that
+	// actually merges) so a child-raised high gates the parent merge. The
+	// trigger lives here — where the decomposed-parent + consolidated-PR
+	// condition is already computed — but the dispatch itself is
+	// server-side (import-cycle avoidance). Fire-and-forget after a
+	// successful dispatch; the dispatcher no-ops for ordinary runs (a
+	// DecomposedFrom==nil run with a PR but no children, e.g. a normal
+	// feature run) and dedups its own re-fire. base/head match
+	// maybeOpenConsolidatedPR exactly.
+	if err == nil && isParentReviewGate && o.ConsolidatedReview != nil &&
+		r.PullRequestURL != nil && *r.PullRequestURL != "" {
+		base := o.DefaultRef
+		if base == "" {
+			base = "main"
+		}
+		o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
+	}
+
+	return out, err
 }
 
 // reconcileStuckRunsPageSize bounds each ListRuns page the startup

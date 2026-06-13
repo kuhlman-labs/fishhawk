@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -2051,6 +2052,196 @@ func (s *Server) sumRunTokens(ctx context.Context, runID uuid.UUID) int64 {
 		total += p.InputTokens + p.OutputTokens
 	}
 	return total
+}
+
+// consolidatedReviewTruncatedCategory records that a decomposed parent's
+// consolidated diff was truncated by GitHub before the consolidated review
+// ran (#1060): the review saw only a partial diff. Internal audit kind
+// (system actor), not an issue-comment surface — it backs the loud
+// degradation signal the dispatch is required to emit rather than silently
+// under-reviewing.
+const consolidatedReviewTruncatedCategory = "consolidated_review_diff_truncated"
+
+// DispatchConsolidatedReview dispatches the gating agent implement review
+// for a decomposed parent run against its consolidated PR diff (#1060),
+// satisfying orchestrator.ConsolidatedReviewDispatcher. The orchestrator
+// invokes it after Advance dispatches the parent's review stage with the
+// consolidated PR present; the dispatch is server-side because the review
+// machinery (runImplementReviews) lives here and the server depends on the
+// orchestrator, not the reverse.
+//
+// The diff that actually merges is the consolidated base...head compare —
+// the parent has no runner trace bundle of its own — so it is sourced via
+// githubclient.ComparePatch and handed to runImplementReviews with the
+// stageID of the PARENT'S IMPLEMENT stage (the awaiting_children→succeeded
+// stage). That stage id is the load-bearing seam: the implement_reviewed
+// concerns attach there, so fishhawk_fixup_stage on that stage resolves
+// them and re-invokes the agent over the #1036 shared branch — no new
+// fix-up code path. Per-child reviews remain advisory early signal; this
+// consolidated review is the gating one (closes #677's parent-merge gap).
+//
+// Best-effort and idempotent: every guard that doesn't add up — not a
+// decomposed parent, no children, no implement stage, GitHub/installation
+// not wired, or a compare failure — logs and returns without dispatching,
+// and runImplementReviews' own started-key guard dedups a re-fire across
+// the sweeper/event-driven double-advance. The review runs on a detached,
+// shutdown-tracked goroutine so the orchestrator's Advance (and the request
+// that drove it) never blocks on the compare fetch or the reviewer LLMs.
+func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uuid.UUID, base, head string) {
+	if s.cfg.RunRepo == nil {
+		return
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, parentRunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: get run failed",
+			slog.String("run_id", parentRunID.String()), slog.String("error", err.Error()))
+		return
+	}
+	// A child run is never a decomposed parent.
+	if runRow.DecomposedFrom != nil {
+		return
+	}
+	// Authoritative parent check: an ordinary feature run (DecomposedFrom
+	// nil, a PR present, but no children) must NOT get a consolidated review
+	// — its implement review already ran on the trace path. Only a run with
+	// decomposed children is a parent.
+	children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{DecomposedFrom: &parentRunID, Limit: 1})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: list children failed",
+			slog.String("run_id", parentRunID.String()), slog.String("error", err.Error()))
+		return
+	}
+	if len(children) == 0 {
+		return
+	}
+
+	var implStage *run.Stage
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, parentRunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: list stages failed",
+			slog.String("run_id", parentRunID.String()), slog.String("error", err.Error()))
+		return
+	}
+	for _, st := range stages {
+		if st.Type == run.StageTypeImplement {
+			implStage = st
+			break
+		}
+	}
+	if implStage == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: parent has no implement stage — skipping",
+			slog.String("run_id", parentRunID.String()))
+		return
+	}
+
+	// GitHub-wired diff source. CLI/dev posture (no client / no
+	// installation) skips silently — same posture as the consolidated-PR
+	// open path; drive parks the review gate until a round dispatches.
+	if s.cfg.GitHub == nil || runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "consolidated review: GitHub/installation not wired — skipping dispatch",
+			slog.String("run_id", parentRunID.String()))
+		return
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: parse repo failed",
+			slog.String("run_id", parentRunID.String()), slog.String("error", err.Error()))
+		return
+	}
+
+	installationID := *runRow.InstallationID
+	stageID := implStage.ID
+	reviewCtx := context.WithoutCancel(ctx)
+	s.bgReviews.Add(1)
+	go func() {
+		defer s.bgReviews.Done()
+		cmp, cerr := s.cfg.GitHub.ComparePatch(reviewCtx, installationID, repo, base, head)
+		if cerr != nil {
+			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn, "consolidated review: compare patch failed — review not dispatched",
+				slog.String("run_id", parentRunID.String()),
+				slog.String("base", base), slog.String("head", head),
+				slog.String("error", cerr.Error()))
+			return
+		}
+		if cmp.Truncated {
+			// Surface loudly + emit a durable degradation signal: the review
+			// is about to run on a partial diff (the consolidated fan-out's
+			// large-diff case the #1060 amendment calls out). Still dispatch
+			// — a partial review beats none — but the gap is now auditable.
+			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn, "consolidated review: diff truncated by GitHub — review will under-review",
+				slog.String("run_id", parentRunID.String()),
+				slog.String("reason", cmp.TruncationReason),
+				slog.Int("changed_files", len(cmp.Files)))
+			s.emitConsolidatedReviewTruncated(reviewCtx, parentRunID, stageID, cmp.TruncationReason, len(cmp.Files))
+		}
+		diff := consolidatedReviewDiff(cmp)
+		// The returned gating-reject signal is intentionally ignored: the
+		// parent implement stage is already succeeded, so there is no
+		// terminal transition to fail to category-B. Gating is enforced by
+		// the drive gate (which parks until this round dispatches) plus the
+		// operator reading the verdicts and routing a fix-up. The
+		// implement_review_started/_reviewed round and any concerns attach
+		// to the parent implement stage regardless of authority.
+		s.runImplementReviews(reviewCtx, parentRunID, stageID, diff, nil, cmp.HeadSHA, nil)
+	}()
+}
+
+// consolidatedReviewDiff maps a githubclient compare result onto a
+// policy.Diff for the consolidated review: each changed file's GitHub
+// word-form status becomes a policy.Status letter, and the reconstructed
+// unified diff rides on Patch for the reviewer's content-level lens.
+func consolidatedReviewDiff(cmp *githubclient.ComparePatchResult) policy.Diff {
+	diff := policy.Diff{Patch: cmp.Patch}
+	diff.ChangedFiles = make([]policy.ChangedFile, 0, len(cmp.Files))
+	for _, f := range cmp.Files {
+		diff.ChangedFiles = append(diff.ChangedFiles, policy.ChangedFile{
+			Path:   f.Path,
+			Status: githubStatusToPolicy(f.Status),
+		})
+	}
+	return diff
+}
+
+// githubStatusToPolicy maps GitHub's compare word-form file status onto the
+// single-letter policy.Status. Unknown / "modified" both fall through to M.
+func githubStatusToPolicy(status string) policy.Status {
+	switch status {
+	case "added":
+		return policy.StatusAdded
+	case "removed":
+		return policy.StatusDeleted
+	case "renamed":
+		return policy.StatusRenamed
+	case "copied":
+		return policy.StatusCopied
+	case "changed":
+		return policy.StatusTypeChg
+	default:
+		return policy.StatusModified
+	}
+}
+
+// emitConsolidatedReviewTruncated writes the durable degradation signal
+// (#1060) when GitHub truncated the consolidated diff before review.
+// Best-effort, system actor; attached to the parent implement stage so it
+// sits beside the consolidated review's other entries.
+func (s *Server) emitConsolidatedReviewTruncated(ctx context.Context, runID, stageID uuid.UUID, reason string, changedFiles int) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{"reason": reason, "changed_files": changedFiles})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  consolidatedReviewTruncatedCategory,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: append truncation audit failed",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+	}
 }
 
 // runImplementReviews resolves the implement stage's review config and
