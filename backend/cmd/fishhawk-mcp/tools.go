@@ -320,15 +320,16 @@ type GetPlanOutput struct {
 	// TestSweep surfaces the plan-gate test-sweep advisory (#942):
 	// scope.files evaluated against the repository's existing *_test.go
 	// files via the Contents API.
-	TestSweep *TestSweep `json:"test_sweep,omitempty" jsonschema:"plan-gate test sweep (#942): heuristic advisory flagging EXISTING *_test.go files adjacent to the plan's scoped .go files that the plan omitted — a stem-sibling test of a scoped production file, or existing tests in a package where the plan creates a new test file. Judge whether the changed behavior's tests or shared harness live in the flagged files; if so the plan must scope them or the runner will scope_drift-exclude the agent's edits to them. Present (possibly with empty findings) when the plan stage ran the sweep; absent on older runs, non-GitHub triggers, and fail-open paths. listed_dirs below scanned directories means some listings failed and findings may be incomplete"`
+	TestSweep *TestSweep `json:"test_sweep,omitempty" jsonschema:"plan-gate test sweep (#942): heuristic advisory flagging EXISTING test files the plan omitted — a stem-sibling test of a scoped production .go file, existing tests in a package where the plan creates a new test file, or a path-trigger rule's pinned test (migration_walk: a scoped migrations/*.sql requires the postgres_test.go that pins the latest migration). Judge whether the changed behavior's tests or shared harness live in the flagged files; if so the plan must scope them or the runner will scope_drift-exclude the agent's edits to them. Present (possibly with empty findings) when the plan stage ran the sweep; absent on older runs, non-GitHub triggers, and fail-open paths. listed_dirs below scanned directories means some listings failed and findings may be incomplete"`
 }
 
 // TestSweepFinding is one test-sweep result decoded from a plan_test_sweep
 // audit entry (#942): the plan touches TriggerPath but omits the existing
 // test files MissingTests the named Rule (stem_sibling |
-// new_test_in_tested_package) associates with it. OmittedCount carries the
-// number of additional existing test files truncated from MissingTests.
-// Mirrors the server-side TestSweepFinding shape exactly.
+// new_test_in_tested_package | migration_walk) associates with it.
+// OmittedCount carries the number of additional existing test files
+// truncated from MissingTests. Mirrors the server-side TestSweepFinding
+// shape exactly.
 type TestSweepFinding struct {
 	Rule         string   `json:"rule"`
 	TriggerPath  string   `json:"trigger_path"`

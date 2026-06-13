@@ -39,7 +39,38 @@ const (
 	// prEventsAuditRepo harness in #876 — a new test file in a tested
 	// package usually extends an existing harness the plan must scope).
 	testSweepRuleNewTestInTestedPackage = "new_test_in_tested_package"
+	// testSweepRuleMigrationWalk flags a scoped migrations/*.sql whose
+	// pinned migration-walk test (postgres_test.go pins the LATEST
+	// migration) is absent from scope.files — the #1031 class, missed by
+	// planners three times (migrations 0029/0030/0031).
+	testSweepRuleMigrationWalk = "migration_walk"
 )
+
+// testSweepPathTriggerRule is one row of the path-trigger rule table: a
+// scoped path matching TriggerGlob (path.Match semantics; '*' does not
+// cross '/') requires every RequiredPaths entry in scope.files. Rows are
+// curated data, not matcher logic — the extension point for future
+// pinned-test patterns ahead of the per-repo test_conventions config
+// (#1004). RequiredPaths is a slice so a future row can require multiple
+// paths per trigger (e.g. the deferred schema-sync pair rule). Evaluation
+// is purely scope-set based: no dirListings consultation, so a required
+// path is not verified to exist on the base ref — a moved required file
+// yields at worst a stale advisory until its row is updated.
+type testSweepPathTriggerRule struct {
+	Rule          string
+	TriggerGlob   string
+	RequiredPaths []string
+}
+
+// testSweepPathTriggerRules is the curated rule table. The single
+// migrations glob covers both .up.sql and .down.sql.
+var testSweepPathTriggerRules = []testSweepPathTriggerRule{
+	{
+		Rule:          testSweepRuleMigrationWalk,
+		TriggerGlob:   "backend/internal/postgres/migrations/*.sql",
+		RequiredPaths: []string{"backend/internal/postgres/postgres_test.go"},
+	},
+}
 
 // testSweepMaxMissingTests caps the existing-test names a single rule-2
 // finding carries; the remainder is reported via OmittedCount so
@@ -80,7 +111,7 @@ type TestSweepPayload struct {
 // evaluateTestSweep is the pure matcher (#942). dirListings maps a
 // slash-normalized directory path to the base names of the files that
 // exist in it on the base ref; a directory absent from the map was not
-// listed (skipped or failed open) and produces no findings. Two
+// listed (skipped or failed open) and produces no findings. Three
 // deterministic rules:
 //
 //   - stem-sibling: a scoped non-test dir/name.go where dir/name_test.go
@@ -90,6 +121,10 @@ type TestSweepPayload struct {
 //     existing files (minus any already in scope) are reported sorted,
 //     capped at testSweepMaxMissingTests with OmittedCount carrying the
 //     remainder.
+//   - path-trigger table rows (testSweepPathTriggerRules, currently
+//     migration_walk): a scoped path matching a row's trigger glob whose
+//     required paths are not all in scope — evaluated against the scope
+//     set only, never dirListings.
 //
 // Paths are slash-normalized like evaluateSurfaceSweep; a scoped test
 // file never flags itself; findings are sorted (rule, then trigger path)
@@ -120,6 +155,30 @@ func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]str
 	var findings []TestSweepFinding
 	for _, f := range scopeFiles {
 		p := filepath.ToSlash(f.Path)
+
+		// Path-trigger rules run before the .go filter: their triggers
+		// (migration .sql files) are not Go files. path.Match errors only
+		// on a malformed pattern; the table is curated constants, so a bad
+		// row simply never matches (fail-open, no finding).
+		for _, rule := range testSweepPathTriggerRules {
+			if matched, _ := path.Match(rule.TriggerGlob, p); !matched {
+				continue
+			}
+			var missing []string
+			for _, req := range rule.RequiredPaths {
+				if !scope[req] {
+					missing = append(missing, req)
+				}
+			}
+			if len(missing) > 0 {
+				findings = append(findings, TestSweepFinding{
+					Rule:         rule.Rule,
+					TriggerPath:  p,
+					MissingTests: missing,
+				})
+			}
+		}
+
 		if !strings.HasSuffix(p, ".go") {
 			continue
 		}
