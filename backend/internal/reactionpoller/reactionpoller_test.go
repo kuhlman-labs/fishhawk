@@ -217,7 +217,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 
 	aud := &fakeAudit{}
-	seedPlanFullAudit(aud, runID, stageID, commentID, commentAt)
+	seedAnchorAndPlan(aud, runID, stageID, commentID, commentAt)
 
 	reactions := &fakeReactions{byComment: map[int64][]githubclient.IssueCommentReaction{}}
 	approvals := &fakeApprovals{}
@@ -248,26 +248,62 @@ func newFixture(t *testing.T) *fixture {
 	}
 }
 
-func seedPlanFullAudit(aud *fakeAudit, runID, stageID uuid.UUID, commentID int64, postedAt time.Time) {
+// seedAnchorAndPlan seeds the two audit facts the poller now reads
+// (#1054): a `status_comment_posted` row carrying the anchor comment
+// id, and a `plan_generated` row marking plan existence (also the
+// cadence age origin + approval cutoff). planExistsAt is used for both
+// the anchor posted-at and the plan-existence instant in the default
+// fixture; the binding-condition-2 tests seed a distinct plan-existence
+// time directly.
+func seedAnchorAndPlan(aud *fakeAudit, runID, stageID uuid.UUID, commentID int64, planExistsAt time.Time) {
+	seedAnchor(aud, runID, stageID, commentID, planExistsAt.Add(-time.Minute))
+	seedPlanGenerated(aud, runID, stageID, planExistsAt)
+}
+
+func seedAnchor(aud *fakeAudit, runID, stageID uuid.UUID, commentID int64, postedAt time.Time) {
 	r := runID
 	s := stageID
 	payload, _ := json.Marshal(map[string]any{
-		"kind":              string(issuecomment.KindPlanFull),
+		"kind":              string(issuecomment.KindStatusUpdate),
 		"issue_number":      42,
 		"repo":              "x/y",
 		"github_comment_id": commentID,
 	})
 	aud.seed(&audit.Entry{
 		ID: uuid.New(), RunID: &r, StageID: &s,
-		Category:  issuecomment.CategoryIssueCommented,
+		Category:  issuecomment.CategoryStatusCommentPosted,
 		Payload:   payload,
 		Timestamp: postedAt,
+	})
+}
+
+func seedPlanGenerated(aud *fakeAudit, runID, stageID uuid.UUID, at time.Time) {
+	r := runID
+	s := stageID
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":         runID.String(),
+		"stage_id":       stageID.String(),
+		"schema_version": "standard_v1",
+	})
+	aud.seed(&audit.Entry{
+		ID: uuid.New(), RunID: &r, StageID: &s,
+		Category:  planGeneratedCategory,
+		Payload:   payload,
+		Timestamp: at,
 	})
 }
 
 func reaction(id int64, content githubclient.IssueCommentReactKind, login string) githubclient.IssueCommentReaction {
 	r := githubclient.IssueCommentReaction{ID: id, Content: content}
 	r.User.Login = login
+	return r
+}
+
+// reactionAt is reaction with an explicit placement time, used by the
+// plan-existence cutoff tests (#1054, binding condition 2).
+func reactionAt(id int64, content githubclient.IssueCommentReactKind, login string, createdAt time.Time) githubclient.IssueCommentReaction {
+	r := reaction(id, content, login)
+	r.CreatedAt = createdAt
 	return r
 }
 
@@ -414,13 +450,80 @@ func TestTick_NonPlanStage_Ignored(t *testing.T) {
 
 func TestTick_NoPlanCommentYet_Skips(t *testing.T) {
 	fx := newFixture(t)
-	// Wipe the seeded plan_full audit row.
+	// Wipe the seeded anchor + plan_generated audit rows.
 	fx.audit.entries = nil
 
 	fx.ticker.Tick(context.Background())
 
 	if fx.reactions.calls != 0 {
-		t.Errorf("missing plan comment should skip the poll; got %d calls", fx.reactions.calls)
+		t.Errorf("missing anchor/plan should skip the poll; got %d calls", fx.reactions.calls)
+	}
+}
+
+func TestTick_NoPlanGeneratedYet_Skips(t *testing.T) {
+	// The anchor exists from run creation (#1054), but no plan has been
+	// generated. There is no approvable plan, so the poller must skip —
+	// and binding condition 2 means a reaction now would predate any
+	// future plan anyway.
+	fx := newFixture(t)
+	fx.audit.entries = nil
+	seedAnchor(fx.audit, fx.runID, fx.stageID, fx.commentID, fx.commentAt)
+
+	fx.ticker.Tick(context.Background())
+
+	if fx.reactions.calls != 0 {
+		t.Errorf("no plan_generated should skip the poll; got %d calls", fx.reactions.calls)
+	}
+}
+
+func TestTick_ReactionBeforePlanExistence_NotAdmitted(t *testing.T) {
+	// Binding condition 2 (#1054): the anchor comment exists from run
+	// creation, so a 👍 placed BEFORE the plan was generated is not a
+	// plan approval. The dedup audit row is still written (so it isn't
+	// re-evaluated forever) but it must NOT forward to the approval
+	// handler.
+	fx := newFixture(t)
+	planExistsAt := fx.commentAt // the fixture's plan_generated timestamp
+	fx.seedReactions(reactionAt(11, githubclient.ReactPlusOne, "alice", planExistsAt.Add(-time.Minute)))
+
+	fx.ticker.Tick(context.Background())
+
+	if got := fx.reactionObservedCount(); got != 1 {
+		t.Errorf("pre-plan reaction should still be recorded for dedup; got %d audit rows", got)
+	}
+	if got := len(fx.approvals.calls); got != 0 {
+		t.Fatalf("pre-plan reaction must NOT forward as a plan approval; got %d forwards", got)
+	}
+}
+
+func TestTick_ReactionAfterPlanExistence_Admitted(t *testing.T) {
+	// The mirror of the above: a 👍 placed AFTER the plan exists IS a
+	// plan approval and forwards.
+	fx := newFixture(t)
+	planExistsAt := fx.commentAt
+	fx.seedReactions(reactionAt(12, githubclient.ReactPlusOne, "alice", planExistsAt.Add(time.Minute)))
+
+	fx.ticker.Tick(context.Background())
+
+	if got := len(fx.approvals.calls); got != 1 {
+		t.Fatalf("post-plan reaction should forward as a plan approval; got %d forwards", got)
+	}
+}
+
+func TestTick_AnchorCommentIdRepoint(t *testing.T) {
+	// The poller resolves the comment to poll from the anchor's
+	// status_comment_posted id (#1054), not the deleted plan_full rows.
+	// Reactions are keyed by that comment id in the fake.
+	fx := newFixture(t)
+	fx.seedReactions(reaction(21, githubclient.ReactRocket, "carol"))
+
+	fx.ticker.Tick(context.Background())
+
+	if fx.reactions.calls != 1 {
+		t.Fatalf("expected the poller to poll the anchor comment id; got %d calls", fx.reactions.calls)
+	}
+	if got := len(fx.approvals.calls); got != 1 {
+		t.Errorf("expected the anchor-id-keyed reaction to forward; got %d", got)
 	}
 }
 
@@ -479,31 +582,33 @@ func TestTick_MultipleApprovalShapedReactions_AllForwarded(t *testing.T) {
 	}
 }
 
-func TestTick_PlanUpdatedRow_TreatedSameAsPlanFull(t *testing.T) {
-	// The `update_on_change` flow writes KindPlanUpdated rows on
-	// subsequent edits (#377). The latest-id walk should pick
-	// those up.
+func TestTick_LegacyPlanUpdatedRow_IgnoredAnchorIdWins(t *testing.T) {
+	// Legacy runs may still carry KindPlanUpdated rows on the
+	// issue_commented category (#377), but the poller now resolves the
+	// comment to poll from the anchor's status_comment_posted id
+	// (#1054), NOT those rows. A stale legacy row carrying a DIFFERENT
+	// comment id must be ignored — the anchor id is canonical.
 	fx := newFixture(t)
-	// Append a plan_updated row with the SAME comment id (edit-in-place).
 	r := fx.runID
 	s := fx.stageID
 	payload, _ := json.Marshal(map[string]any{
 		"kind":              string(issuecomment.KindPlanUpdated),
 		"issue_number":      42,
 		"repo":              "x/y",
-		"github_comment_id": fx.commentID,
+		"github_comment_id": int64(9999), // a different, stale id
 	})
 	fx.audit.seed(&audit.Entry{
 		ID: uuid.New(), RunID: &r, StageID: &s,
 		Category: issuecomment.CategoryIssueCommented, Payload: payload,
 		Timestamp: fx.commentAt.Add(time.Minute),
 	})
+	// Reactions live only under the anchor comment id, not the stale id.
 	fx.seedReactions(reaction(11, githubclient.ReactHooray, "eve"))
 
 	fx.ticker.Tick(context.Background())
 
 	if got := len(fx.approvals.calls); got != 1 {
-		t.Errorf("expected approval forwarded after plan_updated edit; got %d", got)
+		t.Errorf("expected the anchor-id reaction forwarded (legacy row ignored); got %d", got)
 	}
 }
 

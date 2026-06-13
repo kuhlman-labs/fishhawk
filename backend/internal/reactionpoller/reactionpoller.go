@@ -229,12 +229,17 @@ func (t *Ticker) Tick(ctx context.Context) {
 // per-tick observability metric); false when the cadence gate
 // skipped it or the stage had no plan comment to poll.
 func (t *Ticker) pollStage(ctx context.Context, logger *slog.Logger, now time.Time, s *run.Stage) bool {
-	commentID, commentPostedAt, ok := t.planCommentMeta(ctx, s.RunID)
+	commentID, planExistsAt, ok := t.planApprovalMeta(ctx, s.RunID)
 	if !ok {
 		return false
 	}
 
-	cadence := t.cadenceFor(now, commentPostedAt)
+	// Cadence ages off plan EXISTENCE, not the anchor comment's
+	// posted-at (#1054): the anchor is created at run dispatch, before
+	// any plan, so the comment's own age would force every run onto the
+	// slow tier immediately. Plan-existence age preserves the
+	// "reactions land within minutes of plan posting → poll fast" intent.
+	cadence := t.cadenceFor(now, planExistsAt)
 	if !t.shouldPoll(s.ID, now, cadence) {
 		return false
 	}
@@ -288,7 +293,7 @@ func (t *Ticker) pollStage(ctx context.Context, logger *slog.Logger, now time.Ti
 		if _, already := seen[r.ID]; already {
 			continue
 		}
-		t.handleNewReaction(ctx, logger, runRow, s, commentID, issueNumber, r)
+		t.handleNewReaction(ctx, logger, runRow, s, commentID, issueNumber, planExistsAt, r)
 	}
 
 	return true
@@ -305,6 +310,7 @@ func (t *Ticker) handleNewReaction(
 	stage *run.Stage,
 	commentID int64,
 	issueNumber int,
+	planExistsAt time.Time,
 	r githubclient.IssueCommentReaction,
 ) {
 	stageID := stage.ID
@@ -337,6 +343,26 @@ func (t *Ticker) handleNewReaction(
 		return
 	}
 
+	// Plan-existence cutoff (#1054, binding condition 2): the anchor
+	// comment exists from run creation, so a reaction placed BEFORE the
+	// plan was generated cannot be a plan approval — admitting it would
+	// let a pre-plan thumbs-up clear the gate the moment the plan lands.
+	// Drop any approval-shaped reaction whose placement time precedes
+	// plan existence. A zero CreatedAt (GitHub omitted the field, or a
+	// legacy fixture) is admitted — absence of a timestamp is not
+	// evidence the reaction predates the plan, and dropping a real
+	// approval on a parse quirk is the worse failure. The dedup audit
+	// row was already written above, so a dropped reaction is not
+	// re-evaluated.
+	if !r.CreatedAt.IsZero() && r.CreatedAt.Before(planExistsAt) {
+		logger.LogAttrs(ctx, slog.LevelInfo, "reactionpoller: reaction predates plan; not a plan approval",
+			slog.String("run_id", runRow.ID.String()),
+			slog.Int64("reaction_id", r.ID),
+			slog.Time("reaction_created_at", r.CreatedAt),
+			slog.Time("plan_exists_at", planExistsAt))
+		return
+	}
+
 	if err := t.Approvals.HandleApprovalCommand(ctx, webhook.ApprovalCommandParams{
 		Repo:           runRow.Repo,
 		IssueNumber:    issueNumber,
@@ -354,39 +380,59 @@ func (t *Ticker) handleNewReaction(
 	}
 }
 
-// planCommentMeta walks the run's `issue_commented` audit rows for
-// the latest `plan_full` or `plan_updated` entry and returns the
-// (comment id, posted-at) pair. Returns ok=false when no plan
-// comment exists yet (the legacy summary path or the pre-#337
-// stage of an in-progress run).
-func (t *Ticker) planCommentMeta(ctx context.Context, runID uuid.UUID) (int64, time.Time, bool) {
-	entries, err := t.Audit.ListForRunByCategory(ctx, runID, issuecomment.CategoryIssueCommented)
-	if err != nil || len(entries) == 0 {
+// planApprovalMeta resolves the two facts the poller needs to decide
+// whether (and how fast) to poll a plan stage for approval reactions
+// (#1054):
+//
+//   - The anchor comment id: the run's living anchor (#1054) is the
+//     canonical comment reactions land on. Its id is recorded on the
+//     `status_comment_posted` category, latest-row-wins (the
+//     edit-in-place anchor keeps the same id across its lifetime).
+//     This supersedes the pre-#1054 `plan_full`/`plan_updated` lookup;
+//     those plan-on-issue comments no longer exist.
+//   - The plan-existence instant: the first `plan_generated` audit
+//     timestamp for the run. Used both as the cadence age origin and
+//     as the approval cutoff (binding condition 2) — a reaction placed
+//     before this instant is not a plan approval.
+//
+// Returns ok=false when either fact is missing: no anchor comment yet
+// (run just created, comment not posted), or no plan generated yet (no
+// approvable plan, so nothing to poll for).
+func (t *Ticker) planApprovalMeta(ctx context.Context, runID uuid.UUID) (commentID int64, planExistsAt time.Time, ok bool) {
+	statusEntries, err := t.Audit.ListForRunByCategory(ctx, runID, issuecomment.CategoryStatusCommentPosted)
+	if err != nil {
 		return 0, time.Time{}, false
 	}
-	// First-write wins for posted-at; latest-write wins for the
-	// comment id (the edit-in-place path keeps the same id). Walk
-	// once forward to capture the first plan-shaped row, then once
-	// in reverse for the latest id.
-	var firstTimestamp time.Time
-	var latestID int64
-	for _, e := range entries {
-		k := extractKind(e.Payload)
-		if k != string(issuecomment.KindPlanFull) && k != string(issuecomment.KindPlanUpdated) {
-			continue
-		}
-		if firstTimestamp.IsZero() {
-			firstTimestamp = e.Timestamp
-		}
-		if id := extractCommentID(e.Payload); id > 0 {
-			latestID = id
+	// Latest-write wins for the anchor comment id.
+	for i := len(statusEntries) - 1; i >= 0; i-- {
+		if id := extractCommentID(statusEntries[i].Payload); id > 0 {
+			commentID = id
+			break
 		}
 	}
-	if latestID == 0 {
+	if commentID == 0 {
 		return 0, time.Time{}, false
 	}
-	return latestID, firstTimestamp, true
+
+	planEntries, err := t.Audit.ListForRunByCategory(ctx, runID, planGeneratedCategory)
+	if err != nil || len(planEntries) == 0 {
+		return 0, time.Time{}, false
+	}
+	// First-write wins for plan existence: the earliest plan_generated
+	// is when a plan first existed for the run.
+	planExistsAt = planEntries[0].Timestamp
+	for _, e := range planEntries {
+		if e.Timestamp.Before(planExistsAt) {
+			planExistsAt = e.Timestamp
+		}
+	}
+	return commentID, planExistsAt, true
 }
+
+// planGeneratedCategory is the audit category the plan-upload handler
+// appends when a standard_v1 plan artifact lands (server/plan.go). The
+// first such entry's timestamp is the plan-existence cutoff (#1054).
+const planGeneratedCategory = "plan_generated"
 
 // observedReactionIDs reads the `plan_reaction_observed` rows for
 // the run and returns the set of GitHub reaction IDs already
@@ -448,16 +494,6 @@ func (t *Ticker) recordLastPoll(stageID uuid.UUID, now time.Time) {
 		t.lastPolledAt = make(map[uuid.UUID]time.Time, 8)
 	}
 	t.lastPolledAt[stageID] = now
-}
-
-// extractKind reads the `kind` field from an audit payload.
-// Empty string when the payload doesn't decode or carries no kind.
-func extractKind(raw json.RawMessage) string {
-	var p struct {
-		Kind string `json:"kind"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	return p.Kind
 }
 
 // extractCommentID reads `github_comment_id` from the

@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -50,415 +51,6 @@ func happyDeps(t *testing.T) (uuid.UUID, *fakeGitHub, *fakeAudit, *issuecomment.
 	return runID, gh, au, n
 }
 
-func TestNotifyPlanReady_GatedRun_LinksToApprovalSurface(t *testing.T) {
-	runID, gh, _, n := happyDeps(t)
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	p := &plan.Plan{
-		Summary: "Add a feature",
-		Scope: plan.Scope{Files: []plan.ScopeFile{
-			{Path: "x.go", Operation: plan.FileOpModify},
-			{Path: "y.go", Operation: plan.FileOpCreate},
-		}},
-	}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, p); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 GitHub call; got %d", len(gh.calls))
-	}
-	body := gh.calls[0].body
-	if !strings.Contains(body, "Plan ready") {
-		t.Errorf("body should reference plan ready: %q", body)
-	}
-	if !strings.Contains(body, "Add a feature") {
-		t.Errorf("body should include summary: %q", body)
-	}
-	if !strings.Contains(body, "`x.go`") || !strings.Contains(body, "`y.go`") {
-		t.Errorf("body should include file paths: %q", body)
-	}
-	// The approval link must include the /runs/<run_id> prefix
-	// before the /stages/<stage_id> segment — the SPA route is
-	// /runs/:runId/stages/:stageId; pre-#273 this asserted only on
-	// the trailing /stages/<id> shape, which pinned a broken URL
-	// in place (every plan-ready comment 404'd).
-	wantURL := "/runs/" + runID.String() + "/stages/" + planStage.ID.String()
-	if !strings.Contains(body, wantURL) {
-		t.Errorf("body should link to %q (run-scoped stage URL): %q", wantURL, body)
-	}
-	// The typed-reply / slash-reject discovery hint is plan-on-issue-
-	// only (E17.5 / #373). The legacy summary path must not advertise
-	// the approval reply tokens, or reviewers reading the summary
-	// comment will try +1 there and get silence.
-	for _, unwanted := range []string{"+1", "/fishhawk reject"} {
-		if strings.Contains(body, unwanted) {
-			t.Errorf("legacy summary body should not contain %q: %q", unwanted, body)
-		}
-	}
-}
-
-func TestNotifyPlanReady_GatelessRun_LinksToRunPage(t *testing.T) {
-	runID, gh, _, n := happyDeps(t)
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: false}
-	p := &plan.Plan{Summary: "x", Scope: plan.Scope{Files: []plan.ScopeFile{{Path: "a.go", Operation: plan.FileOpModify}}}}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, p); err != nil {
-		t.Fatal(err)
-	}
-	body := gh.calls[0].body
-	if !strings.Contains(body, "/runs/"+runID.String()) {
-		t.Errorf("body should link to run page for gateless run: %q", body)
-	}
-	if strings.Contains(body, "/stages/") {
-		t.Errorf("body should not link to a stage page for gateless run: %q", body)
-	}
-}
-
-func TestNotifyPlanReady_TruncatesLongSummaryAndFiles(t *testing.T) {
-	runID, gh, _, n := happyDeps(t)
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	long := strings.Repeat("a", 400)
-	files := make([]plan.ScopeFile, 25)
-	for i := range files {
-		files[i] = plan.ScopeFile{Path: "f" + strings.Repeat("x", i), Operation: plan.FileOpModify}
-	}
-	p := &plan.Plan{Summary: long, Scope: plan.Scope{Files: files}}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, p); err != nil {
-		t.Fatal(err)
-	}
-	body := gh.calls[0].body
-	if !strings.Contains(body, "...") {
-		t.Errorf("expected summary ellipsis: %q", body)
-	}
-	if !strings.Contains(body, "and 15 more") {
-		t.Errorf("expected '…and 15 more' file list footer: %q", body)
-	}
-}
-
-// fullPlanSpecYAML returns a minimal but valid workflow spec where
-// the plan stage's `produces.persistence` opts into the
-// originating_issue / rendered_comment surface (E17.2 / #337). The
-// `update_on_change` flag is toggled by the caller via a sprintf
-// param so tests can flip behavior without forking the YAML.
-func fullPlanSpecYAML(updateOnChange bool) []byte {
-	return []byte(fmt.Sprintf(`version: "0.3"
-roles:
-  tech_lead:
-    members: ["@org/leads"]
-workflows:
-  feature_change:
-    stages:
-      - id: plan
-        type: plan
-        executor:
-          agent: claude-code
-        inputs:
-          - source: github_issue
-            required: true
-        produces:
-          - artifact: plan
-            schema: standard_v1
-            persistence:
-              - target: originating_issue
-                mode: rendered_comment
-                update_on_change: %t
-        gates:
-          - type: approval
-            approvers:
-              any_of: [tech_lead]
-      - id: implement
-        type: implement
-        executor:
-          agent: claude-code
-`, updateOnChange))
-}
-
-// summaryOnlySpecYAML returns a workflow spec whose plan stage does
-// NOT declare originating_issue persistence — the legacy summary
-// path should fire.
-func summaryOnlySpecYAML() []byte {
-	return []byte(`version: "0.3"
-workflows:
-  feature_change:
-    stages:
-      - id: plan
-        type: plan
-        executor:
-          agent: claude-code
-        inputs:
-          - source: github_issue
-            required: true
-        produces:
-          - artifact: plan
-            schema: standard_v1
-        gates:
-          - type: approval
-            approvers:
-              any_of: ["@org/leads"]
-      - id: implement
-        type: implement
-        executor:
-          agent: claude-code
-`)
-}
-
-// fullPlanFixture returns a plan with every field populated so the
-// rendered-comment body covers all sections.
-func fullPlanFixture() *plan.Plan {
-	return &plan.Plan{
-		Summary: "Refactor the dispatcher to skip the watchdog timer in dry-run mode.",
-		Scope: plan.Scope{
-			Files: []plan.ScopeFile{
-				{Path: "backend/internal/webhook/dispatcher.go", Operation: plan.FileOpModify},
-				{Path: "backend/internal/webhook/dispatcher_test.go", Operation: plan.FileOpModify},
-			},
-		},
-		Approach: []plan.ApproachStep{
-			{Step: 1, Description: "Add a dryRun field to dispatchOptions."},
-			{Step: 2, Description: "Skip the watchdog when dryRun is true."},
-			{Step: 3, Description: "Add a unit test covering the new branch."},
-		},
-		Verification: plan.Verification{
-			TestStrategy: "Run the dispatcher test suite plus the new dry-run case.",
-			RollbackPlan: "Revert the PR; the dispatcher returns to its prior shape.",
-		},
-		RisksAndAssumptions: []string{
-			"Operators set dryRun via a feature flag — no env var landed yet.",
-		},
-	}
-}
-
-func TestNotifyPlanReady_FullPlanSpec_PostsFullDocument(t *testing.T) {
-	// Spec opts into originating_issue + rendered_comment; the
-	// notifier renders the full plan doc and posts it. The legacy
-	// "Plan ready" summary phrase should NOT appear.
-	runID := uuid.New()
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID:             runID,
-		Repo:           "x/y",
-		WorkflowID:     "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(true),
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub:      gh,
-		Runs:        &fakeRuns{runs: runs},
-		Audit:       au,
-		ExternalURL: "https://app.fishhawk.example.com",
-		Now:         func() time.Time { return time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC) },
-	})
-
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	p := fullPlanFixture()
-
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, p); err != nil {
-		t.Fatalf("NotifyPlanReady: %v", err)
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
-	}
-	body := gh.calls[0].body
-	// The full-plan path doesn't use the "Plan ready" phrase — its
-	// header is "Fishhawk plan for Run …".
-	if strings.Contains(body, "Plan ready") {
-		t.Errorf("body should not use the legacy summary phrase: %q", body)
-	}
-	for _, want := range []string{
-		"Fishhawk plan",
-		"feature_change",
-		p.Summary,
-		"Scope",
-		"Approach",
-		"Refactor the dispatcher",
-		"Verification",
-		"Test strategy",
-		"Rollback plan",
-		"Risks & assumptions",
-		"Approve in the dashboard",
-		"+1",
-		"/fishhawk reject",
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("body missing %q\n---\n%s", want, body)
-		}
-	}
-
-	// Audit row records the kind + comment id (the latter so the
-	// next post can edit).
-	if len(au.appended) != 1 {
-		t.Fatalf("expected 1 audit row; got %d", len(au.appended))
-	}
-	var pl map[string]any
-	_ = json.Unmarshal(au.appended[0].Payload, &pl)
-	if pl["kind"] != string(issuecomment.KindPlanFull) {
-		t.Errorf("audit kind = %v, want plan_full", pl["kind"])
-	}
-	if id, _ := pl["github_comment_id"].(float64); int64(id) != 1 {
-		t.Errorf("audit github_comment_id = %v, want 1", pl["github_comment_id"])
-	}
-}
-
-func TestNotifyPlanReady_FullPlanSpec_UpdateOnChange_EditsExistingComment(t *testing.T) {
-	// Pre-seed a KindPlanFull audit row so the second post finds
-	// the comment id and takes the edit-in-place path. update_on_
-	// change=true is on in the spec.
-	runID := uuid.New()
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{
-		"kind":              string(issuecomment.KindPlanFull),
-		"issue_number":      42,
-		"repo":              "x/y",
-		"github_comment_id": 7777,
-	})
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID:             runID,
-		Repo:           "x/y",
-		WorkflowID:     "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(true),
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub:      gh,
-		Runs:        &fakeRuns{runs: runs},
-		Audit:       au,
-		ExternalURL: "https://app.fishhawk.example.com",
-		Now:         func() time.Time { return time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC) },
-	})
-
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatalf("NotifyPlanReady: %v", err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("expected 0 create calls; got %d", len(gh.calls))
-	}
-	if len(gh.updateCalls) != 1 {
-		t.Fatalf("expected 1 update call; got %d", len(gh.updateCalls))
-	}
-	if gh.updateCalls[0].commentID != 7777 {
-		t.Errorf("edit commentID = %d, want 7777 (seeded)", gh.updateCalls[0].commentID)
-	}
-	// Fresh audit row for the update.
-	if len(au.appended) != 1 {
-		t.Fatalf("expected 1 new audit row; got %d", len(au.appended))
-	}
-	var pl map[string]any
-	_ = json.Unmarshal(au.appended[0].Payload, &pl)
-	if pl["kind"] != string(issuecomment.KindPlanUpdated) {
-		t.Errorf("audit kind = %v, want plan_updated", pl["kind"])
-	}
-}
-
-// TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Approve covers
-// #377: re-fire after a plan-approve writes an `_Status: approved
-// by @x · implementing now_` footer onto the edited plan comment,
-// reading the approver from the audit chain's latest approval row.
-func TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Approve(t *testing.T) {
-	runID := uuid.New()
-	planStageID := uuid.New()
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	// Pre-seed the prior plan comment so notifyFullPlan takes the
-	// edit-in-place path on this call.
-	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{
-		"kind":              string(issuecomment.KindPlanFull),
-		"issue_number":      42,
-		"repo":              "x/y",
-		"github_comment_id": 4242,
-	})
-	// Pre-seed the approval row on the plan stage. notifyFullPlan
-	// reads this via latestPlanApproval and feeds it to the renderer.
-	au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{
-		"stage_id": planStageID.String(),
-		"decision": "approve",
-		"approver": "alice",
-	})
-
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(true),
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub:      gh,
-		Runs:        &fakeRuns{runs: runs},
-		Audit:       au,
-		ExternalURL: "https://app.fishhawk.example.com",
-		Now:         func() time.Time { return time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC) },
-	})
-	planStage := &run.Stage{ID: planStageID, Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatalf("NotifyPlanReady: %v", err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("approval re-render should edit, not create: %d new comments", len(gh.calls))
-	}
-	if len(gh.updateCalls) != 1 {
-		t.Fatalf("expected 1 edit; got %d", len(gh.updateCalls))
-	}
-	body := gh.updateCalls[0].body
-	if !strings.Contains(body, "_Status: approved by @alice · implementing now_") {
-		t.Errorf("edited body should carry the approval footer; got:\n%s", body)
-	}
-}
-
-// TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Reject covers
-// the reject side of #377: a plan-reject audit row produces the
-// `_Status: rejected by @x_` footer on the next re-render. No
-// reason rendered because v0 doesn't store one on the approval
-// row.
-func TestNotifyPlanReady_FullPlanSpec_ApprovalFooter_Reject(t *testing.T) {
-	runID := uuid.New()
-	planStageID := uuid.New()
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{
-		"kind":              string(issuecomment.KindPlanFull),
-		"issue_number":      42,
-		"repo":              "x/y",
-		"github_comment_id": 4243,
-	})
-	au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{
-		"stage_id": planStageID.String(),
-		"decision": "reject",
-		"approver": "bob",
-	})
-
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(true),
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub:      gh,
-		Runs:        &fakeRuns{runs: runs},
-		Audit:       au,
-		ExternalURL: "https://app.fishhawk.example.com",
-		Now:         func() time.Time { return time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC) },
-	})
-	planStage := &run.Stage{ID: planStageID, Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatalf("NotifyPlanReady: %v", err)
-	}
-	if len(gh.updateCalls) != 1 {
-		t.Fatalf("expected 1 edit; got %d", len(gh.updateCalls))
-	}
-	body := gh.updateCalls[0].body
-	if !strings.Contains(body, "_Status: rejected by @bob_") {
-		t.Errorf("edited body should carry the reject footer; got:\n%s", body)
-	}
-}
-
-// TestPlanStatusFooterForAuditPayload_PrefersGithubLogin pins the
 // #751 fix at the render seam: when the approval audit payload carries
 // a resolved approver_github_login, the footer `@`-mentions THAT login
 // even though the provenance `approver` is the raw MCP token subject
@@ -695,210 +287,6 @@ func mustJSON(t *testing.T, v any) []byte {
 		t.Fatalf("marshal: %v", err)
 	}
 	return b
-}
-
-// TestNotifyPlanReady_FullPlanSpec_NoApprovalYet_NoFooter pins the
-// awaiting-approval first-post case: no `approval_submitted` rows
-// for the plan stage → no status footer in the body.
-func TestNotifyPlanReady_FullPlanSpec_NoApprovalYet_NoFooter(t *testing.T) {
-	runID := uuid.New()
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(true),
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub:      gh,
-		Runs:        &fakeRuns{runs: runs},
-		Audit:       au,
-		ExternalURL: "https://app.fishhawk.example.com",
-		Now:         func() time.Time { return time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC) },
-	})
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatalf("NotifyPlanReady: %v", err)
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
-	}
-	body := gh.calls[0].body
-	if strings.Contains(body, "_Status:") {
-		t.Errorf("body should NOT carry a status footer pre-approval; got:\n%s", body)
-	}
-}
-
-func TestNotifyPlanReady_FullPlanSpec_NoUpdateOnChange_SkipsOnSecondCall(t *testing.T) {
-	// update_on_change=false: the post is one-shot. A second call
-	// after the first lands the audit row should silently skip.
-	runID := uuid.New()
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{
-		"kind":              string(issuecomment.KindPlanFull),
-		"issue_number":      42,
-		"repo":              "x/y",
-		"github_comment_id": 5555,
-	})
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
-		TriggerSource: run.TriggerGitHubIssue, TriggerRef: ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(false), // update_on_change=false
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: &fakeRuns{runs: runs}, Audit: au,
-		ExternalURL: "https://app.fishhawk.example.com",
-	})
-
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.calls)+len(gh.updateCalls) != 0 {
-		t.Errorf("expected no GitHub calls when update_on_change=false; got %d creates + %d updates",
-			len(gh.calls), len(gh.updateCalls))
-	}
-	if len(au.appended) != 0 {
-		t.Errorf("no audit append expected on skip; got %d", len(au.appended))
-	}
-}
-
-func TestNotifyPlanReady_SummaryOnlySpec_UsesLegacyPath(t *testing.T) {
-	// Spec lacks originating_issue persistence; the legacy summary
-	// path posts a KindPlan row with the "Plan ready" phrase.
-	runID := uuid.New()
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
-		TriggerSource: run.TriggerGitHubIssue, TriggerRef: ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   summaryOnlySpecYAML(),
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: &fakeRuns{runs: runs}, Audit: au,
-		ExternalURL: "https://app.fishhawk.example.com",
-	})
-
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 create call (legacy summary); got %d", len(gh.calls))
-	}
-	if !strings.Contains(gh.calls[0].body, "Plan ready") {
-		t.Errorf("legacy path should use 'Plan ready' phrase: %q", gh.calls[0].body)
-	}
-	// Legacy audit row stays KindPlan, no github_comment_id.
-	if len(au.appended) != 1 {
-		t.Fatalf("expected 1 audit row; got %d", len(au.appended))
-	}
-	var pl map[string]any
-	_ = json.Unmarshal(au.appended[0].Payload, &pl)
-	if pl["kind"] != string(issuecomment.KindPlan) {
-		t.Errorf("legacy audit kind = %v, want plan", pl["kind"])
-	}
-	if _, ok := pl["github_comment_id"]; ok {
-		t.Errorf("legacy summary should not record github_comment_id: %+v", pl)
-	}
-}
-
-func TestNotifyPlanReady_FullPlanSpec_OperatorDeletedComment_FallsBackToCreate(t *testing.T) {
-	// Pre-seed a KindPlanFull row; GitHub returns ErrNotFound on
-	// UpdateIssueComment (operator manually deleted the comment).
-	// The notifier creates a fresh comment + appends a KindPlanFull
-	// audit row carrying the new id.
-	runID := uuid.New()
-	gh := &fakeGitHub{updateErr: githubclient.ErrNotFound}
-	au := &fakeAudit{}
-	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{
-		"kind":              string(issuecomment.KindPlanFull),
-		"issue_number":      42,
-		"repo":              "x/y",
-		"github_comment_id": 4242,
-	})
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
-		TriggerSource: run.TriggerGitHubIssue, TriggerRef: ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(true),
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: &fakeRuns{runs: runs}, Audit: au,
-		ExternalURL: "https://app.fishhawk.example.com",
-	})
-
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.updateCalls) != 1 {
-		t.Errorf("expected 1 update attempt (404'd); got %d", len(gh.updateCalls))
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 fresh create after 404; got %d", len(gh.calls))
-	}
-}
-
-func TestNotifyPlanReady_FullPlanSpec_TruncatesAtGitHubLimit(t *testing.T) {
-	// Build a plan whose rendered body exceeds the 65,536-byte
-	// cap; the renderer truncates with a "view full plan" link.
-	runID := uuid.New()
-	gh := &fakeGitHub{}
-	au := &fakeAudit{}
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
-		TriggerSource: run.TriggerGitHubIssue, TriggerRef: ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(true),
-	}}
-	n := issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: &fakeRuns{runs: runs}, Audit: au,
-		ExternalURL: "https://app.fishhawk.example.com",
-	})
-
-	// One 100KB risk pushes the body well past the cap.
-	huge := strings.Repeat("a", 100_000)
-	p := &plan.Plan{
-		Summary:             "x",
-		RisksAndAssumptions: []string{huge},
-	}
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, p); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
-	}
-	body := gh.calls[0].body
-	if got := len(body); got > issuecomment.MaxIssueCommentBodyBytes {
-		t.Errorf("body length %d exceeds cap %d", got, issuecomment.MaxIssueCommentBodyBytes)
-	}
-	if !strings.Contains(body, "truncated") {
-		t.Errorf("body should carry truncation marker: %q", body[len(body)-200:])
-	}
-	if !strings.Contains(body, "view full plan") {
-		t.Errorf("body should link to the SPA plan view: %q", body[len(body)-200:])
-	}
-}
-
-func TestNotifyPlanReady_DedupsViaAuditLog(t *testing.T) {
-	runID, gh, au, n := happyDeps(t)
-	au.preSeed(runID, issuecomment.CategoryIssueCommented, map[string]any{"kind": "plan"})
-
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-	p := &plan.Plan{Summary: "x"}
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, p); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.calls) != 0 {
-		t.Errorf("expected 0 GitHub calls (deduped); got %d", len(gh.calls))
-	}
 }
 
 func TestNotifyCIRetry_PostsCommentAndAuditEntry(t *testing.T) {
@@ -1757,7 +1145,7 @@ func (f *fakeAudit) preSeed(runID uuid.UUID, category string, payload map[string
 	body, _ := json.Marshal(payload)
 	r := runID
 	f.preSeeds = append(f.preSeeds, &audit.Entry{
-		ID: uuid.New(), RunID: &r, Category: category, Payload: body,
+		ID: uuid.New(), Sequence: int64(len(f.preSeeds) + 1), RunID: &r, Category: category, Payload: body,
 	})
 }
 
@@ -1770,7 +1158,7 @@ func (f *fakeAudit) preSeedWithStage(runID, stageID uuid.UUID, category string, 
 	r := runID
 	s := stageID
 	f.preSeeds = append(f.preSeeds, &audit.Entry{
-		ID: uuid.New(), RunID: &r, StageID: &s, Category: category, Payload: body,
+		ID: uuid.New(), Sequence: int64(len(f.preSeeds) + 1), RunID: &r, StageID: &s, Category: category, Payload: body,
 	})
 }
 
@@ -1792,7 +1180,7 @@ func (f *fakeAudit) appendedToEntries() []*audit.Entry {
 		r := p.RunID
 		out = append(out, &audit.Entry{
 			ID:        uuid.New(),
-			Sequence:  int64(i + 1),
+			Sequence:  int64(len(f.preSeeds) + i + 1),
 			RunID:     &r,
 			StageID:   p.StageID,
 			Timestamp: p.Timestamp,
@@ -1837,106 +1225,132 @@ func (f *fakeAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Ent
 	return out, nil
 }
 
-// newFullPlanNotifier wires the rendered_comment full-plan path
-// (mirrors TestNotifyPlanReady_FullPlanSpec_PostsFullDocument's setup)
-// so the #983 scope-cap line tests can pre-seed plan_scope_precheck
-// audit entries and assert the rendered body.
-func newFullPlanNotifier(t *testing.T) (uuid.UUID, *fakeGitHub, *fakeAudit, *issuecomment.Notifier) {
+// ---------------------------------------------------------------------
+// Living-anchor cross-boundary integration (#1054).
+// ---------------------------------------------------------------------
+
+type fakeArtifacts struct {
+	byStage map[uuid.UUID][]*artifact.Artifact
+}
+
+func (f *fakeArtifacts) ListForStage(_ context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	return f.byStage[stageID], nil
+}
+
+func planArtifactJSON(t *testing.T, summary string, files ...string) json.RawMessage {
 	t.Helper()
+	p := plan.Plan{Summary: summary}
+	for _, f := range files {
+		p.Scope.Files = append(p.Scope.Files, plan.ScopeFile{Path: f, Operation: plan.FileOpModify})
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestNotifyStatusUpdateForRun_AnchorEndToEnd drives a feature_change
+// shape across the full audit-chain → anchor-projection → GitHub-I/O
+// seam (#1054): a first plan version rejected (with a reason) and
+// replanned, two reviewer verdicts (approve + reject), and the replanned
+// plan parked at the approval gate. Through repeated
+// NotifyStatusUpdateForRun calls it asserts: exactly ONE anchor comment
+// (single status_comment_posted id reused + edited in place), page-class
+// pings posted once each as NEW comments, reviewer verdicts visible
+// inline, the CURRENT plan summary projected from the artifact store, and
+// — the supersede/replan path (concern #2) — the SUPERSEDED plan
+// preserved collapsed with its rejection reason.
+func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 	runID := uuid.New()
+	planStageID := uuid.New()
+	triggerRef := "issue:42"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", WorkflowID: "feature_change", State: run.StateRunning,
+			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef, InstallationID: int64Ptr(99),
+		}},
+		// The plan stage is parked at its approval gate (the replanned v2
+		// awaiting a human) — the precondition for the plan-awaiting ping.
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval},
+		}},
+	}
 	gh := &fakeGitHub{}
 	au := &fakeAudit{}
-	runs := map[uuid.UUID]*run.Run{runID: {
-		ID:             runID,
-		Repo:           "x/y",
-		WorkflowID:     "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     ptrStr("issue:42"),
-		InstallationID: int64Ptr(99),
-		WorkflowSpec:   fullPlanSpecYAML(true),
+	// Round 1: plan v1 generated, reviewed (approve + reject), then the
+	// plan gate REJECTED with an operator reason — this is what retires v1.
+	au.preSeedWithStage(runID, planStageID, "plan_generated", map[string]any{"schema_version": "standard_v1"})
+	au.preSeedWithStage(runID, planStageID, "plan_review_started", map[string]any{})
+	au.preSeedWithStage(runID, planStageID, "plan_reviewed", map[string]any{"reviewer_model": "claude-opus-4-8", "verdict": "approve"})
+	au.preSeedWithStage(runID, planStageID, "plan_reviewed", map[string]any{
+		"reviewer_model": "gpt-5.5", "verdict": "reject",
+		"concerns":  []map[string]any{{"severity": "high", "category": "correctness", "note": "boom"}},
+		"free_form": "the codex note",
+	})
+	au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{
+		"decision": "reject", "approver_github_login": "alice",
+		"rejection_comment": "scoped the wrong fork",
+	})
+	// Round 2: replanned plan v2 generated (now awaiting approval).
+	au.preSeedWithStage(runID, planStageID, "plan_generated", map[string]any{"schema_version": "standard_v1"})
+
+	// Two plan artifacts on the stage: v1 (older, superseded) and v2
+	// (newer, current). loadAnchorPlans orders by CreatedAt.
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		planStageID: {
+			{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan,
+				Content: planArtifactJSON(t, "First attempt on the wrong fork", "a.go"), CreatedAt: time.Unix(100, 0)},
+			{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan,
+				Content: planArtifactJSON(t, "Add the living anchor", "b.go"), CreatedAt: time.Unix(200, 0)},
+		},
 	}}
 	n := issuecomment.New(issuecomment.Deps{
-		GitHub:      gh,
-		Runs:        &fakeRuns{runs: runs},
-		Audit:       au,
-		ExternalURL: "https://app.fishhawk.example.com",
-		Now:         func() time.Time { return time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC) },
+		GitHub: gh, Runs: repoRuns, Audit: au, Artifacts: arts,
+		ExternalURL: "https://app.example",
+		Now:         func() time.Time { return time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC) },
 	})
-	if n == nil {
-		t.Fatal("notifier nil")
-	}
-	return runID, gh, au, n
-}
 
-// TestNotifyPlanReady_FullPlan_ScopeCapLine asserts the #983 headroom
-// line renders under **Scope** when a plan_scope_precheck entry
-// carries a configured max_files_changed.
-func TestNotifyPlanReady_FullPlan_ScopeCapLine(t *testing.T) {
-	runID, gh, au, n := newFullPlanNotifier(t)
-	au.preSeed(runID, "plan_scope_precheck", map[string]any{
-		"workflow_id":        "feature_change",
-		"implement_stage_id": "implement",
-		"violations":         []any{},
-		"scanned_files":      29,
-		"max_files_changed":  30,
-	})
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
+	for i := 0; i < 3; i++ {
+		if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
 
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatalf("NotifyPlanReady: %v", err)
+	anchorCreates, pingCreates := 0, 0
+	for _, c := range gh.calls {
+		if strings.Contains(c.body, "Fishhawk run") {
+			anchorCreates++
+		} else {
+			pingCreates++
+		}
 	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	if anchorCreates != 1 {
+		t.Errorf("expected exactly 1 anchor comment create; got %d", anchorCreates)
 	}
-	body := gh.calls[0].body
-	if !strings.Contains(body, "_29 files in scope; implement-stage cap 30 (headroom 1)._") {
-		t.Errorf("body missing cap line:\n%s", body)
+	// Page-class events in the chain: the plan gate awaiting approval +
+	// a reviewer reject = 2 pings, each fired once across the 3
+	// transitions (the gate-decision reject is not itself a ping class).
+	if pingCreates != 2 {
+		t.Errorf("expected 2 page-class pings (plan awaiting + reviewer reject); got %d", pingCreates)
 	}
-	if strings.Contains(body, "⚠") {
-		t.Errorf("clean precheck must not render the over-cap callout:\n%s", body)
+	if len(gh.updateCalls) < 2 {
+		t.Errorf("expected the anchor to edit in place on later transitions; got %d edits", len(gh.updateCalls))
 	}
-}
 
-// TestNotifyPlanReady_FullPlan_OverCapCallout asserts the ⚠ callout
-// renders when the precheck recorded a max_files_changed violation.
-func TestNotifyPlanReady_FullPlan_OverCapCallout(t *testing.T) {
-	runID, gh, au, n := newFullPlanNotifier(t)
-	au.preSeed(runID, "plan_scope_precheck", map[string]any{
-		"workflow_id":        "feature_change",
-		"implement_stage_id": "implement",
-		"violations": []any{map[string]any{
-			"constraint": "max_files_changed",
-			"detail":     "31 files exceeds cap 30",
-		}},
-		"scanned_files":     31,
-		"max_files_changed": 30,
-	})
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatalf("NotifyPlanReady: %v", err)
+	body := gh.updateCalls[len(gh.updateCalls)-1].body
+	if !strings.Contains(body, "claude-opus-4-8: approve") || !strings.Contains(body, "gpt-5.5: reject (1 high)") {
+		t.Errorf("anchor missing inline reviewer verdicts:\n%s", body)
 	}
-	body := gh.calls[0].body
-	if !strings.Contains(body, "_31 files in scope; implement-stage cap 30 (headroom -1)._") {
-		t.Errorf("body missing over-cap line:\n%s", body)
+	if !strings.Contains(body, "Add the living anchor") {
+		t.Errorf("anchor missing CURRENT plan summary projected from artifact store:\n%s", body)
 	}
-	if !strings.Contains(body, "⚠ This plan exceeds the implement stage's max_files_changed and cannot pass as scoped.") {
-		t.Errorf("body missing over-cap callout:\n%s", body)
+	// Supersede/replan seam (concern #2): the older plan is preserved
+	// collapsed, labeled superseded, WITH its rejection reason.
+	if !strings.Contains(body, "Superseded plan") || !strings.Contains(body, "First attempt on the wrong fork") {
+		t.Errorf("anchor missing superseded plan section:\n%s", body)
 	}
-}
-
-// TestNotifyPlanReady_FullPlan_NoPrecheckEntry_NoCapLine asserts the
-// fail-open fallback: older runs with no plan_scope_precheck entry
-// render with no cap line at all.
-func TestNotifyPlanReady_FullPlan_NoPrecheckEntry_NoCapLine(t *testing.T) {
-	runID, gh, _, n := newFullPlanNotifier(t)
-	planStage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan, RunID: runID, RequiresApproval: true}
-
-	if err := n.NotifyPlanReady(context.Background(), runID, planStage, fullPlanFixture()); err != nil {
-		t.Fatalf("NotifyPlanReady: %v", err)
-	}
-	body := gh.calls[0].body
-	if strings.Contains(body, "implement-stage cap") || strings.Contains(body, "⚠") {
-		t.Errorf("no precheck entry must render no cap line:\n%s", body)
+	if !strings.Contains(body, "scoped the wrong fork") {
+		t.Errorf("superseded plan missing its rejection reason:\n%s", body)
 	}
 }
