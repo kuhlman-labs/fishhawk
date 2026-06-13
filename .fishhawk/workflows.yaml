@@ -118,11 +118,18 @@ workflows:
           # re-verify, before the PR opens. max_iterations=1 = one fix attempt;
           # 0 (or removing this block) restores the prior single-shot behavior.
           # scripts/test is hermetic — integration tests use testcontainers.
-          # Accepted cost: a full scripts/test (-race + testcontainers) runs on
-          # every feature_change implement stage. See #651; robustness #804.
+          # Accepted cost: a full scripts/test verify (golangci-lint + -race +
+          # testcontainers) runs on every feature_change implement stage. See
+          # #651; robustness #804.
+          # `scripts/test verify` (#1064) runs golangci-lint run ./... per module
+          # (CI's exact lint invocation; v2 gofmt/goimports formatters included)
+          # BEFORE the -race test loop, so a gofmt/lint-only defect fails the
+          # gate in-loop — where the agent can still fix it — instead of
+          # red-lining the PR in CI after the agent is terminal (the #1060
+          # recurrence). Timeout bumped 12m→15m to absorb the per-module lint.
           verify:
-            command: "scripts/test"
-            timeout: "12m"
+            command: "scripts/test verify"
+            timeout: "15m"
             max_iterations: 1
         # Advisory implement-review (ADR-027 impl 2/2, #561): agent
         # reviewers read the diff against the approved plan and surface
