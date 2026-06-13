@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
@@ -368,5 +369,22 @@ func TestObserveParkedReview_AuditReadError_SkipsQuietly(t *testing.T) {
 
 	if len(h.au.appended) != 0 {
 		t.Errorf("appended = %+v, want none on a read error", h.au.appended)
+	}
+}
+
+// TestNew_WiresConsolidatedReviewDispatcher pins the #1060 production
+// wiring: server.New must set cfg.Orchestrator.ConsolidatedReview to the
+// constructed Server so the parent consolidated implement review actually
+// dispatches in the real binary (the e2e wires it manually; this guards
+// the serve.go → server.New back-reference both reviewers flagged as the
+// dropped-out-of-scope gap).
+func TestNew_WiresConsolidatedReviewDispatcher(t *testing.T) {
+	orch := &orchestrator.Orchestrator{}
+	s := New(Config{Orchestrator: orch})
+	if orch.ConsolidatedReview == nil {
+		t.Fatal("server.New did not wire cfg.Orchestrator.ConsolidatedReview — consolidated review is inert in production")
+	}
+	if orch.ConsolidatedReview != s {
+		t.Fatal("cfg.Orchestrator.ConsolidatedReview is not the constructed Server")
 	}
 }

@@ -412,6 +412,17 @@ func New(cfg Config) *Server {
 	if cfg.AuditRepo != nil {
 		s.drive = &drive.Engine{Audit: cfg.AuditRepo, Logger: cfg.Logger}
 	}
+	// Wire the gating consolidated-review dispatcher (#1060). The
+	// orchestrator dispatches the parent's consolidated implement
+	// review through the Server, which owns the review machinery.
+	// serve.go constructs the orchestrator before server.New and
+	// passes it in cfg; this back-reference activates the dispatch
+	// (the shared pointer means serve.go's instance sees it). Without
+	// it the field stays nil, the consolidated review never dispatches,
+	// and slice-1's drive gate parks every fan-out parent forever.
+	if cfg.Orchestrator != nil {
+		cfg.Orchestrator.ConsolidatedReview = s
+	}
 	if cfg.GitHub != nil {
 		s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
 			GitHub:      cfg.GitHub,
