@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -386,5 +387,29 @@ func TestNew_WiresConsolidatedReviewDispatcher(t *testing.T) {
 	}
 	if orch.ConsolidatedReview != s {
 		t.Fatal("cfg.Orchestrator.ConsolidatedReview is not the constructed Server")
+	}
+}
+
+// TestNew_WiresAnchorPlanArtifactLister pins the #1069 production wiring:
+// server.New must thread cfg.ArtifactRepo into issuecomment.New so the
+// living anchor (#1054) renders its plan section in the real binary.
+// Without it loadAnchorPlans short-circuits on a nil lister and the anchor
+// silently drops the plan despite a green e2e — the same constructor-seam
+// regression class as #1060. The notifier is only built when GitHub is
+// non-nil and issuecomment.New additionally requires Runs, Audit, and a
+// non-empty ExternalURL, so the Config sets all of them plus ArtifactRepo.
+func TestNew_WiresAnchorPlanArtifactLister(t *testing.T) {
+	s := New(Config{
+		RunRepo:      newOrchestratorRepo(),
+		AuditRepo:    newAuditCompleteAuditFake(),
+		ArtifactRepo: newFakeArtifactRepo(),
+		ExternalURL:  "https://app.fishhawk.example.com",
+		GitHub:       &githubclient.Client{},
+	})
+	if s.issueNotifier == nil {
+		t.Fatal("server.New did not construct the issue notifier with GitHub/Runs/Audit/ExternalURL set")
+	}
+	if !s.issueNotifier.ArtifactListerWired() {
+		t.Fatal("server.New did not thread cfg.ArtifactRepo into issuecomment.New — the living anchor renders no plan in production (#1069)")
 	}
 }

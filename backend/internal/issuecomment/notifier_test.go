@@ -883,6 +883,45 @@ func TestNew_NilDepsReturnsNilNotifier(t *testing.T) {
 	}
 }
 
+// TestArtifactListerWired pins the accessor the server-package wiring
+// test depends on (#1069): nil receiver and an unset Artifacts dep both
+// report false; supplying a lister reports true. This is the contract
+// that lets TestNew_WiresAnchorPlanArtifactLister assert the production
+// constructor carries cfg.ArtifactRepo through to the Notifier.
+func TestArtifactListerWired(t *testing.T) {
+	var nilN *issuecomment.Notifier
+	if nilN.ArtifactListerWired() {
+		t.Error("nil receiver should report unwired")
+	}
+
+	unset := issuecomment.New(issuecomment.Deps{
+		GitHub:      &fakeGitHub{},
+		Runs:        &fakeRuns{},
+		Audit:       &fakeAudit{},
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if unset == nil {
+		t.Fatal("notifier should construct without Artifacts")
+	}
+	if unset.ArtifactListerWired() {
+		t.Error("notifier built without Artifacts should report unwired")
+	}
+
+	wired := issuecomment.New(issuecomment.Deps{
+		GitHub:      &fakeGitHub{},
+		Runs:        &fakeRuns{},
+		Audit:       &fakeAudit{},
+		ExternalURL: "https://app.fishhawk.example.com",
+		Artifacts:   &fakeArtifacts{},
+	})
+	if wired == nil {
+		t.Fatal("notifier should construct with Artifacts")
+	}
+	if !wired.ArtifactListerWired() {
+		t.Error("notifier built with Artifacts should report wired")
+	}
+}
+
 func TestNotifySlashApprovalReply_PostsAndDoesNotDedup(t *testing.T) {
 	_, _, _, n := happyDeps(t)
 	gh := &fakeGitHub{}

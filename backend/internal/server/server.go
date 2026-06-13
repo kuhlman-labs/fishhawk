@@ -440,6 +440,12 @@ func New(cfg Config) *Server {
 			Runs:        cfg.RunRepo,
 			Audit:       cfg.AuditRepo,
 			ExternalURL: cfg.ExternalURL,
+			// Artifacts feeds the living anchor's plan section (#1054).
+			// Without it loadAnchorPlans short-circuits and the anchor
+			// renders no plan in production (#1069 regression) despite a
+			// green e2e — the sibling auditcheckpublisher.New above already
+			// passes the same cfg.ArtifactRepo.
+			Artifacts: cfg.ArtifactRepo,
 		})
 	}
 	s.http = &http.Server{
