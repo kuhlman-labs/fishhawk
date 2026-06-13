@@ -29,8 +29,12 @@ Multi-module Go workspace; **no root `go.mod`**, so `go build ./...` from root f
 ```sh
 scripts/test               # `go test -race ./...` in every registered module
 scripts/test coverage      # the same, plus the aggregate coverage gate
+scripts/test lint          # `golangci-lint run ./...` in every registered module
+scripts/test verify        # lint THEN tests (no coverage) — the runner's verify gate
 scripts/test single -run TestName ./backend/internal/version/   # passthrough
 ```
+
+`scripts/test lint` runs `golangci-lint run ./...` per registered module — byte-for-byte CI's lint invocation (`ci.yml`). Because `.golangci.yml` enables the `gofmt`/`goimports` formatters, golangci-lint v2's `run` fails on unformatted files, so `lint` covers gofmt/goimports drift with no separate gofmt invocation. `scripts/test verify` runs `lint` first (a fast format/lint failure leads the captured output and aborts before the slow test loop) then the test loop, omitting coverage to bound runtime. Both **fail closed** if golangci-lint is absent from PATH — an actionable error naming the v2.x install pin, never a silent skip. The runner's committed-tree implement verify gate runs `scripts/test verify`, so gofmt/golangci-lint defects fail in-loop rather than red-lining the PR in CI after the agent is terminal (#1064).
 
 Per-module without the wrapper (still useful for `go build` and `golangci-lint`):
 

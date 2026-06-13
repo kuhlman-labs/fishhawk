@@ -8,6 +8,8 @@
 # Usage:
 #   scripts/test              run `go test -race ./...` in every module
 #   scripts/test coverage     the gate above + scripts/check-coverage.py
+#   scripts/test lint         run `golangci-lint run ./...` in every module
+#   scripts/test verify       lint + tests (no coverage) — the runner's gate
 #   scripts/test single ARGS  pass-through to `go test -race ARGS`
 #                             example:
 #                             scripts/test single -run TestX ./backend/internal/version/...
@@ -61,6 +63,40 @@ cmd_coverage() {
   python3 "$ROOT/scripts/check-coverage.py" --threshold 80 --exclude '/db/' "${profiles[@]}"
 }
 
+# Fail CLOSED if golangci-lint is missing: the verify gate must never silently
+# skip lint and re-open the gofmt/lint-drift-to-CI gap (#1064). Name the v2.x
+# install pin (the v2.8.0 install.sh tag CI uses, per AGENTS.md / ci.yml) so the
+# error is actionable. A v1 binary rejects this repo's v2-format .golangci.yml,
+# so v2.x is required.
+_require_golangci_lint() {
+  if ! command -v golangci-lint >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+scripts/test: golangci-lint not found on PATH (required for `lint`/`verify`).
+Install golangci-lint v2.x (this repo's .golangci.yml is v2-format; v1 rejects it):
+  curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \
+    | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
+EOF
+    exit 1
+  fi
+}
+
+cmd_lint() {
+  _require_golangci_lint
+  while IFS= read -r m; do
+    printf '>>> %s\n' "$m"
+    (cd "$m" && golangci-lint run ./...)
+  done < <(modules)
+}
+
+# verify: the runner's committed-tree implement gate. Lint FIRST so a fast
+# format/lint failure leads the captured output and aborts (set -e) before the
+# slow test loop. Coverage is intentionally omitted to bound in-loop runtime —
+# it stays on `coverage` and in CI.
+cmd_verify() {
+  cmd_lint
+  cmd_test
+}
+
 cmd_single() {
   if [ "$#" -eq 0 ]; then
     cat >&2 <<'EOF'
@@ -78,6 +114,8 @@ usage: scripts/test [SUBCOMMAND] [ARGS]
 
   test                 (default) run `go test -race ./...` in every module
   coverage             run tests + aggregate coverage gate
+  lint                 run `golangci-lint run ./...` in every module
+  verify               lint + tests (no coverage) — the runner's verify gate
   single ARGS          pass-through to `go test -race ARGS`
   -h | --help | help   show this message
 EOF
@@ -86,6 +124,8 @@ EOF
 case "${1:-test}" in
   test|"")          cmd_test ;;
   coverage|cover)   cmd_coverage ;;
+  lint)             cmd_lint ;;
+  verify)           cmd_verify ;;
   single)           shift; cmd_single "$@" ;;
   -h|--help|help)   usage ;;
   *)
