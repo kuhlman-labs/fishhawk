@@ -1898,7 +1898,7 @@ func TestListOpenPullRequestsByHead_ValidationErrors(t *testing.T) {
 func TestListIssueCommentReactions_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.listReactionsBody = `[
-		{"id":1,"content":"+1","user":{"login":"alice"}},
+		{"id":1,"content":"+1","user":{"login":"alice"},"created_at":"2026-05-01T10:00:00Z"},
 		{"id":2,"content":"rocket","user":{"login":"bob"}}
 	]`
 
@@ -1912,6 +1912,12 @@ func TestListIssueCommentReactions_HappyPath(t *testing.T) {
 	}
 	if got[0].Content != ReactPlusOne || got[0].User.Login != "alice" {
 		t.Errorf("got[0] = %+v", got[0])
+	}
+	// created_at is decoded into CreatedAt (#1054) so the reaction-poller
+	// can compare placement time against plan existence.
+	wantCreated := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	if !got[0].CreatedAt.Equal(wantCreated) {
+		t.Errorf("got[0].CreatedAt = %v, want %v", got[0].CreatedAt, wantCreated)
 	}
 	if got[1].Content != ReactRocket || got[1].User.Login != "bob" {
 		t.Errorf("got[1] = %+v", got[1])

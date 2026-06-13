@@ -57,11 +57,14 @@ func TestNotifyPlanReady_FiresNotifierOnPlanStageTransition(t *testing.T) {
 		AuditRepo: au, ArtifactRepo: arts,
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
-	// Wire a real issuecomment.Notifier with the fake GitHub.
+	// Wire a real issuecomment.Notifier with the fake GitHub. The
+	// living anchor (#1054) projects the plan content from the artifact
+	// store, so the notifier needs the artifact lister.
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{
 		GitHub:      gh,
 		Runs:        rr,
 		Audit:       au,
+		Artifacts:   arts,
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
 
@@ -72,20 +75,22 @@ func TestNotifyPlanReady_FiresNotifierOnPlanStageTransition(t *testing.T) {
 	s.notifyPlanReady(req.Context(), r.ID, planStage)
 
 	if got := gh.calls(); len(got) != 1 {
-		t.Fatalf("expected 1 GitHub call; got %d", len(got))
+		t.Fatalf("expected 1 GitHub call (the anchor comment); got %d", len(got))
 	}
 	c := gh.calls()[0]
 	if c.issueNumber != 42 {
 		t.Errorf("issueNumber = %d", c.issueNumber)
 	}
-	if !strings.Contains(c.body, "Plan ready") {
-		t.Errorf("body should reference plan ready: %q", c.body)
+	// The anchor projects the run header + the plan content from the
+	// artifact store (the plan-on-issue "Plan ready" surface is gone).
+	if !strings.Contains(c.body, "Fishhawk run") {
+		t.Errorf("body should be the anchor projection: %q", c.body)
 	}
-	if !strings.Contains(c.body, "/stages/"+planStage.ID.String()) {
-		t.Errorf("body should link to approval surface: %q", c.body)
+	if !strings.Contains(c.body, "/runs/"+r.ID.String()) {
+		t.Errorf("body should deep-link to the run: %q", c.body)
 	}
 	if !strings.Contains(c.body, "x.go") {
-		t.Errorf("body should include scope file: %q", c.body)
+		t.Errorf("body should include the plan scope file: %q", c.body)
 	}
 }
 
@@ -133,21 +138,22 @@ func TestNotifyPlanReady_RealRunnerOrder_TracePrecedesPlan(t *testing.T) {
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{
-		GitHub: gh, Runs: rr, Audit: au,
+		GitHub: gh, Runs: rr, Audit: au, Artifacts: arts,
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
 	req := httptest.NewRequest("POST", "/", nil)
 
 	// Step 1: trace lands first (the runner's actual order). The
 	// trace-handler's notify hook fires; no plan artifact exists
-	// yet; we should silently skip without commenting.
+	// yet; trace.go's notifyPlanReady loads the plan, sees nil, and
+	// skips before reaching the notifier — no comment.
 	s.notifyPlanReady(req.Context(), r.ID, planStage)
 	if got := gh.calls(); len(got) != 0 {
 		t.Fatalf("trace-handler hook commented before plan artifact existed; got %d calls", len(got))
 	}
 
-	// Step 2: plan upload lands. The plan-upload handler's hook
-	// fires; the artifact is now there; the comment lands.
+	// Step 2: plan upload lands. The plan-upload handler's hook fires;
+	// the artifact is now there; the anchor comment is CREATED.
 	v := "standard_v1"
 	arts.all = append(arts.all, &artifact.Artifact{
 		ID: uuid.New(), StageID: planStage.ID,
@@ -158,18 +164,19 @@ func TestNotifyPlanReady_RealRunnerOrder_TracePrecedesPlan(t *testing.T) {
 	})
 	s.notifyPlanReadyIfReady(req, r.ID, planStage)
 	if got := gh.calls(); len(got) != 1 {
-		t.Fatalf("plan-upload hook should have posted one comment; got %d calls", len(got))
+		t.Fatalf("plan-upload hook should have created the anchor comment; got %d calls", len(got))
 	}
-	if !strings.Contains(gh.calls()[0].body, "Plan ready") {
-		t.Errorf("comment body should reference plan-ready: %q", gh.calls()[0].body)
+	if !strings.Contains(gh.calls()[0].body, "Fishhawk run") {
+		t.Errorf("comment body should be the anchor projection: %q", gh.calls()[0].body)
 	}
 
-	// Step 3: re-fire (e.g. runner retries the plan upload, hits
-	// the idempotent path). Audit-log dedup should keep this a
-	// no-op so the issue doesn't get the same comment twice.
+	// Step 3: re-fire (e.g. runner retries the plan upload). The living
+	// anchor edits in place rather than posting a new comment — so the
+	// CREATE count stays at one (the re-fire goes through
+	// UpdateIssueComment, the single-anchor invariant).
 	s.notifyPlanReadyIfReady(req, r.ID, planStage)
 	if got := gh.calls(); len(got) != 1 {
-		t.Errorf("dedup failed — re-firing the plan-upload hook produced %d calls; want 1", len(got))
+		t.Errorf("single-anchor invariant broken — re-firing produced %d creates; want 1", len(got))
 	}
 }
 
@@ -354,8 +361,16 @@ func (f *planReadyAuditFake) ListAll(context.Context, audit.ListAllParams) ([]*a
 func (f *planReadyAuditFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errPlanReadyFakeNotImpl
 }
-func (f *planReadyAuditFake) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, error) {
-	return nil, errPlanReadyFakeNotImpl
+func (f *planReadyAuditFake) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []*audit.Entry{}
+	for _, e := range f.entries {
+		if e.RunID != nil && *e.RunID == runID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 func (f *planReadyAuditFake) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errPlanReadyFakeNotImpl

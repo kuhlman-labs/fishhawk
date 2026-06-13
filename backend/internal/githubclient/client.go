@@ -1929,6 +1929,14 @@ type IssueCommentReaction struct {
 	User    struct {
 		Login string `json:"login"`
 	} `json:"user"`
+	// CreatedAt is the reaction's placement time, parsed from the
+	// GitHub `created_at` field (RFC3339). The reaction-poller (#1054)
+	// compares it against plan existence so a reaction placed before
+	// the plan was generated is not admitted as a plan approval —
+	// the anchor comment now exists from run creation (before any
+	// plan), so the poller can no longer use the comment's posted-at
+	// as the cutoff. Zero value when GitHub omits the field.
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // IssueCommentReactKind is the closed set GitHub uses for the
