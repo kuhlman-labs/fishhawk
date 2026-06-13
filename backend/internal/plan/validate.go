@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -128,8 +129,12 @@ func Parse(data []byte) (*Plan, error) {
 	return &p, nil
 }
 
-// semanticCheck enforces invariants that JSON Schema cannot express.
-// Currently: sub-plan titles must be unique within a decomposition.
+// semanticCheck enforces invariants that JSON Schema cannot express:
+//   - sub-plan titles must be unique within a decomposition;
+//   - a file path may be scoped by at most one sub-plan (#1062): the
+//     orchestrator partitions per-slice scope.files for commit bounding and
+//     scope-drift detection, so a path claimed by two slices would have the
+//     non-owning slice's edit drift-excluded, silently shipping inert code.
 func semanticCheck(p *Plan) error {
 	if p.Decomposition == nil {
 		return nil
@@ -143,7 +148,58 @@ func semanticCheck(p *Plan) error {
 		}
 		seen[sp.Title] = struct{}{}
 	}
-	return nil
+	return checkCrossSliceSharedFiles(p.Decomposition)
+}
+
+// checkCrossSliceSharedFiles rejects a decomposition whose sub-plans
+// collectively scope the same file path across two or more distinct slices.
+// Only sub-plans that DECLARE a scope are considered — an undeclared scope
+// inherits the parent's full scope.files and so cannot partition unsoundly.
+// A single slice listing the same path twice is collapsed to one claimant.
+func checkCrossSliceSharedFiles(d *Decomposition) error {
+	claimants := make(map[string]map[string]struct{})
+	for _, sp := range d.SubPlans {
+		if sp.Scope == nil {
+			continue
+		}
+		for _, f := range sp.Scope.Files {
+			titles, ok := claimants[f.Path]
+			if !ok {
+				titles = make(map[string]struct{})
+				claimants[f.Path] = titles
+			}
+			titles[sp.Title] = struct{}{}
+		}
+	}
+	var shared []string
+	for path, titles := range claimants {
+		if len(titles) >= 2 {
+			shared = append(shared, path)
+		}
+	}
+	if len(shared) == 0 {
+		return nil
+	}
+	sort.Strings(shared)
+	parts := make([]string, 0, len(shared))
+	for _, path := range shared {
+		titles := make([]string, 0, len(claimants[path]))
+		for t := range claimants[path] {
+			titles = append(titles, t)
+		}
+		sort.Strings(titles)
+		quoted := make([]string, len(titles))
+		for i, t := range titles {
+			quoted[i] = strconv.Quote(t)
+		}
+		parts = append(parts, fmt.Sprintf("file %s is scoped by multiple slices (%s)", path, strings.Join(quoted, ", ")))
+	}
+	return &SemanticError{
+		Message: fmt.Sprintf(
+			"decomposition.sub_plans: %s; keep all edits to one file in a single slice or re-slice along file boundaries",
+			strings.Join(parts, "; "),
+		),
+	}
 }
 
 // Warnings returns advisory strings for a successfully-parsed Plan.

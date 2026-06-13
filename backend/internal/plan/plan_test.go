@@ -435,6 +435,93 @@ func TestParse_DecompositionDuplicateTitles_IsSemanticError(t *testing.T) {
 	}
 }
 
+// subPlanWithScope builds a sub_plans entry whose scope.files lists the given
+// modify-operation paths.
+func subPlanWithScope(title, hint string, paths ...string) map[string]any {
+	files := make([]any, len(paths))
+	for i, p := range paths {
+		files[i] = map[string]any{"path": p, "operation": "modify"}
+	}
+	return map[string]any{
+		"title": title, "scope_hint": hint,
+		"scope":                        map[string]any{"files": files},
+		"predicted_runtime_minutes":    5,
+		"predicted_runtime_confidence": "low",
+	}
+}
+
+// TestParse_DecompositionCrossSliceSharedFile_IsSemanticError covers #1062:
+// two sub-plans whose declared scope.files share a path are rejected because
+// the non-owning slice's edit to that file would be drift-excluded.
+func TestParse_DecompositionCrossSliceSharedFile_IsSemanticError(t *testing.T) {
+	const shared = "backend/internal/server/server.go"
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split by layer",
+			"sub_plans": []any{
+				subPlanWithScope("slice 1", "first", shared, "backend/internal/server/a.go"),
+				subPlanWithScope("slice 2", "second", shared, "backend/internal/server/b.go"),
+			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), shared) {
+		t.Errorf("SemanticError message should name the shared path %q, got %q", shared, se.Error())
+	}
+	if !strings.Contains(se.Error(), "slice 1") || !strings.Contains(se.Error(), "slice 2") {
+		t.Errorf("SemanticError message should name both slices, got %q", se.Error())
+	}
+}
+
+// TestParse_DecompositionDisjointSliceScopes_Succeeds confirms the check does
+// not fire when each slice scopes a distinct set of files.
+func TestParse_DecompositionDisjointSliceScopes_Succeeds(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split by layer",
+			"sub_plans": []any{
+				subPlanWithScope("slice 1", "first", "backend/internal/server/a.go"),
+				subPlanWithScope("slice 2", "second", "backend/internal/server/b.go"),
+			},
+		}
+	})
+	if _, err := plan.Parse(marshalFixture(t, m)); err != nil {
+		t.Fatalf("Parse disjoint-slice decomposition: %v", err)
+	}
+}
+
+// TestParse_DecompositionNoSubPlanScope_Succeeds confirms the check is
+// additive: sub-plans without a declared scope (inheriting the parent's full
+// scope.files) cannot partition unsoundly and must still parse.
+func TestParse_DecompositionNoSubPlanScope_Succeeds(t *testing.T) {
+	if _, err := plan.Parse(marshalFixture(t, planfixture.Decomposed())); err != nil {
+		t.Fatalf("Parse decomposed fixture without sub-plan scope: %v", err)
+	}
+}
+
+// TestParse_DecompositionSingleSliceRepeatedPath_Succeeds confirms only
+// distinct slices trip the check: one slice listing the same path twice is a
+// single claimant, not a cross-slice conflict.
+func TestParse_DecompositionSingleSliceRepeatedPath_Succeeds(t *testing.T) {
+	const dup = "backend/internal/server/server.go"
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split by layer",
+			"sub_plans": []any{
+				subPlanWithScope("slice 1", "first", dup, dup),
+				subPlanWithScope("slice 2", "second", "backend/internal/server/b.go"),
+			},
+		}
+	})
+	if _, err := plan.Parse(marshalFixture(t, m)); err != nil {
+		t.Fatalf("Parse single-slice repeated-path decomposition: %v", err)
+	}
+}
+
 // --- Warnings ---
 
 func TestWarnings_SubPlanSumLessThanParent_Explicit(t *testing.T) {

@@ -241,6 +241,7 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 - `generated_by.timestamp` is within the run's wall-clock window (catches clock-skew or replay).
 - `generated_by.agent` matches the workflow spec's `executor.agent` for the active stage.
 - `decomposition.sub_plans[*].title` must be unique within the array (semantic check in the plan package; returns `*SemanticError` on violation).
+- A file path may appear in at most one sub-plan's `scope.files` within a decomposition. A path scoped by two or more slices returns `*SemanticError` (semantic check in the plan package), because the orchestrator partitions per-slice `scope.files` for commit bounding and scope-drift detection — the non-owning slice's edit to a shared file would be drift-excluded and silently shipped inert (#1062). The planner must re-slice so all edits to one file live in a single slice. Only sub-plans that declare a `scope` are checked; an omitted sub-plan `scope` inherits the parent's full `scope.files` and cannot partition unsoundly.
 
 These cross-references aren't expressible in JSON Schema cleanly.
 
