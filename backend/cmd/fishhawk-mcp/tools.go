@@ -56,6 +56,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerRunStage(srv, resolver)
 	registerRuntimeCalibration(srv, resolver)
 	registerVerifyRun(srv, resolver)
+	registerVouchCommit(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All

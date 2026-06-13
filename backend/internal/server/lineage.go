@@ -23,6 +23,18 @@ import (
 // run is allowed to have placed on its branch.
 var lineageLedgerCategories = []string{"pull_request_opened", "child_pushed", "fixup_pushed"}
 
+// lineageVouchLedgerCategory is the audit category carrying an operator's
+// vouched-commit declaration (#1044). Unlike the own-chain head categories
+// above (whose head_sha payload field names a commit the run itself
+// pushed), each entry's vouched_sha payload field names a foreign commit an
+// operator has DECLARED to be run-authored lineage — an operator's
+// mechanical remediation commit on the run branch that no loop-native
+// remediation could route. The ledger unions these alongside the reported
+// heads, on the run's own chain AND its decomposition children, so a
+// vouched commit attributes cleanly instead of wedging the run it fixed.
+// An UN-vouched foreign commit still violates (fail-closed preserved).
+const lineageVouchLedgerCategory = CategoryOperatorCommitVouched
+
 // lineageChildLedgerCategories are the audit categories read from a
 // decomposition CHILD run's chain when building the PARENT's ledger
 // (#1038). Children push onto the shared parent branch (child_pushed)
@@ -427,7 +439,9 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 
 // buildReportedHeadLedger collects the set of head SHAs this run has
 // reported across its pull_request_opened / child_pushed / fixup_pushed
-// audit entries, plus an explicit ledgerSeedSHA bootstrap (when
+// audit entries, plus the commits an operator has VOUCHED as run-authored
+// lineage (operator_commit_vouched, #1044 — read from the vouched_sha
+// field, not head_sha), plus an explicit ledgerSeedSHA bootstrap (when
 // non-empty).
 //
 // The seed is the CRITICAL out-of-band subtlety. The #858 report-boundary
@@ -478,6 +492,23 @@ func (s *Server) buildReportedHeadLedger(ctx context.Context, runRow *run.Run, l
 		addReportedHeads(ledger, entries)
 	}
 
+	// Union in the commits an operator has VOUCHED on this run's own chain
+	// (#1044): an operator's mechanical remediation commit declared
+	// run-authored lineage. Unlike the head categories these carry the
+	// commit in the vouched_sha payload field, so they read via
+	// addVouchedSHAs. A read error sets complete=false (fail open), matching
+	// the head-category contract above.
+	if vouched, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, lineageVouchLedgerCategory); err != nil {
+		complete = false
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch lineage: list vouched commits failed; ledger incomplete (guard fails open)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("category", lineageVouchLedgerCategory),
+			slog.String("error", err.Error()))
+	} else {
+		addVouchedSHAs(ledger, vouched)
+	}
+
 	// Union in the heads reported by this run's decomposition children.
 	// A standalone run (and every child run itself) has no children, so
 	// this is a no-op and standalone behavior is unchanged.
@@ -508,8 +539,41 @@ func (s *Server) buildReportedHeadLedger(ctx context.Context, runRow *run.Run, l
 			}
 			addReportedHeads(ledger, entries)
 		}
+		// A per-child vouch (an operator vouching a foreign commit against a
+		// child run rather than the parent) unions into the parent's ledger
+		// too. Same fail-open-on-read-error contract.
+		if vouched, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, child.ID, lineageVouchLedgerCategory); err != nil {
+			complete = false
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"branch lineage: list child vouched commits failed; ledger incomplete (guard fails open)",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("child_run_id", child.ID.String()),
+				slog.String("category", lineageVouchLedgerCategory),
+				slog.String("error", err.Error()))
+			continue
+		} else {
+			addVouchedSHAs(ledger, vouched)
+		}
 	}
 	return ledger, complete
+}
+
+// addVouchedSHAs adds every non-empty vouched_sha payload field from the
+// given operator_commit_vouched audit entries to the ledger. Parallel to
+// addReportedHeads, but reads the vouched_sha field an operator's vouch
+// declaration carries instead of head_sha.
+func addVouchedSHAs(ledger map[string]struct{}, entries []*audit.Entry) {
+	for _, e := range entries {
+		var payload struct {
+			VouchedSHA string `json:"vouched_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.VouchedSHA != "" {
+			ledger[payload.VouchedSHA] = struct{}{}
+		}
+	}
 }
 
 // addReportedHeads adds every non-empty head_sha payload field from the

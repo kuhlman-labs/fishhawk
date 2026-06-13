@@ -500,6 +500,48 @@ func (c *apiClient) ResetRunBranch(ctx context.Context, runID uuid.UUID, reason 
 	return &res, nil
 }
 
+// vouchCommitRequest mirrors the backend's
+// `POST /v0/runs/{run_id}/vouch-commit` body
+// (`backend/internal/server/vouch.go::vouchCommitRequest`). Both fields
+// are required — the vouch is an audited operator declaration.
+type vouchCommitRequest struct {
+	SHA    string `json:"sha"`
+	Reason string `json:"reason"`
+}
+
+// VouchCommitResult mirrors the backend's vouch-commit 200 body: the
+// recorded declaration, surfaced back to the operator.
+type VouchCommitResult struct {
+	RunID      string `json:"run_id"`
+	VouchedSHA string `json:"vouched_sha"`
+	Reason     string `json:"reason"`
+}
+
+// VouchCommit declares a foreign commit on a run branch to be run-authored
+// lineage (ADR-035 remediation, #1044), via
+// `POST /v0/runs/{run_id}/vouch-commit`. The vouched SHA is unioned into
+// the reported-head ledger, un-wedging the merge reconciler for an
+// operator's mechanical remediation commit. Operator-token-only
+// (write:stages); distinct from ResetRunBranch (which DROPS an on-top
+// foreign commit) — vouch KEEPS the operator commit and attributes it.
+// 4xx/5xx surfaces:
+//   - 400 validation_failed (empty sha or reason)
+//   - 403 run_token_forbidden (a run-bound agent token attempted the vouch)
+//   - 403 insufficient_scope (token lacks write:stages)
+//   - 404 run_not_found
+//   - 503 vouch_unconfigured (run/audit repositories not wired)
+func (c *apiClient) VouchCommit(ctx context.Context, runID uuid.UUID, sha, reason string) (*VouchCommitResult, error) {
+	body, err := json.Marshal(vouchCommitRequest{SHA: sha, Reason: reason})
+	if err != nil {
+		return nil, fmt.Errorf("marshal vouch-commit: %w", err)
+	}
+	var res VouchCommitResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/vouch-commit", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // CancelRun transitions a run to the cancelled state via
 // `POST /v0/runs/{run_id}/cancel`. Idempotent: cancelling an already-
 // cancelled run returns 200 with the same body. 4xx surfaces:
