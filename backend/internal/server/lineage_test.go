@@ -1080,6 +1080,164 @@ func TestReverifyBranchLineage_ChildChainReadErrorFailsOpen(t *testing.T) {
 	}
 }
 
+// TestLineage_VouchedCommitClosesWriteReadSeam is the cross-layer
+// assertion for the #1044 vouch path: it drives the SAME
+// buildReportedHeadLedger path the merge reconciler's ReverifyBranchLineage
+// uses, proving a vouched SHA RECORDED BY THE HANDLER (handleVouchCommit)
+// is attributed clean by the detection core (the handler-write → ledger-read
+// seam), while an UN-vouched foreign commit on the same branch still flags
+// (fail-closed preserved). The vouch payload field is asserted via the
+// shared lineageVouchedSHAField constant the handler writes — one literal,
+// not two.
+func TestLineage_VouchedCommitClosesWriteReadSeam(t *testing.T) {
+	runID := uuid.New()
+	const authoredHead = "1111111111111111111111111111111111111111"  // run's own PR-open head (ledger member)
+	const vouchedCommit = "2222222222222222222222222222222222222222" // operator remediation commit, vouched
+	const stillForeign = "ffffffffffffffffffffffffffffffffffffffff"  // never vouched → must still flag
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {authoredHead, vouchedCommit, stillForeign}},
+	}
+	gh := newReverifyGitHubClient(t, stub, stillForeign)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, _ := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "pull_request_opened",
+		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, authoredHead)),
+	})
+
+	// WRITE side of the seam: vouch the remediation commit via the handler.
+	w := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: vouchedCommit, Reason: "sync-schemas output on the fan-out branch"}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("vouch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	// The handler wrote the vouched SHA under the shared payload-field
+	// constant — the literal the ledger READ side keys on.
+	a := vouchAudit(au)
+	if a == nil {
+		t.Fatal("no operator_commit_vouched audit entry written")
+	}
+	var payloadMap map[string]any
+	if err := json.Unmarshal(a.Payload, &payloadMap); err != nil {
+		t.Fatalf("unmarshal vouch payload: %v", err)
+	}
+	if payloadMap[lineageVouchedSHAField] != vouchedCommit {
+		t.Errorf("payload[%q] = %v, want %q", lineageVouchedSHAField, payloadMap[lineageVouchedSHAField], vouchedCommit)
+	}
+
+	// READ side of the seam: ReverifyBranchLineage builds the ledger that
+	// now unions the vouched commit. The vouched commit is attributed clean
+	// (it is NOT the offender); the never-vouched foreign commit still flags.
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); clean {
+		t.Fatal("expected clean=false: a still-unvouched foreign commit must flag (fail-closed)")
+	}
+	v := foreignViolation(au)
+	if v == nil {
+		t.Fatal("expected a foreign_commit_on_branch entry for the unvouched commit")
+	}
+	var vp struct {
+		OffendingSHA string `json:"offending_sha"`
+	}
+	if err := json.Unmarshal(v.Payload, &vp); err != nil {
+		t.Fatalf("unmarshal violation payload: %v", err)
+	}
+	if vp.OffendingSHA != stillForeign {
+		t.Errorf("offending_sha = %q, want %q (the vouched commit must NOT be flagged)", vp.OffendingSHA, stillForeign)
+	}
+}
+
+// TestLineage_VouchUnwedgesRun proves the full remediation: vouching the
+// only foreign commit on the branch flips the merge-resolution re-check from
+// clean=false to clean=true — exactly the verdict that lets the reconciler
+// terminalize the run an operator remediation commit had wedged (#1044/#1043).
+func TestLineage_VouchUnwedgesRun(t *testing.T) {
+	runID := uuid.New()
+	const authoredHead = "1111111111111111111111111111111111111111"
+	const operatorCommit = "2222222222222222222222222222222222222222" // remediation commit = tip
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {authoredHead, operatorCommit}},
+	}
+	gh := newReverifyGitHubClient(t, stub, operatorCommit)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, _ := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "pull_request_opened",
+		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, authoredHead)),
+	})
+
+	// Pre-vouch: the operator commit flags (wedged).
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); clean {
+		t.Fatal("expected clean=false before vouching")
+	}
+
+	// Vouch it via the handler, then re-check: now clean.
+	w := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: operatorCommit, Reason: "operator remediation"}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("vouch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+		t.Fatal("expected clean=true after vouching the only foreign commit")
+	}
+}
+
+// TestLineage_VouchOnDecompositionParent is the decomposition-parent
+// variant: an operator vouches a remediation commit pushed on top of a
+// shared fan-out branch against the PARENT run, and the parent's ledger —
+// which already unions the children's reported heads — additionally unions
+// the parent's vouch, so the merge reconciler's re-check on the parent
+// returns clean.
+func TestLineage_VouchOnDecompositionParent(t *testing.T) {
+	runID := uuid.New()
+	const c1 = "1111111111111111111111111111111111111111"       // slice 1 child commit
+	const c2 = "2222222222222222222222222222222222222222"       // slice 2 child commit (consolidated head)
+	const opCommit = "3333333333333333333333333333333333333333" // operator remediation on top = tip
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {c1, c2, opCommit}},
+	}
+	gh := newReverifyGitHubClient(t, stub, opCommit)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, rr := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	// Parent's own chain holds the consolidated head; children carry their
+	// own commits on their own chains.
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "pull_request_opened",
+		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, c2)),
+	})
+	seedDecompositionChild(rr, au, runID, "child_pushed", c1)
+	seedDecompositionChild(rr, au, runID, "child_pushed", c2)
+
+	// Pre-vouch: the operator commit on the shared branch flags.
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); clean {
+		t.Fatal("expected clean=false before vouching the operator commit")
+	}
+
+	// Vouch the operator commit against the PARENT run.
+	w := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: opCommit, Reason: "operator remediation on the fan-out branch"}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("vouch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+		t.Fatal("expected clean=true after vouching the operator commit on the parent")
+	}
+}
+
 func TestParsePRNumberFromURL(t *testing.T) {
 	n := "https://github.com/x/y/pull/42"
 	cases := []struct {

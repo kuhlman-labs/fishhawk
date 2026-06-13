@@ -2120,6 +2120,105 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/vouch-commit:
+    post:
+      operationId: vouchCommit
+      summary: Vouch a foreign commit as run-authored lineage
+      description: |
+        Operator-gated, audited ADR-035 provenance path (#1044) for a
+        foreign commit on a run branch that no loop-native remediation can
+        route — an operator's mechanical remediation commit (e.g. a
+        `scripts/sync-schemas` output pushed onto a decomposition fan-out
+        branch whose children are all terminal with zero open concerns). The
+        operator DECLARES the commit run-authored lineage; the declaration
+        records an `operator_commit_vouched` audit entry and unions the
+        vouched SHA into the run's reported-head ledger (on the run's own
+        chain AND its decomposition children), so the merge reconciler's
+        ADR-035 re-check (`ReverifyBranchLineage`) attributes it cleanly and
+        the run it fixed is no longer wedged.
+
+        Distinct from `reset-branch`, which DROPS an on-top foreign commit:
+        vouch KEEPS the operator commit and attributes it. Use vouch when
+        the commit is a legitimate remediation to retain.
+
+        **Fail-closed is preserved.** The handler records the declaration
+        verbatim — it does NOT verify the SHA exists on the branch or in the
+        compare set. Vouching a wrong/non-existent SHA simply adds an
+        unreachable ledger entry and un-wedges nothing; an UN-vouched foreign
+        commit still fails category-B at the report boundary and still blocks
+        merge resolution.
+
+        **Authorization.** Operator-token-only by design (ADR-035 sole-writer
+        invariant). Requires `write:stages`. A run-bound MCP token (subject
+        `mcp:run:<uuid>`) is REJECTED OUTRIGHT 403 (`run_token_forbidden`),
+        even for its own run — an agent self-declaring lineage for a commit
+        on its own branch would defeat the invariant the vouch must preserve.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        description: |
+          Names the commit to vouch and carries the operator's rationale.
+          Both fields are required — the vouch is an audited operator
+          declaration.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sha, reason]
+              properties:
+                sha:
+                  type: string
+                  description: |
+                    The commit SHA on the run branch to declare as
+                    run-authored lineage.
+                reason:
+                  type: string
+                  description: |
+                    Operator rationale — why this commit is legitimate
+                    run-authored lineage. Recorded verbatim on the
+                    `operator_commit_vouched` audit entry.
+      responses:
+        '200':
+          description: Vouch recorded; the declaration is echoed in the body.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  vouched_sha: { type: string, description: 'The commit SHA recorded as run-authored lineage.' }
+                  reason: { type: string }
+        '400':
+          description: |
+            Malformed body or an empty `sha`/`reason`. Body's `error` is
+            `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) the identity lacks `write:stages` scope —
+            body `error` is `insufficient_scope` (enforced unconditionally:
+            a cookie-session operator without the scope is rejected too, no
+            bypass); (2) a run-bound MCP token
+            (subject `mcp:run:<uuid>`) attempted the vouch — body `error` is
+            `run_token_forbidden` (rejected outright, even for its own run).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503':
+          description: |
+            The run or audit repositories are not wired
+            (`vouch_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/stages:
     get:
       operationId: listRunStages

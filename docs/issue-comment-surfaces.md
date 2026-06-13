@@ -429,6 +429,16 @@ Notes:
   anchor (#977); delivery to the agent is poll-based (the agent polls the GET
   endpoint), so no comment surface is involved. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for comment surfaces.
+- The operator-vouch audit kind — `operator_commit_vouched` (ADR-035, #1044) — is an
+  **internal, user-actor audit kind, NOT an issue-comment surface**. Nothing in
+  `issuecomment` posts it; it has no Notifier method. `server/vouch.go::handleVouchCommit`
+  writes it (user actor, payload `{run_id, vouched_sha, reason}`) when an operator
+  declares a foreign commit on a run branch to be run-authored lineage, un-wedging the
+  merge reconciler. Unlike `branch_reset` (below), the vouch does **not** even refresh
+  the sticky status comment — it is a pure ledger declaration. The #1067 living anchor
+  comment projects the entry via the audit chain like any other category. Listed here
+  only so a future reader grepping the audit categories doesn't mistake it for a comment
+  surface.
 - The audit-check publish-health audit kinds — `audit_check_publish_degraded` /
   `audit_check_publish_recovered` (#993) — are **internal, system-actor audit
   kinds, not issue-comment surfaces**. Nothing in `issuecomment` posts them; they
