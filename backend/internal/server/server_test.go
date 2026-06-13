@@ -303,18 +303,57 @@ func TestObserveParkedReview_NonDriveRun_NoOps(t *testing.T) {
 }
 
 // TestObserveParkedReview_NoReviewDispatched_VacuouslyComplete pins
-// the configured-but-not-dispatched posture: with no
-// implement_review_started entry and no required checks, the review
-// evidence is vacuously complete — awaiting_merge stamps without a
-// reviews_settled_gate entry (nothing settled).
+// the zero-configured-reviewers posture (#1060's must-still-advance
+// direction): with no implement reviewers configured and no
+// implement_review_started entry, the review evidence is vacuously
+// complete — awaiting_merge stamps without a reviews_settled_gate entry
+// (nothing settled). A reviewer-less run must never wedge at the gate.
 func TestObserveParkedReview_NoReviewDispatched_VacuouslyComplete(t *testing.T) {
 	h := newDriveObserverHarness(t, true)
+	// Spec with zero implement reviewers: configured==0, so a
+	// never-dispatched round is vacuously terminal and may advance.
+	h.repo.seedRun(&run.Run{
+		ID:           h.runID,
+		Drive:        true,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: specImplementReviewers(0),
+	})
 
 	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
 
 	advances := h.driveAdvances(t)
 	if len(advances) != 1 || advances[0].Rule != drive.RuleChecksGreenAwaitingMerge {
 		t.Fatalf("run_auto_advanced = %+v, want only checks_green_awaiting_merge", advances)
+	}
+}
+
+// TestObserveParkedReview_ReviewersConfiguredButUndispatched_Parks pins
+// the #1060 drive safety fix: a run whose spec configures implement
+// reviewers but whose review round was never dispatched (no
+// implement_review_started entry) is NON-terminal evidence, not
+// vacuously terminal — the decomposed-parent consolidated-review case
+// where the gating review runs against the parent's consolidated diff.
+// checks_green_awaiting_merge must NOT stamp even with no required
+// checks (vacuously green), or a child-raised high never gates the
+// parent merge.
+func TestObserveParkedReview_ReviewersConfiguredButUndispatched_Parks(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	// Re-seed the run with a spec that configures one implement
+	// reviewer; no implement_review_started entry is seeded, so the
+	// round is configured-but-undispatched.
+	h.repo.seedRun(&run.Run{
+		ID:           h.runID,
+		Drive:        true,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: specImplementReviewers(1),
+	})
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	if advances := h.driveAdvances(t); len(advances) != 0 {
+		t.Fatalf("run_auto_advanced = %+v, want none: reviewers are configured but no round was dispatched", advances)
 	}
 }
 

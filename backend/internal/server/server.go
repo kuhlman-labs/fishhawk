@@ -564,8 +564,20 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		})
 	}
 
-	// Review evidence is complete when nothing was dispatched to wait
-	// for (mirrors checkPlanReviewSettled's configured-but-not-dispatched
+	// A round configured but never dispatched is non-terminal evidence
+	// (#1060): reviewers exist on the spec yet no implement_review_started
+	// landed — the decomposed-parent consolidated-review case, where the
+	// gating review runs against the parent's consolidated diff. Park
+	// rather than advance to awaiting_merge; only a genuinely
+	// reviewer-less run (configured==0) is vacuously terminal and may
+	// advance on a never-dispatched round.
+	if !started && configured > 0 {
+		return
+	}
+
+	// Review evidence is complete when nothing was configured to wait
+	// for (configured==0 and no round dispatched — vacuously terminal,
+	// mirrors checkPlanReviewSettled's configured-but-not-dispatched
 	// posture) or the dispatched round settled.
 	if started && !settled {
 		return
@@ -607,7 +619,17 @@ func (s *Server) implementReviewRound(ctx context.Context, runRow *run.Run) (con
 		return 0, 0, false, false
 	}
 	if len(startedEntries) == 0 {
-		return 0, 0, false, true
+		// No round dispatched yet. Resolve the configured agent count
+		// from the spec so the caller can distinguish a genuinely
+		// reviewer-less run (configured==0, vacuously terminal) from a
+		// run with reviewers configured but no round dispatched
+		// (configured>0, non-terminal — #1060's decomposed-parent
+		// consolidated-review case).
+		var configuredFromSpec int
+		if cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement); cfg != nil {
+			configuredFromSpec = cfg.AgentCount()
+		}
+		return configuredFromSpec, 0, false, true
 	}
 	latest := startedEntries[0]
 	for _, e := range startedEntries {
