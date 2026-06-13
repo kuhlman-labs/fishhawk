@@ -513,6 +513,80 @@ func TestShipTrace_ImplementReview_AmendedScopeThreadedIntoPrompt(t *testing.T) 
 	}
 }
 
+// TestShipTrace_ImplementReview_ApprovalConditionsThreadedIntoPrompt is the
+// cross-boundary integration test for #1021: the operator's binding
+// approve-with-conditions text (#558) recorded in the audit log must reach
+// the implement-review prompt's "Approval conditions" section so the
+// reviewer judges the diff against the amended plan instead of flagging a
+// correctly implemented amendment as a plan deviation (runs 338d6b0f,
+// 256032f6). It exercises the audit-store -> resolveApprovalConditions ->
+// prompt.Trigger -> buildImplementReview seam end-to-end through a real raw
+// trace bundle, the same harness the #829 amended-scope threading test uses.
+func TestShipTrace_ImplementReview_ApprovalConditionsThreadedIntoPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	// Seed the approval_submitted entry resolveApprovalConditions reads back.
+	const condition = "Approved with one amendment: validate the nonce server-side, not in the CLI."
+	au.seeded = append(au.seeded, makeApproveWithCommentEntry(runRow.ID, condition))
+
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"### Approval conditions (binding — AMEND the plan, win on conflict)",
+		"that is NOT a plan deviation",
+		condition,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q from threaded approval conditions:\n%s", want, got)
+		}
+	}
+}
+
+// TestShipTrace_ImplementReview_NoApprovalConditions_SectionAbsent is the
+// #1021 companion boundary: with no approval comment seeded, the review
+// prompt must not render the Approval-conditions section — the
+// no-conditions prompt stays byte-identical to today.
+func TestShipTrace_ImplementReview_NoApprovalConditions_SectionAbsent(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	if got := reviewer.calls[0]; strings.Contains(got, "### Approval conditions") {
+		t.Errorf("approval-conditions section should be absent when no approval comment is seeded:\n%s", got)
+	}
+}
+
 // TestShipTrace_ImplementReview_PatchThreadedIntoPrompt asserts the
 // git_diff event's patch text reaches the reviewer prompt end-to-end:
 // the trace handler sets trig.DiffPatch from diff.Patch, and

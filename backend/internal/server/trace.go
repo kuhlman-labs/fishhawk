@@ -2176,6 +2176,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// thread the remainder through so the reviewer treats them as in-scope
 		// rather than flagging them as scope drift.
 		AmendedScopeFiles: s.amendedScopeFilesForReview(ctx, runRow, approvedPlan),
+		// The operator's binding approve-with-conditions text (#1021), via
+		// the same resolver the implement-stage prompt uses (decomposed-
+		// child/retry-parent fallback included). The conditions AMEND the
+		// plan (#558), so the reviewer must see them or a diff correctly
+		// implementing an amendment reads as a plan deviation. Fix-up
+		// re-reviews inherit this for free: the post-fixup re-dispatch
+		// routes through this same function.
+		ApprovalConditions: s.resolveApprovalConditions(ctx, runRow),
 		// The stage's previously recorded implement-review concerns for the
 		// delta-verification section (#984): open states the reviewer must
 		// resolve plus waived concerns shown as not-re-litigable context. A
