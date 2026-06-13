@@ -86,13 +86,39 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 	for _, e := range entries {
 		switch e.Category {
 		case "plan_reviewed", "implement_reviewed":
-			if verdictOf(e.Payload) == "reject" {
+			verdict, model := decodeReviewerVerdict(e.Payload)
+			if verdict == "reject" {
 				stage := strings.TrimSuffix(e.Category, "_reviewed")
+				who := model
+				if who == "" {
+					who = "A reviewer"
+				}
+				// A reviewer reject is ADVISORY — the operator arbitrates the
+				// gate. Word it so it cannot read as a GATE rejection (a stale
+				// "🚫 rejected the plan" as the thread's last word when the
+				// operator in fact approved over it). The resolution ping
+				// (advisory_reject_arbitrated, below) closes the loop.
 				out = append(out, pageEvent{
 					sequence: e.Sequence,
 					kind:     stage + "_review_rejected",
-					message:  fmt.Sprintf("🚫 A reviewer rejected the %s.", stage),
+					message:  fmt.Sprintf("🚫 %s flagged a blocking concern on the %s (advisory reject) — awaiting operator arbitration.", who, stage),
 				})
+			}
+		case "approval_submitted":
+			// Resolution ping: when the operator approves the plan over one
+			// or more current-round reviewer rejects, post a NEW comment so
+			// the thread's most-recent comment reflects the real gate outcome
+			// instead of leaving a stale advisory-reject ping as the last
+			// word. A clean approve (no preceding advisory reject) stays
+			// edit-only on the anchor and produces no ping.
+			if approvalDecisionOf(e.Payload) == "approve" {
+				if n := advisoryRejectCountBefore("plan", entries, e.Sequence); n > 0 {
+					out = append(out, pageEvent{
+						sequence: e.Sequence,
+						kind:     "advisory_reject_arbitrated",
+						message:  fmt.Sprintf("✅ The operator approved the plan over %d advisory %s — implementing now.", n, advisoryRejectNoun(n)),
+					})
+				}
 			}
 		case "scope_amendment_requested":
 			// must_page_human (ADR-040, spec.PageEventScopeAmendment): a
@@ -160,6 +186,24 @@ func verdictOf(payload []byte) string {
 		return ""
 	}
 	return p.Verdict
+}
+
+// decodeReviewerVerdict reads the `verdict` and `reviewer_model` fields
+// from a *_reviewed audit payload — the same shape decodeAnchorVerdict
+// reads — so the reviewer-reject ping can name the model that flagged the
+// concern. Empty strings when absent or unparseable.
+func decodeReviewerVerdict(payload []byte) (verdict, model string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var p struct {
+		Verdict       string `json:"verdict"`
+		ReviewerModel string `json:"reviewer_model"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", ""
+	}
+	return p.Verdict, p.ReviewerModel
 }
 
 // firePings posts a one-line ping comment for each page-class event in

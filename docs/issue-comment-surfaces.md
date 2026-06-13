@@ -10,7 +10,7 @@ it.
 | Surface | Audit category | Audit kind | Caller (production) | First posted | Edits in place? |
 |---|---|---|---|---|---|
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, reviewer reject, must_page_human, CI failure) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, CI failure) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688) | warn_at / 100% crossing of an advisory periodic budget | No (per-`(period_start, tier)` dedup; the warn comment and the 100% comment each post once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
@@ -47,6 +47,16 @@ Notes:
   dispatch boundary, mirroring `decodeReviewVerdicts`' `sinceSeq` floor in
   `fishhawk-mcp/review.go`), so a stale prior-round verdict never reads as the
   current round's state.
+- **Gate-decision timeline projection (#1070).** The anchor timeline renders
+  each `approval_submitted` row as a first-class gate-decision entry instead
+  of a bare activity line: the approver identity (#1053), a precise decision
+  phrase distinguishing approve / approve-with-conditions / reject, an
+  explicit "(over N advisory reject(s))" marker when the operator approved
+  over reviewer reject verdicts in the same round (bounded to the arbitrated
+  round via `advisoryRejectCountBefore`, mirroring the reviewer-verdict
+  isolation above), and — for an approve carrying binding conditions — the
+  verbatim conditions text (`approval_submitted` payload `comment`) in a
+  nested collapsed `<details>`. Reject decisions carry no override marker.
 - **Body cap.** The anchor body is capped at `MaxIssueCommentBodyBytes`
   (65,536) by a degradation ladder that drops the timeline first, then
   superseded plans, always preserving the header, the current plan summary,
@@ -59,8 +69,21 @@ Notes:
     `plan_generated`, but emitted ONLY when a plan stage is actually parked at
     `awaiting_approval`. A gateless / routine plan stage never parks, so it
     produces no spurious "awaiting your review" ping.
-  - **Reviewer reject** — `plan_reviewed` / `implement_reviewed` with verdict
-    `reject`.
+  - **Reviewer reject (advisory)** — `plan_reviewed` / `implement_reviewed`
+    with verdict `reject`. A reviewer reject is ADVISORY — the operator
+    arbitrates the gate — so the ping is worded "🚫 `<model>` flagged a
+    blocking concern on the `<stage>` (advisory reject) — awaiting operator
+    arbitration." (naming the `reviewer_model`, falling back to "A reviewer")
+    and never reads as a gate rejection. The kind token stays
+    `<stage>_review_rejected` for dedup parity.
+  - **Advisory-reject arbitrated (resolution, #1070)** — `advisory_reject_arbitrated`,
+    fired on an `approval_submitted` approve that follows >=1 current-round
+    reviewer reject (`advisoryRejectCountBefore('plan', …) > 0`), deduped on
+    the approval `Sequence`. It posts "✅ The operator approved the plan over N
+    advisory reject(s) — implementing now." so the thread's most-recent
+    comment reflects the real gate outcome instead of leaving a stale advisory
+    reject as the last word. A clean approve (no preceding advisory reject)
+    produces no ping — it stays edit-only on the anchor.
   - **must_page_human (ADR-040)** — the concrete must_page_human EVENTS in the
     closed v0 set (`spec.PageEvent*`) are audit categories even though the
     request-time `may_*` delegation knobs are not. Today this surfaces the

@@ -204,9 +204,65 @@ func renderAnchorTimeline(entries []*audit.Entry, now time.Time) string {
 	var b strings.Builder
 	b.WriteString("<details><summary>Timeline</summary>\n\n")
 	for _, e := range activity {
+		if e.Category == "approval_submitted" {
+			b.WriteString(renderGateDecisionTimelineEntry(e, entries, now))
+			continue
+		}
 		fmt.Fprintf(&b, "- %s · %s\n", renderActivityLine(e), relativeAge(e.Timestamp, now))
 	}
 	b.WriteString("\n</details>")
+	return b.String()
+}
+
+// renderGateDecisionTimelineEntry projects an `approval_submitted` row as
+// a first-class gate-decision timeline entry: the approver identity
+// (#1053), a precise decision phrase distinguishing approve /
+// approve-with-conditions / reject, an explicit "(over N advisory
+// reject(s))" marker when the operator decided over reviewer reject
+// verdicts in the same round, and — for an approve carrying binding
+// conditions — the verbatim conditions text in a nested collapsed
+// <details>. The relative-age suffix stays on the parent bullet so the
+// timeline reads uniformly. `entries` is the full chain (needed to bound
+// the advisory-reject count to the arbitrated round).
+func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry, now time.Time) string {
+	decision := approvalDecisionOf(e.Payload)
+	comment := decodeApprovalComment(e.Payload)
+
+	var phrase string
+	switch decision {
+	case "approve":
+		if comment != "" {
+			phrase = "approved the plan with conditions"
+		} else {
+			phrase = "approved the plan"
+		}
+	case "reject":
+		phrase = "rejected the plan"
+	default:
+		phrase = "acted on the plan"
+	}
+
+	line := fmt.Sprintf("%s %s", approverMention(e), phrase)
+	// The "over N advisory reject(s)" marker is an OVERRIDE signal: it
+	// only makes sense on an approve that proceeded despite reviewer
+	// rejects in the same round. A reject decision aligning with reviewer
+	// rejects is not an override, so it carries no marker.
+	if decision == "approve" {
+		if n := advisoryRejectCountBefore("plan", entries, e.Sequence); n > 0 {
+			line += fmt.Sprintf(" (over %d advisory %s)", n, advisoryRejectNoun(n))
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "- %s · %s\n", line, relativeAge(e.Timestamp, now))
+	if decision == "approve" && comment != "" {
+		// Block-level <details> nested under the bullet — GitHub Flavored
+		// Markdown renders it inside the list item, matching how the anchor
+		// already nests <details> for reviews and plans.
+		b.WriteString("  <details><summary>Approval conditions</summary>\n\n")
+		fmt.Fprintf(&b, "%s\n\n", comment)
+		b.WriteString("  </details>\n")
+	}
 	return b.String()
 }
 
@@ -479,6 +535,82 @@ func decodeAnchorVerdict(payload []byte) anchorReviewVerdict {
 		v.concerns = append(v.concerns, anchorReviewConcern{severity: c.Severity, category: c.Category, note: c.Note})
 	}
 	return v
+}
+
+// advisoryRejectCountBefore counts the current-round reviewer rejects on
+// `<stageType>_reviewed` that precede a given approval (Sequence
+// beforeSeq). The round is bounded below by the latest
+// `<stageType>_review_started` Sequence that is itself below beforeSeq —
+// the round boundary immediately preceding the approval — so the count
+// reflects only the round the approval actually arbitrated and survives
+// replan rounds keyed by their own approval Sequence. Mirrors the
+// current-round isolation in currentRoundReviewVerdicts.
+func advisoryRejectCountBefore(stageType string, entries []*audit.Entry, beforeSeq int64) int {
+	startedCat := stageType + "_review_started"
+	reviewedCat := stageType + "_reviewed"
+
+	var floor int64
+	for _, e := range entries {
+		if e.Category == startedCat && e.Sequence < beforeSeq && e.Sequence > floor {
+			floor = e.Sequence
+		}
+	}
+
+	count := 0
+	for _, e := range entries {
+		if e.Category != reviewedCat {
+			continue
+		}
+		if e.Sequence >= beforeSeq || e.Sequence <= floor {
+			continue
+		}
+		if verdictOf(e.Payload) == "reject" {
+			count++
+		}
+	}
+	return count
+}
+
+// advisoryRejectNoun renders the singular/plural noun for an advisory
+// reject count ("reject" / "rejects").
+func advisoryRejectNoun(n int) string {
+	if n == 1 {
+		return "reject"
+	}
+	return "rejects"
+}
+
+// approvalDecisionOf reads the `decision` field from an
+// `approval_submitted` audit payload. Empty when absent or unparseable.
+func approvalDecisionOf(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var p struct {
+		Decision string `json:"decision"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	return p.Decision
+}
+
+// decodeApprovalComment reads the approve-path conditions/amendment text
+// from an `approval_submitted` payload — the `comment` field that
+// approvals.go stamps on decision=approve (mirroring decodeRejectionComment
+// in notifier.go, which reads the reject-path `rejection_comment`). Empty
+// when absent or unparseable.
+func decodeApprovalComment(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var p struct {
+		Comment string `json:"comment"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	return p.Comment
 }
 
 // oneLine collapses a (possibly multi-line) string to a single line and
