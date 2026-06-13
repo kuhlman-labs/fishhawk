@@ -14,12 +14,17 @@
 package orchestratore2e_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
@@ -32,13 +37,17 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
 // advancerAdapter satisfies childcompletion.Advancer by wrapping
@@ -190,7 +199,7 @@ type parentRunFixture struct {
 // consolidated-PR path (#714): a nil installationID makes fireDispatch /
 // the consolidated-PR path skip GitHub silently, and a human reviewKind
 // parks the review at awaiting_approval without a workflow_dispatch.
-func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte, installationID *int64, reviewKind runpkg.ExecutorKind) parentRunFixture {
+func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte, installationID *int64, reviewKind runpkg.ExecutorKind, workflowSpec []byte) parentRunFixture {
 	t.Helper()
 
 	r, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
@@ -199,6 +208,7 @@ func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository,
 		WorkflowSHA:    "deadbeef",
 		TriggerSource:  runpkg.TriggerCLI,
 		InstallationID: installationID,
+		WorkflowSpec:   workflowSpec,
 	})
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
@@ -292,7 +302,7 @@ func TestDecomposition_E2E_HappyPath(t *testing.T) {
 	}
 
 	planBytes := decomposedPlanContent(t)
-	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, nil, runpkg.ExecutorAgent)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, nil, runpkg.ExecutorAgent, nil)
 	parentID := fx.runID
 
 	// (e) First Advance: orchestrator detects decomposition and fans out.
@@ -462,7 +472,7 @@ func TestDecomposition_E2E_OneChildFails(t *testing.T) {
 	}
 
 	planBytes := decomposedPlanContent(t)
-	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, nil, runpkg.ExecutorAgent)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, nil, runpkg.ExecutorAgent, nil)
 	parentID := fx.runID
 
 	// Steps a–e: same setup as happy path through fanout assertion.
@@ -666,7 +676,7 @@ func TestDecomposition_E2E_ConsolidatedPR(t *testing.T) {
 	// Wire an installation so the consolidated-PR path runs, and a human
 	// review so it parks at awaiting_approval (not auto-merged).
 	installID := int64(4242)
-	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, &installID, runpkg.ExecutorHuman)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, &installID, runpkg.ExecutorHuman, nil)
 	parentID := fx.runID
 
 	// Fan out.
@@ -748,5 +758,266 @@ func TestDecomposition_E2E_ConsolidatedPR(t *testing.T) {
 	}
 	if len(opened) != 1 {
 		t.Errorf("consolidated_pr_opened entries = %d, want 1", len(opened))
+	}
+}
+
+// rejectingReviewer is a server.PlanReviewer that returns one reject
+// verdict carrying a single high-severity concern — the consolidated
+// diff's defect the parent review must surface (#1060).
+type rejectingReviewer struct{}
+
+func (rejectingReviewer) Review(_ context.Context, _ string) (*planreview.ReviewVerdict, string, error) {
+	return &planreview.ReviewVerdict{
+		Verdict: planreview.VerdictReject,
+		Concerns: []planreview.Concern{
+			{Severity: planreview.SeverityHigh, Category: "correctness", Note: "consolidated diff carries a nil deref from child Part A"},
+		},
+	}, "claude-opus-4-8", nil
+}
+
+// staticTokens is a githubapp.TokenProvider returning a fixed token, for
+// the compare-endpoint stub.
+type staticTokens struct{}
+
+func (staticTokens) Token(_ context.Context, _ int64) (string, error) { return "ghs_e2e", nil }
+
+// specImplementGatingReviewers configures the implement stage with one
+// gating agent reviewer so the parent's consolidated review resolves a
+// reviewer and runs.
+var specImplementGatingReviewersE2E = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+`)
+
+// TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge is the
+// cross-boundary gating verification for #1060: a decomposed fan-out whose
+// consolidated diff carries a defect drives the orchestrator → server
+// consolidated-review hook → githubclient.ComparePatch → review → concern
+// seam against a real Postgres database, asserting the implement_reviewed
+// concern attaches with StageID == the PARENT implement stage that
+// fishhawk_fixup_stage targets (the load-bearing seam) and that a fix-up on
+// that stage resolves the concern over the shared branch.
+func TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	runRepo := runpkg.NewPostgresRepository(pool)
+	artifactRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	concernRepo := concern.NewPostgresRepository(pool)
+	apiRepo := apitoken.NewPostgresRepository(pool)
+
+	o := &orchestrator.Orchestrator{
+		Runs:       runRepo,
+		Artifacts:  artifactRepo,
+		Audit:      auditRepo,
+		DefaultRef: "main",
+		Logger:     slog.Default(),
+	}
+
+	// Compare-endpoint stub: the consolidated base...head diff GitHub
+	// returns for the parent. ComparePatch parses it into the review's
+	// policy.Diff.
+	compareBody := `{
+		"total_commits": 2,
+		"commits": [{"sha":"c1"},{"sha":"headsha"}],
+		"files": [{"filename":"x.go","status":"modified","changes":4,"patch":"@@ -1 +1 @@\n-ok\n+nil deref"}]
+	}`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, compareBody)
+	})
+	ghSrv := httptest.NewServer(mux)
+	t.Cleanup(ghSrv.Close)
+	ghClient := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  staticTokens{},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      runRepo,
+		ArtifactRepo: artifactRepo,
+		AuditRepo:    auditRepo,
+		ConcernRepo:  concernRepo,
+		APITokenRepo: apiRepo,
+		PlanReviewer: rejectingReviewer{},
+		GitHub:       ghClient,
+		Orchestrator: o,
+	})
+	// Close the orchestrator→server back-edge for the consolidated
+	// decomposition review (#1060): Advance computes the decomposed-parent +
+	// consolidated-PR condition and fires this hook, but the review
+	// machinery lives server-side (*server.Server).
+	o.ConsolidatedReview = srv
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	sw := &childcompletion.Sweeper{
+		Runs:    runRepo,
+		Audit:   auditRepo,
+		Advance: advancerAdapter{o: o},
+		Logger:  slog.Default(),
+	}
+
+	planBytes := decomposedPlanContent(t)
+	installID := int64(55)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, &installID, runpkg.ExecutorHuman, specImplementGatingReviewersE2E)
+	parentID := fx.runID
+
+	// (a) Fan out into children.
+	if _, err := o.Advance(ctx, parentID); err != nil {
+		t.Fatalf("Advance fanout: %v", err)
+	}
+	children, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRuns children: %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("children = %d, want 2", len(children))
+	}
+
+	// Pre-stamp the consolidated PR URL so the review-gate hook fires (the
+	// orchestrator has no GitHub wired here; the consolidated PR open path
+	// is exercised separately in #714's tests).
+	if _, err := runRepo.SetRunPullRequestURL(ctx, parentID, "https://github.com/kuhlman-labs/fishhawk/pull/777"); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+
+	// Resolve the parent implement stage id — the concern-attach target.
+	stages, err := runRepo.ListStagesForRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	var implStageID uuid.UUID
+	for _, s := range stages {
+		if s.Type == runpkg.StageTypeImplement {
+			implStageID = s.ID
+		}
+	}
+	if implStageID == uuid.Nil {
+		t.Fatal("parent implement stage not found")
+	}
+
+	// (b) Before the consolidated round dispatches, the implement-review
+	// round is configured-but-undispatched, so the drive gate must NOT
+	// advance to awaiting_merge (#1060 slice 1). Assert no
+	// implement_review_started yet.
+	if started, _ := auditRepo.ListForRunByCategory(ctx, parentID, "implement_review_started"); len(started) != 0 {
+		t.Fatalf("implement_review_started before children settle = %d, want 0", len(started))
+	}
+
+	// (c) Drive children to succeeded, then the sweeper resolves the parent
+	// implement stage and Advance dispatches the review gate — firing the
+	// consolidated review hook.
+	for _, child := range children {
+		if _, err := runRepo.TransitionRun(ctx, child.ID, runpkg.StateRunning); err != nil {
+			t.Fatalf("child running: %v", err)
+		}
+		if _, err := runRepo.TransitionRun(ctx, child.ID, runpkg.StateSucceeded); err != nil {
+			t.Fatalf("child succeeded: %v", err)
+		}
+	}
+	if err := sw.Tick(ctx); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// (d) Poll for the consolidated review's concern to land (the dispatch
+	// runs on a detached goroutine).
+	var rows []*concern.Concern
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err = concernRepo.ListByRun(ctx, parentID)
+		if err != nil {
+			t.Fatalf("ListByRun: %v", err)
+		}
+		if len(rows) >= 1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("consolidated review concerns = %d, want 1", len(rows))
+	}
+
+	// (e) LOAD-BEARING ASSERTION (#1060 amendment 2): the concern attaches
+	// with StageID == the parent implement stage that fixup_stage targets.
+	if rows[0].StageID != implStageID {
+		t.Fatalf("concern StageID = %s, want parent implement stage %s", rows[0].StageID, implStageID)
+	}
+	if rows[0].StageKind != concern.StageKindImplement {
+		t.Errorf("concern StageKind = %q, want implement", rows[0].StageKind)
+	}
+	concernID := rows[0].ID
+
+	// The round dispatched against the parent (drive can now distinguish
+	// non-vacuous evidence).
+	if started, _ := auditRepo.ListForRunByCategory(ctx, parentID, "implement_review_started"); len(started) != 1 {
+		t.Errorf("implement_review_started after dispatch = %d, want 1", len(started))
+	}
+
+	// (f) fishhawk_fixup_stage on the PARENT implement stage resolves that
+	// concern over the shared branch. Drive the real HTTP handler with an
+	// operator token carrying write:stages.
+	tok, err := apiRepo.Issue(ctx, "operator@e2e", []string{"read:runs", "read:audit", "write:stages"})
+	if err != nil {
+		t.Fatalf("Issue token: %v", err)
+	}
+	fixupBody, _ := json.Marshal(map[string]any{
+		"concern_ids": []string{concernID.String()},
+		"reason":      "fix the nil deref on the shared branch",
+	})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		fmt.Sprintf("%s/v0/stages/%s/fixup", httpSrv.URL, implStageID), bytes.NewReader(fixupBody))
+	req.Header.Set("Authorization", "Bearer "+tok.PlainText)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("fixup request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("fixup status = %d, want 200: %s", resp.StatusCode, b)
+	}
+
+	// (g) fixup_stage genuinely routed the consolidated concern back: the
+	// concern attached to the parent implement stage transitioned to
+	// addressed_pending. This is the #1060 seam — the consolidated review's
+	// concern is addressable by a fix-up on the parent implement stage.
+	//
+	// NOTE: the fix-up handler's downstream Advance re-opens the parent
+	// implement stage, where the orchestrator's fanout path re-mints
+	// children (fanoutIfDecomposed has no existing-children idempotency
+	// guard). So the re-dispatch routing of a decomposed-parent fix-up "to
+	// the shared branch" is NOT yet realized — it re-fans-out instead. That
+	// is a pre-existing orchestrator interaction outside this slice's "no
+	// new fixup code path" scope and is flagged as a follow-up; #1060's
+	// contribution is the concern-attach seam asserted in (e)+(g), which is
+	// the load-bearing equality the amendment requires.
+	after, err := concernRepo.ListByRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("ListByRun after fixup: %v", err)
+	}
+	if len(after) != 1 || after[0].State != concern.StateAddressedPending {
+		t.Errorf("concern state after fixup = %v, want addressed_pending", after[0].State)
 	}
 }

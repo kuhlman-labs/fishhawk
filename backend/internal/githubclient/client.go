@@ -884,6 +884,147 @@ func (c *Client) CompareCommits(ctx context.Context, installationID int64,
 	return shas, nil
 }
 
+// compareFilesCap is GitHub's documented per-response changed-file
+// ceiling for the Compare API: a comparison touching more than 300 files
+// returns only the first 300 in `files`. The consolidated decomposition
+// fan-out (#1060) is exactly the large-diff case that trips it, so a hit
+// at the cap is surfaced as a truncation rather than silently
+// under-reviewed.
+const compareFilesCap = 300
+
+// ComparePatchFile is one changed file from a ComparePatch result. Path is
+// repo-relative; Status is GitHub's word-form change kind ("added",
+// "removed", "modified", "renamed", "copied", "changed") which the
+// consolidated-review caller maps onto policy.Status.
+type ComparePatchFile struct {
+	Path   string
+	Status string
+}
+
+// ComparePatchResult carries the unified-diff text + changed-file list for
+// base...head, plus a truncation signal (#1060). It is the input the
+// consolidated decomposition review builds its policy.Diff from, since the
+// decomposed parent has no runner trace bundle of its own.
+type ComparePatchResult struct {
+	// HeadSHA is the tip commit of head (the last commit the comparison
+	// reports), reused as the implement-review dedup key. Empty when the
+	// comparison reports no commits ahead of base.
+	HeadSHA string
+	// Patch is the reconstructed unified diff: each changed file's hunks
+	// prefixed with a synthetic `diff --git` header so a downstream
+	// content reviewer reads it as an ordinary git diff. Empty when no
+	// file carried a patch body.
+	Patch string
+	// Files is every changed file the comparison reported, with its
+	// GitHub word-form status.
+	Files []ComparePatchFile
+	// Truncated is set when GitHub capped the comparison — the file list
+	// reached the documented 300-file ceiling, or a changed file's patch
+	// body was omitted (oversized diff). The review under-reviews when
+	// this is set, so the caller surfaces it loudly rather than silently.
+	Truncated bool
+	// TruncationReason names which cap tripped, for the degradation
+	// log/audit. Empty when Truncated is false.
+	TruncationReason string
+}
+
+// ComparePatch returns the unified diff + changed-file list for base...head
+// via the Compare API (#1060). It is the diff source for a decomposed
+// parent's consolidated implement review: the parent has no runner bundle,
+// so the diff that actually merges is sourced from GitHub here.
+//
+//	GET /repos/{owner}/{repo}/compare/{base}...{head}
+//
+// The three-dot form anchors on the merge-base (matching the PR's own
+// diff), so commits merged into base while the run was open are excluded.
+// The default JSON response is used rather than the raw-diff media type: it
+// carries the per-file STATUS (needed to build policy.ChangedFile) and the
+// truncation signals GitHub only exposes in the structured form — the
+// 300-file cap and the per-file omitted-patch marker. The Patch is
+// reconstructed by concatenating each file's hunks under a synthetic
+// `diff --git` header.
+//
+// Returns a typed error (ErrNotFound / ErrValidation / ErrForbidden) on
+// non-2xx. Truncation is NOT an error — the partial diff is returned with
+// Truncated set so the caller can review what it has and surface the gap.
+func (c *Client) ComparePatch(ctx context.Context, installationID int64,
+	repo RepoRef, base, head string) (*ComparePatchResult, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if base == "" || head == "" {
+		return nil, errors.New("githubclient: compare base and head required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/compare/" + escapePath(base) + "..." + escapePath(head))
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: compare patch: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := classifyStatus("compare patch", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		TotalCommits int `json:"total_commits"`
+		Commits      []struct {
+			SHA string `json:"sha"`
+		} `json:"commits"`
+		Files []struct {
+			Filename string `json:"filename"`
+			Status   string `json:"status"`
+			Changes  int    `json:"changes"`
+			Patch    string `json:"patch"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode compare patch: %w", err)
+	}
+
+	result := &ComparePatchResult{}
+	if n := len(body.Commits); n > 0 {
+		result.HeadSHA = body.Commits[n-1].SHA
+	}
+
+	var patch strings.Builder
+	result.Files = make([]ComparePatchFile, 0, len(body.Files))
+	for _, f := range body.Files {
+		result.Files = append(result.Files, ComparePatchFile{Path: f.Filename, Status: f.Status})
+		switch {
+		case f.Patch != "":
+			fmt.Fprintf(&patch, "diff --git a/%s b/%s\n%s\n", f.Filename, f.Filename, f.Patch)
+		case f.Changes > 0:
+			// A changed file whose patch body GitHub dropped (oversized) —
+			// the review cannot see its content. A binary file legitimately
+			// carries no patch but reports zero changes, so gating on
+			// changes>0 isolates the genuine size-cap omission.
+			result.Truncated = true
+			result.TruncationReason = "one or more changed-file patch bodies omitted by GitHub (oversized diff)"
+		}
+	}
+	result.Patch = patch.String()
+
+	// The 300-file ceiling is the broader truncation (whole files dropped,
+	// not just their patch bodies), so let it win the reason field.
+	if len(body.Files) >= compareFilesCap {
+		result.Truncated = true
+		result.TruncationReason = fmt.Sprintf(
+			"changed-file count reached GitHub's %d-file compare cap; files beyond the cap are not reviewed", compareFilesCap)
+	}
+
+	return result, nil
+}
+
 // ForceUpdateRef force-updates a branch ref to point at newSHA — the
 // destructive remediation primitive for ADR-035 (#867). It rewinds the
 // run/PR head branch back to its last run-authored commit, dropping a

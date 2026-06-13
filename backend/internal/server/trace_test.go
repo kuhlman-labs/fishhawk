@@ -25,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -2529,5 +2530,197 @@ func TestGateEvidenceForReview_MapsUndeclaredCategorized(t *testing.T) {
 	if uncat := gateEvidenceForReview(ev); uncat.ScopeFacts.UndeclaredCategorized != nil {
 		t.Errorf("nil categorized input mapped to %+v, want nil",
 			uncat.ScopeFacts.UndeclaredCategorized)
+	}
+}
+
+// cannedComparePatchClient builds a githubclient.Client whose compare
+// endpoint returns the given canned JSON, for the #1060 consolidated-review
+// dispatch tests.
+func cannedComparePatchClient(t *testing.T, body string) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// seedConsolidatedParent wires a decomposed parent run with a succeeded
+// plan stage (+ plan artifact), a succeeded implement stage, and a linked
+// child run, plus the implement-review spec — the fixture the consolidated
+// review dispatches against.
+func seedConsolidatedParent(t *testing.T, rr *orchestratorRepo, art *fakeArtifactRepo, spec []byte) (*run.Run, *run.Stage) {
+	t.Helper()
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = spec
+	runRow.Repo = "kuhlman-labs/example"
+	instID := int64(55)
+	runRow.InstallationID = &instID
+
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedBudgetPlanArtifact(t, art, planStage.ID, &plan.Plan{
+		PlanVersion:                "standard_v1",
+		Summary:                    "Decomposed parent",
+		PredictedRuntimeMinutes:    10,
+		PredictedRuntimeConfidence: plan.RuntimeConfidenceMedium,
+		Scope:                      plan.Scope{Files: []plan.ScopeFile{{Path: "x.go", Operation: plan.FileOpModify}}},
+	})
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateSucceeded)
+	implStage.Type = run.StageTypeImplement
+
+	// Linked child so the parent passes the has-children gate.
+	child := rr.seedRun()
+	child.DecomposedFrom = &runRow.ID
+	child.State = run.StateSucceeded
+
+	return runRow, implStage
+}
+
+const cannedCompareOneFile = `{
+	"total_commits": 1,
+	"commits": [{"sha":"headsha1"}],
+	"files": [{"filename":"x.go","status":"modified","changes":2,"patch":"@@ -1 +1 @@\n-a\n+b"}]
+}`
+
+func TestDispatchConsolidatedReview_AttachesConcernsToParentImplementStage(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict: planreview.VerdictReject,
+			Concerns: []planreview.Concern{
+				{Severity: planreview.SeverityHigh, Category: "correctness", Note: "child A introduced a nil deref the consolidated diff carries"},
+			},
+		},
+		model: "claude-opus-4-8",
+	}
+
+	parent, implStage := seedConsolidatedParent(t, rr, art, specImplementGatingReviewers)
+
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		RunRepo:       rr,
+		ArtifactRepo:  art,
+		AuditRepo:     au,
+		ConcernRepo:   cr,
+		PlanReviewers: singleReviewerSet{reviewer},
+		GitHub:        cannedComparePatchClient(t, cannedCompareOneFile),
+	})
+
+	s.DispatchConsolidatedReview(context.Background(), parent.ID, "main", "fishhawk/run-"+parent.ID.String()[:8])
+	s.waitBackgroundReviews()
+
+	// A round dispatched against the parent: started + reviewed entries.
+	started, _ := au.ListForRunByCategory(context.Background(), parent.ID, "implement_review_started")
+	if len(started) != 1 {
+		t.Fatalf("implement_review_started entries = %d, want 1", len(started))
+	}
+	reviewed, _ := au.ListForRunByCategory(context.Background(), parent.ID, "implement_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1", len(reviewed))
+	}
+
+	// LOAD-BEARING: the concern attaches with StageID == the parent
+	// implement stage that fixup_stage targets.
+	rows, err := cr.ListByRun(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("persisted concerns = %d, want 1", len(rows))
+	}
+	if rows[0].StageID != implStage.ID {
+		t.Errorf("concern StageID = %s, want parent implement stage %s", rows[0].StageID, implStage.ID)
+	}
+	if rows[0].StageKind != concern.StageKindImplement {
+		t.Errorf("concern StageKind = %q, want implement", rows[0].StageKind)
+	}
+}
+
+func TestDispatchConsolidatedReview_OrdinaryRun_NoDispatch(t *testing.T) {
+	// A DecomposedFrom==nil run with NO children (an ordinary feature run)
+	// must not get a consolidated review even when the orchestrator fires
+	// the hook — its implement review already ran on the trace path.
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+	runRow.WorkflowSpec = specImplementGatingReviewers
+	runRow.Repo = "kuhlman-labs/example"
+	instID := int64(55)
+	runRow.InstallationID = &instID
+	impl := rr.seedStage(runRow.ID, 1, run.StageStateSucceeded)
+	impl.Type = run.StageTypeImplement
+	// No child runs seeded.
+
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		RunRepo:       rr,
+		ArtifactRepo:  art,
+		AuditRepo:     au,
+		PlanReviewers: singleReviewerSet{&fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}}},
+		GitHub:        cannedComparePatchClient(t, cannedCompareOneFile),
+	})
+
+	s.DispatchConsolidatedReview(context.Background(), runRow.ID, "main", "fishhawk/run-xxxx")
+	s.waitBackgroundReviews()
+
+	started, _ := au.ListForRunByCategory(context.Background(), runRow.ID, "implement_review_started")
+	if len(started) != 0 {
+		t.Errorf("implement_review_started entries = %d, want 0 for an ordinary run", len(started))
+	}
+}
+
+func TestDispatchConsolidatedReview_TruncatedDiff_EmitsDegradationAndStillReviews(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+
+	// A changed file whose patch body GitHub dropped → ComparePatch flags
+	// truncation.
+	truncatedBody := `{
+		"total_commits": 1,
+		"commits": [{"sha":"h"}],
+		"files": [{"filename":"big.go","status":"modified","changes":99999,"patch":""}]
+	}`
+
+	parent, _ := seedConsolidatedParent(t, rr, art, specImplementGatingReviewers)
+
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		RunRepo:       rr,
+		ArtifactRepo:  art,
+		AuditRepo:     au,
+		ConcernRepo:   cr,
+		PlanReviewers: singleReviewerSet{&fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}},
+		GitHub:        cannedComparePatchClient(t, truncatedBody),
+	})
+
+	s.DispatchConsolidatedReview(context.Background(), parent.ID, "main", "fishhawk/run-"+parent.ID.String()[:8])
+	s.waitBackgroundReviews()
+
+	trunc, _ := au.ListForRunByCategory(context.Background(), parent.ID, consolidatedReviewTruncatedCategory)
+	if len(trunc) != 1 {
+		t.Fatalf("%s entries = %d, want 1", consolidatedReviewTruncatedCategory, len(trunc))
+	}
+	// The review still ran on the partial diff (degradation, not abort).
+	started, _ := au.ListForRunByCategory(context.Background(), parent.ID, "implement_review_started")
+	if len(started) != 1 {
+		t.Errorf("implement_review_started entries = %d, want 1 (review still dispatched on partial diff)", len(started))
 	}
 }

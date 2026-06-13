@@ -2270,3 +2270,148 @@ func TestNewWithSigner_SignError_Propagates(t *testing.T) {
 		t.Errorf("Authorization = %q, want empty (request must not be sent when Sign fails)", fg.gotAuth)
 	}
 }
+
+// comparePatchServer spins up an httptest server that answers the compare
+// endpoint with the canned body and records the request line for the
+// wiring assertions. Mirrors newTestClient's plumbing for ComparePatch.
+func comparePatchServer(t *testing.T, status int, body string) (*Client, *struct {
+	path   string
+	accept string
+}) {
+	t.Helper()
+	rec := &struct {
+		path   string
+		accept string
+	}{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.path = r.URL.Path
+		rec.accept = r.Header.Get("Accept")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+	return c, rec
+}
+
+func TestComparePatch_HappyPath(t *testing.T) {
+	body := `{
+		"total_commits": 2,
+		"commits": [{"sha":"c1"},{"sha":"c2"}],
+		"files": [
+			{"filename":"a.go","status":"modified","changes":3,"patch":"@@ -1 +1 @@\n-a\n+b"},
+			{"filename":"b.go","status":"added","changes":1,"patch":"@@ -0,0 +1 @@\n+new"}
+		]
+	}`
+	c, rec := comparePatchServer(t, http.StatusOK, body)
+	got, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "fishhawk/run-abcd1234")
+	if err != nil {
+		t.Fatalf("ComparePatch: %v", err)
+	}
+	if got.HeadSHA != "c2" {
+		t.Errorf("HeadSHA = %q, want c2 (last commit)", got.HeadSHA)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("Files = %d, want 2", len(got.Files))
+	}
+	if got.Files[0].Path != "a.go" || got.Files[0].Status != "modified" {
+		t.Errorf("Files[0] = %+v", got.Files[0])
+	}
+	if got.Files[1].Path != "b.go" || got.Files[1].Status != "added" {
+		t.Errorf("Files[1] = %+v", got.Files[1])
+	}
+	if !strings.Contains(got.Patch, "diff --git a/a.go b/a.go") ||
+		!strings.Contains(got.Patch, "diff --git a/b.go b/b.go") {
+		t.Errorf("Patch missing synthetic git headers: %q", got.Patch)
+	}
+	if !strings.Contains(got.Patch, "+b") || !strings.Contains(got.Patch, "+new") {
+		t.Errorf("Patch missing hunk bodies: %q", got.Patch)
+	}
+	if got.Truncated {
+		t.Errorf("Truncated = true, want false for a small comparison (reason %q)", got.TruncationReason)
+	}
+	// Wiring: three-dot compare path + default JSON media type.
+	if !strings.Contains(rec.path, "/compare/main...fishhawk/run-abcd1234") {
+		t.Errorf("compare path = %q", rec.path)
+	}
+	if rec.accept != "application/vnd.github+json" {
+		t.Errorf("Accept = %q", rec.accept)
+	}
+}
+
+func TestComparePatch_TruncatedFileCap(t *testing.T) {
+	var files []string
+	for i := 0; i < compareFilesCap; i++ {
+		files = append(files, `{"filename":"f`+strconv.Itoa(i)+`.go","status":"modified","changes":1,"patch":"@@ -1 +1 @@\n-x\n+y"}`)
+	}
+	body := `{"total_commits":1,"commits":[{"sha":"head"}],"files":[` + strings.Join(files, ",") + `]}`
+	c, _ := comparePatchServer(t, http.StatusOK, body)
+	got, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "head")
+	if err != nil {
+		t.Fatalf("ComparePatch: %v", err)
+	}
+	if !got.Truncated {
+		t.Fatal("Truncated = false, want true at the 300-file cap")
+	}
+	if !strings.Contains(got.TruncationReason, "300-file compare cap") {
+		t.Errorf("TruncationReason = %q, want the file-cap reason", got.TruncationReason)
+	}
+}
+
+func TestComparePatch_TruncatedOmittedPatch(t *testing.T) {
+	// A changed file (changes>0) whose patch body GitHub dropped (oversized).
+	body := `{
+		"total_commits": 1,
+		"commits": [{"sha":"head"}],
+		"files": [
+			{"filename":"huge.go","status":"modified","changes":99999,"patch":""},
+			{"filename":"img.png","status":"added","changes":0,"patch":""}
+		]
+	}`
+	c, _ := comparePatchServer(t, http.StatusOK, body)
+	got, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "head")
+	if err != nil {
+		t.Fatalf("ComparePatch: %v", err)
+	}
+	if !got.Truncated {
+		t.Fatal("Truncated = false, want true for an omitted oversized patch")
+	}
+	if !strings.Contains(got.TruncationReason, "omitted") {
+		t.Errorf("TruncationReason = %q, want the omitted-patch reason", got.TruncationReason)
+	}
+	// The binary file (changes==0, no patch) alone must NOT flag truncation —
+	// covered implicitly: only huge.go trips it. Sanity: both files listed.
+	if len(got.Files) != 2 {
+		t.Errorf("Files = %d, want 2", len(got.Files))
+	}
+}
+
+func TestComparePatch_BinaryOnlyNotTruncated(t *testing.T) {
+	body := `{"total_commits":1,"commits":[{"sha":"h"}],"files":[{"filename":"img.png","status":"added","changes":0,"patch":""}]}`
+	c, _ := comparePatchServer(t, http.StatusOK, body)
+	got, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "h")
+	if err != nil {
+		t.Fatalf("ComparePatch: %v", err)
+	}
+	if got.Truncated {
+		t.Errorf("Truncated = true for a binary-only diff (changes==0); want false")
+	}
+}
+
+func TestComparePatch_NotFound(t *testing.T) {
+	c, _ := comparePatchServer(t, http.StatusNotFound, `{"message":"Not Found"}`)
+	_, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "head")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestComparePatch_Validation(t *testing.T) {
+	c := New(&stubTokens{})
+	if _, err := c.ComparePatch(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, "", "head"); err == nil {
+		t.Error("empty base: want error")
+	}
+	if _, err := c.ComparePatch(context.Background(), 1, RepoRef{}, "main", "head"); err == nil {
+		t.Error("empty repo: want error")
+	}
+}

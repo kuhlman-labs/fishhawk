@@ -1345,3 +1345,73 @@ func TestReconcileStuckRuns_PerRunErrorDoesNotBlockOthers(t *testing.T) {
 		t.Errorf("broken run state = %q, want running (left for next boot)", got)
 	}
 }
+
+// recordingConsolidatedReview records DispatchConsolidatedReview calls for
+// the #1060 trigger-condition assertions.
+type recordingConsolidatedReview struct {
+	calls []struct {
+		runID      uuid.UUID
+		base, head string
+	}
+}
+
+func (r *recordingConsolidatedReview) DispatchConsolidatedReview(_ context.Context, runID uuid.UUID, base, head string) {
+	r.calls = append(r.calls, struct {
+		runID      uuid.UUID
+		base, head string
+	}{runID, base, head})
+}
+
+func TestAdvance_DecomposedParent_DispatchesConsolidatedReview(t *testing.T) {
+	// Once the decomposed parent's review stage dispatches WITH the
+	// consolidated PR present, the orchestrator fires the consolidated
+	// implement review against base...consolidatedBranch (#1060).
+	o, rs, _ := newOrchestrator(t)
+	o.DefaultRef = "main"
+	rec := &recordingConsolidatedReview{}
+	o.ConsolidatedReview = rec
+
+	parent, _ := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+
+	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("DispatchConsolidatedReview calls = %d, want 1", len(rec.calls))
+	}
+	call := rec.calls[0]
+	if call.runID != parent.ID {
+		t.Errorf("run id = %s, want parent %s", call.runID, parent.ID)
+	}
+	if call.base != "main" {
+		t.Errorf("base = %q, want main (DefaultRef)", call.base)
+	}
+	if want := consolidatedBranch(parent.ID); call.head != want {
+		t.Errorf("head = %q, want %q (consolidated branch)", call.head, want)
+	}
+}
+
+func TestAdvance_NoConsolidatedReview_WhenNoPR(t *testing.T) {
+	// A run reaching its review gate with no consolidated PR opened (e.g. a
+	// non-decomposed run that graceful-skips maybeOpenConsolidatedPR, or
+	// the CLI/dev posture) must NOT fire the consolidated review — there is
+	// no PR diff to review.
+	o, rs, _ := newOrchestrator(t)
+	o.DefaultRef = "main"
+	rec := &recordingConsolidatedReview{}
+	o.ConsolidatedReview = rec
+
+	r, _ := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	// No decomposed children → maybeOpenConsolidatedPR graceful-skips, PR
+	// stays nil.
+
+	if _, err := o.Advance(context.Background(), r.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("DispatchConsolidatedReview calls = %d, want 0 (no PR present)", len(rec.calls))
+	}
+}
