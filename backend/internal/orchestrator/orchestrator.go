@@ -580,6 +580,32 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 		return false, nil
 	}
 
+	// #1063: existing-children idempotency guard. A fix-up on a decomposed
+	// parent's implement stage re-opens that stage to pending; without this
+	// guard the re-entry through Advance would re-mint a fresh fan-out from
+	// the same approved plan instead of routing the consolidated-review
+	// concern back onto the shared branch. When the parent already has minted
+	// children (DecomposedFrom == parent.ID), this is a fix-up re-open (or a
+	// sweeper double-advance), NOT a fresh decomposition: skip the fanout and
+	// return (false, nil) so Advance falls through to dispatchStage and re-
+	// invokes the parent's implement stage against the existing shared branch.
+	// A ListRuns error returns a wrapped err so a transient store failure does
+	// not silently re-mint a second fan-out. Only the first fanout (zero
+	// children) proceeds to mint.
+	existing, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &parent.ID,
+		Limit:          1,
+	})
+	if err != nil {
+		return false, fmt.Errorf("list existing children: %w", err)
+	}
+	if len(existing) > 0 {
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "fanout skipped: parent already has children",
+			slog.String("parent_run_id", parent.ID.String()),
+		)
+		return false, nil
+	}
+
 	childIDs := make([]string, 0, len(approvedPlan.Decomposition.SubPlans))
 	for _, sub := range approvedPlan.Decomposition.SubPlans {
 		parentID := parent.ID

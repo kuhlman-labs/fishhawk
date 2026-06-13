@@ -2072,6 +2072,100 @@ func TestGetStagePrompt_Implement_FixupDecomposedChild_SharedBranch(t *testing.T
 	}
 }
 
+// TestGetStagePrompt_Implement_FixupDecomposedParent_SharedBranch covers the
+// decomposed-PARENT fix-up branch form (#1063): a parent has DecomposedFrom ==
+// nil, so the per-stage form would target fishhawk/run-<parent>/stage-<stage>,
+// NOT the consolidated PR head. When the parent has minted children, the fix-up
+// must land on the shared consolidated branch fishhawk/run-<shortID(parent)>.
+func TestGetStagePrompt_Implement_FixupDecomposedParent_SharedBranch(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	parentRunID := uuid.New()
+	childRunID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		parentRunID: {
+			{ID: planStageID, RunID: parentRunID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: parentRunID, Type: run.StageTypeImplement},
+		},
+	}
+	// Parent run: DecomposedFrom == nil (it's the parent), and a child row is
+	// registered so hasDecomposedChildren probes true.
+	rr.getRuns[parentRunID] = &run.Run{
+		ID:         parentRunID,
+		Repo:       "o/r",
+		WorkflowID: "feature_change",
+	}
+	rr.getRuns[childRunID] = &run.Run{
+		ID:             childRunID,
+		Repo:           "o/r",
+		WorkflowID:     "feature_change",
+		DecomposedFrom: &parentRunID,
+	}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: parentRunID, Type: run.StageTypeImplement}
+
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityHigh, Category: "coverage", Note: "tighten the bound"},
+	}
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		parentRunID: {makeFixupEntry(parentRunID, implStageID, concerns)},
+	}
+
+	priv, _ := sf.issue(t, parentRunID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, parentRunID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Fixup {
+		t.Fatalf("fixup = false, want true")
+	}
+	wantBranch := "fishhawk/run-" + parentRunID.String()[:8]
+	if resp.FixupBranch != wantBranch {
+		t.Errorf("fixup_branch = %q, want shared consolidated branch %q", resp.FixupBranch, wantBranch)
+	}
+}
+
 // TestResolveFixupConcerns covers the audit-payload reader directly: no
 // trigger entry, a wrong-stage entry, the happy path, and a malformed payload.
 func TestResolveFixupConcerns(t *testing.T) {

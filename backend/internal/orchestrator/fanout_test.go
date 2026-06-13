@@ -316,6 +316,77 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 	}
 }
 
+func TestAdvance_FanoutSkippedWhenChildrenExist(t *testing.T) {
+	// #1063: a fix-up on a decomposed parent re-opens its implement stage to
+	// pending. Re-entering Advance must NOT re-mint a fresh fan-out — the
+	// parent already has children. The existing-children guard skips the
+	// fanout and falls through to dispatch so the parent implement stage is
+	// re-invoked against the existing shared branch.
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	planStage := stages[0]
+
+	// A pre-existing child decomposed from the parent. The guard's ListRuns
+	// returns this, so the fanout is skipped.
+	childParentID := parent.ID
+	rs.listResult = []*run.Run{{
+		ID:             uuid.New(),
+		DecomposedFrom: &childParentID,
+		State:          run.StateRunning,
+	}}
+
+	planBytes := decomposedPlanBytes(t, []string{"Part A", "Part B"})
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			planStage.ID: {{
+				ID:            uuid.New(),
+				StageID:       planStage.ID,
+				Kind:          artifact.KindPlan,
+				SchemaVersion: &schemaV,
+				Content:       planBytes,
+				CreatedAt:     time.Now().UTC(),
+			}},
+		},
+	}
+
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: &recordingAudit{}}
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out == OutcomeDecomposed {
+		t.Errorf("fanout re-minted on a parent with existing children: outcome = %q", out)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("outcome = %q, want %q (re-invoke parent implement)", out, OutcomeDispatched)
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if got := len(rs.createdRuns); got != 0 {
+		t.Errorf("createdRuns = %d, want 0 (no new children minted)", got)
+	}
+	if got := len(rs.createdStages); got != 0 {
+		t.Errorf("createdStages = %d, want 0 (no new child stages)", got)
+	}
+	// The guard's ListRuns probe filtered on DecomposedFrom == parent.ID.
+	var sawProbe bool
+	for _, f := range rs.listFilters {
+		if f.DecomposedFrom != nil && *f.DecomposedFrom == parent.ID {
+			sawProbe = true
+			break
+		}
+	}
+	if !sawProbe {
+		t.Errorf("expected a ListRuns probe filtered on DecomposedFrom == %s, got filters %+v", parent.ID, rs.listFilters)
+	}
+}
+
 func TestAdvance_NoDecomposition_DispatchesNormally(t *testing.T) {
 	rs := newFanoutRunsRepo()
 	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
