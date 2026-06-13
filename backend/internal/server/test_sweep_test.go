@@ -532,6 +532,54 @@ func TestRunTestSweep_DirectoryCap(t *testing.T) {
 	}
 }
 
+// TestRunTestSweep_SubPlanScopeAttributed covers #1077: a decomposition
+// sub-plan that scopes a migration without the pinned postgres_test.go
+// yields a migration_walk finding attributed to that sub-plan, while the
+// flat parent scope stays clean. migration_walk is scope-set-only, so the
+// finding fires with no directory listing needed.
+func TestRunTestSweep_SubPlanScopeAttributed(t *testing.T) {
+	cf := &contentsFake{dirs: map[string][]string{}}
+	s, au, runID := newTestSweepServer(t, cf)
+	body := decomposedScopePlanBody(t,
+		[]plan.ScopeFile{{Path: "docs/ARCHITECTURE.md", Operation: plan.FileOpModify}},
+		[]subPlanScope{
+			{
+				title: "migration slice",
+				files: []plan.ScopeFile{{Path: "backend/internal/postgres/migrations/0032_x.up.sql", Operation: plan.FileOpCreate}},
+			},
+			{
+				title: "doc slice",
+				files: []plan.ScopeFile{{Path: "README.md", Operation: plan.FileOpModify}},
+			},
+		},
+	)
+
+	got := s.runTestSweep(context.Background(), runID, runID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result when the sweep ran")
+	}
+	recorded := lastTestSweepEntry(t, au)
+	var found *TestSweepFinding
+	for i := range recorded.Findings {
+		if recorded.Findings[i].SubPlanTitle == "" {
+			t.Errorf("unexpected parent-scope finding: %+v", recorded.Findings[i])
+			continue
+		}
+		if recorded.Findings[i].SubPlanTitle == "migration slice" {
+			found = &recorded.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("want a finding attributed to the migration sub-plan; got %+v", recorded.Findings)
+	}
+	if found.Rule != testSweepRuleMigrationWalk {
+		t.Errorf("Rule = %q, want %s", found.Rule, testSweepRuleMigrationWalk)
+	}
+	if len(found.MissingTests) != 1 || found.MissingTests[0] != "backend/internal/postgres/postgres_test.go" {
+		t.Errorf("MissingTests = %v", found.MissingTests)
+	}
+}
+
 // TestShipPlan_TestSweep_EndToEnd is the #618-rule cross-boundary check
 // for this feature: a plan POSTed through handleShipPlan, with an
 // httptest-fake Contents API wired into cfg.GitHub, must (a) append a

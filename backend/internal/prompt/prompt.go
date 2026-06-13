@@ -441,10 +441,13 @@ type SurfaceSweepEvidence struct {
 
 // SurfaceSweepFindingEvidence is one missing-sibling finding: the plan
 // touches TriggerPath but omits the pattern's required sibling surfaces.
+// SubPlanTitle, when set, names the decomposition sub-plan whose own scope
+// produced the finding (#1077); empty for parent-scope findings.
 type SurfaceSweepFindingEvidence struct {
 	Pattern         string
 	TriggerPath     string
 	MissingSiblings []string
+	SubPlanTitle    string
 }
 
 // TestSweepEvidence is the plan_test_sweep result (#942): the plan's
@@ -467,6 +470,9 @@ type TestSweepFindingEvidence struct {
 	TriggerPath  string
 	MissingTests []string
 	OmittedCount int
+	// SubPlanTitle, when set, names the decomposition sub-plan whose own
+	// scope produced the finding (#1077); empty for parent-scope findings.
+	SubPlanTitle string
 }
 
 // PriorConcern is one previously recorded concern rendered into the
@@ -772,6 +778,8 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- any test that asserts a registry, count, or enum the change touches (e.g. a wantToolCount total, a MissingKind / kind-enum exhaustiveness table) — adding or removing a member breaks the count/enum assertion even when it lives in a different file;\n")
 	b.WriteString("- the doc/API companion for the surface you change: for any HTTP API change, BOTH docs/api/v0.openapi.yaml (source of truth) AND docs/api/v0.md (human companion); a dedicated feature doc page that mirrors the surface (e.g. docs/architecture/audit-complete.md); and the component README.md when you add or change a flag, tool, or env var;\n")
 	b.WriteString("- the callers' tests when you change a function signature or an exported struct — the call sites compile-break and their tests must update with them.\n")
+	b.WriteString("- when you edit a canonical docs/spec/*.schema.json, EVERY embedded mirror copy of it — backend internal/*/schemas, runner/internal/plan/schemas, AND cli/internal/spec/schemas (the cli copy is routinely omitted) — and run scripts/sync-schemas; CI's schema-sync gate red-lines if any mirror drifts.\n")
+	b.WriteString("- when you add a backend/internal/postgres/migrations/*.sql, also scope backend/internal/postgres/postgres_test.go — TestMigrateDown_RemovesTables pins the LATEST migration and must be updated in the same commit.\n")
 	b.WriteString("\n")
 	b.WriteString("Compound-field shape rule: the following fields must be the structured shape shown in the schema — never a bare string or prose summary:\n")
 	b.WriteString("- approach: array of {\"step\": N, \"description\": \"...\"} objects\n")
@@ -938,6 +946,18 @@ func buildPlanReview(t Trigger) string {
 	return b.String()
 }
 
+// subPlanPrefix returns the "(sub-plan: <title>) " label prepended to a
+// gate-evidence finding line when the finding was produced by a
+// decomposition sub-plan's own scope (#1077), so the reviewer/operator
+// sees which slice is under-scoped. Empty title (parent-scope finding)
+// returns the empty string, leaving the line byte-identical to pre-#1077.
+func subPlanPrefix(title string) string {
+	if title == "" {
+		return ""
+	}
+	return fmt.Sprintf("(sub-plan: %s) ", title)
+}
+
 // writePlanGateEvidence renders the plan-review prompt's "### Gate
 // evidence" section (#963): the backend's synchronous plan-gate results,
 // presented as machine-verified ground truth that outranks the reviewer's
@@ -981,8 +1001,8 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 			b.WriteString("- findings: none (checked and clean)\n")
 		} else {
 			for _, f := range sw.Findings {
-				fmt.Fprintf(b, "- MISSING SIBLINGS (%s): %s is in scope but the pattern's required sibling(s) are absent from scope.files: %s\n",
-					f.Pattern, f.TriggerPath, strings.Join(f.MissingSiblings, ", "))
+				fmt.Fprintf(b, "- %sMISSING SIBLINGS (%s): %s is in scope but the pattern's required sibling(s) are absent from scope.files: %s\n",
+					subPlanPrefix(f.SubPlanTitle), f.Pattern, f.TriggerPath, strings.Join(f.MissingSiblings, ", "))
 			}
 		}
 		b.WriteString("\n")
@@ -997,8 +1017,8 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 			b.WriteString("- findings: none (checked and clean)\n")
 		} else {
 			for _, f := range ts.Findings {
-				fmt.Fprintf(b, "- EXISTING TESTS NOT IN SCOPE (%s): %s is in scope but these existing test files are absent from scope.files: %s",
-					f.Rule, f.TriggerPath, strings.Join(f.MissingTests, ", "))
+				fmt.Fprintf(b, "- %sEXISTING TESTS NOT IN SCOPE (%s): %s is in scope but these existing test files are absent from scope.files: %s",
+					subPlanPrefix(f.SubPlanTitle), f.Rule, f.TriggerPath, strings.Join(f.MissingTests, ", "))
 				if f.OmittedCount > 0 {
 					fmt.Fprintf(b, " (+%d more omitted)", f.OmittedCount)
 				}

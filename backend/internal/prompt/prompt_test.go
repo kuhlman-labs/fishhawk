@@ -801,6 +801,11 @@ func TestBuild_Plan_CouplingDiscoveryChecklist(t *testing.T) {
 		"docs/api/v0.md",
 		"README.md",
 		"callers' tests",
+		// #1077: the two newly-added couplings.
+		"cli/internal/spec/schemas",
+		"scripts/sync-schemas",
+		"backend/internal/postgres/migrations/*.sql",
+		"backend/internal/postgres/postgres_test.go",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -1528,6 +1533,62 @@ func TestBuild_PlanReview_GateEvidence_TestSweepRenders(t *testing.T) {
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
 			t.Errorf("plan_review prompt missing test-sweep element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_SubPlanPrefixRenders covers #1077: a
+// finding attributed to a decomposition sub-plan (SubPlanTitle set) renders
+// with the "(sub-plan: <title>) " prefix on both the surface-sweep and
+// test-sweep finding lines, while parent-scope findings (empty title) stay
+// byte-identical to the pre-#1077 line.
+func TestBuild_PlanReview_GateEvidence_SubPlanPrefixRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			SurfaceSweep: &SurfaceSweepEvidence{
+				ScannedFiles: 2,
+				Findings: []SurfaceSweepFindingEvidence{
+					{
+						Pattern:         "workflow schema requires every mirror",
+						TriggerPath:     "docs/spec/workflow-v0.schema.json",
+						MissingSiblings: []string{"cli/internal/spec/schemas/workflow-v0.schema.json"},
+						SubPlanTitle:    "schema slice",
+					},
+					{
+						Pattern:         "audit kind requires surfaces doc",
+						TriggerPath:     "backend/internal/issuecomment/notifier.go",
+						MissingSiblings: []string{"docs/issue-comment-surfaces.md"},
+					},
+				},
+			},
+			TestSweep: &TestSweepEvidence{
+				ScannedFiles: 2,
+				ListedDirs:   0,
+				Findings: []TestSweepFindingEvidence{
+					{
+						Rule:         "migration_walk",
+						TriggerPath:  "backend/internal/postgres/migrations/0032_x.up.sql",
+						MissingTests: []string{"backend/internal/postgres/postgres_test.go"},
+						SubPlanTitle: "migration slice",
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"- (sub-plan: schema slice) MISSING SIBLINGS (workflow schema requires every mirror): docs/spec/workflow-v0.schema.json is in scope but the pattern's required sibling(s) are absent from scope.files: cli/internal/spec/schemas/workflow-v0.schema.json",
+		"- (sub-plan: migration slice) EXISTING TESTS NOT IN SCOPE (migration_walk): backend/internal/postgres/migrations/0032_x.up.sql is in scope but these existing test files are absent from scope.files: backend/internal/postgres/postgres_test.go",
+		// A parent-scope finding (empty title) renders without a prefix.
+		"- MISSING SIBLINGS (audit kind requires surfaces doc): backend/internal/issuecomment/notifier.go is in scope",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing sub-plan-prefixed element %q:\n%s", w, got)
 		}
 	}
 }

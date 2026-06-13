@@ -25,10 +25,15 @@ const categoryPlanSurfaceSweep = "plan_surface_sweep"
 // SurfaceSweepFinding is one missing-sibling result: the plan touched a
 // trigger path belonging to a known multi-surface pattern but omitted one
 // or more sibling surfaces that pattern requires move in lockstep.
+//
+// SubPlanTitle attributes the finding to a decomposition sub-plan when the
+// trigger came from that sub-plan's own scope.files rather than the flat
+// parent scope (#1077). Empty for parent-scope findings.
 type SurfaceSweepFinding struct {
 	Pattern         string   `json:"pattern"`
 	TriggerPath     string   `json:"trigger_path"`
 	MissingSiblings []string `json:"missing_siblings"`
+	SubPlanTitle    string   `json:"sub_plan_title,omitempty"`
 }
 
 // SurfaceSweepPayload is the audit-payload shape for a plan_surface_sweep
@@ -102,6 +107,61 @@ var surfacePatterns = []surfacePattern{
 		Siblings: []string{
 			"backend/cmd/fishhawk-mcp/tools_test.go",
 			"backend/cmd/fishhawk-mcp/README.md",
+		},
+	},
+	// #1077: a canonical docs/spec/*.schema.json edited without its
+	// embedded mirror copies fails CI's schema-sync gate. scripts/sync-schemas
+	// is the authoritative routing; each canonical schema fans out to a
+	// DISTINCT mirror set, so each is its own pattern rather than one glob.
+	// Each pattern is self-referential (Triggers == Siblings): touching any
+	// member — including a mirror without the canonical — flags the missing
+	// peers. The cli/internal/spec/schemas copy is the one routinely omitted.
+	{
+		Name: "plan-standard schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/plan-standard-v1.schema.json",
+			"backend/internal/plan/schemas/plan-standard-v1.schema.json",
+			"runner/internal/plan/schemas/plan-standard-v1.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/plan-standard-v1.schema.json",
+			"backend/internal/plan/schemas/plan-standard-v1.schema.json",
+			"runner/internal/plan/schemas/plan-standard-v1.schema.json",
+		},
+	},
+	{
+		Name: "workflow schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/workflow-v0.schema.json",
+			"backend/internal/spec/schemas/workflow-v0.schema.json",
+			"cli/internal/spec/schemas/workflow-v0.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/workflow-v0.schema.json",
+			"backend/internal/spec/schemas/workflow-v0.schema.json",
+			"cli/internal/spec/schemas/workflow-v0.schema.json",
+		},
+	},
+	{
+		Name: "operator-role schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/operator-role.schema.json",
+			"backend/internal/operatorrole/schemas/operator-role.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/operator-role.schema.json",
+			"backend/internal/operatorrole/schemas/operator-role.schema.json",
+		},
+	},
+	{
+		Name: "operator-role-overlay schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/operator-role-overlay.schema.json",
+			"backend/internal/operatorrole/schemas/operator-role-overlay.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/operator-role-overlay.schema.json",
+			"backend/internal/operatorrole/schemas/operator-role-overlay.schema.json",
 		},
 	},
 }
@@ -209,6 +269,29 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 	}
 
 	findings := evaluateSurfaceSweep(scopeFiles, surfacePatterns)
+
+	// Evaluate each decomposition sub-plan's own scope.files too (#1077):
+	// an under-scoped slice's coupling gap must surface at the parent plan
+	// gate the operator approves, since the fan-out child runs are
+	// implement-only and never re-upload a plan. Findings are attributed to
+	// their sub-plan via SubPlanTitle; the parent ScannedFiles count is
+	// unchanged. evaluateSurfaceSweep stays pure.
+	if parsedPlan.Decomposition != nil {
+		for _, sp := range parsedPlan.Decomposition.SubPlans {
+			if sp.Scope == nil {
+				continue
+			}
+			subFiles := make([]string, 0, len(sp.Scope.Files))
+			for _, f := range sp.Scope.Files {
+				subFiles = append(subFiles, f.Path)
+			}
+			for _, f := range evaluateSurfaceSweep(subFiles, surfacePatterns) {
+				f.SubPlanTitle = sp.Title
+				findings = append(findings, f)
+			}
+		}
+	}
+
 	if findings == nil {
 		// Marshal an empty array rather than null so the audit payload's
 		// "checked and clean" state is explicit (a missing entry means
