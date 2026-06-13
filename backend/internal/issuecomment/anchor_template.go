@@ -317,35 +317,50 @@ func renderStageReviews(stageType string, entries []*audit.Entry) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "**%s review** — %s\n", capitalize(stageType), strings.Join(summaries, " · "))
+	// Every current-round reviewer gets its own per-reviewer <details> so a
+	// two-reviewer round can never read as one (#1073). When a verdict
+	// carries no concerns and no free_form, the body is "(no additional
+	// notes)" — keeping the block non-empty and the expandable-block count
+	// equal to the reviewer count.
 	for _, v := range verdicts {
-		if v.freeForm == "" && len(v.concerns) == 0 {
-			continue
-		}
 		fmt.Fprintf(&b, "<details><summary>%s</summary>\n\n", v.summaryToken())
-		for _, c := range v.concerns {
-			fmt.Fprintf(&b, "- **%s** (%s): %s\n", c.severity, c.category, c.note)
-		}
-		if v.freeForm != "" {
-			fmt.Fprintf(&b, "\n%s\n", v.freeForm)
+		if v.freeForm == "" && len(v.concerns) == 0 {
+			b.WriteString("(no additional notes)\n")
+		} else {
+			for _, c := range v.concerns {
+				fmt.Fprintf(&b, "- **%s** (%s): %s\n", c.severity, c.category, c.note)
+			}
+			if v.freeForm != "" {
+				fmt.Fprintf(&b, "\n%s\n", v.freeForm)
+			}
 		}
 		b.WriteString("\n</details>\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// renderCurrentPlan renders the current plan with the summary VISIBLE as
+// plain markdown under a **Plan** heading, and only scope+approach tucked
+// into a `Plan details` <details> (#1073). The <summary> attribute holds
+// the short label `Plan details`, never plan prose, and the summary text
+// is never duplicated inside the details body.
 func renderCurrentPlan(p *AnchorPlanView) string {
 	if p == nil {
 		return ""
 	}
 	var b strings.Builder
-	summary := p.Summary
-	if summary == "" {
-		summary = "Plan"
+	b.WriteString("**Plan**\n\n")
+	if p.Summary != "" {
+		fmt.Fprintf(&b, "%s\n", p.Summary)
+	} else {
+		b.WriteString("_No summary provided._\n")
 	}
-	fmt.Fprintf(&b, "<details><summary>📋 Plan — %s</summary>\n\n", oneLine(summary))
-	b.WriteString(renderPlanDetailBody(p))
-	b.WriteString("\n</details>")
-	return b.String()
+	if detail := renderPlanScopeApproach(p); detail != "" {
+		b.WriteString("\n<details><summary>Plan details</summary>\n\n")
+		b.WriteString(detail)
+		b.WriteString("\n</details>")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func renderSupersededPlans(plans []AnchorPlanView) string {
@@ -366,12 +381,29 @@ func renderSupersededPlans(plans []AnchorPlanView) string {
 }
 
 // renderPlanDetailBody renders the expanded plan body (summary, scope,
-// approach) shared by the current + superseded plan sections.
+// approach) shared by the superseded plan section. The current plan no
+// longer uses this — it renders the summary visibly and tucks only
+// scope+approach (via renderPlanScopeApproach) into its `Plan details`
+// block (#1073).
 func renderPlanDetailBody(p *AnchorPlanView) string {
 	var b strings.Builder
 	if p.Summary != "" {
 		fmt.Fprintf(&b, "%s\n\n", p.Summary)
 	}
+	if sa := renderPlanScopeApproach(p); sa != "" {
+		b.WriteString(sa)
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderPlanScopeApproach renders just the **Scope** bullet list and
+// **Approach** ordered list, WITHOUT the leading summary paragraph. Used
+// by renderCurrentPlan's `Plan details` block and shared into
+// renderPlanDetailBody for superseded plans. Empty when the plan has
+// neither scope files nor approach steps.
+func renderPlanScopeApproach(p *AnchorPlanView) string {
+	var b strings.Builder
 	if files := renderFileList(p.Files, len(p.Files)); files != "" {
 		b.WriteString("**Scope**\n\n")
 		b.WriteString(files)

@@ -76,11 +76,24 @@ func TestRenderAnchorBody_CurrentAndSupersededPlans(t *testing.T) {
 		ExternalURL: "https://app.example",
 		Now:         time.Now(),
 	})
-	if !strings.Contains(body, "<details><summary>📋 Plan — Add the living anchor comment.</summary>") {
-		t.Errorf("current plan should be a collapsed details with summary visible: %q", body)
+	if !strings.Contains(body, "**Plan**") {
+		t.Errorf("current plan should have a visible **Plan** heading: %q", body)
+	}
+	if !strings.Contains(body, "Add the living anchor comment.") {
+		t.Errorf("current plan summary should be visible plain markdown: %q", body)
+	}
+	if !strings.Contains(body, "<details><summary>Plan details</summary>") {
+		t.Errorf("current plan scope/approach should be inside a Plan details block: %q", body)
 	}
 	if !strings.Contains(body, "`a.go`") {
 		t.Errorf("current plan scope file should render: %q", body)
+	}
+	// The summary must NOT be buried inside the <summary> attribute anymore.
+	if strings.Contains(body, "<summary>📋 Plan") {
+		t.Errorf("current plan must not use the old summary-in-<summary> form: %q", body)
+	}
+	if strings.Contains(body, "<summary>Add the living anchor comment.") {
+		t.Errorf("plan summary text must not appear inside a <summary> tag: %q", body)
 	}
 	if !strings.Contains(body, "Superseded plan — First attempt.") {
 		t.Errorf("superseded plan should render collapsed: %q", body)
@@ -112,6 +125,37 @@ func TestRenderAnchorBody_ReviewVerdictsInline(t *testing.T) {
 	}
 	if !strings.Contains(body, "see the note") {
 		t.Errorf("free_form should be in the expandable details: %q", body)
+	}
+}
+
+// TestRenderAnchorBody_PerReviewerBlocks pins the per-reviewer-block-count
+// shape (#1073): every current-round reviewer gets its own <details>, even
+// a bare approve with no concerns and no free_form, so a two-reviewer round
+// can never read as one.
+func TestRenderAnchorBody_PerReviewerBlocks(t *testing.T) {
+	entries := []*audit.Entry{
+		startedEntry(10, "plan"),
+		reviewedEntry(t, 11, "plan", "claude-opus-4-8", "approve", nil, ""),
+		reviewedEntry(t, 12, "plan", "gpt-5.5", "approve", nil, ""),
+	}
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}},
+		Audit:       entries,
+		ExternalURL: "https://app.example",
+		Now:         time.Now(),
+	})
+	if !strings.Contains(body, "<details><summary>claude-opus-4-8: approve</summary>") {
+		t.Errorf("opus per-reviewer block missing: %q", body)
+	}
+	if !strings.Contains(body, "<details><summary>gpt-5.5: approve</summary>") {
+		t.Errorf("codex per-reviewer block missing: %q", body)
+	}
+	if n := strings.Count(body, "(no additional notes)"); n != 2 {
+		t.Errorf("expected exactly 2 '(no additional notes)' bodies; got %d: %q", n, body)
+	}
+	if !strings.Contains(body, "claude-opus-4-8: approve · gpt-5.5: approve") {
+		t.Errorf("inline one-liner must survive: %q", body)
 	}
 }
 
