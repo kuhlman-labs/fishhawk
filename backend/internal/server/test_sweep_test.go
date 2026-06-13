@@ -122,6 +122,91 @@ func TestEvaluateTestSweep(t *testing.T) {
 			},
 		},
 		{
+			// #1031: a scoped migration without the pinned migration-walk
+			// test (postgres_test.go pins the LATEST migration).
+			name:     "migration sql without postgres_test flags migration_walk",
+			scope:    []plan.ScopeFile{{Path: "backend/internal/postgres/migrations/0032_x.up.sql", Operation: plan.FileOpCreate}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleMigrationWalk,
+					TriggerPath:  "backend/internal/postgres/migrations/0032_x.up.sql",
+					MissingTests: []string{"backend/internal/postgres/postgres_test.go"},
+				},
+			},
+		},
+		{
+			name: "migration sql with postgres_test in scope no finding",
+			scope: []plan.ScopeFile{
+				{Path: "backend/internal/postgres/migrations/0032_x.up.sql", Operation: plan.FileOpCreate},
+				{Path: "backend/internal/postgres/postgres_test.go", Operation: plan.FileOpModify},
+			},
+			listings: map[string][]string{},
+			want:     nil,
+		},
+		{
+			name:     "down-only migration sql also fires",
+			scope:    []plan.ScopeFile{{Path: "backend/internal/postgres/migrations/0032_x.down.sql", Operation: plan.FileOpCreate}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleMigrationWalk,
+					TriggerPath:  "backend/internal/postgres/migrations/0032_x.down.sql",
+					MissingTests: []string{"backend/internal/postgres/postgres_test.go"},
+				},
+			},
+		},
+		{
+			// One finding per trigger path, deterministically sorted.
+			name: "up and down migrations fire one finding each sorted",
+			scope: []plan.ScopeFile{
+				{Path: "backend/internal/postgres/migrations/0032_x.up.sql", Operation: plan.FileOpCreate},
+				{Path: "backend/internal/postgres/migrations/0032_x.down.sql", Operation: plan.FileOpCreate},
+			},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleMigrationWalk,
+					TriggerPath:  "backend/internal/postgres/migrations/0032_x.down.sql",
+					MissingTests: []string{"backend/internal/postgres/postgres_test.go"},
+				},
+				{
+					Rule:         testSweepRuleMigrationWalk,
+					TriggerPath:  "backend/internal/postgres/migrations/0032_x.up.sql",
+					MissingTests: []string{"backend/internal/postgres/postgres_test.go"},
+				},
+			},
+		},
+		{
+			// path.Match's '*' does not cross '/', so only direct children
+			// of the migrations directory trigger.
+			name:     "sql outside migrations dir does not fire",
+			scope:    []plan.ScopeFile{{Path: "backend/internal/db/queries.sql", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want:     nil,
+		},
+		{
+			// Rule coexistence: migration_walk sorts before stem_sibling.
+			name: "migration_walk coexists with stem_sibling in rule order",
+			scope: []plan.ScopeFile{
+				{Path: dir + "/upload.go", Operation: plan.FileOpModify},
+				{Path: "backend/internal/postgres/migrations/0032_x.up.sql", Operation: plan.FileOpCreate},
+			},
+			listings: map[string][]string{dir: {"upload.go", "upload_test.go"}},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleMigrationWalk,
+					TriggerPath:  "backend/internal/postgres/migrations/0032_x.up.sql",
+					MissingTests: []string{"backend/internal/postgres/postgres_test.go"},
+				},
+				{
+					Rule:         testSweepRuleStemSibling,
+					TriggerPath:  dir + "/upload.go",
+					MissingTests: []string{dir + "/upload_test.go"},
+				},
+			},
+		},
+		{
 			name:     "non-go files never trigger",
 			scope:    []plan.ScopeFile{{Path: "docs/ARCHITECTURE.md", Operation: plan.FileOpModify}},
 			listings: map[string][]string{"docs": {"ARCHITECTURE.md"}},

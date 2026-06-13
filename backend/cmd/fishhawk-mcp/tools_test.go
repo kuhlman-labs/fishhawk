@@ -1970,6 +1970,14 @@ func TestGetPlan_TestSweep_CrossBoundarySeam(t *testing.T) {
 				MissingTests: []string{"backend/internal/server/a_test.go"},
 				OmittedCount: 3,
 			},
+			{
+				// #1031 path-trigger rule: the rule string must round-trip
+				// the server-payload -> audit-entry -> MCP-decode seam
+				// opaquely, like any other rule.
+				Rule:         "migration_walk",
+				TriggerPath:  "backend/internal/postgres/migrations/0032_x.up.sql",
+				MissingTests: []string{"backend/internal/postgres/postgres_test.go"},
+			},
 		},
 	})
 
@@ -1984,8 +1992,8 @@ func TestGetPlan_TestSweep_CrossBoundarySeam(t *testing.T) {
 	if out.TestSweep.ScannedFiles != 3 || out.TestSweep.ListedDirs != 2 {
 		t.Errorf("ScannedFiles/ListedDirs = %d/%d, want 3/2", out.TestSweep.ScannedFiles, out.TestSweep.ListedDirs)
 	}
-	if got := len(out.TestSweep.Findings); got != 2 {
-		t.Fatalf("len(Findings) = %d, want 2", got)
+	if got := len(out.TestSweep.Findings); got != 3 {
+		t.Fatalf("len(Findings) = %d, want 3", got)
 	}
 	f := out.TestSweep.Findings[0]
 	if f.Rule != "stem_sibling" || f.TriggerPath != "backend/internal/server/upload.go" {
@@ -1999,6 +2007,13 @@ func TestGetPlan_TestSweep_CrossBoundarySeam(t *testing.T) {
 	}
 	if out.TestSweep.Findings[1].OmittedCount != 3 {
 		t.Errorf("Findings[1].OmittedCount = %d, want 3", out.TestSweep.Findings[1].OmittedCount)
+	}
+	mw := out.TestSweep.Findings[2]
+	if mw.Rule != "migration_walk" || mw.TriggerPath != "backend/internal/postgres/migrations/0032_x.up.sql" {
+		t.Errorf("Findings[2] = %+v, want the migration_walk finding", mw)
+	}
+	if len(mw.MissingTests) != 1 || mw.MissingTests[0] != "backend/internal/postgres/postgres_test.go" {
+		t.Errorf("Findings[2].MissingTests = %v, want [backend/internal/postgres/postgres_test.go]", mw.MissingTests)
 	}
 }
 

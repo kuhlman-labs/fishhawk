@@ -115,11 +115,13 @@ Notes:
   advisory audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it to the issue thread. It consults the repository
   tree via the GitHub Contents API (default-branch HEAD) and flags EXISTING
-  `*_test.go` files adjacent to the plan's scoped `.go` files that the plan
-  omitted — a stem-sibling test of a scoped production file
-  (`stem_sibling`), or existing tests in a package where the plan creates a
-  new test file (`new_test_in_tested_package`, capped at 10 names +
-  `omitted_count`) — with payload `{findings, scanned_files, listed_dirs}`.
+  test files the plan omitted — a stem-sibling test of a scoped production
+  `.go` file (`stem_sibling`), existing tests in a package where the plan
+  creates a new test file (`new_test_in_tested_package`, capped at 10 names
+  + `omitted_count`), or a path-trigger rule's pinned test
+  (`migration_walk`: a scoped `migrations/*.sql` requires
+  `backend/internal/postgres/postgres_test.go`, scope-set only, #1031) —
+  with payload `{findings, scanned_files, listed_dirs}`.
   Advisory + fail-open (nil GitHub client, nil installation, every listing
   failing → no entry, never a block) and written even on a clean sweep
   (empty `findings`) so a reader can distinguish "checked and clean" from
