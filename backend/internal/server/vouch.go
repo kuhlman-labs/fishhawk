@@ -72,7 +72,9 @@ type vouchCommitResponse struct {
 //     #797/#856 cross-write protection). Mirrors the #961
 //     decide_scope_amendment run-bound rejection. Only an operator fhk_*
 //     token carrying write:stages may vouch;
-//   - a token without write:stages → 403 insufficient_scope.
+//   - any identity without write:stages → 403 insufficient_scope. This is
+//     enforced UNCONDITIONALLY (no cookie-session bypass): a non-token
+//     operator identity must not be able to append vouch lineage either.
 //
 // The handler records the operator's declaration verbatim — it does NOT
 // verify the SHA exists on the branch or in the compare set. This is
@@ -99,7 +101,16 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 			nil)
 		return
 	}
-	if id.TokenID != "" && !hasScope(id, "write:stages") {
+	// write:stages is enforced UNCONDITIONALLY here — the binding approval
+	// condition made vouch operator-fhk-token-only, so this deliberately
+	// does NOT mirror the sibling `id.TokenID != ""` guard (reset-branch,
+	// waive, retry, …) that waves operator cookie-session identities (empty
+	// TokenID, no scopes) past the scope gate. A cookie session, a future
+	// non-token credential, or any authenticated-but-unscoped identity must
+	// NOT be able to append operator_commit_vouched lineage and unblock the
+	// branch-lineage check: vouching git lineage is a scoped operator action
+	// (ADR-035 sole-writer invariant).
+	if !hasScope(id, "write:stages") {
 		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
 			"token is missing required scope: write:stages",
 			map[string]any{"required_scope": "write:stages"})

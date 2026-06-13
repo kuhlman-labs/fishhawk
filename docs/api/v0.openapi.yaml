@@ -2201,8 +2201,10 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            One of two cases: (1) bearer token lacks `write:stages` scope —
-            body `error` is `insufficient_scope`; (2) a run-bound MCP token
+            One of two cases: (1) the identity lacks `write:stages` scope —
+            body `error` is `insufficient_scope` (enforced unconditionally:
+            a cookie-session operator without the scope is rejected too, no
+            bypass); (2) a run-bound MCP token
             (subject `mcp:run:<uuid>`) attempted the vouch — body `error` is
             `run_token_forbidden` (rejected outright, even for its own run).
           content:

@@ -1112,7 +1112,7 @@ func TestLineage_VouchedCommitClosesWriteReadSeam(t *testing.T) {
 
 	// WRITE side of the seam: vouch the remediation commit via the handler.
 	w := postVouchCommit(t, s, runID,
-		vouchCommitRequest{SHA: vouchedCommit, Reason: "sync-schemas output on the fan-out branch"}, withAuth)
+		vouchCommitRequest{SHA: vouchedCommit, Reason: "sync-schemas output on the fan-out branch"}, withVouchOperator)
 	if w.Code != http.StatusOK {
 		t.Fatalf("vouch status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -1182,7 +1182,7 @@ func TestLineage_VouchUnwedgesRun(t *testing.T) {
 
 	// Vouch it via the handler, then re-check: now clean.
 	w := postVouchCommit(t, s, runID,
-		vouchCommitRequest{SHA: operatorCommit, Reason: "operator remediation"}, withAuth)
+		vouchCommitRequest{SHA: operatorCommit, Reason: "operator remediation"}, withVouchOperator)
 	if w.Code != http.StatusOK {
 		t.Fatalf("vouch status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -1229,7 +1229,7 @@ func TestLineage_VouchOnDecompositionParent(t *testing.T) {
 
 	// Vouch the operator commit against the PARENT run.
 	w := postVouchCommit(t, s, runID,
-		vouchCommitRequest{SHA: opCommit, Reason: "operator remediation on the fan-out branch"}, withAuth)
+		vouchCommitRequest{SHA: opCommit, Reason: "operator remediation on the fan-out branch"}, withVouchOperator)
 	if w.Code != http.StatusOK {
 		t.Fatalf("vouch status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
