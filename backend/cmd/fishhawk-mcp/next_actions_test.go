@@ -443,3 +443,84 @@ func TestNextActions_PlanReviewPendingDoesNotOfferApproval(t *testing.T) {
 		}
 	}
 }
+
+// TestNextActions_CIFailedRoutable pins the negative-mirror routable arm
+// (#1045): a drive run whose derived_status is ci_failed WITH open
+// concerns (hint != nil) classifies ci_failed_routable and leads with
+// fishhawk_fixup_stage (consuming fixup_budget) carrying the implement
+// stage id, then a no-cost rerun_ci_checks flake path. The merge ritual
+// is NOT offered — a red required check is not mergeable.
+func TestNextActions_CIFailedRoutable(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naRun("running")
+	run.PullRequestURL = &prURL
+	impl := naStage("implement", "awaiting_approval")
+	stages := []Stage{naStage("plan", "succeeded"), impl}
+	drive := &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}
+	hint := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
+
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), hint, drive)
+	if na.State != "ci_failed_routable" {
+		t.Fatalf("state = %q, want ci_failed_routable", na.State)
+	}
+	if na.Actions[0].Action != "fishhawk_fixup_stage" {
+		t.Errorf("actions[0] = %q, want fishhawk_fixup_stage first", na.Actions[0].Action)
+	}
+	if na.Actions[0].Consumes != consumesFixupBudget {
+		t.Errorf("fixup consumes = %q, want fixup_budget", na.Actions[0].Consumes)
+	}
+	if na.Actions[0].Params["stage_id"] != impl.ID {
+		t.Errorf("fixup stage_id = %q, want the implement stage id %q", na.Actions[0].Params["stage_id"], impl.ID)
+	}
+	findAction(t, na, "rerun_ci_checks")
+	for _, a := range na.Actions {
+		if a.Action == "merge_pr" || a.Action == "approve_pr" || a.Action == "merge_and_file_follow_up" {
+			t.Errorf("merge ritual action %q offered on a red required check — ci_failed is not mergeable", a.Action)
+		}
+	}
+}
+
+// TestNextActions_CIFailedUnroutable pins the structurally-unroutable arm
+// (#1045 / #1044): a ci_failed drive run with NO open concerns (hint ==
+// nil) classifies ci_failed_unroutable and offers commit_and_vouch (the
+// operator-remediation arm) first, then rerun_ci_checks, then page_human.
+func TestNextActions_CIFailedUnroutable(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naRun("running")
+	run.PullRequestURL = &prURL
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")}
+	drive := &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}
+
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive)
+	if na.State != "ci_failed_unroutable" {
+		t.Fatalf("state = %q, want ci_failed_unroutable", na.State)
+	}
+	if got := actionNames(na); len(got) != 3 || got[0] != "commit_and_vouch" || got[1] != "rerun_ci_checks" || got[2] != "page_human" {
+		t.Fatalf("actions = %v, want [commit_and_vouch rerun_ci_checks page_human]", got)
+	}
+	for i, a := range na.Actions {
+		if a.Precondition == "" || a.Consumes == "" || a.Reason == "" {
+			t.Errorf("actions[%d] (%s) missing structured fields: %+v", i, a.Action, a)
+		}
+	}
+}
+
+// TestNextActions_CIFailedFoldsDriveNextActionFirst pins that the drive
+// next_action still folds in FIRST on the ci_failed path, so the
+// classify_ci_failure distilled step leads and drive/next_actions agree.
+func TestNextActions_CIFailedFoldsDriveNextActionFirst(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naRun("running")
+	run.PullRequestURL = &prURL
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")}
+	drive := &DriveStatus{
+		Drive:         true,
+		DerivedStatus: "ci_failed",
+		NextAction:    &RunNextAction{Action: "classify_ci_failure", Detail: "required PR checks red", PRURL: prURL},
+	}
+
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive)
+	if na.Actions[0].Action != "classify_ci_failure" {
+		t.Errorf("actions[0] = %q, want the drive next_action classify_ci_failure folded first", na.Actions[0].Action)
+	}
+}

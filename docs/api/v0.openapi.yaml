@@ -350,21 +350,26 @@ components:
             no open concerns.
         derived_status:
           type: string
-          enum: [awaiting_merge]
+          enum: [awaiting_merge, ci_failed]
           description: |
             Presentation-only drive-mode status (#1023):
             `awaiting_merge` while a non-terminal drive run with an
             open PR has `checks_green_awaiting_merge` as its latest
             recorded auto-advance — every gate resolved, required
             checks green, merge (a judgment point) parked for the
-            operator. Never a persisted run state: `state` stays
-            `running` while parked here, and the transition table in
-            `backend/internal/run/transition.go` is unchanged. Emitted
-            by `GET /v0/runs/{run_id}` ONLY (distilled from
-            `run_auto_advanced` audit entries, same single-read posture
-            as `concerns`); omitted on non-drive runs, terminal runs,
-            and whenever a later transition superseded the
-            checks-green park.
+            operator. `ci_failed` is its negative mirror (#1045): a
+            non-terminal drive run with an open PR whose latest
+            auto-advance is `ci_failed` — the review evidence settled
+            but a required PR check concluded red, parking the run for
+            operator classification (fix-up, an operator commit +
+            vouch, or a checks re-run). Never a persisted run state:
+            `state` stays `running` while parked here, and the
+            transition table in `backend/internal/run/transition.go` is
+            unchanged. Emitted by `GET /v0/runs/{run_id}` ONLY
+            (distilled from `run_auto_advanced` audit entries, same
+            single-read posture as `concerns`); omitted on non-drive
+            runs, terminal runs, and whenever a later transition
+            superseded the parked status.
         next_action:
           $ref: '#/components/schemas/RunNextAction'
           description: |
@@ -506,7 +511,9 @@ components:
         the from/to edge it stamps. Rule names are a closed set
         (`backend/internal/drive`): `plan_approved_dispatch`,
         `reviews_settled_gate`, `fixup_rereview_repark`,
-        `checks_green_awaiting_merge`.
+        `checks_green_awaiting_merge`, `ci_failed` (the negative mirror
+        of `checks_green_awaiting_merge`: a required PR check concluded
+        red).
       required: [rule, from, to, ts]
       properties:
         rule:

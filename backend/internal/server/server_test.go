@@ -238,10 +238,34 @@ func TestObserveParkedReview_FreshRoundAfterRepark_NotSettledByOldRound(t *testi
 	}
 }
 
-// TestObserveParkedReview_ChecksNotGreen_NoAwaitingMerge pins the
-// conservative checks gate: settled reviews but a non-pass required
-// check stamps reviews_settled_gate only.
-func TestObserveParkedReview_ChecksNotGreen_NoAwaitingMerge(t *testing.T) {
+// TestObserveParkedReview_ChecksPending_NoAwaitingMergeNoCIFailed pins
+// the conservative checks gate from both sides: settled reviews but a
+// still-running (StatePending) required check stamps reviews_settled_gate
+// only — neither awaiting_merge (not green) nor ci_failed (not red), so
+// an in-flight check can never trip either derived status.
+func TestObserveParkedReview_ChecksPending_NoAwaitingMergeNoCIFailed(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.repo.seedRun(&run.Run{
+		ID: h.runID, Drive: true, State: run.StateRunning,
+		RequiredChecksSnapshot: &run.RequiredChecksSnapshot{Contexts: []string{"ci_pass"}},
+	})
+	h.scs.seed(h.stage.ID, "ci_pass", stagecheck.StatePending)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 1 || advances[0].Rule != drive.RuleReviewsSettledGate {
+		t.Fatalf("run_auto_advanced = %+v, want only reviews_settled_gate", advances)
+	}
+}
+
+// TestObserveParkedReview_ChecksFailed_StampsCIFailed pins the negative
+// mirror (#1045): settled reviews with a red (StateFail) required check
+// stamp reviews_settled_gate + ci_failed, the ci_failed entry naming the
+// failed check and carrying the classify next action. Idempotent across
+// two ticks (single stamp per stage).
+func TestObserveParkedReview_ChecksFailed_StampsCIFailed(t *testing.T) {
 	h := newDriveObserverHarness(t, true)
 	h.seedImplementReviewRound(t, 1, 1, 10)
 	h.repo.seedRun(&run.Run{
@@ -251,10 +275,20 @@ func TestObserveParkedReview_ChecksNotGreen_NoAwaitingMerge(t *testing.T) {
 	h.scs.seed(h.stage.ID, "ci_pass", stagecheck.StateFail)
 
 	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
 
 	advances := h.driveAdvances(t)
-	if len(advances) != 1 || advances[0].Rule != drive.RuleReviewsSettledGate {
-		t.Fatalf("run_auto_advanced = %+v, want only reviews_settled_gate", advances)
+	if len(advances) != 2 {
+		t.Fatalf("run_auto_advanced = %+v, want settled + ci_failed (idempotent across two ticks)", advances)
+	}
+	if advances[1].Rule != drive.RuleCIFailed || advances[1].To != "ci_failed" {
+		t.Fatalf("second entry = %+v, want ci_failed -> ci_failed", advances[1])
+	}
+	if !strings.Contains(advances[1].Event, "ci_pass") {
+		t.Errorf("Event = %q, want it to name the failed check ci_pass", advances[1].Event)
+	}
+	if advances[1].NextAction == nil || advances[1].NextAction.Action != "classify_ci_failure" || advances[1].NextAction.PRURL != driveObserverPRURL {
+		t.Errorf("NextAction = %+v, want classify_ci_failure with PR URL", advances[1].NextAction)
 	}
 }
 

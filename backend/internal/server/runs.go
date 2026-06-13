@@ -65,7 +65,8 @@ type runResponse struct {
 	// DerivedStatus is the presentation-only drive-mode status (#1023):
 	// "awaiting_merge" while a non-terminal drive run with an open PR has
 	// a checks_green_awaiting_merge auto-advance as its latest recorded
-	// transition. Never a persisted run.State — the state machine in
+	// transition, or "ci_failed" (#1045) when its negative mirror — a
+	// ci_failed stamp — is the latest. Never a persisted run.State — the state machine in
 	// run/transition.go is untouched. Populated by handleGetRun ONLY
 	// (distilled from run_auto_advanced audit entries, same single-read
 	// posture as Concerns); omitted everywhere else.
@@ -825,6 +826,14 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 	}
 	if latest.Rule == drive.RuleChecksGreenAwaitingMerge && runRow.PullRequestURL != nil {
 		resp.DerivedStatus = "awaiting_merge"
+	}
+	// Negative mirror (#1045): the latest stamp is ci_failed and the PR
+	// is open → the derived ci_failed presentation status. Keying off the
+	// LATEST entry means a later checks_green/fixup_rereview_repark stamp
+	// naturally supersedes it (and vice versa) with no separate
+	// supersession code.
+	if latest.Rule == drive.RuleCIFailed && runRow.PullRequestURL != nil {
+		resp.DerivedStatus = "ci_failed"
 	}
 }
 
