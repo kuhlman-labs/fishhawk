@@ -784,7 +784,7 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	if err != nil {
 		return fmt.Errorf("issuecomment: list audit: %w", err)
 	}
-	current, superseded := n.loadAnchorPlans(ctx, stages)
+	current, superseded := n.loadAnchorPlans(ctx, stages, entries)
 	body := RenderAnchorBody(AnchorInput{
 		Run:             runRow,
 		Stages:          stages,
@@ -804,17 +804,20 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	if err != nil || !ok {
 		return err
 	}
-	return n.firePings(ctx, ctxv, entries, ctxv.runURL)
+	return n.firePings(ctx, ctxv, entries, stages, ctxv.runURL)
 }
 
 // loadAnchorPlans projects the run's plan artifacts into the anchor's
 // current + superseded plan views. The latest plan artifact (by
 // CreatedAt) across the run's plan stages is the current plan; any
-// earlier ones are superseded. Returns (nil, nil) when no artifact
-// lister is wired (graceful degradation — the anchor omits the plan
-// sections) or no plan artifact exists yet. Best-effort throughout: a
-// load or decode failure for one stage is skipped, never fatal.
-func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage) (*AnchorPlanView, []AnchorPlanView) {
+// earlier ones are superseded, oldest-first, each annotated with the
+// rejection reason that retired it (derived from the run's plan-gate
+// reject decisions, chronologically aligned — see planRejectionReasons).
+// Returns (nil, nil) when no artifact lister is wired (graceful
+// degradation — the anchor omits the plan sections) or no plan artifact
+// exists yet. Best-effort throughout: a load or decode failure for one
+// stage is skipped, never fatal.
+func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage, entries []*audit.Entry) (*AnchorPlanView, []AnchorPlanView) {
 	if n.artifacts == nil {
 		return nil, nil
 	}
@@ -852,14 +855,69 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage) (*A
 	if len(views) == 0 {
 		return nil, nil
 	}
-	// Newest first.
-	sort.SliceStable(views, func(i, j int) bool { return views[i].at.After(views[j].at) })
-	current := views[0].view
-	var superseded []AnchorPlanView
-	for _, v := range views[1:] {
-		superseded = append(superseded, v.view)
+	// Oldest first so each superseded plan lines up with the rejection
+	// (in chronological order) that retired it. The newest is current.
+	sort.SliceStable(views, func(i, j int) bool { return views[i].at.Before(views[j].at) })
+	current := views[len(views)-1].view
+	reasons := planRejectionReasons(entries)
+	superseded := make([]AnchorPlanView, 0, len(views)-1)
+	for i := 0; i < len(views)-1; i++ {
+		v := views[i].view
+		if i < len(reasons) {
+			v.RejectionReason = reasons[i]
+		}
+		superseded = append(superseded, v)
 	}
 	return &current, superseded
+}
+
+// planRejectionReasons extracts the rejection comments from the run's
+// plan-gate reject decisions (`approval_submitted` with
+// decision=reject), ascending by audit sequence — so the Nth rejected
+// plan version aligns with the Nth (oldest-first) superseded plan
+// artifact. A reject with no recorded comment contributes an empty
+// string (rendered without a "Rejected:" line). Used by loadAnchorPlans
+// to annotate superseded plan views.
+func planRejectionReasons(entries []*audit.Entry) []string {
+	type seqReason struct {
+		seq    int64
+		reason string
+	}
+	var rs []seqReason
+	for _, e := range entries {
+		if e.Category != "approval_submitted" {
+			continue
+		}
+		decision, reason := decodeRejectionComment(e.Payload)
+		if decision != string(approval.DecisionReject) {
+			continue
+		}
+		rs = append(rs, seqReason{seq: e.Sequence, reason: reason})
+	}
+	sort.SliceStable(rs, func(i, j int) bool { return rs[i].seq < rs[j].seq })
+	out := make([]string, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, r.reason)
+	}
+	return out
+}
+
+// decodeRejectionComment reads the decision + rejection_comment out of
+// an approval_submitted payload (the reject path stamps the operator's
+// reason there; see approvals.go). Returns ("", "") on any decode
+// failure.
+func decodeRejectionComment(payload []byte) (decision, comment string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var p struct {
+		Decision         string `json:"decision"`
+		RejectionComment string `json:"rejection_comment"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", ""
+	}
+	return p.Decision, p.RejectionComment
 }
 
 // contextForStatus is the status-comment variant of contextFor — it

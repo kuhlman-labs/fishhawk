@@ -1251,30 +1251,35 @@ func planArtifactJSON(t *testing.T, summary string, files ...string) json.RawMes
 }
 
 // TestNotifyStatusUpdateForRun_AnchorEndToEnd drives a feature_change
-// shape — plan generated, two reviewer verdicts (approve + reject), an
-// awaiting-approval implement gate — through repeated
-// NotifyStatusUpdateForRun calls and asserts the full seam (#1054):
-// exactly ONE anchor comment (single status_comment_posted id reused +
-// edited in place), page-class pings posted once each as NEW comments,
-// reviewer verdicts visible inline, and the plan summary projected from
-// the artifact store.
+// shape across the full audit-chain → anchor-projection → GitHub-I/O
+// seam (#1054): a first plan version rejected (with a reason) and
+// replanned, two reviewer verdicts (approve + reject), and the replanned
+// plan parked at the approval gate. Through repeated
+// NotifyStatusUpdateForRun calls it asserts: exactly ONE anchor comment
+// (single status_comment_posted id reused + edited in place), page-class
+// pings posted once each as NEW comments, reviewer verdicts visible
+// inline, the CURRENT plan summary projected from the artifact store, and
+// — the supersede/replan path (concern #2) — the SUPERSEDED plan
+// preserved collapsed with its rejection reason.
 func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 	runID := uuid.New()
 	planStageID := uuid.New()
-	implStageID := uuid.New()
 	triggerRef := "issue:42"
 	repoRuns := &fakeRuns{
 		runs: map[uuid.UUID]*run.Run{runID: {
 			ID: runID, Repo: "x/y", WorkflowID: "feature_change", State: run.StateRunning,
 			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef, InstallationID: int64Ptr(99),
 		}},
+		// The plan stage is parked at its approval gate (the replanned v2
+		// awaiting a human) — the precondition for the plan-awaiting ping.
 		stages: map[uuid.UUID][]*run.Stage{runID: {
-			{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded},
-			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement, State: run.StageStateAwaitingApproval},
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval},
 		}},
 	}
 	gh := &fakeGitHub{}
 	au := &fakeAudit{}
+	// Round 1: plan v1 generated, reviewed (approve + reject), then the
+	// plan gate REJECTED with an operator reason — this is what retires v1.
 	au.preSeedWithStage(runID, planStageID, "plan_generated", map[string]any{"schema_version": "standard_v1"})
 	au.preSeedWithStage(runID, planStageID, "plan_review_started", map[string]any{})
 	au.preSeedWithStage(runID, planStageID, "plan_reviewed", map[string]any{"reviewer_model": "claude-opus-4-8", "verdict": "approve"})
@@ -1283,11 +1288,22 @@ func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 		"concerns":  []map[string]any{{"severity": "high", "category": "correctness", "note": "boom"}},
 		"free_form": "the codex note",
 	})
-	au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{"decision": "approve", "approver_github_login": "alice"})
+	au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{
+		"decision": "reject", "approver_github_login": "alice",
+		"rejection_comment": "scoped the wrong fork",
+	})
+	// Round 2: replanned plan v2 generated (now awaiting approval).
+	au.preSeedWithStage(runID, planStageID, "plan_generated", map[string]any{"schema_version": "standard_v1"})
 
+	// Two plan artifacts on the stage: v1 (older, superseded) and v2
+	// (newer, current). loadAnchorPlans orders by CreatedAt.
 	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
-		planStageID: {{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan,
-			Content: planArtifactJSON(t, "Add the living anchor", "a.go"), CreatedAt: time.Unix(100, 0)}},
+		planStageID: {
+			{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan,
+				Content: planArtifactJSON(t, "First attempt on the wrong fork", "a.go"), CreatedAt: time.Unix(100, 0)},
+			{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan,
+				Content: planArtifactJSON(t, "Add the living anchor", "b.go"), CreatedAt: time.Unix(200, 0)},
+		},
 	}}
 	n := issuecomment.New(issuecomment.Deps{
 		GitHub: gh, Runs: repoRuns, Audit: au, Artifacts: arts,
@@ -1312,10 +1328,11 @@ func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 	if anchorCreates != 1 {
 		t.Errorf("expected exactly 1 anchor comment create; got %d", anchorCreates)
 	}
-	// Page-class events in the chain: plan ready (plan_generated) + a
-	// reviewer reject = 2 pings, each fired once across the 3 transitions.
+	// Page-class events in the chain: the plan gate awaiting approval +
+	// a reviewer reject = 2 pings, each fired once across the 3
+	// transitions (the gate-decision reject is not itself a ping class).
 	if pingCreates != 2 {
-		t.Errorf("expected 2 page-class pings (plan ready + reject); got %d", pingCreates)
+		t.Errorf("expected 2 page-class pings (plan awaiting + reviewer reject); got %d", pingCreates)
 	}
 	if len(gh.updateCalls) < 2 {
 		t.Errorf("expected the anchor to edit in place on later transitions; got %d edits", len(gh.updateCalls))
@@ -1326,6 +1343,14 @@ func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 		t.Errorf("anchor missing inline reviewer verdicts:\n%s", body)
 	}
 	if !strings.Contains(body, "Add the living anchor") {
-		t.Errorf("anchor missing plan summary projected from artifact store:\n%s", body)
+		t.Errorf("anchor missing CURRENT plan summary projected from artifact store:\n%s", body)
+	}
+	// Supersede/replan seam (concern #2): the older plan is preserved
+	// collapsed, labeled superseded, WITH its rejection reason.
+	if !strings.Contains(body, "Superseded plan") || !strings.Contains(body, "First attempt on the wrong fork") {
+		t.Errorf("anchor missing superseded plan section:\n%s", body)
+	}
+	if !strings.Contains(body, "scoped the wrong fork") {
+		t.Errorf("superseded plan missing its rejection reason:\n%s", body)
 	}
 }

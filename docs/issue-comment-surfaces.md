@@ -10,7 +10,7 @@ it.
 | Surface | Audit category | Audit kind | Caller (production) | First posted | Edits in place? |
 |---|---|---|---|---|---|
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan awaiting approval, reviewer reject, CI failure) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, reviewer reject, must_page_human, CI failure) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688) | warn_at / 100% crossing of an advisory periodic budget | No (per-`(period_start, tier)` dedup; the warn comment and the 100% comment each post once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
@@ -25,7 +25,8 @@ Notes:
   `<details>` timeline of interesting audit rows; surfaced reviewer verdicts
   (severity-tagged concern counts inline, free_form in an expandable
   `<details>`); the current plan as a collapsed `<details>` with its summary
-  visible; and any superseded plans kept collapsed. `NotifyPlanReady` no
+  visible; and any superseded plans kept collapsed with the rejection reason
+  that retired them. `NotifyPlanReady` no
   longer posts its own comment — it routes to the same anchor rebuild. The
   deleted paths (`notifyFullPlan` / `renderFullPlanBody` / `renderPlanBody`
   and the `plan` / `plan_full` / `plan_updated` posting) are gone;
@@ -36,7 +37,10 @@ Notes:
   `Deps.Artifacts` (`PlanArtifactLister`) — the latest plan artifact (by
   `CreatedAt`) across the run's plan stages is current, earlier ones are
   superseded. When the lister is not wired the anchor degrades gracefully and
-  omits the plan sections, rendering everything else.
+  omits the plan sections, rendering everything else. Each superseded plan is
+  annotated with its rejection reason, derived by aligning the run's plan-gate
+  reject decisions (`approval_submitted` with decision `reject`, ascending by
+  `Sequence`) to the superseded plan artifacts oldest-first.
 - **Reviewer-verdict isolation (binding condition 1).** The anchor counts
   only the verdicts of the MOST-RECENT review dispatch per stage: it floors
   verdict counting at the latest `*_review_started` audit `Sequence` (the
@@ -50,14 +54,23 @@ Notes:
 - **Page-class pings (`anchor_ping_posted`).** GitHub does not notify on
   comment EDITS, so a state change that needs a human is announced by a
   one-line NEW comment linking to the anchor. Page-class events are derived
-  from the audit chain — plan ready / awaiting approval (`plan_generated`), a
-  reviewer reject (`plan_reviewed` / `implement_reviewed` with verdict
-  `reject`), and CI failure (`ci_failure_retry_dispatched` /
-  `ci_retry_exhausted`). Each ping records its source audit `Sequence` so a
-  re-render never double-pings. (must_page_human per ADR-040 is a
-  request-time delegation computation, not a standalone audit category, so it
-  is not yet derivable from this pure chain projection — a follow-up
-  extension point.)
+  from the audit chain:
+  - **Plan gate awaiting human approval** — keyed to the LATEST
+    `plan_generated`, but emitted ONLY when a plan stage is actually parked at
+    `awaiting_approval`. A gateless / routine plan stage never parks, so it
+    produces no spurious "awaiting your review" ping.
+  - **Reviewer reject** — `plan_reviewed` / `implement_reviewed` with verdict
+    `reject`.
+  - **must_page_human (ADR-040)** — the concrete must_page_human EVENTS in the
+    closed v0 set (`spec.PageEvent*`) are audit categories even though the
+    request-time `may_*` delegation knobs are not. Today this surfaces the
+    scope-amendment request (`scope_amendment_requested`, an internal audit
+    kind that otherwise has NO issue-comment surface and would be silent on
+    edits); other closed-set events join here as their categories are wired.
+  - **CI failure** — `ci_failure_retry_dispatched` / `ci_retry_exhausted`.
+
+  Each ping records its source audit `Sequence` so a re-render never
+  double-pings.
 - The reaction-polling worker (#360) is a *read-side* concern that reads the
   anchor comment rather than writing new surfaces; it records observed
   reactions under the separate `plan_reaction_observed` audit category and

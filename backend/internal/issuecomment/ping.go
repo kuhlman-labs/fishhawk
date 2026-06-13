@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // The living anchor (#1054) is edited in place on every transition, but
@@ -21,17 +23,22 @@ import (
 // stays edit-only.
 //
 // Page-class events (the ones worth interrupting a human for):
-//   - a plan is ready and the gate is awaiting human approval
+//   - a plan gate is actually awaiting human approval (NOT every
+//     plan_generated — a gateless/routine plan stage that never parks
+//     awaiting_approval produces no ping; #1054 review)
 //   - a reviewer rejected (plan or implement)
+//   - a must_page_human (ADR-040) event always parks for a human and has
+//     no other issue-comment surface — today the scope-amendment request
+//     (scope_amendment_requested). The request-time may_* delegation knobs
+//     are NOT chain-derivable, but the concrete must_page_human EVENTS in
+//     the closed v0 set (spec.PageEvent*) are audit categories, and this
+//     surfaces the one that is otherwise silent on edits.
 //   - CI failed (#1045)
 //
 // Dedup is per source audit event: each ping records the originating
 // entry's audit Sequence on CategoryAnchorPingPosted, so a re-render of
 // the anchor (which re-reads the whole chain) never double-pings the same
-// event. must_page_human (ADR-040) paging is a request-time delegation
-// computation rather than a standalone audit category, so it is not
-// derivable from a pure chain projection here; it is tracked as a
-// follow-up extension point on pageClassEvents.
+// event.
 
 // CategoryAnchorPingPosted records that the notifier posted a page-class
 // ping comment for a specific source audit event. The payload carries
@@ -50,20 +57,34 @@ type pageEvent struct {
 }
 
 // pageClassEvents projects the page-class events out of the run's audit
-// chain, oldest-first by sequence. Pure + dedup-friendly: each event is
+// chain, ascending by sequence. Pure + dedup-friendly: each event is
 // keyed by its source Sequence so the caller can skip ones already
 // pinged. Categories that are NOT page-class (status edits, plan scope
-// prechecks, cost rollups, etc.) produce no event.
-func pageClassEvents(entries []*audit.Entry) []pageEvent {
+// prechecks, cost rollups, etc.) produce no event. `stages` gates the
+// plan-awaiting-approval event on an actual human-approval wait.
+func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 	var out []pageEvent
-	for _, e := range entries {
-		switch e.Category {
-		case "plan_generated":
+
+	// "Gate awaiting human approval" fires ONLY when a plan stage is
+	// actually parked at an approval gate right now. A gateless/routine
+	// plan stage proceeds straight to its next stage and never enters
+	// awaiting_approval, so plan_generated alone is not sufficient — we'd
+	// otherwise ping with misleading "awaiting your review" text on every
+	// ungated plan (#1054 review). Keyed to the LATEST plan_generated
+	// sequence so a replan round pings once per round (dedup absorbs
+	// re-renders).
+	if planStageAwaitingApproval(stages) {
+		if seq := latestSequenceForCategory(entries, "plan_generated"); seq > 0 {
 			out = append(out, pageEvent{
-				sequence: e.Sequence,
+				sequence: seq,
 				kind:     "plan_awaiting_approval",
 				message:  "📋 A plan is ready and awaiting your review.",
 			})
+		}
+	}
+
+	for _, e := range entries {
+		switch e.Category {
 		case "plan_reviewed", "implement_reviewed":
 			if verdictOf(e.Payload) == "reject" {
 				stage := strings.TrimSuffix(e.Category, "_reviewed")
@@ -73,6 +94,16 @@ func pageClassEvents(entries []*audit.Entry) []pageEvent {
 					message:  fmt.Sprintf("🚫 A reviewer rejected the %s.", stage),
 				})
 			}
+		case "scope_amendment_requested":
+			// must_page_human (ADR-040, spec.PageEventScopeAmendment): a
+			// scope-amendment request always parks for an operator decision
+			// and is an internal audit kind with no other issue-comment
+			// surface, so it is silent on anchor edits without a ping.
+			out = append(out, pageEvent{
+				sequence: e.Sequence,
+				kind:     "scope_amendment",
+				message:  "🔔 An agent requested a scope amendment — your decision is needed.",
+			})
 		case "ci_failure_retry_dispatched":
 			out = append(out, pageEvent{
 				sequence: e.Sequence,
@@ -87,7 +118,34 @@ func pageClassEvents(entries []*audit.Entry) []pageEvent {
 			})
 		}
 	}
+	// Deterministic, oldest-first ordering regardless of the order the
+	// plan-awaiting event was prepended in.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].sequence < out[j].sequence })
 	return out
+}
+
+// planStageAwaitingApproval reports whether a plan stage is currently
+// parked at an approval gate — the signal that a human approval is
+// genuinely pending (a gateless plan stage never enters this state).
+func planStageAwaitingApproval(stages []*run.Stage) bool {
+	for _, s := range stages {
+		if s.Type == run.StageTypePlan && s.State == run.StageStateAwaitingApproval {
+			return true
+		}
+	}
+	return false
+}
+
+// latestSequenceForCategory returns the highest audit Sequence among
+// entries in the named category, or 0 when none exist.
+func latestSequenceForCategory(entries []*audit.Entry, category string) int64 {
+	var seq int64
+	for _, e := range entries {
+		if e.Category == category && e.Sequence > seq {
+			seq = e.Sequence
+		}
+	}
+	return seq
 }
 
 // verdictOf reads the `verdict` field from a *_reviewed audit payload.
@@ -109,8 +167,8 @@ func verdictOf(payload []byte) string {
 // CategoryAnchorPingPosted. Best-effort: a post failure for one event
 // returns a wrapped error but the dedup row for any earlier successful
 // ping is already written, so a retry only re-attempts the unpinged tail.
-func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries []*audit.Entry, runURL string) error {
-	events := pageClassEvents(entries)
+func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries []*audit.Entry, stages []*run.Stage, runURL string) error {
+	events := pageClassEvents(entries, stages)
 	if len(events) == 0 {
 		return nil
 	}
