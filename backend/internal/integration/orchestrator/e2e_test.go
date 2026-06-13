@@ -981,6 +981,12 @@ func TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Issue token: %v", err)
 	}
+	// Capture the child count before the fix-up so step (g) can assert the
+	// fix-up's downstream Advance mints NO new children (#1063).
+	childrenBefore, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRuns children before fixup: %v", err)
+	}
 	fixupBody, _ := json.Marshal(map[string]any{
 		"concern_ids": []string{concernID.String()},
 		"reason":      "fix the nil deref on the shared branch",
@@ -1003,21 +1009,43 @@ func TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge(t *testing.T) {
 	// concern attached to the parent implement stage transitioned to
 	// addressed_pending. This is the #1060 seam — the consolidated review's
 	// concern is addressable by a fix-up on the parent implement stage.
-	//
-	// NOTE: the fix-up handler's downstream Advance re-opens the parent
-	// implement stage, where the orchestrator's fanout path re-mints
-	// children (fanoutIfDecomposed has no existing-children idempotency
-	// guard). So the re-dispatch routing of a decomposed-parent fix-up "to
-	// the shared branch" is NOT yet realized — it re-fans-out instead. That
-	// is a pre-existing orchestrator interaction outside this slice's "no
-	// new fixup code path" scope and is flagged as a follow-up; #1060's
-	// contribution is the concern-attach seam asserted in (e)+(g), which is
-	// the load-bearing equality the amendment requires.
 	after, err := concernRepo.ListByRun(ctx, parentID)
 	if err != nil {
 		t.Fatalf("ListByRun after fixup: %v", err)
 	}
 	if len(after) != 1 || after[0].State != concern.StateAddressedPending {
 		t.Errorf("concern state after fixup = %v, want addressed_pending", after[0].State)
+	}
+
+	// (h) #1063 REALIZED CONTRACT: the fix-up handler's downstream Advance
+	// re-opens the parent implement stage to pending, but the orchestrator's
+	// existing-children idempotency guard now skips fanoutIfDecomposed (the
+	// parent already has children) and re-invokes the parent's implement stage
+	// against the existing shared branch instead of re-minting a fresh
+	// fan-out. Assert NO new children were minted.
+	childrenAfter, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRuns children after fixup: %v", err)
+	}
+	if len(childrenAfter) != len(childrenBefore) {
+		t.Errorf("children after fixup = %d, want %d (existing-children guard must mint zero new children)",
+			len(childrenAfter), len(childrenBefore))
+	}
+
+	// (i) Where observable: the re-dispatched parent implement stage routes to
+	// the shared consolidated branch. The branch derivation itself is a
+	// server-side prompt-handler concern (covered byte-exactly by
+	// TestGetStagePrompt_Implement_FixupDecomposedParent_SharedBranch); here
+	// the observable proxy is that the guard fell through to dispatch — the
+	// parent implement stage left awaiting_children / pending and re-dispatched
+	// rather than re-parking awaiting a fresh fan-out.
+	reStages, err := runRepo.ListStagesForRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun after fixup: %v", err)
+	}
+	for _, s := range reStages {
+		if s.ID == implStageID && s.State == runpkg.StageStateAwaitingChildren {
+			t.Errorf("parent implement stage re-parked awaiting_children after fixup; want re-dispatched against the shared branch")
+		}
 	}
 }

@@ -125,6 +125,39 @@ func fixupBranchFor(runRow *run.Run, stage *run.Stage) string {
 	return fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(runRow.ID), shortID(stage.ID))
 }
 
+// fixupBranchForRun resolves the fix-up branch for a run, extending
+// fixupBranchFor to handle the decomposed-PARENT case (#1063). A decomposed
+// parent has DecomposedFrom == nil, so fixupBranchFor would return a per-stage
+// branch — but a parent fix-up's commit must land on the consolidated PR head,
+// the shared branch `fishhawk/run-<shortID(runID)>` (byte-matching
+// orchestrator.consolidatedBranch). When the run is a parent (DecomposedFrom ==
+// nil) WITH minted children, return that shared branch; otherwise delegate to
+// fixupBranchFor. On a probe error, fall back to fixupBranchFor — never widen
+// an ordinary run onto a shared branch.
+func (s *Server) fixupBranchForRun(ctx context.Context, runRow *run.Run, stage *run.Stage) string {
+	if runRow.DecomposedFrom == nil && s.hasDecomposedChildren(ctx, runRow.ID) {
+		return "fishhawk/run-" + shortID(runRow.ID)
+	}
+	return fixupBranchFor(runRow, stage)
+}
+
+// hasDecomposedChildren reports whether the run has minted decomposition
+// children (a bounded Limit:1 probe). A nil RunRepo or a probe error returns
+// false so the caller falls back to the conservative per-stage branch.
+func (s *Server) hasDecomposedChildren(ctx context.Context, runID uuid.UUID) bool {
+	if s.cfg.RunRepo == nil {
+		return false
+	}
+	children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &runID,
+		Limit:          1,
+	})
+	if err != nil {
+		return false
+	}
+	return len(children) > 0
+}
+
 // scopeFile is one entry in promptResponse.ScopeFiles: the path the
 // agent declared it would touch plus the per-file operation
 // (create/modify/delete). Mirrors plan.ScopeFile but pins the wire
@@ -492,7 +525,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// stage's existing PR branch so it takes the RebaseFromRemote
 			// same-branch path instead of `checkout -b <existing branch>`.
 			fixup = true
-			fixupBranch = fixupBranchFor(runRow, stage)
+			fixupBranch = s.fixupBranchForRun(r.Context(), runRow, stage)
 			// Advertise the run's recorded head so the runner can verify the
 			// fetched PR-branch tip before invoking the agent (#967).
 			fixupExpectedHeadSHA = s.resolveFixupExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
@@ -704,7 +737,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// is read-only and never drives a commit; the same derivation keeps
 			// the displayed and dispatched responses identical.
 			fixup = true
-			fixupBranch = fixupBranchFor(runRow, stage)
+			fixupBranch = s.fixupBranchForRun(r.Context(), runRow, stage)
 			fixupExpectedHeadSHA = s.resolveFixupExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 		}
 	}
