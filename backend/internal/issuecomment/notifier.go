@@ -195,6 +195,18 @@ func New(d Deps) *Notifier {
 	}
 }
 
+// ArtifactListerWired reports whether the Notifier was constructed with
+// a plan-artifact lister, i.e. whether the living anchor (#1054) will
+// render its plan section in production. It exists only so
+// constructor-wiring tests can assert the server.New → issuecomment.New
+// seam carries cfg.ArtifactRepo through (the #1069 regression: the field
+// is unexported, so neither the external notifier test nor the server
+// test can read it directly). Nil-safe; not an issue-comment surface —
+// it posts nothing.
+func (n *Notifier) ArtifactListerWired() bool {
+	return n != nil && n.artifacts != nil
+}
+
 // NotifyPlanReady fires the plan-ready hook after the plan stage
 // transitions terminally. The living anchor (#1054) subsumes the old
 // plan-on-issue full/summary comment surfaces: the plan is now projected
