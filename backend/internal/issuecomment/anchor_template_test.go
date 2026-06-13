@@ -151,6 +151,125 @@ func TestRenderAnchorBody_StaleVerdictExcluded(t *testing.T) {
 	}
 }
 
+func approvalEntry(t *testing.T, seq int64, login, decision, comment string) *audit.Entry {
+	t.Helper()
+	payload := map[string]any{
+		"decision":              decision,
+		"approver_github_login": login,
+	}
+	if decision == "approve" && comment != "" {
+		payload["comment"] = comment
+	}
+	if decision == "reject" && comment != "" {
+		payload["rejection_comment"] = comment
+	}
+	raw, _ := json.Marshal(payload)
+	return &audit.Entry{Sequence: seq, Category: "approval_submitted", Payload: raw, Timestamp: time.Unix(seq, 0).UTC()}
+}
+
+// TestRenderAnchorBody_GateDecisionTimeline covers the enriched
+// gate-decision timeline entry (#1070): the decision phrase, the
+// conditions <details>, and the "over N advisory reject(s)" arbitration
+// marker — each only when the underlying chain warrants it.
+func TestRenderAnchorBody_GateDecisionTimeline(t *testing.T) {
+	now := time.Unix(1000, 0).UTC()
+	tests := []struct {
+		name        string
+		entries     []*audit.Entry
+		wantContain []string
+		wantAbsent  []string
+	}{
+		{
+			name: "approve with conditions",
+			entries: []*audit.Entry{
+				approvalEntry(t, 5, "alice", "approve", "keep the two-round test"),
+			},
+			wantContain: []string{
+				"@alice approved the plan with conditions",
+				"<details><summary>Approval conditions</summary>",
+				"keep the two-round test",
+			},
+			wantAbsent: []string{"advisory reject"},
+		},
+		{
+			name: "approve over one advisory reject",
+			entries: []*audit.Entry{
+				startedEntry(10, "plan"),
+				reviewedEntry(t, 11, "plan", "claude-opus-4-8", "approve", nil, ""),
+				reviewedEntry(t, 12, "plan", "gpt-5.5", "reject",
+					[]anchorReviewConcern{{severity: "high", category: "correctness", note: "boom"}}, "see note"),
+				approvalEntry(t, 13, "alice", "approve", ""),
+			},
+			wantContain: []string{"@alice approved the plan (over 1 advisory reject)"},
+			wantAbsent:  []string{"Approval conditions", "over 2 advisory"},
+		},
+		{
+			name: "clean approve",
+			entries: []*audit.Entry{
+				approvalEntry(t, 5, "alice", "approve", ""),
+			},
+			wantContain: []string{"@alice approved the plan"},
+			wantAbsent:  []string{"advisory reject", "Approval conditions", "with conditions"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := RenderAnchorBody(AnchorInput{
+				Run:         anchorRun(),
+				Stages:      []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateRunning}},
+				Audit:       tt.entries,
+				ExternalURL: "https://app.example",
+				Now:         now,
+			})
+			for _, want := range tt.wantContain {
+				if !strings.Contains(body, want) {
+					t.Errorf("body missing %q:\n%s", want, body)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(body, absent) {
+					t.Errorf("body should not contain %q:\n%s", absent, body)
+				}
+			}
+		})
+	}
+}
+
+// TestAdvisoryRejectCountBefore_ReplanRoundBound is load-bearing per the
+// approval conditions: a second approval round counts only its OWN
+// round's reviewer rejects, never the prior round's — the bound between
+// the approval Sequence and the latest preceding plan_review_started.
+func TestAdvisoryRejectCountBefore_ReplanRoundBound(t *testing.T) {
+	entries := []*audit.Entry{
+		// Round 1: a reject, then the operator rejects the plan (replan).
+		startedEntry(5, "plan"),
+		reviewedEntry(t, 6, "plan", "gpt-5.5", "reject", nil, "round-1 concern"),
+		approvalEntry(t, 7, "alice", "reject", "replan please"),
+		// Round 2: a reject, then the operator approves OVER it.
+		startedEntry(20, "plan"),
+		reviewedEntry(t, 21, "plan", "gpt-5.5", "reject", nil, "round-2 concern"),
+		reviewedEntry(t, 22, "plan", "claude-opus-4-8", "approve", nil, ""),
+		approvalEntry(t, 23, "alice", "approve", ""),
+	}
+	if n := advisoryRejectCountBefore("plan", entries, 23); n != 1 {
+		t.Fatalf("round-2 approval should count only its own round's 1 reject; got %d", n)
+	}
+
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateRunning}},
+		Audit:       entries,
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	if !strings.Contains(body, "over 1 advisory reject") {
+		t.Errorf("round-2 approve should show 'over 1 advisory reject':\n%s", body)
+	}
+	if strings.Contains(body, "over 2 advisory") {
+		t.Errorf("round-2 approve must not over-count round-1 rejects:\n%s", body)
+	}
+}
+
 func TestRenderAnchorBody_DegradationLadder(t *testing.T) {
 	// Build an oversized synthetic chain: many timeline rows + a huge
 	// superseded plan + a huge current plan. The ladder must keep the

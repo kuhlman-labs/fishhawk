@@ -2,6 +2,7 @@ package issuecomment
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -11,6 +12,91 @@ import (
 func verdictEntry(seq int64, category, verdict string) *audit.Entry {
 	payload, _ := json.Marshal(map[string]any{"verdict": verdict})
 	return &audit.Entry{Sequence: seq, Category: category, Payload: payload}
+}
+
+func reviewerVerdictEntry(seq int64, category, verdict, model string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"verdict": verdict, "reviewer_model": model})
+	return &audit.Entry{Sequence: seq, Category: category, Payload: payload}
+}
+
+func approvalDecisionEntry(seq int64, decision string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"decision": decision})
+	return &audit.Entry{Sequence: seq, Category: "approval_submitted", Payload: payload}
+}
+
+// TestPageClassEvents_ReviewerRejectWording covers the reworded advisory
+// reject ping (#1070): it names the reviewer model, frames the reject as
+// ADVISORY (awaiting operator arbitration), and never reads as a gate
+// rejection.
+func TestPageClassEvents_ReviewerRejectWording(t *testing.T) {
+	entries := []*audit.Entry{
+		reviewerVerdictEntry(5, "plan_reviewed", "reject", "gpt-5.5"),
+	}
+	got := pageClassEvents(entries, nil)
+	if len(got) != 1 {
+		t.Fatalf("expected one reviewer-reject event; got %+v", got)
+	}
+	msg := got[0].message
+	if got[0].kind != "plan_review_rejected" {
+		t.Errorf("kind token must stay plan_review_rejected (dedup parity); got %q", got[0].kind)
+	}
+	for _, want := range []string{"gpt-5.5", "advisory reject", "awaiting operator arbitration"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q missing %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "rejected the plan") {
+		t.Errorf("advisory reject ping must not read as a gate rejection: %q", msg)
+	}
+}
+
+// TestPageClassEvents_ReviewerRejectModelFallback covers the missing-model
+// fallback to "A reviewer".
+func TestPageClassEvents_ReviewerRejectModelFallback(t *testing.T) {
+	entries := []*audit.Entry{
+		verdictEntry(5, "implement_reviewed", "reject"), // no reviewer_model
+	}
+	got := pageClassEvents(entries, nil)
+	if len(got) != 1 || !strings.HasPrefix(got[0].message, "🚫 A reviewer flagged") {
+		t.Fatalf("expected 'A reviewer' fallback; got %+v", got)
+	}
+}
+
+// TestPageClassEvents_AdvisoryRejectArbitrated covers the resolution ping
+// (#1070): an approve OVER a current-round reviewer reject fires exactly
+// one advisory_reject_arbitrated event keyed on the approval Sequence;
+// a clean approve fires none.
+func TestPageClassEvents_AdvisoryRejectArbitrated(t *testing.T) {
+	arbitrated := []*audit.Entry{
+		startedEntry(10, "plan"),
+		reviewerVerdictEntry(11, "plan_reviewed", "reject", "gpt-5.5"),
+		approvalDecisionEntry(12, "approve"),
+	}
+	got := pageClassEvents(arbitrated, nil)
+	// Two events: the advisory-reject ping (seq 11) and the resolution
+	// ping (seq 12), oldest-first.
+	if len(got) != 2 {
+		t.Fatalf("expected reject + resolution events; got %+v", got)
+	}
+	res := got[1]
+	if res.kind != "advisory_reject_arbitrated" || res.sequence != 12 {
+		t.Errorf("resolution event = %+v, want advisory_reject_arbitrated at seq 12", res)
+	}
+	if !strings.Contains(res.message, "over 1 advisory reject") {
+		t.Errorf("resolution message missing override marker: %q", res.message)
+	}
+
+	// Clean approve (no preceding advisory reject) fires no resolution ping.
+	clean := []*audit.Entry{
+		startedEntry(10, "plan"),
+		reviewerVerdictEntry(11, "plan_reviewed", "approve", "claude-opus-4-8"),
+		approvalDecisionEntry(12, "approve"),
+	}
+	for _, ev := range pageClassEvents(clean, nil) {
+		if ev.kind == "advisory_reject_arbitrated" {
+			t.Errorf("clean approve must not fire a resolution ping; got %+v", ev)
+		}
+	}
 }
 
 // planAwaitingStages is a stage set with the plan stage parked at the
