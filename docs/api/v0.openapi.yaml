@@ -2602,10 +2602,18 @@ paths:
         '400':
           description: |
             `validation_failed` — `repo` not in owner/name form, or `type` /
-            `summary` / `run_id` missing or malformed; `body_too_large`.
+            `summary` / `run_id` missing or malformed.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `run_repo_mismatch` — the supplied `run_id` belongs to a different
+            repository than the filing target. A run_id is honoured only when
+            its repo matches `repo`, so a caller cannot borrow an unrelated
+            run's installation context or inject an audit entry onto its chain.
         '404':
           description: "`run_not_found` — `run_id` supplied but no such run."
+        '413':
+          description: "`body_too_large` — request body exceeds the size cap."
         '422':
           description: |
             `work_item_invalid` — the request violates the conventions for

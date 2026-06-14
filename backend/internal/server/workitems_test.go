@@ -376,6 +376,131 @@ func TestFileWorkItem_BadRequests(t *testing.T) {
 	}
 }
 
+// TestFileWorkItem_RunRepoMismatch_Forbidden asserts the #1005 fix-up
+// authorization gate: a run_id whose run belongs to a different repo than
+// the filing target is rejected 403 before any provider dispatch or audit
+// write, closing the cross-run / cross-repo borrow-an-installation surface.
+func TestFileWorkItem_RunRepoMismatch_Forbidden(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	runID := uuid.New()
+	inst := int64(99)
+	rr.getRuns[runID] = &run.Run{
+		ID:             runID,
+		Repo:           "someone-else/private-repo",
+		State:          run.StateRunning,
+		InstallationID: &inst,
+	}
+	s := New(Config{AuditRepo: au, RunRepo: rr})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "chore",
+		Summary: "Borrow another run's installation",
+		RunID:   runID.String(),
+	}, "attacker@local")
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "run_repo_mismatch" {
+		t.Errorf("code = %q, want run_repo_mismatch", env.Error.Code)
+	}
+	if fp.called {
+		t.Error("provider dispatched despite repo mismatch")
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	if len(au.appended) != 0 {
+		t.Errorf("appended %d audit entries on a mismatched run, want 0", len(au.appended))
+	}
+}
+
+// TestFileWorkItem_RunResolutionGuards covers the run-resolution and
+// size-cap error branches that accepting both repo and run_id introduced.
+func TestFileWorkItem_RunResolutionGuards(t *testing.T) {
+	t.Run("invalid run_id UUID", func(t *testing.T) {
+		fp := &fakeWorkProvider{}
+		registerFakeProvider(t, fp)
+		s := New(Config{RunRepo: newPromptRunRepo()})
+		rec := fileWorkItem(t, s, workItemRequest{
+			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: "not-a-uuid",
+		}, "github:operator")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+		}
+		var env errorEnvelope
+		_ = json.Unmarshal(rec.Body.Bytes(), &env)
+		if env.Error.Code != "validation_failed" {
+			t.Errorf("code = %q, want validation_failed", env.Error.Code)
+		}
+		if fp.called {
+			t.Error("provider dispatched on invalid run_id")
+		}
+	})
+
+	t.Run("run not found", func(t *testing.T) {
+		fp := &fakeWorkProvider{}
+		registerFakeProvider(t, fp)
+		s := New(Config{RunRepo: newPromptRunRepo()}) // empty repo -> ErrNotFound
+		rec := fileWorkItem(t, s, workItemRequest{
+			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: uuid.New().String(),
+		}, "github:operator")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+		}
+		var env errorEnvelope
+		_ = json.Unmarshal(rec.Body.Bytes(), &env)
+		if env.Error.Code != "run_not_found" {
+			t.Errorf("code = %q, want run_not_found", env.Error.Code)
+		}
+	})
+
+	t.Run("run lookup unconfigured", func(t *testing.T) {
+		fp := &fakeWorkProvider{}
+		registerFakeProvider(t, fp)
+		s := New(Config{}) // no RunRepo
+		rec := fileWorkItem(t, s, workItemRequest{
+			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: uuid.New().String(),
+		}, "github:operator")
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 (body=%s)", rec.Code, rec.Body.String())
+		}
+		var env errorEnvelope
+		_ = json.Unmarshal(rec.Body.Bytes(), &env)
+		if env.Error.Code != "run_lookup_unconfigured" {
+			t.Errorf("code = %q, want run_lookup_unconfigured", env.Error.Code)
+		}
+	})
+
+	t.Run("body too large", func(t *testing.T) {
+		s := New(Config{})
+		// Build a raw body that exceeds the cap without routing through the
+		// typed marshal helper, so the size guard (not field validation) trips.
+		oversize := bytes.Repeat([]byte("a"), maxWorkItemRequestBytes+1)
+		raw, _ := json.Marshal(workItemRequest{
+			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", Body: string(oversize),
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v0/work-items", bytes.NewReader(raw))
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{Subject: "github:operator"}))
+		rec := httptest.NewRecorder()
+		s.handleFileWorkItem(rec, req)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want 413 (body=%s)", rec.Code, rec.Body.String())
+		}
+		var env errorEnvelope
+		_ = json.Unmarshal(rec.Body.Bytes(), &env)
+		if env.Error.Code != "body_too_large" {
+			t.Errorf("code = %q, want body_too_large", env.Error.Code)
+		}
+	})
+}
+
 // TestFileWorkItem_Anonymous_Unauthorized asserts an unauthenticated
 // caller is rejected.
 func TestFileWorkItem_Anonymous_Unauthorized(t *testing.T) {

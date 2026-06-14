@@ -224,6 +224,25 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 				"run does not exist", map[string]any{"run_id": runID.String()})
 			return
 		}
+		// Repo-consistency authorization gate (#1005 fix-up). A run_id is
+		// only honoured when the run's repo matches the filing target.
+		// Without this, any authenticated subject that knows a run UUID
+		// could (a) borrow that run's installation context to file against
+		// a caller-chosen repo and (b) inject a work_item_filed audit entry
+		// onto an unrelated run's hash chain (actor_subject = their token).
+		// v0's authorization posture is authenticated-caller + run/repo
+		// consistency: the conventions loader is hard-wired to the default
+		// repo and the installation id is sourced from the named run, so
+		// binding the run to the requested repo closes the cross-run /
+		// cross-repo write surface. A per-caller entitlement check (does
+		// this subject own this run?) is a follow-up for once runs carry an
+		// owning-subject ACL.
+		if !strings.EqualFold(rn.Repo, owner+"/"+name) {
+			s.writeError(w, r, http.StatusForbidden, "run_repo_mismatch",
+				"run_id belongs to a different repository than the filing target",
+				map[string]any{"run_repo": rn.Repo, "requested_repo": owner + "/" + name})
+			return
+		}
 		activeRun = rn
 	}
 
@@ -231,6 +250,13 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},
 		Project: conv.Project,
 	}
+	// InstallationID is sourced only from a consistency-checked active run.
+	// On the run-absent path (the ADR-040 operator-agent follow-up filing
+	// path) it stays 0: the real GitHub Projects provider cannot mint an
+	// installation token without it, so GitHub filing is run-scoped by
+	// design in v0. Supplying an installation source for run-absent GitHub
+	// filing is a follow-up; non-GitHub providers that don't need an
+	// installation token are unaffected.
 	if activeRun != nil && activeRun.InstallationID != nil {
 		target.InstallationID = *activeRun.InstallationID
 	}
