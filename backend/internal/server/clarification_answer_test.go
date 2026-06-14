@@ -114,6 +114,76 @@ func TestAnswerClarification_HappyPath_ResumesStage(t *testing.T) {
 	}
 }
 
+// casClarificationRepo wraps promptRunRepo with a compare-and-set
+// ResumeAwaitingInputStage that models the postgres row-lock CAS: the first
+// call wins (returns a pending stage + won=true), every later call loses
+// (won=false). It deliberately leaves the embedded getStages entry at
+// awaiting_input so a second submit still passes the handler's read-time
+// pre-check — reproducing the double-submit TOCTOU window where both requests
+// observe the stage parked and the CAS is the sole gate.
+type casClarificationRepo struct {
+	*promptRunRepo
+	resumeCalls int
+}
+
+func (r *casClarificationRepo) ResumeAwaitingInputStage(_ context.Context, id uuid.UUID) (*run.Stage, bool, error) {
+	st, ok := r.getStages[id]
+	if !ok {
+		return nil, false, run.ErrNotFound
+	}
+	r.resumeCalls++
+	if r.resumeCalls > 1 {
+		return st, false, nil // lost the race: another request already re-opened it
+	}
+	resumed := *st
+	resumed.State = run.StageStatePending
+	return &resumed, true, nil
+}
+
+// TestAnswerClarification_DoubleSubmit_OnlyFirstWins covers the double-submit /
+// transition-race path (#1088 fixup): two answers race past the awaiting_input
+// read, but the compare-and-set re-open admits exactly one. The loser is
+// rejected 409 BEFORE any audit write, so only the winner's
+// clarification_answered entry exists and the resumed prompt cannot be
+// overridden by the failed request.
+func TestAnswerClarification_DoubleSubmit_OnlyFirstWins(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	rr := &casClarificationRepo{promptRunRepo: newPromptRunRepo()}
+	au := newAuditFake()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingInput}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change"}
+	seedClarificationRequested(au, runID, stageID)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+	// First submit wins the CAS and persists its answer.
+	w1 := answerClarification(t, s, stageID, `{"answers":[{"id":"auth-backend","answer":"Postgres"}]}`)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first submit status = %d, want 200:\n%s", w1.Code, w1.Body.String())
+	}
+
+	// Second submit (different answer) loses the CAS even though it passed the
+	// read-time pre-check — it must be rejected and must NOT append.
+	w2 := answerClarification(t, s, stageID, `{"answers":[{"id":"auth-backend","answer":"in-memory"}]}`)
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("second submit status = %d, want 409:\n%s", w2.Code, w2.Body.String())
+	}
+	if !bytes.Contains(w2.Body.Bytes(), []byte("invalid_state_transition")) {
+		t.Errorf("second submit missing invalid_state_transition: %s", w2.Body.String())
+	}
+
+	// Exactly one clarification_answered entry, and it is the winner's — the
+	// loser never overrode the resumed answer.
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1 (loser must not append)", len(au.appended))
+	}
+	if !bytes.Contains(au.appended[0].Payload, []byte("Postgres")) {
+		t.Errorf("winning answer overwritten or missing: %s", au.appended[0].Payload)
+	}
+	if bytes.Contains(au.appended[0].Payload, []byte("in-memory")) {
+		t.Errorf("loser's answer leaked into the persisted entry: %s", au.appended[0].Payload)
+	}
+}
+
 func TestAnswerClarification_NonPlanStage_409(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, _, _ := newClarificationServer(t, runID, stageID, run.StageStateAwaitingInput, run.StageTypeImplement)
@@ -300,5 +370,34 @@ func TestLoadClarificationAnswers_NewestWins(t *testing.T) {
 	// No entries → nil.
 	if s.loadClarificationAnswers(context.Background(), uuid.New()) != nil {
 		t.Error("loadClarificationAnswers should be nil when no entry exists")
+	}
+}
+
+// TestLoadClarificationAnswers_TruncatesOversizedBlob exercises the 4000-byte
+// cap: an answer payload larger than maxConditionBytes is truncated and the
+// "...[truncated]" marker is appended, so a pathological clarification answer
+// can never blow up the resumed plan prompt.
+func TestLoadClarificationAnswers_TruncatesOversizedBlob(t *testing.T) {
+	runID := uuid.New()
+	au := newAuditFake()
+	rid := runID
+	const maxConditionBytes = 4000
+	oversized := strings.Repeat("x", maxConditionBytes+500)
+	payload, _ := json.Marshal(map[string]any{"conditions": oversized})
+	au.seeded = append(au.seeded,
+		&audit.Entry{RunID: &rid, Category: "clarification_answered", Payload: payload},
+	)
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+
+	got := s.loadClarificationAnswers(context.Background(), runID)
+	if got == nil {
+		t.Fatal("loadClarificationAnswers returned nil, want the truncated blob")
+	}
+	want := strings.Repeat("x", maxConditionBytes) + "...[truncated]"
+	if *got != want {
+		t.Errorf("blob not truncated: len=%d, want %d + marker", len(*got), maxConditionBytes)
+	}
+	if !strings.HasSuffix(*got, "...[truncated]") {
+		t.Errorf("truncated blob missing marker suffix: %q", (*got)[len(*got)-32:])
 	}
 }

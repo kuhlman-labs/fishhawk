@@ -16,6 +16,20 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
+// clarificationResumer is the optional repo capability handleAnswerClarification
+// uses to close the double-submit race on a parked plan stage. It performs an
+// atomic compare-and-set under the stage row lock: awaiting_input → pending,
+// reporting won=true only for the single caller that actually moved the stage.
+// Concurrent callers that arrive after the stage left awaiting_input get
+// won=false (nil error), so exactly one request proceeds to append the
+// clarification_answered audit entry. Returns run.ErrNotFound when the stage
+// does not exist. Mirrors the runCostRecorder optional-capability pattern
+// (trace.go) — a repo that does not implement it (test fakes) falls back to the
+// plain TransitionStage path.
+type clarificationResumer interface {
+	ResumeAwaitingInputStage(ctx context.Context, stageID uuid.UUID) (stage *run.Stage, won bool, err error)
+}
+
 // clarificationAnswerRequest mirrors POST /v0/stages/{stage_id}/
 // clarification's request body in docs/api/v0.openapi.yaml. The operator
 // answers the planner's parked clarification_request questions, keyed by
@@ -131,6 +145,57 @@ func (s *Server) handleAnswerClarification(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Re-open the parked stage FIRST, then persist the audit entry — the
+	// transition is the concurrency gate so only the request that actually
+	// moves the stage out of awaiting_input writes a clarification_answered
+	// entry. Were the audit appended first, two concurrent double-submits
+	// could both pass the awaiting_input read above and both append; the
+	// loser's newer entry would then override the winner's answer in the
+	// resumed plan prompt (loadClarificationAnswers reads newest-first).
+	//
+	// When the repo provides the ResumeAwaitingInputStage compare-and-set
+	// (postgres, under the row lock), use it: the loser observes the stage
+	// already re-opened and is rejected here, before any audit write. A repo
+	// without the capability (test fakes) falls back to the plain transition,
+	// mirroring the runCostRecorder optional-capability pattern.
+	if resumer, ok := s.cfg.RunRepo.(clarificationResumer); ok {
+		resumed, won, rerr := resumer.ResumeAwaitingInputStage(r.Context(), stageID)
+		if rerr != nil {
+			if errors.Is(rerr, run.ErrNotFound) {
+				s.writeError(w, r, http.StatusNotFound, "stage_not_found",
+					"no stage with that id", map[string]any{"stage_id": stageID.String()})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"resume parked stage failed", map[string]any{"error": rerr.Error()})
+			return
+		}
+		if !won {
+			s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+				"stage is no longer parked at awaiting_input (already answered)",
+				map[string]any{"stage_id": stageID.String()})
+			return
+		}
+		stage = resumed
+	} else {
+		// The transition rule already exists (run/transition.go); map an
+		// unexpected rejection to a 409 like the approval handler.
+		resumed, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stageID, run.StageStatePending, nil)
+		if terr != nil {
+			var inv run.InvalidTransitionError
+			if errors.As(terr, &inv) {
+				s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+					terr.Error(),
+					map[string]any{"stage_id": stageID.String(), "from": inv.From, "to": inv.To})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"transition stage to pending failed", map[string]any{"error": terr.Error()})
+			return
+		}
+		stage = resumed
+	}
+
 	ident := IdentityFrom(r.Context())
 	subject := ident.Subject
 	if subject == "" {
@@ -159,23 +224,6 @@ func (s *Server) handleAnswerClarification(w http.ResponseWriter, r *http.Reques
 	}); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"append clarification_answered audit entry failed", map[string]any{"error": err.Error()})
-		return
-	}
-
-	// Re-open the parked stage: AwaitingInput → Pending. The transition
-	// rule already exists (run/transition.go); map an unexpected rejection
-	// to a 409 like the approval handler.
-	stage, err = s.cfg.RunRepo.TransitionStage(r.Context(), stageID, run.StageStatePending, nil)
-	if err != nil {
-		var inv run.InvalidTransitionError
-		if errors.As(err, &inv) {
-			s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
-				err.Error(),
-				map[string]any{"stage_id": stageID.String(), "from": inv.From, "to": inv.To})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"transition stage to pending failed", map[string]any{"error": err.Error()})
 		return
 	}
 
