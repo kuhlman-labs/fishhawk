@@ -302,6 +302,50 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone},
 		},
 		{
+			// #1082: a succeeded decomposition child (parent_run_id set,
+			// implement-only — no plan/review of its own) whose own
+			// implement review is still pending is NOT the #968 wedge: the
+			// parent gates the consolidated diff (#1061) and there is no
+			// per-child PR to merge. It surfaces as
+			// awaiting_parent_consolidation, pointing the read-only poll at
+			// the PARENT run, never merge_and_file_follow_up.
+			name: "j_1082_succeeded_decomp_child_awaits_parent",
+			run: func() *Run {
+				r := naRun("succeeded")
+				parent := uuid.NewString()
+				r.ParentRunID = &parent
+				return r
+			}(),
+			stages:       []Stage{naStage("implement", "succeeded")},
+			implRS:       naReviewStatus("implement", "pending"),
+			wantState:    "awaiting_parent_consolidation",
+			wantActions:  []string{"fishhawk_get_run_status"},
+			wantConsumes: []string{consumesNone},
+		},
+		{
+			// #1082 negative guard: a SUCCEEDED CI-retry child carries a
+			// parent_run_id AND a review stage of its own, so the new arm's
+			// `review == nil` clause EXCLUDES it — it must fall through to
+			// the genuine #968 succeeded_review_wedged wedge
+			// (merge_and_file_follow_up), NOT awaiting_parent_consolidation.
+			// This is the case the Risks section names as "the test that
+			// would fail if wrong": drop the review==nil clause and this
+			// case regresses while every other present case still passes.
+			name: "j_1082_succeeded_ci_retry_child_not_consolidation",
+			run: func() *Run {
+				r := naRun("succeeded")
+				r.PullRequestURL = &prURL
+				parent := uuid.NewString()
+				r.ParentRunID = &parent
+				return r
+			}(),
+			stages:       []Stage{naStage("implement", "succeeded"), naStage("review", "pending")},
+			implRS:       naReviewStatus("implement", "pending"),
+			wantState:    "succeeded_review_wedged",
+			wantActions:  []string{"merge_and_file_follow_up"},
+			wantConsumes: []string{consumesNone},
+		},
+		{
 			name:        "k_terminal_failed_no_recovery_arm",
 			run:         naRun("failed"),
 			stages:      []Stage{naStage("plan", "failed")},
@@ -461,6 +505,28 @@ func TestNextActions_ResumeRunNamesThisRunAsParent(t *testing.T) {
 	resume := findAction(t, na, "fishhawk_resume_run")
 	if resume.Params["parent_run_id"] != run.ID {
 		t.Errorf("resume_run params.parent_run_id = %q, want this run's id %s", resume.Params["parent_run_id"], run.ID)
+	}
+}
+
+// TestNextActions_AwaitingParentConsolidationPointsAtParent pins the
+// #1082 load-bearing param: the single read-only poll the
+// awaiting_parent_consolidation arm emits targets the PARENT run id
+// (*run.ParentRunID), not the child's own id or an empty value. A
+// regression returning either would still satisfy the state-table's
+// action-name/consumes assertions while breaking the intended parent
+// poll, so this is asserted on the param directly.
+func TestNextActions_AwaitingParentConsolidationPointsAtParent(t *testing.T) {
+	r := naRun("succeeded")
+	parent := uuid.NewString()
+	r.ParentRunID = &parent
+	na := nextActionsFor(r, []Stage{naStage("implement", "succeeded")},
+		nil, naReviewStatus("implement", "pending"), nil, nil)
+	if na.State != "awaiting_parent_consolidation" {
+		t.Fatalf("state = %q, want awaiting_parent_consolidation", na.State)
+	}
+	poll := findAction(t, na, "fishhawk_get_run_status")
+	if poll.Params["run_id"] != parent {
+		t.Errorf("poll params.run_id = %q, want the PARENT run id %q (not the child's own id %q)", poll.Params["run_id"], parent, r.ID)
 	}
 }
 
