@@ -990,9 +990,11 @@ func TestCompleteRun_AllFailedChildrenRetryable_ParksParent(t *testing.T) {
 	}
 }
 
-func TestCompleteRun_FailedChildCategoryB_ResolvesFailed(t *testing.T) {
-	// #698: a genuine non-retryable category-B child failure still
-	// resolves the parent to failed-C (no parking).
+func TestCompleteRun_FailedChildCategoryB_ParksParent(t *testing.T) {
+	// #1081: a category-B child is now recoverable in decomposition
+	// (re-driven in place via the recover path), so the event-driven
+	// parent-resolution path parks the awaiting_children stage and emits
+	// parent_awaiting_redrive rather than resolving to failed-C.
 	o, rs, _ := newOrchestrator(t)
 	au := &recordingAudit{}
 	o.Audit = au
@@ -1016,14 +1018,51 @@ func TestCompleteRun_FailedChildCategoryB_ResolvesFailed(t *testing.T) {
 		t.Fatalf("Advance(child): %v", err)
 	}
 
+	if parentStages[0].State != run.StageStateAwaitingChildren {
+		t.Errorf("parent implement stage = %q, want awaiting_children (parked for recoverable B)", parentStages[0].State)
+	}
+	if rs.runs[parentRun.ID].State != run.StateRunning {
+		t.Errorf("parent run state = %q, want running (parked)", rs.runs[parentRun.ID].State)
+	}
+	if !auditHasCategory(au, "parent_awaiting_redrive") {
+		t.Errorf("audit categories = %v, want a parent_awaiting_redrive entry", au.appended)
+	}
+}
+
+func TestCompleteRun_FailedChildNonRecoverable_ResolvesFailed(t *testing.T) {
+	// A D-rejection child (approver said no) stays non-recoverable and
+	// still resolves the parent to failed-C with no parking.
+	o, rs, _ := newOrchestrator(t)
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parentRun, parentStages := rs.seed(t, "x/y", nil, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingChildren},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStatePending},
+	})
+
+	cat := run.FailureD
+	reason := "gate rejected by approver"
+	child, childStages := rs.seed(t, "x/y", nil, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateRunning},
+	})
+	child.DecomposedFrom = &parentRun.ID
+	childStages[0].State = run.StageStateFailed
+	childStages[0].FailureCategory = &cat
+	childStages[0].FailureReason = &reason
+
+	if _, err := o.Advance(context.Background(), child.ID); err != nil {
+		t.Fatalf("Advance(child): %v", err)
+	}
+
 	if parentStages[0].State != run.StageStateFailed {
-		t.Errorf("parent implement stage = %q, want failed (B is non-retryable)", parentStages[0].State)
+		t.Errorf("parent implement stage = %q, want failed (D-rejection is non-recoverable)", parentStages[0].State)
 	}
 	if rs.runs[parentRun.ID].State != run.StateFailed {
 		t.Errorf("parent run state = %q, want failed", rs.runs[parentRun.ID].State)
 	}
 	if auditHasCategory(au, "parent_awaiting_redrive") {
-		t.Errorf("parent_awaiting_redrive emitted for non-retryable B child: %v", au.appended)
+		t.Errorf("parent_awaiting_redrive emitted for non-recoverable D-rejection child: %v", au.appended)
 	}
 }
 

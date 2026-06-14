@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -125,6 +127,20 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"get run failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Decomposition-child target: recover IN PLACE rather than minting a
+	// new run. A child that failed its own implement category-B is
+	// re-opened via run.RedriveChild against the parent-walked approved
+	// plan on the shared branch — branching here, before the new-child
+	// eligibility gate, because a decomposition child has no plan stage
+	// of its own and re-creates no stages from spec. An in-place re-drive
+	// (not a freshly minted child sharing DecomposedFrom) is deliberate:
+	// a second DecomposedFrom row would double-count in
+	// childcompletion.resolveParent's consolidation counters.
+	if parent.DecomposedFrom != nil {
+		s.handleRecoverDecompositionChild(w, r, parent, amendPaths, req.Reason)
 		return
 	}
 
@@ -298,29 +314,9 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 				"recovery run has no implement stage to attach the scope amendment to", nil)
 			return
 		}
-		reason := strings.TrimSpace(req.Reason)
-		if reason == "" {
-			reason = "operator-named scope amendment at category-B recovery of run " + parent.ID.String()
-		}
-		amendment, err := s.cfg.ScopeAmendmentRepo.Create(r.Context(), scopeamendment.CreateParams{
-			RunID:   child.ID,
-			StageID: newImplement.ID,
-			Paths:   amendPaths,
-			Reason:  reason,
-		})
-		if err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"create scope amendment failed", map[string]any{"error": err.Error()})
-			return
-		}
-		if _, err := s.cfg.ScopeAmendmentRepo.Decide(r.Context(), scopeamendment.DecideParams{
-			ID:        amendment.ID,
-			Status:    scopeamendment.StatusApproved,
-			Reason:    "pre-approved by the recovering operator",
-			DecidedBy: id.Subject,
-		}); err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"approve scope amendment failed", map[string]any{"error": err.Error()})
+		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, newImplement.ID, amendPaths, req.Reason,
+			"operator-named scope amendment at category-B recovery of run "+parent.ID.String(), id.Subject); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
 			return
 		}
 	}
@@ -329,24 +325,217 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	// child's ParentRunID and the approved amendment row are the
 	// durable records; a failed append warn-logs rather than
 	// unwinding the created run.
-	s.writePlanReusedFromAudit(r, child, parent, amendPaths, req.Reason, id.Subject)
+	s.writePlanReusedFromAudit(r, child.ID, parent.ID.String(), "operator_recovery", amendPaths, req.Reason, id.Subject)
 
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(child))
 }
 
+// createApprovedScopeAmendment folds the operator-named paths into the
+// effective scope of the given run's implement stage as a pre-approved
+// #961 amendment row (create, then auto-approve). It is the shared core
+// of both recover branches: the new-child mint attaches the row to the
+// freshly created implement stage; the in-place decomposition re-drive
+// attaches it to the child's EXISTING implement stage. amendPaths must
+// be non-empty. defaultReason is used when the operator gave no reason.
+func (s *Server) createApprovedScopeAmendment(ctx context.Context, runID, stageID uuid.UUID, amendPaths []scopeamendment.PathEntry, reason, defaultReason, decidedBy string) error {
+	rsn := strings.TrimSpace(reason)
+	if rsn == "" {
+		rsn = defaultReason
+	}
+	amendment, err := s.cfg.ScopeAmendmentRepo.Create(ctx, scopeamendment.CreateParams{
+		RunID:   runID,
+		StageID: stageID,
+		Paths:   amendPaths,
+		Reason:  rsn,
+	})
+	if err != nil {
+		return fmt.Errorf("create scope amendment failed: %w", err)
+	}
+	if _, err := s.cfg.ScopeAmendmentRepo.Decide(ctx, scopeamendment.DecideParams{
+		ID:        amendment.ID,
+		Status:    scopeamendment.StatusApproved,
+		Reason:    "pre-approved by the recovering operator",
+		DecidedBy: decidedBy,
+	}); err != nil {
+		return fmt.Errorf("approve scope amendment failed: %w", err)
+	}
+	return nil
+}
+
+// handleRecoverDecompositionChild is the recover-handler branch for a
+// target that is itself a decomposition child (DecomposedFrom != nil).
+// It recovers the child IN PLACE rather than minting a new run:
+//
+//  1. Eligibility — the child's own implement stage must be failed with
+//     FailureCategory==B AND its approved plan must resolve via the
+//     ParentRunID parent-walk (loadApprovedPlanForRun); otherwise
+//     recovery_not_eligible names which leg failed.
+//  2. Re-open the child via run.RedriveChild (failed implement →
+//     pending, failed run → running) on the shared parent branch. This
+//     runs FIRST and acts as the duplicate guard: it un-terminals the
+//     run, so a concurrent/replayed recover fails here and never folds an
+//     amendment.
+//  3. Fold the operator's add_scope_files as a pre-approved amendment on
+//     the EXISTING implement stage — only after a successful re-drive (so
+//     a failed attempt never orphans an approved amendment) and BEFORE
+//     the orchestrator handoff, so the implement prompt's
+//     mergeApprovedScopeAmendments fold (keyed by run + stage id) sees it.
+//  4. Append a plan_reused_from provenance entry
+//     (source=decomposition_child_recovery).
+//  5. Hand off to Orchestrator.Advance to walk pending → dispatched,
+//     then return the re-opened child (same id).
+//
+// run.RedriveChild accepts any failure category — gating on category-B
+// is this handler's job, not RedriveChild's.
+//
+// Authorization: this branch re-opens a terminal run via the same
+// run.RedriveChild action POST /v0/runs/{id}/redrive performs, and that
+// action is operator-only — an agent (MCP subject-bound) token must
+// never re-drive any run (#698 / handleRedriveChild). The enclosing
+// handler's write:runs gate is necessary but not sufficient: we reject
+// agent-subject tokens here too so BOTH paths to RedriveChild enforce
+// the identical contract. (Runner-side fhm_ tokens carry only mcp:read
+// and so can't clear write:runs to reach this branch in practice — but
+// the authz posture must be consistent by construction, not by accident.)
+func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.Request, child *run.Run, amendPaths []scopeamendment.PathEntry, reason string) {
+	id := IdentityFrom(r.Context())
+	if strings.HasPrefix(id.Subject, "mcp:run:") {
+		s.writeError(w, r, http.StatusForbidden, "agent_token_forbidden",
+			"in-place re-drive of a decomposition child is an operator action; agent (mcp) tokens may not re-drive any run", nil)
+		return
+	}
+
+	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), child.ID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list stages failed", map[string]any{"error": err.Error()})
+		return
+	}
+	var implementStage *run.Stage
+	for _, st := range stages {
+		if st.Type == run.StageTypeImplement {
+			implementStage = st
+			break
+		}
+	}
+	implementState := ""
+	failureCategory := ""
+	if implementStage != nil {
+		implementState = string(implementStage.State)
+		if implementStage.FailureCategory != nil {
+			failureCategory = string(*implementStage.FailureCategory)
+		}
+	}
+
+	// Eligibility leg 1: the child's own implement stage failed
+	// category-B. Leg 2: its approved plan resolves via the parent walk.
+	categoryB := implementStage != nil && implementStage.State == run.StageStateFailed &&
+		implementStage.FailureCategory != nil && *implementStage.FailureCategory == run.FailureB
+	approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), child.ID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"resolve parent plan failed", map[string]any{"error": err.Error()})
+		return
+	}
+	if !categoryB || approvedPlan == nil {
+		s.writeError(w, r, http.StatusConflict, "recovery_not_eligible",
+			"in-place recovery of a decomposition child requires the child's own implement stage failed category-B and an approved plan resolvable via the parent walk",
+			map[string]any{
+				"implement_state":  implementState,
+				"failure_category": failureCategory,
+				"plan_resolved":    approvedPlan != nil,
+			})
+		return
+	}
+
+	// Re-open the child in place against the shared parent branch FIRST.
+	// RedriveChild transitions the run failed → running, so it is the
+	// duplicate guard: a concurrent duplicate recover (or any replay after
+	// the child has already re-opened) fails here with
+	// ErrRedriveNotApplicable and never reaches the amendment fold below.
+	// Folding the scope amendment ONLY after a successful re-drive means a
+	// failed recover attempt can never leave an orphaned approved
+	// amendment that would silently widen the re-driven prompt's scope.
+	if _, err := run.RedriveChild(r.Context(), s.cfg.RunRepo, child.ID); err != nil {
+		switch {
+		case errors.Is(err, run.ErrRedriveNotApplicable):
+			s.writeError(w, r, http.StatusConflict, "recovery_not_eligible", err.Error(), nil)
+			return
+		case errors.Is(err, run.ErrNotFound):
+			s.writeError(w, r, http.StatusNotFound, "run_not_found",
+				"no run with that id", map[string]any{"run_id": child.ID.String()})
+			return
+		}
+		var inv run.InvalidTransitionError
+		if errors.As(err, &inv) {
+			s.writeError(w, r, http.StatusConflict, "invalid_state_transition", err.Error(),
+				map[string]any{"run_id": child.ID.String(), "from": inv.From, "to": inv.To})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"re-drive child failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Fold the operator's amendment on the EXISTING implement stage —
+	// after the successful re-drive (so no orphan on a failed attempt) and
+	// BEFORE the Orchestrator handoff, so the implement prompt's
+	// mergeApprovedScopeAmendments fold sees it on the re-opened stage (its
+	// id is preserved by RetryStage's in-place reset, so implementStage.ID
+	// is still valid post-redrive).
+	if len(amendPaths) > 0 {
+		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, implementStage.ID, amendPaths, reason,
+			"operator-named scope amendment at in-place recovery of decomposition child "+child.ID.String(), id.Subject); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
+			return
+		}
+	}
+
+	// Provenance: plan_reused_from on the re-opened child. Best-effort —
+	// the approved amendment row and the re-driven stage are the durable
+	// records.
+	s.writePlanReusedFromAudit(r, child.ID, child.DecomposedFrom.String(),
+		"decomposition_child_recovery", amendPaths, reason, id.Subject)
+
+	// Un-terminal-ing the run let Advance act (it no-ops on terminal
+	// runs); walk the re-opened pending implement stage → dispatched.
+	// Best-effort, mirroring handleRedriveChild — the run is already
+	// running and an operator can re-fire Advance.
+	if s.cfg.Orchestrator != nil {
+		if _, err := s.cfg.Orchestrator.Advance(r.Context(), child.ID); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+				"orchestrator advance failed for decomposition-child recovery",
+				slog.String("run_id", child.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	// Return the re-opened child (re-fetched for its running state).
+	updated, err := s.cfg.RunRepo.GetRun(r.Context(), child.ID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get re-opened child failed", map[string]any{"error": err.Error()})
+		return
+	}
+	s.writeJSON(w, r, http.StatusCreated, toRunResponse(updated))
+}
+
 // writePlanReusedFromAudit appends the plan_reused_from chain entry on
-// the recovery run.
-func (s *Server) writePlanReusedFromAudit(r *http.Request, child, parent *run.Run, addedPaths []scopeamendment.PathEntry, reason, subject string) {
+// the recovery run (childID). source distinguishes the new-child mint
+// (operator_recovery) from the in-place decomposition re-drive
+// (decomposition_child_recovery); parentRunID is the run whose approved
+// plan was reused.
+func (s *Server) writePlanReusedFromAudit(r *http.Request, childID uuid.UUID, parentRunID, source string, addedPaths []scopeamendment.PathEntry, reason, subject string) {
 	actorKind := audit.ActorUser
 	payload, _ := json.Marshal(map[string]any{
-		"parent_run_id":           parent.ID.String(),
+		"parent_run_id":           parentRunID,
 		"parent_failure_category": string(run.FailureB),
 		"added_paths":             addedPaths,
-		"source":                  "operator_recovery",
+		"source":                  source,
 		"reason":                  reason,
 	})
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-		RunID:        child.ID,
+		RunID:        childID,
 		Timestamp:    time.Now().UTC(),
 		Category:     CategoryPlanReusedFrom,
 		ActorKind:    &actorKind,
@@ -355,8 +544,8 @@ func (s *Server) writePlanReusedFromAudit(r *http.Request, child, parent *run.Ru
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"plan_reused_from audit append failed",
-			slog.String("run_id", child.ID.String()),
-			slog.String("parent_run_id", parent.ID.String()),
+			slog.String("run_id", childID.String()),
+			slog.String("parent_run_id", parentRunID),
 			slog.String("error", err.Error()))
 	}
 }

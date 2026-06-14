@@ -1812,24 +1812,47 @@ paths:
       operationId: recoverRun
       summary: Recover a category-B-failed run against its approved plan
       description: |
-        Operator-initiated category-B recovery (#978). Mints a NEW
-        plan-stage-less child run that re-executes against the parent
-        run's approved plan — the same inheritance shape as the
-        CI-failure auto-retry, but operator-triggered and exempt from
-        the `on_ci_failure` cap: the child carries the parent's
-        `retry_attempt` UNCHANGED, with `parent_run_id` as provenance.
+        Operator-initiated category-B recovery (#978). The target shape
+        — top-level run vs. decomposition child — is auto-detected from
+        the run's `decomposed_from`:
 
-        **Eligibility.** The parent's plan stage must be `succeeded`
-        AND its implement stage `failed` with failure category `B`
-        (scope/constraint violation). Anything else is refused 409
-        `recovery_not_eligible` with `details` naming
-        `{plan_state, implement_state, failure_category}`. The
-        stage-level retry endpoint keeps refusing category B —
-        recovery is a NEW run, not a retry of the terminal one.
+        **Top-level target.** Mints a NEW plan-stage-less child run that
+        re-executes against the parent run's approved plan — the same
+        inheritance shape as the CI-failure auto-retry, but
+        operator-triggered and exempt from the `on_ci_failure` cap: the
+        child carries the parent's `retry_attempt` UNCHANGED, with
+        `parent_run_id` as provenance. Responds 201 with the new run.
+
+        **Decomposition-child target (#1081).** When the target run is
+        itself a decomposition child (`decomposed_from` set), recovery
+        re-drives THAT child IN PLACE — the same run id, NOT a freshly
+        minted run — on the shared parent branch, so the parent fan-out
+        parked in `awaiting_children` can still consolidate. An in-place
+        re-drive (rather than a new child sharing `decomposed_from`) is
+        deliberate: a second child row would double-count in the
+        parent's consolidation counters. The child's failed implement
+        stage is re-opened (`failed` → `pending`) and the run
+        un-terminal-ed (`failed` → `running`), then handed to the
+        orchestrator to dispatch; its plan resolves via the existing
+        `parent_run_id` walk. Responds 201 with the re-opened child.
+
+        **Eligibility.** A top-level target requires the parent's plan
+        stage `succeeded` AND its implement stage `failed` category `B`
+        (scope/constraint violation). A decomposition-child target
+        requires the CHILD's own implement stage `failed` category `B`
+        AND a plan resolvable via the `parent_run_id` walk. Anything
+        else is refused 409 `recovery_not_eligible` with `details`
+        naming `{plan_state, implement_state, failure_category,
+        plan_resolved}`. The stage-level retry endpoint keeps refusing
+        category B — recovery is broader than a retry, not a retry of
+        the terminal stage.
 
         **Scope amendments.** Optional `add_scope_files` paths land as
-        a PRE-APPROVED #961 scope-amendment row on the child's
-        implement stage (visible via the scope-amendments list, folded
+        a PRE-APPROVED #961 scope-amendment row on the implement stage
+        — the newly minted one for a top-level target, the EXISTING
+        re-opened one for a decomposition child (its stage id is
+        preserved across the re-drive, so the fold by run + stage id
+        still sees it) (visible via the scope-amendments list, folded
         by the prompt fetch and the runner's pre-commit refresh).
         `operation: create` entries flow into the net-new-file gates
         like any approved amendment. Note the fold deliberately no-ops
@@ -1840,7 +1863,9 @@ paths:
         **Provenance.** A `plan_reused_from` audit entry is appended
         on the child with
         `{parent_run_id, parent_failure_category, added_paths, source,
-        reason}`; the approved amendment row is the second surface.
+        reason}`; `source` is `operator_recovery` for a top-level
+        target and `decomposition_child_recovery` for an in-place
+        child re-drive. The approved amendment row is the second surface.
 
         No `workflow_dispatch` is fired — identical to `POST /v0/runs`:
         local-runner runs sit pending for the local loop to drive. The
@@ -1856,7 +1881,12 @@ paths:
         new spend).
 
         **Authorization.** Requires `write:runs` (same as
-        `POST /v0/runs`).
+        `POST /v0/runs`). A decomposition-child target ADDITIONALLY
+        rejects agent (MCP subject-bound, `mcp:run:<uuid>`) tokens with
+        403 `agent_token_forbidden`: that path re-opens a terminal run
+        via the same `run.RedriveChild` action `POST /v0/runs/{id}/redrive`
+        performs, which is operator-only — an agent may not re-drive any
+        run, including its own (#698, #1081).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -1910,7 +1940,9 @@ paths:
                     blocking budget is over.
       responses:
         '201':
-          description: Recovery run created.
+          description: |
+            Recovery run created (top-level target) or decomposition
+            child re-opened in place (same run id).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
@@ -1921,14 +1953,26 @@ paths:
               schema: { $ref: '#/components/schemas/Run' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            Missing `write:runs` scope (`insufficient_scope`), OR a
+            decomposition-child target presented with an MCP/agent
+            subject-bound token (subject `mcp:run:<uuid>`) — body `error`
+            is `agent_token_forbidden`; that path re-drives a terminal run
+            in place, an operator-only action (#698, #1081).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            `recovery_not_eligible` — the parent's plan stage is not
-            `succeeded` and/or its implement stage is not `failed`
-            category-B. `details` carries
-            `{plan_state, implement_state, failure_category}`.
+            `recovery_not_eligible` — a top-level target whose plan
+            stage is not `succeeded` and/or whose implement stage is not
+            `failed` category-B, or a decomposition-child target whose
+            own implement stage is not `failed` category-B and/or whose
+            plan does not resolve via the `parent_run_id` walk.
+            `details` carries `{plan_state, implement_state,
+            failure_category, plan_resolved}`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

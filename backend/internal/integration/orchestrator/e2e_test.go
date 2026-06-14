@@ -47,6 +47,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
@@ -1047,5 +1048,272 @@ func TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge(t *testing.T) {
 		if s.ID == implStageID && s.State == runpkg.StageStateAwaitingChildren {
 			t.Errorf("parent implement stage re-parked awaiting_children after fixup; want re-dispatched against the shared branch")
 		}
+	}
+}
+
+// findImplementStage returns the run's single implement stage, failing
+// the test when it can't be resolved.
+func findImplementStage(t *testing.T, ctx context.Context, runRepo runpkg.Repository, runID uuid.UUID) *runpkg.Stage {
+	t.Helper()
+	stages, err := runRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun %s: %v", runID, err)
+	}
+	for _, s := range stages {
+		if s.Type == runpkg.StageTypeImplement {
+			return s
+		}
+	}
+	t.Fatalf("implement stage not found on run %s", runID)
+	return nil
+}
+
+// driveStageThrough transitions a stage through the given non-terminal
+// states in order (completion is nil — none of these is `failed`).
+func driveStageThrough(t *testing.T, ctx context.Context, runRepo runpkg.Repository, stageID uuid.UUID, states ...runpkg.StageState) {
+	t.Helper()
+	for _, to := range states {
+		if _, err := runRepo.TransitionStage(ctx, stageID, to, nil); err != nil {
+			t.Fatalf("TransitionStage %s to %s: %v", stageID, to, err)
+		}
+	}
+}
+
+// TestDecomposition_E2E_CategoryBChildRecoverInPlace is the cross-boundary
+// verification for #1081: a decomposed fan-out where one child fails its
+// implement stage category-B must PARK the parent in awaiting_children (the
+// recoverable-in-decomposition gate, NOT failed-C), and the operator's
+// in-place recover path (POST /v0/runs/{child}/recover with add_scope_files)
+// must re-open that SAME child on the shared branch so its next implement run
+// succeeds and the sweeper then resolves the parent's awaiting_children stage
+// to succeeded and advances it toward consolidation/review. This drives the
+// full loop across the run-layer parking predicate (slice 1), the server
+// recover handler + scope-amendment persistence (slice 2), and the
+// sweeper/orchestrator consolidation seam — coverage no per-layer unit gives.
+func TestDecomposition_E2E_CategoryBChildRecoverInPlace(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	runRepo := runpkg.NewPostgresRepository(pool)
+	artifactRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	scopeRepo := scopeamendment.NewPostgresRepository(pool)
+	apiRepo := apitoken.NewPostgresRepository(pool)
+
+	o := &orchestrator.Orchestrator{
+		Runs:       runRepo,
+		Artifacts:  artifactRepo,
+		Audit:      auditRepo,
+		DefaultRef: "main",
+		Logger:     slog.Default(),
+	}
+	srv := server.New(server.Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            runRepo,
+		ArtifactRepo:       artifactRepo,
+		AuditRepo:          auditRepo,
+		ScopeAmendmentRepo: scopeRepo,
+		APITokenRepo:       apiRepo,
+		Orchestrator:       o,
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	sw := &childcompletion.Sweeper{
+		Runs:    runRepo,
+		Audit:   auditRepo,
+		Advance: advancerAdapter{o: o},
+		Logger:  slog.Default(),
+	}
+
+	planBytes := decomposedPlanContent(t)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, planBytes, nil, runpkg.ExecutorAgent, nil)
+	parentID := fx.runID
+
+	// (a) Fan out into two children.
+	if _, err := o.Advance(ctx, parentID); err != nil {
+		t.Fatalf("Advance fanout: %v", err)
+	}
+	children, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRuns children: %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("children = %d, want 2", len(children))
+	}
+	failing, succeeding := children[0], children[1]
+
+	// (b) Drive the failing child's implement stage to a category-B failure
+	// and its run to failed; drive the other child to succeeded.
+	failImpl := findImplementStage(t, ctx, runRepo, failing.ID)
+	driveStageThrough(t, ctx, runRepo, failImpl.ID, runpkg.StageStateDispatched, runpkg.StageStateRunning)
+	cat := runpkg.FailureB
+	failReason := "scope violation: edited an out-of-scope file"
+	if _, err := runRepo.TransitionStage(ctx, failImpl.ID, runpkg.StageStateFailed,
+		&runpkg.StageCompletion{FailureCategory: &cat, FailureReason: &failReason}); err != nil {
+		t.Fatalf("fail child implement stage category-B: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, failing.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun failing child running: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, failing.ID, runpkg.StateFailed); err != nil {
+		t.Fatalf("TransitionRun failing child failed: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, succeeding.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun succeeding child running: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, succeeding.ID, runpkg.StateSucceeded); err != nil {
+		t.Fatalf("TransitionRun succeeding child succeeded: %v", err)
+	}
+
+	// (c) Sweeper tick: the only failed child is recoverable in decomposition
+	// (category B), so the parent PARKS — implement stays awaiting_children,
+	// run stays running, NOT resolved to failed-C.
+	if err := sw.Tick(ctx); err != nil {
+		t.Fatalf("Tick (park): %v", err)
+	}
+	parentImpl := findImplementStage(t, ctx, runRepo, parentID)
+	if parentImpl.State != runpkg.StageStateAwaitingChildren {
+		t.Fatalf("parent implement stage after category-B child park = %q, want awaiting_children (NOT failed-C)", parentImpl.State)
+	}
+	parent, err := runRepo.GetRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("GetRun parent: %v", err)
+	}
+	if parent.State != runpkg.StateRunning {
+		t.Errorf("parent run state after park = %q, want running", parent.State)
+	}
+
+	// (d) Operator recovers the failed child IN PLACE via the real recover
+	// endpoint, folding an add_scope_files amendment. Pointed at the CHILD's
+	// own id (not the parent), recovery re-drives the same run — write:runs.
+	tok, err := apiRepo.Issue(ctx, "operator@e2e", []string{"read:runs", "write:runs"})
+	if err != nil {
+		t.Fatalf("Issue token: %v", err)
+	}
+	const recoveredFile = "backend/internal/server/recover.go"
+	recoverBody, _ := json.Marshal(map[string]any{
+		"add_scope_files": []map[string]string{{"path": recoveredFile, "operation": "modify"}},
+		"reason":          "fold the dropped file and re-drive the child in place",
+	})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		fmt.Sprintf("%s/v0/runs/%s/recover", httpSrv.URL, failing.ID), bytes.NewReader(recoverBody))
+	req.Header.Set("Authorization", "Bearer "+tok.PlainText)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("recover request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("recover status = %d, want 201: %s", resp.StatusCode, b)
+	}
+	var recovered struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&recovered); err != nil {
+		t.Fatalf("decode recover response: %v", err)
+	}
+	// Same run id — in-place re-drive, NOT a freshly minted run.
+	if recovered.ID != failing.ID.String() {
+		t.Fatalf("recover returned id %s, want the SAME child %s (in-place re-drive, no new run)", recovered.ID, failing.ID)
+	}
+
+	// No new DecomposedFrom child was minted (a second row would double-count
+	// in resolveParent's consolidation counters — the reason for in-place).
+	childrenAfter, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRuns children after recover: %v", err)
+	}
+	if len(childrenAfter) != 2 {
+		t.Errorf("children after recover = %d, want 2 (in-place re-drive must mint zero new children)", len(childrenAfter))
+	}
+
+	// The child run re-opened failed → running.
+	reopened, err := runRepo.GetRun(ctx, failing.ID)
+	if err != nil {
+		t.Fatalf("GetRun re-opened child: %v", err)
+	}
+	if reopened.State != runpkg.StateRunning {
+		t.Errorf("re-opened child run state = %q, want running", reopened.State)
+	}
+
+	// The implement stage re-opened in place (failed → non-terminal) with its
+	// id PRESERVED — so the scope amendment keyed to it folds into the prompt.
+	reImpl := findImplementStage(t, ctx, runRepo, failing.ID)
+	if reImpl.ID != failImpl.ID {
+		t.Errorf("re-opened implement stage id = %s, want preserved %s (in-place re-drive)", reImpl.ID, failImpl.ID)
+	}
+	if reImpl.State == runpkg.StageStateFailed {
+		t.Errorf("re-opened implement stage still failed; want re-opened (pending/dispatched)")
+	}
+
+	// The operator's add_scope_files landed as an APPROVED amendment on the
+	// EXISTING (preserved-id) implement stage.
+	amends, err := scopeRepo.ListByRun(ctx, failing.ID)
+	if err != nil {
+		t.Fatalf("ListByRun amendments: %v", err)
+	}
+	if len(amends) != 1 {
+		t.Fatalf("amendments on re-driven child = %d, want 1", len(amends))
+	}
+	if amends[0].Status != scopeamendment.StatusApproved {
+		t.Errorf("amendment status = %q, want approved", amends[0].Status)
+	}
+	if amends[0].StageID != failImpl.ID {
+		t.Errorf("amendment StageID = %s, want the existing implement stage %s", amends[0].StageID, failImpl.ID)
+	}
+
+	// A plan_reused_from provenance entry with source=decomposition_child_recovery.
+	reused, err := auditRepo.ListForRunByCategory(ctx, failing.ID, "plan_reused_from")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory plan_reused_from: %v", err)
+	}
+	if len(reused) != 1 {
+		t.Fatalf("plan_reused_from entries = %d, want 1", len(reused))
+	}
+	var reusedPayload struct {
+		Source string `json:"source"`
+	}
+	if err := json.Unmarshal(reused[0].Payload, &reusedPayload); err != nil {
+		t.Fatalf("decode plan_reused_from payload: %v", err)
+	}
+	if reusedPayload.Source != "decomposition_child_recovery" {
+		t.Errorf("plan_reused_from source = %q, want decomposition_child_recovery", reusedPayload.Source)
+	}
+
+	// (e) The re-driven child succeeds; the sweeper then resolves the parent's
+	// awaiting_children stage to succeeded and advances it toward the review
+	// gate (consolidation) — the parked parent fan-out consolidated.
+	if _, err := runRepo.TransitionRun(ctx, failing.ID, runpkg.StateSucceeded); err != nil {
+		t.Fatalf("TransitionRun re-driven child succeeded: %v", err)
+	}
+	if err := sw.Tick(ctx); err != nil {
+		t.Fatalf("Tick (resolve): %v", err)
+	}
+	parentImpl = findImplementStage(t, ctx, runRepo, parentID)
+	if parentImpl.State != runpkg.StageStateSucceeded {
+		t.Fatalf("parent implement stage after re-drive success = %q, want succeeded", parentImpl.State)
+	}
+
+	// The sweeper's internal Advance dispatched the parent review stage —
+	// the fan-out advanced past implement toward consolidation/review.
+	stages, err := runRepo.ListStagesForRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun parent after resolve: %v", err)
+	}
+	var reviewStage *runpkg.Stage
+	for _, s := range stages {
+		if s.Type == runpkg.StageTypeReview {
+			reviewStage = s
+			break
+		}
+	}
+	if reviewStage == nil {
+		t.Fatal("parent review stage not found")
+	}
+	if reviewStage.State == runpkg.StageStatePending {
+		t.Errorf("parent review stage = pending, want advanced (dispatched) — parent did not progress toward consolidation after re-drive")
 	}
 }

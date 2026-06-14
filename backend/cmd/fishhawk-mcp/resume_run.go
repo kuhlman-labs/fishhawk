@@ -15,7 +15,7 @@ import (
 // a NEW plan-stage-less child run executing against the parent's
 // approved plan.
 type ResumeRunInput struct {
-	ParentRunID string `json:"parent_run_id" jsonschema:"UUID of the category-B-failed run whose approved plan the recovery run re-executes"`
+	ParentRunID string `json:"parent_run_id" jsonschema:"UUID of the failed run to recover: a top-level category-B-failed run (mints a new plan-stage-less child against its approved plan) OR a failed decomposition CHILD (re-drives that child in place on the shared parent branch)"`
 	// AddScopeFiles are operator-named paths folded into the recovery
 	// run's effective scope as a pre-approved scope amendment.
 	AddScopeFiles []RecoverScopePath `json:"add_scope_files,omitempty" jsonschema:"paths to fold into the recovery run's effective scope; each entry is {path, operation} with operation 'modify' (default) or 'create' for net-new files the #818 gate would otherwise fail"`
@@ -43,25 +43,34 @@ func registerResumeRun(srv *mcp.Server, resolver *runResolver) {
 		Description: strings.TrimSpace(`
 Recover a category-B-failed run without replanning. Use this when a
 run's implement stage failed category-B (scope/constraint violation)
-after its plan was approved: it mints a NEW plan-stage-less child run
-that re-executes against the parent's approved plan, optionally folding
-operator-named add_scope_files into the effective scope as a
-pre-approved scope amendment — the recovery counterpart to
-fishhawk_retry_stage (which refuses category B) and fishhawk_start_run
-(which replans from scratch).
+after its plan was approved, optionally folding operator-named
+add_scope_files into the effective scope as a pre-approved scope
+amendment — the recovery counterpart to fishhawk_retry_stage (which
+refuses category B) and fishhawk_start_run (which replans from scratch).
 
-Eligibility: the parent's plan stage must have SUCCEEDED and its
-implement stage must have FAILED category-B; anything else returns a
-recovery_not_eligible error naming which leg failed the gate. Parents
-without a cached workflow spec (legacy rows) cannot recover — start a
-fresh run instead.
+Two target shapes, auto-detected from parent_run_id:
 
-The child run carries parent_run_id (provenance + plan resolution via
-the existing parent walk), the parent's retry_attempt UNCHANGED (the
-on_ci_failure auto-retry budget is not consumed), and a
-plan_reused_from audit entry recording the recovery. Drive it like any
-local run: fishhawk_run_stage executes the implement stage directly —
-no plan stage exists, no plan approval is needed.
+  - A top-level failed run: mints a NEW plan-stage-less child run that
+    re-executes against the parent's approved plan. Eligibility: the
+    parent's plan stage SUCCEEDED and its implement stage FAILED
+    category-B. The child carries parent_run_id (provenance + plan
+    resolution via the parent walk) and the parent's retry_attempt
+    UNCHANGED (the on_ci_failure auto-retry budget is not consumed).
+
+  - A failed DECOMPOSITION CHILD (a run minted by a parent fan-out):
+    re-drives THAT child IN PLACE on the shared parent branch — the same
+    run id, NOT a freshly minted run — so the parked parent fan-out can
+    still consolidate. Eligibility: the child's own implement stage
+    FAILED category-B and its plan resolves via the parent walk. Point
+    parent_run_id at the failed child's own id (next_actions surfaces
+    it); pointing it at the parent run replans from scratch instead.
+
+Either way an ineligible target returns a recovery_not_eligible error
+naming which leg failed the gate, and a plan_reused_from audit entry
+records the recovery. Parents without a cached workflow spec (legacy
+rows) cannot recover — start a fresh run instead. Drive the recovered
+run like any local run: fishhawk_run_stage executes the implement stage
+directly — no plan stage exists, no plan approval is needed.
 
 Idempotency: pass idempotency_key to make re-calls safe after a
 network hiccup; a replay returns the existing recovery run with
@@ -95,8 +104,8 @@ func (r *runResolver) resumeRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 					"run_not_found: no run with id %s — pass the FAILED run's id as parent_run_id (fishhawk_list_runs to find it)", parentID)
 			case "recovery_not_eligible":
 				return nil, ResumeRunOutput{}, fmt.Errorf(
-					"recovery_not_eligible: %s (plan_state=%v implement_state=%v failure_category=%v). Recovery requires the parent's plan stage SUCCEEDED and its implement stage FAILED category-B; for category A/C/D use fishhawk_retry_stage instead",
-					ae.Message, ae.Details["plan_state"], ae.Details["implement_state"], ae.Details["failure_category"])
+					"recovery_not_eligible: %s (plan_state=%v implement_state=%v failure_category=%v plan_resolved=%v). A top-level recovery requires the run's plan stage SUCCEEDED and its implement stage FAILED category-B; an in-place decomposition-child recovery requires the CHILD's own implement stage FAILED category-B and a plan resolvable via the parent walk. For category A/C/D use fishhawk_retry_stage instead",
+					ae.Message, ae.Details["plan_state"], ae.Details["implement_state"], ae.Details["failure_category"], ae.Details["plan_resolved"])
 			case "recovery_unsupported":
 				return nil, ResumeRunOutput{}, fmt.Errorf(
 					"recovery_unsupported: %s — start a fresh run with fishhawk_start_run", ae.Message)

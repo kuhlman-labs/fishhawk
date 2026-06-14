@@ -99,6 +99,27 @@ func TestResumeRun_NotEligible_MapsActionableError(t *testing.T) {
 	}
 }
 
+// TestResumeRun_NotEligible_MentionsDecompositionChild pins the
+// slice-2 messaging: the recovery_not_eligible mapping explains BOTH
+// the top-level and the in-place decomposition-child eligibility legs,
+// and surfaces the plan_resolved detail the child branch returns.
+func TestResumeRun_NotEligible_MentionsDecompositionChild(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.recoverStatus = http.StatusConflict
+	fb.recoverErrBody = `{"error":{"code":"recovery_not_eligible","message":"in-place recovery of a decomposition child requires the child's own implement stage failed category-B and an approved plan resolvable via the parent walk","details":{"implement_state":"failed","failure_category":"B","plan_resolved":false}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.resumeRun(context.Background(), nil, ResumeRunInput{ParentRunID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("err = nil, want recovery_not_eligible mapping")
+	}
+	for _, want := range []string{"decomposition-child", "plan_resolved=false", "in-place"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
 func TestResumeRun_Unsupported_MapsActionableError(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	fb.recoverStatus = http.StatusUnprocessableEntity

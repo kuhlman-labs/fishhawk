@@ -30,6 +30,16 @@ func naReviewStatus(stage, status string) *ReviewStatus {
 	return &ReviewStatus{Stage: stage, Status: status}
 }
 
+// naDecompChild builds a failed decomposition-child Run: it carries a
+// parent_run_id and (paired with an implement-only stage list) has no
+// plan or review stage of its own — the orchestrator's minted-child shape.
+func naDecompChild() *Run {
+	r := naRun("failed")
+	parent := uuid.NewString()
+	r.ParentRunID = &parent
+	return r
+}
+
 func actionNames(na *NextActions) []string {
 	if na == nil {
 		return nil
@@ -166,6 +176,29 @@ func TestNextActions_StateTable(t *testing.T) {
 			name:         "d_category_b_without_plan_fresh_run",
 			run:          naRun("failed"),
 			stages:       []Stage{naFailedImplement("B", "scope drift")},
+			wantState:    "implement_failed_category_b",
+			wantActions:  []string{"fishhawk_start_run"},
+			wantConsumes: []string{consumesNewRun},
+		},
+		{
+			// #1081: a failed decomposition child (parent_run_id set,
+			// implement-only — no plan/review of its own) routes category-B
+			// to an IN-PLACE re-drive against THIS child's own id (consumes
+			// nothing), not a fresh run.
+			name:         "d_category_b_decomposition_child_in_place",
+			run:          naDecompChild(),
+			stages:       []Stage{naFailedImplement("B", "scope drift")},
+			wantState:    "implement_failed_category_b_decomposition_child",
+			wantActions:  []string{"fishhawk_resume_run"},
+			wantConsumes: []string{consumesNone},
+		},
+		{
+			// A CI-retry child (parent_run_id set, plan-less BUT carrying a
+			// review stage) is NOT a decomposition child: it stays on the
+			// "resume at the parent / replan" arm, not the in-place re-drive.
+			name:         "d_category_b_ci_retry_child_not_in_place",
+			run:          naDecompChild(),
+			stages:       []Stage{naFailedImplement("B", "scope drift"), naStage("review", "pending")},
 			wantState:    "implement_failed_category_b",
 			wantActions:  []string{"fishhawk_start_run"},
 			wantConsumes: []string{consumesNewRun},

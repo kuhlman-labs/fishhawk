@@ -299,7 +299,10 @@ func TestTick_AllFailedChildrenRetryable_ParksParent(t *testing.T) {
 	}
 }
 
-func TestTick_FailedChildCategoryB_ResolvesFailedC(t *testing.T) {
+func TestTick_FailedChildCategoryB_ParksParent(t *testing.T) {
+	// #1081: a category-B (constraint/policy) child is now recoverable
+	// in decomposition (re-driven in place via the recover path), so the
+	// parent parks awaiting re-drive instead of resolving to failed-C.
 	parentRun := uuid.New()
 	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
 	failedChild := uuid.New()
@@ -312,9 +315,45 @@ func TestTick_FailedChildCategoryB_ResolvesFailedC(t *testing.T) {
 			},
 		},
 		stagesByRun: map[uuid.UUID][]*run.Stage{
-			// Category B (constraint/policy) is NOT retryable: the
-			// parent must resolve to failed-C.
 			failedChild: {mkFailedImplement(failedChild, run.FailureB, "scope violation")},
+		},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 (category-B child should park awaiting re-drive)", len(rs.transitions))
+	}
+	if len(ad.advanced) != 0 {
+		t.Errorf("Advance calls = %v, want none (parent parked)", ad.advanced)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit appended = %v, want none (sweeper park is silent)", au.appended)
+	}
+}
+
+func TestTick_FailedChildNonRecoverable_ResolvesFailedC(t *testing.T) {
+	// A D-rejection child (approver said no) stays non-recoverable: the
+	// parent must resolve to failed-C rather than park indefinitely.
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	failedChild := uuid.New()
+
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {
+				mkChild(failedChild, run.StateFailed),
+			},
+		},
+		stagesByRun: map[uuid.UUID][]*run.Stage{
+			failedChild: {mkFailedImplement(failedChild, run.FailureD, "gate rejected by approver")},
 		},
 	}
 	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, Logger: slog.Default()}
@@ -325,7 +364,7 @@ func TestTick_FailedChildCategoryB_ResolvesFailedC(t *testing.T) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if len(rs.transitions) != 1 {
-		t.Fatalf("transitions = %d, want 1 (non-retryable B resolves failed-C)", len(rs.transitions))
+		t.Fatalf("transitions = %d, want 1 (non-recoverable D-rejection resolves failed-C)", len(rs.transitions))
 	}
 	tr := rs.transitions[0]
 	if tr.To != run.StageStateFailed {

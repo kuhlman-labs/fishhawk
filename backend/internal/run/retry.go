@@ -111,6 +111,46 @@ func RetryableFailure(cat FailureCategory, reason string) bool {
 // confirmed recoverable, so an unclassifiable failure resolves the
 // parent rather than parking it indefinitely.
 func ImplementFailureRetryable(stages []*Stage) bool {
+	return implementFailureMatches(stages, RetryableFailure)
+}
+
+// RecoverableInDecomposition reports whether a decomposition child's
+// stage failure can be recovered IN PLACE by an operator (via
+// fishhawk_resume_run's in-place re-drive), as opposed to forcing the
+// parent fan-out to resolve to failed. It is strictly broader than
+// RetryableFailure: every retryable failure is recoverable, AND a
+// genuine category-B (constraint/policy) failure is recoverable too,
+// because the recover path folds operator-supplied scope amendments and
+// re-runs the child rather than re-running the identical stage.
+//
+// This predicate is exclusive to the decomposition recover path. The
+// auto-retry / retry_stage path keeps using RetryableFailure, so B stays
+// non-retryable there — only the operator-gated recover broadens to B.
+// D-rejection (approver said no) and unclassifiable failures remain
+// non-recoverable, matching RetryableFailure.
+func RecoverableInDecomposition(cat FailureCategory, reason string) bool {
+	return RetryableFailure(cat, reason) || cat == FailureB
+}
+
+// ImplementFailureRecoverable reports whether the implement stage among
+// the given run stages failed in a category that the decomposition
+// recover path can re-drive in place (RecoverableInDecomposition). The
+// parent-resolution paths gate the awaiting_children park on this rather
+// than ImplementFailureRetryable, so a parent whose only failed child is
+// category B parks awaiting re-drive instead of resolving to failed-C.
+// Returns false when there is no failed implement stage or it carries no
+// failure category — parking is only safe when every failed child's
+// failure is positively confirmed recoverable, so an unclassifiable
+// failure resolves the parent rather than parking it indefinitely.
+func ImplementFailureRecoverable(stages []*Stage) bool {
+	return implementFailureMatches(stages, RecoverableInDecomposition)
+}
+
+// implementFailureMatches finds the failed implement stage among stages
+// and reports pred(category, reason) for it. Returns false when there is
+// no failed implement stage or it carries no failure category — the
+// shared core of ImplementFailureRetryable and ImplementFailureRecoverable.
+func implementFailureMatches(stages []*Stage, pred func(FailureCategory, string) bool) bool {
 	for _, s := range stages {
 		if s.Type == StageTypeImplement && s.State == StageStateFailed {
 			if s.FailureCategory == nil {
@@ -120,7 +160,7 @@ func ImplementFailureRetryable(stages []*Stage) bool {
 			if s.FailureReason != nil {
 				reason = *s.FailureReason
 			}
-			return RetryableFailure(*s.FailureCategory, reason)
+			return pred(*s.FailureCategory, reason)
 		}
 	}
 	return false
