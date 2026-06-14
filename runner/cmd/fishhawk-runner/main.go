@@ -3606,8 +3606,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 					return fmt.Errorf("%w: the fix-up created %d file(s) outside the stage's fixed scope.files: %s. "+
 						"A fix-up cannot widen scope.files, so these net-new files were rejected rather than silently "+
 						"stripped (which would ship a misleadingly-green partial result). The run has been restored to "+
-						"its pre-fix-up review gate — hand-apply the named file(s), or start a fresh run with a corrected "+
-						"scope that declares them",
+						"its pre-fix-up review gate — recover with fishhawk_resume_run on the parent run (add_scope_files "+
+						"naming the created file(s) with operation 'create'), hand-apply the named file(s), or start a "+
+						"fresh run with a corrected scope that declares them",
 						gitops.ErrFixupCreatedOutOfScope, len(created), strings.Join(created, ", "))
 				}
 				_, _ = fmt.Fprintf(logSink,
@@ -3615,8 +3616,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 					cfg.runID, cfg.stageID, headSHA, createdJSON)
 				return fmt.Errorf("%w: the implement stage created %d file(s) outside the approved scope.files: %s. "+
 					"These net-new files were rejected rather than silently stripped (which would ship a "+
-					"misleadingly-green partial PR). Amend the scope to declare them — name the files in the approval "+
-					"condition, or use the structured add_scope_files param once it exists — or replan with a corrected "+
+					"misleadingly-green partial PR). Recover with fishhawk_resume_run (parent_run_id = this run, "+
+					"add_scope_files naming the created file(s) with operation 'create'); at the plan-approval gate "+
+					"you can instead name the files in the approval condition; otherwise replan with a corrected "+
 					"scope that declares them",
 					gitops.ErrCreatedOutOfScope, len(created), strings.Join(created, ", "))
 			}
