@@ -4483,9 +4483,40 @@ paths:
         the POST (cross-run → 403 `cross_run_scope_amendment`) —
         **OR** an operator bearer/session (not run-bound). Anonymous
         callers get 401.
+
+        **Optional `?wait=<seconds>` long-poll (#1035).** When `wait`
+        is a positive integer and at least one amendment is currently
+        `pending`, the server holds the connection — re-listing
+        internally — and returns early the moment any amendment that
+        was pending at request time leaves `pending` (the
+        honored-decision path), so a mid-stage decision is reachable
+        while `fishhawk_run_stage` blocks the driving session. If no
+        such decision lands within `wait` seconds, it returns the
+        still-pending list at the cap and the client re-issues to
+        extend toward its own total budget. `wait` is clamped to
+        `0..30`; `0`, absent, or a non-positive/non-integer value is
+        the unchanged single-list behavior (no wait). A `wait` with
+        nothing currently pending returns immediately. The response
+        envelope is unchanged — only the return timing differs; no new
+        error codes.
       tags: [runner, runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: wait
+          in: query
+          required: false
+          description: |
+            Optional server-side long-poll in seconds (#1035). `0` or
+            absent = no wait (unchanged single-list response). When
+            positive and an amendment is pending, holds until a
+            snapshotted-pending amendment is decided or the wait
+            elapses; the client re-issues to extend. Clamped to
+            `0..30`.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 30
+            default: 0
       responses:
         '200':
           description: The run's amendments, oldest first.

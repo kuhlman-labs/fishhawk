@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -168,6 +169,21 @@ func getAmendments(t *testing.T, s *Server, pathRunID uuid.UUID, decorate func(*
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet,
 		"/v0/runs/"+pathRunID.String()+"/scope-amendments", nil)
+	req.SetPathValue("run_id", pathRunID.String())
+	if decorate != nil {
+		req = decorate(req)
+	}
+	w := httptest.NewRecorder()
+	s.handleListScopeAmendments(w, req)
+	return w
+}
+
+// getAmendmentsWait drives the list handler with a ?wait=<seconds>
+// query param so the #1035 long-poll path is exercised.
+func getAmendmentsWait(t *testing.T, s *Server, pathRunID uuid.UUID, waitSeconds int, decorate func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/runs/"+pathRunID.String()+"/scope-amendments?wait="+strconv.Itoa(waitSeconds), nil)
 	req.SetPathValue("run_id", pathRunID.String())
 	if decorate != nil {
 		req = decorate(req)
@@ -517,6 +533,134 @@ func TestListScopeAmendments_Anonymous401(t *testing.T) {
 	w := getAmendments(t, s, runRow.ID, nil)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+// --- GET ?wait long-poll (#1035) ---
+
+// shortenScopeAmendmentPoll lowers the long-poll re-list interval for
+// the duration of a test so the ?wait loop reacts in milliseconds, and
+// restores it on cleanup.
+func shortenScopeAmendmentPoll(t *testing.T) {
+	t.Helper()
+	prev := scopeAmendmentPollInterval
+	scopeAmendmentPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { scopeAmendmentPollInterval = prev })
+}
+
+// TestListScopeAmendments_WaitReturnsOnDecision asserts the ?wait
+// long-poll returns PROMPTLY (well before the cap) the moment a
+// snapshotted-pending amendment is decided from another session.
+func TestListScopeAmendments_WaitReturnsOnDecision(t *testing.T) {
+	shortenScopeAmendmentPoll(t)
+	s, _, _, _, runRow, _ := scopeAmendmentServer(t)
+	amendmentID := seedPendingAmendment(t, s, runRow.ID)
+
+	// A second session decides ~30ms into the agent's wait.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		_ = postDecision(t, s, runRow.ID, amendmentID,
+			`{"decision":"approve","reason":"in-window decision"}`,
+			func(r *http.Request) *http.Request { return withOperatorIdentity(r, "write:stages") })
+	}()
+
+	start := time.Now()
+	w := getAmendmentsWait(t, s, runRow.ID, 10, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read")
+	})
+	elapsed := time.Since(start)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", w.Code, w.Body.String())
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("wait returned after %s — expected prompt return on decision, not at cap", elapsed)
+	}
+	var resp scopeAmendmentListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Items) != 1 || resp.Items[0].Status != "approved" {
+		t.Errorf("items = %+v, want one approved", resp.Items)
+	}
+}
+
+// TestListScopeAmendments_WaitReturnsAtCap asserts a ?wait elapses and
+// returns the still-pending list when no decision lands in the window.
+func TestListScopeAmendments_WaitReturnsAtCap(t *testing.T) {
+	shortenScopeAmendmentPoll(t)
+	s, _, _, _, runRow, _ := scopeAmendmentServer(t)
+	seedPendingAmendment(t, s, runRow.ID)
+
+	start := time.Now()
+	w := getAmendmentsWait(t, s, runRow.ID, 1, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read")
+	})
+	elapsed := time.Since(start)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", w.Code, w.Body.String())
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Errorf("wait returned after %s — expected to hold ~1s to the cap", elapsed)
+	}
+	var resp scopeAmendmentListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Items) != 1 || resp.Items[0].Status != "pending" {
+		t.Errorf("items = %+v, want one still-pending at the cap", resp.Items)
+	}
+}
+
+// TestListScopeAmendments_NoWaitBackCompat asserts the absence of ?wait
+// returns the single list immediately (unchanged behavior) even with a
+// pending amendment outstanding.
+func TestListScopeAmendments_NoWaitBackCompat(t *testing.T) {
+	s, _, _, _, runRow, _ := scopeAmendmentServer(t)
+	seedPendingAmendment(t, s, runRow.ID)
+
+	start := time.Now()
+	w := getAmendments(t, s, runRow.ID, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read")
+	})
+	elapsed := time.Since(start)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", w.Code, w.Body.String())
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("no-wait GET took %s — must return immediately", elapsed)
+	}
+	var resp scopeAmendmentListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Items) != 1 || resp.Items[0].Status != "pending" {
+		t.Errorf("items = %+v", resp.Items)
+	}
+}
+
+// TestListScopeAmendments_WaitNoPendingImmediate asserts ?wait returns
+// immediately when nothing is currently pending — there is nothing to
+// await.
+func TestListScopeAmendments_WaitNoPendingImmediate(t *testing.T) {
+	s, _, _, _, runRow, _ := scopeAmendmentServer(t)
+
+	start := time.Now()
+	w := getAmendmentsWait(t, s, runRow.ID, 30, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read")
+	})
+	elapsed := time.Since(start)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", w.Code, w.Body.String())
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("wait with no pending took %s — must return immediately", elapsed)
+	}
+	var resp scopeAmendmentListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Items) != 0 {
+		t.Errorf("items = %+v, want empty", resp.Items)
 	}
 }
 
