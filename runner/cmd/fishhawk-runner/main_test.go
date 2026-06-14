@@ -9504,6 +9504,42 @@ func TestWatchScopeAmendments_EmitsOnNewlyPending(t *testing.T) {
 	}
 }
 
+// TestWatchScopeAmendments_FetchErrorSwallowed feeds a FetchScopeAmendments
+// error to the running watcher and asserts the documented best-effort
+// posture: it keeps ticking (the fetch is attempted) but emits nothing and
+// does not panic. Covers the swallowed-error branch the happy-path emit and
+// no-op-guard tests skip. Run with -race.
+func TestWatchScopeAmendments_FetchErrorSwallowed(t *testing.T) {
+	orig := scopeAmendmentWatchInterval
+	scopeAmendmentWatchInterval = 2 * time.Millisecond
+	t.Cleanup(func() { scopeAmendmentWatchInterval = orig })
+
+	fake := newFakeUploader(t)
+	fake.amendmentsErr = errors.New("backend unreachable")
+	cfg := *amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := newSyncWriter(&bytes.Buffer{})
+	done := make(chan struct{})
+	go func() {
+		watchScopeAmendments(ctx, fake, cfg, "fhm_held", "implement", sink)
+		close(done)
+	}()
+
+	// Allow several fetch-error ticks, then stop the watcher and join so
+	// the assertions below read fake/sink with no concurrent writer.
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+	<-done
+
+	if fake.gotAmendmentArgs == nil {
+		t.Error("watcher never attempted a fetch despite a live client + token")
+	}
+	if buf := sink.w.(*bytes.Buffer); buf.Len() != 0 {
+		t.Errorf("fetch error must emit nothing; got %q", buf.String())
+	}
+}
+
 // TestSyncWriter_ConcurrentLinesParse asserts the mutex-guarded sink keeps
 // the one-JSON-object-per-line invariant under the two concurrent writers
 // the watcher introduces alongside the heartbeat (#1035). Two goroutines
