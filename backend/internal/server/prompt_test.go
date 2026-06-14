@@ -2633,12 +2633,15 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 		return out
 	}
 
-	t.Run("sub-plan with scope narrows to its own slice", func(t *testing.T) {
+	t.Run("sub-plan scope auto-includes coupled _test.go", func(t *testing.T) {
+		// Part A's slice is {pkg/a/a.go (create)}; the fold (#1083) must add
+		// pkg/a/a_test.go so the coupled unit tests are in-scope for the slice
+		// that owns the code, while still excluding the parent union's pkg/b.
 		resp := seedChildPrompt(t, "Part A title", "Implement Part A in pkg/a.")
 		got := scopePaths(resp.ScopeFiles)
-		want := []string{"pkg/a/a.go"}
+		want := []string{"pkg/a/a.go", "pkg/a/a_test.go"}
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("scope_files = %v, want the sub-plan's slice %v (NOT the parent union)", got, want)
+			t.Errorf("scope_files = %v, want the sub-plan's slice plus its coupled test sibling %v (NOT the parent union)", got, want)
 		}
 	})
 
@@ -2648,6 +2651,81 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 		want := []string{"pkg/a/a.go", "pkg/b/b.go"}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("scope_files = %v, want the parent's full scope %v", got, want)
+		}
+	})
+}
+
+// TestCoupledTestSiblings exercises the pure stem-sibling derivation behind
+// the decomposed-child scope auto-fold (#1083): a non-test .go entry yields
+// its _test.go sibling, a _test.go entry yields nothing, non-.go and
+// delete-operation entries are skipped, nested dirs produce correct paths,
+// and duplicate siblings collapse in first-seen order.
+func TestCoupledTestSiblings(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []scopeFile
+		want  []string
+	}{
+		{
+			name:  "non-test go yields sibling",
+			files: []scopeFile{{Path: "pkg/a/a.go", Operation: "create"}},
+			want:  []string{"pkg/a/a_test.go"},
+		},
+		{
+			name:  "test file yields nothing",
+			files: []scopeFile{{Path: "pkg/a/a_test.go", Operation: "modify"}},
+			want:  nil,
+		},
+		{
+			name:  "non-go ignored",
+			files: []scopeFile{{Path: "docs/x.yaml", Operation: "modify"}},
+			want:  nil,
+		},
+		{
+			name:  "delete operation skipped",
+			files: []scopeFile{{Path: "pkg/a/a.go", Operation: "delete"}},
+			want:  nil,
+		},
+		{
+			name: "nested dirs and mixed packages",
+			files: []scopeFile{
+				{Path: "backend/internal/server/plan.go", Operation: "modify"},
+				{Path: "backend/internal/run/run.go", Operation: "create"},
+			},
+			want: []string{
+				"backend/internal/server/plan_test.go",
+				"backend/internal/run/run_test.go",
+			},
+		},
+		{
+			name: "duplicate source files collapse",
+			files: []scopeFile{
+				{Path: "pkg/a/a.go", Operation: "create"},
+				{Path: "pkg/a/a.go", Operation: "modify"},
+			},
+			want: []string{"pkg/a/a_test.go"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := coupledTestSiblings(tt.files)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("coupledTestSiblings = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// dedup against an already-scoped sibling is foldScopePaths' job: a
+	// _test.go already in scope must not be duplicated by the fold.
+	t.Run("already-scoped sibling not duplicated", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0"})
+		in := []scopeFile{
+			{Path: "pkg/a/a.go", Operation: "create"},
+			{Path: "pkg/a/a_test.go", Operation: "modify"},
+		}
+		got := s.foldScopePaths(context.Background(), in, coupledTestSiblings(in), "coupled-test-sibling")
+		if len(got) != 2 {
+			t.Fatalf("folded scope = %v, want no duplicate of the already-scoped _test.go", got)
 		}
 	})
 }
