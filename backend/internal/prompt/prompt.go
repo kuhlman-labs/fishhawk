@@ -738,6 +738,29 @@ func buildPlan(t Trigger) string {
 		b.WriteString("\n\n")
 	}
 
+	// Clarification answers (#1057): on resume after an awaiting_input park,
+	// the operator's answers to the planner's parked clarification_request
+	// questions flow back through the #558 binding-conditions channel
+	// (t.ApprovalConditions). The first-pass plan dispatch leaves this nil —
+	// the server only populates it when re-opening a parked plan stage — so
+	// this section is absent on a normal plan. Capped like the other resume
+	// channels.
+	if t.ApprovalConditions != nil {
+		answers := *t.ApprovalConditions
+		const maxAnswerBytes = 4000
+		if len(answers) > maxAnswerBytes {
+			answers = answers[:maxAnswerBytes] + "...[truncated]"
+		}
+		b.WriteString("### Clarification answers (binding — resolve your parked questions)\n\n")
+		b.WriteString("You previously parked this issue at awaiting_input with a clarification_request " +
+			"because it was not yet plannable. The operator answered your questions through the " +
+			"binding-conditions channel (#558); their answers are below. Treat them as authoritative " +
+			"non-derivable facts and decisions: fold them into the step-zero plannability check and " +
+			"produce a concrete standard_v1 plan now. Do NOT park again on anything these answers resolve.\n\n")
+		b.WriteString(answers)
+		b.WriteString("\n\n")
+	}
+
 	writeIssueContext(&b, t)
 
 	planMins := resolveMins(t.PlanStageTimeout)
@@ -749,6 +772,38 @@ func buildPlan(t Trigger) string {
 			"so the reviewer can split the work into multiple runs.\n\n",
 		planMins, implMins,
 	)
+
+	// Step zero (#1057): the plannability / needs-direction gate. The planner
+	// must run this BEFORE drafting a plan; a genuinely unplannable issue
+	// parks via a clarification_request sibling instead of producing a guess.
+	// The calibration guard keeps parking the exception, not an escape hatch.
+	b.WriteString("### Step zero — is this issue plannable? (#1057)\n\n")
+	b.WriteString("Before drafting any plan, run a two-question plannability / needs-direction check:\n")
+	b.WriteString("1. FACTS — do you have every non-derivable fact a concrete plan requires? " +
+		"A fact is non-derivable only if it is NOT discoverable from the codebase, the issue, the docs, or the workflow spec.\n")
+	b.WriteString("2. DECISION — does this need an operator policy or product decision you cannot make from the codebase " +
+		"(e.g. which of several equally-valid designs to ship, a user-facing behaviour choice)?\n\n")
+	b.WriteString("If you have the facts AND no operator decision is needed, proceed to produce a standard_v1 plan as normal.\n\n")
+	b.WriteString("If EITHER check fails — a genuinely non-derivable fact is missing, or an operator decision is required — " +
+		"DO NOT guess a plan. Instead emit a clarification_request artifact and stop: the stage parks at awaiting_input " +
+		"until the operator answers, then planning resumes in the SAME run with their answers injected (the " +
+		"\"Clarification answers\" section above on the resumed attempt).\n\n")
+	b.WriteString("Calibration guard (MANDATORY — parking is the exception, not the escape hatch):\n")
+	b.WriteString("- Every parked question MUST be provably non-derivable from the codebase / issue / docs. " +
+		"A question you could answer by reading the repo is a planner bug, not a clarification — investigate first, park only what survives.\n")
+	b.WriteString("- \"I could do this N ways\" is NOT grounds to park on its own. Attach a recommended_default " +
+		"(the option you would take absent an answer) and tradeoffs (its consequences versus the alternatives) to EVERY question. " +
+		"If you cannot name a recommended default, you do not understand the issue well enough to park — keep investigating.\n")
+	b.WriteString("- A well-formed issue that already states Problem / Proposal / Done-means is plannable. Parking on it is a bug: produce the plan.\n\n")
+	b.WriteString("clarification_request shape (the additive standard_v1 SIBLING — schema docs/spec/clarification-request-v1.md). " +
+		"Write it as a single JSON object to the SAME path (")
+	b.WriteString(PlanArtifactPath)
+	b.WriteString(") INSTEAD of a plan; the runner routes the artifact by its top-level \"kind\":\n")
+	b.WriteString("- kind: \"clarification_request\" (REQUIRED discriminator; do NOT also set plan_version)\n")
+	b.WriteString("- ticket_reference, generated_by: same shape as the plan artifact\n")
+	b.WriteString("- summary: one paragraph on why the issue is not yet plannable (the lead line of the operator ping)\n")
+	b.WriteString("- questions: array of >= 1 {\"id\", \"question\", \"recommended_default\", \"tradeoffs\"} objects — " +
+		"ids MUST be unique (operator answers are keyed by id); add the optional \"what_i_can_infer\" to narrow each question to the genuinely non-derivable part\n\n")
 
 	b.WriteString("Your task: produce a `standard_v1` plan artifact describing the change. ")
 	b.WriteString("Write the plan as a single JSON object to `")

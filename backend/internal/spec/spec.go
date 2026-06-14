@@ -167,6 +167,12 @@ const (
 	PageEventPolicyOverride         = "policy_override"
 	PageEventExceptionRequest       = "exception_request"
 	PageEventRequirementArbitration = "requirement_arbitration"
+	// PageEventClarificationRequest (#1057): the planner parked the plan
+	// stage at awaiting_input with a clarification_request because the
+	// issue was not yet plannable. The operator must answer the parked
+	// questions before planning resumes — a judgment a delegation never
+	// absorbs.
+	PageEventClarificationRequest = "clarification_request"
 )
 
 // OperatorAgent holds the delegation knobs for the operator agent

@@ -129,6 +129,19 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		return nil, nil
 	}
 
+	// A stage parked at awaiting_input (#1057) is waiting on a human to
+	// answer the planner's clarification_request — a parked D-category
+	// judgment, not a failure and not a delegable agent decision. While
+	// the run is parked for direction the operator agent must page the
+	// human rather than act, so delegate nothing: surface only the
+	// effective block's must_page_human envelope with zero met actions.
+	// This is fail-closed by intent — without it a stale open concern
+	// could still satisfy a knob (e.g. solo_low) while the run is
+	// genuinely blocked on operator answers.
+	if parkedAwaitingInput(stages) {
+		return &Result{MustPageHuman: effective.MustPageHuman}, nil
+	}
+
 	open, err := e.Concerns.ListOpenByRun(ctx, runRow.ID)
 	if err != nil {
 		return nil, fmt.Errorf("list open concerns: %w", err)
@@ -173,6 +186,18 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		res.Actions = append(res.Actions, d)
 	}
 	return res, nil
+}
+
+// parkedAwaitingInput reports whether any stage is parked at
+// awaiting_input — the planner's clarification_request gate (#1057), a
+// parked D-category judgment that pages the human rather than delegating.
+func parkedAwaitingInput(stages []*run.Stage) bool {
+	for _, st := range stages {
+		if st.State == run.StageStateAwaitingInput {
+			return true
+		}
+	}
+	return false
 }
 
 // currentGatedStage returns the lowest-sequence stage parked in

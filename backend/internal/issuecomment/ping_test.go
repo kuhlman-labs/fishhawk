@@ -215,3 +215,79 @@ func TestPageClassEvents_ScopeAmendmentPagesHuman(t *testing.T) {
 		t.Errorf("got %+v, want scope_amendment at seq 2", got[0])
 	}
 }
+
+// clarificationEntry builds a clarification_requested audit entry whose
+// payload nests the parked document under `clarification_request`, mirroring
+// what server/plan.go::handleClarificationRequest writes.
+func clarificationEntry(seq int64, questionIDs ...string) *audit.Entry {
+	questions := make([]map[string]any, 0, len(questionIDs))
+	for _, id := range questionIDs {
+		questions = append(questions, map[string]any{
+			"id":                  id,
+			"question":            "which?",
+			"recommended_default": "the first",
+			"tradeoffs":           "trade",
+		})
+	}
+	doc := map[string]any{
+		"kind":      "clarification_request",
+		"summary":   "not yet plannable",
+		"questions": questions,
+	}
+	payload, _ := json.Marshal(map[string]any{"clarification_request": doc})
+	return &audit.Entry{Sequence: seq, Category: "clarification_requested", Payload: payload}
+}
+
+// TestPageClassEvents_ClarificationRequestPagesHuman covers the #1057
+// awaiting_input park: a clarification_requested event is a must_page_human
+// page class (the planner parked for operator direction) and must surface a
+// NEW ping naming how many questions need an answer.
+func TestPageClassEvents_ClarificationRequestPagesHuman(t *testing.T) {
+	entries := []*audit.Entry{
+		{Sequence: 1, Category: "run_dispatched"},
+		clarificationEntry(2, "auth-backend", "rate-limit"),
+	}
+	got := pageClassEvents(entries, nil)
+	if len(got) != 1 {
+		t.Fatalf("expected one clarification page event; got %+v", got)
+	}
+	if got[0].kind != "clarification_request" || got[0].sequence != 2 {
+		t.Errorf("got %+v, want clarification_request at seq 2", got[0])
+	}
+	if !strings.Contains(got[0].message, "2 questions need") {
+		t.Errorf("message = %q, want it to name the 2-question count", got[0].message)
+	}
+	if !strings.Contains(got[0].message, "❓") {
+		t.Errorf("message = %q, want the clarification glyph", got[0].message)
+	}
+}
+
+// TestClarificationQuestionPhrase covers the singular/plural/zero arms of
+// the count-aware phrase so a malformed payload never renders "0 questions".
+func TestClarificationQuestionPhrase(t *testing.T) {
+	cases := map[int]string{
+		0: "your parked questions need",
+		1: "1 question needs",
+		2: "2 questions need",
+		5: "5 questions need",
+	}
+	for n, want := range cases {
+		if got := clarificationQuestionPhrase(n); got != want {
+			t.Errorf("clarificationQuestionPhrase(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+// TestClarificationQuestionCount reads the question count off the nested
+// payload and degrades to 0 (→ count-free phrase) for an absent/garbled body.
+func TestClarificationQuestionCount(t *testing.T) {
+	if n := clarificationQuestionCount(clarificationEntry(1, "a", "b", "c").Payload); n != 3 {
+		t.Errorf("count = %d, want 3", n)
+	}
+	if n := clarificationQuestionCount(nil); n != 0 {
+		t.Errorf("nil payload count = %d, want 0", n)
+	}
+	if n := clarificationQuestionCount([]byte("{not json")); n != 0 {
+		t.Errorf("garbled payload count = %d, want 0", n)
+	}
+}

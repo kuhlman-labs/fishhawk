@@ -101,6 +101,14 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone},
 		},
 		{
+			name:         "plan_awaiting_input_answer_clarification",
+			run:          naRun("running"),
+			stages:       []Stage{naStage("plan", "awaiting_input")},
+			wantState:    "plan_awaiting_input",
+			wantActions:  []string{"answer_clarification"},
+			wantConsumes: []string{consumesNone},
+		},
+		{
 			name:         "b_plan_review_pending_do_not_approve",
 			run:          naRun("running"),
 			stages:       []Stage{naStage("plan", "awaiting_approval")},

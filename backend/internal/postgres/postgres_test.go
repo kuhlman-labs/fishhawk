@@ -205,11 +205,26 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0031 (#1023) added the
-	// runs.drive column; the down migration drops it. Confirm: the
-	// column is gone, but every prior migration's effect is still present
-	// (review_concerns from 0030, scope_amendments from 0029,
-	// cost_usd_total + resolved_model from 0028, etc.).
+	// MigrateDown rolls back one step. 0032 (#1057) widened
+	// stages_state_check to admit 'awaiting_input'; its down migration
+	// narrows the constraint back. Confirm: the widened constraint no
+	// longer admits 'awaiting_input', but every prior migration's effect
+	// is still present (runs.drive from 0031, review_concerns from 0030,
+	// scope_amendments from 0029, cost_usd_total + resolved_model from
+	// 0028, etc.).
+	var stageStateCheckDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		 WHERE conname = 'stages_state_check'`,
+	).Scan(&stageStateCheckDef); err != nil {
+		t.Fatalf("query stages_state_check constraint def: %v", err)
+	}
+	if strings.Contains(stageStateCheckDef, "awaiting_input") {
+		t.Errorf("stages_state_check after MigrateDown still admits 'awaiting_input' (0032 down should have narrowed it): %s", stageStateCheckDef)
+	}
+	if !strings.Contains(stageStateCheckDef, "awaiting_children") {
+		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_children' (only 0032 should roll back): %s", stageStateCheckDef)
+	}
 	var driveCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -217,8 +232,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&driveCol); err != nil {
 		t.Fatalf("query runs.drive column: %v", err)
 	}
-	if driveCol != 0 {
-		t.Errorf("runs.drive column count after MigrateDown = %d, want 0 (0031 down dropped it)", driveCol)
+	if driveCol != 1 {
+		t.Errorf("runs.drive column count after MigrateDown = %d, want 1 (0031 still applied; only 0032 rolled back)", driveCol)
 	}
 	var reviewConcernsTable int
 	if err := pool.QueryRow(context.Background(),

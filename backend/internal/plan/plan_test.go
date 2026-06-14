@@ -1,6 +1,8 @@
 package plan_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -675,5 +677,177 @@ func TestSemanticError_FormatsMessage(t *testing.T) {
 	want := "plan: semantic: duplicate title \"Foo\""
 	if got := err.Error(); got != want {
 		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
+// --- clarification_request sibling (#1057 slice 1) ---
+
+// validClarificationJSON returns a schema-conformant clarification_request
+// artifact. The mutate callback can tamper with the decoded map before it is
+// re-marshalled, mirroring planfixture.Valid's option style.
+func validClarificationJSON(t *testing.T, mutate ...func(map[string]any)) []byte {
+	t.Helper()
+	m := map[string]any{
+		"kind": "clarification_request",
+		"ticket_reference": map[string]any{
+			"type": "github_issue",
+			"url":  "https://github.com/kuhlman-labs/fishhawk/issues/1057",
+			"id":   "kuhlman-labs/fishhawk#1057",
+		},
+		"generated_by": map[string]any{
+			"agent":     "claude-code",
+			"model":     "claude-opus-4-8",
+			"timestamp": "2026-06-13T21:00:00Z",
+		},
+		"summary": "The issue needs an operator decision not derivable from the codebase.",
+		"questions": []any{
+			map[string]any{
+				"id":                  "store",
+				"question":            "Which store backs the limiter?",
+				"recommended_default": "in-process",
+				"tradeoffs":           "resets on restart vs an added dependency",
+			},
+			map[string]any{
+				"id":                  "policy",
+				"question":            "What ceiling?",
+				"recommended_default": "60/min",
+				"tradeoffs":           "tighter protects, looser permits bursts",
+			},
+		},
+	}
+	for _, fn := range mutate {
+		fn(m)
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal clarification fixture: %v", err)
+	}
+	return b
+}
+
+func TestDetectArtifactKind(t *testing.T) {
+	k, err := plan.DetectArtifactKind(validClarificationJSON(t))
+	if err != nil {
+		t.Fatalf("DetectArtifactKind(clarification): %v", err)
+	}
+	if k != plan.ArtifactKindClarificationRequest {
+		t.Errorf("kind = %q, want %q", k, plan.ArtifactKindClarificationRequest)
+	}
+
+	k, err = plan.DetectArtifactKind(readFixture(t, "valid/example.json"))
+	if err != nil {
+		t.Fatalf("DetectArtifactKind(plan): %v", err)
+	}
+	if k != plan.ArtifactKindPlan {
+		t.Errorf("kind = %q, want %q", k, plan.ArtifactKindPlan)
+	}
+
+	var perr *plan.ParseError
+	if _, err := plan.DetectArtifactKind(nil); !errors.As(err, &perr) {
+		t.Errorf("empty: err = %v, want *ParseError", err)
+	}
+	if _, err := plan.DetectArtifactKind([]byte("{ not json")); !errors.As(err, &perr) {
+		t.Errorf("malformed: err = %v, want *ParseError", err)
+	}
+}
+
+func TestValidateArtifact_RoutesByKind(t *testing.T) {
+	if err := plan.ValidateArtifact(validClarificationJSON(t)); err != nil {
+		t.Errorf("ValidateArtifact(clarification): %v", err)
+	}
+	if err := plan.ValidateArtifact(readFixture(t, "valid/example.json")); err != nil {
+		t.Errorf("ValidateArtifact(plan): %v", err)
+	}
+}
+
+func TestParseClarificationRequest_Valid(t *testing.T) {
+	cr, err := plan.ParseClarificationRequest(validClarificationJSON(t))
+	if err != nil {
+		t.Fatalf("ParseClarificationRequest: %v", err)
+	}
+	if cr.Kind != plan.KindClarificationRequest {
+		t.Errorf("Kind = %q", cr.Kind)
+	}
+	if len(cr.Questions) != 2 {
+		t.Fatalf("questions = %d, want 2", len(cr.Questions))
+	}
+	if cr.Questions[0].ID != "store" || cr.Questions[0].RecommendedDefault != "in-process" {
+		t.Errorf("question[0] = %+v", cr.Questions[0])
+	}
+	if cr.TicketReference.Type != plan.TicketTypeGitHubIssue {
+		t.Errorf("ticket type = %q", cr.TicketReference.Type)
+	}
+}
+
+// TestValidateClarificationRequest_DuplicateID locks the binding-condition
+// fix: a duplicate question id must be rejected by the VALIDATE path (not only
+// the typed parse path), because operator answers are keyed by id.
+func TestValidateClarificationRequest_DuplicateID(t *testing.T) {
+	dup := validClarificationJSON(t, func(m map[string]any) {
+		qs := m["questions"].([]any)
+		qs[1].(map[string]any)["id"] = "store" // collide with questions[0]
+	})
+
+	var se *plan.SemanticError
+	if err := plan.ValidateClarificationRequest(dup); !errors.As(err, &se) {
+		t.Fatalf("ValidateClarificationRequest: err = %v, want *SemanticError", err)
+	} else if !strings.Contains(se.Message, "duplicate id") {
+		t.Errorf("message = %q, want it to mention duplicate id", se.Message)
+	}
+
+	// The discriminating entry point and the typed parse must reject it too.
+	if err := plan.ValidateArtifact(dup); !errors.As(err, &se) {
+		t.Errorf("ValidateArtifact: err = %v, want *SemanticError", err)
+	}
+	if _, err := plan.ParseClarificationRequest(dup); !errors.As(err, &se) {
+		t.Errorf("ParseClarificationRequest: err = %v, want *SemanticError", err)
+	}
+}
+
+func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
+	// Missing recommended_default — required by the calibration guard.
+	missingDefault := validClarificationJSON(t, func(m map[string]any) {
+		q := m["questions"].([]any)[0].(map[string]any)
+		delete(q, "recommended_default")
+	})
+	var se *plan.SchemaError
+	if err := plan.ValidateClarificationRequest(missingDefault); !errors.As(err, &se) {
+		t.Errorf("missing recommended_default: err = %v, want *SchemaError", err)
+	}
+
+	// Wrong discriminator value is rejected by the const constraint.
+	badKind := validClarificationJSON(t, func(m map[string]any) {
+		m["kind"] = "something_else"
+	})
+	// DetectArtifactKind routes a non-clarification kind to the plan schema,
+	// which rejects it (no plan_version etc). ValidateArtifact must error.
+	if err := plan.ValidateArtifact(badKind); err == nil {
+		t.Error("ValidateArtifact(bad kind): want error, got nil")
+	}
+
+	var pe *plan.ParseError
+	if err := plan.ValidateClarificationRequest(nil); !errors.As(err, &pe) {
+		t.Errorf("empty: err = %v, want *ParseError", err)
+	}
+}
+
+// TestPlanSchemaFrozen locks the parent-plan invariant: slice 1 must NOT
+// mutate the frozen plan-standard-v1 schema. The embedded copy's sha256 is
+// pinned; any byte change (here or via a drifted docs/spec sync) fails this
+// test deliberately. A standard_v1 plan must also still validate unchanged
+// through the plan-only Validate entry point.
+func TestPlanSchemaFrozen(t *testing.T) {
+	const wantHash = "56f840126fde20d8051a9551af9d2528d7d7c32e4f5b6de4ba7216486d0aa555"
+	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
+	if err != nil {
+		t.Fatalf("read embedded plan schema: %v", err)
+	}
+	sum := sha256.Sum256(b)
+	if got := hex.EncodeToString(sum[:]); got != wantHash {
+		t.Errorf("plan-standard-v1.schema.json sha256 = %s, want %s (the plan schema is frozen — do not edit it)", got, wantHash)
+	}
+
+	if err := plan.Validate(readFixture(t, "valid/example.json")); err != nil {
+		t.Errorf("standard_v1 plan no longer validates through Validate: %v", err)
 	}
 }

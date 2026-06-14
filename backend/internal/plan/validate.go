@@ -16,13 +16,17 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-//go:embed schemas/plan-standard-v1.schema.json
+//go:embed schemas/plan-standard-v1.schema.json schemas/clarification-request-v1.schema.json
 var schemaFS embed.FS
 
 // compiledSchema is the JSON Schema used by Validate / Parse. Compiled
 // once at package init; if the embedded schema is malformed we want
 // to crash loudly at process start, not on the first call.
 var compiledSchema = mustCompileSchema()
+
+// compiledClarificationSchema is the JSON Schema for the clarification_request
+// sibling artifact, compiled once at init for the same fail-loud reason.
+var compiledClarificationSchema = mustCompileNamedSchema("schemas/clarification-request-v1.schema.json", "clarification-request-v1.schema.json")
 
 // embeddedSchemaHash is the hex-encoded SHA-256 of the canonical JSON
 // bytes of the embedded plan-standard-v1 schema. Computed once at init
@@ -61,7 +65,14 @@ const expensiveTestRuntimeThreshold = 20
 var expensiveCountRe = regexp.MustCompile(`(?i)-count[= ](\d+)`)
 
 func mustCompileSchema() *jsonschema.Schema {
-	const path = "schemas/plan-standard-v1.schema.json"
+	return mustCompileNamedSchema("schemas/plan-standard-v1.schema.json", "plan-standard-v1.schema.json")
+}
+
+// mustCompileNamedSchema reads, registers, and compiles an embedded schema
+// under the given path, registered to the compiler under resourceName.
+// Panics on any failure so a malformed embedded schema crashes at process
+// start rather than on first use.
+func mustCompileNamedSchema(path, resourceName string) *jsonschema.Schema {
 	data, err := schemaFS.ReadFile(path)
 	if err != nil {
 		panic(fmt.Sprintf("plan: read embedded schema %s: %v", path, err))
@@ -71,10 +82,10 @@ func mustCompileSchema() *jsonschema.Schema {
 		panic(fmt.Sprintf("plan: parse embedded schema %s: %v", path, err))
 	}
 	c := jsonschema.NewCompiler()
-	if err := c.AddResource("plan-standard-v1.schema.json", raw); err != nil {
+	if err := c.AddResource(resourceName, raw); err != nil {
 		panic(fmt.Sprintf("plan: register embedded schema %s: %v", path, err))
 	}
-	s, err := c.Compile("plan-standard-v1.schema.json")
+	s, err := c.Compile(resourceName)
 	if err != nil {
 		panic(fmt.Sprintf("plan: compile embedded schema %s: %v", path, err))
 	}
@@ -102,6 +113,109 @@ func Validate(data []byte) error {
 		return &SchemaError{Path: "/", Message: err.Error()}
 	}
 	return nil
+}
+
+// DetectArtifactKind inspects the top-level "kind" discriminator and
+// reports which plan-stage artifact the document is. A document carrying
+// kind == "clarification_request" is ArtifactKindClarificationRequest;
+// anything else (including the plan artifact, which has no "kind" field)
+// defaults to ArtifactKindPlan. The bytes are only peeked, not fully
+// validated — callers route to ValidateArtifact / Validate next. Returns
+// *ParseError for empty or non-JSON input.
+func DetectArtifactKind(data []byte) (ArtifactKind, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return "", &ParseError{Msg: "empty document"}
+	}
+	var disc struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(data, &disc); err != nil {
+		return "", &ParseError{Msg: err.Error(), Cause: err}
+	}
+	if disc.Kind == KindClarificationRequest {
+		return ArtifactKindClarificationRequest, nil
+	}
+	return ArtifactKindPlan, nil
+}
+
+// ValidateArtifact validates a plan-stage artifact, discriminating on the
+// top-level "kind" field BEFORE validation so the frozen plan schema is
+// never consulted for a clarification_request (and vice versa). A
+// clarification_request is validated by ValidateClarificationRequest
+// (schema + unique-id semantics); anything else is validated as a plan.
+func ValidateArtifact(data []byte) error {
+	kind, err := DetectArtifactKind(data)
+	if err != nil {
+		return err
+	}
+	switch kind {
+	case ArtifactKindClarificationRequest:
+		return ValidateClarificationRequest(data)
+	default:
+		return Validate(data)
+	}
+}
+
+// ValidateClarificationRequest validates bytes against the
+// clarification-request-v1 schema and then enforces the semantic
+// invariant the schema cannot express: question ids must be unique
+// (operator answers are keyed by id on resume, so a duplicate is
+// ambiguous). The returned error is *ParseError, *SchemaError, or
+// *SemanticError. This is the validate path used by the runner-equivalent
+// backend ingest — the unique-id check lives here, not only in
+// ParseClarificationRequest, so a duplicate-id artifact is rejected even
+// by callers that never decode the typed struct.
+func ValidateClarificationRequest(data []byte) error {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return &ParseError{Msg: "empty document"}
+	}
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return &ParseError{Msg: err.Error(), Cause: err}
+	}
+	if err := compiledClarificationSchema.Validate(raw); err != nil {
+		var verr *jsonschema.ValidationError
+		if errors.As(err, &verr) {
+			return schemaErrorFrom(verr)
+		}
+		return &SchemaError{Path: "/", Message: err.Error()}
+	}
+	// Schema accepted the shape; decode just the question ids to enforce
+	// uniqueness semantically.
+	var ids struct {
+		Questions []struct {
+			ID string `json:"id"`
+		} `json:"questions"`
+	}
+	if err := json.Unmarshal(data, &ids); err != nil {
+		return &ParseError{Msg: err.Error(), Cause: err}
+	}
+	seen := make(map[string]struct{}, len(ids.Questions))
+	for _, q := range ids.Questions {
+		if _, dup := seen[q.ID]; dup {
+			return &SemanticError{Message: fmt.Sprintf("questions: duplicate id %q", q.ID)}
+		}
+		seen[q.ID] = struct{}{}
+	}
+	return nil
+}
+
+// ParseClarificationRequest validates clarification_request bytes and
+// returns the typed *ClarificationRequest. Equivalent to
+// ValidateClarificationRequest followed by a strict JSON decode.
+func ParseClarificationRequest(data []byte) (*ClarificationRequest, error) {
+	if err := ValidateClarificationRequest(data); err != nil {
+		return nil, err
+	}
+	var cr ClarificationRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cr); err != nil {
+		// Schema accepted the bytes; this should only fail on an
+		// internal type-mapping bug.
+		return nil, fmt.Errorf("internal: decode to ClarificationRequest: %w", err)
+	}
+	return &cr, nil
 }
 
 // Parse validates plan bytes and returns the typed *Plan. Equivalent

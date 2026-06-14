@@ -10,7 +10,7 @@ it.
 | Surface | Audit category | Audit kind | Caller (production) | First posted | Edits in place? |
 |---|---|---|---|---|---|
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, CI failure) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688) | warn_at / 100% crossing of an advisory periodic budget | No (per-`(period_start, tier)` dedup; the warn comment and the 100% comment each post once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
@@ -90,6 +90,15 @@ Notes:
     scope-amendment request (`scope_amendment_requested`, an internal audit
     kind that otherwise has NO issue-comment surface and would be silent on
     edits); other closed-set events join here as their categories are wired.
+  - **Clarification request / awaiting_input park (#1057)** —
+    `clarification_requested` (`spec.PageEventClarificationRequest`). The
+    planner parked the plan stage at `awaiting_input` because the issue is not
+    yet plannable, so the operator must answer the parked questions before
+    planning resumes. The ping reads "❓ The planner parked this issue for
+    direction — N question(s) need your answer before planning resumes." (the
+    count is read from the parked document on the `clarification_requested`
+    payload; a malformed payload degrades to a count-free phrase). Deduped on
+    the `clarification_requested` `Sequence`.
   - **CI failure** — `ci_failure_retry_dispatched` / `ci_retry_exhausted`.
 
   Each ping records its source audit `Sequence` so a re-render never

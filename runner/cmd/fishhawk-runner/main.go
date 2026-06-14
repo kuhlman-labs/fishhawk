@@ -669,7 +669,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// the historical behavior: operator's --plan-out flag drives
 		// validation directly.
 		if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
-			if ev, demote := validatePlan(cfg.planOut); demote != nil {
+			if isClarif, ev := detectClarificationRequest(cfg.planOut); isClarif {
+				// The planner parked: it emitted a clarification_request sibling
+				// (#1057) instead of a plan because the issue is not yet
+				// plannable. It is NOT a plan, so skip plan-schema validation
+				// (which would wrongly demote it to category-B) and leave res.OK
+				// true. uploadPlan ships the bytes as-is; the backend ingests the
+				// sibling, persists it, and parks the stage at awaiting_input.
+				res.Events = append(res.Events, ev)
+			} else if ev, demote := validatePlan(cfg.planOut); demote != nil {
 				res.Events = append(res.Events, ev)
 				res.OK = false
 				res.FailureCategory = "B"
@@ -1870,6 +1878,43 @@ func makeGitDiffEvent(baseRef string, d constraint.Diff, patch string, truncated
 // the validation outcome. The second return is non-nil ONLY on
 // validation failure — it carries the reason for callers wiring up
 // category-B failure handling per MVP_SPEC §6.
+// detectClarificationRequest peeks the plan-out file's top-level "kind"
+// discriminator (#1057). A clarification_request is the additive standard_v1
+// sibling the planner emits when an issue is not yet plannable — it is shipped
+// as-is (the backend ingests it and parks the stage at awaiting_input) rather
+// than validated as a plan, so the runner must NOT demote it to category-B.
+// Mirrors backend/internal/plan.DetectArtifactKind: a plan artifact carries no
+// "kind" field (it has plan_version), so only an explicit
+// kind == "clarification_request" routes here.
+//
+// Returns (false, zero Event) on any read/parse error so the caller falls
+// through to validatePlan, where a genuinely-missing or malformed plan is
+// demoted as before. On a hit it returns a policy_event recording the
+// detection in the trace bundle.
+func detectClarificationRequest(path string) (bool, agent.Event) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, agent.Event{}
+	}
+	var disc struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(data, &disc); err != nil {
+		return false, agent.Event{}
+	}
+	if disc.Kind != "clarification_request" {
+		return false, agent.Event{}
+	}
+	return true, agent.Event{
+		Kind: "policy_event",
+		Payload: agent.MakePayload(map[string]string{
+			"check":   "plan_validation",
+			"outcome": "clarification_request",
+			"path":    path,
+		}),
+	}
+}
+
 func validatePlan(path string) (agent.Event, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

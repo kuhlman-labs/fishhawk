@@ -37,6 +37,46 @@ type Plan struct {
 	Decomposition              *Decomposition    `json:"decomposition,omitempty"`
 }
 
+// KindClarificationRequest is the top-level discriminator value carried
+// by a clarification_request artifact. A plan artifact has no "kind"
+// field (it carries plan_version), so the two are routed apart before
+// validation without touching the frozen plan schema.
+const KindClarificationRequest = "clarification_request"
+
+// ArtifactKind identifies which plan-stage artifact a document is, as
+// determined by the top-level discriminator. The plan artifact is the
+// default (it predates the discriminator and carries plan_version).
+type ArtifactKind string
+
+// Artifact kinds produced by the plan stage.
+const (
+	ArtifactKindPlan                 ArtifactKind = "plan"
+	ArtifactKindClarificationRequest ArtifactKind = "clarification_request"
+)
+
+// ClarificationRequest is a parsed and schema-validated clarification_request
+// artifact — the additive standard_v1 sibling the plan stage emits when an
+// issue is not yet plannable (lacks a non-derivable fact or needs an operator
+// decision). JSON tags mirror clarification-request-v1.schema.json.
+type ClarificationRequest struct {
+	Kind            string                  `json:"kind"`
+	TicketReference TicketReference         `json:"ticket_reference"`
+	GeneratedBy     GeneratedBy             `json:"generated_by"`
+	Summary         string                  `json:"summary"`
+	Questions       []ClarificationQuestion `json:"questions"`
+}
+
+// ClarificationQuestion is one parked question within a ClarificationRequest.
+// IDs must be unique within Questions — operator answers are keyed by ID on
+// resume, so a duplicate is ambiguous.
+type ClarificationQuestion struct {
+	ID                 string `json:"id"`
+	Question           string `json:"question"`
+	WhatICanInfer      string `json:"what_i_can_infer,omitempty"`
+	RecommendedDefault string `json:"recommended_default"`
+	Tradeoffs          string `json:"tradeoffs"`
+}
+
 // RuntimeConfidence is the agent's confidence level in a runtime estimate.
 type RuntimeConfidence string
 

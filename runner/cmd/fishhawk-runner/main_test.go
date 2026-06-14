@@ -9531,3 +9531,128 @@ func TestIsBinaryArtifactDrift(t *testing.T) {
 		}
 	}
 }
+
+// validClarificationJSON returns a minimal clarification_request artifact
+// (the additive standard_v1 sibling, #1057) that satisfies
+// clarification-request-v1: a top-level kind discriminator plus the required
+// ticket_reference / generated_by / summary / questions fields.
+func validClarificationJSON() string {
+	return `{
+  "kind": "clarification_request",
+  "ticket_reference": {"type": "github_issue", "url": "https://github.com/kuhlman-labs/fishhawk/issues/1057", "id": "kuhlman-labs/fishhawk#1057"},
+  "generated_by": {"agent": "claude-code", "model": "claude-opus-4-8", "timestamp": "2026-06-14T00:00:00Z"},
+  "summary": "Issue needs an operator policy decision before a concrete plan can be written.",
+  "questions": [
+    {"id": "auth-backend", "question": "Which auth backend should the token store use?", "what_i_can_infer": "The repo has both an in-memory and a Postgres store.", "recommended_default": "Postgres", "tradeoffs": "Postgres survives restarts but adds a migration; in-memory is simpler but loses tokens."}
+  ]
+}`
+}
+
+// TestDetectClarificationRequest pins the runner-side top-level "kind" peek
+// (#1057 slice 3): a clarification_request sibling is detected and yields a
+// policy_event carrying outcome=clarification_request so the runner skips
+// plan-schema validation and ships it as-is; a plan, a non-JSON blob, and a
+// missing file all return false with a zero Event so the normal validatePlan
+// path runs.
+func TestDetectClarificationRequest(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	clarPath := write("clar.json", validClarificationJSON())
+	planPath := write("plan.json", validPlanJSON())
+	junkPath := write("junk.json", "not json at all")
+
+	t.Run("clarification_request detected", func(t *testing.T) {
+		ok, ev := detectClarificationRequest(clarPath)
+		if !ok {
+			t.Fatal("detectClarificationRequest = false, want true for a clarification_request")
+		}
+		if ev.Kind != "policy_event" {
+			t.Errorf("event kind = %q, want policy_event", ev.Kind)
+		}
+		if !strings.Contains(string(ev.Payload), `"outcome":"clarification_request"`) {
+			t.Errorf("event missing outcome=clarification_request: %s", ev.Payload)
+		}
+	})
+
+	t.Run("plan not detected", func(t *testing.T) {
+		ok, ev := detectClarificationRequest(planPath)
+		if ok {
+			t.Error("detectClarificationRequest = true, want false for a standard_v1 plan")
+		}
+		if ev.Kind != "" {
+			t.Errorf("event kind = %q, want zero Event for a plan", ev.Kind)
+		}
+	})
+
+	t.Run("non-JSON not detected", func(t *testing.T) {
+		if ok, _ := detectClarificationRequest(junkPath); ok {
+			t.Error("detectClarificationRequest = true, want false for non-JSON")
+		}
+	})
+
+	t.Run("missing file not detected", func(t *testing.T) {
+		if ok, _ := detectClarificationRequest(filepath.Join(dir, "nope.json")); ok {
+			t.Error("detectClarificationRequest = true, want false for a missing file")
+		}
+	})
+}
+
+// TestRun_ClarificationRequest_NotDemotedToCategoryB is the slice-3 seam at the
+// runner edge: when the agent parks by emitting a clarification_request at
+// --plan-out, run() must NOT demote the stage to category-B (as it would for an
+// invalid plan). It leaves res.OK true, emits a policy_event with
+// outcome=clarification_request, and ships the bytes for the backend to ingest.
+func TestRun_ClarificationRequest_NotDemotedToCategoryB(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planPath, []byte(validClarificationJSON()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "system.init"}}},
+	})
+	withFakeUploader(t, newFakeUploader(t))
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath, "--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (a clarification_request must not demote):\n%s", got, stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("clarification_request was wrongly demoted to category B:\n%s", stderr.String())
+	}
+
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawClarification bool
+	for _, ev := range events {
+		if ev.Kind == "policy_event" && strings.Contains(string(ev.Data), `"outcome":"clarification_request"`) {
+			sawClarification = true
+		}
+	}
+	if !sawClarification {
+		t.Errorf("missing policy_event outcome=clarification_request in bundle:\n%+v", events)
+	}
+}

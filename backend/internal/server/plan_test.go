@@ -2378,3 +2378,150 @@ func TestShipPlan_SubPlanCoupling_EndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// validClarificationBytes returns a minimal clarification_request artifact
+// (#1057) that validates against clarification-request-v1: the top-level kind
+// discriminator plus ticket_reference / generated_by / summary / questions.
+func validClarificationBytes(t *testing.T) []byte {
+	t.Helper()
+	return []byte(`{
+  "kind": "clarification_request",
+  "ticket_reference": {"type": "github_issue", "url": "https://github.com/kuhlman-labs/fishhawk/issues/1057", "id": "kuhlman-labs/fishhawk#1057"},
+  "generated_by": {"agent": "claude-code", "model": "claude-opus-4-8", "timestamp": "2026-06-14T00:00:00Z"},
+  "summary": "Issue needs an operator policy decision before a concrete plan can be written.",
+  "questions": [
+    {"id": "auth-backend", "question": "Which auth backend should the token store use?", "what_i_can_infer": "Both an in-memory and a Postgres store exist.", "recommended_default": "Postgres", "tradeoffs": "Postgres survives restarts but adds a migration; in-memory is simpler but loses tokens."}
+  ]
+}`)
+}
+
+// TestShipPlan_ClarificationRequest_ParksAwaitingInput is the slice-3 backend
+// seam (#1057): when the runner ships a clarification_request sibling to
+// POST /plan instead of a standard_v1 plan, handleShipPlan discriminates it by
+// the top-level kind, validates it, persists the full document in a
+// clarification_requested audit entry (NOT the artifacts table), and parks the
+// plan stage at awaiting_input — a D-category judgment, not an approval and not
+// a failure.
+func TestShipPlan_ClarificationRequest_ParksAwaitingInput(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validClarificationBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	var resp planResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.SchemaVersion != "clarification-request-v1" {
+		t.Errorf("schema_version = %q, want clarification-request-v1", resp.SchemaVersion)
+	}
+	if resp.Idempotent {
+		t.Error("first clarification upload should not be marked idempotent")
+	}
+
+	// Persisted in the audit log, not the artifacts table.
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 (clarification rides the audit log)", len(ar.all))
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	if got := au.appended[0].Category; got != "clarification_requested" {
+		t.Errorf("audit category = %q, want clarification_requested", got)
+	}
+	// The full document must ride in the entry payload (the ping renderer and
+	// resume prompt read it back).
+	if !bytes.Contains(au.appended[0].Payload, []byte("auth-backend")) {
+		t.Errorf("audit payload missing the clarification document: %s", au.appended[0].Payload)
+	}
+
+	// Parked at awaiting_input — never awaiting_approval, never failed.
+	var sawPark bool
+	for _, c := range rr.transitionStageCalls {
+		if c.To == run.StageStateAwaitingInput {
+			sawPark = true
+		}
+		if c.To == run.StageStateAwaitingApproval {
+			t.Errorf("clarification stage wrongly transitioned to awaiting_approval")
+		}
+	}
+	if !sawPark {
+		t.Errorf("stage was not parked at awaiting_input; transitions=%v", rr.transitionStageCalls)
+	}
+}
+
+// TestShipPlan_ClarificationRequest_DuplicateID_400 confirms the unique-question-id
+// semantic (#1057): operator answers are keyed by question id on resume, so a
+// clarification_request whose questions share an id is rejected at ingest
+// (400 clarification_request_invalid) rather than parked with an ambiguous
+// artifact.
+func TestShipPlan_ClarificationRequest_DuplicateID_400(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, rr := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	dup := []byte(`{
+  "kind": "clarification_request",
+  "ticket_reference": {"type": "github_issue", "url": "https://github.com/kuhlman-labs/fishhawk/issues/1057", "id": "kuhlman-labs/fishhawk#1057"},
+  "generated_by": {"agent": "claude-code", "model": "claude-opus-4-8", "timestamp": "2026-06-14T00:00:00Z"},
+  "summary": "Two questions reuse the same id.",
+  "questions": [
+    {"id": "dupe", "question": "First?", "recommended_default": "a", "tradeoffs": "x"},
+    {"id": "dupe", "question": "Second?", "recommended_default": "b", "tradeoffs": "y"}
+  ]
+}`)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, dup, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("clarification_request_invalid")) {
+		t.Errorf("error code missing clarification_request_invalid: %s", w.Body.String())
+	}
+	// An invalid park is the agent's bad output: the stage fails (category-B),
+	// it is never parked at awaiting_input.
+	for _, c := range rr.transitionStageCalls {
+		if c.To == run.StageStateAwaitingInput {
+			t.Errorf("invalid clarification was wrongly parked at awaiting_input")
+		}
+	}
+	// No clarification_requested entry for a rejected artifact.
+	for _, p := range au.appended {
+		if p.Category == "clarification_requested" {
+			t.Errorf("rejected clarification should not append a clarification_requested entry")
+		}
+	}
+}
+
+// TestShipPlan_ClarificationRequest_Idempotent confirms a runner retry after a
+// successful park is idempotent (#1057): the stage is already awaiting_input, so
+// a re-POST of the same sibling returns 200 idempotent with no second audit
+// entry and no second transition.
+func TestShipPlan_ClarificationRequest_Idempotent(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := validClarificationBytes(t)
+
+	w1 := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first upload status = %d, want 201:\n%s", w1.Code, w1.Body.String())
+	}
+
+	w2 := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second upload status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	var resp planResponse
+	_ = json.NewDecoder(w2.Body).Decode(&resp)
+	if !resp.Idempotent {
+		t.Error("second clarification upload should be marked idempotent=true")
+	}
+	if len(au.appended) != 1 {
+		t.Errorf("audit entries = %d, want 1 (no second clarification_requested)", len(au.appended))
+	}
+}

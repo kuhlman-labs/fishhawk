@@ -380,7 +380,7 @@ workflows:
 
 **Precedence.** A gate-level block (approval gates only — the schema rejects `operator_agent` on `check` gates) overrides the workflow-level block **wholesale**: knobs are never merged across levels, so a gate block that omits `may_retry` does not inherit the workflow's `may_retry`. Resolution lives in `spec.Workflow.EffectiveOperatorAgent(gate)`: gate block if present, else workflow block, else nil.
 
-**`must_page_human`.** Events that always page the human regardless of the `may_*` knobs (closed set: `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`). An event listed here is never absorbed by a delegation.
+**`must_page_human`.** Events that always page the human regardless of the `may_*` knobs (closed set: `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`, `clarification_request`). An event listed here is never absorbed by a delegation. (`clarification_request` is the planner parking the plan stage at `awaiting_input` because the issue is not yet plannable — #1057.)
 
 **Authority unchanged (ADR-027).** Delegation changes *who* may act at a gate, not what gates exist or how reviewer authority resolves. The condition evaluation, API surfacing, and delegated-action enforcement are backend follow-ups (#1026 sibling slices); v0.5 of the schema defines the authoring surface and the parsed types.
 
@@ -413,7 +413,7 @@ workflows:
 | Gate `type`                 | `approval` \| `check`                                                        | closed set                                                                                          |
 | Approvers shape             | `any_of: [<role_id>...]` xor `all_of: [<role_id>...]`                        | one shape per gate                                                                                  |
 | `operator_agent.may_*`      | one closed condition per knob (see ## Operator agent delegation)             | v0.5+; workflow level + approval-gate override (gate wins wholesale); absent → fail-closed          |
-| `operator_agent.must_page_human` | `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration` | closed set; always pages the human regardless of `may_*` knobs |
+| `operator_agent.must_page_human` | `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`, `clarification_request` | closed set; always pages the human regardless of `may_*` knobs |
 
 ## Validation rules beyond the schema
 
