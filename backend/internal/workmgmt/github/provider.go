@@ -64,6 +64,15 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	}
 	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
 	inst := req.Target.InstallationID
+	// Fail closed when no installation id is available (#1005 concern-2).
+	// On the run-absent filing path Target.InstallationID stays 0, so the
+	// client cannot mint an installation token; proceeding would fail
+	// opaquely deep inside the first REST call. GitHub Projects filing is
+	// run-scoped in v0 — name the missing context and the constraint here
+	// instead. A run-absent installation source is a follow-up.
+	if inst == 0 {
+		return nil, errors.New("workmgmt/github: no installation id available; GitHub Projects filing is run-scoped in v0 — file with a run_id whose run carries an installation, or use a provider that needs no installation token")
+	}
 
 	issue, err := p.api.CreateIssue(ctx, inst, repo, githubclient.CreateIssueParams{
 		Title:  req.Item.Title,

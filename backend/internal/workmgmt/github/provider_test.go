@@ -194,6 +194,26 @@ func TestProvider_File_MissingRepoRejected(t *testing.T) {
 	}
 }
 
+func TestProvider_File_MissingInstallationRejected(t *testing.T) {
+	// #1005 concern-2: the run-absent path leaves InstallationID 0; the
+	// provider must fail closed with an actionable error naming the v0
+	// run-scoped constraint rather than dispatching an untokened REST call.
+	api := &fakeAPI{created: &githubclient.CreatedIssue{Number: 1, NodeID: "N", HTMLURL: "u"}}
+	req := baseRequest()
+	req.Target.InstallationID = 0
+	_, err := New(api).File(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "no installation id available") {
+		t.Fatalf("want missing-installation error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "run-scoped in v0") {
+		t.Errorf("error should name the v0 run-scoped constraint: %v", err)
+	}
+	// Must fail closed before any issue is created.
+	if api.createParams.Title != "" {
+		t.Errorf("issue should not be created when installation id is absent")
+	}
+}
+
 func TestParseIssueRef(t *testing.T) {
 	for _, tc := range []struct {
 		in      string
