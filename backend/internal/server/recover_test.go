@@ -437,6 +437,223 @@ func TestRecoverRun_PromptRenderCrossesAllSeams(t *testing.T) {
 	}
 }
 
+// seedRecoverableDecompositionChild seeds a parent run carrying an
+// approved plan artifact on its plan stage, plus a decomposition child
+// (DecomposedFrom + ParentRunID = parent) whose own implement stage
+// failed with the given category. The child is left in run.StateFailed.
+// Returns the child run and its failed implement stage.
+func seedRecoverableDecompositionChild(t *testing.T, rr *recoverRepo, art *fakeArtifactRepo, cat *run.FailureCategory) (*run.Run, *run.Stage) {
+	t.Helper()
+	parent := rr.seedRun()
+	parent.WorkflowID = "feature_change"
+	parent.WorkflowSpec = []byte(gatedSpecYAML)
+	planStage := rr.seedStage(parent.ID, 0, run.StageStateSucceeded)
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "decomposition child plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: "backend/internal/server/handlers.go", Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	child := rr.seedRun()
+	child.WorkflowID = "feature_change"
+	child.WorkflowSpec = []byte(gatedSpecYAML)
+	child.State = run.StateFailed
+	pid := parent.ID
+	child.ParentRunID = &pid
+	child.DecomposedFrom = &pid
+	implStage := rr.seedStage(child.ID, 0, run.StageStateFailed)
+	implStage.Type = run.StageTypeImplement
+	implStage.FailureCategory = cat
+	reason := "scope violation: edited an out-of-scope file"
+	implStage.FailureReason = &reason
+	return child, implStage
+}
+
+func newDecompositionRecoverServer(t *testing.T) (*Server, *recoverRepo, *fakeScopeAmendmentRepo, *recoverAuditRepo, *fakeArtifactRepo) {
+	t.Helper()
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	au := &recoverAuditRepo{}
+	art := newFakeArtifactRepo()
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          au,
+		ArtifactRepo:       art,
+	})
+	return s, rr, sa, au, art
+}
+
+// TestRecoverRun_DecompositionChildInPlace covers the slice-2 branch:
+// pointing recover at a failed decomposition CHILD re-opens that child
+// in place (same id, no new run minted) against the parent-walked plan,
+// folding add_scope_files onto the EXISTING implement stage and emitting
+// a decomposition_child_recovery provenance entry.
+func TestRecoverRun_DecompositionChildInPlace(t *testing.T) {
+	s, rr, sa, au, art := newDecompositionRecoverServer(t)
+	child, implStage := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+
+	w := postRecover(t, s, child.ID.String(),
+		`{"add_scope_files":[{"path":"docs/extra.md"},{"path":"backend/new.go","operation":"create"}],"reason":"fold the dropped companion"}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// In place: same run id, and only the parent + the re-opened child
+	// exist — no second DecomposedFrom row was minted.
+	if resp.ID != child.ID {
+		t.Errorf("re-drive minted a new run %s, want in-place %s", resp.ID, child.ID)
+	}
+	if resp.State != string(run.StateRunning) {
+		t.Errorf("child state = %q, want running (re-opened)", resp.State)
+	}
+	rows, _ := rr.ListRuns(context.Background(), run.ListRunsFilter{})
+	if len(rows) != 2 {
+		t.Errorf("runs = %d, want 2 (parent + the re-opened child, no new run)", len(rows))
+	}
+
+	// The existing implement stage was re-opened failed → pending.
+	reopened, err := rr.GetStage(context.Background(), implStage.ID)
+	if err != nil {
+		t.Fatalf("get implement stage: %v", err)
+	}
+	if reopened.State != run.StageStatePending {
+		t.Errorf("implement stage state = %q, want pending", reopened.State)
+	}
+
+	// The operator's paths landed APPROVED on the EXISTING implement
+	// stage id (so mergeApprovedScopeAmendments, keyed by run+stage id,
+	// folds them on the re-driven prompt).
+	amendments, err := sa.ListByRun(context.Background(), child.ID)
+	if err != nil {
+		t.Fatalf("list amendments: %v", err)
+	}
+	if len(amendments) != 1 {
+		t.Fatalf("amendments = %d, want 1", len(amendments))
+	}
+	if amendments[0].StageID != implStage.ID {
+		t.Errorf("amendment StageID = %s, want existing implement %s", amendments[0].StageID, implStage.ID)
+	}
+	if amendments[0].Status != scopeamendment.StatusApproved {
+		t.Errorf("amendment status = %q, want approved", amendments[0].Status)
+	}
+
+	// Exactly one plan_reused_from with the decomposition source.
+	var reused *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryPlanReusedFrom {
+			reused = &au.appended[i]
+		}
+	}
+	if reused == nil {
+		t.Fatalf("no plan_reused_from audit entry")
+	}
+	if reused.RunID != child.ID {
+		t.Errorf("plan_reused_from RunID = %s, want re-opened child %s", reused.RunID, child.ID)
+	}
+	var payload struct {
+		ParentRunID string                     `json:"parent_run_id"`
+		Source      string                     `json:"source"`
+		AddedPaths  []scopeamendment.PathEntry `json:"added_paths"`
+	}
+	if err := json.Unmarshal(reused.Payload, &payload); err != nil {
+		t.Fatalf("decode plan_reused_from payload: %v", err)
+	}
+	if payload.Source != "decomposition_child_recovery" {
+		t.Errorf("source = %q, want decomposition_child_recovery", payload.Source)
+	}
+	if payload.ParentRunID != child.DecomposedFrom.String() {
+		t.Errorf("parent_run_id = %q, want parent %q", payload.ParentRunID, child.DecomposedFrom)
+	}
+	if len(payload.AddedPaths) != 2 {
+		t.Errorf("added_paths = %+v, want the two operator paths", payload.AddedPaths)
+	}
+}
+
+// TestRecoverRun_DecompositionChildNoAmendment confirms the branch
+// recovers with an empty body (no add_scope_files) — the amendment is
+// optional; the re-drive against the parent-walked plan is the point.
+func TestRecoverRun_DecompositionChildNoAmendment(t *testing.T) {
+	s, rr, sa, _, art := newDecompositionRecoverServer(t)
+	child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+
+	w := postRecover(t, s, child.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	amendments, _ := sa.ListByRun(context.Background(), child.ID)
+	if len(amendments) != 0 {
+		t.Errorf("amendments = %d, want 0 (none requested)", len(amendments))
+	}
+}
+
+// TestRecoverRun_DecompositionChildGateMatrix exercises the two
+// eligibility legs of the in-place branch: the child's own implement
+// must be failed category-B, and its plan must resolve via the parent
+// walk. Anything else is recovery_not_eligible with no re-drive.
+func TestRecoverRun_DecompositionChildGateMatrix(t *testing.T) {
+	t.Run("category A child not eligible", func(t *testing.T) {
+		s, rr, _, _, art := newDecompositionRecoverServer(t)
+		child, implStage := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureA))
+
+		w := postRecover(t, s, child.ID.String(), `{}`, nil)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "recovery_not_eligible")
+		// No re-drive: the child stays failed.
+		got, _ := rr.GetStage(context.Background(), implStage.ID)
+		if got.State != run.StageStateFailed {
+			t.Errorf("implement stage = %q, want still failed (no re-drive)", got.State)
+		}
+	})
+
+	t.Run("plan unresolvable not eligible", func(t *testing.T) {
+		// No ArtifactRepo → loadApprovedPlanForRun returns nil, so leg 2
+		// of eligibility fails even though the child failed category-B.
+		rr := newRecoverRepo()
+		au := &recoverAuditRepo{}
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+		parent := rr.seedRun()
+		child := rr.seedRun()
+		child.State = run.StateFailed
+		pid := parent.ID
+		child.ParentRunID = &pid
+		child.DecomposedFrom = &pid
+		impl := rr.seedStage(child.ID, 0, run.StageStateFailed)
+		impl.Type = run.StageTypeImplement
+		impl.FailureCategory = failureCat(run.FailureB)
+
+		w := postRecover(t, s, child.ID.String(), `{}`, nil)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "recovery_not_eligible")
+	})
+}
+
 func TestRecoverRun_GateMatrix(t *testing.T) {
 	tests := []struct {
 		name           string
