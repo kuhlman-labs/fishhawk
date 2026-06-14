@@ -861,16 +861,18 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 		return
 	}
 
-	// #698: when children failed but EVERY failed child's implement
-	// failure is retryable (A/C/D-timeout), park the parent in
+	// #698 / #1081: when children failed but EVERY failed child's
+	// implement failure is recoverable in decomposition (A/C/D-timeout,
+	// or category B via the in-place recover path), park the parent in
 	// awaiting_children rather than resolving it to failed-C. This
 	// closes the race where a near-instant event-driven resolution
 	// would terminate the parent before an operator can re-drive the
 	// recoverable child. The parent stays parked until a re-drive
 	// re-runs the child and this path fires again on its next
-	// terminal transition. Only a non-retryable failed child (genuine
-	// category B) resolves the parent to failed-C.
-	if len(failedChildren) > 0 && o.failedChildrenAllRetryable(ctx, failedChildren) {
+	// terminal transition. Only a non-recoverable failed child
+	// (D-rejection or an unclassifiable failure) resolves the parent to
+	// failed-C; a genuine category-B child is now recoverable in place.
+	if len(failedChildren) > 0 && o.failedChildrenAllRecoverable(ctx, failedChildren) {
 		o.emitParentAwaitingRedrive(ctx, parentRunID, awaitingStage.ID, failedChildren)
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parked parent awaiting re-drive",
 			slog.String("parent_run_id", parentRunID.String()),
@@ -912,25 +914,26 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 	}
 }
 
-// failedChildrenAllRetryable reports whether every failed child run's
-// implement-stage failure is in a retryable category (A/C/D-timeout).
-// Used by maybeAdvanceDecomposedParent to decide whether to park the
-// parent awaiting re-drive. A failed child whose stages can't be
-// listed, or whose implement stage carries no failure category, is
-// treated as NOT retryable — parking is only safe when every failure
-// is positively confirmed recoverable, so an unclassifiable child
-// resolves the parent rather than parking it indefinitely.
-func (o *Orchestrator) failedChildrenAllRetryable(ctx context.Context, failed []*run.Run) bool {
+// failedChildrenAllRecoverable reports whether every failed child run's
+// implement-stage failure is recoverable in decomposition (A/C/D-timeout,
+// or category B via the in-place recover path). Used by
+// maybeAdvanceDecomposedParent to decide whether to park the parent
+// awaiting re-drive. A failed child whose stages can't be listed, or
+// whose implement stage carries no failure category, is treated as NOT
+// recoverable — parking is only safe when every failure is positively
+// confirmed recoverable, so an unclassifiable child resolves the parent
+// rather than parking it indefinitely.
+func (o *Orchestrator) failedChildrenAllRecoverable(ctx context.Context, failed []*run.Run) bool {
 	for _, c := range failed {
 		stages, err := o.Runs.ListStagesForRun(ctx, c.ID)
 		if err != nil {
-			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list child stages for retryability check failed",
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list child stages for recoverability check failed",
 				slog.String("child_run_id", c.ID.String()),
 				slog.String("error", err.Error()),
 			)
 			return false
 		}
-		if !run.ImplementFailureRetryable(stages) {
+		if !run.ImplementFailureRecoverable(stages) {
 			return false
 		}
 	}

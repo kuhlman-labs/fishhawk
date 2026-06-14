@@ -216,3 +216,63 @@ func TestImplementFailureRetryable(t *testing.T) {
 		})
 	}
 }
+
+func TestRecoverableInDecomposition(t *testing.T) {
+	cases := []struct {
+		name   string
+		cat    run.FailureCategory
+		reason string
+		want   bool
+	}{
+		// Strictly broader than RetryableFailure: B is now recoverable.
+		{"A agent failure", run.FailureA, "agent crashed", true},
+		{"B policy violation", run.FailureB, "scope violation", true},
+		{"C infrastructure", run.FailureC, "runner OOM", true},
+		{"D sla timeout", run.FailureD, "sla_timeout: 5h elapsed (deadline 4h)", true},
+		// D-rejection and unclassifiable failures remain non-recoverable.
+		{"D gate rejected", run.FailureD, "gate rejected by approver", false},
+		{"D other variant", run.FailureD, "some future D reason", false},
+		{"unknown category", run.FailureCategory("Z"), "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := run.RecoverableInDecomposition(tc.cat, tc.reason); got != tc.want {
+				t.Errorf("RecoverableInDecomposition(%q, %q) = %v, want %v", tc.cat, tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestImplementFailureRecoverable(t *testing.T) {
+	mkImpl := func(state run.StageState, cat *run.FailureCategory, reason string) *run.Stage {
+		s := &run.Stage{Type: run.StageTypeImplement, State: state, FailureCategory: cat}
+		if reason != "" {
+			s.FailureReason = &reason
+		}
+		return s
+	}
+	catB := run.FailureB
+	catC := run.FailureC
+	catD := run.FailureD
+
+	cases := []struct {
+		name   string
+		stages []*run.Stage
+		want   bool
+	}{
+		// Category B is recoverable in decomposition (unlike retryable).
+		{"failed implement category B", []*run.Stage{mkImpl(run.StageStateFailed, &catB, "scope violation")}, true},
+		{"failed implement category C", []*run.Stage{mkImpl(run.StageStateFailed, &catC, "infra")}, true},
+		{"failed implement D rejection", []*run.Stage{mkImpl(run.StageStateFailed, &catD, "gate rejected by approver")}, false},
+		{"failed implement no category", []*run.Stage{mkImpl(run.StageStateFailed, nil, "")}, false},
+		{"no failed implement stage", []*run.Stage{mkImpl(run.StageStateSucceeded, nil, "")}, false},
+		{"no stages", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := run.ImplementFailureRecoverable(tc.stages); got != tc.want {
+				t.Errorf("ImplementFailureRecoverable = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

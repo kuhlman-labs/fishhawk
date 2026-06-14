@@ -145,17 +145,18 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		return nil
 	}
 
-	// #698: when children failed but EVERY failed child's implement
-	// failure is retryable (A/C/D-timeout), leave the parent parked in
-	// awaiting_children rather than resolving it to failed-C, so an
-	// operator can re-drive the recoverable child without racing this
-	// timer (the event-driven orchestrator path parks identically).
+	// #698 / #1081: when children failed but EVERY failed child's
+	// implement failure is recoverable in decomposition (A/C/D-timeout,
+	// or category B via the in-place recover path), leave the parent
+	// parked in awaiting_children rather than resolving it to failed-C,
+	// so an operator can re-drive the recoverable child without racing
+	// this timer (the event-driven orchestrator path parks identically).
 	// We deliberately do NOT log per parked parent on every tick: an
 	// indefinitely-parked parent would otherwise emit an INFO line
 	// every ~60s. Discoverability comes from the one-time
 	// parent_awaiting_redrive audit emitted by the orchestrator path;
 	// here we drop to debug so steady-state sweeps stay quiet.
-	if len(failedChildren) > 0 && s.failedChildrenAllRetryable(ctx, failedChildren) {
+	if len(failedChildren) > 0 && s.failedChildrenAllRecoverable(ctx, failedChildren) {
 		s.logger().LogAttrs(ctx, slog.LevelDebug, "childcompletion: parent parked awaiting re-drive",
 			slog.String("parent_run_id", parentRunID.String()),
 			slog.String("parent_stage_id", parentStage.ID.String()),
@@ -203,25 +204,26 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 	return nil
 }
 
-// failedChildrenAllRetryable reports whether every failed child run's
-// implement-stage failure is in a retryable category (A/C/D-timeout).
-// Used by resolveParent to decide whether to park the parent awaiting
-// re-drive. A failed child whose stages can't be listed, or whose
-// implement stage carries no failure category, is treated as NOT
-// retryable — parking is only safe when every failure is positively
-// confirmed recoverable, so an unclassifiable child resolves the
-// parent to failed-C rather than parking it indefinitely.
-func (s *Sweeper) failedChildrenAllRetryable(ctx context.Context, failed []*run.Run) bool {
+// failedChildrenAllRecoverable reports whether every failed child run's
+// implement-stage failure is recoverable in decomposition (A/C/D-timeout,
+// or category B via the in-place recover path). Used by resolveParent to
+// decide whether to park the parent awaiting re-drive. A failed child
+// whose stages can't be listed, or whose implement stage carries no
+// failure category, is treated as NOT recoverable — parking is only safe
+// when every failure is positively confirmed recoverable, so an
+// unclassifiable child resolves the parent to failed-C rather than
+// parking it indefinitely.
+func (s *Sweeper) failedChildrenAllRecoverable(ctx context.Context, failed []*run.Run) bool {
 	for _, c := range failed {
 		stages, err := s.Runs.ListStagesForRun(ctx, c.ID)
 		if err != nil {
-			s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: list child stages for retryability check failed",
+			s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: list child stages for recoverability check failed",
 				slog.String("child_run_id", c.ID.String()),
 				slog.String("error", err.Error()),
 			)
 			return false
 		}
-		if !run.ImplementFailureRetryable(stages) {
+		if !run.ImplementFailureRecoverable(stages) {
 			return false
 		}
 	}
