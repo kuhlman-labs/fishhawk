@@ -3247,6 +3247,100 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/stages/{stage_id}/clarification:
+    post:
+      operationId: answerClarification
+      summary: Answer a plan stage parked at awaiting_input
+      description: |
+        Closes the #1057 answer-and-resume seam (#1088). A plan stage the
+        planner parked at `awaiting_input` with a `clarification_request`
+        (#1080) is stranded until the operator answers: nothing populates the
+        answers or re-opens the stage. This endpoint validates the operator's
+        answers against the questions the planner actually parked, persists
+        them as a DEDICATED `clarification_answered` audit entry, transitions
+        the stage `awaiting_input` → `pending`, and hands off to the
+        orchestrator so a drive run re-dispatches the plan stage (a local run
+        re-runs via the operator's next `fishhawk_run_stage plan`). The resumed
+        plan prompt injects the answers in its binding "Clarification answers"
+        section.
+
+        The `clarification_answered` channel is intentionally isolated from the
+        approval (`approval_submitted` / `decision=approve`) channel: a parked
+        plan stage is NOT yet approved, and the implement prompt's approval-
+        conditions loader matches only `decision=='approve'`, so the two never
+        collide.
+
+        Requires `write:approvals` scope — the #558 binding-conditions /
+        gate-answer family.
+      tags: [approvals]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answers]
+              properties:
+                answers:
+                  type: array
+                  minItems: 1
+                  description: |
+                    The operator's answers, each keyed by a parked question
+                    `id`. Every id must match a question in the newest
+                    `clarification_requested` entry, every parked question must
+                    be answered, and ids must not repeat.
+                  items:
+                    type: object
+                    required: [id, answer]
+                    properties:
+                      id:
+                        type: string
+                        description: The parked question's stable id.
+                      answer:
+                        type: string
+                        description: The operator's answer to that question.
+                comment:
+                  type: string
+                  description: |
+                    Optional free-text note appended after the rendered answers
+                    in the binding-conditions blob the resume prompt injects.
+      responses:
+        '200':
+          description: |
+            Answers recorded; the plan stage transitioned
+            `awaiting_input` → `pending`. The body is the bare `Stage` shape.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stage' }
+        '400':
+          description: |
+            Possible error codes:
+
+            - `validation_failed` — the body is not valid JSON, carries
+              unknown fields, or `answers` is empty.
+            - `clarification_answer_invalid` — an answer id does not match any
+              parked question, a parked question was left unanswered, or an id
+              was repeated. The answers are keyed to real parked questions, so
+              an ambiguous or incomplete set is refused before anything is
+              recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `invalid_state_transition` — the target is not a plan stage parked
+            at `awaiting_input` (the only state with parked questions to
+            answer), or the `awaiting_input` → `pending` transition was
+            rejected by the state machine. `details` carries `stage_id`,
+            `stage_type`, and `stage_state`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/stages/{stage_id}/retry:
     post:
       operationId: retryStage

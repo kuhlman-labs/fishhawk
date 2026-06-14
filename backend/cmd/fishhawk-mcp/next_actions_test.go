@@ -115,7 +115,7 @@ func TestNextActions_StateTable(t *testing.T) {
 			run:          naRun("running"),
 			stages:       []Stage{naStage("plan", "awaiting_input")},
 			wantState:    "plan_awaiting_input",
-			wantActions:  []string{"answer_clarification"},
+			wantActions:  []string{"fishhawk_answer_clarification"},
 			wantConsumes: []string{consumesNone},
 		},
 		{

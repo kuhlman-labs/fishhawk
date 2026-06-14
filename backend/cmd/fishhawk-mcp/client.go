@@ -324,6 +324,49 @@ func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decis
 	return &res, nil
 }
 
+// ClarificationAnswer is one operator answer to a parked clarification
+// question, matched back to the question by id. Exported (like
+// RecoverScopePath) so the MCP tool's input schema can reuse the same
+// shape the wire body carries.
+type ClarificationAnswer struct {
+	ID     string `json:"id" jsonschema:"the parked question's id, from the run's clarification_requested audit entry (read it via fishhawk_get_run_status / fishhawk_list_audit)"`
+	Answer string `json:"answer" jsonschema:"the operator's answer to that question"`
+}
+
+// clarificationAnswerRequest mirrors the backend's
+// `POST /v0/stages/{stage_id}/clarification` body
+// (`backend/internal/server/clarification_answer.go::clarificationAnswerRequest`).
+type clarificationAnswerRequest struct {
+	Answers []ClarificationAnswer `json:"answers"`
+	Comment string                `json:"comment,omitempty"`
+}
+
+// AnswerClarification posts the operator's answers to a plan stage parked
+// at awaiting_input by a clarification_request, re-opening it
+// (AwaitingInput → Pending), via
+// `POST /v0/stages/{stage_id}/clarification` (#1088, the #1057
+// answer-and-resume seam). The answers are persisted as a dedicated
+// clarification_answered audit entry — NOT an approval — and injected into
+// the resumed plan prompt's binding conditions. Returns the re-opened
+// Stage. 4xx surfaces:
+//   - 400 validation_failed (empty answers / unknown fields)
+//   - 400 clarification_answer_invalid (unknown / missing / duplicate
+//     answer id relative to the parked questions)
+//   - 404 stage_not_found
+//   - 409 invalid_state_transition (the stage is not a plan stage parked
+//     at awaiting_input)
+func (c *apiClient) AnswerClarification(ctx context.Context, stageID uuid.UUID, answers []ClarificationAnswer, comment string) (*Stage, error) {
+	body, err := json.Marshal(clarificationAnswerRequest{Answers: answers, Comment: comment})
+	if err != nil {
+		return nil, fmt.Errorf("marshal clarification answer: %w", err)
+	}
+	var s Stage
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/clarification", body, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 // RetryStage re-fires a failed stage via
 // `POST /v0/stages/{stage_id}/retry`. Returns the updated Stage row
 // (failed → pending → dispatched for category A/C; failed →
