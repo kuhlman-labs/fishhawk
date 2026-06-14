@@ -326,3 +326,26 @@ func TestErrorMessages(t *testing.T) {
 		t.Errorf("SemanticError.Error() = %q, want it to contain the message", sem.Error())
 	}
 }
+
+func TestProductFeedbackEnabled(t *testing.T) {
+	// Default-on: nil ProductFeedback means egress is allowed, so an
+	// existing config keeps working without the field.
+	if !(Conventions{}).ProductFeedbackEnabled() {
+		t.Error("nil ProductFeedback should be enabled by default")
+	}
+	if !(Conventions{ProductFeedback: &ProductFeedback{Enabled: true}}).ProductFeedbackEnabled() {
+		t.Error("enabled=true should be enabled")
+	}
+	// Kill-switch: explicit enabled=false disables egress.
+	if (Conventions{ProductFeedback: &ProductFeedback{Enabled: false}}).ProductFeedbackEnabled() {
+		t.Error("enabled=false should be the kill-switch (disabled)")
+	}
+}
+
+func TestDefault_ProductFeedbackEnabled(t *testing.T) {
+	// The shipped default advertises the kill-switch in its enabled
+	// (egress-on) position.
+	if !Default().ProductFeedbackEnabled() {
+		t.Error("shipped default should have product feedback enabled")
+	}
+}

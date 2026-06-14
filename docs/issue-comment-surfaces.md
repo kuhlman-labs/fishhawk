@@ -575,6 +575,26 @@ Notes:
   append failure never fails the response since the item is already filed. No
   sticky status comment is refreshed. Listed here so a future reader grepping
   the audit categories doesn't mistake it for a comment surface.
+- The product-feedback egress kind — `product_report_filed` (#1006) — is an
+  **internal, source-side audit-only category, not a run-thread comment
+  surface**. Nothing in `issuecomment` posts it; it has no Notifier method. It
+  is written under its own category `product_report_filed` by the acting caller
+  (`actor_kind` resolved from the token subject) in
+  `server/product_report.go::auditProductReport` after `POST
+  /v0/runs/{run_id}/product-reports` files or dedups a report. It names ONLY
+  what left the boundary — `{fingerprint, destination, action
+  (created|occurrence), upstream_url, upstream_num}` — and carries no diffs,
+  paths, prompts, free text, or audit payload bodies. The write is best-effort
+  (the egress already happened). Listed here so a future reader grepping the
+  audit categories doesn't mistake it for a comment surface.
+- The product-feedback **occurrence comment** (#1006) IS an egress comment
+  surface, but a distinct one: on a fingerprint dedup hit the GitHub
+  `FeedbackProvider` (`workmgmt/github/feedback.go`) posts a product-facts-only
+  occurrence comment to the matched issue **in the FIXED upstream product
+  repo** (`kuhlman-labs/fishhawk`), NOT to the run's own issue thread, and via
+  the provider, NOT a Notifier method. It is not the sticky-comment surface and
+  does not touch the run thread; it collapses repeat occurrences of the same
+  failure onto one upstream report instead of filing duplicates.
 
 ## Routing
 

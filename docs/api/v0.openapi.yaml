@@ -1201,6 +1201,42 @@ components:
               type: string
               description: Minimum fishhawk-runner version this backend requires.
 
+    ProductReportRequest:
+      type: object
+      description: |
+        Body for POST /v0/runs/{run_id}/product-reports (#1006). Slice 2
+        (the egress path) carries product facts ONLY — `kind` selects the
+        report flavor and nothing else crosses. An empty body is valid
+        (kind defaults to bug).
+      properties:
+        kind:
+          type: string
+          enum: [bug, feature]
+          default: bug
+          description: Report flavor — bug (default) or feature request.
+
+    ProductReportResponse:
+      type: object
+      description: What left the boundary — echoed so the caller can render the outcome.
+      required: [fingerprint, action, number, url, destination]
+      properties:
+        fingerprint:
+          type: string
+          description: Stable dedup fingerprint over (failure category, audit surface, version family).
+        action:
+          type: string
+          enum: [created, occurrence]
+          description: "created — a new fingerprint-marked report; occurrence — a comment on the existing report (nothing created)."
+        number:
+          type: integer
+          description: Upstream issue number that was created or appended to.
+        url:
+          type: string
+          description: Upstream issue URL.
+        destination:
+          type: string
+          description: The fixed upstream product repo the report landed in (owner/name).
+
     RunBudgetStatus:
       type: object
       description: |
@@ -2562,6 +2598,56 @@ paths:
           description: "`validation_failed` — `run_id` not a UUID."
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: Run or audit repository unavailable. }
+
+  /v0/runs/{run_id}/product-reports:
+    post:
+      operationId: fileProductReport
+      summary: File a deduped, audited upstream product report for a run
+      description: |
+        The deduped, audited egress path for upstream Fishhawk product
+        feedback (#1006). Collects the run's product-facts diagnostic
+        bundle, fingerprints the failure over (failure category, audit
+        surface, fishhawkd version family), searches the FIXED upstream
+        product repo for an open report already carrying that fingerprint,
+        and either appends an occurrence comment (dedup hit, nothing
+        created) or files a new fingerprint-marked report (dedup miss).
+        A source-side `product_report_filed` audit entry names what left
+        the boundary (fingerprint, destination, created-vs-occurrence).
+
+        **Egress is gated.** Only the run's own run-bound agent token may
+        file a report on its chain (a foreign/unbound caller → 403
+        `run_not_entitled`), and a per-repo `product_feedback` kill-switch
+        (`enabled: false`) → 403 `product_feedback_disabled`, files
+        nothing. Slice 2 carries product facts only — the operator
+        free-text description and its consent/redaction are layered on by
+        the MCP/CLI surfaces (later slice).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductReportRequest' }
+      responses:
+        '201':
+          description: The report was filed (created) or an occurrence was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductReportResponse' }
+        '400':
+          description: "`validation_failed` — `run_id` not a UUID or `kind` not bug/feature."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `run_not_entitled` — caller is not the run's own run-bound agent
+            token; `product_feedback_disabled` — the repo's kill-switch is off.
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501':
+          description: "`provider_unimplemented` — no feedback provider registered for the conventions' provider."
+        '502':
+          description: "`product_report_failed` — the dedup search or upstream filing failed."
         '503': { description: Run or audit repository unavailable. }
 
   /v0/runs/{run_id}/status-comment:
