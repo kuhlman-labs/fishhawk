@@ -1330,6 +1330,37 @@ workflows:
 	}
 }
 
+func TestParse_OperatorAgent_ClarificationRequestPageEvent_Accepted(t *testing.T) {
+	// clarification_request (#1057) joins the closed must_page_human set:
+	// the planner parking the plan stage at awaiting_input always pages the
+	// human and is never absorbed by a delegation.
+	if spec.PageEventClarificationRequest != "clarification_request" {
+		t.Fatalf("PageEventClarificationRequest = %q, want clarification_request", spec.PageEventClarificationRequest)
+	}
+	s, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      must_page_human: [clarification_request]
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf := s.Workflows["feature_change"]
+	if wf.OperatorAgent == nil || len(wf.OperatorAgent.MustPageHuman) != 1 ||
+		wf.OperatorAgent.MustPageHuman[0] != spec.PageEventClarificationRequest {
+		t.Errorf("MustPageHuman = %v, want [clarification_request]", wf.OperatorAgent)
+	}
+}
+
 func TestParse_OperatorAgent_OnCheckGate_Rejected(t *testing.T) {
 	// operator_agent lives on the approval branch of the gate oneOf
 	// only; unevaluatedProperties rejects it on a check gate.

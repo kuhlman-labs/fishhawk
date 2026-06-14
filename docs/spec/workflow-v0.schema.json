@@ -424,7 +424,8 @@
               "budget_override",
               "policy_override",
               "exception_request",
-              "requirement_arbitration"
+              "requirement_arbitration",
+              "clarification_request"
             ]
           }
         }

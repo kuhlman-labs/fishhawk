@@ -33,6 +33,10 @@ import (
 //     are NOT chain-derivable, but the concrete must_page_human EVENTS in
 //     the closed v0 set (spec.PageEvent*) are audit categories, and this
 //     surfaces the one that is otherwise silent on edits.
+//   - the planner parked the plan stage at awaiting_input with a
+//     clarification_request (#1057) — a must_page_human event
+//     (spec.PageEventClarificationRequest) that waits on the operator's
+//     answers before planning can resume.
 //   - CI failed (#1045)
 //
 // Dedup is per source audit event: each ping records the originating
@@ -130,6 +134,20 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 				kind:     "scope_amendment",
 				message:  "🔔 An agent requested a scope amendment — your decision is needed.",
 			})
+		case "clarification_requested":
+			// must_page_human (ADR-040, spec.PageEventClarificationRequest):
+			// the planner parked the plan stage at awaiting_input with a
+			// clarification_request because the issue was not yet plannable
+			// (#1057). The park always waits on an operator decision and has no
+			// other issue-comment surface — the anchor edit alone is silent —
+			// so it gets a ping. The question count comes from the parked
+			// document, which rides in this entry's payload.
+			out = append(out, pageEvent{
+				sequence: e.Sequence,
+				kind:     "clarification_request",
+				message: fmt.Sprintf("❓ The planner parked this issue for direction — %s your answer before planning resumes.",
+					clarificationQuestionPhrase(clarificationQuestionCount(e.Payload))),
+			})
 		case "ci_failure_retry_dispatched":
 			out = append(out, pageEvent{
 				sequence: e.Sequence,
@@ -204,6 +222,42 @@ func decodeReviewerVerdict(payload []byte) (verdict, model string) {
 		return "", ""
 	}
 	return p.Verdict, p.ReviewerModel
+}
+
+// clarificationQuestionCount reads how many questions the planner parked
+// from a clarification_requested audit payload — the full
+// clarification_request document rides under the `clarification_request`
+// key (server/plan.go). Returns 0 when absent or unparseable; the phrase
+// helper renders that as a non-numeric fallback so a malformed payload
+// never produces "0 questions".
+func clarificationQuestionCount(payload []byte) int {
+	if len(payload) == 0 {
+		return 0
+	}
+	var p struct {
+		ClarificationRequest struct {
+			Questions []json.RawMessage `json:"questions"`
+		} `json:"clarification_request"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return 0
+	}
+	return len(p.ClarificationRequest.Questions)
+}
+
+// clarificationQuestionPhrase renders the count-aware noun+verb fragment
+// for the clarification ping ("1 question needs", "3 questions need").
+// A zero/unknown count degrades to a count-free phrase rather than a
+// misleading "0 questions".
+func clarificationQuestionPhrase(n int) string {
+	switch {
+	case n == 1:
+		return "1 question needs"
+	case n > 1:
+		return fmt.Sprintf("%d questions need", n)
+	default:
+		return "your parked questions need"
+	}
 }
 
 // firePings posts a one-line ping comment for each page-class event in
