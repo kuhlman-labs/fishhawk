@@ -1008,6 +1008,108 @@ func TestBuild_Plan_PriorSchemaValidationError_Truncated(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_StepZero_PlannabilityGate pins the #1057 step-zero
+// plannability / needs-direction check and its calibration guard. The
+// section is unconditional — every plan prompt carries it so the planner
+// always runs the FACTS/DECISION gate before drafting.
+func TestBuild_Plan_StepZero_PlannabilityGate(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Step zero — is this issue plannable?",
+		"1. FACTS",
+		"2. DECISION",
+		// The clarification_request escape and its routing path.
+		"clarification_request",
+		"docs/spec/clarification-request-v1.md",
+		"awaiting_input",
+		// The calibration guard's load-bearing anchors.
+		"Calibration guard (MANDATORY",
+		"provably non-derivable",
+		"recommended_default",
+		"tradeoffs",
+		"Problem / Proposal / Done-means",
+		// The sibling discriminator must be spelled out.
+		"do NOT also set plan_version",
+		"ids MUST be unique",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing step-zero anchor %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_ClarificationAnswers_Rendered covers the resume path
+// (#1057): when the operator's answers arrive via the #558
+// binding-conditions channel (ApprovalConditions), buildPlan injects a
+// binding "Clarification answers" section so the resumed planner folds
+// them in instead of parking again.
+func TestBuild_Plan_ClarificationAnswers_Rendered(t *testing.T) {
+	answers := "auth-backend: use the existing OIDC provider, not a new one."
+	got, err := Build("plan", Trigger{
+		IssueNumber:        7,
+		Repo:               "x/y",
+		ApprovalConditions: &answers,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Clarification answers (binding — resolve your parked questions)",
+		"binding-conditions channel (#558)",
+		"Do NOT park again on anything these answers resolve",
+		answers,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing clarification-answers anchor %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_ClarificationAnswers_Nil_SectionAbsent confirms the
+// first-pass plan dispatch (no answers) omits the section entirely.
+func TestBuild_Plan_ClarificationAnswers_Nil_SectionAbsent(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		// ApprovalConditions deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Clarification answers") {
+		t.Errorf("plan prompt should not contain clarification-answers section when nil:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_ClarificationAnswers_Truncated mirrors the other resume
+// channels' 4000-byte cap so a runaway answer payload can't blow the
+// prompt budget.
+func TestBuild_Plan_ClarificationAnswers_Truncated(t *testing.T) {
+	longAnswers := strings.Repeat("x", 5000)
+	got, err := Build("plan", Trigger{
+		IssueNumber:        7,
+		Repo:               "x/y",
+		ApprovalConditions: &longAnswers,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "...[truncated]") {
+		t.Errorf("plan prompt missing truncation suffix:\n%s", got)
+	}
+	if strings.Contains(got, longAnswers) {
+		t.Errorf("untruncated long clarification answers appeared in prompt")
+	}
+}
+
 func TestBuild_Implement_ScopeConstraint_Rendered(t *testing.T) {
 	got, err := Build("implement", Trigger{
 		Repo:         "o/r",
