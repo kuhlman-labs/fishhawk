@@ -1129,6 +1129,78 @@ components:
             GitHub comment ID from the last `status_comment_posted` audit entry.
             Zero when no comment has been posted yet (create-path).
 
+    DiagnosticBundle:
+      type: object
+      description: |
+        Product-facts-only diagnostic summary for a run (#1006). Every
+        field is a structured fact safe to leave the operator's boundary
+        without redaction; the bundle never carries diffs, paths, prompts,
+        free text, or audit payload bodies.
+      required: [run_id, workflow_id, workflow_spec_hash, runner_kind, run_state, stages, versions]
+      properties:
+        run_id:
+          $ref: '#/components/schemas/UUID'
+        workflow_id:
+          type: string
+          description: Workflow key the run executed (e.g. feature_change).
+        workflow_spec_hash:
+          type: string
+          description: Git SHA of .fishhawk/workflows.yaml at run-create time.
+        runner_kind:
+          type: string
+          description: "Execution backend tag (github_actions | local)."
+        run_state:
+          type: string
+          description: "Run lifecycle state (pending|running|succeeded|failed|cancelled)."
+        stages:
+          type: array
+          description: Ordered stage facts, by sequence ascending.
+          items:
+            type: object
+            required: [sequence, type, state]
+            properties:
+              sequence: { type: integer }
+              type: { type: string, description: "plan | implement | review" }
+              state: { type: string, description: "Stage lifecycle state." }
+        failing_stage:
+          type: object
+          description: |
+            The failed stage's structured facts. Absent when no stage
+            failed. Carries the single-letter failure category and the
+            audit category of the most-recent entry scoped to the stage
+            (the failing surface) — never the free-text failure reason.
+          required: [sequence, type, failure_category]
+          properties:
+            sequence: { type: integer }
+            type: { type: string }
+            failure_category:
+              type: string
+              description: "MVP_SPEC §6 class: A | B | C | D."
+            failure_surface:
+              type: string
+              description: Audit category of the most-recent entry scoped to the failing stage.
+        audit_sequence_range:
+          type: object
+          description: "[min,max] of the run's audit-entry sequence numbers. Absent when the run has no audit entries."
+          required: [min, max]
+          properties:
+            min: { type: integer, format: int64 }
+            max: { type: integer, format: int64 }
+        versions:
+          type: object
+          description: Build identity the backend authoritatively knows.
+          required: [fishhawkd, min_runner_version]
+          properties:
+            fishhawkd:
+              type: object
+              required: [version, git_sha]
+              properties:
+                version: { type: string, description: "fishhawkd build version ('dev' when unstamped)." }
+                git_sha: { type: string, description: "fishhawkd build git SHA ('unknown' when unstamped)." }
+            min_runner_version:
+              type: string
+              description: Minimum fishhawk-runner version this backend requires.
+
     RunBudgetStatus:
       type: object
       description: |
@@ -2458,6 +2530,39 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '503': { description: Run repository unavailable. }
+
+  /v0/runs/{run_id}/diagnostics:
+    get:
+      operationId: getRunDiagnostics
+      summary: Product-facts-only diagnostic bundle for a run
+      description: |
+        Returns a redaction-safe diagnostic bundle for the run (#1006):
+        the minimal, structured product facts an operator attaches to an
+        upstream Fishhawk product report. The bundle carries the run id,
+        ordered stage states, the failing stage's category + audit
+        surface, the audit sequence range, this backend's build version +
+        git SHA (and the minimum runner version it requires), the workflow
+        spec hash, and the runner kind.
+
+        **Pure read, no egress.** By construction the bundle carries NO
+        diffs, paths, prompts, free text, or audit payload bodies — the
+        failing stage's free-text reason is excluded. Backs the
+        `fishhawk diagnose <run-id>` CLI verb and the foundation of the
+        product-feedback egress path (later slices).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The product-facts diagnostic bundle.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiagnosticBundle' }
+        '400':
+          description: "`validation_failed` — `run_id` not a UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: Run or audit repository unavailable. }
 
   /v0/runs/{run_id}/status-comment:
     get:

@@ -28,9 +28,12 @@ fishhawk plan approve <run-id> [--reason R] [--output text|json]
 fishhawk plan reject  <run-id> [--reason R] [--output text|json]
 fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
 fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
+fishhawk diagnose     <run-id> [--output text|json]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
 fishhawk version
 ```
+
+`diagnose` prints a run's **product-facts-only** diagnostic bundle (`GET /v0/runs/{id}/diagnostics`): run id, stage states, the failing stage's category + audit surface, audit sequence range, build versions + git SHAs, workflow spec hash, and runner kind. It is pure read — the bundle carries no diffs, paths, prompts, or free text, so it is safe to attach to an upstream Fishhawk product report.
 
 `run retry` takes a **stage** id, not a run id — retry is stage-scoped per the state machine. Pick the failed stage from `fishhawk run status <run-id> --output json` (`.stages[].id`).
 

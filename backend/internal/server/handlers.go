@@ -26,6 +26,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", s.handleListRunStages)
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", s.handleListRunAudit)
 	mux.HandleFunc("GET /v0/runs/{run_id}/budget", s.handleGetRunBudget)
+	mux.HandleFunc("GET /v0/runs/{run_id}/diagnostics", s.handleGetRunDiagnostics)
 	mux.HandleFunc("GET /v0/runs/{run_id}/status-comment", s.handleGetStatusComment)
 	mux.HandleFunc("POST /v0/runs/{run_id}/status-comment", s.handlePostStatusComment)
 	mux.HandleFunc("GET /v0/audit", s.handleListGlobalAudit)
