@@ -370,12 +370,16 @@ func (s *Server) createApprovedScopeAmendment(ctx context.Context, runID, stageI
 //     FailureCategory==B AND its approved plan must resolve via the
 //     ParentRunID parent-walk (loadApprovedPlanForRun); otherwise
 //     recovery_not_eligible names which leg failed.
-//  2. Fold the operator's add_scope_files as a pre-approved amendment on
-//     the EXISTING implement stage, BEFORE the orchestrator handoff so
-//     the implement prompt's mergeApprovedScopeAmendments fold (keyed by
-//     run + stage id) sees it.
-//  3. Re-open the child via run.RedriveChild (failed implement →
-//     pending, failed run → running) on the shared parent branch.
+//  2. Re-open the child via run.RedriveChild (failed implement →
+//     pending, failed run → running) on the shared parent branch. This
+//     runs FIRST and acts as the duplicate guard: it un-terminals the
+//     run, so a concurrent/replayed recover fails here and never folds an
+//     amendment.
+//  3. Fold the operator's add_scope_files as a pre-approved amendment on
+//     the EXISTING implement stage — only after a successful re-drive (so
+//     a failed attempt never orphans an approved amendment) and BEFORE
+//     the orchestrator handoff, so the implement prompt's
+//     mergeApprovedScopeAmendments fold (keyed by run + stage id) sees it.
 //  4. Append a plan_reused_from provenance entry
 //     (source=decomposition_child_recovery).
 //  5. Hand off to Orchestrator.Advance to walk pending → dispatched,
@@ -444,19 +448,14 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Fold the operator's amendment on the EXISTING implement stage
-	// BEFORE re-drive + Advance, so the implement prompt's
-	// mergeApprovedScopeAmendments fold sees it on the re-opened stage
-	// (its id is preserved by RetryStage's in-place reset).
-	if len(amendPaths) > 0 {
-		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, implementStage.ID, amendPaths, reason,
-			"operator-named scope amendment at in-place recovery of decomposition child "+child.ID.String(), id.Subject); err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
-			return
-		}
-	}
-
-	// Re-open the child in place against the shared parent branch.
+	// Re-open the child in place against the shared parent branch FIRST.
+	// RedriveChild transitions the run failed → running, so it is the
+	// duplicate guard: a concurrent duplicate recover (or any replay after
+	// the child has already re-opened) fails here with
+	// ErrRedriveNotApplicable and never reaches the amendment fold below.
+	// Folding the scope amendment ONLY after a successful re-drive means a
+	// failed recover attempt can never leave an orphaned approved
+	// amendment that would silently widen the re-driven prompt's scope.
 	if _, err := run.RedriveChild(r.Context(), s.cfg.RunRepo, child.ID); err != nil {
 		switch {
 		case errors.Is(err, run.ErrRedriveNotApplicable):
@@ -476,6 +475,20 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"re-drive child failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	// Fold the operator's amendment on the EXISTING implement stage —
+	// after the successful re-drive (so no orphan on a failed attempt) and
+	// BEFORE the Orchestrator handoff, so the implement prompt's
+	// mergeApprovedScopeAmendments fold sees it on the re-opened stage (its
+	// id is preserved by RetryStage's in-place reset, so implementStage.ID
+	// is still valid post-redrive).
+	if len(amendPaths) > 0 {
+		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, implementStage.ID, amendPaths, reason,
+			"operator-named scope amendment at in-place recovery of decomposition child "+child.ID.String(), id.Subject); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
+			return
+		}
 	}
 
 	// Provenance: plan_reused_from on the re-opened child. Best-effort —

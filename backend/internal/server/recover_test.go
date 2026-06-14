@@ -771,19 +771,67 @@ func TestRecoverRun_DecompositionChildErrorMappings(t *testing.T) {
 		assertErrorCode(t, w, "internal_error")
 	})
 
-	t.Run("redrive default error", func(t *testing.T) {
-		s, rr, _, _, art := newDecompositionRecoverServer(t)
+	t.Run("redrive default error leaves no orphaned amendment", func(t *testing.T) {
+		s, rr, sa, _, art := newDecompositionRecoverServer(t)
 		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
 		// A plain RetryRun error inside RedriveChild is neither
 		// ErrRedriveNotApplicable, ErrNotFound, nor InvalidTransitionError,
 		// so it hits the switch default → 500 "re-drive child failed".
 		rr.retryRunErr = errors.New("reopen boom")
 
-		w := postRecover(t, s, child.ID.String(), `{}`, nil)
+		// add_scope_files is requested: because the amendment is folded only
+		// AFTER a successful re-drive, a failed re-drive must NOT leave an
+		// approved amendment that would silently widen the prompt's scope.
+		w := postRecover(t, s, child.ID.String(),
+			`{"add_scope_files":[{"path":"docs/extra.md"}],"reason":"fold the companion"}`, nil)
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
 		}
 		assertErrorCode(t, w, "internal_error")
+		if amendments, _ := sa.ListByRun(context.Background(), child.ID); len(amendments) != 0 {
+			t.Errorf("amendments = %d, want 0 (re-drive failed — no orphaned scope grant)", len(amendments))
+		}
+	})
+
+	t.Run("redrive invalid transition maps to 409", func(t *testing.T) {
+		s, rr, sa, _, art := newDecompositionRecoverServer(t)
+		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+		// An InvalidTransitionError surfaced from RetryRun inside
+		// RedriveChild unwraps via errors.As → 409 invalid_state_transition.
+		rr.retryRunErr = run.InvalidTransitionError{Kind: "run", From: "failed", To: "running"}
+
+		w := postRecover(t, s, child.ID.String(),
+			`{"add_scope_files":[{"path":"docs/extra.md"}]}`, nil)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "invalid_state_transition")
+		if amendments, _ := sa.ListByRun(context.Background(), child.ID); len(amendments) != 0 {
+			t.Errorf("amendments = %d, want 0 (re-drive rejected — no orphaned scope grant)", len(amendments))
+		}
+	})
+
+	// A concurrent duplicate recover (or any replay after the child has
+	// already re-opened) is modeled by a child whose implement stage is
+	// still failed category-B — so it clears the eligibility gate — but
+	// whose run is no longer failed. RedriveChild then rejects with
+	// ErrRedriveNotApplicable → 409 recovery_not_eligible, and because the
+	// amendment is folded only after a successful re-drive, no orphaned
+	// approved amendment is left behind.
+	t.Run("redrive not applicable on already-reopened run leaves no orphan", func(t *testing.T) {
+		s, rr, sa, _, art := newDecompositionRecoverServer(t)
+		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+		child.State = run.StateRunning // a peer recover already un-terminaled the run
+
+		w := postRecover(t, s, child.ID.String(),
+			`{"add_scope_files":[{"path":"docs/extra.md"}],"reason":"fold the companion"}`, nil)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "recovery_not_eligible")
+		if amendments, _ := sa.ListByRun(context.Background(), child.ID); len(amendments) != 0 {
+			t.Errorf("amendments = %d, want 0 (duplicate recover — no orphaned scope grant)", len(amendments))
+		}
 	})
 
 	t.Run("final get run error", func(t *testing.T) {
