@@ -3252,6 +3252,12 @@ func TestBuild_ScopeAmendmentSection_ImplementOnly(t *testing.T) {
 		"FISHHAWK_API_TOKEN",
 		"at most 2 amendment requests",
 		"NEVER edit or create a requested file before the approval lands",
+		// The ?wait long-poll loop replaced the fixed sleep-poll (#1035):
+		// the agent re-issues the bounded wait until a decision lands or its
+		// total budget elapses, then proceeds as if denied at the cap.
+		"scope-amendments?wait=30",
+		"~15 minutes total",
+		"proceed as if denied",
 	} {
 		if !strings.Contains(impl, want) {
 			t.Errorf("implement prompt missing %q", want)

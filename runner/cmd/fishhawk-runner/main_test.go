@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1691,9 +1692,11 @@ func TestRun_FetchPrompt_MCPTokenFetchFailure_StillProceeds(t *testing.T) {
 }
 
 // TestRun_WiresProgressSinkToLogSink confirms run() sets the
-// Invocation's ProgressSink to the same logSink it writes lifecycle
-// lines to, so the agent adapter's stage_progress heartbeats land on
-// the stream the fishhawk-mcp relay forwards (#580).
+// Invocation's ProgressSink to the mutex-guarded wrapper around the same
+// logSink it writes lifecycle lines to, so the agent adapter's
+// stage_progress heartbeats land on the stream the fishhawk-mcp relay
+// forwards (#580) while staying serialized against the mid-stage
+// scope-amendment watcher's concurrent writes (#1035).
 func TestRun_WiresProgressSinkToLogSink(t *testing.T) {
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	withFakeInvoker(t, invoker)
@@ -1720,8 +1723,12 @@ func TestRun_WiresProgressSinkToLogSink(t *testing.T) {
 	if invoker.gotInv == nil {
 		t.Fatal("invoker.gotInv nil — invocation not captured")
 	}
-	if invoker.gotInv.ProgressSink != io.Writer(&stderr) {
-		t.Errorf("ProgressSink = %v, want the logSink passed to run()", invoker.gotInv.ProgressSink)
+	sw, ok := invoker.gotInv.ProgressSink.(*syncWriter)
+	if !ok {
+		t.Fatalf("ProgressSink = %T, want *syncWriter wrapping the logSink", invoker.gotInv.ProgressSink)
+	}
+	if sw.w != io.Writer(&stderr) {
+		t.Errorf("ProgressSink wraps %v, want the logSink passed to run()", sw.w)
 	}
 }
 
@@ -9352,6 +9359,228 @@ func TestRefreshScopeAmendments_FetchErrorKeepsScope(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "scope_amendment_refresh_failed") {
 		t.Errorf("log missing scope_amendment_refresh_failed: %s", log.String())
+	}
+}
+
+// TestEmitPendingScopeAmendments_SeamContract pins the runner end of the
+// runner->fishhawk-mcp scope_amendment_pending seam (#1035). The literal
+// field names asserted here {event, run_id, stage_id, amendment_id, paths}
+// are the contract the fishhawk-mcp relay test
+// (TestRunStageEventMessage_ScopeAmendmentPending) decodes — two
+// independently-drifting literals pinned on both ends per the #618 rule.
+// It also covers emit-once (already-seen ids skipped) and pending-only
+// (approved/denied never emit the in-band signal).
+func TestEmitPendingScopeAmendments_SeamContract(t *testing.T) {
+	items := []upload.ScopeAmendment{
+		{ID: "amd-1", Status: "pending", Paths: []upload.ScopeAmendmentPath{
+			{Path: "pkg/a.go", Operation: "modify"},
+			{Path: "pkg/new.go", Operation: "create"},
+		}},
+		{ID: "amd-2", Status: "approved", Paths: []upload.ScopeAmendmentPath{{Path: "pkg/b.go", Operation: "modify"}}},
+		{ID: "amd-3", Status: "denied", Paths: []upload.ScopeAmendmentPath{{Path: "pkg/c.go", Operation: "modify"}}},
+	}
+	seen := map[string]struct{}{}
+	var log bytes.Buffer
+	emitPendingScopeAmendments(seen, items, "run-abc", "stage-1", &log)
+
+	lines := strings.Split(strings.TrimSpace(log.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly 1 (pending-only): %q", len(lines), log.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("emitted line is not one JSON object: %v (%q)", err, lines[0])
+	}
+	if got["event"] != "scope_amendment_pending" {
+		t.Errorf("event = %v, want scope_amendment_pending", got["event"])
+	}
+	if got["run_id"] != "run-abc" || got["stage_id"] != "stage-1" {
+		t.Errorf("run_id/stage_id = %v/%v", got["run_id"], got["stage_id"])
+	}
+	if got["amendment_id"] != "amd-1" {
+		t.Errorf("amendment_id = %v, want amd-1", got["amendment_id"])
+	}
+	paths, ok := got["paths"].([]any)
+	if !ok || len(paths) != 2 {
+		t.Fatalf("paths = %v, want a 2-element array", got["paths"])
+	}
+	first, _ := paths[0].(map[string]any)
+	if first["path"] != "pkg/a.go" || first["operation"] != "modify" {
+		t.Errorf("paths[0] = %v, want {path:pkg/a.go, operation:modify}", paths[0])
+	}
+
+	// Re-running with the SAME seen map must not re-emit amd-1.
+	log.Reset()
+	emitPendingScopeAmendments(seen, items, "run-abc", "stage-1", &log)
+	if log.Len() != 0 {
+		t.Errorf("re-emit for already-seen id: %q", log.String())
+	}
+}
+
+// TestWatchScopeAmendments_NoOpGuards verifies the best-effort guards:
+// a nil client, an empty token, or a non-implement stage disables the
+// watcher entirely (no fetch, no emit).
+func TestWatchScopeAmendments_NoOpGuards(t *testing.T) {
+	cfg := *amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+
+	// Non-implement stage → no-op even with a live client + token.
+	fake := newFakeUploader(t)
+	fake.amendments = []upload.ScopeAmendment{{ID: "a1", Status: "pending", Paths: []upload.ScopeAmendmentPath{{Path: "x.go", Operation: "modify"}}}}
+	var log bytes.Buffer
+	watchScopeAmendments(context.Background(), fake, cfg, "fhm_held", "plan", &log)
+	if fake.gotAmendmentArgs != nil || log.Len() != 0 {
+		t.Errorf("non-implement stage should no-op; fetched=%v log=%q", fake.gotAmendmentArgs != nil, log.String())
+	}
+
+	// Empty token → no-op.
+	fake = newFakeUploader(t)
+	log.Reset()
+	watchScopeAmendments(context.Background(), fake, cfg, "", "implement", &log)
+	if fake.gotAmendmentArgs != nil || log.Len() != 0 {
+		t.Errorf("empty token should no-op; fetched=%v log=%q", fake.gotAmendmentArgs != nil, log.String())
+	}
+
+	// Nil client → no-op (and no panic).
+	log.Reset()
+	watchScopeAmendments(context.Background(), nil, cfg, "fhm_held", "implement", &log)
+	if log.Len() != 0 {
+		t.Errorf("nil client should no-op: %q", log.String())
+	}
+}
+
+// TestWatchScopeAmendments_EmitsOnNewlyPending runs the watcher goroutine
+// against a fake that returns a pending amendment and asserts it emits the
+// in-band signal exactly once before ctx cancel.
+func TestWatchScopeAmendments_EmitsOnNewlyPending(t *testing.T) {
+	orig := scopeAmendmentWatchInterval
+	scopeAmendmentWatchInterval = 2 * time.Millisecond
+	t.Cleanup(func() { scopeAmendmentWatchInterval = orig })
+
+	fake := newFakeUploader(t)
+	fake.amendments = []upload.ScopeAmendment{
+		{ID: "amd-9", Status: "pending", Paths: []upload.ScopeAmendmentPath{{Path: "pkg/z.go", Operation: "modify"}}},
+	}
+	cfg := *amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := newSyncWriter(&bytes.Buffer{})
+	done := make(chan struct{})
+	go func() {
+		watchScopeAmendments(ctx, fake, cfg, "fhm_held", "implement", sink)
+		close(done)
+	}()
+
+	// Poll the buffer until the first emit lands, then stop the watcher.
+	deadline := time.After(2 * time.Second)
+	buf := sink.w.(*bytes.Buffer)
+	for {
+		sink.mu.Lock()
+		n := buf.Len()
+		sink.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("watcher never emitted a scope_amendment_pending line")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	sink.mu.Lock()
+	out := buf.String()
+	sink.mu.Unlock()
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for _, l := range lines {
+		if !strings.Contains(l, `"event":"scope_amendment_pending"`) || !strings.Contains(l, `"amendment_id":"amd-9"`) {
+			t.Errorf("unexpected emitted line: %q", l)
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Errorf("emitted line not valid JSON: %v (%q)", err, l)
+		}
+	}
+}
+
+// TestWatchScopeAmendments_FetchErrorSwallowed feeds a FetchScopeAmendments
+// error to the running watcher and asserts the documented best-effort
+// posture: it keeps ticking (the fetch is attempted) but emits nothing and
+// does not panic. Covers the swallowed-error branch the happy-path emit and
+// no-op-guard tests skip. Run with -race.
+func TestWatchScopeAmendments_FetchErrorSwallowed(t *testing.T) {
+	orig := scopeAmendmentWatchInterval
+	scopeAmendmentWatchInterval = 2 * time.Millisecond
+	t.Cleanup(func() { scopeAmendmentWatchInterval = orig })
+
+	fake := newFakeUploader(t)
+	fake.amendmentsErr = errors.New("backend unreachable")
+	cfg := *amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := newSyncWriter(&bytes.Buffer{})
+	done := make(chan struct{})
+	go func() {
+		watchScopeAmendments(ctx, fake, cfg, "fhm_held", "implement", sink)
+		close(done)
+	}()
+
+	// Allow several fetch-error ticks, then stop the watcher and join so
+	// the assertions below read fake/sink with no concurrent writer.
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+	<-done
+
+	if fake.gotAmendmentArgs == nil {
+		t.Error("watcher never attempted a fetch despite a live client + token")
+	}
+	if buf := sink.w.(*bytes.Buffer); buf.Len() != 0 {
+		t.Errorf("fetch error must emit nothing; got %q", buf.String())
+	}
+}
+
+// TestSyncWriter_ConcurrentLinesParse asserts the mutex-guarded sink keeps
+// the one-JSON-object-per-line invariant under the two concurrent writers
+// the watcher introduces alongside the heartbeat (#1035). Two goroutines
+// hammer the shared writer with single-line JSON; every emitted line must
+// parse as one object (a torn write would fail). Run with -race.
+func TestSyncWriter_ConcurrentLinesParse(t *testing.T) {
+	var underlying bytes.Buffer
+	sink := newSyncWriter(&underlying)
+
+	const iters = 500
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// Simulated heartbeat writer.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			_, _ = fmt.Fprintf(sink, `{"event":"stage_progress","turns":%d}`+"\n", i)
+		}
+	}()
+	// Simulated watcher writer: a fresh seen map per iteration so each call
+	// emits, exercising emitPendingScopeAmendments through the shared sink.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			emitPendingScopeAmendments(
+				map[string]struct{}{},
+				[]upload.ScopeAmendment{{ID: fmt.Sprintf("amd-%d", i), Status: "pending", Paths: []upload.ScopeAmendmentPath{{Path: "p.go", Operation: "modify"}}}},
+				"run-abc", "stage-1", sink)
+		}
+	}()
+	wg.Wait()
+
+	lines := strings.Split(strings.TrimSpace(underlying.String()), "\n")
+	if len(lines) != 2*iters {
+		t.Fatalf("got %d lines, want %d (no dropped/merged writes)", len(lines), 2*iters)
+	}
+	for _, l := range lines {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("interleaved (non-JSON) line: %v (%q)", err, l)
+		}
 	}
 }
 

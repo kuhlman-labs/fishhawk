@@ -32,6 +32,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -343,6 +344,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.timeout = 15 * time.Minute
 	}
 
+	// From here on the runner's structured stderr stream (logSink) has
+	// concurrent producers during the agent invocation: the agent
+	// heartbeat goroutine (wired below via inv.ProgressSink) and the
+	// mid-stage scope-amendment watcher (#1035). io.Writer carries no
+	// concurrency guarantee, so serialize every write behind a mutex —
+	// a torn pair of single-line fmt.Fprintf writes would produce a line
+	// the fishhawk-mcp relay's JSON scanner rejects. Reassigning the local
+	// keeps every existing logSink call site (and ProgressSink) on the
+	// guarded writer with no further changes.
+	logSink = newSyncWriter(logSink)
+
 	inv := agent.Invocation{
 		RunID:      cfg.runID,
 		Stage:      cfg.stage,
@@ -653,6 +665,24 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Mid-stage scope-amendment watcher (#1035): for implement stages,
+	// emit an in-band scope_amendment_pending event the moment the agent
+	// files a request, so the fishhawk_run_stage relay surfaces the
+	// actionable amendment id + paths to an operator who can decide it from
+	// a second session via fishhawk_decide_scope_amendment while the agent
+	// blocks on its own ?wait long-poll. Best-effort and implement-only —
+	// the guard inside watchScopeAmendments no-ops on a nil client, an empty
+	// mcpBearerToken, or a non-implement stage. Stopped right after the
+	// invoke loop (ctx cancel + WaitGroup join) so it never races the
+	// post-invoke logSink writes.
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	var watchWG sync.WaitGroup
+	watchWG.Add(1)
+	go func() {
+		defer watchWG.Done()
+		watchScopeAmendments(watchCtx, client, cfg, mcpBearerToken, stageType, logSink)
+	}()
+
 	invokeStart := time.Now()
 	for {
 		res, invokeErr = invoker.Invoke(ctx, inv)
@@ -798,6 +828,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		break
 	}
+
+	// Stop the mid-stage scope-amendment watcher before the post-invoke
+	// phase resumes writing to logSink on the main goroutine, so the two
+	// never write concurrently (#1035).
+	stopWatch()
+	watchWG.Wait()
 
 	// Mid-stage scope-amendment refresh (E22.X / #961). Immediately before
 	// the commit phase — and crucially BEFORE the committed-tree verify
@@ -4181,6 +4217,96 @@ func writeScopeHandoff(files []upload.ScopeFile, logSink io.Writer) {
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"scope_handoff_written","path":%q,"file_count":%d}`+"\n",
 		scopeHandoffPath, len(files))
+}
+
+// syncWriter serializes concurrent Write calls to an underlying writer
+// behind a mutex. The runner's structured stderr stream (logSink) has
+// multiple concurrent producers during the agent invocation — the agent
+// heartbeat goroutine (via inv.ProgressSink) and the mid-stage
+// scope-amendment watcher (#1035) — and io.Writer carries no concurrency
+// guarantee, so an unguarded pair of single-line fmt.Fprintf writes could
+// interleave into a line the fishhawk-mcp relay's JSON scanner rejects.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func newSyncWriter(w io.Writer) *syncWriter {
+	return &syncWriter{w: w}
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+// scopeAmendmentWatchInterval is how often watchScopeAmendments re-lists
+// the run's scope amendments looking for a newly-pending request. A var so
+// tests can shorten it. The agent's own ?wait long-poll (#1035) is what
+// makes a decision reach it promptly; this interval only bounds how fast
+// the in-band scope_amendment_pending SIGNAL reaches the operator.
+var scopeAmendmentWatchInterval = 20 * time.Second
+
+// watchScopeAmendments polls the run's scope amendments during the agent
+// invocation and emits a single-line scope_amendment_pending JSONL event
+// the first time it observes each newly-pending amendment (#1035). That
+// event is the in-band signal the fishhawk_run_stage relay surfaces so an
+// operator driving a second session can decide a mid-stage request via
+// fishhawk_decide_scope_amendment while the agent blocks on its own ?wait
+// long-poll — guaranteeing an in-window decision is HONORED rather than
+// the agent having already proceeded as-denied.
+//
+// Best-effort and implement-only: a nil client, an empty mcpToken, or a
+// non-implement stage disables it (clean no-op). Fetch errors are swallowed
+// (the operator still has fishhawk_list_scope_amendments). Each amendment_id
+// emits at most once. The caller cancels ctx and joins a WaitGroup to stop
+// it before the post-invoke phase resumes writing to the shared sink.
+func watchScopeAmendments(ctx context.Context, client uploadClient, cfg config, mcpToken, stageType string, sink io.Writer) {
+	if client == nil || mcpToken == "" || stageType != "implement" {
+		return
+	}
+	seen := make(map[string]struct{})
+	ticker := time.NewTicker(scopeAmendmentWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			items, err := client.FetchScopeAmendments(ctx, upload.FetchScopeAmendmentsArgs{
+				RunID:    cfg.runID,
+				MCPToken: mcpToken,
+			})
+			if err != nil {
+				continue
+			}
+			emitPendingScopeAmendments(seen, items, cfg.runID, cfg.stageID, sink)
+		}
+	}
+}
+
+// emitPendingScopeAmendments writes a scope_amendment_pending JSONL line
+// for each pending amendment in items not already in seen, marking it seen
+// so a later poll does not re-emit it. Factored out of watchScopeAmendments
+// so the literal-JSONL seam contract (#1035, #618 — the field set is
+// {event, run_id, stage_id, amendment_id, paths}) and the emit-at-most-once
+// behavior are unit-testable without timing. The paths array marshals to
+// the same [{path, operation}, ...] shape the fishhawk-mcp relay decodes.
+func emitPendingScopeAmendments(seen map[string]struct{}, items []upload.ScopeAmendment, runID, stageID string, sink io.Writer) {
+	for _, a := range items {
+		if a.Status != "pending" {
+			continue
+		}
+		if _, ok := seen[a.ID]; ok {
+			continue
+		}
+		seen[a.ID] = struct{}{}
+		pathsJSON, _ := json.Marshal(a.Paths)
+		_, _ = fmt.Fprintf(sink,
+			`{"event":"scope_amendment_pending","run_id":%q,"stage_id":%q,"amendment_id":%q,"paths":%s}`+"\n",
+			runID, stageID, a.ID, pathsJSON)
+	}
 }
 
 // refreshScopeAmendments fetches the run's scope amendments with the

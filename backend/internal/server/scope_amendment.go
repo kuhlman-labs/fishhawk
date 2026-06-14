@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,20 @@ const CategoryScopeAmendmentDecided = "scope_amendment_decided"
 // bounds operator interruptions, not approvals. Mirrors the fix-up
 // budget posture (defaultMaxFixupPasses).
 const maxScopeAmendmentsPerStage = 2
+
+// maxScopeAmendmentWaitSeconds caps the opt-in server-side long-poll on
+// GET /v0/runs/{run_id}/scope-amendments (?wait=<seconds>, #1035). A
+// single ?wait holds the connection at most this long before returning
+// the still-pending list; the agent re-issues to extend toward its own
+// total budget. Deliberately modest and forward-safe: the fishhawkd
+// http.Server sets only ReadHeaderTimeout (no WriteTimeout), so a held
+// wait well under any future WriteTimeout stays correct.
+const maxScopeAmendmentWaitSeconds = 30
+
+// scopeAmendmentPollInterval is how often the ?wait long-poll re-lists
+// to detect a decision. A package var (not const) so tests can shorten
+// it; production keeps the modest default.
+var scopeAmendmentPollInterval = 500 * time.Millisecond
 
 // scopeAmendmentRequest is the JSON body of POST
 // /v0/runs/{run_id}/scope-amendments.
@@ -309,25 +324,103 @@ func (s *Server) handleListScopeAmendments(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	items, err := s.cfg.ScopeAmendmentRepo.ListByRun(r.Context(), runID)
+	items, pending, err := s.buildScopeAmendmentItems(r.Context(), runID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"list scope amendments failed", map[string]any{"error": err.Error()})
 		return
 	}
-	resp := scopeAmendmentListResponse{Items: make([]scopeAmendmentResponse, 0, len(items))}
-	for _, a := range items {
+
+	// Opt-in, bounded server-side long-poll (#1035): ?wait=<seconds>
+	// holds the connection until a snapshotted-pending amendment is
+	// decided or the wait cap elapses, so a mid-stage decision is
+	// reachable while fishhawk_run_stage blocks the driving session.
+	// wait<=0/absent → unchanged single-list behavior (back-compat); a
+	// wait with nothing currently pending returns immediately.
+	if wait := parseScopeAmendmentWaitSeconds(r); wait > 0 && len(pending) > 0 {
+		items = s.awaitScopeAmendmentDecision(r, runID, pending, wait, items)
+	}
+
+	s.writeJSON(w, r, http.StatusOK, scopeAmendmentListResponse{Items: items})
+}
+
+// parseScopeAmendmentWaitSeconds reads and clamps the optional ?wait
+// query param to [0, maxScopeAmendmentWaitSeconds]. A missing,
+// non-integer, or non-positive value reads as 0 (no wait) so the param
+// is purely additive — no new error code, unchanged non-wait envelope.
+func parseScopeAmendmentWaitSeconds(r *http.Request) int {
+	raw := strings.TrimSpace(r.URL.Query().Get("wait"))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if n > maxScopeAmendmentWaitSeconds {
+		return maxScopeAmendmentWaitSeconds
+	}
+	return n
+}
+
+// buildScopeAmendmentItems lists the run's amendments, maps each row to
+// its wire shape (attaching #983 headroom on PENDING items only), and
+// returns the items plus the set of currently-pending amendment IDs —
+// the snapshot the ?wait long-poll watches for a decision.
+func (s *Server) buildScopeAmendmentItems(ctx context.Context, runID uuid.UUID) ([]scopeAmendmentResponse, map[uuid.UUID]bool, error) {
+	rows, err := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, runID)
+	if err != nil {
+		return nil, nil, err
+	}
+	items := make([]scopeAmendmentResponse, 0, len(rows))
+	pending := make(map[uuid.UUID]bool)
+	for _, a := range rows {
 		item := amendmentToResponse(a)
 		// Headroom (#983) for PENDING items only: the operator deciding
 		// from the list sees what approving would do; decided rows carry
 		// their decision-time numbers in the audit log.
 		if a.Status == scopeamendment.StatusPending {
 			item.EffectiveScopeFilesAfterApproval, item.MaxFilesChanged =
-				s.amendmentHeadroom(r.Context(), a)
+				s.amendmentHeadroom(ctx, a)
+			pending[a.ID] = true
 		}
-		resp.Items = append(resp.Items, item)
+		items = append(items, item)
 	}
-	s.writeJSON(w, r, http.StatusOK, resp)
+	return items, pending, nil
+}
+
+// awaitScopeAmendmentDecision is the ?wait poll loop: it re-lists on
+// scopeAmendmentPollInterval and returns the moment any amendment that
+// was pending at snapshot time has left pending (the honored-decision
+// path), or when the wait cap elapses (returning the still-pending list
+// so the agent re-issues), or when the request context is canceled
+// (client disconnect). A new amendment filed mid-wait does not reset
+// the wait — only the snapshotted set is watched. On a transient list
+// error it returns the last good items (best-effort; the non-wait GET
+// surfaces list errors as 500, the wait does not regress to one).
+func (s *Server) awaitScopeAmendmentDecision(r *http.Request, runID uuid.UUID, snapshotPending map[uuid.UUID]bool, waitSeconds int, current []scopeAmendmentResponse) []scopeAmendmentResponse {
+	deadline := time.After(time.Duration(waitSeconds) * time.Second)
+	ticker := time.NewTicker(scopeAmendmentPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return current
+		case <-deadline:
+			return current
+		case <-ticker.C:
+			items, pending, err := s.buildScopeAmendmentItems(r.Context(), runID)
+			if err != nil {
+				return current
+			}
+			current = items
+			for id := range snapshotPending {
+				if !pending[id] {
+					return current
+				}
+			}
+		}
+	}
 }
 
 // handleDecideScopeAmendment implements POST
