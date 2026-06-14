@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -322,6 +324,41 @@ func (s *Server) resolveApprovedScopeAmendments(ctx context.Context, runID, stag
 		for _, p := range a.Paths {
 			out = append(out, p.Path)
 		}
+	}
+	return out
+}
+
+// coupledTestSiblings derives the stem-sibling test file for each owned
+// source file in a scope slice: for every entry whose normalized path ends in
+// `.go` but NOT `_test.go` and whose operation is create or modify (a deleted
+// or renamed source file's test is handled separately), it returns the
+// `<dir>/<stem>_test.go` sibling in the same directory. Returned paths are
+// de-duped in first-seen order. The derivation is purely syntactic — no
+// directory listing is consulted, so the sibling is folded whether it exists
+// on the base ref (the agent will modify it) or not (the agent will create
+// it). Mirrors evaluateTestSweep's testSweepRuleStemSibling rule
+// (test_sweep.go) so the auto-fold and the advisory sweep agree on what a
+// "coupled test" is.
+func coupledTestSiblings(files []scopeFile) []string {
+	seen := make(map[string]struct{}, len(files))
+	var out []string
+	for _, f := range files {
+		switch f.Operation {
+		case "create", "modify":
+		default:
+			continue
+		}
+		p := filepath.ToSlash(f.Path)
+		if !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
+			continue
+		}
+		base := path.Base(p)
+		sibling := path.Join(path.Dir(p), strings.TrimSuffix(base, ".go")+"_test.go")
+		if _, ok := seen[sibling]; ok {
+			continue
+		}
+		seen[sibling] = struct{}{}
+		out = append(out, sibling)
 	}
 	return out
 }
@@ -1877,6 +1914,11 @@ func (s *Server) resolveDecomposedScopeFiles(ctx context.Context, runRow *run.Ru
 	if len(files) == 0 {
 		return nil
 	}
+	// Fold the coupled stem-sibling *_test.go for each owned source file into
+	// the narrowed slice so "write the coupled unit tests" is always in-scope
+	// for the slice that owns the code (#1083). foldScopePaths dedups an
+	// already-scoped sibling and defaults net-new ones to operation=modify.
+	files = s.foldScopePaths(ctx, files, coupledTestSiblings(files), "coupled-test-sibling")
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 		"prompt: narrowed scope_files to sub-plan slice for decomposed child",
 		slog.String("child_run_id", runRow.ID.String()),
