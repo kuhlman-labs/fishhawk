@@ -5592,6 +5592,11 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 		if !strings.Contains(err.Error(), "newfile.go") {
 			t.Errorf("error should name the created file newfile.go: %v", err)
 		}
+		// The remediation must name the shipped recovery path (#978/#1022), not
+		// the stale "once it exists" future-feature phrasing.
+		if !strings.Contains(err.Error(), "fishhawk_resume_run") {
+			t.Errorf("error should name the fishhawk_resume_run recovery path: %v", err)
+		}
 	})
 
 	// (e) An open-PR push with only modified-but-out-of-scope drift (a tracked
