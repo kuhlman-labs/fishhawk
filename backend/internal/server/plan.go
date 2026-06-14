@@ -232,6 +232,21 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Discriminate the plan-stage artifact by its top-level "kind" BEFORE
+	// schema validation (#1057). A clarification_request is the additive
+	// standard_v1 sibling the planner emits when an issue is not yet
+	// plannable; it is ingested, persisted, and parks the stage at
+	// awaiting_input rather than validated as a plan. A detection error
+	// (empty / non-JSON body) falls through to the plan path below, where
+	// plan.Validate reproduces the same ParseError and the existing fail-B
+	// handling owns the response — so the discriminator never swallows a
+	// malformed upload.
+	if kind, derr := plan.DetectArtifactKind(body); derr == nil &&
+		kind == plan.ArtifactKindClarificationRequest {
+		s.handleClarificationRequest(w, r, runID, stageID, stage, body)
+		return
+	}
+
 	// Validate payload against standard_v1. For the known string-elision
 	// class of schema violations, attempt coercion before returning 400.
 	// For all other errors, category-B maps the failure so the runner
@@ -458,6 +473,119 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		StageID:       created.StageID,
 		ContentHash:   created.ContentHash,
 		SchemaVersion: deref(created.SchemaVersion),
+		Idempotent:    false,
+	})
+}
+
+// clarificationSchemaVersion is the schema_version recorded for an ingested
+// clarification_request sibling (#1057). It mirrors the canonical
+// docs/spec/clarification-request-v1.schema.json filename stem.
+const clarificationSchemaVersion = "clarification-request-v1"
+
+// handleClarificationRequest ingests a clarification_request artifact — the
+// additive standard_v1 sibling (#1057) — shipped to POST
+// /v0/runs/{run_id}/plan. The planner emits it instead of a plan when an
+// issue is not yet plannable: a non-derivable fact is missing, or an operator
+// policy decision is required. The handler validates the sibling, persists it,
+// and parks the plan stage at awaiting_input — a D-category judgment, NOT a
+// failure. Operator answers later flow back through the #558 binding-conditions
+// channel and re-open the parked stage in the SAME run (slices 4/5).
+//
+// Persistence is the audit log, not the artifacts table: clarification_request
+// is not a closed artifacts.kind, so the full document rides in a
+// clarification_requested entry's payload, where the ping renderer (slice 5)
+// and the resume prompt (slice 4) read it back.
+//
+// Failure modes mirror handleShipPlan so the runner maps them to the right
+// category:
+//   - sibling invalid (bad shape / duplicate question id) → 400, stage fail-B
+//   - audit / transition storage failure                  → 500 (runner retries)
+//
+// stage is the pre-fetched stage row (handleShipPlan confirmed it belongs to
+// the run); body is the verified, size-capped request body.
+func (s *Server) handleClarificationRequest(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, stage *run.Stage, body []byte) {
+	// Validate the sibling against clarification-request-v1 plus the
+	// unique-question-id semantic the schema cannot express. An invalid park
+	// is the agent's bad output: fail category-B (re-shipping the same bytes
+	// won't help) and walk the run to terminal, exactly as the plan-invalid
+	// path does.
+	if err := plan.ValidateClarificationRequest(body); err != nil {
+		cat := run.FailureB
+		reason := "clarification_request_invalid: " + err.Error()
+		if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"clarification upload: transition to failed-B after validation error failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", ferr.Error()))
+		}
+		s.advanceAfterFailure(r, runID, stageID)
+		s.writeError(w, r, http.StatusBadRequest, "clarification_request_invalid",
+			"clarification_request does not validate against clarification-request-v1",
+			map[string]any{"error": err.Error()})
+		return
+	}
+
+	contentHash := sha256Hex(body)
+
+	// Idempotency: a runner retry after a successful park re-POSTs the same
+	// sibling. The stage is already awaiting_input, so acknowledge without a
+	// duplicate audit entry or a second transition.
+	if stage.State == run.StageStateAwaitingInput {
+		s.writeJSON(w, r, http.StatusOK, planResponse{
+			StageID:       stageID,
+			ContentHash:   contentHash,
+			SchemaVersion: clarificationSchemaVersion,
+			Idempotent:    true,
+		})
+		return
+	}
+
+	// Persist. The full document rides in a clarification_requested audit
+	// entry's payload — queryable by the ping renderer (slice 5) and by the
+	// resume prompt (slice 4) that injects the operator's answers. The chained
+	// append holds the runs row-lock so concurrent uploads can't fork the hash
+	// chain; a failure here surfaces 500 so the runner retries (idempotent via
+	// the awaiting_input short-circuit above once the park lands).
+	auditPayload, _ := json.Marshal(map[string]any{
+		"run_id":                runID.String(),
+		"stage_id":              stageID.String(),
+		"content_hash":          contentHash,
+		"schema_version":        clarificationSchemaVersion,
+		"size_bytes":            len(body),
+		"clarification_request": json.RawMessage(body),
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "clarification_requested",
+		ActorKind: &systemKind,
+		Payload:   auditPayload,
+	}); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"append clarification audit entry failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Park: running → awaiting_input. A parked judgment (D-category), not a
+	// failure — the stage waits for operator answers and then re-opens in the
+	// SAME run. A transition failure is a 500 so the runner retries; the
+	// awaiting_input short-circuit above keeps that retry idempotent.
+	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID, run.StageStateAwaitingInput, nil); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"park stage at awaiting_input failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Sticky status comment (E20.4 / #330): the plan stage just parked.
+	s.notifyStatusUpdate(r.Context(), runID, "plan_handler")
+
+	s.writeJSON(w, r, http.StatusCreated, planResponse{
+		StageID:       stageID,
+		ContentHash:   contentHash,
+		SchemaVersion: clarificationSchemaVersion,
 		Idempotent:    false,
 	})
 }
