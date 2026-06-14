@@ -13,6 +13,7 @@
 //	fishhawk plan reject  <run-id> [--reason ...] [--output text|json]
 //	fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
 //	fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
+//	fishhawk file-issue   --repo R --type T --summary S [--body B] [--label L]... [--parent-epic E] [--run-id ID] [--output text|json]
 //
 // Auth is the same `bearerToken` scheme defined in the OpenAPI:
 // CLI sends `Authorization: Bearer <token>` from --token /
@@ -65,6 +66,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runRunner(rest, stdout, stderr)
 	case "doctor":
 		return runDoctor(rest, stdout, stderr)
+	case "file-issue":
+		return runFileIssue(rest, stdout, stderr)
 	case "version", "--version":
 		if version.GitSHA != "unknown" {
 			_, _ = fmt.Fprintf(stdout, "%s (%s)\n", version.Version, version.GitSHA)
@@ -113,6 +116,7 @@ func printUsage(w io.Writer) {
 		"  audit tail   Follow the audit log of a run in real time.",
 		"  validate     Validate a workflow spec file locally.",
 		"  doctor       Run local-loop install checks.",
+		"  file-issue   File a work item (issue/bug/chore/adr) via repo conventions.",
 		"  runner start Spawn the fishhawk-runner locally against an already-minted run (Phase C of E22 / #389).",
 		"  version      Print the CLI version and exit.",
 		"  help         Show this help.",
