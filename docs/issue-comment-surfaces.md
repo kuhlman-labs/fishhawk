@@ -561,6 +561,20 @@ Notes:
   the table above, same comment id, edits in place), but the `branch_reset`
   audit kind itself posts nothing. Listed here so a future reader grepping the
   audit categories doesn't mistake it for a comment surface.
+- The work-item filing kind — `work_item_filed` (#1005) — is an **internal,
+  audit-only category, not an issue-comment surface**. Nothing in `issuecomment`
+  posts it; it has no Notifier method. It is written under its own category
+  `work_item_filed` by the acting caller (`actor_kind` resolved from the token
+  subject per ADR-040 D4 — `agent` for the operator-agent role instance, `user`
+  otherwise): `server/workitems.go::auditWorkItemFiling` calls
+  `AuditRepo.AppendChained` after `POST /v0/work-items` files a work item, but
+  ONLY when the request's `run_id` names a run that is in flight (non-terminal).
+  The payload is `{type, title, provider, created_url, created_number,
+  applied_labels, board_column, status}`. The write is best-effort — filing
+  succeeds with no `run_id` (the operator-agent follow-up filing path), and an
+  append failure never fails the response since the item is already filed. No
+  sticky status comment is refreshed. Listed here so a future reader grepping
+  the audit categories doesn't mistake it for a comment surface.
 
 ## Routing
 

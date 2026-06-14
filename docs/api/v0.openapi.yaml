@@ -113,6 +113,86 @@ components:
             code: run_not_found
             message: No run with id 11111111-2222-3333-4444-555555555555
 
+    WorkItemRequest:
+      type: object
+      required: [repo, type, summary]
+      description: |
+        Provider-neutral work-item filing (#1005). The conventions layer
+        turns this into a filed item; only `repo`, `type`, and `summary`
+        are required. Unknown properties are rejected.
+      additionalProperties: false
+      properties:
+        repo:
+          type: string
+          description: Target repository in `owner/name` form.
+          example: kuhlman-labs/fishhawk
+        type:
+          type: string
+          description: Work-item type; must be a key in the repo's conventions (e.g. feature, bug, chore, adr).
+          example: feature
+        summary:
+          type: string
+          description: |
+            Mandatory one-liner: fills the `{summary}` title placeholder
+            and is the required Summary field.
+          example: Add the widget endpoint
+        body:
+          type: string
+          description: Verbatim body. When omitted, the body is assembled from the type's skeleton + `sections`.
+        sections:
+          type: object
+          additionalProperties: { type: string }
+          description: Per-skeleton-section content keyed by section name; used only when `body` is empty.
+        title_vars:
+          type: object
+          additionalProperties: { type: string }
+          description: Title placeholders beyond `{summary}`/`{number}` (e.g. `epic`, `n`). An unresolved placeholder fails the filing.
+        labels:
+          type: array
+          items: { type: string }
+          description: Labels merged on top of the type's `default_labels`.
+        complexity:
+          type: string
+          description: Overrides the type's default complexity; must be a declared level.
+          example: low
+        status:
+          type: string
+          description: Overrides the type's default board status.
+          example: Backlog
+        relations:
+          type: object
+          additionalProperties: false
+          properties:
+            parent_epic: { type: string, description: "Epic this item rolls up to (e.g. `#1005`)." }
+            supersedes: { type: array, items: { type: string } }
+            companion_to: { type: array, items: { type: string } }
+            evidence_runs: { type: array, items: { type: string } }
+        existing_numbers:
+          type: array
+          items: { type: integer }
+          description: Numbers already in use for a numbered type, so the next sequential number can be allocated.
+        run_id:
+          allOf: [ { $ref: '#/components/schemas/UUID' } ]
+          description: Optional in-flight run; when set and non-terminal, a `work_item_filed` audit entry is appended to it.
+
+    WorkItemResponse:
+      type: object
+      required: [type, title, number, url, provider, audited]
+      description: The created item — exactly what landed, so the caller renders the result without a second fetch.
+      properties:
+        type: { type: string }
+        title: { type: string }
+        number: { type: integer, description: Created item number (e.g. GitHub issue number). }
+        url: { type: string, description: Created item URL. }
+        provider: { type: string, description: Provider id that filed the item. }
+        applied_labels: { type: array, items: { type: string } }
+        complexity: { type: string }
+        status: { type: string }
+        board_column: { type: string }
+        audited:
+          type: boolean
+          description: True when a `work_item_filed` audit entry was written (a run was in flight).
+
     Pagination:
       type: object
       description: |
@@ -2475,6 +2555,72 @@ paths:
         '503':
           description: Audit repository not configured on this instance.
 
+  # ---------------------------------------------------------------------
+  # Work-item filing
+  # ---------------------------------------------------------------------
+  /v0/work-items:
+    post:
+      operationId: fileWorkItem
+      summary: File a work item via the repo's work-management conventions
+      description: |
+        Provider-agnostic work-item filing (#1005). Loads the repo's
+        work-management conventions (the shipped default in v0; a per-repo
+        `work_management` config in a follow-up), applies them to the
+        caller's request — rendering the title from `title_format`,
+        assembling the body from the type's skeleton + `sections`, merging
+        `default_labels`, resolving board placement + complexity, allocating
+        the sequential number for a numbered type (e.g. `adr`), and
+        validating relations against the type's `epic_link` rule — then
+        dispatches the resolved item to the configured provider
+        (`github_projects`; `jira` is interface-only in v0) and returns the
+        created item.
+
+        `summary` is the mandatory one-liner: it fills the `{summary}`
+        title placeholder and is the required Summary field. The same call
+        shape works for any repo because only the conventions differ.
+
+        When `run_id` names a run that is **in flight** (not terminal), a
+        best-effort `work_item_filed` audit entry is appended to that run.
+        Filing succeeds with no `run_id` (the operator-agent follow-up
+        filing path, ADR-040) — `audited` is then `false`. An audit-append
+        failure never fails the response: the item is already filed.
+
+        An unregistered/unimplemented provider id fails closed with `501
+        provider_unimplemented` naming the missing provider — never a panic.
+      tags: [work-items]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkItemRequest' }
+      responses:
+        '201':
+          description: Work item filed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkItemResponse' }
+        '400':
+          description: |
+            `validation_failed` — `repo` not in owner/name form, or `type` /
+            `summary` / `run_id` missing or malformed; `body_too_large`.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`run_not_found` — `run_id` supplied but no such run."
+        '422':
+          description: |
+            `work_item_invalid` — the request violates the conventions for
+            its type (unknown type, missing complexity, unresolved title
+            placeholder, or an `epic_link` rule violation).
+        '501':
+          description: |
+            `provider_unimplemented` — the conventions name a provider that
+            is not registered (e.g. `jira`); `details.provider` names it and
+            `details.registered` lists the available providers.
+        '502':
+          description: "`work_item_filing_failed` — the provider rejected the filing."
+        '503':
+          description: "`run_lookup_unconfigured` — `run_id` supplied but no run repository is wired."
+
   /v0/calibration:
     get:
       operationId: getCalibration
@@ -4702,6 +4848,8 @@ tags:
     description: Plans and pull-request references emitted by stages.
   - name: audit
     description: Append-only audit log read paths.
+  - name: work-items
+    description: Provider-agnostic work-item filing via per-repo conventions.
   - name: runner
     description: Endpoints called by the fishhawk/runner GitHub Action.
   - name: webhooks
