@@ -156,6 +156,22 @@ type fakeBackend struct {
 	fixupErrBody    string
 	fixupCalledByID map[uuid.UUID]int
 
+	// #1088 fixtures: POST /v0/stages/{id}/clarification.
+	// clarificationBody captures the last decoded request body so tests
+	// can assert the answers + comment threading.
+	// clarificationResp seeds the re-opened Stage keyed by stage id; default
+	// is a minimal Stage with Type="plan" State="pending" (the re-opened
+	// outcome).
+	// clarificationStatus drives the HTTP status (default 200).
+	// clarificationErrBody, when set, is written verbatim — drives the 400 /
+	// 404 / 409 error-path tests.
+	// clarificationCalledByID counts calls per stage id.
+	clarificationBody       clarificationAnswerRequest
+	clarificationResp       map[uuid.UUID]Stage
+	clarificationStatus     int
+	clarificationErrBody    string
+	clarificationCalledByID map[uuid.UUID]int
+
 	// #984 fixtures: POST /v0/concerns/{id}/waive.
 	// waiveBody captures the last decoded request body (the reason).
 	// waiveResp seeds the waived-concern response keyed by concern id;
@@ -253,6 +269,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fixupResp:                map[uuid.UUID]Stage{},
 		fixupStatus:              http.StatusOK,
 		fixupCalledByID:          map[uuid.UUID]int{},
+		clarificationResp:        map[uuid.UUID]Stage{},
+		clarificationStatus:      http.StatusOK,
+		clarificationCalledByID:  map[uuid.UUID]int{},
 		waiveResp:                map[uuid.UUID]WaivedConcern{},
 		waiveStatus:              http.StatusOK,
 		waiveCalledByID:          map[uuid.UUID]int{},
@@ -351,6 +370,32 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if !ok {
 			resp = Stage{ID: id.String(), State: "pending"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/stages/{stage_id}/clarification", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body clarificationAnswerRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.clarificationCalledByID[id]++
+		fb.clarificationBody = body
+		status := fb.clarificationStatus
+		errBody := fb.clarificationErrBody
+		resp, ok := fb.clarificationResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = Stage{ID: id.String(), Type: "plan", State: "pending"}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -1012,7 +1057,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 22
+	const wantToolCount = 23
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

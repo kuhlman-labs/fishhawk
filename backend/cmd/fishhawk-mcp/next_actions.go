@@ -44,7 +44,7 @@ var flakeTraceEvents = []string{"verify_infra_flake_retry"}
 // (approve_pr, merge_pr, post_merge, file_product_issue) when the move
 // happens outside the MCP surface.
 type SuggestedAction struct {
-	Action       string            `json:"action" jsonschema:"the tool to call (e.g. fishhawk_resume_run, fishhawk_fixup_stage) or a named ritual step outside the MCP surface (approve_pr, merge_pr, post_merge, merge_and_file_follow_up, answer_clarification, file_product_issue)"`
+	Action       string            `json:"action" jsonschema:"the tool to call (e.g. fishhawk_resume_run, fishhawk_fixup_stage) or a named ritual step outside the MCP surface (approve_pr, merge_pr, post_merge, merge_and_file_follow_up, file_product_issue)"`
 	Params       map[string]string `json:"params,omitempty" jsonschema:"key parameters for the action (run_id, stage_id, parent_run_id, the concern_ids source, ...); values naming a field path (e.g. run.concerns.items[].id) tell you where to read the real value"`
 	Precondition string            `json:"precondition" jsonschema:"one-line statement of when this action is legal"`
 	Consumes     string            `json:"consumes" jsonschema:"what taking the action spends: one of none, fixup_budget, retry_budget, approval_slot, new_run"`
@@ -205,19 +205,20 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 		}
 	case "awaiting_input":
 		// The planner parked at awaiting_input with a clarification_request
-		// (#1057): the issue was not yet plannable, so the operator must
-		// answer the parked questions before planning resumes. Answers flow
-		// back through the #558 binding-conditions channel and re-open the
-		// SAME plan stage — no new run, no duplicate reviews (distinct from
+		// (#1080/#1057): the issue was not yet plannable, so the operator
+		// must answer the parked questions before planning resumes.
+		// fishhawk_answer_clarification (#1088) records the answers as a
+		// dedicated clarification_answered audit entry and re-opens the SAME
+		// plan stage — no new run, no duplicate reviews (distinct from
 		// fishhawk_resume_run, which mints a child run).
 		return &NextActions{
 			State: "plan_awaiting_input",
 			Actions: []SuggestedAction{{
-				Action:       "answer_clarification",
+				Action:       "fishhawk_answer_clarification",
 				Params:       map[string]string{"run_id": run.ID},
-				Precondition: "the plan stage parked at awaiting_input with a clarification_request; read the parked questions first (fishhawk_get_run_status or the issue ping)",
+				Precondition: "the plan stage parked at awaiting_input with a clarification_request; read the parked questions first (fishhawk_get_run_status or fishhawk_list_audit on category clarification_requested)",
 				Consumes:     consumesNone,
-				Reason:       "answer the planner's parked questions through the binding-conditions channel (#558); the answers inject as 'Clarification answers' and re-open this plan stage in the SAME run — accept each recommended_default or override it",
+				Reason:       "answer the planner's parked questions; the answers inject into the resumed plan agent's binding conditions and re-open this plan stage in the SAME run — pass one {id, answer} per parked question",
 			}},
 		}
 	case "awaiting_approval":

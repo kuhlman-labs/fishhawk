@@ -35,6 +35,7 @@ type runResolver struct {
 // order so the protocol's tool-listing endpoint returns a stable
 // ordering for clients that index on position.
 func registerTools(srv *mcp.Server, resolver *runResolver) {
+	registerAnswerClarification(srv, resolver)
 	registerGetActiveRun(srv, resolver)
 	registerGetPlan(srv, resolver)
 	registerGetRunStatus(srv, resolver)
