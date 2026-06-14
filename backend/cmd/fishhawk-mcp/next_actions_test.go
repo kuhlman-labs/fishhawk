@@ -302,6 +302,27 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone},
 		},
 		{
+			// #1082: a succeeded decomposition child (parent_run_id set,
+			// implement-only — no plan/review of its own) whose own
+			// implement review is still pending is NOT the #968 wedge: the
+			// parent gates the consolidated diff (#1061) and there is no
+			// per-child PR to merge. It surfaces as
+			// awaiting_parent_consolidation, pointing the read-only poll at
+			// the PARENT run, never merge_and_file_follow_up.
+			name: "j_1082_succeeded_decomp_child_awaits_parent",
+			run: func() *Run {
+				r := naRun("succeeded")
+				parent := uuid.NewString()
+				r.ParentRunID = &parent
+				return r
+			}(),
+			stages:       []Stage{naStage("implement", "succeeded")},
+			implRS:       naReviewStatus("implement", "pending"),
+			wantState:    "awaiting_parent_consolidation",
+			wantActions:  []string{"fishhawk_get_run_status"},
+			wantConsumes: []string{consumesNone},
+		},
+		{
 			name:        "k_terminal_failed_no_recovery_arm",
 			run:         naRun("failed"),
 			stages:      []Stage{naStage("plan", "failed")},
