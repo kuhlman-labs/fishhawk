@@ -383,7 +383,24 @@ func (s *Server) createApprovedScopeAmendment(ctx context.Context, runID, stageI
 //
 // run.RedriveChild accepts any failure category — gating on category-B
 // is this handler's job, not RedriveChild's.
+//
+// Authorization: this branch re-opens a terminal run via the same
+// run.RedriveChild action POST /v0/runs/{id}/redrive performs, and that
+// action is operator-only — an agent (MCP subject-bound) token must
+// never re-drive any run (#698 / handleRedriveChild). The enclosing
+// handler's write:runs gate is necessary but not sufficient: we reject
+// agent-subject tokens here too so BOTH paths to RedriveChild enforce
+// the identical contract. (Runner-side fhm_ tokens carry only mcp:read
+// and so can't clear write:runs to reach this branch in practice — but
+// the authz posture must be consistent by construction, not by accident.)
 func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.Request, child *run.Run, amendPaths []scopeamendment.PathEntry, reason string) {
+	id := IdentityFrom(r.Context())
+	if strings.HasPrefix(id.Subject, "mcp:run:") {
+		s.writeError(w, r, http.StatusForbidden, "agent_token_forbidden",
+			"in-place re-drive of a decomposition child is an operator action; agent (mcp) tokens may not re-drive any run", nil)
+		return
+	}
+
 	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), child.ID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -426,8 +443,6 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 			})
 		return
 	}
-
-	id := IdentityFrom(r.Context())
 
 	// Fold the operator's amendment on the EXISTING implement stage
 	// BEFORE re-drive + Advance, so the implement prompt's

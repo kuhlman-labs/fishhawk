@@ -1881,7 +1881,12 @@ paths:
         new spend).
 
         **Authorization.** Requires `write:runs` (same as
-        `POST /v0/runs`).
+        `POST /v0/runs`). A decomposition-child target ADDITIONALLY
+        rejects agent (MCP subject-bound, `mcp:run:<uuid>`) tokens with
+        403 `agent_token_forbidden`: that path re-opens a terminal run
+        via the same `run.RedriveChild` action `POST /v0/runs/{id}/redrive`
+        performs, which is operator-only — an agent may not re-drive any
+        run, including its own (#698, #1081).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -1948,7 +1953,16 @@ paths:
               schema: { $ref: '#/components/schemas/Run' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            Missing `write:runs` scope (`insufficient_scope`), OR a
+            decomposition-child target presented with an MCP/agent
+            subject-bound token (subject `mcp:run:<uuid>`) — body `error`
+            is `agent_token_forbidden`; that path re-drives a terminal run
+            in place, an operator-only action (#698, #1081).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |

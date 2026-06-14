@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,10 +27,44 @@ type recoverRepo struct {
 	*orchestratorRepo
 	createRunErr   error
 	createStageErr error
+	// Error-injection hooks for the in-place decomposition-child recover
+	// branch's post-eligibility failure mappings (#1081 fix-up):
+	listStagesErr error // ListStagesForRun fails → handler 500 "list stages failed"
+	retryRunErr   error // RedriveChild's RetryRun fails → handler default 500 "re-drive child failed"
+	// failGetRunRunning, when set, makes GetRun fail for that id once the
+	// run is in StateRunning — i.e. only the FINAL post-redrive re-fetch,
+	// since the child is failed on every earlier GetRun. Exercises the
+	// "get re-opened child failed" 500 mapping.
+	failGetRunRunning uuid.UUID
 }
 
 func newRecoverRepo() *recoverRepo {
 	return &recoverRepo{orchestratorRepo: newOrchestratorRepo()}
+}
+
+func (r *recoverRepo) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	if r.listStagesErr != nil {
+		return nil, r.listStagesErr
+	}
+	return r.orchestratorRepo.ListStagesForRun(ctx, runID)
+}
+
+func (r *recoverRepo) RetryRun(ctx context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	if r.retryRunErr != nil {
+		return nil, r.retryRunErr
+	}
+	return r.orchestratorRepo.RetryRun(ctx, id, to)
+}
+
+func (r *recoverRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	rr, err := r.orchestratorRepo.GetRun(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if r.failGetRunRunning != uuid.Nil && id == r.failGetRunRunning && rr.State == run.StateRunning {
+		return nil, errors.New("get run boom")
+	}
+	return rr, nil
 }
 
 func (r *recoverRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run, error) {
@@ -651,6 +686,118 @@ func TestRecoverRun_DecompositionChildGateMatrix(t *testing.T) {
 			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
 		}
 		assertErrorCode(t, w, "recovery_not_eligible")
+	})
+}
+
+// postRecoverAs posts to the recover endpoint under the given identity
+// (instead of the default session-operator from withAuth), so the
+// agent-token rejection on the in-place re-drive path can be exercised.
+func postRecoverAs(t *testing.T, s *Server, pathRunID string, body string, id Identity) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/runs/"+pathRunID+"/recover", strings.NewReader(body))
+	req.SetPathValue("run_id", pathRunID)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	w := httptest.NewRecorder()
+	s.handleRecoverRun(w, req)
+	return w
+}
+
+// TestRecoverRun_DecompositionChildAgentTokenRejected is the binding
+// security guard for the #1081 fix-up: the in-place re-drive branch
+// reaches run.RedriveChild — the same operator-only action POST
+// /v0/runs/{id}/redrive performs — so an MCP/agent subject-bound token
+// (subject mcp:run:<uuid>) must be rejected 403 agent_token_forbidden
+// even when it clears the enclosing write:runs gate. The two paths to
+// RedriveChild must enforce the identical contract.
+func TestRecoverRun_DecompositionChildAgentTokenRejected(t *testing.T) {
+	s, rr, sa, _, art := newDecompositionRecoverServer(t)
+	child, implStage := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+
+	// An agent token carrying write:runs (the enclosing gate) is still
+	// rejected: re-opening a terminal run is operator-only.
+	agent := Identity{
+		Subject: "mcp:run:" + child.ID.String(),
+		TokenID: "tok-agent",
+		Scopes:  []string{"mcp:read", "write:runs"},
+	}
+	w := postRecoverAs(t, s, child.ID.String(), `{}`, agent)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, "agent_token_forbidden")
+
+	// No re-drive happened: the child's implement stage is still failed,
+	// and no amendment row was minted.
+	got, _ := rr.GetStage(context.Background(), implStage.ID)
+	if got.State != run.StageStateFailed {
+		t.Errorf("implement stage = %q, want still failed (no re-drive)", got.State)
+	}
+	if amendments, _ := sa.ListByRun(context.Background(), child.ID); len(amendments) != 0 {
+		t.Errorf("amendments = %d, want 0 (rejected before any fold)", len(amendments))
+	}
+}
+
+// TestRecoverRun_DecompositionChildErrorMappings covers the in-place
+// branch's post-eligibility error legs (#1081 fix-up): the
+// ListStagesForRun read, the parent-plan resolve, the RedriveChild
+// default error, and the final re-fetch GetRun all map to 500
+// internal_error. The eligibility gate makes a RedriveChild failure
+// unlikely in practice, but the mappings should not be untested.
+func TestRecoverRun_DecompositionChildErrorMappings(t *testing.T) {
+	t.Run("list stages error", func(t *testing.T) {
+		s, rr, _, _, art := newDecompositionRecoverServer(t)
+		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+		rr.listStagesErr = errors.New("stage list boom")
+
+		w := postRecover(t, s, child.ID.String(), `{}`, nil)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "internal_error")
+	})
+
+	t.Run("plan resolve error", func(t *testing.T) {
+		s, rr, _, _, art := newDecompositionRecoverServer(t)
+		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+		// ArtifactRepo present (so it's not the "plan nil → 409" gate leg)
+		// but ListForStage errors → loadApprovedPlanForRun returns an error.
+		art.listErr = errors.New("artifact list boom")
+
+		w := postRecover(t, s, child.ID.String(), `{}`, nil)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "internal_error")
+	})
+
+	t.Run("redrive default error", func(t *testing.T) {
+		s, rr, _, _, art := newDecompositionRecoverServer(t)
+		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+		// A plain RetryRun error inside RedriveChild is neither
+		// ErrRedriveNotApplicable, ErrNotFound, nor InvalidTransitionError,
+		// so it hits the switch default → 500 "re-drive child failed".
+		rr.retryRunErr = errors.New("reopen boom")
+
+		w := postRecover(t, s, child.ID.String(), `{}`, nil)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "internal_error")
+	})
+
+	t.Run("final get run error", func(t *testing.T) {
+		s, rr, _, _, art := newDecompositionRecoverServer(t)
+		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+		// The re-drive succeeds (child → running); only the final re-fetch
+		// of the re-opened child fails → 500 "get re-opened child failed".
+		rr.failGetRunRunning = child.ID
+
+		w := postRecover(t, s, child.ID.String(), `{}`, nil)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "internal_error")
 	})
 }
 
