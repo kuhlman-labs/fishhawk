@@ -864,6 +864,40 @@ func runStageEventMessage(payload any) string {
 			return fmt.Sprintf("stage_progress turns=%.0f tokens=%.0f elapsed=%.0fs last=%s",
 				num("turns"), num("tokens_so_far"), num("elapsed_seconds"), last)
 		}
+		// A scope_amendment_pending event (#1035) is the in-band signal that
+		// the agent filed a mid-stage scope amendment and is now blocking on
+		// its ?wait long-poll for a decision. The generic fallback below
+		// would relay only the bare event name, losing the actionable
+		// amendment_id + paths, so format them explicitly: the operator,
+		// watching this blocked fishhawk_run_stage call's progress, can then
+		// decide the request from a second session via
+		// fishhawk_decide_scope_amendment while the agent waits. The field
+		// names {event, amendment_id, paths} are the literal-JSONL seam this
+		// relay shares with the runner emitter (cf. #618).
+		if ev, _ := m["event"].(string); ev == "scope_amendment_pending" {
+			id, _ := m["amendment_id"].(string)
+			var paths []string
+			if raw, ok := m["paths"].([]any); ok {
+				for _, p := range raw {
+					pm, ok := p.(map[string]any)
+					if !ok {
+						continue
+					}
+					path, _ := pm["path"].(string)
+					if path == "" {
+						continue
+					}
+					op, _ := pm["operation"].(string)
+					if op != "" {
+						paths = append(paths, path+" ("+op+")")
+					} else {
+						paths = append(paths, path)
+					}
+				}
+			}
+			return fmt.Sprintf("scope_amendment_pending id=%s paths=%s",
+				id, strings.Join(paths, ", "))
+		}
 		for _, key := range []string{"kind", "type", "event"} {
 			if v, ok := m[key].(string); ok && v != "" {
 				return v

@@ -659,13 +659,17 @@ func buildImplement(t Trigger) string {
 	// for a genuinely missing scope.files entry. Documented inline because
 	// the agent reads the prompt and nothing else. The request/poll loop
 	// uses the same FISHHAWK_API_TOKEN / FISHHAWK_BACKEND_URL env the MCP
-	// token wiring injects (E19.8); delivery is poll-based — no push
-	// channel exists in v0.
+	// token wiring injects (E19.8). Delivery uses the GET ?wait long-poll
+	// (#1035) so the agent blocks on its own poll until the operator's
+	// decision lands or its total budget elapses; the runner additionally
+	// emits a scope_amendment_pending event the fishhawk_run_stage relay
+	// surfaces in-band, so an operator driving a second session can decide
+	// the request mid-stage and have the agent resume WITH the decision.
 	b.WriteString("### Mid-stage scope amendments\n\n")
 	b.WriteString("If, while implementing, you discover a file that MUST change but is not in the effective scope.files (a coupled test, a registration table, a doc companion), do NOT edit it — an undeclared edit is dropped from the commit and an undeclared created file fails the stage. Instead, request an operator-gated scope amendment:\n")
 	b.WriteString("\n")
 	b.WriteString("1. POST `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` with header `Authorization: Bearer $FISHHAWK_API_TOKEN` and body `{\"paths\": [{\"path\": \"dir/file.ext\", \"operation\": \"modify\"|\"create\"}], \"reason\": \"why each path must change\"}`. Paths are repo-relative; use `create` for net-new files.\n")
-	b.WriteString("2. Poll GET `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` (same bearer) every 15–30 seconds until your request's `status` leaves `pending`. Keep working on in-scope files while you wait; give up on the amendment after ~5 minutes of polling and proceed as if denied.\n")
+	b.WriteString("2. Await the decision with the bounded long-poll: GET `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments?wait=30` (same bearer). The `?wait=30` makes the server hold the request up to 30 seconds and return as soon as your request's `status` leaves `pending`; re-issue the wait-poll each time it returns still-`pending`. Keep working on in-scope files while you wait. Loop the wait-poll until your request leaves `pending` OR ~15 minutes total have elapsed; at the ~15-minute cap with no decision, proceed as if denied (fail loud if the change is genuinely impossible without the path).\n")
 	b.WriteString("3. On `approved`: the paths are folded into the effective scope — edit them as normal.\n")
 	b.WriteString("4. On `denied` (read the `decision_reason`): adapt within the original scope. If the change is genuinely impossible without the denied file, stop and surface that in your final response (fail loud) rather than working around the boundary.\n")
 	b.WriteString("\n")

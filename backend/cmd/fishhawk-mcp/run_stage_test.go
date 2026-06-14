@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -1088,6 +1089,35 @@ func TestRunStageEventMessage_StageProgress(t *testing.T) {
 	normal := map[string]any{"kind": "runner_started"}
 	if msg := runStageEventMessage(normal); msg != "runner_started" {
 		t.Errorf("normal event message = %q, want runner_started", msg)
+	}
+}
+
+// TestRunStageEventMessage_ScopeAmendmentPending pins the runner->relay
+// seam for the mid-stage scope-amendment in-band signal (#1035). It feeds
+// the EXACT literal-JSONL line the runner watcher emits (the seam contract
+// shared with the runner-emit test, cf. #618 — the field set is
+// {event, amendment_id, paths}) through the relay's json.Unmarshal-into-any
+// path and asserts the surfaced message carries the actionable amendment id
+// and paths rather than the bare event name the generic fallback would
+// yield.
+func TestRunStageEventMessage_ScopeAmendmentPending(t *testing.T) {
+	// The literal line the runner's watchScopeAmendments goroutine emits.
+	// Keep the field names byte-identical to the runner emitter.
+	const line = `{"event":"scope_amendment_pending","run_id":"run-1","stage_id":"stage-1","amendment_id":"amd-7","paths":[{"path":"docs/ARCHITECTURE.md","operation":"modify"},{"path":"x/new.go","operation":"create"}]}`
+	var payload any
+	if err := json.Unmarshal([]byte(line), &payload); err != nil {
+		t.Fatalf("unmarshal seam line: %v", err)
+	}
+	got := runStageEventMessage(payload)
+	for _, want := range []string{
+		"scope_amendment_pending",
+		"id=amd-7",
+		"docs/ARCHITECTURE.md (modify)",
+		"x/new.go (create)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message = %q, want it to contain %q", got, want)
+		}
 	}
 }
 
