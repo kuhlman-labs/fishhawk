@@ -1,0 +1,103 @@
+# Shipped default work-management conventions (#1005). This is a product
+# artifact, versioned with the product: the canonical copy lives at
+# docs/spec/work-management-default.yaml and is mirrored into
+# backend/internal/workmgmt/defaults/ by scripts/sync-schemas. Seed
+# content extracted from the kuhlman-labs/fishhawk Project #7 conventions
+# (AGENTS.md "Project tracker (#7)").
+spec_version: work-management-v0
+provider: github_projects
+
+project:
+  owner: kuhlman-labs
+  owner_type: user
+  number: 7
+
+# The complexity prior: pick a level by what the change touches, not by
+# how it feels. These are the concrete file/coupling definitions.
+complexity_levels:
+  low: >-
+    A single file or a few tightly-scoped edits; no cross-package coupling;
+    no schema, wire, or migration change.
+  medium: >-
+    Multiple files within one module/package, or one cross-package seam;
+    may touch a coupled test fixture; no migration.
+  high: >-
+    Spans wire/domain/persistence boundaries, a schema or DB migration, or
+    fans out across modules; needs an integration test for the seam (#618).
+
+# The mandatory trio. Everything else a type declares is optional.
+required_fields:
+  - Summary
+  - Done-means
+  - complexity
+
+field_hints:
+  Summary: One or two sentences naming the motivation and the load-bearing change.
+  Done-means: >-
+    State the single testable condition that proves the item is complete —
+    an observable outcome a reviewer can check, not a description of effort.
+  complexity: >-
+    Pick low/medium/high from complexity_levels by the files and coupling the
+    change touches.
+
+types:
+  feature:
+    title_format: "[E{epic}.{n}] {summary}"
+    body_skeleton:
+      - Summary
+      - Proposal
+      - Done-means
+      - Notes
+      - Relations
+    default_labels:
+      - type:feature
+    default_fields:
+      status: Backlog
+      complexity: medium
+    epic_link: required
+
+  bug:
+    title_format: "{summary}"
+    body_skeleton:
+      - Summary
+      - Observed
+      - Proposal
+      - Done-means
+      - Notes
+      - Relations
+    default_labels:
+      - type:bug
+    default_fields:
+      status: Backlog
+      complexity: medium
+    epic_link: optional
+
+  chore:
+    title_format: "{summary}"
+    body_skeleton:
+      - Summary
+      - Done-means
+    default_labels:
+      - type:chore
+    default_fields:
+      status: Backlog
+      complexity: low
+    epic_link: optional
+
+  adr:
+    title_format: "[ADR-{number}] {summary}"
+    body_skeleton:
+      - Context
+      - Options
+      - Recommendation
+      - Decision
+      - Consequences
+    default_labels:
+      - adr
+    default_fields:
+      status: Backlog
+      complexity: medium
+    numbering:
+      scheme: sequential
+      prefix: ADR-
+    epic_link: none
