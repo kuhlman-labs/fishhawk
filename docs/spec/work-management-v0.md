@@ -1,0 +1,62 @@
+# Work-management conventions `work-management-v0`
+
+The contract for a repo's work-item filing conventions (#1005): the config that turns one `fishhawk_file_issue` call into a conventions-complete work item — title format, body skeleton, default labels, board placement, ADR numbering, epic linking. The conventions layer is the value; the provider API call is trivial.
+
+This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.yaml`. The workflow spec (`workflow-v0`) is frozen at Day 21 ("never break this schema in place; bump to a new spec version"), and the operator-role overlay (`.fishhawk/operator.yaml`) carries only an opaque `work_management` pointer at the config resolved here (ADR-040 D1).
+
+- Canonical schema: [`work-management-v0.schema.json`](work-management-v0.schema.json) (JSON Schema Draft 2020-12, `$id` pins `work-management-v0`).
+- Shipped default: [`work-management-default.yaml`](work-management-default.yaml) — a **product artifact**, versioned with the product, seeded from the `kuhlman-labs/fishhawk` Project #7 conventions.
+- Go validation: `backend/internal/workmgmt` (embedded copies of the schema + default, mirrored by `scripts/sync-schemas`, locked by the schema-sync gate). `Default()` returns the shipped config, validated against its own schema at package init; `Parse` is the canonical enforcement point for a repo's config. The provider-agnostic canonical work-item model lives in the same package (`model.go`).
+
+## Top-level fields
+
+| Field | Required | Shape | Meaning |
+|---|---|---|---|
+| `spec_version` | yes | enum `work-management-v0` | Single-value enum per the versioning rules below. |
+| `provider` | yes | enum `github_projects` \| `jira` | Work-management backend. `github_projects` is the only concrete provider in v0; `jira` is reserved at the interface level (no implementation) and an unimplemented provider must fail closed at filing time. |
+| `project` | conditional | object | GitHub Projects connection (`owner`, `owner_type`, `number`). Required when `provider` is `github_projects` (semantic check). |
+| `complexity_levels` | no | object: `low`/`medium`/`high` → prose | The complexity prior: concrete file/coupling definitions for each level. Optional in a repo config; shipped in the default. |
+| `required_fields` | yes | non-empty unique string list | Fields every filed item must carry. Must include the mandatory trio Summary, Done-means, complexity (semantic check). |
+| `field_hints` | no | object: field name → prose | Per-field authoring hints. The Done-means hint states the condition must be testable. |
+| `types` | yes | object: type name → type config | Work-item types, keyed by snake_case name (bug, feature, chore, adr, …). |
+
+### Per-type fields (`types.<name>`)
+
+| Field | Required | Shape | Meaning |
+|---|---|---|---|
+| `title_format` | no | template string | Title template with `{placeholder}` tokens (`{summary}`, `{epic}`, `{n}`, `{number}`). Rendering is the apply layer's concern. |
+| `body_skeleton` | yes | non-empty string list | Ordered body section headings. Dual-audience: Feature = Summary/Proposal/Done-means/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means. |
+| `default_labels` | no | unique label list | Labels applied before caller-supplied labels are merged. Each label is a bare token (`epic`, `adr`) or namespaced (`area:backend`, `type:feature`). |
+| `default_fields` | no | object | `status` (single-select Status value), `board_column`, and `complexity` (low/medium/high). |
+| `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix`. Required when the type is `adr` (semantic check). |
+| `epic_link` | no | enum `required` \| `optional` \| `none` | Whether items of this type link to a parent epic. |
+
+Every object level is `additionalProperties: false` — the surface is closed; new sections are additive schema changes within v0.
+
+## Required-field discipline
+
+The mandatory trio is **Summary**, **Done-means**, **complexity** (#1005, operator discussion 2026-06-11). The JSON Schema requires a non-empty `required_fields`; a semantic check (`workmgmt.Parse`) enforces that the trio is present, normalizing entries so `Done-means` and `Done means` both satisfy it. Everything else a type declares is optional.
+
+- **Done-means** must be a *testable* condition — an observable outcome a reviewer can check, not a description of effort. The shipped default's `field_hints[Done-means]` states this.
+- **complexity** is picked from `complexity_levels` by the files and coupling a change touches (low = a few tightly-scoped edits; medium = one module or cross-package seam; high = spans wire/domain/persistence or a migration, needs an integration test for the seam).
+
+## Validation
+
+`workmgmt.Parse` validates in two stages and returns a typed error:
+
+- `*SchemaError` — a structural violation (unknown key, wrong enum, malformed label, empty `body_skeleton`). Carries a JSON Pointer path.
+- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, or a type named `adr` has no `numbering` rule.
+- `*YAMLError` — unparseable, empty, or multi-document input (the config must be a single YAML document; a trailing document would bypass validation).
+
+The shipped default is validated against the schema at backend package init, so the product artifact can never drift from its own schema.
+
+## Versioning
+
+- `spec_version` is a required, single-value enum (`work-management-v0`), matching the `version` / `plan_version` / `operator-role-v0` convention.
+- The `$id` URL pins the version (`work-management-v0.schema.json`); the canonical filename matches.
+- Additive optional fields are permitted within v0 and require validator-test updates. A breaking change bumps to `work-management-v1` in a new schema file; validators carry every version forever.
+
+## See also
+
+- `docs/spec/operator-role.md` — the `.fishhawk/operator.yaml` overlay carries the `work_management` pointer at this config.
+- Parent epic #389; triggering issue #1005.

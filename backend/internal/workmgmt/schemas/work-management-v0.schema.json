@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/work-management-v0.schema.json",
+  "title": "Fishhawk work-management conventions v0",
+  "description": "Schema for a repo's work-management conventions config (#1005). This is a NEW canonical artifact, NOT a block inside .fishhawk/workflows.yaml (workflow-v0 is frozen at Day 21). It declares the work-management provider (GitHub Projects today; Jira deferred), its connection, and a map of work-item types (bug / feature / chore / adr / …) — each with a title format, body skeleton, default labels/fields, board placement, numbering rule, and epic-link policy. The conventions layer is the value: it turns one tool call into a conventions-complete work item. The shipped default (docs/spec/work-management-default.yaml) is a product artifact validated against this schema at backend package init. Breaking changes bump to work-management-v1 in a new schema file; old configs stay readable forever.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spec_version", "provider", "types", "required_fields"],
+
+  "properties": {
+    "spec_version": {
+      "type": "string",
+      "enum": ["work-management-v0"],
+      "description": "Config schema version. Single-value enum per the docs/spec versioning rules; a breaking change goes to work-management-v1 in a new schema file."
+    },
+    "provider": {
+      "type": "string",
+      "enum": ["github_projects", "jira"],
+      "description": "Work-management backend. github_projects is the only concrete provider in v0; jira is reserved at the interface level (the model must be expressible as a Jira issue) but has no implementation yet — an unimplemented provider must fail closed at filing time, never silently."
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "number"],
+      "description": "GitHub Projects connection. Required when provider is github_projects. Jira will add its own connection block additively when implemented.",
+      "properties": {
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Project owner login (user or organization)."
+        },
+        "owner_type": {
+          "type": "string",
+          "enum": ["user", "organization"],
+          "default": "user",
+          "description": "Whether the owner login is a user or an organization. GitHub's GraphQL owner query differs by kind (the Project #7 trap: kuhlman-labs is a user, not an org)."
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Project number (the integer in the project URL)."
+        }
+      }
+    },
+    "complexity_levels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["low", "medium", "high"],
+      "description": "The complexity prior: concrete file/coupling definitions for each level, so a filer picks one deterministically. Optional in a repo config but shipped in the default.",
+      "properties": {
+        "low": { "type": "string", "minLength": 1 },
+        "medium": { "type": "string", "minLength": 1 },
+        "high": { "type": "string", "minLength": 1 }
+      }
+    },
+    "required_fields": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Fields every filed item must carry. The mandatory trio is Summary, Done-means, complexity (semantic check enforces their presence); everything else is optional. Done-means must be testable — see field_hints."
+    },
+    "field_hints": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "minLength": 1 },
+      "description": "Per-field authoring hints, keyed by field name. The Done-means hint must state that the condition is testable."
+    },
+    "types": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "description": "Work-item types, keyed by snake_case type name (bug, feature, chore, adr, …). Each declares how an item of that type is materialized.",
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": { "$ref": "#/$defs/work_item_type" }
+      }
+    }
+  },
+
+  "$defs": {
+    "work_item_type": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["body_skeleton"],
+      "description": "Conventions for one work-item type.",
+      "properties": {
+        "title_format": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Title template with {placeholder} tokens (e.g. {summary}, {epic}, {n}, {number}). Rendering is the apply layer's concern; this schema only carries the template."
+        },
+        "body_skeleton": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Ordered list of body section headings. Dual-audience by design, e.g. Feature = Summary/Proposal/Done-means/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means."
+        },
+        "default_labels": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/label" },
+          "description": "Labels applied to every item of this type before caller-supplied labels are merged."
+        },
+        "default_fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Default board placement and classification fields.",
+          "properties": {
+            "status": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Single-select Status field value (e.g. Backlog). For GitHub Projects this is the status field set via updateProjectV2ItemFieldValue."
+            },
+            "board_column": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Board column, when distinct from status."
+            },
+            "complexity": {
+              "$ref": "#/$defs/complexity",
+              "description": "Default complexity prior for this type."
+            }
+          }
+        },
+        "numbering": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scheme"],
+          "description": "Numbering rule. Required when the type is `adr` (semantic check). ADRs number sequentially.",
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": ["sequential"],
+              "description": "Allocation scheme. v0 supports sequential (next integer after the highest existing)."
+            },
+            "prefix": {
+              "type": "string",
+              "description": "Number prefix rendered into the title (e.g. ADR-)."
+            }
+          }
+        },
+        "epic_link": {
+          "type": "string",
+          "enum": ["required", "optional", "none"],
+          "default": "optional",
+          "description": "Whether items of this type link to a parent epic. required = a parent epic relation must be supplied; none = epic linking does not apply."
+        }
+      }
+    },
+    "complexity": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "label": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(:[a-z0-9][a-z0-9-]*)?$",
+      "description": "A repo label, either a bare token (epic, adr) or a namespaced token (area:backend, type:feature, autonomy:low, phase:p0)."
+    }
+  }
+}

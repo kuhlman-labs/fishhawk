@@ -17,6 +17,9 @@ for schema in "$REPO_ROOT"/docs/spec/*.schema.json; do
     operator-role*.schema.json)
       cp "$schema" "$REPO_ROOT/backend/internal/operatorrole/schemas/$base"
       ;;
+    work-management-v*.schema.json)
+      cp "$schema" "$REPO_ROOT/backend/internal/workmgmt/schemas/$base"
+      ;;
     *)
       echo "sync-schemas: unrecognized schema file '$base' — skipping (add a case to route it)" >&2
       ;;
@@ -27,5 +30,10 @@ done
 # artifact synced like the schemas, not just an example.
 cp "$REPO_ROOT/docs/spec/operator-role-default.yaml" \
   "$REPO_ROOT/backend/internal/operatorrole/defaults/operator-role-default.yaml"
+
+# The shipped default work-management conventions (#1005) are likewise a
+# product artifact synced alongside the schema, not just an example.
+cp "$REPO_ROOT/docs/spec/work-management-default.yaml" \
+  "$REPO_ROOT/backend/internal/workmgmt/defaults/work-management-default.yaml"
 
 echo "schemas synced from docs/spec/"

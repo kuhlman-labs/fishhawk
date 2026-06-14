@@ -693,6 +693,80 @@ func (c *apiClient) RecoverRun(ctx context.Context, p RecoverRunParams) (*Run, b
 	return &run, status == http.StatusOK, nil
 }
 
+// FileWorkItemRequest mirrors the backend's POST /v0/work-items body
+// (`backend/internal/server/workitems.go::workItemRequest`). The
+// conventions layer turns this provider-neutral filing into a created
+// item; only Repo, Type, and Summary are required. Repeated here rather
+// than imported because the MCP server's apiClient is deliberately a thin
+// local copy — the import-direction rule is `cli → backend`, not the
+// reverse.
+type FileWorkItemRequest struct {
+	Repo            string             `json:"repo"`
+	Type            string             `json:"type"`
+	Summary         string             `json:"summary"`
+	Body            string             `json:"body,omitempty"`
+	Sections        map[string]string  `json:"sections,omitempty"`
+	TitleVars       map[string]string  `json:"title_vars,omitempty"`
+	Labels          []string           `json:"labels,omitempty"`
+	Complexity      string             `json:"complexity,omitempty"`
+	Status          string             `json:"status,omitempty"`
+	Relations       *WorkItemRelations `json:"relations,omitempty"`
+	ExistingNumbers []int              `json:"existing_numbers,omitempty"`
+	RunID           string             `json:"run_id,omitempty"`
+}
+
+// WorkItemRelations mirrors the wire `relations` sub-object: the
+// provider-neutral links the conventions layer resolves into provider
+// link operations.
+type WorkItemRelations struct {
+	ParentEpic   string   `json:"parent_epic,omitempty"`
+	Supersedes   []string `json:"supersedes,omitempty"`
+	CompanionTo  []string `json:"companion_to,omitempty"`
+	EvidenceRuns []string `json:"evidence_runs,omitempty"`
+}
+
+// FiledWorkItem mirrors the backend's WorkItemResponse: the created item,
+// echoing the conventions-resolved placement so the caller renders the
+// result without a second fetch. Audited is true only when a
+// work_item_filed audit entry was written (a run was in flight).
+type FiledWorkItem struct {
+	Type          string   `json:"type"`
+	Title         string   `json:"title"`
+	Number        int      `json:"number"`
+	URL           string   `json:"url"`
+	Provider      string   `json:"provider"`
+	AppliedLabels []string `json:"applied_labels,omitempty"`
+	Complexity    string   `json:"complexity,omitempty"`
+	Status        string   `json:"status,omitempty"`
+	BoardColumn   string   `json:"board_column,omitempty"`
+	Audited       bool     `json:"audited"`
+}
+
+// FileWorkItem files a provider-agnostic work item via
+// `POST /v0/work-items` (#1005). The backend loads the repo's
+// work-management conventions, applies them, dispatches to the registered
+// provider, and (when run_id names an in-flight run) writes a best-effort
+// work_item_filed audit entry. 4xx/5xx surface as *apiError; the tool
+// layer reads the code:
+//   - 400 validation_failed (repo not owner/name, missing type/summary,
+//     unknown fields)
+//   - 401 authentication_required (anonymous caller)
+//   - 422 work_item_invalid (the request violates the type's conventions)
+//   - 501 provider_unimplemented (the configured provider id — e.g. the
+//     interface-only jira — is not registered; details name it)
+//   - 502 work_item_filing_failed (the provider rejected the filing)
+func (c *apiClient) FileWorkItem(ctx context.Context, req FileWorkItemRequest) (*FiledWorkItem, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal file-work-item: %w", err)
+	}
+	var out FiledWorkItem
+	if err := c.do(ctx, http.MethodPost, "/v0/work-items", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Stage mirrors the wire shape. The fields cover both get_plan's
 // "find the plan stage" use case and get_run_status's "tell me
 // what's happening" view: type/state for the lifecycle, sequence

@@ -342,6 +342,7 @@ GitHub OAuth (E4.2 / #49) is the sign-in flow that mints the cookie session. App
 | Workflow spec grammar | `docs/spec/workflow-v0.md` + `docs/spec/workflow-v0.schema.json` |
 | Plan artifact structure | `docs/spec/plan-standard-v1.md` + `docs/spec/plan-standard-v1.schema.json` |
 | Operator role contract (ADR-040: shipped default, `.fishhawk/operator.yaml` overlay + thinness rule) | `docs/spec/operator-role.md` + `docs/spec/operator-role.schema.json` / `operator-role-overlay.schema.json`; Go validation in `backend/internal/operatorrole/` |
+| Work-management conventions (#1005: per-repo work-item types, title/body/labels/board/numbering, mandatory Summary/Done-means/complexity trio) + canonical work-item model | `docs/spec/work-management-v0.md` + `docs/spec/work-management-v0.schema.json`; shipped default `docs/spec/work-management-default.yaml`; Go model + parse/validate in `backend/internal/workmgmt/` (`Default()`, `Parse`; provider/apply layered on in sibling files) |
 | HTTP API contract (endpoints, auth, errors) | `docs/api/v0.openapi.yaml` (source of truth) + `docs/api/v0.md` (companion) |
 | Trace bundle wire format (`*.jsonl.gz`) | `runner/internal/bundle/bundle.go` (pack + open) — implements ADR-007 (#71) |
 | Runner → backend trace upload | `runner/internal/upload/` (HTTP client, retries, signing) — wired into runner main behind `--upload-trace` |
