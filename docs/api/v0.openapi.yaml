@@ -2606,10 +2606,15 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            `run_repo_mismatch` — the supplied `run_id` belongs to a different
-            repository than the filing target. A run_id is honoured only when
-            its repo matches `repo`, so a caller cannot borrow an unrelated
-            run's installation context or inject an audit entry onto its chain.
+            `run_not_entitled` — a `run_id` was supplied by a caller that is
+            not that run's own run-bound agent token (`mcp:run:<uuid>`). Only
+            the run's bound token may drive a `work_item_filed` audit entry
+            onto its chain, so an arbitrary authenticated caller cannot inject
+            an entry under their own actor_subject by knowing the run UUID.
+            `run_repo_mismatch` — the entitled `run_id` belongs to a different
+            repository than the filing target; a run_id is honoured only when
+            its repo matches `repo`, so a run-bound token cannot borrow an
+            unrelated repository's installation context.
         '404':
           description: "`run_not_found` — `run_id` supplied but no such run."
         '413':

@@ -102,6 +102,8 @@ func TestFileWorkItem_RunInFlight_AuditsAndApplies(t *testing.T) {
 	}
 	s := New(Config{AuditRepo: au, RunRepo: rr})
 
+	// The caller is the run's own run-bound agent token: the only
+	// identity entitled to drive a work_item_filed audit onto this run.
 	rec := fileWorkItem(t, s, workItemRequest{
 		Repo:      "kuhlman-labs/fishhawk",
 		Type:      "feature",
@@ -109,7 +111,7 @@ func TestFileWorkItem_RunInFlight_AuditsAndApplies(t *testing.T) {
 		TitleVars: map[string]string{"epic": "22", "n": "5"},
 		Relations: &workItemRelations{ParentEpic: "#1005"},
 		RunID:     runID.String(),
-	}, "fishhawk-operator-agent@local")
+	}, "mcp:run:"+runID.String())
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
@@ -161,7 +163,7 @@ func TestFileWorkItem_RunInFlight_AuditsAndApplies(t *testing.T) {
 		if e.RunID != runID {
 			t.Errorf("audit RunID = %s, want %s", e.RunID, runID)
 		}
-		if e.ActorSubject == nil || *e.ActorSubject != "fishhawk-operator-agent@local" {
+		if e.ActorSubject == nil || *e.ActorSubject != "mcp:run:"+runID.String() {
 			t.Errorf("audit ActorSubject = %v", e.ActorSubject)
 		}
 		var payload map[string]any
@@ -230,7 +232,7 @@ func TestFileWorkItem_TerminalRun_NoAudit(t *testing.T) {
 		Type:    "chore",
 		Summary: "Tidy after the run",
 		RunID:   runID.String(),
-	}, "github:operator")
+	}, "mcp:run:"+runID.String())
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
@@ -377,9 +379,11 @@ func TestFileWorkItem_BadRequests(t *testing.T) {
 }
 
 // TestFileWorkItem_RunRepoMismatch_Forbidden asserts the #1005 fix-up
-// authorization gate: a run_id whose run belongs to a different repo than
-// the filing target is rejected 403 before any provider dispatch or audit
-// write, closing the cross-run / cross-repo borrow-an-installation surface.
+// run-to-repo consistency gate: even a caller holding the run's own
+// run-bound token cannot file against — or borrow the installation of —
+// a different repository than that run's, so a run_id whose run belongs
+// to a different repo than the filing target is rejected 403 before any
+// provider dispatch or audit write.
 func TestFileWorkItem_RunRepoMismatch_Forbidden(t *testing.T) {
 	fp := &fakeWorkProvider{}
 	registerFakeProvider(t, fp)
@@ -396,12 +400,14 @@ func TestFileWorkItem_RunRepoMismatch_Forbidden(t *testing.T) {
 	}
 	s := New(Config{AuditRepo: au, RunRepo: rr})
 
+	// Entitled caller (run-bound token for runID) but a cross-repo
+	// filing target: the entitlement gate passes, the repo gate trips.
 	rec := fileWorkItem(t, s, workItemRequest{
 		Repo:    "kuhlman-labs/fishhawk",
 		Type:    "chore",
 		Summary: "Borrow another run's installation",
 		RunID:   runID.String(),
-	}, "attacker@local")
+	}, "mcp:run:"+runID.String())
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
@@ -418,6 +424,69 @@ func TestFileWorkItem_RunRepoMismatch_Forbidden(t *testing.T) {
 	defer au.mu.Unlock()
 	if len(au.appended) != 0 {
 		t.Errorf("appended %d audit entries on a mismatched run, want 0", len(au.appended))
+	}
+}
+
+// TestFileWorkItem_UnauthorizedRun_Forbidden asserts the #1005 fix-up
+// caller-to-run entitlement gate for the same-repo case: a caller that
+// supplies an in-flight run's UUID in the SAME repo but is NOT that run's
+// own run-bound agent token is rejected 403 run_not_entitled before any
+// provider dispatch or audit write. This closes the cross-run audit-write
+// surface — an authenticated caller cannot inject a work_item_filed entry
+// onto a run's hash chain under their own actor_subject just by knowing
+// the run UUID. Both an un-bound caller and a caller bound to a different
+// run are covered.
+func TestFileWorkItem_UnauthorizedRun_Forbidden(t *testing.T) {
+	runID := uuid.New()
+	newServer := func() (*Server, *fakeWorkProvider, *auditFake) {
+		fp := &fakeWorkProvider{}
+		registerFakeProvider(t, fp)
+		au := newAuditFake()
+		rr := newPromptRunRepo()
+		inst := int64(99)
+		rr.getRuns[runID] = &run.Run{
+			ID:             runID,
+			Repo:           "kuhlman-labs/fishhawk", // SAME repo as the filing target
+			State:          run.StateRunning,
+			InstallationID: &inst,
+		}
+		return New(Config{AuditRepo: au, RunRepo: rr}), fp, au
+	}
+
+	cases := []struct {
+		name    string
+		subject string
+	}{
+		{"not run-bound", "github:operator"},
+		{"bound to a different run", "mcp:run:" + uuid.New().String()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fp, au := newServer()
+			rec := fileWorkItem(t, s, workItemRequest{
+				Repo:    "kuhlman-labs/fishhawk",
+				Type:    "chore",
+				Summary: "Inject an entry onto someone else's run",
+				RunID:   runID.String(),
+			}, tc.subject)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+			}
+			var env errorEnvelope
+			_ = json.Unmarshal(rec.Body.Bytes(), &env)
+			if env.Error.Code != "run_not_entitled" {
+				t.Errorf("code = %q, want run_not_entitled", env.Error.Code)
+			}
+			if fp.called {
+				t.Error("provider dispatched for an unentitled run_id")
+			}
+			au.mu.Lock()
+			defer au.mu.Unlock()
+			if len(au.appended) != 0 {
+				t.Errorf("appended %d audit entries for an unentitled run, want 0", len(au.appended))
+			}
+		})
 	}
 }
 
@@ -448,9 +517,12 @@ func TestFileWorkItem_RunResolutionGuards(t *testing.T) {
 		fp := &fakeWorkProvider{}
 		registerFakeProvider(t, fp)
 		s := New(Config{RunRepo: newPromptRunRepo()}) // empty repo -> ErrNotFound
+		// Run-bound caller for this run_id so the entitlement gate passes
+		// and the not-found lookup branch is exercised.
+		rid := uuid.New()
 		rec := fileWorkItem(t, s, workItemRequest{
-			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: uuid.New().String(),
-		}, "github:operator")
+			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: rid.String(),
+		}, "mcp:run:"+rid.String())
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
 		}
@@ -465,9 +537,12 @@ func TestFileWorkItem_RunResolutionGuards(t *testing.T) {
 		fp := &fakeWorkProvider{}
 		registerFakeProvider(t, fp)
 		s := New(Config{}) // no RunRepo
+		// Run-bound caller for this run_id so the entitlement gate passes
+		// and the unconfigured-RunRepo branch is exercised.
+		rid := uuid.New()
 		rec := fileWorkItem(t, s, workItemRequest{
-			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: uuid.New().String(),
-		}, "github:operator")
+			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: rid.String(),
+		}, "mcp:run:"+rid.String())
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want 503 (body=%s)", rec.Code, rec.Body.String())
 		}

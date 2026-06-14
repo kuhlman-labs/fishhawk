@@ -93,7 +93,9 @@ type workItemResponse struct {
 // validating relations), dispatches the resolved item to the registered
 // provider, and returns the created item. When `run_id` names a run that
 // is in flight, it also writes a best-effort work_item_filed audit entry
-// onto that run (#1005). An unimplemented/unregistered provider fails
+// onto that run (#1005) — but only when the caller holds that run's own
+// run-bound agent token (the entitlement gate below closes the cross-run
+// audit-write surface). An unimplemented/unregistered provider fails
 // closed with a typed error naming the missing provider — never a nil
 // dispatch.
 func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
@@ -203,19 +205,43 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve the optional active run up front: it supplies the
 	// installation id the provider needs to act on the repo and is the
-	// target of the work_item_filed audit.
+	// target of the work_item_filed audit. run_id is an
+	// authorization-sensitive input — it names whose hash chain a
+	// work_item_filed entry is appended to — so it is gated by a
+	// caller-to-run entitlement check AND a run-to-repo consistency
+	// check before it is honoured.
 	var activeRun *run.Run
 	if strings.TrimSpace(req.RunID) != "" {
-		if s.cfg.RunRepo == nil {
-			s.writeError(w, r, http.StatusServiceUnavailable, "run_lookup_unconfigured",
-				"run_id supplied but no run repository is configured", nil)
-			return
-		}
 		runID, perr := uuid.Parse(req.RunID)
 		if perr != nil {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 				"run_id must be a valid UUID",
 				map[string]any{"field": "run_id", "got": req.RunID})
+			return
+		}
+		// (1) Caller-to-run entitlement (#1005 fix-up). A work_item_filed
+		// audit entry may only be written onto a run by that run's own
+		// run-bound agent token — the same `mcp:run:<uuid>` binding the
+		// scope-amendment endpoints enforce (runBoundTokenRunID). Without
+		// this, any authenticated caller that learns an in-flight run UUID
+		// could inject an entry onto that run's hash chain under their own
+		// actor_subject (a cross-run audit-write surface; Fishhawk's threat
+		// model assumes agent tokens run arbitrary commands). A token bound
+		// to a *different* run, an operator token, or a cookie session is
+		// rejected here too: the in-runner filing path (fishhawk_file_issue
+		// with FISHHAWK_RUN_ID) carries the agent's own run-bound token, and
+		// the ADR-040 operator follow-up path files run-absent (no run_id,
+		// no audit).
+		tokenRunID, runBound := runBoundTokenRunID(id)
+		if !runBound || tokenRunID != runID {
+			s.writeError(w, r, http.StatusForbidden, "run_not_entitled",
+				"run_id may only be supplied by that run's own run-bound agent token",
+				map[string]any{"run_id": runID.String()})
+			return
+		}
+		if s.cfg.RunRepo == nil {
+			s.writeError(w, r, http.StatusServiceUnavailable, "run_lookup_unconfigured",
+				"run_id supplied but no run repository is configured", nil)
 			return
 		}
 		rn, gerr := s.cfg.RunRepo.GetRun(r.Context(), runID)
@@ -224,19 +250,10 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 				"run does not exist", map[string]any{"run_id": runID.String()})
 			return
 		}
-		// Repo-consistency authorization gate (#1005 fix-up). A run_id is
-		// only honoured when the run's repo matches the filing target.
-		// Without this, any authenticated subject that knows a run UUID
-		// could (a) borrow that run's installation context to file against
-		// a caller-chosen repo and (b) inject a work_item_filed audit entry
-		// onto an unrelated run's hash chain (actor_subject = their token).
-		// v0's authorization posture is authenticated-caller + run/repo
-		// consistency: the conventions loader is hard-wired to the default
-		// repo and the installation id is sourced from the named run, so
-		// binding the run to the requested repo closes the cross-run /
-		// cross-repo write surface. A per-caller entitlement check (does
-		// this subject own this run?) is a follow-up for once runs carry an
-		// owning-subject ACL.
+		// (2) Run-to-repo consistency (#1005 fix-up). Defense in depth: the
+		// run the caller is entitled to must also be the run for the filing
+		// target repo, so a run-bound token cannot file against — or borrow
+		// the installation of — a different repository than its own run.
 		if !strings.EqualFold(rn.Repo, owner+"/"+name) {
 			s.writeError(w, r, http.StatusForbidden, "run_repo_mismatch",
 				"run_id belongs to a different repository than the filing target",
