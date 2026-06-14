@@ -130,7 +130,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// Implement-failure recovery arms apply whether the run row is failed
 	// (the usual case — a failed stage fails the run) or still running.
 	if impl != nil && impl.State == "failed" {
-		return implementFailedNextActions(run, plan, impl)
+		return implementFailedNextActions(run, plan, stageByType(stages, "review"), impl)
 	}
 
 	if runStateIsTerminal(run.State) {
@@ -283,16 +283,41 @@ func implementStageNextActions(run *Run, impl *Stage, implementReviewStatus *Rev
 }
 
 // implementFailedNextActions branches on the failed implement stage's
-// failure category: B routes to the no-replan recovery run, A to an
-// in-place retry (citing a known flake trace event when the failure
-// detail carries one), everything else to retry-or-cancel.
-func implementFailedNextActions(run *Run, plan, impl *Stage) *NextActions {
+// failure category: B routes to the no-replan recovery run (or, for a
+// decomposition child, an IN-PLACE re-drive), A to an in-place retry
+// (citing a known flake trace event when the failure detail carries one),
+// everything else to retry-or-cancel.
+func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextActions {
 	category := ""
 	if impl.FailureCategory != nil {
 		category = *impl.FailureCategory
 	}
 	switch category {
 	case "B":
+		// A failed DECOMPOSITION CHILD recovers IN PLACE (#1081): point
+		// fishhawk_resume_run at THIS child's own id and the backend
+		// re-drives the SAME run on the shared parent branch — not a new
+		// run — so the parked parent fan-out can still consolidate. The
+		// MCP Run row does not mirror the backend's decomposed_from field,
+		// so the in-band signal is the orchestrator's minted-child shape:
+		// a parent_run_id plus an implement stage but NO plan or review
+		// stage of its own (each decomposed child carries a single
+		// implement stage; the parent owns plan + review). This matches the
+		// recover handler's DecomposedFrom gate for every minted child while
+		// excluding a CI-retry child, which carries a review stage and is
+		// served by the "resume at the parent" arm below.
+		if run.ParentRunID != nil && plan == nil && review == nil {
+			return &NextActions{
+				State: "implement_failed_category_b_decomposition_child",
+				Actions: []SuggestedAction{{
+					Action:       "fishhawk_resume_run",
+					Params:       map[string]string{"parent_run_id": run.ID},
+					Precondition: "this run is a failed decomposition child (it carries a parent_run_id and has only an implement stage — no plan or review of its own) whose implement stage failed category-B; point resume at THIS child's own id, NOT the parent",
+					Consumes:     consumesNone,
+					Reason:       "category-B decomposition-child failure: fishhawk_resume_run pointed at the child re-opens the SAME run in place on the shared parent branch (folding add_scope_files), so the parked parent fan-out can still consolidate — pointing resume at the parent would replan from scratch and discard the succeeded sibling slices",
+				}},
+			}
+		}
 		if plan != nil && plan.State == "succeeded" {
 			return &NextActions{
 				State: "implement_failed_category_b",
