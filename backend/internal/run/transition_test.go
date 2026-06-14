@@ -84,8 +84,9 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 		{StageStateDispatched, StageStateFailed, true},
 		{StageStateDispatched, StageStateCancelled, true},
 		{StageStateDispatched, StageStateAwaitingApproval, false},
-		// running → awaiting_approval | succeeded | failed | cancelled
+		// running → awaiting_approval | awaiting_input | succeeded | failed | cancelled
 		{StageStateRunning, StageStateAwaitingApproval, true},
+		{StageStateRunning, StageStateAwaitingInput, true},
 		{StageStateRunning, StageStateSucceeded, true},
 		{StageStateRunning, StageStateFailed, true},
 		{StageStateRunning, StageStateCancelled, true},
@@ -95,6 +96,12 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 		{StageStateAwaitingApproval, StageStateFailed, true},
 		{StageStateAwaitingApproval, StageStateCancelled, true},
 		{StageStateAwaitingApproval, StageStateRunning, false}, // no rewinding
+		// awaiting_input → pending (resume) | succeeded | failed | cancelled (#1057)
+		{StageStateAwaitingInput, StageStatePending, true}, // operator answered → resume in place
+		{StageStateAwaitingInput, StageStateSucceeded, true},
+		{StageStateAwaitingInput, StageStateFailed, true},
+		{StageStateAwaitingInput, StageStateCancelled, true},
+		{StageStateAwaitingInput, StageStateDispatched, false}, // resume routes through pending
 		// terminal idempotency + lockdown
 		{StageStateSucceeded, StageStateSucceeded, true},
 		{StageStateSucceeded, StageStateRunning, false},
@@ -201,6 +208,7 @@ func TestStageStateIsTerminal(t *testing.T) {
 		StageStateDispatched:       false,
 		StageStateRunning:          false,
 		StageStateAwaitingApproval: false,
+		StageStateAwaitingInput:    false,
 		StageStateSucceeded:        true,
 		StageStateFailed:           true,
 		StageStateCancelled:        true,

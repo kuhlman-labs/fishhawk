@@ -66,10 +66,23 @@ func ValidRunRetryTransition(from, to State) bool {
 // Dispatched → Running: runner checked in and started executing.
 // Dispatched → Failed: runner never started (category C).
 // Running → AwaitingApproval: gate evaluation produced a blocking gate.
+// Running → AwaitingInput: the planner emitted a clarification_request
+//
+//	and the plan stage parked for operator direction (#1057).
+//
 // Running → Succeeded: gate auto-passed (e.g., implicit no-gate stage).
 // Running → Failed: any failure category.
 // AwaitingApproval → Succeeded: approver said yes.
 // AwaitingApproval → Failed: approver rejected, or D-category timeout.
+// AwaitingInput → Pending: operator answered; the orchestrator re-opens
+//
+//	the parked plan stage to resume in the SAME run (pending-resume).
+//
+// AwaitingInput → Succeeded: the park resolved without re-dispatch.
+// AwaitingInput → Failed: the park was abandoned, or its SLA timed out
+//
+//	(a D-category judgment, not an agent failure).
+//
 // Cancelled is reachable from any non-terminal state via manual halt.
 var stageTransitions = map[StageState]map[StageState]struct{}{
 	StageStatePending: {
@@ -85,6 +98,7 @@ var stageTransitions = map[StageState]map[StageState]struct{}{
 	},
 	StageStateRunning: {
 		StageStateAwaitingApproval: {},
+		StageStateAwaitingInput:    {},
 		StageStateSucceeded:        {},
 		StageStateFailed:           {},
 		StageStateCancelled:        {},
@@ -95,6 +109,12 @@ var stageTransitions = map[StageState]map[StageState]struct{}{
 		StageStateCancelled: {},
 	},
 	StageStateAwaitingChildren: {
+		StageStateSucceeded: {},
+		StageStateFailed:    {},
+		StageStateCancelled: {},
+	},
+	StageStateAwaitingInput: {
+		StageStatePending:   {}, // operator answered → resume in place
 		StageStateSucceeded: {},
 		StageStateFailed:    {},
 		StageStateCancelled: {},

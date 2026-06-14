@@ -48,7 +48,10 @@ func (s State) IsTerminal() bool {
 // `dispatched` means the workflow_dispatch event has been sent to
 // GitHub but the runner has not yet checked in. `running` means the
 // runner has started executing. `awaiting_approval` means a gate is
-// blocking on human action.
+// blocking on human action. `awaiting_input` means the stage parked
+// for operator direction — the planner emitted a clarification_request
+// (#1057) and the run resumes in place once the answers arrive; it is a
+// parked judgment, not a failure.
 type StageState string
 
 // Stage states. Terminal states (Succeeded, Failed, Cancelled) admit
@@ -59,6 +62,7 @@ const (
 	StageStateRunning          StageState = "running"
 	StageStateAwaitingApproval StageState = "awaiting_approval"
 	StageStateAwaitingChildren StageState = "awaiting_children"
+	StageStateAwaitingInput    StageState = "awaiting_input"
 	StageStateSucceeded        StageState = "succeeded"
 	StageStateFailed           StageState = "failed"
 	StageStateCancelled        StageState = "cancelled"

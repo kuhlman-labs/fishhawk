@@ -215,6 +215,30 @@ func TestEvaluate_WorkflowBlockWhenNoGatePending(t *testing.T) {
 	}
 }
 
+// TestEvaluate_AwaitingInputParksHuman: a stage parked at awaiting_input
+// (#1057, the planner's clarification_request gate) is a parked
+// D-category judgment — the operator agent delegates nothing and pages
+// the human. Even a lone low-severity open concern (which would
+// otherwise satisfy solo_low/waive) must NOT yield a met action.
+func TestEvaluate_AwaitingInputParksHuman(t *testing.T) {
+	wf := testWorkflow(allKnobs(), nil)
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
+		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
+		Audit:    &fakeAudit{},
+	}
+	res := evaluate(t, ev, wf, newRun())
+	if res == nil {
+		t.Fatal("Result is nil; want the must_page_human envelope while parked at awaiting_input")
+	}
+	if len(res.Actions) != 0 {
+		t.Errorf("Actions = %+v, want none delegated while parked at awaiting_input", res.Actions)
+	}
+	if len(res.MustPageHuman) != 1 || res.MustPageHuman[0] != spec.PageEventReviewerReject {
+		t.Errorf("MustPageHuman = %v, want the effective block's page list", res.MustPageHuman)
+	}
+}
+
 // TestEvaluate_GateOnlyBlock_OtherGatePending: a gate-level-only block
 // does not govern while NO gate (or a different stage's gate) is
 // pending — fail-closed, nil result.
