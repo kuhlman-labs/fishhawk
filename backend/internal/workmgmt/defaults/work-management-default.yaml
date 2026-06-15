@@ -31,6 +31,24 @@ required_fields:
   - Done-means
   - complexity
 
+# Canonical board states -> the Project #7 single-select Status options
+# (#1012). The closed canonical set keeps a future Jira provider tractable.
+states:
+  backlog: Backlog
+  in_progress: In Progress
+  in_review: In Review
+  blocked: Blocked
+  done: Done
+
+# Run-lifecycle event -> canonical state. The board-sync hook moves the
+# card along these edges, but only from the transition's expected source
+# state — a human's manual placement is never overridden.
+transitions:
+  run_started: in_progress
+  pr_opened: in_review
+  run_failed: blocked
+  run_merged: done
+
 field_hints:
   Summary: One or two sentences naming the motivation and the load-bearing change.
   Done-means: >-

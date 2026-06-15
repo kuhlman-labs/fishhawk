@@ -19,6 +19,8 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `required_fields` | yes | non-empty unique string list | Fields every filed item must carry. Must include the mandatory trio Summary, Done-means, complexity (semantic check). |
 | `field_hints` | no | object: field name → prose | Per-field authoring hints. The Done-means hint states the condition must be testable. |
 | `types` | yes | object: type name → type config | Work-item types, keyed by snake_case name (bug, feature, chore, adr, …). |
+| `states` | no | object: canonical state → provider option | Canonical board-state map for run-lifecycle transitions (#1012). Keys from the closed set `backlog`/`in_progress`/`in_review`/`blocked`/`done`; values are provider option strings. |
+| `transitions` | no | object: lifecycle event → canonical state | Run-lifecycle-event → canonical-state map (#1012). Keys from the closed set `run_started`/`pr_opened`/`run_failed`/`run_merged`; each value must be a key declared in `states` (semantic check). |
 
 ### Per-type fields (`types.<name>`)
 
@@ -40,12 +42,23 @@ The mandatory trio is **Summary**, **Done-means**, **complexity** (#1005, operat
 - **Done-means** must be a *testable* condition — an observable outcome a reviewer can check, not a description of effort. The shipped default's `field_hints[Done-means]` states this.
 - **complexity** is picked from `complexity_levels` by the files and coupling a change touches (low = a few tightly-scoped edits; medium = one module or cross-package seam; high = spans wire/domain/persistence or a migration, needs an integration test for the seam).
 
+## Board states and transitions
+
+The `states` and `transitions` blocks (both optional, additive within v0) drive run-lifecycle board moves (#1012), the companion to the filing conventions above:
+
+- **`states`** maps each canonical board state (the closed set `backlog`, `in_progress`, `in_review`, `blocked`, `done`) to the provider's column/option string — for GitHub Projects, the single-select Status option name (e.g. `in_progress → In Progress`). The small closed set is what keeps a future Jira provider tractable, since Jira transitions are workflow-gated.
+- **`transitions`** maps each run-lifecycle event (the closed set `run_started`, `pr_opened`, `run_failed`, `run_merged`) to a canonical state. When a run reaches that lifecycle point, the board-sync hook moves the card to the mapped state — resolved to a provider option through `states`.
+
+Both blocks are optional: absent (or empty) means no transitions are configured and the board-sync hook no-ops. A configured transition is best-effort and never blocks or fails the run, and the move fires only from the transition's expected source state — a card a human parked deliberately is never overridden.
+
+The cross-reference is a semantic rule (`workmgmt.Parse`): **every `transitions` value must be a key present in `states`**. The schema constrains transition values to the canonical enum, but only the semantic check ties a value to a declared `states` key, so a transition can't target a state that has no provider option.
+
 ## Validation
 
 `workmgmt.Parse` validates in two stages and returns a typed error:
 
 - `*SchemaError` — a structural violation (unknown key, wrong enum, malformed label, empty `body_skeleton`). Carries a JSON Pointer path.
-- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, or a type named `adr` has no `numbering` rule.
+- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, a type named `adr` has no `numbering` rule, or a `transitions` value names a canonical state not declared in `states`.
 - `*YAMLError` — unparseable, empty, or multi-document input (the config must be a single YAML document; a trailing document would bypass validation).
 
 The shipped default is validated against the schema at backend package init, so the product artifact can never drift from its own schema.

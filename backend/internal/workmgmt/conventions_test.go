@@ -202,6 +202,18 @@ types: {adr: {body_skeleton: [Context]}}
 `,
 			want: "numbering rule",
 		},
+		"transition targets undeclared state": {
+			cfg: `
+spec_version: work-management-v0
+provider: github_projects
+project: {owner: a, number: 1}
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+states: {backlog: Backlog}
+transitions: {run_started: in_progress}
+`,
+			want: "not declared in states",
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -237,6 +249,75 @@ types: {feature: {body_skeleton: [Summary], default_fields: {complexity: medium}
 	}
 	if c.Types["feature"].DefaultFields.Complexity != "medium" {
 		t.Errorf("feature complexity = %q, want medium", c.Types["feature"].DefaultFields.Complexity)
+	}
+}
+
+// TestParseWithStatesAndTransitions proves a config carrying the optional
+// board states + transitions blocks parses cleanly and the typed maps are
+// populated when every transition target is a declared canonical state.
+func TestParseWithStatesAndTransitions(t *testing.T) {
+	cfg := `
+spec_version: work-management-v0
+provider: github_projects
+project: {owner: a, number: 1}
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+states:
+  backlog: Backlog
+  in_progress: In Progress
+  in_review: In Review
+  blocked: Blocked
+  done: Done
+transitions:
+  run_started: in_progress
+  pr_opened: in_review
+  run_failed: blocked
+  run_merged: done
+`
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(states+transitions) = %v, want nil", err)
+	}
+	if c.States["in_progress"] != "In Progress" {
+		t.Errorf("states[in_progress] = %q, want %q", c.States["in_progress"], "In Progress")
+	}
+	if c.Transitions["run_started"] != "in_progress" {
+		t.Errorf("transitions[run_started] = %q, want %q", c.Transitions["run_started"], "in_progress")
+	}
+}
+
+// TestDefaultStatesAndTransitions locks the shipped default's board-state
+// map and lifecycle transitions (#1012): the four canonical edges resolve
+// through the states map to the Project #7 Status options.
+func TestDefaultStatesAndTransitions(t *testing.T) {
+	d := Default()
+	wantStates := map[string]string{
+		"backlog":     "Backlog",
+		"in_progress": "In Progress",
+		"in_review":   "In Review",
+		"blocked":     "Blocked",
+		"done":        "Done",
+	}
+	for k, want := range wantStates {
+		if d.States[k] != want {
+			t.Errorf("default states[%s] = %q, want %q", k, d.States[k], want)
+		}
+	}
+	wantTransitions := map[string]string{
+		"run_started": "in_progress",
+		"pr_opened":   "in_review",
+		"run_failed":  "blocked",
+		"run_merged":  "done",
+	}
+	for event, target := range wantTransitions {
+		if d.Transitions[event] != target {
+			t.Errorf("default transitions[%s] = %q, want %q", event, d.Transitions[event], target)
+		}
+		// Cross-reference invariant: every default transition target must
+		// resolve to a declared state.
+		if _, ok := d.States[target]; !ok {
+			t.Errorf("default transition %s targets %q, absent from states", event, target)
+		}
 	}
 }
 
