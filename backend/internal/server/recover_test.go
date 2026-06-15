@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -834,6 +837,26 @@ func TestRecoverRun_DecompositionChildErrorMappings(t *testing.T) {
 		}
 	})
 
+	t.Run("redrive not-found maps to 404", func(t *testing.T) {
+		s, rr, sa, _, art := newDecompositionRecoverServer(t)
+		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+		// RedriveChild wraps RetryRun's error with %w, so a RetryRun
+		// run.ErrNotFound surfaces through errors.Is → 404 run_not_found.
+		rr.retryRunErr = run.ErrNotFound
+
+		w := postRecover(t, s, child.ID.String(),
+			`{"add_scope_files":[{"path":"docs/extra.md"}],"reason":"fold the companion"}`, nil)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "run_not_found")
+		// The amendment is folded only after a successful re-drive, so a
+		// failed re-drive must not leave an orphaned approved amendment.
+		if amendments, _ := sa.ListByRun(context.Background(), child.ID); len(amendments) != 0 {
+			t.Errorf("amendments = %d, want 0 (re-drive not-found — no orphaned scope grant)", len(amendments))
+		}
+	})
+
 	t.Run("final get run error", func(t *testing.T) {
 		s, rr, _, _, art := newDecompositionRecoverServer(t)
 		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
@@ -846,6 +869,46 @@ func TestRecoverRun_DecompositionChildErrorMappings(t *testing.T) {
 			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
 		}
 		assertErrorCode(t, w, "internal_error")
+	})
+
+	// The Orchestrator.Advance hand-off is best-effort: a failure is
+	// logged at LevelError and the handler STILL returns the re-opened
+	// child with 201 — the Advance error must never surface as a 500.
+	t.Run("advance failure is logged and still returns the re-opened child", func(t *testing.T) {
+		s, rr, _, au, art := newDecompositionRecoverServer(t)
+		child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+
+		// Capture the handler's error log so we can pin the best-effort
+		// log-and-continue semantics.
+		var logBuf bytes.Buffer
+		s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+		// Wire an Orchestrator whose Runs repo is a fresh EMPTY store that
+		// does NOT contain the child. RedriveChild and the final re-fetch
+		// both go through the handler's real RunRepo (rr), so they succeed;
+		// only Advance fails, because its separate empty Runs repo returns
+		// run.ErrNotFound on its internal GetRun.
+		s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: newOrchestratorRepo(), Audit: au}
+
+		w := postRecover(t, s, child.ID.String(), `{}`, nil)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (Advance failure must not surface as a 500):\n%s", w.Code, w.Body.String())
+		}
+		var resp runResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		// The re-opened child is returned: same id, re-opened in place.
+		if resp.ID != child.ID {
+			t.Errorf("response id = %s, want re-opened child %s", resp.ID, child.ID)
+		}
+		if resp.State != string(run.StateRunning) {
+			t.Errorf("child state = %q, want running (re-opened despite the Advance failure)", resp.State)
+		}
+		// And the failure was logged, pinning the log-and-continue branch.
+		if !strings.Contains(logBuf.String(), "orchestrator advance failed for decomposition-child recovery") {
+			t.Errorf("expected an Advance-failure error log, got:\n%s", logBuf.String())
+		}
 	})
 }
 
