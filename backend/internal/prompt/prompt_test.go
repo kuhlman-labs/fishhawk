@@ -180,6 +180,15 @@ func TestBuild_Implement_NeverReingestsUntrustedComments(t *testing.T) {
 	}{
 		{"approved plan present", func() Trigger { c := base; c.ApprovedPlan = fixturePlan(); return c }()},
 		{"plan missing fallback", base},
+		// #1152: the slim fix-up path (FixupConcerns set) must uphold the same
+		// never-re-ingest invariant — it links the issue but renders no body
+		// or comment text.
+		{"fix-up slim path", func() Trigger {
+			c := base
+			c.ApprovedPlan = fixturePlan()
+			c.FixupConcerns = []string{"[high] resolve the missing authz check"}
+			return c
+		}()},
 	}
 
 	for _, tc := range cases {
@@ -1411,19 +1420,28 @@ func TestBuild_Implement_FixupConcerns_Rendered(t *testing.T) {
 		"win on conflict",
 		concerns[0],
 		concerns[1],
+		// #1152: the slim fix-up path carries the targeted-patch framing.
+		"TARGETED fix-up",
+		"smallest change",
+		"do NOT re-implement",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
 			t.Errorf("prompt missing %q\n---\n%s", w, got)
 		}
 	}
-	// Concerns must appear before the approved plan so the agent sees the
-	// binding instructions before reading the plan steps (mirrors #558).
-	fixIdx := strings.Index(got, "### Fix-up concerns")
-	planIdx := strings.Index(got, "Approved plan (binding instruction)")
-	if fixIdx < 0 || planIdx < 0 || fixIdx > planIdx {
-		t.Errorf("fix-up concerns should appear before approved plan (fixIdx=%d planIdx=%d):\n%s",
-			fixIdx, planIdx, got)
+	// #1152: a fix-up now renders the SLIM prompt, not the full implement
+	// scaffolding. The plan render, budget context, and PR-description block
+	// must all be absent.
+	absent := []string{
+		"Approved plan (binding instruction)",
+		"### Budget context",
+		"write a pull-request description",
+	}
+	for _, a := range absent {
+		if strings.Contains(got, a) {
+			t.Errorf("slim fix-up prompt should not contain %q\n---\n%s", a, got)
+		}
 	}
 }
 
@@ -1462,6 +1480,57 @@ func TestBuild_Implement_FixupConcerns_Truncated(t *testing.T) {
 	}
 	if strings.Contains(got, "so should this one") {
 		t.Errorf("concerns past the byte cap should be dropped:\n%s", got)
+	}
+}
+
+func TestBuild_Implement_Fixup_OmitsFullScaffolding(t *testing.T) {
+	// #1152 lever 1: a fix-up dispatch renders the SLIM targeted-patch prompt.
+	// It retains the trust- and scope-relevant pieces (issue link, git-ops
+	// prohibition, scope-amendment escape hatch) but omits the full-implement
+	// scaffolding (approved-plan render, budget context, PR-description block).
+	conds := "Keep the change bounded."
+	got, err := Build("implement", Trigger{
+		Repo:               "o/r",
+		IssueNumber:        1152,
+		IssueTitle:         "Lower the cost of a fixup pass",
+		IssueURL:           "https://github.com/kuhlman-labs/fishhawk/issues/1152",
+		ApprovedPlan:       fixturePlan(),
+		ApprovalConditions: &conds,
+		PredictionContext:  &PredictionContext{PredictedMinutes: 14, PredictedConfidence: "medium", StageBudgetMinutes: 40},
+		FixupConcerns:      []string{"[medium] tighten the bound check"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// Retained on the slim path.
+	wants := []string{
+		"Triggering issue: #1152", // writeIssueLink
+		"https://github.com/kuhlman-labs/fishhawk/issues/1152",
+		"### Mid-stage scope amendments", // scope-amendment block
+		"Do not run `git checkout`",      // git-ops prohibition
+		"### Approval conditions",        // operator conditions still bind
+		conds,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("slim fix-up prompt missing %q\n---\n%s", w, got)
+		}
+	}
+
+	// Omitted on the slim path — even though an ApprovedPlan and a
+	// PredictionContext were supplied, neither the plan render nor the budget
+	// nor the PR-description block is emitted.
+	absent := []string{
+		"Approved plan (binding instruction)",
+		"### Budget context",
+		"write a pull-request description",
+		PullRequestDescriptionPath,
+	}
+	for _, a := range absent {
+		if strings.Contains(got, a) {
+			t.Errorf("slim fix-up prompt should omit %q\n---\n%s", a, got)
+		}
 	}
 }
 
