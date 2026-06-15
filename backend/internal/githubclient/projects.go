@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // CreateIssueParams is the typed body for CreateIssue. Labels are applied
@@ -38,6 +39,15 @@ type CreatedIssue struct {
 	Number  int
 	NodeID  string
 	HTMLURL string
+}
+
+// IssueSearchResult is the slice of a search-result item the feedback
+// dedup search consumes: the human Number + HTMLURL to return, and the
+// Body the caller re-verifies the fingerprint marker against.
+type IssueSearchResult struct {
+	Number  int
+	HTMLURL string
+	Body    string
 }
 
 // ProjectCoord identifies a GitHub Projects (v2) board by owner + number.
@@ -116,6 +126,54 @@ func (c *Client) CreateIssue(ctx context.Context, installationID int64, repo Rep
 		return nil, fmt.Errorf("githubclient: create issue response missing node_id")
 	}
 	return &CreatedIssue{Number: out.Number, NodeID: out.NodeID, HTMLURL: out.HTMLURL}, nil
+}
+
+// SearchOpenIssues runs an issue search and returns the matched items.
+//
+//	GET /search/issues?q={query}
+//
+// The caller composes the full query string (including any repo:owner/name
+// and is:open qualifiers); this method just forwards it as the q parameter
+// and decodes the {items:[{number,html_url,body}]} envelope. The feedback
+// dedup search uses it to find an open report already carrying a
+// fingerprint marker. Requires the App to hold `issues:read`. Returns
+// ErrForbidden on auth issues, ErrValidation when GitHub rejects the query.
+func (c *Client) SearchOpenIssues(ctx context.Context, installationID int64, query string) ([]IssueSearchResult, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if strings.TrimSpace(query) == "" {
+		return nil, errors.New("githubclient: search query required")
+	}
+
+	endpoint := c.endpoint("/search/issues") + "?q=" + url.QueryEscape(query)
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: search issues: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := classifyStatus("search issues", resp); err != nil {
+		return nil, err
+	}
+	var out struct {
+		Items []struct {
+			Number  int    `json:"number"`
+			HTMLURL string `json:"html_url"`
+			Body    string `json:"body"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("githubclient: decode search issues: %w", err)
+	}
+	results := make([]IssueSearchResult, 0, len(out.Items))
+	for _, it := range out.Items {
+		results = append(results, IssueSearchResult{Number: it.Number, HTMLURL: it.HTMLURL, Body: it.Body})
+	}
+	return results, nil
 }
 
 // IssueNodeID resolves an existing issue's GraphQL node id by number.
