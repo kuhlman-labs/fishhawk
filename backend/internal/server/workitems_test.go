@@ -678,6 +678,54 @@ func TestFileWorkItem_NoRun_NoInstallation_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestFileWorkItem_NoRun_ResolutionError_BadGateway pins the distinct
+// handler-side resolution-error branch: a transient/non-ErrNotInstalled
+// GetRepoInstallation failure (the installation endpoint returns a 5xx,
+// which classifyStatus maps to a non-ErrNotInstalled error) is surfaced
+// as 502 work_item_filing_failed by the handler ITSELF, before provider
+// dispatch — not masked as the provider's "no installation" message.
+// This is a different code path than TestFileWorkItem_NoRun_NoInstallation_FailsClosed,
+// which reaches 502 through the ErrNotInstalled-leaves-0 path and the
+// provider's own fail-closed. Assert the provider was NOT dispatched.
+func TestFileWorkItem_NoRun_ResolutionError_BadGateway(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	// Installation endpoint returns 500 -> non-ErrNotInstalled error.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"message":"server error"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	gh := &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+	s := New(Config{GitHub: gh})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "chore",
+		Summary: "Installation lookup is transiently unavailable",
+	}, "github:operator")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_filing_failed" {
+		t.Errorf("code = %q, want work_item_filing_failed", env.Error.Code)
+	}
+	if fp.called {
+		t.Error("provider dispatched despite a resolution error (want handler-side 502 before dispatch)")
+	}
+}
+
 // TestFileWorkItem_RunBound_RunAbsent_Forbidden pins the binding authz
 // condition for #1095: a run-bound agent token (mcp:run:<uuid> subject)
 // that files run-absent (no run_id) MUST be rejected 403 before any
