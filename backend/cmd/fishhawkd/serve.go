@@ -753,6 +753,12 @@ func runServe(args []string, logSink io.Writer) int {
 	// stays honest when slash-command-approval deps aren't ready.
 	if cfg.WebhookDispatcher != nil {
 		cfg.WebhookDispatcher.ApprovalHandler = srv
+		// Board-state sync (#1012): the Server implements BoardSyncer and
+		// holds the conventions loader, provider registry, run + audit repos
+		// the run_started board move needs. Plugged in here for the same
+		// reason as ApprovalHandler — the dispatcher was built before the
+		// Server existed.
+		cfg.WebhookDispatcher.BoardSyncer = srv
 		logger.Info("slash-command approval handler wired")
 	}
 

@@ -53,6 +53,8 @@ type Conventions struct {
 	FieldHints       map[string]string   `json:"field_hints,omitempty"`
 	Types            map[string]ItemType `json:"types"`
 	ProductFeedback  *ProductFeedback    `json:"product_feedback,omitempty"`
+	States           map[string]string   `json:"states,omitempty"`
+	Transitions      map[string]string   `json:"transitions,omitempty"`
 }
 
 // ProductFeedback configures the upstream product-feedback egress path
@@ -229,8 +231,9 @@ func parse(data []byte) (Conventions, error) {
 
 // validateSemantics enforces the cross-field rules the JSON Schema can't
 // express: the mandatory required-field trio, the github_projects
-// connection requirement, ADR numbering, and the complexity
-// cross-reference.
+// connection requirement, ADR numbering, the complexity cross-reference,
+// and the transitions->states cross-reference (every configured transition
+// target must name a canonical state declared in the states map).
 func validateSemantics(c Conventions) error {
 	if missing := missingMandatoryFields(c.RequiredFields); len(missing) > 0 {
 		return &SemanticError{Msg: fmt.Sprintf(
@@ -248,6 +251,20 @@ func validateSemantics(c Conventions) error {
 	for _, name := range sortedTypeNames(c.Types) {
 		if name == "adr" && c.Types[name].Numbering == nil {
 			return &SemanticError{Msg: "type \"adr\" must declare a numbering rule"}
+		}
+	}
+
+	// Every lifecycle transition must target a canonical state that the
+	// states map actually declares — otherwise the board-sync hook would
+	// have no provider option to move the card to. The schema constrains
+	// transition values to the canonical enum, but only this check ties a
+	// value to a configured states key. Event keys are sorted so the first
+	// failure is stable across runs.
+	for _, event := range sortedKeys(c.Transitions) {
+		target := c.Transitions[event]
+		if _, ok := c.States[target]; !ok {
+			return &SemanticError{Msg: fmt.Sprintf(
+				"transition %q targets canonical state %q, which is not declared in states", event, target)}
 		}
 	}
 	return nil

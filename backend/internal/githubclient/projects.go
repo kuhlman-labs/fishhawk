@@ -301,6 +301,89 @@ func (c *Client) ProjectFields(ctx context.Context, installationID int64, coord 
 	}, nil
 }
 
+// ProjectItemStatus is the current board placement of an already-filed
+// issue on one project: whether the issue has an item on that project
+// (OnBoard), the item id the Status mutation keys on (ItemID), and the
+// item's current single-select Status option name (Status, empty when the
+// item is on the board but its Status is unset). The board-state-sync
+// Transition reads it to decide whether to move the card and from what.
+type ProjectItemStatus struct {
+	OnBoard bool
+	ItemID  string
+	Status  string
+}
+
+// ProjectItemStatus resolves an issue's existing project-item id and its
+// current single-select Status on the project identified by projectID (the
+// project node id, e.g. from ProjectFields). It looks up the issue's
+// project items by node id and matches the one whose project node id equals
+// projectID — unambiguous across boards the issue also sits on.
+//
+//	query node(id: $issueId) { ... on Issue { projectItems { ... } } }
+//
+// Returns OnBoard=false (no error) when the issue has no item on that
+// project — the not-on-board path the Transition skips on. Honors the
+// user-owned-projects token opt-in (WithProjectsToken) like the other
+// Projects (v2) calls, since it routes through doGraphQL.
+func (c *Client) ProjectItemStatus(ctx context.Context, installationID int64, issueNodeID, projectID, fieldName string) (*ProjectItemStatus, error) {
+	if issueNodeID == "" || projectID == "" {
+		return nil, errors.New("githubclient: issue node id and project id required")
+	}
+	if fieldName == "" {
+		return nil, errors.New("githubclient: project field name required")
+	}
+	const query = `query ProjectItemStatus($issueId: ID!, $field: String!) {
+  node(id: $issueId) {
+    ... on Issue {
+      projectItems(first: 50) {
+        nodes {
+          id
+          project { id }
+          fieldValueByName(name: $field) {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
+          }
+        }
+      }
+    }
+  }
+}`
+	var data struct {
+		Node *struct {
+			ProjectItems struct {
+				Nodes []struct {
+					ID      string `json:"id"`
+					Project struct {
+						ID string `json:"id"`
+					} `json:"project"`
+					FieldValueByName *struct {
+						Name string `json:"name"`
+					} `json:"fieldValueByName"`
+				} `json:"nodes"`
+			} `json:"projectItems"`
+		} `json:"node"`
+	}
+	if err := c.doGraphQL(ctx, installationID, query, map[string]any{
+		"issueId": issueNodeID,
+		"field":   fieldName,
+	}, &data); err != nil {
+		return nil, err
+	}
+	if data.Node == nil {
+		return &ProjectItemStatus{OnBoard: false}, nil
+	}
+	for _, n := range data.Node.ProjectItems.Nodes {
+		if n.Project.ID != projectID {
+			continue
+		}
+		status := ""
+		if n.FieldValueByName != nil {
+			status = n.FieldValueByName.Name
+		}
+		return &ProjectItemStatus{OnBoard: true, ItemID: n.ID, Status: status}, nil
+	}
+	return &ProjectItemStatus{OnBoard: false}, nil
+}
+
 // AddProjectItem adds an issue (by content node id) to a project and
 // returns the created project-item id, the handle the field mutation
 // keys on.
@@ -400,6 +483,17 @@ func WithProjectsToken(ctx context.Context) context.Context {
 func ProjectsTokenRequested(ctx context.Context) bool {
 	v, _ := ctx.Value(projectsTokenKey{}).(bool)
 	return v
+}
+
+// ProjectsTokenConfigured reports whether a static projects token is set on
+// the client. The work-management board-sync Transition consults it to fail
+// fast for user-owned Projects v2 boards the App installation token cannot
+// reach (#1114): with no projects token configured the board is unreachable,
+// so the move degrades to a best-effort skip (the #1107/#1114 posture) rather
+// than dispatching a GraphQL call the installation-token fallback would error
+// on — an error that would drop the mandated work_item_transitioned audit.
+func (c *Client) ProjectsTokenConfigured() bool {
+	return c.ProjectsToken != ""
 }
 
 // doGraphQL POSTs a GraphQL query/mutation to /graphql and decodes the

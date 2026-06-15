@@ -33,6 +33,20 @@
 // sweep retries exactly the publishes a transient GitHub failure
 // dropped, and an already-published state dedups to a no-op.
 //
+// The tick also self-heals a dropped work-item board move (#1012): for
+// every parked review stage whose PR is confirmed open, the run's
+// authoritative lifecycle state is in_review — the state the pr_opened
+// board transition targets — so the optional BoardTransitionHealer
+// re-asserts pr_opened, healing the in_review board move a missed
+// pull_request.opened webhook would have dropped. The provider's
+// expected-source check makes the re-assert idempotent at the board level
+// (a card already in_review, or one a human parked in Blocked, is left
+// untouched). Because the board hook audits every attempt — both moves and
+// never-fight-the-human skips — the Ticker dedups the heal to at most once
+// per run per process so a long-parked run doesn't append a skip audit
+// every tick. The run_merged board move needs no heal here: it already
+// rides the shared ResolveReviewFromPollState merge-resolve path.
+//
 // Rate-limit note (ADR-031 Phase 1, low severity): each tick makes one
 // synchronous GetPullRequest call per parked review stage with NO
 // per-stage cooldown — unlike reactionpoller's adaptive fast/slow
@@ -66,6 +80,16 @@ import (
 // DefaultInterval is the tick period fishhawkd applies when the caller
 // leaves Interval zero.
 const DefaultInterval = 60 * time.Second
+
+// boardHealEvent is the run-lifecycle event the board-state self-heal
+// re-asserts for every parked-open review stage (#1012). A parked review
+// stage whose PR is open has an authoritative lifecycle state of in_review —
+// the state pr_opened targets — so re-asserting pr_opened heals an in_review
+// board move dropped by a missed pull_request.opened webhook. The string MUST
+// match the server's lifecyclePROpened transition-event key (boardsync.go);
+// the server maps it to a canonical state via the repo conventions, and the
+// provider's expected-source check makes the re-assert idempotent.
+const boardHealEvent = "pr_opened"
 
 // PRGetter reads a single pull request's live state from GitHub.
 // Satisfied by *githubclient.Client. Tests inject a stub returning
@@ -125,6 +149,25 @@ type AuditCheckRepublisher interface {
 	RepublishAuditCheck(ctx context.Context, runID uuid.UUID)
 }
 
+// BoardTransitionHealer re-asserts the work-item board transition implied by
+// a parked review stage's authoritative lifecycle state (#1012), healing a
+// board move dropped by a missed webhook. Satisfied by *server.Server
+// (NotifyBoardTransition): the server resolves the run, maps the lifecycle
+// event to a canonical state through the repo conventions, and dispatches the
+// provider transition. The implementation is best-effort (errors log, never
+// propagate) and the provider's expected-source check makes the move
+// idempotent at the board level, so the Ticker only needs to avoid re-auditing
+// an unchanged card every tick — it does so with a once-per-run dedup.
+//
+// OPTIONAL — like LineageReverifier and DriveObserver, not required by Run().
+// When the field is nil the ticker upgrades the Resolver via a type assertion
+// (production wires *server.Server as Resolver, which implements it), so the
+// fishhawkd wiring needs no new field; a Resolver that doesn't implement it
+// preserves the pre-#1012 behavior (no board heal).
+type BoardTransitionHealer interface {
+	NotifyBoardTransition(ctx context.Context, runID uuid.UUID, event string)
+}
+
 // Ticker scans review stages parked in awaiting_approval and resolves
 // any whose PR has reached a terminal merge state. Run() blocks until
 // ctx is done.
@@ -162,6 +205,24 @@ type Ticker struct {
 	// wires *server.Server as Resolver, which implements it); tests can
 	// inject a stub explicitly.
 	DriveObserver DriveObserver
+
+	// BoardTransitionHealer re-asserts the in_review board move for a
+	// parked-open review stage (#1012), healing a transition dropped by a
+	// missed pull_request.opened webhook. OPTIONAL: when nil, Tick upgrades
+	// the Resolver via a type assertion (production wires *server.Server as
+	// Resolver, which implements NotifyBoardTransition); a Resolver that
+	// doesn't implement it preserves the pre-#1012 behavior.
+	BoardTransitionHealer BoardTransitionHealer
+
+	// boardHealed dedups the board-state heal to at most once per run per
+	// process. The provider's expected-source check already makes the move
+	// idempotent at the board level, but the hook audits every attempt (move
+	// AND never-fight-the-human skip), so re-asserting every tick would
+	// append a skip audit to a healthy long-parked run's chained log on each
+	// pass. Recorded after the heal fires; a process restart re-arms it (cost:
+	// one more skip). Touched only from the single-goroutine tick loop, so it
+	// needs no lock — same posture as the resolved-stage bookkeeping.
+	boardHealed map[uuid.UUID]bool
 
 	// Logger receives structured warnings about transient errors.
 	// nil → slog.Default().
@@ -226,6 +287,15 @@ func (t *Ticker) Tick(ctx context.Context) {
 	if t.DriveObserver == nil {
 		if obs, ok := t.Resolver.(DriveObserver); ok {
 			t.DriveObserver = obs
+		}
+	}
+
+	// Same Resolver-upgrade default for the board-transition healer (#1012):
+	// *server.Server implements NotifyBoardTransition, so the production
+	// wiring picks up the board heal with no new fishhawkd field.
+	if t.BoardTransitionHealer == nil {
+		if h, ok := t.Resolver.(BoardTransitionHealer); ok {
+			t.BoardTransitionHealer = h
 		}
 	}
 
@@ -329,6 +399,14 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 	default:
 		// Open PR (or any non-terminal state) — leave parked. No
 		// force-succeed: the merge/close event is what advances the stage.
+		// Board-state self-heal (#1012): the PR is confirmed open, so the
+		// run's authoritative lifecycle state is in_review — re-assert the
+		// pr_opened board move a dropped pull_request.opened webhook would
+		// have left undone. Best-effort, deduped to once per run, and
+		// idempotent at the board level via the provider's expected-source
+		// check (a card already in_review or human-parked in Blocked is left
+		// untouched). Fires for every issue-triggered run regardless of Drive.
+		t.healBoardTransition(ctx, s.RunID)
 		// Drive (#1023): a drive-enabled run's parked-open tick is where
 		// the poll-driven mechanical rules are evaluated —
 		// reviews_settled_gate when every configured implement review is
@@ -358,6 +436,23 @@ func (t *Ticker) resolve(ctx context.Context, logger *slog.Logger, runID uuid.UU
 		slog.String("run_id", runID.String()),
 		slog.String("pr_url", prURL),
 		slog.Bool("merged", merged))
+}
+
+// healBoardTransition re-asserts the pr_opened board move for a parked-open
+// review stage (#1012), at most once per run per process. The server-side hook
+// is best-effort and the provider's expected-source check makes the move
+// idempotent at the board level; the dedup here keeps a healthy long-parked run
+// from appending a never-fight-the-human skip audit on every tick. A nil healer
+// (Resolver doesn't implement NotifyBoardTransition) is a clean no-op.
+func (t *Ticker) healBoardTransition(ctx context.Context, runID uuid.UUID) {
+	if t.BoardTransitionHealer == nil || t.boardHealed[runID] {
+		return
+	}
+	t.BoardTransitionHealer.NotifyBoardTransition(ctx, runID, boardHealEvent)
+	if t.boardHealed == nil {
+		t.boardHealed = map[uuid.UUID]bool{}
+	}
+	t.boardHealed[runID] = true
 }
 
 // parsePRURL extracts (repo, number) from a GitHub PR html_url of the

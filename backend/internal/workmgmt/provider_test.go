@@ -9,8 +9,9 @@ import (
 
 // fakeProvider is a test double registered to exercise the registry.
 type fakeProvider struct {
-	name string
-	got  ProviderRequest
+	name    string
+	got     ProviderRequest
+	gotTran TransitionRequest
 }
 
 func (f *fakeProvider) Name() string { return f.name }
@@ -18,6 +19,11 @@ func (f *fakeProvider) Name() string { return f.name }
 func (f *fakeProvider) File(_ context.Context, req ProviderRequest) (*CreatedItem, error) {
 	f.got = req
 	return &CreatedItem{Provider: f.name, Number: 42, URL: "https://example/42"}, nil
+}
+
+func (f *fakeProvider) Transition(_ context.Context, req TransitionRequest) (*TransitionResult, error) {
+	f.gotTran = req
+	return &TransitionResult{Moved: true, From: "Backlog", To: "In Progress"}, nil
 }
 
 func TestRegistry_RegisterAndGet(t *testing.T) {
@@ -81,5 +87,36 @@ func TestRegistry_DispatchPassesRequest(t *testing.T) {
 	}
 	if fp.got.Item.Title != "boom" {
 		t.Errorf("provider did not receive request: %+v", fp.got)
+	}
+}
+
+func TestRegistry_DispatchTransition(t *testing.T) {
+	fp := &fakeProvider{name: "test_provider_transition"}
+	Register(fp)
+	p, err := Get("test_provider_transition")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	tr, ok := p.(Transitioner)
+	if !ok {
+		t.Fatalf("provider does not implement Transitioner")
+	}
+	req := TransitionRequest{
+		IssueNumber:          1012,
+		Trigger:              "run_started",
+		Target:               Target{InstallationID: 7, Repo: Repo{Owner: "o", Name: "r"}},
+		CanonicalState:       CanonicalStateInProgress,
+		ExpectedSourceStates: []string{CanonicalStateBacklog},
+		States:               map[string]string{CanonicalStateBacklog: "Backlog", CanonicalStateInProgress: "In Progress"},
+	}
+	res, err := tr.Transition(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if !res.Moved || res.To != "In Progress" {
+		t.Errorf("result = %+v", res)
+	}
+	if fp.gotTran.IssueNumber != 1012 || fp.gotTran.CanonicalState != CanonicalStateInProgress {
+		t.Errorf("provider did not receive transition request: %+v", fp.gotTran)
 	}
 }

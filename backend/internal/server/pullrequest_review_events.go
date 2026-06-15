@@ -264,6 +264,9 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// terminal state for review-gated workflows; this is one of the
 		// most operator-visible moments of the run lifecycle.
 		s.notifyStatusUpdate(ctx, target.ID, "pr_merged")
+		// Board-state sync (#1012): the PR merging advances the work item to
+		// the done canonical state. Best-effort; never unwinds the merge.
+		s.notifyBoardTransition(ctx, target.ID, lifecycleRunMerged)
 		return
 	}
 

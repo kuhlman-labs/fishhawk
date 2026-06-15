@@ -52,6 +52,61 @@ type BoardPlacement struct {
 	BoardColumn string `json:"board_column,omitempty"`
 }
 
+// Canonical work-item lifecycle states (#1012). These are the
+// provider-agnostic states the conventions `states` map binds to
+// provider-specific board columns/options, and the values the
+// `transitions` map points a run-lifecycle event at. The set is closed —
+// the schema constrains both the states keys and the transitions values to
+// exactly these — so the board-sync hook and the provider agree on a fixed
+// vocabulary independent of how any one board labels its columns.
+const (
+	CanonicalStateBacklog    = "backlog"
+	CanonicalStateInProgress = "in_progress"
+	CanonicalStateInReview   = "in_review"
+	CanonicalStateBlocked    = "blocked"
+	CanonicalStateDone       = "done"
+)
+
+// TransitionRequest is a board-state move resolved by the run-lifecycle
+// hook (#1012): advance the work item identified by IssueNumber to
+// CanonicalState — but only when the card's current board status is in
+// ExpectedSourceStates. That guard is load-bearing (never-fight-the-human):
+// a card a human parked elsewhere (e.g. Blocked) is left untouched and the
+// provider returns a Skipped result. Transition touches ONLY the board
+// Status column — never labels, fields, or epic links (those are filing,
+// #1005).
+//
+// States is the canonical-state -> provider-option map (Conventions.States),
+// carried on the request so the provider resolves CanonicalState and
+// ExpectedSourceStates to board options without re-reading the conventions.
+// Trigger names the lifecycle event (run_started, pr_opened, …) for audit.
+type TransitionRequest struct {
+	Item                 WorkItem
+	IssueNumber          int
+	Trigger              string
+	Target               Target
+	CanonicalState       string
+	ExpectedSourceStates []string
+	States               map[string]string
+}
+
+// TransitionResult reports what a Transition did. Moved is true with From/To
+// holding the previous and new provider-option strings when the card was
+// advanced. Skipped is true (with a SkipReason) when the move was a
+// deliberate no-op: the card is off-board, its current status is not in the
+// expected source set (the never-fight-the-human case), it is already at the
+// target, or the canonical state has no configured/board option. A non-nil
+// error from Transition is a genuine provider failure, distinct from a
+// Skipped no-op; the lifecycle hook logs it best-effort and never unwinds
+// the run.
+type TransitionResult struct {
+	Moved      bool   `json:"moved"`
+	From       string `json:"from,omitempty"`
+	To         string `json:"to,omitempty"`
+	Skipped    bool   `json:"skipped"`
+	SkipReason string `json:"skip_reason,omitempty"`
+}
+
 // Relations links a work item to other work. ParentEpic is the epic this
 // item rolls up to (an issue reference); Supersedes and CompanionTo are
 // peer links; EvidenceRuns names the run IDs that motivated the item (the

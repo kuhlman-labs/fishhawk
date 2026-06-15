@@ -479,6 +479,10 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// signal that lets operators jump to the PR from the issue thread.
 	s.notifyStatusUpdate(r.Context(), runID, "pr_opened")
 
+	// Board-state sync (#1012): the PR-opened edge advances the work item to
+	// the in_review canonical state. Best-effort; never unwinds the response.
+	s.notifyBoardTransition(r.Context(), runID, lifecyclePROpened)
+
 	s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
 		ID:          created.ID,
 		StageID:     created.StageID,

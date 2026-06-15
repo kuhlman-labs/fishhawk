@@ -37,6 +37,11 @@ type fakeAPI struct {
 	fieldsErr   error
 	meta        *githubclient.ProjectMeta
 
+	itemStatus          *githubclient.ProjectItemStatus
+	itemStatusErr       error
+	itemStatusIssueNode string
+	itemStatusProjectID string
+
 	addItemContent string
 	addItemErr     error
 	itemID         string
@@ -50,6 +55,8 @@ type fakeAPI struct {
 
 	subParent, subChild string
 	subErr              error
+
+	projectsTokenConfigured bool
 }
 
 func (f *fakeAPI) CreateIssue(_ context.Context, _ int64, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
@@ -76,6 +83,14 @@ func (f *fakeAPI) ProjectFields(_ context.Context, _ int64, coord githubclient.P
 	return f.meta, nil
 }
 
+func (f *fakeAPI) ProjectItemStatus(_ context.Context, _ int64, issueNodeID, projectID, _ string) (*githubclient.ProjectItemStatus, error) {
+	f.itemStatusIssueNode, f.itemStatusProjectID = issueNodeID, projectID
+	if f.itemStatusErr != nil {
+		return nil, f.itemStatusErr
+	}
+	return f.itemStatus, nil
+}
+
 func (f *fakeAPI) AddProjectItem(_ context.Context, _ int64, projectID, contentID string) (string, error) {
 	f.addItemContent = contentID
 	_ = projectID
@@ -94,6 +109,8 @@ func (f *fakeAPI) AddSubIssue(_ context.Context, _ int64, parentNodeID, childNod
 	f.subParent, f.subChild = parentNodeID, childNodeID
 	return f.subErr
 }
+
+func (f *fakeAPI) ProjectsTokenConfigured() bool { return f.projectsTokenConfigured }
 
 func baseRequest() workmgmt.ProviderRequest {
 	return workmgmt.ProviderRequest{
@@ -409,5 +426,222 @@ func TestProvider_File_CrossBoundary_NoProjectsTokenDegradesBoarded(t *testing.T
 	}
 }
 
-// Provider must satisfy workmgmt.Provider.
-var _ workmgmt.Provider = (*Provider)(nil)
+// canonicalStates is the conventions states map the transition tests
+// resolve canonical states to board options through.
+var canonicalStates = map[string]string{
+	workmgmt.CanonicalStateBacklog:    "Backlog",
+	workmgmt.CanonicalStateInProgress: "In Progress",
+	workmgmt.CanonicalStateInReview:   "In Review",
+	workmgmt.CanonicalStateBlocked:    "Blocked",
+	workmgmt.CanonicalStateDone:       "Done",
+}
+
+// transitionAPI returns a fakeAPI primed for a run_started move: the issue
+// resolves to a node id, the board exposes every Status option, and the
+// issue's current item carries currentStatus.
+func transitionAPI(currentStatus string, onBoard bool) *fakeAPI {
+	return &fakeAPI{
+		parentNode: "ISSUE_NODE",
+		meta: &githubclient.ProjectMeta{ProjectID: "PROJ", FieldID: "FIELD", StatusOptions: map[string]string{
+			"Backlog": "OPT_BACKLOG", "In Progress": "OPT_IP", "In Review": "OPT_IR", "Blocked": "OPT_BLOCKED", "Done": "OPT_DONE",
+		}},
+		itemStatus: &githubclient.ProjectItemStatus{OnBoard: onBoard, ItemID: "ITEM", Status: currentStatus},
+		// The transition fixtures target a user-owned board (baseRequest's
+		// Project), so a projects token must be configured for the move to be
+		// dispatched; the no-token degradation has its own test.
+		projectsTokenConfigured: true,
+	}
+}
+
+// runStartedRequest is the canonical run_started move: advance to In
+// Progress from an expected source of Backlog (unset counts as Backlog).
+func runStartedRequest() workmgmt.TransitionRequest {
+	return workmgmt.TransitionRequest{
+		IssueNumber:          1012,
+		Trigger:              "run_started",
+		Target:               baseRequest().Target,
+		CanonicalState:       workmgmt.CanonicalStateInProgress,
+		ExpectedSourceStates: []string{workmgmt.CanonicalStateBacklog},
+		States:               canonicalStates,
+	}
+}
+
+func TestProvider_Transition_MovesFromExpectedSource(t *testing.T) {
+	api := transitionAPI("Backlog", true)
+	res, err := New(api).Transition(context.Background(), runStartedRequest())
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if !res.Moved || res.From != "Backlog" || res.To != "In Progress" {
+		t.Fatalf("result = %+v, want moved Backlog->In Progress", res)
+	}
+	// The Status single-select must be set to the In Progress option on the
+	// resolved item — and nothing else (Status-only scope, #1005 split).
+	if api.setOptionID != "OPT_IP" || api.setItemID != "ITEM" || api.setFieldID != "FIELD" {
+		t.Errorf("set field call = item=%q field=%q opt=%q", api.setItemID, api.setFieldID, api.setOptionID)
+	}
+	if api.itemStatusIssueNode != "ISSUE_NODE" || api.itemStatusProjectID != "PROJ" {
+		t.Errorf("status read = node=%q project=%q", api.itemStatusIssueNode, api.itemStatusProjectID)
+	}
+	// Transition must never create an issue or touch epic links.
+	if api.createParams.Title != "" || api.subParent != "" {
+		t.Errorf("transition must not file or link: create=%+v sub=%q", api.createParams, api.subParent)
+	}
+}
+
+func TestProvider_Transition_UnsetStatusCountsAsBacklog(t *testing.T) {
+	// A fresh card with no Status set still advances on run_started, because
+	// unset is treated as Backlog (an expected source).
+	api := transitionAPI("", true)
+	res, err := New(api).Transition(context.Background(), runStartedRequest())
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if !res.Moved || res.To != "In Progress" {
+		t.Errorf("result = %+v, want moved to In Progress from unset", res)
+	}
+	if api.setOptionID != "OPT_IP" {
+		t.Errorf("set option = %q, want OPT_IP", api.setOptionID)
+	}
+}
+
+func TestProvider_Transition_NeverFightsHumanParkedCard(t *testing.T) {
+	// A human parked the card in Blocked. run_started expects a Backlog
+	// source, so the move is SKIPPED with no mutation — never-fight-the-human.
+	api := transitionAPI("Blocked", true)
+	res, err := New(api).Transition(context.Background(), runStartedRequest())
+	if err != nil {
+		t.Fatalf("Transition should not error on a skip: %v", err)
+	}
+	if res.Moved || !res.Skipped {
+		t.Fatalf("result = %+v, want skipped (not moved)", res)
+	}
+	if res.From != "Blocked" || !strings.Contains(res.SkipReason, "expected source") {
+		t.Errorf("skip = from=%q reason=%q", res.From, res.SkipReason)
+	}
+	if api.setOptionID != "" {
+		t.Errorf("Status must not be mutated on a skip, got set opt %q", api.setOptionID)
+	}
+}
+
+func TestProvider_Transition_SkipsWhenOffBoard(t *testing.T) {
+	api := transitionAPI("", false)
+	res, err := New(api).Transition(context.Background(), runStartedRequest())
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if res.Moved || !res.Skipped || !strings.Contains(res.SkipReason, "not on the project board") {
+		t.Errorf("result = %+v, want off-board skip", res)
+	}
+	if api.setOptionID != "" {
+		t.Errorf("off-board skip must not set Status, got %q", api.setOptionID)
+	}
+}
+
+func TestProvider_Transition_SkipsWhenAlreadyAtTarget(t *testing.T) {
+	// Idempotency: a card already In Progress is a no-op skip, so a
+	// reconciler re-assertion never thrashes the board.
+	api := transitionAPI("In Progress", true)
+	req := runStartedRequest()
+	// In Progress is an acceptable source for the re-assertion too.
+	req.ExpectedSourceStates = []string{workmgmt.CanonicalStateBacklog, workmgmt.CanonicalStateInProgress}
+	res, err := New(api).Transition(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if res.Moved || !res.Skipped || !strings.Contains(res.SkipReason, "already at target") {
+		t.Errorf("result = %+v, want already-at-target skip", res)
+	}
+	if api.setOptionID != "" {
+		t.Errorf("no mutation expected, got set opt %q", api.setOptionID)
+	}
+}
+
+func TestProvider_Transition_SkipsWhenNoProject(t *testing.T) {
+	req := runStartedRequest()
+	req.Target.Project = nil
+	res, err := New(transitionAPI("Backlog", true)).Transition(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if !res.Skipped || !strings.Contains(res.SkipReason, "no project configured") {
+		t.Errorf("result = %+v, want no-project skip", res)
+	}
+}
+
+func TestProvider_Transition_SkipsUserProjectWhenNoProjectsToken(t *testing.T) {
+	// Edge (approval condition): a user-owned board (Project #7) with no
+	// projects token configured is unreachable with the installation token.
+	// The move must degrade to a best-effort SKIP — never an error — so the
+	// lifecycle hook still writes a work_item_transitioned audit. No board
+	// GraphQL is dispatched (no status read, no mutation).
+	api := transitionAPI("Backlog", true)
+	api.projectsTokenConfigured = false
+	res, err := New(api).Transition(context.Background(), runStartedRequest())
+	if err != nil {
+		t.Fatalf("Transition should degrade to a skip, not error: %v", err)
+	}
+	if res.Moved || !res.Skipped {
+		t.Fatalf("result = %+v, want skipped (not moved)", res)
+	}
+	if !strings.Contains(res.SkipReason, "no projects token") {
+		t.Errorf("skip reason = %q, want it to name the missing projects token", res.SkipReason)
+	}
+	if api.itemStatusIssueNode != "" {
+		t.Errorf("no board read expected on the no-token skip, got status read for %q", api.itemStatusIssueNode)
+	}
+	if api.setOptionID != "" {
+		t.Errorf("no mutation expected on the no-token skip, got set opt %q", api.setOptionID)
+	}
+}
+
+func TestProvider_Transition_SkipsWhenTargetNotABoardOption(t *testing.T) {
+	api := transitionAPI("Backlog", true)
+	// Drop In Progress from the board's options: the target can't be set.
+	delete(api.meta.StatusOptions, "In Progress")
+	res, err := New(api).Transition(context.Background(), runStartedRequest())
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if !res.Skipped || !strings.Contains(res.SkipReason, "not a Status option") {
+		t.Errorf("result = %+v, want target-not-an-option skip", res)
+	}
+}
+
+func TestProvider_Transition_SkipsWhenCanonicalStateUnmapped(t *testing.T) {
+	req := runStartedRequest()
+	req.CanonicalState = workmgmt.CanonicalStateDone
+	delete(req.States, workmgmt.CanonicalStateDone)
+	res, err := New(transitionAPI("Backlog", true)).Transition(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if !res.Skipped || !strings.Contains(res.SkipReason, "no configured provider option") {
+		t.Errorf("result = %+v, want unmapped-canonical-state skip", res)
+	}
+}
+
+func TestProvider_Transition_ResolveErrorsPropagate(t *testing.T) {
+	api := transitionAPI("Backlog", true)
+	api.nodeIDErr = errors.New("issue gone")
+	_, err := New(api).Transition(context.Background(), runStartedRequest())
+	if err == nil || !strings.Contains(err.Error(), "resolve issue") {
+		t.Fatalf("want resolve-issue error, got %v", err)
+	}
+}
+
+func TestProvider_Transition_MissingInstallationRejected(t *testing.T) {
+	req := runStartedRequest()
+	req.Target.InstallationID = 0
+	_, err := New(transitionAPI("Backlog", true)).Transition(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "no installation id available") {
+		t.Fatalf("want missing-installation error, got %v", err)
+	}
+}
+
+// Provider must satisfy workmgmt.Provider and the optional board-sync
+// capability workmgmt.Transitioner.
+var (
+	_ workmgmt.Provider     = (*Provider)(nil)
+	_ workmgmt.Transitioner = (*Provider)(nil)
+)
