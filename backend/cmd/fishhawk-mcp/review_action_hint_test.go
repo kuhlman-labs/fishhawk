@@ -24,6 +24,22 @@ func seedFixupTriggeredAudit(fb *fakeBackend, runID, stageID uuid.UUID) {
 	fb.mu.Unlock()
 }
 
+// seedFixupNoChangesAudit appends a fixup_no_changes audit entry keyed to
+// stageID — the durable refund signal reviewActionHintFor counts to widen the
+// normal fix-up budget, mirroring the backend's no-change refund (#967).
+func seedFixupNoChangesAudit(fb *fakeBackend, runID, stageID uuid.UUID) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  &sid,
+		Category: categoryFixupNoChanges,
+	})
+	fb.mu.Unlock()
+}
+
 // seedImplementReviewedAudit appends an implement_reviewed audit entry keyed
 // to stageID carrying an approve_with_concerns verdict with n concerns — the
 // round-scoped source reviewActionHintFor counts concerns from (#860).
@@ -73,6 +89,11 @@ func TestReviewActionHintFor(t *testing.T) {
 		// prior fix-up round. The latest-round count then only includes the
 		// implement_reviewed entry seeded after them.
 		priorPasses int
+		// refunds seeds that many fixup_no_changes entries against the
+		// implement stage — no-change passes refunded against the normal
+		// budget (#967/#1150). The hint widens the normal budget by the
+		// refund count (clamped to priorPasses).
+		refunds int
 		// fixupOnOtherStage, when true, seeds the prior passes against a
 		// DIFFERENT stage so they do not count against this one.
 		fixupOnOtherStage bool
@@ -120,6 +141,69 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantConcerns:  1,
 			wantRemaining: 0,
 			wantOverride:  true,
+		},
+		{
+			// #1150 (a): a no-change pass is refunded against the normal
+			// budget — one triggered + one refund => effectiveConsumed=0 < 1
+			// => a normal route-back is restored (the core assertion the
+			// backend's widened MaxPasses admits without force_additional_pass).
+			name:          "refund restores normal budget -> route-back, no override",
+			status:        completeStatus(),
+			seedConcerns:  1,
+			priorPasses:   1,
+			refunds:       1,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 1,
+			wantOverride:  false,
+		},
+		{
+			// #1150 (c): a refund count exceeding the triggered passes is
+			// clamped to priorPasses, so remaining never widens past the
+			// normal budget. Mirrors the backend's refundedPasses>priorPasses
+			// clamp.
+			name:          "refund clamped to prior passes -> remaining capped at budget",
+			status:        completeStatus(),
+			seedConcerns:  1,
+			priorPasses:   1,
+			refunds:       2,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 1,
+			wantOverride:  false,
+		},
+		{
+			// #1150 (d): two triggered + one refund => effectiveConsumed=1,
+			// which is NOT < maxFixupPasses(1), so the NORMAL arm does not
+			// fire — the override arm does. raw priorPasses=2 is still < the
+			// hard ceiling of 3, so an override pass is available. Proves the
+			// override arm keys off RAW priorPasses, not effectiveConsumed.
+			name:          "two passes, one refund -> override (keys off raw priorPasses)",
+			status:        completeStatus(),
+			seedConcerns:  1,
+			priorPasses:   2,
+			refunds:       1,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 0,
+			wantOverride:  true,
+		},
+		{
+			// #1150 (d) boundary: three triggered + one refund =>
+			// effectiveConsumed=2. If the ceiling arm wrongly keyed off
+			// effectiveConsumed (2 < 3) it would still offer an override; it
+			// must key off RAW priorPasses=3, which is at the ceiling => no
+			// override left. This is the case that truly distinguishes raw
+			// from effective.
+			name:          "ceiling keys off raw passes despite refund -> no override",
+			status:        completeStatus(),
+			seedConcerns:  1,
+			priorPasses:   3,
+			refunds:       1,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 0,
+			wantOverride:  false,
 		},
 		{
 			name:          "ceiling reached -> hard-stop hint, no override",
@@ -194,6 +278,9 @@ func TestReviewActionHintFor(t *testing.T) {
 				} else {
 					seedFixupTriggeredAudit(fb, runID, implementStageID)
 				}
+			}
+			for i := 0; i < tc.refunds; i++ {
+				seedFixupNoChangesAudit(fb, runID, implementStageID)
 			}
 			if tc.seedConcerns > 0 {
 				seedImplementReviewedAudit(fb, runID, implementStageID, tc.seedConcerns)

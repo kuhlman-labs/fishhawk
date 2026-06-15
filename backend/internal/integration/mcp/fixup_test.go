@@ -1388,6 +1388,120 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
 	}
 }
 
+// TestE2E_Fixup_NoChangeRefundRestoresHintBudget drives the #1150 seam end to
+// end: the MCP review-action hint must mirror the backend's no-change fix-up
+// refund (#967). The per-layer units can't cover the seam (cf. #618) — it lives
+// between the backend's refund accounting (handleFixupStage /
+// countFixupNoChangeRefunds, which widens MaxPasses so a refunded normal pass is
+// admissible WITHOUT force_additional_pass) and the INDEPENDENT MCP surface
+// (reviewActionHintFor, which before #1150 derived RemainingFixupBudget from the
+// RAW stage_fixup_triggered count alone). Without the fix the operator saw
+// remaining_budget=0 + a forced-override route after a verified no-op pass while
+// the backend would actually admit a normal pass — the perceived wedge in run
+// a4cfd41b.
+//
+// Flow: implement stage at the gate with an approve_with_concerns verdict → one
+// real fix-up pass (spends the normal budget, one stage_fixup_triggered) → a
+// {outcome:"fixup_no_changes"} /pull-request report (writes the fixup_no_changes
+// audit entry the refund counts) → a fresh round-2 implement_reviewed concern
+// after the fix-up boundary → assert get_run_status's review_action_hint reports
+// RemainingFixupBudget==1 and OverrideAvailable==false, proving the surface
+// agrees with the backend's admit-a-normal-pass decision rather than reporting a
+// spent budget + forced override.
+func TestE2E_Fixup_NoChangeRefundRestoresHintBudget(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+
+	// 1. Implement stage parked at the review gate (a valid fix-up candidate).
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	// 2. Record an implement-review approve_with_concerns verdict keyed to the
+	// stage — the round-1 concern routed back by the fix-up.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+
+	// 3. Spend the NORMAL fix-up budget via the real fix-up tool — one
+	// stage_fixup_triggered entry lands in Postgres.
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": stage.ID.String(),
+			"concerns": []int{0},
+			"reason":   "route the concern back onto the branch",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, res))
+	}
+
+	// 4. The re-dispatch produced no commit — ship the
+	// {outcome:"fixup_no_changes"} report through the real /pull-request
+	// handler, which writes the fixup_no_changes audit entry the #967 refund
+	// (and the #1150 hint mirror) count.
+	branch := "fishhawk/run-" + fx.runID.String()[:8] + "/stage-" + stage.ID.String()[:8]
+	reportFixupNoChangesViaBackend(t, ctx, fx, stage.ID, branch)
+
+	// 5. The re-review of the fix-up head lands a fresh concern AFTER the
+	// fix-up boundary (re-park the gate first, the shape the re-review leaves).
+	// This both restores the implement review to 'complete' and supplies the
+	// round-scoped concern the hint surfaces.
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "the re-review still sees drift"})
+
+	// 6. The hint mirrors the backend's refund: the no-change pass was refunded
+	// against the NORMAL budget, so a normal route-back is restored —
+	// RemainingFixupBudget==1 and OverrideAvailable==false, NOT remaining=0 +
+	// forced override (the pre-#1150 wedge surface).
+	hint := getReviewActionHint(t, ctx, session, fx.runID)
+	if hint == nil {
+		t.Fatalf("review_action_hint absent after the refunded no-change pass; want a populated hint")
+	}
+	if hint.RemainingFixupBudget != 1 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d, want 1 (the no-change pass was refunded against the normal budget — the surface must agree with the backend's admit-a-normal-pass decision)", hint.RemainingFixupBudget)
+	}
+	if hint.OverrideAvailable {
+		t.Errorf("review_action_hint.override_available = true, want false (a normal pass is available after the refund — no forced override needed)")
+	}
+	if !strings.Contains(hint.Message, "fishhawk_fixup_stage") {
+		t.Errorf("review_action_hint.message should point at fishhawk_fixup_stage; got %q", hint.Message)
+	}
+
+	// #1024 agreement: the next_actions concern arm derives FROM the same hint
+	// value, so the two surfaces must agree — a below-budget normal fixup
+	// (consuming fixup_budget), not a forced override.
+	na := getNextActions(t, ctx, session, fx.runID)
+	if na == nil || na.State != "implement_concerns_open" {
+		t.Fatalf("next_actions = %+v, want state implement_concerns_open alongside the refunded hint", na)
+	}
+	fixupAction := na.Actions[0]
+	if fixupAction.Action != "fishhawk_fixup_stage" || fixupAction.Consumes != "fixup_budget" {
+		t.Fatalf("actions[0] = %+v, want a below-budget fishhawk_fixup_stage consuming fixup_budget", fixupAction)
+	}
+	if _, forced := fixupAction.Params["force_additional_pass"]; forced {
+		t.Errorf("refunded-budget fixup action must NOT carry force_additional_pass; params = %v", fixupAction.Params)
+	}
+}
+
 // TestE2E_Fixup_AwaitReviewWaitsForReReviewOfFixupHead drives the #894 seam
 // end to end: fishhawk_await_review (and the get_run_status
 // implement_review_status it shares) must NOT report the PRE-fix-up review as
