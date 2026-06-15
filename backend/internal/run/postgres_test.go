@@ -14,6 +14,7 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -1027,5 +1028,196 @@ func TestPostgres_SumWorkflowCostInRange(t *testing.T) {
 	}
 	if got != 0 {
 		t.Errorf("unknown-workflow sum = %v, want 0", got)
+	}
+}
+
+// resumeAppender is the optional combined-commit capability the
+// clarification handler type-asserts on the concrete postgres repo
+// (#1090). It is not part of run.Repository, so the test asserts it the
+// same way the handler does.
+type resumeAppender interface {
+	ResumeAwaitingInputAndAppend(ctx context.Context, stageID uuid.UUID, p audit.ChainAppendParams) (*run.Stage, bool, error)
+}
+
+// seedAwaitingInputStage creates a run + plan stage and walks it
+// pending → running → awaiting_input, the state a clarification_request
+// parks a plan stage at.
+func seedAwaitingInputStage(t *testing.T, repo run.Repository) (*run.Run, *run.Stage) {
+	t.Helper()
+	ctx := context.Background()
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		if _, err := repo.TransitionStage(ctx, s.ID, to, nil); err != nil {
+			t.Fatalf("transition to %s: %v", to, err)
+		}
+	}
+	parked, err := repo.TransitionStage(ctx, s.ID, run.StageStateAwaitingInput, nil)
+	if err != nil {
+		t.Fatalf("transition to awaiting_input: %v", err)
+	}
+	return r, parked
+}
+
+// clarificationParams builds a clarification_answered ChainAppendParams
+// for the run/stage with the given JSON payload bytes.
+func clarificationParams(runID, stageID uuid.UUID, payload []byte) audit.ChainAppendParams {
+	sid := stageID
+	subject := "operator@example.com"
+	kind := audit.ActorKind("user")
+	return audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &sid,
+		Timestamp:    time.Now().UTC(),
+		Category:     "clarification_answered",
+		ActorKind:    &kind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}
+}
+
+func TestPostgres_ResumeAwaitingInputAndAppend_HappyPath(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	ra, ok := repo.(resumeAppender)
+	if !ok {
+		t.Fatal("postgres repo does not implement ResumeAwaitingInputAndAppend")
+	}
+	auditRepo := audit.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r, parked := seedAwaitingInputStage(t, repo)
+	payload := []byte(`{"conditions":"Q1: Postgres"}`)
+
+	stage, won, err := ra.ResumeAwaitingInputAndAppend(ctx, parked.ID, clarificationParams(r.ID, parked.ID, payload))
+	if err != nil {
+		t.Fatalf("ResumeAwaitingInputAndAppend: %v", err)
+	}
+	if !won {
+		t.Fatal("won = false, want true for the single resuming caller")
+	}
+	if stage.State != run.StageStatePending {
+		t.Errorf("stage state = %q, want pending", stage.State)
+	}
+
+	// The stage really committed at pending.
+	got, err := repo.GetStage(ctx, parked.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStatePending {
+		t.Errorf("persisted stage state = %q, want pending", got.State)
+	}
+
+	// Exactly one clarification_answered entry persisted in the same tx.
+	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, "clarification_answered")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("clarification_answered entries = %d, want 1", len(entries))
+	}
+}
+
+func TestPostgres_ResumeAwaitingInputAndAppend_AppendFailureRollsBack(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	ra, ok := repo.(resumeAppender)
+	if !ok {
+		t.Fatal("postgres repo does not implement ResumeAwaitingInputAndAppend")
+	}
+	auditRepo := audit.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r, parked := seedAwaitingInputStage(t, repo)
+
+	// PostgreSQL jsonb rejects the \u0000 unicode escape in string values,
+	// so the audit INSERT fails AFTER the stage CAS — the whole transaction
+	// must roll back, leaving the stage at awaiting_input.
+	payload := []byte(`{"conditions":"\u0000"}`)
+	stage, won, err := ra.ResumeAwaitingInputAndAppend(ctx, parked.ID, clarificationParams(r.ID, parked.ID, payload))
+	if err == nil {
+		t.Fatal("expected an error from the jsonb \\u0000 append, got nil")
+	}
+	if won {
+		t.Error("won = true on a rolled-back transaction; want false")
+	}
+	if stage != nil {
+		t.Errorf("stage = %+v on failure, want nil", stage)
+	}
+
+	// The stage stayed re-answerable at awaiting_input (rollback worked).
+	got, err := repo.GetStage(ctx, parked.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingInput {
+		t.Errorf("stage state = %q after rollback, want awaiting_input", got.State)
+	}
+
+	// No orphaned audit entry.
+	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, "clarification_answered")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("clarification_answered entries = %d after rollback, want 0", len(entries))
+	}
+}
+
+func TestPostgres_ResumeAwaitingInputAndAppend_LoserCAS(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	ra, ok := repo.(resumeAppender)
+	if !ok {
+		t.Fatal("postgres repo does not implement ResumeAwaitingInputAndAppend")
+	}
+	auditRepo := audit.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r, parked := seedAwaitingInputStage(t, repo)
+
+	// First caller wins and moves the stage to pending.
+	if _, won, err := ra.ResumeAwaitingInputAndAppend(ctx, parked.ID, clarificationParams(r.ID, parked.ID, []byte(`{"conditions":"first"}`))); err != nil || !won {
+		t.Fatalf("first call: won=%v err=%v, want won=true err=nil", won, err)
+	}
+
+	// Second caller observes the stage already pending: won=false, no new
+	// audit entry, no error.
+	stage, won, err := ra.ResumeAwaitingInputAndAppend(ctx, parked.ID, clarificationParams(r.ID, parked.ID, []byte(`{"conditions":"second"}`)))
+	if err != nil {
+		t.Fatalf("second call err = %v, want nil", err)
+	}
+	if won {
+		t.Error("second call won = true, want false (loser of the CAS)")
+	}
+	if stage == nil || stage.State != run.StageStatePending {
+		t.Errorf("loser stage = %+v, want pending row", stage)
+	}
+
+	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, "clarification_answered")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("clarification_answered entries = %d, want 1 (loser must not append)", len(entries))
+	}
+}
+
+func TestPostgres_ResumeAwaitingInputAndAppend_MissingStage(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	ra, ok := repo.(resumeAppender)
+	if !ok {
+		t.Fatal("postgres repo does not implement ResumeAwaitingInputAndAppend")
+	}
+	ctx := context.Background()
+
+	_, won, err := ra.ResumeAwaitingInputAndAppend(ctx, uuid.New(), clarificationParams(uuid.New(), uuid.New(), []byte(`{}`)))
+	if !errors.Is(err, run.ErrNotFound) {
+		t.Fatalf("err = %v, want run.ErrNotFound", err)
+	}
+	if won {
+		t.Error("won = true for a missing stage, want false")
 	}
 }

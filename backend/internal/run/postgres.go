@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	rundb "github.com/kuhlman-labs/fishhawk/backend/internal/run/db"
 )
 
@@ -496,6 +497,78 @@ func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to Sta
 		return nil, err
 	}
 	return result, nil
+}
+
+// ResumeAwaitingInputAndAppend atomically re-opens a parked plan stage
+// (awaiting_input → pending) AND appends the clarification_answered
+// audit entry in ONE pgx transaction (#1090). It closes the
+// append-after-transition gap in the clarification answer-and-resume
+// seam: if the audit append fails, the closure returns an error so
+// BeginFunc rolls the whole transaction back and the stage stays at
+// awaiting_input (re-answerable), instead of being left pending with no
+// persisted answer.
+//
+// The compare-and-set under the stage row lock is the single-winner
+// gate for a double-submit: a concurrent caller that arrives after the
+// stage left awaiting_input observes current.State != awaiting_input,
+// gets won=false (nil error), and never appends an orphaned audit
+// entry. The winning caller gets won=true and the updated stage.
+//
+// Both repos are constructed from the same *pgxpool.Pool, so a single
+// transaction spans the stages and audit_entries tables. Lock order is
+// stage-row then run-row (audit.AppendChainedTx locks the run); no
+// other path holds the run lock while waiting on a stage lock, so no
+// deadlock is introduced.
+//
+// This is an OPTIONAL capability on the concrete postgres repo (not on
+// the Repository interface): the clarification handler type-asserts it
+// and falls back to the two-step path for in-memory fakes.
+func (r *postgresRepo) ResumeAwaitingInputAndAppend(ctx context.Context, stageID uuid.UUID, p audit.ChainAppendParams) (*Stage, bool, error) {
+	var result *Stage
+	won := false
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		current, err := q.LockStageForUpdate(ctx, stageID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock stage: %w", err)
+		}
+		// Compare-and-set: only the caller that observes the stage still
+		// parked moves it. A loser of a double-submit commits a no-op
+		// (won stays false) and writes no audit entry.
+		if StageState(current.State) != StageStateAwaitingInput {
+			result = rowToStage(current)
+			return nil
+		}
+
+		// pending is non-terminal and not Running, so neither started_at
+		// nor ended_at is stamped — mirrors TransitionStage's handling of
+		// this target.
+		updated, err := q.UpdateStageState(ctx, rundb.UpdateStageStateParams{
+			ID:    stageID,
+			State: string(StageStatePending),
+		})
+		if err != nil {
+			return fmt.Errorf("update stage state: %w", err)
+		}
+
+		// Append the clarification_answered entry in the SAME tx. Any
+		// error here aborts the closure so BeginFunc rolls back the
+		// transition too — the stage stays awaiting_input.
+		if _, err := audit.AppendChainedTx(ctx, tx, p); err != nil {
+			return err
+		}
+
+		result = rowToStage(updated)
+		won = true
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return result, won, nil
 }
 
 // RetryStage is the explicit override out of a terminal state. The
