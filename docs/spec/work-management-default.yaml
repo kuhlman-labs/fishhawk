@@ -75,7 +75,7 @@ types:
     epic_link: required
 
   bug:
-    title_format: "{summary}"
+    title_format: "[E{epic}.{n}] {summary}"
     body_skeleton:
       - Summary
       - Observed
@@ -91,7 +91,7 @@ types:
     epic_link: optional
 
   chore:
-    title_format: "{summary}"
+    title_format: "[E{epic}.{n}] {summary}"
     body_skeleton:
       - Summary
       - Done-means
