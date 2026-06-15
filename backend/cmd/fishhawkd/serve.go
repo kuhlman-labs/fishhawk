@@ -625,12 +625,18 @@ func runServe(args []string, logSink io.Writer) int {
 			ExternalURL: cfg.ExternalURL,
 		})
 		cfg.WebhookDispatcher = &webhook.Dispatcher{
-			GitHub:        cfg.GitHub,
-			Runs:          cfg.RunRepo,
-			Audit:         cfg.AuditRepo,
-			Artifacts:     cfg.ArtifactRepo,
-			Logger:        logger,
-			IssueNotifier: notifier,
+			GitHub:    cfg.GitHub,
+			Runs:      cfg.RunRepo,
+			Audit:     cfg.AuditRepo,
+			Artifacts: cfg.ArtifactRepo,
+			Logger:    logger,
+			// Route the webhook surfaces through the Channel abstraction
+			// too (ADR-015 #79): the Router satisfies the dispatcher's
+			// narrower webhook.IssueNotifier subset and fans out to the v0
+			// GitHub-comment channel. NewRouter over a nil *Notifier still
+			// degrades to a no-op via the Router's nil-channel skipping, so
+			// the empty-ExternalURL posture is unchanged.
+			IssueNotifier: issuecomment.NewRouter(notifier),
 			// PlanReviewerConfigured mirrors the run-create guard's
 			// default-reviewer check (#574) so the webhook-dispatcher
 			// path refuses an agent-gated plan stage with no reviewer

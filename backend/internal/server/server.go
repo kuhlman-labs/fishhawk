@@ -310,10 +310,14 @@ type Server struct {
 	auditCheckPublisher *auditcheckpublisher.Publisher
 
 	// issueNotifier posts pickup-ack and plan-ready comments back
-	// to the triggering GitHub issue (#234). nil when the deps
-	// don't add up (no GitHub client, no audit repo, or no
-	// ExternalURL). Concurrent NotifyXxx calls are safe.
-	issueNotifier *issuecomment.Notifier
+	// to the triggering GitHub issue (#234). Typed as the
+	// issuecomment.Channel seam (ADR-015 #79 option B): server.New
+	// wires an issuecomment.Router fanning out to the v0 GitHub-comment
+	// channel, so a future Slack adapter drops in with no call-site
+	// change. nil when the deps don't add up (no GitHub client, no
+	// audit repo, or no ExternalURL). Concurrent NotifyXxx calls are
+	// safe.
+	issueNotifier issuecomment.Channel
 
 	// bgReviews tracks detached advisory plan/implement review
 	// goroutines (#584). Advisory-mode agent review is dispatched off
@@ -436,7 +440,13 @@ func New(cfg Config) *Server {
 			OnDegraded:  s.auditCheckPublishDegraded,
 			OnRecovered: s.auditCheckPublishRecovered,
 		})
-		s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		// Wire the GitHub-comment channel behind the Router seam (ADR-015
+		// #79). Guard the wrap on a non-nil channel so a nil notifier
+		// (e.g. empty ExternalURL) leaves s.issueNotifier as a nil
+		// interface, NOT a non-nil Router over a typed-nil channel —
+		// preserving the exact nil semantics approvalCommandConfigured and
+		// the trace.go guards depend on (no behavior change).
+		if ghChannel := issuecomment.New(issuecomment.Deps{
 			GitHub:      cfg.GitHub,
 			Runs:        cfg.RunRepo,
 			Audit:       cfg.AuditRepo,
@@ -447,7 +457,9 @@ func New(cfg Config) *Server {
 			// green e2e — the sibling auditcheckpublisher.New above already
 			// passes the same cfg.ArtifactRepo.
 			Artifacts: cfg.ArtifactRepo,
-		})
+		}); ghChannel != nil {
+			s.issueNotifier = issuecomment.NewRouter(ghChannel)
+		}
 	}
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
