@@ -84,6 +84,25 @@ var ErrFixupCreatedOutOfScope = fmt.Errorf("%w (fix-up)", ErrCreatedOutOfScope)
 // commit's content is the declared scope and nothing else.
 var ErrCommitOutOfScope = errors.New("gitops: commit contains out-of-scope paths")
 
+// ErrScopeFilesMissing is the pre-push scope-completeness (shortfall) sentinel
+// (#1151): the inverse of ErrCommitOutOfScope / ErrCreatedOutOfScope. After the
+// scope-only commit on the standalone open-PR push path, the runner asserts the
+// committed file set TOUCHES every CONCRETE declared scope.files path. When a
+// declared path was NOT touched, the agent dropped an edit the approved plan
+// required — the #1148 subset-PR class (run a4cfd41b: 8 declared scope files,
+// only 6 committed, dropping the two edits that fixed the bug; PR #1149 opened
+// anyway and burned a full review + a no-op fix-up). A VerifyCommit branch wraps
+// this (via fmt.Errorf("%w: ...")) and returns it BEFORE the push, so origin is
+// untouched (no broken branch, no PR). The runner classifies it category-B
+// (re-scope/re-plan). Trailing-slash directory-prefix scope entries are skipped
+// (a folded directory cannot require any specific touched path), so only
+// exact-match concrete declared paths are enforced. The v1 gate is STRICT: an
+// in-band self-exempt for a deliberately-no-op declared file is deferred to
+// #1153. The gate runs only on the standalone open-PR push — fix-ups (which
+// legitimately touch fewer files than the full scope) and decomposed children
+// (narrowed slice scope on a shared branch) are excluded.
+var ErrScopeFilesMissing = errors.New("gitops: commit did not touch every declared scope file")
+
 // ErrCommittedTestsFailed is the test-gate analogue of
 // ErrCommitWouldNotCompile (#800): the scope-only committed tree COMPILES
 // (go vet passes) but a touched package's tests fail because a build- or
@@ -813,6 +832,57 @@ func (p *Pusher) assertCommitInScope(ctx context.Context, repoDir, headSHA strin
 			ErrCommitOutOfScope, headSHA, len(violations), strings.Join(violations, ", "))
 	}
 	return nil
+}
+
+// MissingScopeFiles enforces the pre-push scope-completeness (shortfall) gate
+// (#1151): it enumerates the file set the commit at headSHA changed relative to
+// its parent and returns BOTH the subset of declared CONCRETE paths the commit
+// did NOT touch (missing) and the full committed path set (committed). It is the
+// inverse of assertCommitInScope — that proves every committed path is declared,
+// this proves every declared concrete path is committed.
+//
+// It runs `git diff-tree -r -z --no-commit-id --name-only <headSHA>` — the same
+// NUL-separated, quotePath-immune enumeration assertCommitInScope relies on (the
+// commit is always parented, so diff-tree lists its FULL change set against the
+// parent, not an incremental delta). A delete-operation declared path the commit
+// actually deletes shows up as a changed (status D) path, so it counts as
+// touched and does not false-trip. Trailing-slash directory-prefix declared
+// entries are skipped (newScopeMatcher's split semantics) — a folded directory
+// cannot require any specific touched path — so only exact-match concrete paths
+// are required. The returned committed set lets the caller render the precise
+// "declared N scope files, committed M" message and populate the
+// scope_files_missing event from real data rather than a recomputation.
+//
+// Package-level (not a *Pusher method) like UntrackedPaths: the caller is the
+// VerifyCommit closure with no *Pusher in scope.
+func MissingScopeFiles(ctx context.Context, repoDir, headSHA string, declared []string) (missing []string, committed []string, err error) {
+	out, err := (&Pusher{}).runOut(ctx, repoDir, "diff-tree", "-r", "-z", "--no-commit-id", "--name-only", headSHA)
+	if err != nil {
+		return nil, nil, fmt.Errorf("gitops: diff-tree %s: %w", headSHA, err)
+	}
+	present := make(map[string]bool)
+	for _, path := range strings.Split(out, "\x00") {
+		if path == "" {
+			continue
+		}
+		if !present[path] {
+			present[path] = true
+			committed = append(committed, path)
+		}
+	}
+	// Require only the exact-match concrete declared paths: a trailing-slash
+	// entry is a folded directory prefix (#824) that cannot require any specific
+	// touched path. Iterate the declared slice (not newScopeMatcher's map) to
+	// keep the missing list order-preserving.
+	for _, d := range declared {
+		if strings.HasSuffix(d, "/") {
+			continue
+		}
+		if !present[d] {
+			missing = append(missing, d)
+		}
+	}
+	return missing, committed, nil
 }
 
 // hasDirPrefix reports whether path lies under any of the trailing-slash

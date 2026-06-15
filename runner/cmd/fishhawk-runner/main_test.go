@@ -9885,3 +9885,43 @@ func TestRun_ClarificationRequest_NotDemotedToCategoryB(t *testing.T) {
 		t.Errorf("missing policy_event outcome=clarification_request in bundle:\n%+v", events)
 	}
 }
+
+// TestMissingScopeFilesMessage covers the operation-annotated category-B
+// message builder for the pre-push scope-completeness (shortfall) gate
+// (#1151): each missing path renders with its declared operation, a missing
+// path with no matching scope entry renders bare, and the declared/committed
+// counts appear in the preamble.
+func TestMissingScopeFilesMessage(t *testing.T) {
+	scopeFiles := []upload.ScopeFile{
+		{Path: "a.go", Operation: "modify"},
+		{Path: "b.go", Operation: "create"},
+		{Path: "c.go", Operation: "delete"},
+	}
+	msg := missingScopeFilesMessage(scopeFiles, []string{"a.go", "c.go"}, 3, 1)
+
+	if !strings.Contains(msg, "a.go (modify)") {
+		t.Errorf("message %q must annotate a.go with its modify operation", msg)
+	}
+	if !strings.Contains(msg, "c.go (delete)") {
+		t.Errorf("message %q must annotate c.go with its delete operation", msg)
+	}
+	if strings.Contains(msg, "b.go") {
+		t.Errorf("message %q must not name b.go: it was not in the missing set", msg)
+	}
+	if !strings.Contains(msg, "declared 3 scope file(s), committed 1") {
+		t.Errorf("message %q must carry the declared/committed counts", msg)
+	}
+	if !strings.Contains(msg, "#1153") {
+		t.Errorf("message %q must point recovery at the deferred self-exempt follow-up #1153", msg)
+	}
+
+	// A missing path with no matching scope entry (operation unknown) renders
+	// bare rather than with an empty parenthesized operation.
+	bare := missingScopeFilesMessage(scopeFiles, []string{"unknown.go"}, 3, 2)
+	if strings.Contains(bare, "unknown.go (") {
+		t.Errorf("message %q must render an unmatched path without an empty operation suffix", bare)
+	}
+	if !strings.Contains(bare, "unknown.go") {
+		t.Errorf("message %q must still name the unmatched missing path", bare)
+	}
+}
