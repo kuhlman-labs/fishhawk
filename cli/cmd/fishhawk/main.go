@@ -15,6 +15,7 @@
 //	fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
 //	fishhawk file-issue   --repo R --type T --summary S [--body B] [--label L]... [--parent-epic E] [--run-id ID] [--output text|json]
 //	fishhawk diagnose     <run-id> [--output text|json]
+//	fishhawk report-issue <run-id> [--kind bug|feature] [--description T] [--include-free-text] [--output text|json]
 //
 // Auth is the same `bearerToken` scheme defined in the OpenAPI:
 // CLI sends `Authorization: Bearer <token>` from --token /
@@ -71,6 +72,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runFileIssue(rest, stdout, stderr)
 	case "diagnose":
 		return runDiagnose(rest, stdout, stderr)
+	case "report-issue":
+		return runReportIssue(rest, stdout, stderr)
 	case "version", "--version":
 		if version.GitSHA != "unknown" {
 			_, _ = fmt.Fprintf(stdout, "%s (%s)\n", version.Version, version.GitSHA)
@@ -121,6 +124,7 @@ func printUsage(w io.Writer) {
 		"  doctor       Run local-loop install checks.",
 		"  file-issue   File a work item (issue/bug/chore/adr) via repo conventions.",
 		"  diagnose     Show a run's product-facts diagnostic bundle.",
+		"  report-issue File an upstream Fishhawk product bug/feature with a redacted, deduped bundle.",
 		"  runner start Spawn the fishhawk-runner locally against an already-minted run (Phase C of E22 / #389).",
 		"  version      Print the CLI version and exit.",
 		"  help         Show this help.",
