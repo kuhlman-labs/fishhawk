@@ -102,6 +102,17 @@ type Client struct {
 	// production this wraps githubapp.Signer.Sign(0); tests inject
 	// a stub that returns a fixed string.
 	AppJWT func() (string, error)
+
+	// ProjectsToken is an optional static user PAT/UAT carrying the
+	// `project` scope. Empty → not configured. It is used ONLY for
+	// GraphQL against USER-owned Projects (v2) boards, which App
+	// installation tokens cannot reach — there is no user-projects
+	// permission for GitHub Apps (#1114). doGraphQL swaps to this
+	// token only when the request opts in via WithProjectsToken AND
+	// this field is non-empty; otherwise the installation-token path
+	// is unchanged. It is backend config, never run data — it MUST
+	// NOT be logged, traced, or included in any error message.
+	ProjectsToken string
 }
 
 // New returns a Client with sensible defaults. tokens is required;
@@ -2213,6 +2224,23 @@ func (c *Client) buildRequest(ctx context.Context, method, url string, body io.R
 	if err != nil {
 		return nil, fmt.Errorf("githubclient: get token: %w", err)
 	}
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	return req, nil
+}
+
+// buildStaticTokenRequest constructs an http.Request authenticated with a
+// caller-supplied static token (the projects PAT/UAT — Client.ProjectsToken)
+// instead of resolving an installation token. Used only by doGraphQL for
+// user-owned Projects v2 boards, which installation tokens cannot reach
+// (#1114). Header shape is identical to buildRequest so only the token value
+// differs. The token value is never logged or surfaced in errors.
+func (*Client) buildStaticTokenRequest(ctx context.Context, method, url string, body io.Reader, token string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("githubclient: build request: %w", err)

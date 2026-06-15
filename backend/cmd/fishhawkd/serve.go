@@ -292,6 +292,9 @@ func runServe(args []string, logSink io.Writer) int {
 	githubAppKeyFile := fs.String("github-app-private-key-file",
 		envOr("FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE", ""),
 		"path to the GitHub App's PEM-encoded RSA private key")
+	projectsToken := fs.String("projects-token",
+		envOr("FISHHAWKD_PROJECTS_TOKEN", ""),
+		"optional user PAT/UAT with the `project` scope; lets fishhawk_file_issue board items on a USER-owned Projects v2 board, which App installation tokens cannot reach")
 	enableSLATimer := fs.Bool("enable-sla-timer",
 		envOr("FISHHAWKD_ENABLE_SLA_TIMER", "false") == "true",
 		"start the approval SLA timeout ticker; off by default to keep dev runs from racing with the timer")
@@ -589,8 +592,16 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 		cfg.GitHubTokens = githubapp.NewCachedProvider(githubapp.NewClient(signer))
 		cfg.GitHub = githubclient.NewWithSigner(cfg.GitHubTokens, signer)
+		// Optional user-scoped projects token. Presence-only log: the token
+		// is a secret and must never be logged or traced (#1114). Absent, a
+		// user-owned project board stays best-effort boarded:false (#1107).
+		cfg.GitHub.ProjectsToken = *projectsToken
 		logger.Info("github app + REST client configured",
-			slog.Int64("app_id", appID))
+			slog.Int64("app_id", appID),
+			slog.Bool("projects_token_configured", *projectsToken != ""))
+		if *projectsToken == "" {
+			logger.Info("FISHHAWKD_PROJECTS_TOKEN not set; user-owned Projects v2 board placement stays best-effort boarded:false (#1107)")
+		}
 	} else {
 		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
 	}
