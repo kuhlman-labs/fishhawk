@@ -626,6 +626,30 @@ The `Notifier`'s `contextFor` / `contextForStatus` helpers gate the skip:
 missing `installation_id`, unparseable `trigger_ref`, or non-issue
 `trigger_source` short-circuits before any GitHub call.
 
+### Channel routing (ADR-015 #79 option B)
+
+Every surface above is delivered through the `Channel` interface
+(`channel.go`). In v0 there is exactly ONE channel — the GitHub-comment
+channel, `*Notifier` — and `Router` (`NewRouter(channels…)`) is the
+notification core that fans each `Notify*` call out to its registered
+channels. With a single channel the fan-out is a pass-through, so the
+routing structure changed but the delivered output did not.
+
+The **(audit category, kind) taxonomy** in the table above is the routing
+key: a channel decides what to deliver and how to dedup from that taxonomy.
+A future Slack adapter (v0.x) is a new `Channel` appended to the Router —
+no change to the core, the call sites, or this GitHub channel. Two v0
+semantics to carry forward when that adapter lands:
+
+- `Router.NotifyBudgetAlert` returns `posted = OR` across channels, and the
+  cross-run `budget_alert_sent` dedup marker (#758) keys off "any channel
+  posted". For v0's single channel this is exactly the channel's own value;
+  per-channel dedup (so a Slack post doesn't suppress a GitHub post) is a
+  deferred v0.x design.
+- The Router is nil-safe (nil receiver / nil channel entries skipped),
+  matching the existing nil-safe `Notifier` posture, so call sites need no
+  nil checks.
+
 ## Local-runner runs (#416, #428)
 
 For runs minted with `runner_kind=local`, the backend's `IssueNotifier` is a

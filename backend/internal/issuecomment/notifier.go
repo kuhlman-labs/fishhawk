@@ -145,6 +145,13 @@ type PlanArtifactLister interface {
 // share — methods are safe for concurrent use (each post writes an
 // independent audit entry, and the dedup check is read-then-write
 // scoped to a single run).
+//
+// Notifier is the GitHub-comment Channel: the first (and, in v0, only)
+// channel behind the Channel routing abstraction (ADR-015 #79 option B).
+// Its method set IS the Channel surface, so it satisfies Channel
+// unchanged (the compile-time assertion lives in channel.go) and the
+// Router fans every Notify* call out to it. A future Slack adapter is a
+// sibling Channel, not a change to this type.
 type Notifier struct {
 	github      IssueCommenter
 	runs        run.Repository
