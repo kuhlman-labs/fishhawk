@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/diagnostics"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/redaction"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -38,13 +39,17 @@ const productRepo = "kuhlman-labs/fishhawk"
 const categoryProductReportFiled = "product_report_filed"
 
 // productReportRequest is the POST /v0/runs/{run_id}/product-reports body.
-// Slice 2 (the egress path) carries product facts ONLY: `kind` selects
-// the report flavor (bug default; feature for an enhancement request) and
-// nothing else crosses. The operator free-text description plus its
-// include_free_text consent + redaction are added by slice 3 on top of
-// this same endpoint.
+// `kind` selects the report flavor (bug default; feature for an enhancement
+// request). The egress carries product facts ONLY unless the caller sets
+// the explicit consent flag: `description` (operator free text) crosses the
+// boundary ONLY when `include_free_text` is true, and even then it is run
+// through backend/internal/redaction FIRST (the hard consent/redaction
+// contract, #1006 slice 3). Without the flag, `description` is ignored and
+// nothing but product facts leaves the boundary.
 type productReportRequest struct {
-	Kind string `json:"kind,omitempty"`
+	Kind            string `json:"kind,omitempty"`
+	Description     string `json:"description,omitempty"`
+	IncludeFreeText bool   `json:"include_free_text,omitempty"`
 }
 
 // productReportResponse echoes what left the boundary so the caller can
@@ -172,6 +177,12 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 	bundle := diagnostics.Collect(runRow, stages, auditEntries, currentVersionFacts())
 	fingerprint := bundleFingerprint(bundle)
 
+	// Consent/redaction boundary (binding condition 2): operator free text
+	// crosses ONLY when include_free_text is set, and even then it is run
+	// through redaction.RedactDefault FIRST. Without the flag, freeText stays
+	// empty and the report carries product facts only.
+	freeText := redactedFreeText(req)
+
 	owner, name, _ := splitRepoFullName(productRepo)
 	target := workmgmt.Target{Repo: workmgmt.Repo{Owner: owner, Name: name}}
 	// Installation: the source run supplies the installation that can act
@@ -195,7 +206,7 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 	if existing != nil {
 		// Dedup hit: append an occurrence comment, create nothing.
 		if err := provider.AppendOccurrence(r.Context(), target, existing.Number,
-			renderOccurrenceComment(bundle, fingerprint)); err != nil {
+			renderOccurrenceComment(bundle, fingerprint, freeText)); err != nil {
 			s.writeError(w, r, http.StatusBadGateway, "product_report_failed",
 				"could not append occurrence to the existing report", map[string]any{"error": err.Error()})
 			return
@@ -205,7 +216,7 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		// Dedup miss: file a new fingerprint-marked report.
 		created, err := provider.File(r.Context(), target, workmgmt.FeedbackReport{
 			Title:       renderReportTitle(bundle, req.Kind),
-			Body:        renderReportBody(bundle, fingerprint),
+			Body:        renderReportBody(bundle, fingerprint, freeText),
 			Labels:      reportLabels(req.Kind),
 			Fingerprint: fingerprint,
 		})
@@ -311,6 +322,24 @@ func bundleFingerprint(b diagnostics.DiagnosticBundle) string {
 	return diagnostics.Fingerprint(errorCode, surface, diagnostics.VersionFamily(b.Versions.Fishhawkd.Version))
 }
 
+// redactedFreeText returns the operator free text that may cross the egress
+// boundary. It returns "" unless include_free_text consent is set AND the
+// description is non-empty; on consent the description is run through
+// redaction.RedactDefault so any embedded secrets are scrubbed before they
+// leave the boundary. This is the single chokepoint for the consent +
+// redaction contract — both render paths draw from its output, never from
+// req.Description directly.
+func redactedFreeText(req productReportRequest) string {
+	if !req.IncludeFreeText {
+		return ""
+	}
+	if strings.TrimSpace(req.Description) == "" {
+		return ""
+	}
+	scrubbed, _ := redaction.RedactDefault([]byte(req.Description))
+	return string(scrubbed)
+}
+
 // reportLabels maps the report kind onto upstream labels.
 func reportLabels(kind string) []string {
 	if kind == "feature" {
@@ -336,9 +365,11 @@ func renderReportTitle(b diagnostics.DiagnosticBundle, kind string) string {
 }
 
 // renderReportBody renders the product facts as a markdown body. It draws
-// only from the bundle (no free text by construction) plus the
-// fingerprint. The provider appends the hidden fingerprint marker.
-func renderReportBody(b diagnostics.DiagnosticBundle, fingerprint string) string {
+// from the bundle (product facts) plus the fingerprint, and appends the
+// redaction-scrubbed operator free text ONLY when freeText is non-empty
+// (the caller passes "" unless include_free_text consent was given). The
+// provider appends the hidden fingerprint marker.
+func renderReportBody(b diagnostics.DiagnosticBundle, fingerprint, freeText string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Auto-collected Fishhawk diagnostic bundle (product facts only).\n\n")
 	fmt.Fprintf(&sb, "- run: `%s`\n", b.RunID)
@@ -360,13 +391,23 @@ func renderReportBody(b diagnostics.DiagnosticBundle, fingerprint string) string
 	fmt.Fprintf(&sb, "- versions: fishhawkd `%s` (`%s`), min runner `%s`\n",
 		b.Versions.Fishhawkd.Version, b.Versions.Fishhawkd.GitSHA, b.Versions.MinRunnerVersion)
 	fmt.Fprintf(&sb, "- fingerprint: `%s`\n", fingerprint)
+	if freeText != "" {
+		fmt.Fprintf(&sb, "\n## Operator notes (redacted)\n\n%s\n", freeText)
+	}
 	return sb.String()
 }
 
 // renderOccurrenceComment is the body of an occurrence comment appended to
-// an existing report on a dedup hit. Product facts only.
-func renderOccurrenceComment(b diagnostics.DiagnosticBundle, fingerprint string) string {
-	return fmt.Sprintf(
+// an existing report on a dedup hit. Product facts only, plus the
+// redaction-scrubbed operator free text when consent was given (freeText
+// non-empty).
+func renderOccurrenceComment(b diagnostics.DiagnosticBundle, fingerprint, freeText string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb,
 		"Another occurrence of fingerprint `%s`.\n\n- run: `%s`\n- run state: `%s`\n- observed: %s",
 		fingerprint, b.RunID, b.RunState, time.Now().UTC().Format(time.RFC3339))
+	if freeText != "" {
+		fmt.Fprintf(&sb, "\n\n## Operator notes (redacted)\n\n%s\n", freeText)
+	}
+	return sb.String()
 }

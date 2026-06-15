@@ -245,6 +245,64 @@ func TestProductReport_ForeignToken_Returns403(t *testing.T) {
 	}
 }
 
+// TestProductReport_FreeText_RedactedOnConsent is the cross-boundary
+// assertion for binding condition (5): a consented free-text description
+// reaches the real handler, is run through backend/internal/redaction, and
+// crosses into the filed report — with embedded secrets scrubbed. This is
+// the seam the per-layer MCP/CLI tests cannot prove: their fake backends
+// decode without DisallowUnknownFields, so they accept the body the real
+// server would otherwise reject.
+func TestProductReport_FreeText_RedactedOnConsent(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	// A description carrying a real GitHub PAT shape (36 chars after ghp_)
+	// plus prose. With consent, the prose must cross and the token must be
+	// redacted.
+	secret := "ghp_" + strings.Repeat("A", 36)
+	body := `{"include_free_text":true,"description":"Tried to file an issue but it hung; my token was ` + secret + `"}`
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.filed {
+		t.Fatal("provider.File was not called")
+	}
+	// The consented prose crossed the boundary.
+	if !strings.Contains(fp.filedReport.Body, "Tried to file an issue but it hung") {
+		t.Errorf("consented free text did not cross into the report body: %q", fp.filedReport.Body)
+	}
+	// The embedded secret was redacted server-side before it crossed.
+	if strings.Contains(fp.filedReport.Body, secret) {
+		t.Errorf("raw secret leaked into the report body: %q", fp.filedReport.Body)
+	}
+	if !strings.Contains(fp.filedReport.Body, "[REDACTED:github-pat-classic]") {
+		t.Errorf("expected the secret to be replaced by a redaction marker; body=%q", fp.filedReport.Body)
+	}
+}
+
+// TestProductReport_FreeText_AbsentWithoutConsent asserts that a
+// description supplied WITHOUT include_free_text never crosses the
+// boundary — the default is product facts only (binding conditions 1 & 2).
+func TestProductReport_FreeText_AbsentWithoutConsent(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	body := `{"description":"this prose must NOT cross without consent"}`
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.filed {
+		t.Fatal("provider.File was not called")
+	}
+	if strings.Contains(fp.filedReport.Body, "this prose must NOT cross") {
+		t.Errorf("free text crossed the boundary without consent: %q", fp.filedReport.Body)
+	}
+}
+
 func assertProductReportAudit(t *testing.T, af *scAuditFake, runID uuid.UUID, fingerprint, action string) {
 	t.Helper()
 	var found bool
