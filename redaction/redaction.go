@@ -1,21 +1,28 @@
-// Package redaction scans byte payloads for known secret patterns and
-// replaces them with stable, non-sensitive markers (E22.X / #1006).
+// Package redaction scans byte payloads for known secret patterns
+// and replaces them with stable, non-sensitive markers (E2.4 / #25,
+// E22.X / #1106).
 //
-// This is a deliberate, byte-for-byte copy of runner/internal/redaction.
-// Go forbids importing another module's internal/ packages, so the
-// backend cannot reach across to the runner's copy — the two libraries
-// are siblings that MUST stay in lock-step. The shared use is the
-// product-report consent boundary (#1006, slice 3): operator free text
-// only crosses POST /v0/runs/{run_id}/product-reports after being run
-// through RedactDefault, the same scrubbing the runner applies to trace
-// bytes before upload.
+// This is the single shared definition consumed by BOTH the runner and
+// the backend. Two consumers, one boundary:
 //
-// DRIFT RISK: because this copy and runner/internal/redaction cannot
-// import one another, a pattern added to one and not the other silently
-// diverges. redaction_test.go mirrors the runner's pattern cases so a
-// drift fails loudly here; a SHARED redaction module that both the
-// backend and runner depend on is the durable fix and is tracked as a
-// follow-up.
+//   - Runner trace bytes: the runner runs RedactDefault over each
+//     captured event payload (and the manifest's agent_failure_reason)
+//     before re-packing the redacted bundle variant for upload to S3.
+//     Per MVP_SPEC §4.4, prompts and tool outputs surfaced through
+//     agent runs WILL contain secrets — API keys customers pass in,
+//     tokens agents stumble across, occasional Authorization headers in
+//     pasted HTTP traces. The audit log persists both the unredacted
+//     bytes (under stricter access control) and the redacted view
+//     (default-readable); this library produces the redacted view.
+//   - Backend product-report egress: operator free text only crosses
+//     POST /v0/runs/{run_id}/product-reports after being run through
+//     RedactDefault, the same scrubbing the runner applies to trace
+//     bytes (#1006, slice 3).
+//
+// Collapsing the two former hand-copies (backend/internal/redaction and
+// runner/internal/redaction) into this one module is the durable fix
+// for the silent-drift risk that two byte-for-byte siblings carried: a
+// pattern added here now covers both paths at once.
 //
 // The pattern set is intentionally conservative: each pattern below
 // targets a specific, well-known credential format with low false-
@@ -23,8 +30,8 @@
 // patterns via Redact; the default set via RedactDefault.
 //
 // Hits returned alongside the redacted output drive telemetry —
-// "the boundary redacted N GitHub tokens" without ever surfacing the
-// tokens themselves.
+// "the boundary redacted N GitHub tokens this run" without ever
+// surfacing the tokens themselves.
 package redaction
 
 import (
@@ -57,9 +64,6 @@ type Hit struct {
 // positive rate against typical agent traces; the trade is that
 // some secret formats outside this list will pass through. New
 // formats land here as we encounter them.
-//
-// MUST stay in lock-step with runner/internal/redaction.DefaultPatterns
-// (see the package-level DRIFT RISK note).
 //
 // References: GitHub Token Formats (PAT, fine-grained), OpenAI API
 // Keys, Anthropic API Keys (sk-ant-…), AWS Access Key IDs (AKIA…),
@@ -174,7 +178,9 @@ func Redact(input []byte, patterns []Pattern) ([]byte, []Hit) {
 }
 
 // RedactDefault is shorthand for Redact(input, DefaultPatterns). The
-// product-report endpoint uses this on operator free text before it
+// runner uses it on the gzip-decompressed trace bytes before
+// re-compressing the redacted variant for upload to S3; the backend's
+// product-report endpoint uses it on operator free text before it
 // crosses the consent boundary into an upstream report.
 func RedactDefault(input []byte) ([]byte, []Hit) {
 	return Redact(input, DefaultPatterns)

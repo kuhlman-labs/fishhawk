@@ -892,7 +892,7 @@ func (c *apiClient) GetDiagnostics(ctx context.Context, runID uuid.UUID) (*Diagn
 // (`backend/internal/server/product_report.go::productReportRequest`).
 // Kind selects the report flavor (bug default; feature). Description is
 // operator free text that crosses the boundary ONLY when IncludeFreeText
-// is true, and is run through backend/internal/redaction server-side
+// is true, and is run through the shared redaction module server-side
 // first (#1006, slice 3 consent boundary).
 type productReportBody struct {
 	Kind            string `json:"kind,omitempty"`

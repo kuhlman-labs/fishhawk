@@ -6,8 +6,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuhlman-labs/fishhawk/runner/internal/redaction"
+	"github.com/kuhlman-labs/fishhawk/redaction"
 )
+
+// This suite is the single shared scrubber test: it merges the cases the
+// two former hand-copies (backend/internal/redaction and
+// runner/internal/redaction) each carried, so every default pattern's
+// positive and negative behavior is asserted from one place. A pattern
+// regression now fails loudly here for both consumers at once.
 
 // findHit returns the count for a named pattern in hits, or 0 if the
 // pattern didn't fire. Test helper.
@@ -295,7 +301,3 @@ func TestRedact_HitsAreDeterministic(t *testing.T) {
 		}
 	}
 }
-
-// min is needed for substring slicing in test names; Go 1.25 has
-// builtin min for ordered types.
-func _testHelpersUnused() {} //nolint:unused

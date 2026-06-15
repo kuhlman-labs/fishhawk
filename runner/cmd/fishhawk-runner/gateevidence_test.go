@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/redaction"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
-	"github.com/kuhlman-labs/fishhawk/runner/internal/redaction"
 )
 
 // diffOf builds a constraint.Diff of modified files for makeGitDiffEvent.

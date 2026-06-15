@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/redaction"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
-	"github.com/kuhlman-labs/fishhawk/runner/internal/redaction"
 )
 
 func TestRedactEvents_ReplacesPayloadSecrets(t *testing.T) {
