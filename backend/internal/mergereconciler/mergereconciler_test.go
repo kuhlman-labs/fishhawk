@@ -686,3 +686,152 @@ func TestTick_PlainResolver_NoObserver_NoPanic(t *testing.T) {
 		t.Errorf("resolve calls = %d, want 0", len(res.calls))
 	}
 }
+
+// stubBoardHealer records NotifyBoardTransition calls, modeling the
+// server-side run-lifecycle board-sync hook (#1012).
+type stubBoardHealer struct {
+	calls []boardHealCall
+}
+
+type boardHealCall struct {
+	runID uuid.UUID
+	event string
+}
+
+func (s *stubBoardHealer) NotifyBoardTransition(_ context.Context, runID uuid.UUID, event string) {
+	s.calls = append(s.calls, boardHealCall{runID: runID, event: event})
+}
+
+// resolverWithBoardHealer embeds the resolver stub and implements
+// BoardTransitionHealer, modeling production's *server.Server (which is
+// both) so the Resolver-upgrade default path for the board heal is pinned.
+type resolverWithBoardHealer struct {
+	stubResolver
+	stubBoardHealer
+}
+
+// TestTick_OpenPR_BoardHealerInvoked: a parked review stage with an open PR
+// re-asserts the pr_opened board move every sweep so a dropped
+// pull_request.opened webhook (card stuck in In Progress) self-heals to
+// In Review. The provider's expected-source check makes a card already in
+// In Review a no-op, so re-asserting is safe.
+func TestTick_OpenPR_BoardHealerInvoked(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	res := &stubResolver{}
+	bh := &stubBoardHealer{}
+	tk := newTicker(repo, pg, res)
+	tk.BoardTransitionHealer = bh
+	tk.Tick(context.Background())
+
+	if len(bh.calls) != 1 {
+		t.Fatalf("board heal calls = %d, want 1", len(bh.calls))
+	}
+	if bh.calls[0].runID != r.ID || bh.calls[0].event != "pr_opened" {
+		t.Errorf("board heal call = %+v, want runID=%s event=pr_opened", bh.calls[0], r.ID)
+	}
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (open PR left parked)", len(res.calls))
+	}
+}
+
+// TestTick_BoardHeal_DedupedAcrossTicks: a still-open parked stage is healed
+// at most once per process. Because the server-side hook audits every move
+// AND every never-fight-the-human skip, re-firing each tick would spam the
+// run's chained audit log; the Ticker dedup keeps it to one attempt.
+func TestTick_BoardHeal_DedupedAcrossTicks(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	res := &stubResolver{}
+	bh := &stubBoardHealer{}
+	tk := newTicker(repo, pg, res)
+	tk.BoardTransitionHealer = bh
+
+	tk.Tick(context.Background())
+	tk.Tick(context.Background())
+	tk.Tick(context.Background())
+
+	if len(bh.calls) != 1 {
+		t.Errorf("board heal calls = %d across three ticks, want 1 (deduped to avoid skip-audit spam)", len(bh.calls))
+	}
+}
+
+// TestTick_MergedPR_BoardHealerNotInvoked: the pr_opened heal targets the
+// OPEN-PR branch only. A merged PR resolves through ResolveReviewFromPollState,
+// which already drives the run_merged board move on the shared path, so the
+// reconciler must not also fire a redundant pr_opened heal.
+func TestTick_MergedPR_BoardHealerNotInvoked(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	bh := &stubBoardHealer{}
+	tk := newTicker(repo, pg, res)
+	tk.BoardTransitionHealer = bh
+	tk.Tick(context.Background())
+
+	if len(bh.calls) != 0 {
+		t.Errorf("board heal calls = %d, want 0 on a merged PR (run_merged rides the resolve path)", len(bh.calls))
+	}
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Errorf("resolve calls = %+v, want one merged=true resolve", res.calls)
+	}
+}
+
+// TestTick_SkipCleanStages_BoardHealerNotInvoked: the no-installation /
+// no-PR skip-clean guards run BEFORE the heal, and the heal lives in the
+// open-PR branch (which those runs never reach), so neither is healed.
+func TestTick_SkipCleanStages_BoardHealerNotInvoked(t *testing.T) {
+	noInst, noInstStage := reviewRun("https://github.com/x/y/pull/42", nil)
+	noPR, noPRStage := reviewRun("", instID(99))
+	repo := &fakeRepo{
+		awaiting: []*run.Stage{noInstStage, noPRStage},
+		runs:     map[uuid.UUID]*run.Run{noInst.ID: noInst, noPR.ID: noPR},
+	}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	res := &stubResolver{}
+	bh := &stubBoardHealer{}
+	tk := newTicker(repo, pg, res)
+	tk.BoardTransitionHealer = bh
+	tk.Tick(context.Background())
+
+	if len(bh.calls) != 0 {
+		t.Errorf("board heal calls = %v, want none for skip-clean stages", bh.calls)
+	}
+}
+
+// TestTick_NilBoardHealer_BehaviorUnchanged: a nil BoardTransitionHealer
+// preserves the pre-#1012 ticker byte-for-byte — the open PR is still left
+// parked with no heal and no panic.
+func TestTick_NilBoardHealer_BehaviorUnchanged(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	res := &stubResolver{}
+	newTicker(repo, pg, res).Tick(context.Background()) // BoardTransitionHealer left nil
+
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (open PR parked, nil healer = today's behavior)", len(res.calls))
+	}
+}
+
+// TestTick_ResolverUpgrade_DefaultsBoardHealer: production wires
+// *server.Server as Resolver; the ticker must upgrade it to
+// BoardTransitionHealer with no explicit field set.
+func TestTick_ResolverUpgrade_DefaultsBoardHealer(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	res := &resolverWithBoardHealer{}
+	tk := &Ticker{Runs: repo, PRGetter: pg, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.stubBoardHealer.calls) != 1 {
+		t.Fatalf("board heal calls = %d, want 1 via the Resolver type-assertion upgrade", len(res.stubBoardHealer.calls))
+	}
+	if res.stubBoardHealer.calls[0].event != "pr_opened" {
+		t.Errorf("board heal event = %q, want pr_opened", res.stubBoardHealer.calls[0].event)
+	}
+}
