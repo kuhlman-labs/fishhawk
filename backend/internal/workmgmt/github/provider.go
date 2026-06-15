@@ -34,6 +34,7 @@ type API interface {
 	CreateIssue(ctx context.Context, installationID int64, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
 	IssueNodeID(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) (string, error)
 	ProjectFields(ctx context.Context, installationID int64, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error)
+	ProjectItemStatus(ctx context.Context, installationID int64, issueNodeID, projectID, fieldName string) (*githubclient.ProjectItemStatus, error)
 	AddProjectItem(ctx context.Context, installationID int64, projectID, contentID string) (string, error)
 	SetProjectItemSingleSelect(ctx context.Context, installationID int64, projectID, itemID, fieldID, optionID string) error
 	AddSubIssue(ctx context.Context, installationID int64, parentNodeID, childNodeID string) error
@@ -120,6 +121,123 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	}
 
 	return created, nil
+}
+
+// Transition moves an already-filed issue's board Status along a
+// run-lifecycle edge (#1012). It resolves the issue node id, the project's
+// Status field + options, and the issue's current project item, then:
+//   - SKIPS (no mutation) when no project is configured, the issue is not on
+//     the board, the target canonical state has no configured/board option,
+//     or — the never-fight-the-human guard — the card's current status is
+//     not in the request's expected source set. An unset status counts as
+//     Backlog so a fresh card still advances on run_started.
+//   - otherwise sets the Status single-select to the target option and
+//     reports Moved with from->to.
+//
+// Genuine provider failures (issue/field resolution, the status read, the
+// set mutation) return an error; the lifecycle hook logs it best-effort and
+// never unwinds the run. Only the Status column is touched — never labels,
+// fields, or epic links (the #1005 scope split).
+func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionRequest) (*workmgmt.TransitionResult, error) {
+	if p.api == nil {
+		return nil, errors.New("workmgmt/github: provider missing API client")
+	}
+	if req.Target.Repo.Owner == "" || req.Target.Repo.Name == "" {
+		return nil, errors.New("workmgmt/github: target repo owner and name required")
+	}
+	proj := req.Target.Project
+	if proj == nil {
+		return &workmgmt.TransitionResult{Skipped: true, SkipReason: "no project configured"}, nil
+	}
+	if req.IssueNumber <= 0 {
+		return nil, errors.New("workmgmt/github: transition requires a positive issue number")
+	}
+	inst := req.Target.InstallationID
+	if inst == 0 {
+		return nil, errors.New("workmgmt/github: no installation id available; board transitions are run-scoped in v0")
+	}
+
+	// Resolve the target board option from the canonical state via the
+	// conventions' states map. An unmapped canonical state is a no-op skip,
+	// not an error — the config simply doesn't bind that state to a column.
+	toOption := strings.TrimSpace(req.States[req.CanonicalState])
+	if toOption == "" {
+		return &workmgmt.TransitionResult{Skipped: true,
+			SkipReason: fmt.Sprintf("canonical state %q has no configured provider option", req.CanonicalState)}, nil
+	}
+
+	coord := githubclient.ProjectCoord{Owner: proj.Owner, OwnerType: proj.OwnerType, Number: proj.Number}
+	// User-owned Projects v2 (the Project #7 case) cannot be reached with the
+	// App installation token (#1114). Opt the board GraphQL calls into the
+	// static projects token; the client honors it only when one is configured,
+	// so this stays a best-effort no-op when it is not (the #1107 posture).
+	if proj.OwnerType == "user" {
+		ctx = githubclient.WithProjectsToken(ctx)
+	}
+	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
+
+	issueNodeID, err := p.api.IssueNodeID(ctx, inst, repo, req.IssueNumber)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: resolve issue #%d: %w", req.IssueNumber, err)
+	}
+	meta, err := p.api.ProjectFields(ctx, inst, coord, statusFieldName)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
+	}
+	optionID, ok := meta.StatusOptions[toOption]
+	if !ok {
+		return &workmgmt.TransitionResult{Skipped: true,
+			SkipReason: fmt.Sprintf("target status %q is not a %s option on the project", toOption, statusFieldName)}, nil
+	}
+
+	item, err := p.api.ProjectItemStatus(ctx, inst, issueNodeID, meta.ProjectID, statusFieldName)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: read project item status: %w", err)
+	}
+	if !item.OnBoard {
+		return &workmgmt.TransitionResult{Skipped: true, To: toOption,
+			SkipReason: "issue is not on the project board"}, nil
+	}
+	current := item.Status
+	// never-fight-the-human: only advance from an expected source status. A
+	// card a human parked elsewhere (e.g. Blocked) is left untouched.
+	if !sourceAllows(current, req) {
+		return &workmgmt.TransitionResult{Skipped: true, From: current, To: toOption,
+			SkipReason: fmt.Sprintf("current status %q is not in the expected source set", labelOrUnset(current))}, nil
+	}
+	if current == toOption {
+		return &workmgmt.TransitionResult{Skipped: true, From: current, To: toOption,
+			SkipReason: "card already at target status"}, nil
+	}
+	if err := p.api.SetProjectItemSingleSelect(ctx, inst, meta.ProjectID, item.ItemID, meta.FieldID, optionID); err != nil {
+		return nil, fmt.Errorf("workmgmt/github: set status field: %w", err)
+	}
+	return &workmgmt.TransitionResult{Moved: true, From: current, To: toOption}, nil
+}
+
+// sourceAllows reports whether the card's current board status is an
+// expected source for the move. The expected source canonical states are
+// resolved to board options through the request's states map; an unset
+// current status (a fresh/un-triaged card) counts as Backlog so it still
+// advances when backlog is an expected source (run_started's unset/Backlog).
+func sourceAllows(current string, req workmgmt.TransitionRequest) bool {
+	for _, s := range req.ExpectedSourceStates {
+		if current == "" && s == workmgmt.CanonicalStateBacklog {
+			return true
+		}
+		if opt := strings.TrimSpace(req.States[s]); opt != "" && current == opt {
+			return true
+		}
+	}
+	return false
+}
+
+// labelOrUnset renders an empty status as "(unset)" for skip-reason text.
+func labelOrUnset(status string) string {
+	if status == "" {
+		return "(unset)"
+	}
+	return status
 }
 
 // placeOnBoard adds the created issue to the configured project and sets

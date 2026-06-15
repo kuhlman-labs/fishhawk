@@ -23,6 +23,26 @@ type Provider interface {
 	File(ctx context.Context, req ProviderRequest) (*CreatedItem, error)
 }
 
+// Transitioner is the optional board-state-sync capability (#1012): move an
+// already-filed work item's board Status along a run-lifecycle edge. It is
+// declared as a separate capability interface rather than folded into
+// Provider because not every provider boards work (jira is interface-only in
+// v0) — and, decisively for the decomposed rollout, widening Provider would
+// force every registered fake in a sibling slice's test to grow the method,
+// the cross-slice scope-amendment trap the plan's decomposition explicitly
+// avoids. The run-lifecycle hook resolves a provider via Get and type-asserts
+// this capability before dispatching; a provider that does not implement it
+// simply yields no board move.
+//
+// Transition honors the never-fight-the-human guard: it advances the card
+// only when its current status is in the request's expected source set,
+// otherwise returning a Skipped result with no mutation. It touches ONLY the
+// Status column, never the rich fields File applies — the scope split with
+// #1005.
+type Transitioner interface {
+	Transition(ctx context.Context, req TransitionRequest) (*TransitionResult, error)
+}
+
 // Repo is a provider-neutral repository coordinate. The GitHub provider
 // maps it onto its own owner/name ref; a future Jira provider maps it
 // onto a project key.

@@ -187,6 +187,81 @@ func TestProjectFields_GraphQLErrorIsValidation(t *testing.T) {
 	}
 }
 
+func TestProjectItemStatus_OnBoardMatchesProjectAndReadsStatus(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	// The issue sits on two projects; only PROJ is ours, and its item is in
+	// the In Progress column.
+	pf.graphqlByOp["ProjectItemStatus"] = `{"data":{"node":{"projectItems":{"nodes":[
+	  {"id":"ITEM_OTHER","project":{"id":"OTHER"},"fieldValueByName":{"name":"Done"}},
+	  {"id":"ITEM_OURS","project":{"id":"PROJ"},"fieldValueByName":{"name":"In Progress"}}
+	]}}}}`
+	got, err := c.ProjectItemStatus(context.Background(), 7, "ISSUE_NODE", "PROJ", "Status")
+	if err != nil {
+		t.Fatalf("ProjectItemStatus: %v", err)
+	}
+	if !got.OnBoard || got.ItemID != "ITEM_OURS" || got.Status != "In Progress" {
+		t.Errorf("status = %+v", got)
+	}
+	if vars := pf.gotGraphQLVars["ProjectItemStatus"]; vars["issueId"] != "ISSUE_NODE" || vars["field"] != "Status" {
+		t.Errorf("vars = %+v", vars)
+	}
+}
+
+func TestProjectItemStatus_UnsetStatusReadsEmpty(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	// On the board but no Status set: fieldValueByName resolves to null.
+	pf.graphqlByOp["ProjectItemStatus"] = `{"data":{"node":{"projectItems":{"nodes":[
+	  {"id":"ITEM_OURS","project":{"id":"PROJ"},"fieldValueByName":null}
+	]}}}}`
+	got, err := c.ProjectItemStatus(context.Background(), 7, "ISSUE_NODE", "PROJ", "Status")
+	if err != nil {
+		t.Fatalf("ProjectItemStatus: %v", err)
+	}
+	if !got.OnBoard || got.ItemID != "ITEM_OURS" || got.Status != "" {
+		t.Errorf("status = %+v, want on-board with empty Status", got)
+	}
+}
+
+func TestProjectItemStatus_NotOnBoard(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	// The issue has items, but none on our project → not on board (no error).
+	pf.graphqlByOp["ProjectItemStatus"] = `{"data":{"node":{"projectItems":{"nodes":[
+	  {"id":"ITEM_OTHER","project":{"id":"OTHER"},"fieldValueByName":{"name":"Done"}}
+	]}}}}`
+	got, err := c.ProjectItemStatus(context.Background(), 7, "ISSUE_NODE", "PROJ", "Status")
+	if err != nil {
+		t.Fatalf("ProjectItemStatus: %v", err)
+	}
+	if got.OnBoard || got.ItemID != "" {
+		t.Errorf("status = %+v, want not-on-board", got)
+	}
+}
+
+func TestProjectItemStatus_ProjectsTokenOptIn(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	c.ProjectsToken = "pat_projects"
+	pf.graphqlByOp["ProjectItemStatus"] = `{"data":{"node":{"projectItems":{"nodes":[
+	  {"id":"ITEM_OURS","project":{"id":"PROJ"},"fieldValueByName":{"name":"Backlog"}}
+	]}}}}`
+	ctx := WithProjectsToken(context.Background())
+	if _, err := c.ProjectItemStatus(ctx, 7, "ISSUE_NODE", "PROJ", "Status"); err != nil {
+		t.Fatalf("ProjectItemStatus: %v", err)
+	}
+	if pf.gotGraphQLAuth != "Bearer pat_projects" {
+		t.Errorf("Authorization = %q, want projects token (user-owned board read)", pf.gotGraphQLAuth)
+	}
+}
+
+func TestProjectItemStatus_MissingArgs(t *testing.T) {
+	_, c := newProjectsFake(t)
+	if _, err := c.ProjectItemStatus(context.Background(), 7, "", "PROJ", "Status"); err == nil {
+		t.Errorf("want error when issue node id is empty")
+	}
+	if _, err := c.ProjectItemStatus(context.Background(), 7, "ISSUE_NODE", "PROJ", ""); err == nil {
+		t.Errorf("want error when field name is empty")
+	}
+}
+
 func TestAddProjectItem(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["AddItem"] = `{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM"}}}}`
