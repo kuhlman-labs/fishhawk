@@ -249,6 +249,13 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 					Reason:       "the plan is parked at its approval gate" + reviewVerdictSummary(planReviewStatus),
 				},
 				{
+					Action:       "fishhawk_revise_plan",
+					Params:       map[string]string{"run_id": run.ID, "constraint": "<binding design constraint>"},
+					Precondition: "the plan's direction is sound but a design constraint must change before it proceeds; cheaper than a reject → fresh-run replan",
+					Consumes:     consumesApprovalSlot,
+					Reason:       "re-plans IN PLACE with your binding constraint injected and the prior plan as the revision base; re-enters the review → approve gate (bounded, default one pass)",
+				},
+				{
 					Action:       "fishhawk_reject_plan",
 					Params:       map[string]string{"run_id": run.ID},
 					Precondition: "the plan takes a wrong fork that approval conditions cannot amend",

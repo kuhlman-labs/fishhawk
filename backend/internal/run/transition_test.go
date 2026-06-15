@@ -168,6 +168,39 @@ func TestFailedToSucceededLeaksOnlyThroughRecovery(t *testing.T) {
 	}
 }
 
+// TestStageReviseTransitions pins the dedicated plan-revise edge (#1099):
+// the validator admits ONLY awaiting_approval → pending, and the base
+// stageTransitions machine must NOT admit that edge (so the revise re-open
+// is reachable only through the dedicated table).
+func TestStageReviseTransitions(t *testing.T) {
+	cases := []struct {
+		from, to StageState
+		want     bool
+	}{
+		// The single revise edge.
+		{StageStateAwaitingApproval, StageStatePending, true},
+		// Unrelated edges the revise validator must refuse.
+		{StageStateSucceeded, StageStatePending, false}, // that is a fix-up edge, not revise
+		{StageStateFailed, StageStatePending, false},
+		{StageStateRunning, StageStatePending, false},
+		{StageStatePending, StageStateAwaitingApproval, false},
+		{StageStateAwaitingApproval, StageStateSucceeded, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.from)+"→"+string(tc.to), func(t *testing.T) {
+			if got := ValidStageReviseTransition(tc.from, tc.to); got != tc.want {
+				t.Errorf("ValidStageReviseTransition(%q, %q) = %v, want %v", tc.from, tc.to, got, tc.want)
+			}
+		})
+	}
+
+	// The base machine must NOT carry the revise edge — it is reachable
+	// only through the dedicated revise table (the #1099 invariant).
+	if ValidStageTransition(StageStateAwaitingApproval, StageStatePending) {
+		t.Error("ValidStageTransition admits awaiting_approval → pending; the base machine must not (revise edge belongs to the dedicated table)")
+	}
+}
+
 func TestInvalidTransitionError_FormatsHumanReadable(t *testing.T) {
 	err := InvalidTransitionError{Kind: "run", From: "pending", To: "succeeded"}
 	want := "invalid run transition: pending → succeeded"

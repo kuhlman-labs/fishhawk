@@ -512,6 +512,56 @@ func TestSubmitApproval_DecodesBothResponseShapes(t *testing.T) {
 	}
 }
 
+// TestSubmitRevise_RequestShaping pins the wire shape of the #1099
+// revise client method: the constraint + force flag ride the JSON body,
+// the request lands on POST /v0/stages/{id}/revise, and the re-opened
+// Stage decodes back.
+func TestSubmitRevise_RequestShaping(t *testing.T) {
+	stageID := uuid.New()
+	runID := uuid.New()
+
+	var gotMethod, gotPath string
+	var gotBody struct {
+		Constraint          string `json:"constraint"`
+		ForceAdditionalPass bool   `json:"force_additional_pass"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"`+stageID.String()+`","run_id":"`+runID.String()+`",`+
+			`"sequence":1,"type":"plan","executor":{"kind":"agent","ref":"claude-code"},`+
+			`"state":"pending","created_at":"2026-06-15T00:00:00Z","updated_at":"2026-06-15T00:00:00Z"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	got, err := c.SubmitRevise(context.Background(), stageID, SubmitReviseInput{
+		Constraint:          "use the existing retry helper",
+		ForceAdditionalPass: true,
+	})
+	if err != nil {
+		t.Fatalf("SubmitRevise: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if want := "/v0/stages/" + stageID.String() + "/revise"; gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+	if gotBody.Constraint != "use the existing retry helper" {
+		t.Errorf("body constraint = %q, want the threaded constraint", gotBody.Constraint)
+	}
+	if !gotBody.ForceAdditionalPass {
+		t.Errorf("body force_additional_pass = false, want true")
+	}
+	if got.ID != stageID || got.State != "pending" {
+		t.Errorf("stage = (%s, %s), want (%s, pending)", got.ID, got.State, stageID)
+	}
+}
+
 func TestAPIError_Error(t *testing.T) {
 	tests := []struct {
 		name string

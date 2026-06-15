@@ -392,6 +392,26 @@ Notes:
   Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
 
+- The plan-gate revise audit kind — `plan_revised` (#1099) — is an
+  **internal, user-actor audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread; it has no Notifier method. The
+  revise handler (`server/revise.go::handleRevisePlan`,
+  `POST /v0/stages/{stage_id}/revise`) writes it once on a successful re-open,
+  with the acting token's subject and a kind selected from it, and payload
+  `{stage_id, prior_state, conditions, pass_ordinal, max_passes, hard_ceiling,
+  remaining_budget, forced, actor}`. It serves double duty: the canonical
+  receipt of who re-planned the plan stage in place against which binding
+  operator constraint, AND **the durable revise-pass counter** — the bound
+  (default 1) is enforced by counting prior `plan_revised` entries for the
+  stage, so there is no dedicated column (exactly as `stage_fixup_triggered`
+  bounds fix-up). The `conditions` field (the rendered operator constraint) is
+  read back by the prompt renderer (`server/prompt.go::loadRevisionConstraint`)
+  to deliver the constraint to the planner as a binding "Revision constraint"
+  prompt section (the #558 condition-delivery framing), with the prior plan
+  carried as the revision base. The plan-stage analogue of
+  `stage_fixup_triggered`. Listed here only so a future reader grepping the
+  audit categories doesn't mistake it for a comment surface.
+
 - The concern-waiver audit kinds — `concern_waived` and its corrective
   companion `concern_waive_failed` (#984) — are **internal audit kinds, not
   issue-comment surfaces**. Nothing in `issuecomment` posts them; they have no

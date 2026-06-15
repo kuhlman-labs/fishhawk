@@ -317,6 +317,34 @@ func (c *Client) SubmitApproval(ctx context.Context, stageID uuid.UUID, in Submi
 	return &res, nil
 }
 
+// SubmitReviseInput is the request body for POST /v0/stages/{id}/revise
+// (#1099). Constraint is the operator's binding design constraint the
+// planner must revise the prior plan to satisfy — REQUIRED.
+// ForceAdditionalPass is the bounded operator override (grant ONE revise
+// pass beyond the normal budget, hard-capped at 3 total passes).
+type SubmitReviseInput struct {
+	Constraint          string `json:"constraint"`
+	ForceAdditionalPass bool   `json:"force_additional_pass,omitempty"`
+}
+
+// SubmitRevise calls POST /v0/stages/{stage_id}/revise (#1099) — the
+// plan-gate revise verdict. It re-opens the plan stage parked at
+// awaiting_approval, re-planning in place against the operator's binding
+// constraint (injected into the re-dispatched plan prompt with the prior
+// plan as the revision base), and returns the re-opened Stage (pending,
+// or dispatched once the orchestrator advances it).
+func (c *Client) SubmitRevise(ctx context.Context, stageID uuid.UUID, in SubmitReviseInput) (*Stage, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	var s Stage
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/revise", body, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 // AuditEntry is the CLI-side projection of the OpenAPI AuditEntry
 // schema. Payload is left as raw JSON so the CLI can render or pass
 // through whatever shape a given category emits — categories grow

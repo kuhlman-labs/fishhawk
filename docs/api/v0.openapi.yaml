@@ -3719,6 +3719,109 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/stages/{stage_id}/revise:
+    post:
+      operationId: revisePlan
+      summary: Re-plan a plan stage in place against a binding operator constraint
+      description: |
+        The plan-gate `revise` verdict (#1099) — the third option alongside
+        approve and reject. A `revise` re-plans IN PLACE in the same run: it
+        re-opens the plan stage parked at `awaiting_approval` back to
+        `pending`, re-dispatches the plan stage ONCE with the operator's
+        binding design `constraint` injected into the plan prompt (a DEDICATED
+        "Revision constraint" section — the #558 binding-conditions channel)
+        and the prior plan carried as the revision base, then re-enters the
+        normal plan review → approve gate. It is the plan-stage analogue of
+        `POST /v0/stages/{stage_id}/fixup` (a bounded, operator-gated re-open
+        of a HEALTHY gate).
+
+        Use `revise` when the plan's direction is sound but a design
+        constraint must change first — cheaper than rejecting the plan to a
+        fresh-run replan, because only the constrained parts change.
+
+        Bounded + operator-gated: the NORMAL bound defaults to ONE revise pass
+        per stage, enforced server-side by counting prior `plan_revised` audit
+        entries (no dedicated column — exactly as fix-up counts
+        `stage_fixup_triggered`). Once spent, an operator may grant ONE more
+        pass with `force_additional_pass: true`, hard-capped at 3 TOTAL passes
+        per stage; at the ceiling the endpoint refuses with the DISTINCT
+        `revise_ceiling_reached`. A run-bound MCP token may revise only stages
+        within its own run.
+
+        Requires `write:approvals` scope — the #558 binding-conditions /
+        gate-answer family.
+      tags: [approvals]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [constraint]
+              properties:
+                constraint:
+                  type: string
+                  description: |
+                    The binding design constraint the planner must revise the
+                    prior plan to satisfy. Injected into the re-dispatched plan
+                    prompt as a dedicated, binding "Revision constraint"
+                    section (MANDATORY, wins on conflict), with the prior plan
+                    as the revision base. Empty/whitespace-only is rejected.
+                force_additional_pass:
+                  type: boolean
+                  default: false
+                  description: |
+                    Bounded operator override: grant ONE revise pass beyond the
+                    normal budget (default 1) when it is already spent, hard-
+                    capped at 3 total passes per stage. The forced pass is
+                    audited on the `plan_revised` entry (`forced: true`).
+      responses:
+        '200':
+          description: |
+            The plan stage was re-opened `awaiting_approval` → `pending` and
+            the orchestrator re-dispatches it. The body is the re-opened
+            `Stage` shape (pending, or dispatched once the orchestrator
+            advances it before the response returns).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stage' }
+        '400':
+          description: |
+            `validation_failed` — the `stage_id` is not a valid UUID, the body
+            is not valid JSON, or `constraint` is empty/whitespace-only.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            Possible error codes:
+
+            - `insufficient_scope` — the token lacks `write:approvals`.
+            - `cross_run_revise` — a run-bound MCP token tried to revise a
+              stage outside its own run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Possible error codes:
+
+            - `revise_not_applicable` — the target is not a plan stage parked
+              at `awaiting_approval`. `details` carries `stage_type` and
+              `stage_state`.
+            - `revise_budget_exhausted` — the NORMAL bounded pass count is
+              spent; one more pass is available via `force_additional_pass`.
+              `details` carries `max_passes` and `used`.
+            - `revise_ceiling_reached` — the hard ceiling of 3 total passes is
+              reached; the override cannot push past it (reject → fresh-run
+              replan). `details` carries `ceiling` and `used`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v0/stages/{stage_id}/retry:
     post:
       operationId: retryStage

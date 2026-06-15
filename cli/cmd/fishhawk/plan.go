@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -20,7 +21,7 @@ import (
 // already use, including the terminal.
 func runPlan(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(stderr, `fishhawk plan: subcommand required (approve|reject)`)
+		_, _ = fmt.Fprintln(stderr, `fishhawk plan: subcommand required (approve|reject|revise)`)
 		return exitUsage
 	}
 	sub, rest := args[0], args[1:]
@@ -29,6 +30,8 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 		return planApprove(rest, stdout, stderr)
 	case "reject":
 		return planReject(rest, stdout, stderr)
+	case "revise":
+		return planRevise(rest, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "fishhawk plan: unknown subcommand %q\n", sub)
 		return exitUsage
@@ -55,6 +58,72 @@ func planApprove(args []string, stdout, stderr io.Writer) int {
 func planReject(args []string, stdout, stderr io.Writer) int {
 	return planDecision("fishhawk plan reject", httpclient.ApprovalReject,
 		args, stdout, stderr)
+}
+
+// planRevise implements `fishhawk plan revise <run-id> --constraint … [--force] [--output text|json]`.
+// It is the third plan-gate verdict (#1099): re-plan in place against a
+// binding operator design constraint, rather than approving the plan
+// as-is or rejecting it to a fresh-run replan. Resolves the plan stage
+// from the run id and POSTs the constraint to /v0/stages/{id}/revise.
+func planRevise(args []string, stdout, stderr io.Writer) int {
+	const name = "fishhawk plan revise"
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cf := bindCommonFlags(fs)
+	constraint := fs.String("constraint", "", "binding design constraint the planner must revise the plan to satisfy (required)")
+	force := fs.Bool("force", false, "grant ONE revise pass beyond the normal budget when it is spent (hard-capped at 3 total passes)")
+	outputFmt := fs.String("output", "text", "output format: text | json")
+	fs.StringVar(outputFmt, "o", "text", "output format: text | json (shorthand)")
+	positionals, err := parseIntermixed(fs, args)
+	if err != nil {
+		return exitUsage
+	}
+	if err := validateOutputFormat(*outputFmt); err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", name, err)
+		return exitUsage
+	}
+	if len(positionals) != 1 {
+		_, _ = fmt.Fprintf(stderr, "%s: <run-id> required\n", name)
+		return exitUsage
+	}
+	runID, err := uuid.Parse(positionals[0])
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: %q is not a UUID: %v\n", name, positionals[0], err)
+		return exitUsage
+	}
+	if strings.TrimSpace(*constraint) == "" {
+		_, _ = fmt.Fprintf(stderr, "%s: --constraint is required (the binding design constraint to revise the plan against)\n", name)
+		return exitUsage
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
+	defer cancel()
+	client := newClient(cf)
+
+	planStage, exitCode := resolvePlanStage(ctx, client, name, runID, stderr)
+	if planStage == nil {
+		return exitCode
+	}
+
+	stage, err := client.SubmitRevise(ctx, planStage.ID, httpclient.SubmitReviseInput{
+		Constraint:          *constraint,
+		ForceAdditionalPass: *force,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", name, err)
+		return exitOnAPIError(err)
+	}
+
+	switch *outputFmt {
+	case "json":
+		if err := json.NewEncoder(stdout).Encode(stage); err != nil {
+			_, _ = fmt.Fprintf(stderr, "%s: encode: %v\n", name, err)
+			return exitFailure
+		}
+	default:
+		printStage(stdout, stage)
+	}
+	return exitOK
 }
 
 // planDecision is the shared body of `plan approve` / `plan reject`.
