@@ -247,7 +247,7 @@ func TestProductReport_ForeignToken_Returns403(t *testing.T) {
 
 // TestProductReport_FreeText_RedactedOnConsent is the cross-boundary
 // assertion for binding condition (5): a consented free-text description
-// reaches the real handler, is run through backend/internal/redaction, and
+// reaches the real handler, is run through the shared redaction module, and
 // crosses into the filed report — with embedded secrets scrubbed. This is
 // the seam the per-layer MCP/CLI tests cannot prove: their fake backends
 // decode without DisallowUnknownFields, so they accept the body the real

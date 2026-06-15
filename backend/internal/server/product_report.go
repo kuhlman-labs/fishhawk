@@ -15,9 +15,9 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/diagnostics"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/redaction"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	"github.com/kuhlman-labs/fishhawk/redaction"
 )
 
 // maxProductReportRequestBytes caps the product-report request body. The
@@ -43,7 +43,7 @@ const categoryProductReportFiled = "product_report_filed"
 // request). The egress carries product facts ONLY unless the caller sets
 // the explicit consent flag: `description` (operator free text) crosses the
 // boundary ONLY when `include_free_text` is true, and even then it is run
-// through backend/internal/redaction FIRST (the hard consent/redaction
+// through the shared redaction module FIRST (the hard consent/redaction
 // contract, #1006 slice 3). Without the flag, `description` is ignored and
 // nothing but product facts leaves the boundary.
 type productReportRequest struct {
