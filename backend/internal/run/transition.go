@@ -215,6 +215,44 @@ func ValidStageFixupTransition(from, to StageState) bool {
 	return ok
 }
 
+// stageReviseTransitions enumerates the explicit plan-gate REVISE
+// override off the normal state machine — the plan-revise re-open
+// (E22.X / #1099).
+//
+// One revise edge lives here: awaiting_approval → pending for a plan
+// stage parked at its approval gate. A `revise` verdict (the third
+// plan-gate option alongside approve/reject) re-plans IN PLACE: it
+// re-opens the parked plan stage so the orchestrator walks pending →
+// dispatched and re-dispatches the plan stage with the operator's
+// binding design constraint injected and the prior plan carried as the
+// revision base, then the run re-enters the normal review → approve
+// gate.
+//
+// This is deliberately a SEPARATE table from stageFixupTransitions and
+// stageRetryTransitions: a revise is a distinct semantic from a fix-up
+// (it re-opens a PLAN stage, not an implement stage, and never touches a
+// review stage or an implement diff) and from a retry (no failure to
+// clear, re-opened from a healthy gate). The repo's TransitionStage
+// consults this table in addition to ValidStageTransition so the revise
+// edge is admissible there without loosening the normal machine for
+// ordinary callers. The domain gate in run.RevisePlanStage (plan-stage
+// type + awaiting_approval state + budget) is the real guard.
+var stageReviseTransitions = map[StageState]map[StageState]struct{}{
+	StageStateAwaitingApproval: {
+		StageStatePending: {},
+	},
+}
+
+// ValidStageReviseTransition reports whether `from` is allowed to
+// re-open into `to` via the plan-revise path. The revise path is
+// intentionally narrow and SEPARATE from every other table — callers
+// that want a regular transition should keep using ValidStageTransition
+// + TransitionStage, and only run.RevisePlanStage reaches this edge.
+func ValidStageReviseTransition(from, to StageState) bool {
+	_, ok := stageReviseTransitions[from][to]
+	return ok
+}
+
 // stageFixupRecoveryTransitions enumerates the explicit fix-up
 // RECOVERY override off the normal state machine — the edges used to
 // restore a run to its pre-fix-up review gate when a fix-up

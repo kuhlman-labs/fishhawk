@@ -133,8 +133,8 @@ func TestNextActions_StateTable(t *testing.T) {
 			stages:       []Stage{naStage("plan", "awaiting_approval")},
 			planRS:       naReviewStatus("plan", "complete"),
 			wantState:    "plan_gate_parked",
-			wantActions:  []string{"fishhawk_approve_plan", "fishhawk_reject_plan"},
-			wantConsumes: []string{consumesApprovalSlot, consumesApprovalSlot},
+			wantActions:  []string{"fishhawk_approve_plan", "fishhawk_revise_plan", "fishhawk_reject_plan"},
+			wantConsumes: []string{consumesApprovalSlot, consumesApprovalSlot, consumesApprovalSlot},
 		},
 		{
 			name:         "amended_implement_pending_local_dispatch",

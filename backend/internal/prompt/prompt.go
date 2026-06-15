@@ -217,6 +217,23 @@ type Trigger struct {
 	// amended plan, not the superseded plan text (#1021). Nil means no
 	// conditions were given (section omitted in both prompts).
 	ApprovalConditions *string
+	// RevisionConstraint carries the operator's binding design constraint
+	// for a plan-gate `revise` re-open (#1099). When non-nil, buildPlan
+	// renders a DEDICATED "### Revision constraint (binding ...)" section
+	// instructing the planner to revise the prior plan (RevisionBasePlan)
+	// to satisfy this constraint rather than replan blank-slate. A
+	// dedicated field — NOT reusing ApprovalConditions — so the constraint
+	// is never mislabeled under the Clarification answers heading. First-
+	// pass plan dispatch leaves this nil (no plan_revised entry), so normal
+	// plans are byte-unchanged.
+	RevisionConstraint *string
+	// RevisionBasePlan is the JSON-serialized prior plan that a `revise`
+	// re-open carries as the revision base (#1099). When RevisionConstraint
+	// is set, buildPlan renders it under the Revision constraint section so
+	// the planner revises the existing plan rather than starting over. Nil
+	// on a normal plan dispatch and tolerated nil even on a revise (the
+	// section then omits the base block and still binds the constraint).
+	RevisionBasePlan *string
 	// FixupConcerns carries the operator-selected implement-review concerns
 	// for a bounded fix-up pass (#762). Each entry is one rendered concern
 	// (severity/category/note). When non-empty, buildImplement injects a
@@ -762,6 +779,41 @@ func buildPlan(t Trigger) string {
 			"non-derivable facts and decisions: fold them into the step-zero plannability check and " +
 			"produce a concrete standard_v1 plan now. Do NOT park again on anything these answers resolve.\n\n")
 		b.WriteString(answers)
+		b.WriteString("\n\n")
+	}
+
+	// Revision constraint (#1099): on a plan-gate `revise` re-open, the
+	// operator's binding design constraint flows back through a DEDICATED
+	// channel (t.RevisionConstraint) — NOT the clarification/approval one —
+	// and the prior plan rides as the revision base (t.RevisionBasePlan).
+	// The first-pass plan dispatch leaves both nil (the server only
+	// populates them when re-opening a parked plan stage via revise), so
+	// this section is absent on a normal plan. Both blocks are capped like
+	// the other resume channels.
+	if t.RevisionConstraint != nil && *t.RevisionConstraint != "" {
+		b.WriteString("### Revision constraint (binding — revise this plan to satisfy)\n\n")
+		b.WriteString("The operator reviewed your previous plan and approved its direction, but requires a " +
+			"design change before it can proceed. They routed a binding constraint back through the revise " +
+			"channel (#558). Treat it as authoritative: REVISE the prior plan below to satisfy it — do NOT " +
+			"replan blank-slate, and do NOT discard the parts of the plan the constraint does not touch. " +
+			"Re-emit a complete, valid standard_v1 plan that honours the constraint.\n\n")
+		if t.RevisionBasePlan != nil && *t.RevisionBasePlan != "" {
+			base := *t.RevisionBasePlan
+			const maxBaseBytes = 4000
+			if len(base) > maxBaseBytes {
+				base = base[:maxBaseBytes] + "...[truncated]"
+			}
+			b.WriteString("Prior plan (the revision base):\n\n")
+			b.WriteString(base)
+			b.WriteString("\n\n")
+		}
+		constraint := *t.RevisionConstraint
+		const maxConstraintBytes = 4000
+		if len(constraint) > maxConstraintBytes {
+			constraint = constraint[:maxConstraintBytes] + "...[truncated]"
+		}
+		b.WriteString("Operator constraint (MANDATORY — wins on conflict with the prior plan):\n\n")
+		b.WriteString(constraint)
 		b.WriteString("\n\n")
 	}
 
@@ -1789,6 +1841,7 @@ var trustedMarkers = []string{
 	"Approved plan",
 	"Approval conditions",
 	"Fix-up concerns",
+	"Revision constraint",
 }
 
 // sanitizeUntrustedComment neutralizes prompt-injection-shaped structure

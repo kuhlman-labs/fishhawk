@@ -593,6 +593,16 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// approval_submitted one — a parked plan stage is not yet approved.
 		// nil on a normal first-pass plan (no answers recorded).
 		trigger.ApprovalConditions = s.loadClarificationAnswers(r.Context(), runRow.ID)
+		// Revision constraint (#1099): on a plan-gate `revise` re-open, the
+		// operator's binding design constraint rides a DEDICATED plan_revised
+		// channel (not the approval/clarification one) and the prior plan is
+		// carried as the revision base. First-pass plan dispatch records no
+		// plan_revised entry, so RevisionConstraint stays nil and the base is
+		// not loaded — normal plans are byte-unchanged.
+		trigger.RevisionConstraint = s.loadRevisionConstraint(r.Context(), runRow.ID)
+		if trigger.RevisionConstraint != nil {
+			trigger.RevisionBasePlan = s.loadRevisionBasePlan(r.Context(), runRow.ID)
+		}
 	}
 
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
@@ -811,6 +821,16 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// approval_submitted one — a parked plan stage is not yet approved.
 		// nil on a normal first-pass plan (no answers recorded).
 		trigger.ApprovalConditions = s.loadClarificationAnswers(r.Context(), runRow.ID)
+		// Revision constraint (#1099): on a plan-gate `revise` re-open, the
+		// operator's binding design constraint rides a DEDICATED plan_revised
+		// channel (not the approval/clarification one) and the prior plan is
+		// carried as the revision base. First-pass plan dispatch records no
+		// plan_revised entry, so RevisionConstraint stays nil and the base is
+		// not loaded — normal plans are byte-unchanged.
+		trigger.RevisionConstraint = s.loadRevisionConstraint(r.Context(), runRow.ID)
+		if trigger.RevisionConstraint != nil {
+			trigger.RevisionBasePlan = s.loadRevisionBasePlan(r.Context(), runRow.ID)
+		}
 	}
 
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
@@ -2063,6 +2083,75 @@ func (s *Server) loadClarificationAnswers(ctx context.Context, runID uuid.UUID) 
 		}
 	}
 	return nil
+}
+
+// loadRevisionConstraint scans the run's plan_revised audit entries
+// (newest-first) for the first entry carrying a non-empty rendered
+// `conditions` blob — the operator's binding design constraint for a
+// plan-gate `revise` re-open (#1099). Returns the blob (capped at 4000
+// bytes) or nil when none is found. Best-effort: WARN-logs and returns
+// nil on any error.
+//
+// This is a DEDICATED channel, isolated from loadApprovalConditions
+// (approval_submitted) and loadClarificationAnswers (clarification_
+// answered): the revise constraint must never ride a decision=approve or
+// a clarification answer entry. The plan-stage prompt branch feeds this
+// into trigger.RevisionConstraint so the dedicated "Revision constraint
+// (binding ...)" renderer fires on the re-dispatch.
+func (s *Server) loadRevisionConstraint(ctx context.Context, runID uuid.UUID) *string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryPlanRevised)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list plan_revised for revise resume failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Conditions string `json:"conditions"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Conditions != "" {
+			c := payload.Conditions
+			const maxConditionBytes = 4000
+			if len(c) > maxConditionBytes {
+				c = c[:maxConditionBytes] + "...[truncated]"
+			}
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded revision constraint into re-dispatched plan prompt",
+				slog.String("run_id", runID.String()),
+				slog.Int("constraint_bytes", len(payload.Conditions)),
+			)
+			return &c
+		}
+	}
+	return nil
+}
+
+// loadRevisionBasePlan returns the run's most-recent plan artifact
+// serialized to indented JSON — the revision base a plan-gate `revise`
+// re-open carries so the planner revises the existing plan rather than
+// replanning blank-slate (#1099). Returns nil when no plan artifact
+// exists yet (impossible on a real revise, which only fires after a plan
+// landed) or on any load/marshal error — best-effort, the prompt still
+// binds the constraint without the base block.
+func (s *Server) loadRevisionBasePlan(ctx context.Context, runID uuid.UUID) *string {
+	p, err := s.loadApprovedPlanForRun(ctx, runID)
+	if err != nil || p == nil {
+		return nil
+	}
+	raw, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return nil
+	}
+	base := string(raw)
+	return &base
 }
 
 // resolveApprovalConditions returns the binding approve-with-conditions text

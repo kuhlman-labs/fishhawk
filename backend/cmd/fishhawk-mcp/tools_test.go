@@ -172,6 +172,21 @@ type fakeBackend struct {
 	clarificationErrBody    string
 	clarificationCalledByID map[uuid.UUID]int
 
+	// #1099 fixtures: POST /v0/stages/{id}/revise.
+	// reviseBody captures the last decoded request body so tests can
+	// assert the constraint + force threading.
+	// reviseResp seeds the re-opened Stage keyed by stage id; default is a
+	// minimal Stage with Type="plan" State="pending" (the re-opened outcome).
+	// reviseStatus drives the HTTP status (default 200).
+	// reviseErrBody, when set, is written verbatim — drives the 400 / 409
+	// error-path tests.
+	// reviseCalledByID counts revise calls per stage id.
+	reviseBody       reviseRequest
+	reviseResp       map[uuid.UUID]Stage
+	reviseStatus     int
+	reviseErrBody    string
+	reviseCalledByID map[uuid.UUID]int
+
 	// #984 fixtures: POST /v0/concerns/{id}/waive.
 	// waiveBody captures the last decoded request body (the reason).
 	// waiveResp seeds the waived-concern response keyed by concern id;
@@ -272,6 +287,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		clarificationResp:        map[uuid.UUID]Stage{},
 		clarificationStatus:      http.StatusOK,
 		clarificationCalledByID:  map[uuid.UUID]int{},
+		reviseResp:               map[uuid.UUID]Stage{},
+		reviseStatus:             http.StatusOK,
+		reviseCalledByID:         map[uuid.UUID]int{},
 		waiveResp:                map[uuid.UUID]WaivedConcern{},
 		waiveStatus:              http.StatusOK,
 		waiveCalledByID:          map[uuid.UUID]int{},
@@ -388,6 +406,32 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		status := fb.clarificationStatus
 		errBody := fb.clarificationErrBody
 		resp, ok := fb.clarificationResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = Stage{ID: id.String(), Type: "plan", State: "pending"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/stages/{stage_id}/revise", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body reviseRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.reviseCalledByID[id]++
+		fb.reviseBody = body
+		status := fb.reviseStatus
+		errBody := fb.reviseErrBody
+		resp, ok := fb.reviseResp[id]
 		fb.mu.Unlock()
 		w.WriteHeader(status)
 		if errBody != "" {
@@ -1057,7 +1101,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 25
+	const wantToolCount = 26
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -2428,8 +2472,8 @@ func TestGetRunStatus_NextActions_PlanGateParked(t *testing.T) {
 	for _, a := range out.NextActions.Actions {
 		names = append(names, a.Action)
 	}
-	if len(names) != 2 || names[0] != "fishhawk_approve_plan" || names[1] != "fishhawk_reject_plan" {
-		t.Errorf("next_actions.actions = %v, want [fishhawk_approve_plan fishhawk_reject_plan]", names)
+	if len(names) != 3 || names[0] != "fishhawk_approve_plan" || names[1] != "fishhawk_revise_plan" || names[2] != "fishhawk_reject_plan" {
+		t.Errorf("next_actions.actions = %v, want [fishhawk_approve_plan fishhawk_revise_plan fishhawk_reject_plan]", names)
 	}
 }
 

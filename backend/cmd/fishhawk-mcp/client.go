@@ -447,6 +447,51 @@ func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []s
 	return &s, nil
 }
 
+// reviseRequest mirrors the backend's
+// `POST /v0/stages/{stage_id}/revise` body
+// (`backend/internal/server/revise.go::reviseRequest`). Constraint is the
+// operator's binding design constraint the planner must revise the prior
+// plan to satisfy — REQUIRED. ForceAdditionalPass is the bounded operator
+// override: grant ONE revise pass beyond the normal budget, hard-capped
+// at 3 total passes per stage.
+type reviseRequest struct {
+	Constraint          string `json:"constraint"`
+	ForceAdditionalPass bool   `json:"force_additional_pass,omitempty"`
+}
+
+// SubmitRevise re-opens a plan stage parked at its approval gate to
+// re-plan IN PLACE against a binding operator design constraint via
+// `POST /v0/stages/{stage_id}/revise` (#1099). The third plan-gate
+// verdict alongside approve/reject: the constraint is injected into the
+// re-dispatched plan prompt (the #558 binding channel, a dedicated
+// "Revision constraint" section) with the prior plan as the revision
+// base, and the stage re-enters the review → approve gate. Distinct from
+// RetryStage: revise re-opens a HEALTHY plan gate and is bounded
+// (default one pass). Returns the re-opened Stage row (pending, or
+// dispatched once the orchestrator advances it before the response
+// returns). 4xx surfaces:
+//   - 400 validation_failed (empty constraint / malformed UUID)
+//   - 403 cross_run_revise (a run-bound token reaching another run's
+//     stage) or insufficient_scope
+//   - 404 stage_not_found
+//   - 409 revise_not_applicable (the stage is not a plan stage parked at
+//     awaiting_approval)
+//   - 409 revise_budget_exhausted (the NORMAL bounded pass count is spent;
+//     one more pass is available via forceAdditionalPass)
+//   - 409 revise_ceiling_reached (the hard ceiling of 3 total passes is
+//     reached; the override cannot push past it — reject → fresh-run replan)
+func (c *apiClient) SubmitRevise(ctx context.Context, stageID uuid.UUID, constraint string, forceAdditionalPass bool) (*Stage, error) {
+	body, err := json.Marshal(reviseRequest{Constraint: constraint, ForceAdditionalPass: forceAdditionalPass})
+	if err != nil {
+		return nil, fmt.Errorf("marshal revise: %w", err)
+	}
+	var s Stage
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/revise", body, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 // waiveConcernRequest mirrors the backend's
 // `POST /v0/concerns/{concern_id}/waive` body
 // (`backend/internal/server/waive.go::waiveConcernRequest`). Reason is

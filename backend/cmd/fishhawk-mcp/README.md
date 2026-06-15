@@ -181,6 +181,36 @@ What a fix-up does — and how it differs from `fishhawk_retry_stage`:
 
 Error surfaces propagated as tool errors: `validation_failed` (400, no concern selection / both `concern_ids` and `concerns` supplied / out-of-range index / unknown, foreign, plan-stage, or non-open `concern_id` — the empty/mixed selections are also caught locally before the HTTP hop), `cross_run_fixup` (403), `stage_not_found` (404), `fixup_not_applicable` (422, no recorded `approve_with_concerns` verdict to route back), `fixup_budget_exhausted` (422).
 
+## Plan-gate revise (`fishhawk_revise_plan`)
+
+`fishhawk_revise_plan` (E22.X / [#1099](https://github.com/kuhlman-labs/fishhawk/issues/1099)) is the **third plan-gate verdict** alongside `fishhawk_approve_plan` and `fishhawk_reject_plan`: it re-plans **in place** in the same run against a binding operator design constraint, instead of approving the plan as-is or rejecting it to a fresh-run replan. It wraps `POST /v0/stages/{stage_id}/revise`. Takes a **run id**; the tool resolves the plan stage internally (the `type=plan` stage, like the approve/reject tools).
+
+Inputs:
+
+| Field | Required | Notes |
+|---|---|---|
+| `run_id` | **yes** | The run whose plan stage to revise. |
+| `constraint` | **yes** | The binding design constraint the planner must revise the prior plan to satisfy. Injected into the re-dispatched plan prompt as a dedicated, binding **"Revision constraint"** section (the [#558](https://github.com/kuhlman-labs/fishhawk/issues/558) condition-delivery framing: MANDATORY, wins on conflict), with the prior plan carried as the **revision base**. Empty constraints are rejected (`validation_failed`, also caught locally before the HTTP hop). |
+| `force_additional_pass` | no | Bounded operator override — grant ONE revise pass **beyond** the normal budget when it is already spent (`revise_budget_exhausted`), hard-capped at 3 total passes per stage. The forced pass is audited. |
+
+When to reach for revise vs the alternatives:
+
+- **approve** — the plan is correct as written.
+- **revise** — the plan's direction is sound but a design constraint must change first. Cheaper than a reject → fresh-run replan because the prior plan is the revision base and only the constrained parts change; the operator's design intent reaches the agent through the same binding channel as approval conditions.
+- **reject** — the plan takes a wrong fork no constraint can amend.
+
+What a revise does — and how it differs from `fishhawk_reject_plan`:
+
+- The constraint is delivered to the planner as a **binding** instruction in a dedicated "Revision constraint" prompt section — never under the clarification-answers or approval-conditions heading — and the prior plan rides as the revision base so the planner **revises** rather than replanning blank-slate.
+- On success the plan stage flips `awaiting_approval → pending` (the orchestrator advances it to `dispatched`, re-firing `workflow_dispatch`); the run re-enters the normal plan **review → approve** gate. (`reject` fails the gate as category D and the next step is a fresh run.)
+
+**Operator-gated and bounded — this is never an unbounded auto-loop:**
+
+- The bound defaults to **one pass per stage**, enforced server-side by counting prior `plan_revised` audit entries (no dedicated column — exactly as fix-up counts `stage_fixup_triggered`). A second attempt once the bound is spent returns a `revise_budget_exhausted` tool error (details carry `max_passes` + `used`); the operator may grant ONE more pass with `force_additional_pass=true`, hard-capped at 3 total passes. At the ceiling the tool returns the distinct `revise_ceiling_reached` error (a hard stop — reject and start a fresh run).
+- **Auth:** a write tool requiring `write:approvals` scope (the #558 binding-conditions / gate-answer family). A run-bound token may revise only stages **within its own run** — a cross-run target returns `cross_run_revise` (403).
+
+Error surfaces propagated as tool errors: `validation_failed` (400, empty constraint), `cross_run_revise` (403), `stage_not_found` (404), `revise_not_applicable` (409, the stage is not a plan stage parked at `awaiting_approval`), `revise_budget_exhausted` (409), `revise_ceiling_reached` (409). The OpenAPI/`v0.md` surface remains the authoritative parameter reference.
+
 ## Concern waiver (`fishhawk_waive_concern`)
 
 `fishhawk_waive_concern` (E22.X / [#984](https://github.com/kuhlman-labs/fishhawk/issues/984)) waives one **open** review concern (`raised`, `addressed_pending`, or `reopened`) with a **required, audited reason** — the operator judgment that the concern does not warrant a change (false positive, accepted trade-off, deliberate deferral), as distinct from `fishhawk_fixup_stage` (route the concern back to the agent). It wraps `POST /v0/concerns/{concern_id}/waive`.
