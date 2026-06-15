@@ -51,6 +51,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 
 	"os"
 	"strconv"
@@ -691,6 +692,21 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Info("role resolver configured")
 	} else {
 		logger.Warn("role resolver not configured: approval handler will accept any authenticated subject")
+	}
+
+	// Work-management providers (#1104). Register the github_projects
+	// work-item + product-feedback providers so fishhawk_file_issue and
+	// fishhawk_report_product_issue resolve a provider instead of 501.
+	// Gated on a configured GitHub client — unconfigured leaves both
+	// registries empty and the endpoints continue to 501 (the v0
+	// not-yet-wired posture).
+	if cfg.GitHub != nil {
+		registerWorkmgmtProviders(cfg.GitHub)
+		logger.Info("work-management providers registered",
+			slog.Any("work_item", workmgmt.Registered()),
+			slog.Any("feedback", workmgmt.RegisteredFeedback()))
+	} else {
+		logger.Warn("work-management providers not registered: fishhawk_file_issue / fishhawk_report_product_issue respond 501 until GitHub is configured")
 	}
 
 	// GitHub OAuth sign-in (E4.2). All three of client_id +

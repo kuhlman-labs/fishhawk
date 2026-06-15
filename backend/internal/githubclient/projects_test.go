@@ -3,6 +3,7 @@ package githubclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -223,5 +224,66 @@ func TestAddProjectItem_MissingItemID(t *testing.T) {
 	_, err := c.AddProjectItem(context.Background(), 7, "P", "C")
 	if err == nil || !strings.Contains(err.Error(), "missing item id") {
 		t.Fatalf("want missing-item-id error, got %v", err)
+	}
+}
+
+// newSearchFake serves GET /search/issues, recording the q parameter and
+// returning a canned status + body.
+func newSearchFake(t *testing.T, status int, body string) (*string, *Client) {
+	t.Helper()
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /search/issues", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query().Get("q")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(orDefault(status, http.StatusOK))
+		_, _ = io.WriteString(w, body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{
+		BaseURL: srv.URL,
+		Tokens:  &stubTokens{token: "ghs_canned"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+	return &gotQuery, c
+}
+
+func TestSearchOpenIssues_HitMapsFields(t *testing.T) {
+	gotQuery, c := newSearchFake(t, http.StatusOK,
+		`{"total_count":1,"items":[{"number":42,"html_url":"https://github.com/o/r/issues/42","body":"boom <!-- fishhawk-fingerprint:abc -->"}]}`)
+	const q = `repo:o/r is:issue is:open in:body "<!-- fishhawk-fingerprint:abc -->"`
+	got, err := c.SearchOpenIssues(context.Background(), 7, q)
+	if err != nil {
+		t.Fatalf("SearchOpenIssues: %v", err)
+	}
+	if *gotQuery != q {
+		t.Errorf("q parameter = %q, want %q", *gotQuery, q)
+	}
+	if len(got) != 1 {
+		t.Fatalf("results = %d, want 1", len(got))
+	}
+	if got[0].Number != 42 || got[0].HTMLURL != "https://github.com/o/r/issues/42" ||
+		!strings.Contains(got[0].Body, "fishhawk-fingerprint:abc") {
+		t.Errorf("result = %+v", got[0])
+	}
+}
+
+func TestSearchOpenIssues_EmptyMiss(t *testing.T) {
+	_, c := newSearchFake(t, http.StatusOK, `{"total_count":0,"items":[]}`)
+	got, err := c.SearchOpenIssues(context.Background(), 7, "repo:o/r is:issue is:open")
+	if err != nil {
+		t.Fatalf("SearchOpenIssues: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("results = %d, want 0", len(got))
+	}
+}
+
+func TestSearchOpenIssues_ErrorStatus(t *testing.T) {
+	_, c := newSearchFake(t, http.StatusUnprocessableEntity, `{"message":"Validation Failed"}`)
+	_, err := c.SearchOpenIssues(context.Background(), 7, "repo:o/r bad")
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Fatalf("want ErrValidation, got %v", err)
 	}
 }
