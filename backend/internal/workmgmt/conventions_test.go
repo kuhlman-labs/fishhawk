@@ -112,6 +112,42 @@ func TestParseValid(t *testing.T) {
 	}
 }
 
+// TestParseValidJira proves a provider:jira config carrying the additive
+// jira connection block (project_key + optional issue_types, and NO
+// base_url — the instance URL and creds are server-side env) parses
+// cleanly and round-trips into the typed *JiraConnection. No provider
+// behavior is exercised here; provider:jira still fails closed at filing
+// time until the concrete provider lands.
+func TestParseValidJira(t *testing.T) {
+	cfg := `
+spec_version: work-management-v0
+provider: jira
+jira:
+  project_key: FISH
+  issue_types:
+    feature: Story
+    bug: Bug
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(jira) = %v, want nil", err)
+	}
+	if c.Provider != "jira" {
+		t.Errorf("Provider = %q, want jira", c.Provider)
+	}
+	if c.Jira == nil {
+		t.Fatal("Jira is nil; the jira block did not round-trip into the struct")
+	}
+	if c.Jira.ProjectKey != "FISH" {
+		t.Errorf("Jira.ProjectKey = %q, want FISH", c.Jira.ProjectKey)
+	}
+	if c.Jira.IssueTypes["feature"] != "Story" || c.Jira.IssueTypes["bug"] != "Bug" {
+		t.Errorf("Jira.IssueTypes = %v, want {feature:Story bug:Bug}", c.Jira.IssueTypes)
+	}
+}
+
 // TestParseDoneMeansSpaceVariant proves the mandatory-field check is
 // robust to "Done means" vs "Done-means".
 func TestParseDoneMeansSpaceVariant(t *testing.T) {
@@ -198,6 +234,15 @@ required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: [Summary]}}
 `,
 			want: "requires a project connection",
+		},
+		"jira without jira block": {
+			cfg: `
+spec_version: work-management-v0
+provider: jira
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`,
+			want: "requires a jira connection",
 		},
 		"adr without numbering": {
 			cfg: `
