@@ -56,6 +56,16 @@ type ProviderRequest struct {
 // CreatedItem is what a Provider returns on a successful filing: the
 // created item's number + URL and the placement/labels actually applied,
 // so the caller can audit and echo exactly what landed.
+//
+// Boarded and EpicLinked report whether the post-create best-effort
+// enrichment landed. Creating the issue is the fatal step (no CreatedItem
+// is returned when it fails); board placement and epic linking are
+// best-effort — a failure leaves Boarded/EpicLinked false and records the
+// cause in BoardingError/EpicLinkError, but the issue is still the durable
+// result so File returns it with a nil error (#1107). Boarded false with
+// an empty BoardingError means there was nothing to board (no project
+// configured); likewise EpicLinked false with an empty EpicLinkError means
+// no parent epic was requested.
 type CreatedItem struct {
 	Provider      string   `json:"provider"`
 	Number        int      `json:"number"`
@@ -63,6 +73,10 @@ type CreatedItem struct {
 	AppliedLabels []string `json:"applied_labels,omitempty"`
 	Status        string   `json:"status,omitempty"`
 	BoardColumn   string   `json:"board_column,omitempty"`
+	Boarded       bool     `json:"boarded"`
+	EpicLinked    bool     `json:"epic_linked"`
+	BoardingError string   `json:"boarding_error,omitempty"`
+	EpicLinkError string   `json:"epic_link_error,omitempty"`
 }
 
 // UnknownProviderError is returned by Get when no provider is registered

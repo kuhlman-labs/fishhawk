@@ -177,7 +177,7 @@ components:
 
     WorkItemResponse:
       type: object
-      required: [type, title, number, url, provider, audited]
+      required: [type, title, number, url, provider, boarded, audited]
       description: The created item — exactly what landed, so the caller renders the result without a second fetch.
       properties:
         type: { type: string }
@@ -189,6 +189,27 @@ components:
         complexity: { type: string }
         status: { type: string }
         board_column: { type: string }
+        boarded:
+          type: boolean
+          description: >-
+            Whether the created item was placed on the configured project board with its
+            status set (#1107). Best-effort: board placement no longer fails the filing — when
+            it fails, the item is still created and this is `false` with the cause in
+            `boarding_error` (also WARN-logged server-side). `false` with no `boarding_error`
+            means no project board was configured (nothing to board).
+        epic_linked:
+          type: boolean
+          description: >-
+            Whether the parent epic was linked as a sub-issue (#1107). Best-effort like
+            `boarded`: a link failure does not fail the filing — this is `false` with the cause
+            in `epic_link_error`. `false` with no `epic_link_error` means no parent epic was
+            requested.
+        boarding_error:
+          type: string
+          description: The cause when best-effort board placement failed (#1107); absent on success.
+        epic_link_error:
+          type: string
+          description: The cause when best-effort epic linking failed (#1107); absent on success.
         audited:
           type: boolean
           description: True when a `work_item_filed` audit entry was written (a run was in flight).

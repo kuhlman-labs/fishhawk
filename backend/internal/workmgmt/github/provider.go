@@ -51,10 +51,15 @@ func New(api API) *Provider { return &Provider{api: api} }
 func (*Provider) Name() string { return ProviderName }
 
 // File creates the issue and applies the conventions-resolved placement
-// and relations. The issue is created first (the durable result); a
-// later placement/link failure returns an error naming the step, leaving
-// the created issue's URL in the error for recovery. The created issue is
-// returned only when every requested step succeeds.
+// and relations. The issue is created first — it is the durable result and
+// the only fatal step: a CreateIssue failure (or a failed pre-create
+// guard) returns a nil item and an error, because no issue exists. Board
+// placement and epic linking are best-effort (#1107): once the issue
+// exists File always returns it with a nil error, recording whether the
+// enrichment landed in CreatedItem.Boarded / EpicLinked and the cause in
+// BoardingError / EpicLinkError when it did not. The server logs those
+// causes and echoes them in the response so a real misconfiguration stays
+// diagnosable while a placement failure no longer orphans a created issue.
 func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
 	if p.api == nil {
 		return nil, errors.New("workmgmt/github: provider missing API client")
@@ -92,13 +97,25 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		BoardColumn:   req.Item.BoardPlacement.BoardColumn,
 	}
 
-	if err := p.placeOnBoard(ctx, inst, req, issue); err != nil {
-		return nil, fmt.Errorf("%w (issue created: %s)", err, issue.HTMLURL)
+	// Board placement is best-effort (#1107): the issue is the durable
+	// result, so a placement failure records the cause and leaves Boarded
+	// false rather than discarding the created issue. No project configured
+	// means nothing to board — leave Boarded false with no error.
+	if req.Target.Project == nil {
+		created.Boarded = false
+	} else if err := p.placeOnBoard(ctx, inst, req, issue); err != nil {
+		created.BoardingError = err.Error()
+	} else {
+		created.Boarded = true
 	}
 
+	// Epic linking is best-effort too; an empty parent epic means nothing
+	// to link (leave EpicLinked false with no error).
 	if epic := strings.TrimSpace(req.Item.Relations.ParentEpic); epic != "" {
 		if err := p.linkEpic(ctx, inst, repo, epic, issue.NodeID); err != nil {
-			return nil, fmt.Errorf("%w (issue created: %s)", err, issue.HTMLURL)
+			created.EpicLinkError = err.Error()
+		} else {
+			created.EpicLinked = true
 		}
 	}
 
