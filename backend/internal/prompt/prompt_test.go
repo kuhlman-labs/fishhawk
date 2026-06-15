@@ -1810,6 +1810,95 @@ func TestBuild_PlanReview_GateEvidence_SubPlanPrefixRenders(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_CrossSliceCouplingRenders pins the
+// cross-slice coupling render block (#1102): with CrossSliceFindings set,
+// the prompt must carry the CROSS-SLICE COUPLING line naming the pattern,
+// the involved slice titles, and their owned files; with no cross-slice
+// findings the block must be absent.
+func TestBuild_PlanReview_GateEvidence_CrossSliceCouplingRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			SurfaceSweep: &SurfaceSweepEvidence{
+				ScannedFiles: 2,
+				CrossSliceFindings: []CrossSliceCouplingFindingEvidence{
+					{
+						Pattern: "work-management schema requires every mirror",
+						Slices: []CrossSliceClaimEvidence{
+							{SliceTitle: "schema slice", Files: []string{"docs/spec/work-management-v0.schema.json"}},
+							{SliceTitle: "wiring slice", Files: []string{"backend/internal/workmgmt/schemas/work-management-v0.schema.json"}},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"- CROSS-SLICE COUPLING (work-management schema requires every mirror): these lockstep files are split across slices — \"schema slice\" owns [docs/spec/work-management-v0.schema.json], \"wiring slice\" owns [backend/internal/workmgmt/schemas/work-management-v0.schema.json].",
+		"runtime scope amendment, which can time out (#1035)",
+		"Consolidate these files into the single slice that completes the seam",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing cross-slice element %q:\n%s", w, got)
+		}
+	}
+
+	// A surface sweep with no cross-slice findings must not render the block.
+	clean, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			SurfaceSweep: &SurfaceSweepEvidence{ScannedFiles: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build clean: %v", err)
+	}
+	if strings.Contains(clean, "CROSS-SLICE COUPLING") {
+		t.Errorf("cross-slice block must be absent when CrossSliceFindings is empty:\n%s", clean)
+	}
+}
+
+// TestBuild_Plan_CrossSliceSeamGuidance is binding condition: the decomposer
+// prompt must carry the case-1 cross-slice-seam rule (#1102) so a slice's
+// serializer/client is not split from the request-type/schema that an
+// earlier slice owns.
+func TestBuild_Plan_CrossSliceSeamGuidance(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 1102,
+		IssueTitle:  "Plan a decomposed change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Cross-slice seam rule",
+		"single end-to-end contract",
+		"never split a request-type from the code that populates it",
+		"runtime scope amendment that can time out (#1035)",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing cross-slice-seam guidance %q\n---\n%s", w, got)
+		}
+	}
+
+	// The rule is plan-stage only — it must not bleed into the implement prompt.
+	impl, err := Build("implement", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build implement: %v", err)
+	}
+	if strings.Contains(impl, "Cross-slice seam rule") {
+		t.Errorf("cross-slice-seam rule must not render in the implement prompt:\n%s", impl)
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_TestSweepCleanAndNil verifies the
 // "checked and clean" line for an empty-findings test sweep and the
 // additive property: a nil TestSweep omits the block entirely.

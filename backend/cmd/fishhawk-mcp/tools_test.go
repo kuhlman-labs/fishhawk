@@ -2068,6 +2068,97 @@ func TestGetPlan_SurfaceSweep_AbsentWhenNoEntry(t *testing.T) {
 	}
 }
 
+// TestGetPlan_SurfaceSweep_CrossSliceFindings exercises the #1102 seam:
+// a server-side SurfaceSweepPayload carrying cross_slice_findings decodes
+// into the MCP SurfaceSweep struct via the real backend write -> mcp read
+// JSON contract, so a struct-tag drift fails here rather than in production.
+func TestGetPlan_SurfaceSweep_CrossSliceFindings(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedSurfaceSweepAudit(fb, runID, server.SurfaceSweepPayload{
+		ScannedFiles: 1,
+		Findings:     []server.SurfaceSweepFinding{},
+		CrossSliceFindings: []server.CrossSliceCouplingFinding{
+			{
+				Pattern: "work-management schema requires every mirror",
+				Slices: []server.CrossSliceClaim{
+					{SliceTitle: "schema slice", Files: []string{"docs/spec/work-management-v0.schema.json"}},
+					{SliceTitle: "wiring slice", Files: []string{"backend/internal/workmgmt/schemas/work-management-v0.schema.json"}},
+				},
+			},
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SurfaceSweep == nil {
+		t.Fatal("SurfaceSweep is nil; want populated")
+	}
+	if got := len(out.SurfaceSweep.CrossSliceFindings); got != 1 {
+		t.Fatalf("len(CrossSliceFindings) = %d, want 1", got)
+	}
+	f := out.SurfaceSweep.CrossSliceFindings[0]
+	if f.Pattern != "work-management schema requires every mirror" {
+		t.Errorf("Pattern = %q", f.Pattern)
+	}
+	if len(f.Slices) != 2 {
+		t.Fatalf("len(Slices) = %d, want 2", len(f.Slices))
+	}
+	if f.Slices[0].SliceTitle != "schema slice" || len(f.Slices[0].Files) != 1 ||
+		f.Slices[0].Files[0] != "docs/spec/work-management-v0.schema.json" {
+		t.Errorf("Slices[0] = %+v", f.Slices[0])
+	}
+}
+
+// TestGetPlan_SurfaceSweep_LegacyPayloadDecodesEmpty pins backward
+// compatibility (#1102): a plan_surface_sweep entry written before the
+// cross_slice_findings field existed decodes to an empty slice, never an
+// error, so the omitempty field is simply absent.
+func TestGetPlan_SurfaceSweep_LegacyPayloadDecodesEmpty(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// A legacy payload with no cross_slice_findings key at all.
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: 1,
+		RunID:    runID.String(),
+		Category: "plan_surface_sweep",
+		Payload:  map[string]any{"scanned_files": float64(3), "findings": []any{}},
+	})
+	fb.mu.Unlock()
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SurfaceSweep == nil {
+		t.Fatal("SurfaceSweep is nil; want populated from the legacy entry")
+	}
+	if out.SurfaceSweep.ScannedFiles != 3 {
+		t.Errorf("ScannedFiles = %d, want 3", out.SurfaceSweep.ScannedFiles)
+	}
+	if len(out.SurfaceSweep.CrossSliceFindings) != 0 {
+		t.Errorf("legacy payload must decode CrossSliceFindings to empty; got %+v", out.SurfaceSweep.CrossSliceFindings)
+	}
+}
+
 // seedTestSweepAudit marshals a SERVER-side TestSweepPayload and feeds it
 // back through the fake backend as a plan_test_sweep audit entry. Using
 // the real server type is the point of the seam test (#618): it exercises

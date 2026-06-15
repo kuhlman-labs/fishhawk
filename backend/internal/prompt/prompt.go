@@ -450,10 +450,13 @@ type GateViolation struct {
 
 // SurfaceSweepEvidence is the plan_surface_sweep result: the plan's
 // scope.files evaluated against the static multi-surface lockstep
-// registry. Empty Findings means "checked and clean".
+// registry. Empty Findings means "checked and clean". CrossSliceFindings
+// carries the cross-slice coupling pass (#1102): lockstep patterns whose
+// members are split across decomposition slices.
 type SurfaceSweepEvidence struct {
-	ScannedFiles int
-	Findings     []SurfaceSweepFindingEvidence
+	ScannedFiles       int
+	Findings           []SurfaceSweepFindingEvidence
+	CrossSliceFindings []CrossSliceCouplingFindingEvidence
 }
 
 // SurfaceSweepFindingEvidence is one missing-sibling finding: the plan
@@ -465,6 +468,23 @@ type SurfaceSweepFindingEvidence struct {
 	TriggerPath     string
 	MissingSiblings []string
 	SubPlanTitle    string
+}
+
+// CrossSliceCouplingFindingEvidence is one cross-slice coupling finding
+// (#1102): a lockstep pattern's member files are partitioned across 2+
+// distinct decomposition slices, so completing the seam would otherwise
+// need a runtime scope amendment (which can time out, #1035). Slices names
+// each involved slice and the pattern-member files it owns.
+type CrossSliceCouplingFindingEvidence struct {
+	Pattern string
+	Slices  []CrossSliceClaimEvidence
+}
+
+// CrossSliceClaimEvidence is one decomposition slice's ownership of a
+// lockstep pattern's member files in a cross-slice coupling finding.
+type CrossSliceClaimEvidence struct {
+	SliceTitle string
+	Files      []string
 }
 
 // TestSweepEvidence is the plan_test_sweep result (#942): the plan's
@@ -901,6 +921,7 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- generated_by: {\"agent\": \"...\", \"model\": \"...\", \"timestamp\": \"...\"} object\n")
 	b.WriteString("- decomposition (when present): {\"rationale\": \"...\", \"sub_plans\": [...]} object — when you are NOT decomposing, OMIT this field entirely; do NOT set it to null\n")
 	b.WriteString("- decomposition.sub_plans[i]: {\"title\": \"...\", \"scope_hint\": \"...\", \"scope\": {\"files\": [...]}, \"predicted_runtime_minutes\": N, \"predicted_runtime_confidence\": \"low|medium|high\"} object — use the FULL canonical field names; \"confidence\" / \"minutes\" shorthand will be rejected. Author each sub-plan's own scope.files (the files THAT slice will touch, same {\"path\", \"operation\"} shape as the top-level scope.files) in addition to scope_hint — it narrows the fan-out child run's scope to that slice instead of the parent's full scope.files. scope is optional but recommended; omit it only when the slice's files are not yet known.\n")
+	b.WriteString("- Cross-slice seam rule (when decomposing): keep a single end-to-end contract's files within ONE slice. When a slice's serializer/client/wiring will need a file whose server/schema/request-type counterpart is owned by an EARLIER slice — never split a request-type from the code that populates it, or a schema from the parser/field-adder that touches it — either keep that contract's files in a single slice or assign the shared file to the integrating (later) slice. Completing a seam split across slices otherwise needs a runtime scope amendment that can time out (#1035), shipping the seam broken (#1102).\n")
 	b.WriteString("The validator rejects any plan where these fields contain bare strings instead of their required structured shapes.\n")
 	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
@@ -1115,6 +1136,16 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 				fmt.Fprintf(b, "- %sMISSING SIBLINGS (%s): %s is in scope but the pattern's required sibling(s) are absent from scope.files: %s\n",
 					subPlanPrefix(f.SubPlanTitle), f.Pattern, f.TriggerPath, strings.Join(f.MissingSiblings, ", "))
 			}
+		}
+		for _, f := range sw.CrossSliceFindings {
+			parts := make([]string, 0, len(f.Slices))
+			for _, c := range f.Slices {
+				parts = append(parts, fmt.Sprintf("%q owns [%s]", c.SliceTitle, strings.Join(c.Files, ", ")))
+			}
+			fmt.Fprintf(b, "- CROSS-SLICE COUPLING (%s): these lockstep files are split across slices — %s. "+
+				"Completing this seam will otherwise need a runtime scope amendment, which can time out (#1035). "+
+				"Consolidate these files into the single slice that completes the seam, or assign the shared file to the integrating slice.\n",
+				f.Pattern, strings.Join(parts, ", "))
 		}
 		b.WriteString("\n")
 	}
