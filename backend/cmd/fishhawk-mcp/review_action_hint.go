@@ -33,6 +33,17 @@ const fixupCeiling = 3
 // layer counts those entries to derive the remaining fix-up budget.
 const categoryStageFixupTriggered = "stage_fixup_triggered"
 
+// categoryFixupNoChanges mirrors the backend report category written by
+// server.succeedFixupNoChangesStage (backend/internal/server/pullrequest.go)
+// when a fix-up re-dispatch produces no commit. KEEP IN SYNC: it is the
+// durable refund signal server.countFixupNoChangeRefunds counts (#967), and
+// the MCP layer counts the same entries so RemainingFixupBudget mirrors the
+// backend's widened MaxPasses (defaultMaxFixupPasses + refunds). If the
+// backend category drifts and this constant does not, a refunded no-op pass
+// surfaces remaining_budget=0 here while the backend would admit a normal
+// pass — the surface-vs-backend disagreement #1150 fixes.
+const categoryFixupNoChanges = "fixup_no_changes"
+
 // ReviewActionHint is a DISPLAY-ONLY next-action pointer surfaced on
 // fishhawk_get_run_status and fishhawk_run_stage when an implement review
 // has landed with unresolved approve_with_concerns concerns and the bounded
@@ -57,7 +68,7 @@ const categoryStageFixupTriggered = "stage_fixup_triggered"
 // fresh review with no concerns).
 type ReviewActionHint struct {
 	Concerns             int    `json:"concerns" jsonschema:"number of unresolved approve_with_concerns concerns from the LATEST implement-review round (summed across reviewers; scoped to concerns that landed after the most-recent fix-up so the count is not inflated across rounds)"`
-	RemainingFixupBudget int    `json:"remaining_fixup_budget" jsonschema:"remaining NORMAL fix-up passes for the implement stage (max_passes minus prior stage_fixup_triggered entries); 0 once the budget is spent"`
+	RemainingFixupBudget int    `json:"remaining_fixup_budget" jsonschema:"remaining NORMAL fix-up passes for the implement stage (max_passes minus prior stage_fixup_triggered entries that were NOT refunded as no-change passes); 0 once the budget is spent, restored when a prior pass produced no changes (#967)"`
 	OverrideAvailable    bool   `json:"override_available" jsonschema:"true when the NORMAL budget is spent but an operator override pass (fishhawk_fixup_stage with force_additional_pass=true) can still be granted below the hard ceiling of 3 total passes; false below budget (no override needed) and at/above the ceiling (no override left)"`
 	Message              string `json:"message" jsonschema:"one-line advisory pointer at the next action: route concerns back with fishhawk_fixup_stage vs approving to merge (below budget), the operator override vs merge-with-follow-up (budget spent, below ceiling), or merge-with-follow-up vs a fresh run (at the ceiling); display-only, never gates the run"`
 }
@@ -197,20 +208,49 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		return nil, nil
 	}
 
-	remaining := maxFixupPasses - priorPasses
+	// No-change refund (#967/#1150): the backend widens MaxPasses by the count
+	// of fixup_no_changes audit entries (handleFixupStage), so a refunded no-op
+	// pass is admissible WITHOUT force_additional_pass. Mirror that here so the
+	// surfaced budget agrees with the backend's admit decision. The refund only
+	// affects the NORMAL-budget arm; the hard ceiling keeps counting RAW passes.
+	refunds, err := r.fixupNoChangeRefunds(ctx, runID, implementStageID)
+	if err != nil {
+		return nil, err
+	}
+	// Defensive clamp, mirroring the backend's `if refundedPasses > priorPasses`
+	// clamp: a refund can never exceed the passes actually triggered.
+	if refunds > priorPasses {
+		refunds = priorPasses
+	}
+	// effectiveConsumed is the normal-budget consumption the backend actually
+	// enforces: it admits when raw priorPasses < (maxFixupPasses + refunds),
+	// algebraically priorPasses - refunds < maxFixupPasses.
+	effectiveConsumed := priorPasses - refunds
+
+	remaining := maxFixupPasses - effectiveConsumed
 	if remaining < 0 {
 		remaining = 0
 	}
 
-	// Below the normal budget: the original route-back vs approve pointer.
-	if priorPasses < maxFixupPasses {
+	// Below the normal budget (after refunds): the original route-back vs
+	// approve pointer. A refunded no-op restores a normal route-back here, so
+	// the message explains WHY budget is non-zero after a spent pass.
+	if effectiveConsumed < maxFixupPasses {
+		var msg string
+		if refunds > 0 {
+			msg = fmt.Sprintf(
+				"%d concern(s) from the implement review — a prior fix-up produced no changes and was refunded against the normal budget, so route-back is available again with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. Remaining fix-up budget: %d.",
+				concerns, implementStageID, remaining)
+		} else {
+			msg = fmt.Sprintf(
+				"%d concern(s) from the implement review — route them back with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. Remaining fix-up budget: %d.",
+				concerns, implementStageID, remaining)
+		}
 		return &ReviewActionHint{
 			Concerns:             concerns,
 			RemainingFixupBudget: remaining,
 			OverrideAvailable:    false,
-			Message: fmt.Sprintf(
-				"%d concern(s) from the implement review — route them back with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. Remaining fix-up budget: %d.",
-				concerns, implementStageID, remaining),
+			Message:              msg,
 		}, nil
 	}
 
@@ -270,6 +310,34 @@ func (r *runResolver) fixupPassesAndLatestSeq(ctx context.Context, runID, stageI
 		}
 	}
 	return n, latestSeq, nil
+}
+
+// fixupNoChangeRefunds returns the number of fixup_no_changes audit entries
+// recorded for the stage — the fix-up passes that produced no commit and are
+// refunded against the NORMAL budget (#967). Mirrors
+// server.countFixupNoChangeRefunds, including the per-entry StageID
+// double-check (as fixupPassesAndLatestSeq does) so a refund on a DIFFERENT
+// stage is never counted against this one. The backend report path's
+// stage-keyed idempotency dedup admits at most one such entry per stage, so in
+// practice this is 0 or 1.
+func (r *runResolver) fixupNoChangeRefunds(ctx context.Context, runID, stageID uuid.UUID) (int, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryFixupNoChanges,
+		StageID:  stageID.String(),
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	want := stageID.String()
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != want {
+			continue
+		}
+		n++
+	}
+	return n, nil
 }
 
 // latestRoundConcerns sums the approve_with_concerns concerns from
