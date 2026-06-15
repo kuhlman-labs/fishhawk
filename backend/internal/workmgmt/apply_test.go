@@ -84,8 +84,9 @@ func TestApply_ADRFirstNumberIsOne(t *testing.T) {
 func TestApply_ChoreAssemblesBodyFromSkeleton(t *testing.T) {
 	conv := testConventions(t)
 	item, _, err := Apply(FilingRequest{
-		Type:    "chore",
-		Summary: "bump deps",
+		Type:      "chore",
+		Summary:   "bump deps",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 		Sections: map[string]string{
 			"Summary":    "bump the pinned tools",
 			"Done-means": "CI green on the bump PR",
@@ -94,8 +95,8 @@ func TestApply_ChoreAssemblesBodyFromSkeleton(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if item.Title != "bump deps" {
-		t.Errorf("title = %q, want bump deps", item.Title)
+	if item.Title != "[E22.7] bump deps" {
+		t.Errorf("title = %q, want [E22.7] bump deps", item.Title)
 	}
 	for _, want := range []string{"## Summary", "bump the pinned tools", "## Done-means", "CI green on the bump PR"} {
 		if !strings.Contains(item.Body, want) {
@@ -177,9 +178,13 @@ func TestApply_ComplexityOverrideWins(t *testing.T) {
 	conv := testConventions(t)
 	item, _, err := Apply(FilingRequest{
 		Type: "bug", Summary: "boom", Complexity: "high",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, conv)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
+	}
+	if want := "[E22.7] boom"; item.Title != want {
+		t.Errorf("title = %q, want %q", item.Title, want)
 	}
 	if item.Classification.Complexity != "high" {
 		t.Errorf("complexity = %q, want high", item.Classification.Complexity)

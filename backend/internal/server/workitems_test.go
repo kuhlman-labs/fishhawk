@@ -213,9 +213,10 @@ func TestFileWorkItem_NoRun_FilesWithoutAudit(t *testing.T) {
 	s := New(Config{AuditRepo: au})
 
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Tidy the workspace file",
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Tidy the workspace file",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "github:operator")
 
 	if rec.Code != http.StatusCreated {
@@ -249,10 +250,11 @@ func TestFileWorkItem_TerminalRun_NoAudit(t *testing.T) {
 	s := New(Config{AuditRepo: au, RunRepo: rr})
 
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Tidy after the run",
-		RunID:   runID.String(),
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Tidy after the run",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		RunID:     runID.String(),
 	}, "mcp:run:"+runID.String())
 
 	if rec.Code != http.StatusCreated {
@@ -305,9 +307,10 @@ func TestFileWorkItem_UnimplementedProvider_FailsClosed(t *testing.T) {
 
 	s := New(Config{})
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Try the jira path",
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Try the jira path",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "github:operator")
 
 	if rec.Code != http.StatusNotImplemented {
@@ -361,9 +364,10 @@ func TestFileWorkItem_ProviderFileError_BadGateway(t *testing.T) {
 	s := New(Config{})
 
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Will fail at the provider",
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Will fail at the provider",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "github:operator")
 
 	if rec.Code != http.StatusBadGateway {
@@ -393,9 +397,10 @@ func TestFileWorkItem_BoardingBestEffort_Created(t *testing.T) {
 	s := New(Config{})
 
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Board placement will fail but the issue lands",
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Board placement will fail but the issue lands",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "github:operator")
 
 	if rec.Code != http.StatusCreated {
@@ -480,10 +485,11 @@ func TestFileWorkItem_RunRepoMismatch_Forbidden(t *testing.T) {
 	// Entitled caller (run-bound token for runID) but a cross-repo
 	// filing target: the entitlement gate passes, the repo gate trips.
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Borrow another run's installation",
-		RunID:   runID.String(),
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Borrow another run's installation",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		RunID:     runID.String(),
 	}, "mcp:run:"+runID.String())
 
 	if rec.Code != http.StatusForbidden {
@@ -541,10 +547,11 @@ func TestFileWorkItem_UnauthorizedRun_Forbidden(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, fp, au := newServer()
 			rec := fileWorkItem(t, s, workItemRequest{
-				Repo:    "kuhlman-labs/fishhawk",
-				Type:    "chore",
-				Summary: "Inject an entry onto someone else's run",
-				RunID:   runID.String(),
+				Repo:      "kuhlman-labs/fishhawk",
+				Type:      "chore",
+				Summary:   "Inject an entry onto someone else's run",
+				TitleVars: map[string]string{"epic": "22", "n": "7"},
+				RunID:     runID.String(),
 			}, tc.subject)
 
 			if rec.Code != http.StatusForbidden {
@@ -576,6 +583,7 @@ func TestFileWorkItem_RunResolutionGuards(t *testing.T) {
 		s := New(Config{RunRepo: newPromptRunRepo()})
 		rec := fileWorkItem(t, s, workItemRequest{
 			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: "not-a-uuid",
+			TitleVars: map[string]string{"epic": "22", "n": "7"},
 		}, "github:operator")
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
@@ -599,6 +607,7 @@ func TestFileWorkItem_RunResolutionGuards(t *testing.T) {
 		rid := uuid.New()
 		rec := fileWorkItem(t, s, workItemRequest{
 			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: rid.String(),
+			TitleVars: map[string]string{"epic": "22", "n": "7"},
 		}, "mcp:run:"+rid.String())
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
@@ -619,6 +628,7 @@ func TestFileWorkItem_RunResolutionGuards(t *testing.T) {
 		rid := uuid.New()
 		rec := fileWorkItem(t, s, workItemRequest{
 			Repo: "kuhlman-labs/fishhawk", Type: "chore", Summary: "x", RunID: rid.String(),
+			TitleVars: map[string]string{"epic": "22", "n": "7"},
 		}, "mcp:run:"+rid.String())
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want 503 (body=%s)", rec.Code, rec.Body.String())
@@ -697,9 +707,10 @@ func TestFileWorkItem_NoRun_ResolvesInstallation(t *testing.T) {
 	// Non-run-bound operator caller, no run and no run_id: the run-absent
 	// ADR-040 follow-up filing path.
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Operator follow-up filing",
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Operator follow-up filing",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "github:operator")
 
 	if rec.Code != http.StatusCreated {
@@ -727,9 +738,10 @@ func TestFileWorkItem_NoRun_NoInstallation_FailsClosed(t *testing.T) {
 	s := New(Config{GitHub: gh})
 
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "No installation on this repo",
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "No installation on this repo",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "github:operator")
 
 	if rec.Code != http.StatusBadGateway {
@@ -775,9 +787,10 @@ func TestFileWorkItem_NoRun_ResolutionError_BadGateway(t *testing.T) {
 	s := New(Config{GitHub: gh})
 
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Installation lookup is transiently unavailable",
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Installation lookup is transiently unavailable",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "github:operator")
 
 	if rec.Code != http.StatusBadGateway {
@@ -826,9 +839,10 @@ func TestFileWorkItem_RunBound_RunAbsent_Forbidden(t *testing.T) {
 	// Run-bound agent token but NO run_id supplied: it must not be able to
 	// use the run-absent door.
 	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:    "kuhlman-labs/fishhawk",
-		Type:    "chore",
-		Summary: "Sneak through the run-absent door",
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Sneak through the run-absent door",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "mcp:run:"+uuid.New().String())
 
 	if rec.Code != http.StatusForbidden {
