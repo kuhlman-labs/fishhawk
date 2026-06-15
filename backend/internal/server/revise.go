@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -174,11 +175,22 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Record the plan_revised audit entry (carrying the binding constraint
+	// the plan prompt renderer reads back) via the OnAdmit hook, which fires
+	// after the gate + budget decision but BEFORE the stage is re-opened.
+	// This is the #1099 fix-up ordering: the prompt path loads the constraint
+	// EXCLUSIVELY from this entry, so were the transition to land first and
+	// the append to fail best-effort, the orchestrator would re-dispatch a
+	// constraint-less plan. A failed append aborts the revise with the plan
+	// stage left at its approval gate (errReviseAuditAppendFailed → 500).
 	dec, err := run.RevisePlanStage(r.Context(), s.cfg.RunRepo, stageID, run.ReviseOptions{
 		PriorPassCount:      priorPasses,
 		MaxPasses:           defaultMaxRevisePasses,
 		ForceAdditionalPass: reqBody.ForceAdditionalPass,
 		HardCeiling:         defaultReviseCeiling,
+		OnAdmit: func(d *run.ReviseDecision) error {
+			return s.writeReviseAudit(r, d, constraint, priorPasses)
+		},
 	})
 	if err != nil {
 		switch {
@@ -202,16 +214,19 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 				err.Error(),
 				map[string]any{"stage_type": string(stage.Type), "stage_state": string(stage.State)})
 			return
+		case errors.Is(err, errReviseAuditAppendFailed):
+			// The pre-transition audit append failed, so the stage was NEVER
+			// re-opened — the gate is intact and the operator can retry. Fail
+			// loud rather than re-dispatch a constraint-less plan (#1099).
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"append plan_revised audit entry failed; revise aborted with the plan stage left at its approval gate",
+				map[string]any{"error": err.Error()})
+			return
 		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"revise failed", map[string]any{"error": err.Error()})
 		return
 	}
-
-	// Audit first so the revise intent (and the binding constraint the
-	// plan prompt renderer reads back) is recorded even if the orchestrator
-	// handoff below fails. Same posture as the fixup handler.
-	s.writeReviseAudit(r, dec, constraint, priorPasses)
 
 	// The revise re-open lands the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire workflow_dispatch.
@@ -256,16 +271,30 @@ func (s *Server) countRevisePasses(ctx context.Context, runID, stageID uuid.UUID
 	return n, nil
 }
 
+// errReviseAuditAppendFailed wraps an AppendChained failure from
+// writeReviseAudit so handleRevisePlan can distinguish the
+// must-not-proceed audit outage (the #1099 ordering hazard) from the
+// other RevisePlanStage error classes and surface a precise 500. It is
+// returned through ReviseOptions.OnAdmit, which fires BEFORE the
+// transition, so the revise aborts with the plan stage still parked at
+// its approval gate.
+var errReviseAuditAppendFailed = errors.New("append plan_revised audit entry failed")
+
 // writeReviseAudit appends a plan_revised entry capturing the rendered
 // operator constraint (so the plan prompt renderer delivers it as a
 // binding "Revision constraint" section on the re-dispatch), the
 // bounded-pass receipt fields, and whether the pass was operator-forced.
 // The `conditions` key carries the constraint blob the plan-stage prompt
 // builder reads back (loadRevisionConstraint), mirroring how
-// clarification_answered carries the resumed plan's answers. Best-effort:
-// the transition is already committed, so a failure here logs but doesn't
-// unwind.
-func (s *Server) writeReviseAudit(r *http.Request, dec *run.ReviseDecision, constraint string, priorPasses int) {
+// clarification_answered carries the resumed plan's answers.
+//
+// It is wired as RevisePlanStage's OnAdmit hook so it runs BEFORE the
+// awaiting_approval → pending transition: the plan prompt path loads the
+// constraint EXCLUSIVELY from this entry, so an append failure MUST abort
+// the revise rather than let the orchestrator re-dispatch a constraint-less
+// plan (#1099). On failure it logs and returns errReviseAuditAppendFailed,
+// which RevisePlanStage propagates to leave the stage at its gate.
+func (s *Server) writeReviseAudit(r *http.Request, dec *run.ReviseDecision, constraint string, priorPasses int) error {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -301,5 +330,7 @@ func (s *Server) writeReviseAudit(r *http.Request, dec *run.ReviseDecision, cons
 			"stage_id", dec.Stage.ID,
 			"error", err.Error(),
 		)
+		return fmt.Errorf("%w: %v", errReviseAuditAppendFailed, err)
 	}
+	return nil
 }

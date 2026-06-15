@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -241,6 +242,66 @@ func TestLoadRevisionConstraint_NewestWins(t *testing.T) {
 	got := s.loadRevisionConstraint(context.Background(), runID)
 	if got == nil || *got != "NEW constraint" {
 		t.Errorf("loadRevisionConstraint = %v, want \"NEW constraint\"", got)
+	}
+}
+
+// TestRevisePlan_AuditAppendFails_GateIntact is the #1099 fix-up
+// regression guard: the plan prompt path loads the operator constraint
+// EXCLUSIVELY from the plan_revised audit entry, so the append must
+// happen-before the awaiting_approval → pending re-open. When the append
+// fails the handler must NOT re-open (or re-dispatch) the stage — it must
+// fail loud (500) with the plan stage left parked at its approval gate, so
+// no constraint-less plan is ever dispatched.
+func TestRevisePlan_AuditAppendFails_GateIntact(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, rr, au := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+	au.appendErr = errors.New("db down")
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep it additive"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+
+	// The stage must NOT have been re-opened: the append happens-before the
+	// transition, so a failed append leaves the gate intact.
+	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (gate must be intact)", got)
+	}
+	for _, c := range rr.transitionStageCalls {
+		if c.To == run.StageStatePending {
+			t.Errorf("stage was re-opened to pending despite the audit append failure")
+		}
+	}
+}
+
+// TestRevisePlan_CrossRun_403 exercises the subject-binding authz guard:
+// a run-bound MCP token (subject mcp:run:<uuid>) may only revise stages
+// within its own run. Targeting a stage in a DIFFERENT run is refused with
+// 403 cross_run_revise, mirroring the fixup handler's cross_run_fixup
+// guard.
+func TestRevisePlan_CrossRun_403(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, rr, _ := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+
+	// A token bound to a DIFFERENT run than the stage's run.
+	otherRun := uuid.New()
+	id := Identity{
+		Subject: "mcp:run:" + otherRun.String(),
+		TokenID: "tok-test",
+		Scopes:  []string{"write:approvals"},
+	}
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/stages/"+stageID.String()+"/revise", strings.NewReader(`{"constraint":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("stage_id", stageID.String())
+	w := httptest.NewRecorder()
+	s.handleRevisePlan(w, injectIdentity(req, id))
+
+	assertScopeError(t, w, http.StatusForbidden, "cross_run_revise")
+
+	// The cross-run refusal fires before any state change.
+	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no state change on a cross-run refusal)", got)
 	}
 }
 

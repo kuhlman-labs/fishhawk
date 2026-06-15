@@ -129,6 +129,65 @@ func TestRevisePlanStage_ForceAdditionalPassGrantsPassPastBudget(t *testing.T) {
 	}
 }
 
+func TestRevisePlanStage_OnAdmitErrorAbortsBeforeTransition(t *testing.T) {
+	// The OnAdmit hook (the handler's durable audit append) runs after the
+	// bound decision but BEFORE the transition. A hook error must abort the
+	// revise with the plan stage left at its approval gate — never re-opened
+	// without the constraint on record (#1099).
+	repo, stage := planStageAtGate(run.StageStateAwaitingApproval)
+
+	wantErr := errors.New("audit append failed")
+	var sawDec *run.ReviseDecision
+	_, err := run.RevisePlanStage(context.Background(), repo, stage.ID, run.ReviseOptions{
+		PriorPassCount: 0,
+		MaxPasses:      1,
+		HardCeiling:    3,
+		OnAdmit: func(d *run.ReviseDecision) error {
+			sawDec = d
+			return wantErr
+		},
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want it to wrap the OnAdmit error", err)
+	}
+	// The hook saw the provisional decision (pre-transition values).
+	if sawDec == nil || sawDec.PriorState != run.StageStateAwaitingApproval {
+		t.Errorf("OnAdmit decision = %+v, want PriorState awaiting_approval", sawDec)
+	}
+	// The stage must NOT have been re-opened.
+	cur, _ := repo.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingApproval {
+		t.Errorf("state = %q, want unchanged (awaiting_approval) after a hook abort", cur.State)
+	}
+}
+
+func TestRevisePlanStage_OnAdmitRunsBeforeTransitionOnSuccess(t *testing.T) {
+	// On the happy path OnAdmit fires while the stage is still parked, then
+	// the transition lands.
+	repo, stage := planStageAtGate(run.StageStateAwaitingApproval)
+
+	var stateAtHook run.StageState
+	dec, err := run.RevisePlanStage(context.Background(), repo, stage.ID, run.ReviseOptions{
+		PriorPassCount: 0,
+		MaxPasses:      1,
+		HardCeiling:    3,
+		OnAdmit: func(d *run.ReviseDecision) error {
+			cur, _ := repo.GetStage(context.Background(), d.Stage.ID)
+			stateAtHook = cur.State
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("RevisePlanStage: %v", err)
+	}
+	if stateAtHook != run.StageStateAwaitingApproval {
+		t.Errorf("state at OnAdmit = %q, want awaiting_approval (hook runs before the transition)", stateAtHook)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-revise state = %q, want pending", dec.Stage.State)
+	}
+}
+
 func TestRevisePlanStage_HardCeilingWinsEvenWhenForced(t *testing.T) {
 	// At the hard ceiling the override can NOT push past — the ceiling is
 	// the absolute stop, surfaced as the distinct ErrReviseCeilingReached.

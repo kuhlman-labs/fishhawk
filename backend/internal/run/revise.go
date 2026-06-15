@@ -68,6 +68,20 @@ type ReviseOptions struct {
 	// HardCeiling means no override headroom, so callers that want the
 	// override MUST set it.
 	HardCeiling int
+
+	// OnAdmit, when non-nil, is invoked AFTER the gate + budget decision
+	// passes but strictly BEFORE the awaiting_approval → pending transition,
+	// with the provisional decision (PriorState/RemainingBudget/Forced
+	// populated; Stage is the PRE-transition row, so only its ID/RunID are
+	// stable). It exists so the caller can DURABLY record the revise — the
+	// plan_revised audit entry the plan prompt renderer reads the operator's
+	// binding constraint back from — before the stage is re-opened. The plan
+	// prompt path loads the constraint EXCLUSIVELY from that entry, so if the
+	// hook returns an error RevisePlanStage aborts WITHOUT transitioning,
+	// leaving the plan stage parked at its approval gate rather than
+	// re-opening (and re-dispatching) it with no constraint on record
+	// (#1099). A nil hook preserves the plain transition-only behaviour.
+	OnAdmit func(*ReviseDecision) error
 }
 
 // ReviseDecision summarizes what RevisePlanStage did, for the audit
@@ -133,7 +147,10 @@ type ReviseDecision struct {
 // The rendered operator constraint and the prior-plan base are the
 // handler's responsibility (they require the audit log + artifact store,
 // which run does not depend on); RevisePlanStage owns only the
-// state-machine and bound decisions.
+// state-machine and bound decisions. The handler hooks its durable
+// recording in via ReviseOptions.OnAdmit, which runs after the bound
+// decision but BEFORE the transition so the constraint is on record
+// before the stage is re-opened (#1099).
 func RevisePlanStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts ReviseOptions) (*ReviseDecision, error) {
 	stage, err := repo.GetStage(ctx, stageID)
 	if err != nil {
@@ -168,20 +185,35 @@ func RevisePlanStage(ctx context.Context, repo Repository, stageID uuid.UUID, op
 
 	priorState := stage.State
 
-	updated, err := repo.TransitionStage(ctx, stageID, StageStatePending, nil)
-	if err != nil {
-		return nil, fmt.Errorf("RevisePlanStage: %s → pending: %w", priorState, err)
-	}
-
 	remaining := opts.MaxPasses - (opts.PriorPassCount + 1)
 	if remaining < 0 {
 		remaining = 0
 	}
 
-	return &ReviseDecision{
+	dec := &ReviseDecision{
 		PriorState:      priorState,
-		Stage:           updated,
+		Stage:           stage, // pre-transition; OnAdmit reads ID/RunID only
 		RemainingBudget: remaining,
 		Forced:          forced,
-	}, nil
+	}
+
+	// Durably record the revise BEFORE re-opening the stage (#1099): the plan
+	// prompt path loads the operator constraint EXCLUSIVELY from the
+	// plan_revised audit entry the hook writes, so transitioning first and
+	// recording best-effort would let an audit outage re-open (and the
+	// orchestrator re-dispatch) the plan stage with the constraint missing. On
+	// a hook error we abort with the stage still parked at its approval gate.
+	if opts.OnAdmit != nil {
+		if err := opts.OnAdmit(dec); err != nil {
+			return nil, fmt.Errorf("RevisePlanStage: pre-transition hook: %w", err)
+		}
+	}
+
+	updated, err := repo.TransitionStage(ctx, stageID, StageStatePending, nil)
+	if err != nil {
+		return nil, fmt.Errorf("RevisePlanStage: %s → pending: %w", priorState, err)
+	}
+	dec.Stage = updated
+
+	return dec, nil
 }
