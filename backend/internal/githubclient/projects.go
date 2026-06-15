@@ -485,6 +485,17 @@ func ProjectsTokenRequested(ctx context.Context) bool {
 	return v
 }
 
+// ProjectsTokenConfigured reports whether a static projects token is set on
+// the client. The work-management board-sync Transition consults it to fail
+// fast for user-owned Projects v2 boards the App installation token cannot
+// reach (#1114): with no projects token configured the board is unreachable,
+// so the move degrades to a best-effort skip (the #1107/#1114 posture) rather
+// than dispatching a GraphQL call the installation-token fallback would error
+// on — an error that would drop the mandated work_item_transitioned audit.
+func (c *Client) ProjectsTokenConfigured() bool {
+	return c.ProjectsToken != ""
+}
+
 // doGraphQL POSTs a GraphQL query/mutation to /graphql and decodes the
 // `data` field into out (out may be nil to ignore the payload). GraphQL
 // returns HTTP 200 even for application-level errors, so the `errors`

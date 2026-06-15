@@ -38,6 +38,7 @@ type API interface {
 	AddProjectItem(ctx context.Context, installationID int64, projectID, contentID string) (string, error)
 	SetProjectItemSingleSelect(ctx context.Context, installationID int64, projectID, itemID, fieldID, optionID string) error
 	AddSubIssue(ctx context.Context, installationID int64, parentNodeID, childNodeID string) error
+	ProjectsTokenConfigured() bool
 }
 
 // Provider is the GitHub Projects work-management provider.
@@ -168,10 +169,17 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 
 	coord := githubclient.ProjectCoord{Owner: proj.Owner, OwnerType: proj.OwnerType, Number: proj.Number}
 	// User-owned Projects v2 (the Project #7 case) cannot be reached with the
-	// App installation token (#1114). Opt the board GraphQL calls into the
-	// static projects token; the client honors it only when one is configured,
-	// so this stays a best-effort no-op when it is not (the #1107 posture).
+	// App installation token (#1114). With no projects token configured the
+	// installation-token fallback would error on every board GraphQL call, and
+	// that error would drop the mandated work_item_transitioned audit — so
+	// degrade to a best-effort SKIP (the #1107/#1114 posture: never an error)
+	// before dispatching anything. With a projects token configured, opt the
+	// board GraphQL calls into it.
 	if proj.OwnerType == "user" {
+		if !p.api.ProjectsTokenConfigured() {
+			return &workmgmt.TransitionResult{Skipped: true, To: toOption,
+				SkipReason: "user-owned project board unreachable: no projects token configured"}, nil
+		}
 		ctx = githubclient.WithProjectsToken(ctx)
 	}
 	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}

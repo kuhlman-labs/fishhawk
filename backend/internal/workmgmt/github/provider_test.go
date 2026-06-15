@@ -55,6 +55,8 @@ type fakeAPI struct {
 
 	subParent, subChild string
 	subErr              error
+
+	projectsTokenConfigured bool
 }
 
 func (f *fakeAPI) CreateIssue(_ context.Context, _ int64, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
@@ -107,6 +109,8 @@ func (f *fakeAPI) AddSubIssue(_ context.Context, _ int64, parentNodeID, childNod
 	f.subParent, f.subChild = parentNodeID, childNodeID
 	return f.subErr
 }
+
+func (f *fakeAPI) ProjectsTokenConfigured() bool { return f.projectsTokenConfigured }
 
 func baseRequest() workmgmt.ProviderRequest {
 	return workmgmt.ProviderRequest{
@@ -442,6 +446,10 @@ func transitionAPI(currentStatus string, onBoard bool) *fakeAPI {
 			"Backlog": "OPT_BACKLOG", "In Progress": "OPT_IP", "In Review": "OPT_IR", "Blocked": "OPT_BLOCKED", "Done": "OPT_DONE",
 		}},
 		itemStatus: &githubclient.ProjectItemStatus{OnBoard: onBoard, ItemID: "ITEM", Status: currentStatus},
+		// The transition fixtures target a user-owned board (baseRequest's
+		// Project), so a projects token must be configured for the move to be
+		// dispatched; the no-token degradation has its own test.
+		projectsTokenConfigured: true,
 	}
 }
 
@@ -558,6 +566,32 @@ func TestProvider_Transition_SkipsWhenNoProject(t *testing.T) {
 	}
 	if !res.Skipped || !strings.Contains(res.SkipReason, "no project configured") {
 		t.Errorf("result = %+v, want no-project skip", res)
+	}
+}
+
+func TestProvider_Transition_SkipsUserProjectWhenNoProjectsToken(t *testing.T) {
+	// Edge (approval condition): a user-owned board (Project #7) with no
+	// projects token configured is unreachable with the installation token.
+	// The move must degrade to a best-effort SKIP — never an error — so the
+	// lifecycle hook still writes a work_item_transitioned audit. No board
+	// GraphQL is dispatched (no status read, no mutation).
+	api := transitionAPI("Backlog", true)
+	api.projectsTokenConfigured = false
+	res, err := New(api).Transition(context.Background(), runStartedRequest())
+	if err != nil {
+		t.Fatalf("Transition should degrade to a skip, not error: %v", err)
+	}
+	if res.Moved || !res.Skipped {
+		t.Fatalf("result = %+v, want skipped (not moved)", res)
+	}
+	if !strings.Contains(res.SkipReason, "no projects token") {
+		t.Errorf("skip reason = %q, want it to name the missing projects token", res.SkipReason)
+	}
+	if api.itemStatusIssueNode != "" {
+		t.Errorf("no board read expected on the no-token skip, got status read for %q", api.itemStatusIssueNode)
+	}
+	if api.setOptionID != "" {
+		t.Errorf("no mutation expected on the no-token skip, got set opt %q", api.setOptionID)
 	}
 }
 
