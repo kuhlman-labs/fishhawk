@@ -28,6 +28,11 @@ type projectsFake struct {
 
 	gotCreateBody  []byte
 	gotGraphQLVars map[string]map[string]any // op marker -> variables
+
+	// gotGraphQLAuth records the Authorization header of the most recent
+	// GraphQL request, so token-selection tests can assert which token
+	// (installation vs projects) doGraphQL used.
+	gotGraphQLAuth string
 }
 
 func newProjectsFake(t *testing.T) (*projectsFake, *Client) {
@@ -49,6 +54,7 @@ func newProjectsFake(t *testing.T) (*projectsFake, *Client) {
 	})
 
 	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		pf.gotGraphQLAuth = r.Header.Get("Authorization")
 		var body struct {
 			Query     string         `json:"query"`
 			Variables map[string]any `json:"variables"`
@@ -285,5 +291,48 @@ func TestSearchOpenIssues_ErrorStatus(t *testing.T) {
 	_, err := c.SearchOpenIssues(context.Background(), 7, "repo:o/r bad")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
+	}
+}
+
+func TestDoGraphQL_ProjectsTokenSelected(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	// Tokens stub mints "ghs_canned"; configure a distinct projects PAT so
+	// the Authorization header unambiguously identifies the token used.
+	c.ProjectsToken = "pat_projects"
+	pf.graphqlByOp["AddItem"] = `{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM"}}}}`
+
+	// With the opt-in flag AND a non-empty ProjectsToken, the request must
+	// carry the projects PAT, not the installation token.
+	ctx := WithProjectsToken(context.Background())
+	if _, err := c.AddProjectItem(ctx, 7, "PROJ", "ISSUE_NODE"); err != nil {
+		t.Fatalf("AddProjectItem: %v", err)
+	}
+	if pf.gotGraphQLAuth != "Bearer pat_projects" {
+		t.Errorf("Authorization = %q, want projects token", pf.gotGraphQLAuth)
+	}
+}
+
+func TestDoGraphQL_FallsBackToInstallationToken(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["AddItem"] = `{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM"}}}}`
+
+	// Flag set but ProjectsToken empty → installation-token fallback,
+	// preserving the #1107 best-effort path when unconfigured.
+	ctx := WithProjectsToken(context.Background())
+	if _, err := c.AddProjectItem(ctx, 7, "PROJ", "ISSUE_NODE"); err != nil {
+		t.Fatalf("AddProjectItem: %v", err)
+	}
+	if pf.gotGraphQLAuth != "Bearer ghs_canned" {
+		t.Errorf("Authorization = %q, want installation token", pf.gotGraphQLAuth)
+	}
+
+	// No flag, even with a projects token set → installation token (the
+	// flag is the explicit opt-in seam).
+	c.ProjectsToken = "pat_projects"
+	if _, err := c.AddProjectItem(context.Background(), 7, "PROJ", "ISSUE_NODE"); err != nil {
+		t.Fatalf("AddProjectItem (no flag): %v", err)
+	}
+	if pf.gotGraphQLAuth != "Bearer ghs_canned" {
+		t.Errorf("Authorization without flag = %q, want installation token", pf.gotGraphQLAuth)
 	}
 }

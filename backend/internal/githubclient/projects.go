@@ -377,13 +377,46 @@ func (c *Client) AddSubIssue(ctx context.Context, installationID int64, parentNo
 	}, nil)
 }
 
+// projectsTokenKey is the unexported context-key type for the
+// request-scoped flag that asks doGraphQL to authenticate with the
+// static projects token (Client.ProjectsToken) instead of the
+// installation token. A dedicated unexported type avoids collisions
+// with any other package's context keys.
+type projectsTokenKey struct{}
+
+// WithProjectsToken returns a child context that opts the GraphQL call
+// it threads through into the static projects token (Client.ProjectsToken).
+// It is the explicit seam the work-management provider uses to route the
+// user-owned board-placement GraphQL through the projects token WITHOUT
+// changing any method signature: doGraphQL honors the flag only when
+// Client.ProjectsToken is non-empty, so setting it is inert (installation-
+// token fallback) when no projects token is configured (#1114).
+func WithProjectsToken(ctx context.Context) context.Context {
+	return context.WithValue(ctx, projectsTokenKey{}, true)
+}
+
+// ProjectsTokenRequested reports whether ctx carries the WithProjectsToken
+// opt-in flag.
+func ProjectsTokenRequested(ctx context.Context) bool {
+	v, _ := ctx.Value(projectsTokenKey{}).(bool)
+	return v
+}
+
 // doGraphQL POSTs a GraphQL query/mutation to /graphql and decodes the
 // `data` field into out (out may be nil to ignore the payload). GraphQL
 // returns HTTP 200 even for application-level errors, so the `errors`
 // array is surfaced as ErrValidation — matching EnableAutoMerge's
 // handling so callers can switch on the error kind without re-parsing.
+//
+// Token selection: when the request opted in via WithProjectsToken AND
+// Client.ProjectsToken is non-empty, the request authenticates with that
+// static user token (user-owned Projects v2 boards, which installation
+// tokens cannot reach — #1114). Otherwise the installation-token path is
+// used unchanged, which also preserves the #1107 best-effort boarded:false
+// degradation when the flag is set but no projects token is configured.
 func (c *Client) doGraphQL(ctx context.Context, installationID int64, query string, variables map[string]any, out any) error {
-	if c.Tokens == nil {
+	useProjectsToken := ProjectsTokenRequested(ctx) && c.ProjectsToken != ""
+	if c.Tokens == nil && !useProjectsToken {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
 	body := map[string]any{"query": query}
@@ -394,7 +427,12 @@ func (c *Client) doGraphQL(ctx context.Context, installationID int64, query stri
 	if err != nil {
 		return fmt.Errorf("githubclient: marshal graphql request: %w", err)
 	}
-	req, err := c.buildRequest(ctx, http.MethodPost, c.endpoint("/graphql"), bytes.NewReader(raw), installationID)
+	var req *http.Request
+	if useProjectsToken {
+		req, err = c.buildStaticTokenRequest(ctx, http.MethodPost, c.endpoint("/graphql"), bytes.NewReader(raw), c.ProjectsToken)
+	} else {
+		req, err = c.buildRequest(ctx, http.MethodPost, c.endpoint("/graphql"), bytes.NewReader(raw), installationID)
+	}
 	if err != nil {
 		return err
 	}

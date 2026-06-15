@@ -130,6 +130,17 @@ func (p *Provider) placeOnBoard(ctx context.Context, inst int64, req workmgmt.Pr
 		return nil
 	}
 	coord := githubclient.ProjectCoord{Owner: proj.Owner, OwnerType: proj.OwnerType, Number: proj.Number}
+	// User-owned Projects v2 boards (the Project #7 case) cannot be written
+	// with the App installation token — there is no user-projects permission
+	// for GitHub Apps (#1114). Opt the three board-placement GraphQL calls
+	// into the static projects token via the request-scoped flag; the client
+	// honors it only when a projects token is configured, so this stays the
+	// #1107 best-effort boarded:false path when it is not. Org-owned projects
+	// and the repo-scoped epic link (AddSubIssue) stay on the installation
+	// token.
+	if proj.OwnerType == "user" {
+		ctx = githubclient.WithProjectsToken(ctx)
+	}
 	meta, err := p.api.ProjectFields(ctx, inst, coord, statusFieldName)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: resolve project fields: %w", err)

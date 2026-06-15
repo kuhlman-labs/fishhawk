@@ -2,13 +2,27 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
+
+// stubTokenProvider mints a fixed installation token so the cross-boundary
+// test can distinguish it from the static projects PAT by Authorization
+// header value.
+type stubTokenProvider struct{ token string }
+
+func (s stubTokenProvider) Token(_ context.Context, _ int64) (string, error) {
+	return s.token, nil
+}
 
 // fakeAPI records calls and returns canned results so the provider's
 // orchestration can be asserted without the wire.
@@ -281,6 +295,117 @@ func TestParseIssueRef(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Errorf("parseIssueRef(%q) = %d, %v; want %d", tc.in, got, err, tc.want)
 		}
+	}
+}
+
+// realClientFixture builds a real *githubclient.Client pointed at an
+// httptest mux, recording the Authorization header the REST issue-create
+// call and the GraphQL board-placement calls each carried. projectsToken
+// empty exercises the #1107 unconfigured path.
+type realClientFixture struct {
+	restAuth    string
+	graphqlAuth string
+}
+
+func newRealClient(t *testing.T, projectsToken string) (*githubclient.Client, *realClientFixture) {
+	t.Helper()
+	fx := &realClientFixture{}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /repos/{owner}/{repo}/issues", func(w http.ResponseWriter, r *http.Request) {
+		fx.restAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"number":1234,"node_id":"ISSUE_NODE","html_url":"https://github.com/kuhlman-labs/fishhawk/issues/1234"}`)
+	})
+
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		fx.graphqlAuth = r.Header.Get("Authorization")
+		var body struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		switch {
+		case strings.Contains(body.Query, "ProjectFields"):
+			_, _ = io.WriteString(w, `{"data":{"user":{"projectV2":{"id":"PROJ","field":{"id":"FIELD","options":[{"id":"OPT_BACKLOG","name":"Backlog"}]}}}}}`)
+		case strings.Contains(body.Query, "AddItem"):
+			_, _ = io.WriteString(w, `{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM"}}}}`)
+		case strings.Contains(body.Query, "SetField"):
+			_, _ = io.WriteString(w, `{"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM"}}}}`)
+		default:
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
+	c.BaseURL = srv.URL
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+	c.ProjectsToken = projectsToken
+	return c, fx
+}
+
+func TestProvider_File_CrossBoundary_ProjectsTokenBoardsUserProject(t *testing.T) {
+	// End-to-end seam (config -> client token selection -> provider): a
+	// real *githubclient.Client with a projects PAT boards a USER-owned
+	// project. The board-placement GraphQL must carry the PAT while the
+	// issue-create REST call stays on the installation token (#1114).
+	c, fx := newRealClient(t, "pat_projects")
+	created, err := New(c).File(context.Background(), baseRequest())
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if !created.Boarded {
+		t.Errorf("boarded = false (%q), want true", created.BoardingError)
+	}
+	if fx.restAuth != "Bearer ghs_install" {
+		t.Errorf("issue-create REST Authorization = %q, want installation token", fx.restAuth)
+	}
+	if fx.graphqlAuth != "Bearer pat_projects" {
+		t.Errorf("board GraphQL Authorization = %q, want projects token", fx.graphqlAuth)
+	}
+}
+
+func TestProvider_File_CrossBoundary_NoProjectsTokenDegradesBoarded(t *testing.T) {
+	// #1107 preserved: with no projects token, a user-owned board placement
+	// falls back to the installation token. GitHub answers an installation
+	// token's user-Projects GraphQL with "Could not resolve to a ProjectV2",
+	// so board placement degrades to boarded:false with a BoardingError — the
+	// change is inert until the operator sets the token.
+	mux := http.NewServeMux()
+	var graphqlAuth string
+	mux.HandleFunc("POST /repos/{owner}/{repo}/issues", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"number":1234,"node_id":"ISSUE_NODE","html_url":"https://x/1234"}`)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		graphqlAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"errors":[{"message":"Could not resolve to a ProjectV2 with the number 7"}]}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
+	c.BaseURL = srv.URL
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+
+	created, err := New(c).File(context.Background(), baseRequest())
+	if err != nil {
+		t.Fatalf("File should not error on a board-placement failure: %v", err)
+	}
+	if created.Boarded {
+		t.Errorf("boarded = true, want false (#1107 degradation)")
+	}
+	if created.BoardingError == "" {
+		t.Errorf("want a BoardingError naming the cause")
+	}
+	if graphqlAuth != "Bearer ghs_install" {
+		t.Errorf("board GraphQL Authorization = %q, want installation-token fallback", graphqlAuth)
 	}
 }
 
