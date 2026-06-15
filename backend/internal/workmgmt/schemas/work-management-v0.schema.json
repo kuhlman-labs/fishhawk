@@ -99,6 +99,18 @@
         "run_failed": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run fails (e.g. blocked)." },
         "run_merged": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run's PR merges (e.g. done)." }
       }
+    },
+    "product_feedback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "description": "Per-repo kill-switch for upstream product-feedback egress (ADR-029, #1006). Absent means egress is enabled (the default), so an existing config keeps working without edits. With enabled:false, POST /v0/runs/{id}/product-reports returns 403 product_feedback_disabled and files nothing. The object shape mirrors the backend workmgmt.ProductFeedback struct (a boolean enabled), decoded under DisallowUnknownFields.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether upstream product-feedback egress is allowed for this repo. enabled:false hard-disables the product-report endpoint."
+        }
+      }
     }
   },
 

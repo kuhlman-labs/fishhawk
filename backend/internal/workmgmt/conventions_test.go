@@ -430,3 +430,38 @@ func TestDefault_ProductFeedbackEnabled(t *testing.T) {
 		t.Error("shipped default should have product feedback enabled")
 	}
 }
+
+// TestParseProductFeedbackDisabled exercises the schema↔Go-struct seam: a
+// config declaring the optional product_feedback.enabled:false kill-switch
+// must satisfy the schema AND round-trip through the DisallowUnknownFields
+// JSON decode into the typed *ProductFeedback. A per-layer unit would pass
+// while the schema (object) and struct (object) shapes silently diverge.
+func TestParseProductFeedbackDisabled(t *testing.T) {
+	cfg := minimalConfig + "product_feedback:\n  enabled: false\n"
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(product_feedback disabled) = %v, want nil", err)
+	}
+	if c.ProductFeedback == nil {
+		t.Fatal("ProductFeedback is nil; the field did not round-trip into the struct")
+	}
+	if c.ProductFeedbackEnabled() {
+		t.Error("product_feedback.enabled:false should disable egress")
+	}
+}
+
+// TestParseProductFeedbackEnabled is the egress-on companion: the explicit
+// enabled:true object round-trips and leaves egress allowed.
+func TestParseProductFeedbackEnabled(t *testing.T) {
+	cfg := minimalConfig + "product_feedback:\n  enabled: true\n"
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(product_feedback enabled) = %v, want nil", err)
+	}
+	if c.ProductFeedback == nil {
+		t.Fatal("ProductFeedback is nil; the field did not round-trip into the struct")
+	}
+	if !c.ProductFeedbackEnabled() {
+		t.Error("product_feedback.enabled:true should keep egress enabled")
+	}
+}
