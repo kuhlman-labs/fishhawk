@@ -174,6 +174,57 @@ func TestFileIssue_MissingRepoNoEnv_FailsLocally(t *testing.T) {
 	}
 }
 
+func TestFileIssue_BoardingBestEffort_DecodesThroughMirror(t *testing.T) {
+	fb, srv := newFileIssueFakeBackend(t)
+	fb.resp = &FiledWorkItem{
+		Type:          "feature",
+		Title:         "Best-effort boarding",
+		Number:        1300,
+		URL:           "https://github.com/kuhlman-labs/fishhawk/issues/1300",
+		Provider:      "github_projects",
+		Boarded:       false,
+		EpicLinked:    false,
+		BoardingError: "workmgmt/github: status \"Backlog\" is not a Status option on the project",
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.fileIssue(context.Background(), nil, FileIssueInput{
+		Repo: "kuhlman-labs/fishhawk", Type: "feature", Summary: "x",
+	})
+	if err != nil {
+		t.Fatalf("fileIssue: %v", err)
+	}
+	// The created issue lands; boarded/epic_linked decode through the mirror
+	// so the tool renders exactly what landed (#1107).
+	if out.Item.Number != 1300 {
+		t.Errorf("Number = %d, want 1300", out.Item.Number)
+	}
+	if out.Item.Boarded {
+		t.Errorf("Boarded = true, want false")
+	}
+	if !strings.Contains(out.Item.BoardingError, "is not a Status option") {
+		t.Errorf("BoardingError = %q, want the cause", out.Item.BoardingError)
+	}
+}
+
+func TestFileIssue_FilingFailed_SurfacesDetailsError(t *testing.T) {
+	fb, srv := newFileIssueFakeBackend(t)
+	fb.status = http.StatusBadGateway
+	fb.errBody = `{"error":{"code":"work_item_filing_failed","message":"provider could not file the work item","details":{"error":"workmgmt/github: create issue: 403 Resource not accessible by integration"}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.fileIssue(context.Background(), nil, FileIssueInput{
+		Repo: "kuhlman-labs/fishhawk", Type: "feature", Summary: "x",
+	})
+	if err == nil {
+		t.Fatal("want a tool error on a 502")
+	}
+	// The operator must see the provider cause, not a bare HTTP 502.
+	if !strings.Contains(err.Error(), "create issue: 403 Resource not accessible by integration") {
+		t.Errorf("err = %v, want the surfaced details.error cause", err)
+	}
+}
+
 func TestFileIssue_ProviderUnimplemented_PropagatesError(t *testing.T) {
 	fb, srv := newFileIssueFakeBackend(t)
 	fb.status = http.StatusNotImplemented

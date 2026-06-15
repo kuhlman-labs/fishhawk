@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,10 @@ type fakeWorkProvider struct {
 	// (#1092's installation_unavailable guard): File errors when the
 	// resolved Target.InstallationID is still 0.
 	failIfNoInstallation bool
+	// boardingError, when set, mirrors the github.Provider best-effort
+	// boarding failure (#1107): File returns the created item with a nil
+	// error, Boarded=false, and this string as BoardingError.
+	boardingError string
 }
 
 func (f *fakeWorkProvider) Name() string { return f.name }
@@ -44,14 +49,20 @@ func (f *fakeWorkProvider) File(_ context.Context, req workmgmt.ProviderRequest)
 	if f.fileErr != nil {
 		return nil, f.fileErr
 	}
-	return &workmgmt.CreatedItem{
+	created := &workmgmt.CreatedItem{
 		Provider:      f.name,
 		Number:        4242,
 		URL:           "https://github.com/kuhlman-labs/fishhawk/issues/4242",
 		AppliedLabels: req.Item.Classification.Labels,
 		Status:        req.Item.BoardPlacement.Status,
 		BoardColumn:   req.Item.BoardPlacement.BoardColumn,
-	}, nil
+	}
+	if f.boardingError != "" {
+		created.BoardingError = f.boardingError
+	} else {
+		created.Boarded = true
+	}
+	return created, nil
 }
 
 // registerFakeProvider registers p under the default conventions'
@@ -340,8 +351,10 @@ func TestFileWorkItem_ApplyError_Unprocessable(t *testing.T) {
 	}
 }
 
-// TestFileWorkItem_ProviderFileError_BadGateway asserts a provider-side
-// failure surfaces as 502 work_item_filing_failed.
+// TestFileWorkItem_ProviderFileError_BadGateway asserts a genuinely fatal
+// provider-side failure (CreateIssue / installation resolution — no durable
+// issue exists) surfaces as 502 work_item_filing_failed with the provider
+// cause in details.error.
 func TestFileWorkItem_ProviderFileError_BadGateway(t *testing.T) {
 	fp := &fakeWorkProvider{fileErr: errors.New("github said no")}
 	registerFakeProvider(t, fp)
@@ -360,6 +373,60 @@ func TestFileWorkItem_ProviderFileError_BadGateway(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &env)
 	if env.Error.Code != "work_item_filing_failed" {
 		t.Errorf("code = %q, want work_item_filing_failed", env.Error.Code)
+	}
+	// The provider cause is surfaced in details.error (the apiError.Details
+	// precedent the MCP tool reads to render it).
+	if got, _ := env.Error.Details["error"].(string); !strings.Contains(got, "github said no") {
+		t.Errorf("details.error should carry the provider cause, got %v", env.Error.Details["error"])
+	}
+}
+
+// TestFileWorkItem_BoardingBestEffort_Created is the #1107 cross-boundary
+// test: a best-effort board-placement failure must NOT 502 and orphan the
+// created issue. The provider returns a CreatedItem with Boarded=false and
+// a BoardingError set (the issue exists); the handler must return 201 with
+// boarded:false and the cause echoed in boarding_error, exercising the
+// provider-return -> handler -> wire-response seam (cf. #618).
+func TestFileWorkItem_BoardingBestEffort_Created(t *testing.T) {
+	fp := &fakeWorkProvider{boardingError: "workmgmt/github: status \"Backlog\" is not a Status option on the project"}
+	registerFakeProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "chore",
+		Summary: "Board placement will fail but the issue lands",
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 not 502 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Number != 4242 || resp.URL == "" {
+		t.Errorf("created issue not echoed: %+v", resp)
+	}
+	if resp.Boarded {
+		t.Errorf("boarded = true, want false on a board-placement failure")
+	}
+	if !strings.Contains(resp.BoardingError, "is not a Status option") {
+		t.Errorf("boarding_error should carry the cause, got %q", resp.BoardingError)
+	}
+
+	// The wire JSON the MCP FiledWorkItem mirror decodes must carry boarded
+	// as a present field (always set; required). Decode the raw body into a
+	// shape with the same json tag to prove the seam.
+	var mirror struct {
+		Boarded       bool   `json:"boarded"`
+		BoardingError string `json:"boarding_error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &mirror); err != nil {
+		t.Fatalf("decode mirror: %v", err)
+	}
+	if mirror.Boarded {
+		t.Errorf("mirror boarded = true, want false")
+	}
+	if mirror.BoardingError == "" {
+		t.Errorf("mirror boarding_error empty, want the cause")
 	}
 }
 

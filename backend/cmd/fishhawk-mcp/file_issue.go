@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -79,11 +80,17 @@ run in flight (the audited flag in the response reports whether an entry was
 written).
 
 Returns the created item: type, title, number, url, provider, the resolved
-applied_labels / complexity / status / board_column, and audited. Tool
-errors: validation_failed (400), authentication_required (401),
-work_item_invalid (422 — the request violates the type's conventions),
-provider_unimplemented (501 — the configured provider id is not registered,
-e.g. the interface-only jira), work_item_filing_failed (502).
+applied_labels / complexity / status / board_column, boarded / epic_linked
+(whether the best-effort board placement and epic link landed; false with a
+boarding_error / epic_link_error when they did not — the issue is still
+filed), and audited. Board placement / epic linking are best-effort and no
+longer fail the filing; work_item_filing_failed (502) is reserved for a
+create-issue or installation-resolution failure (no durable issue exists),
+and the provider cause is surfaced in the tool error. Tool errors:
+validation_failed (400), authentication_required (401), work_item_invalid
+(422 — the request violates the type's conventions), provider_unimplemented
+(501 — the configured provider id is not registered, e.g. the interface-only
+jira), work_item_filing_failed (502).
 `),
 	}, resolver.fileIssue)
 }
@@ -137,6 +144,17 @@ func (r *runResolver) fileIssue(ctx context.Context, _ *mcp.CallToolRequest, in 
 
 	item, err := r.api.FileWorkItem(ctx, req)
 	if err != nil {
+		// Surface the backend's details.error on the remaining genuine 502
+		// paths (CreateIssue / installation-resolution failure) so the
+		// operator gets the provider cause instead of a bare
+		// "HTTP 502 (work_item_filing_failed)" (#1107). Mirrors the
+		// Details-extraction precedent in resume_run.go / tools.go.
+		var ae *apiError
+		if errors.As(err, &ae) {
+			if cause, ok := ae.Details["error"].(string); ok && cause != "" {
+				return nil, FileIssueOutput{}, fmt.Errorf("file work item: %w: %s", err, cause)
+			}
+		}
 		return nil, FileIssueOutput{}, fmt.Errorf("file work item: %w", err)
 	}
 	return nil, FileIssueOutput{Item: *item}, nil

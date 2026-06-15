@@ -739,7 +739,16 @@ type FiledWorkItem struct {
 	Complexity    string   `json:"complexity,omitempty"`
 	Status        string   `json:"status,omitempty"`
 	BoardColumn   string   `json:"board_column,omitempty"`
-	Audited       bool     `json:"audited"`
+	// Boarded / EpicLinked report whether the best-effort post-create
+	// enrichment landed (#1107). Board placement and epic linking are no
+	// longer fatal: the issue is the durable result, so a placement/link
+	// failure files the issue (boarded/epic_linked false) and carries the
+	// cause in BoardingError / EpicLinkError rather than a 502.
+	Boarded       bool   `json:"boarded"`
+	EpicLinked    bool   `json:"epic_linked"`
+	BoardingError string `json:"boarding_error,omitempty"`
+	EpicLinkError string `json:"epic_link_error,omitempty"`
+	Audited       bool   `json:"audited"`
 }
 
 // FileWorkItem files a provider-agnostic work item via

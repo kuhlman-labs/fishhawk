@@ -83,7 +83,19 @@ type workItemResponse struct {
 	Complexity    string   `json:"complexity,omitempty"`
 	Status        string   `json:"status,omitempty"`
 	BoardColumn   string   `json:"board_column,omitempty"`
-	Audited       bool     `json:"audited"`
+	// Boarded / EpicLinked report whether the best-effort post-create
+	// enrichment landed (#1107). Board placement and epic linking no longer
+	// fail the filing: the created issue is the durable result, so a
+	// placement/link failure returns 201 with boarded/epic_linked false and
+	// the cause in boarding_error / epic_link_error (also WARN-logged
+	// server-side) rather than a 502 that orphans the issue. Boarded is
+	// always set (required); boarding_error / epic_link_error are present
+	// only when the respective step failed.
+	Boarded       bool   `json:"boarded"`
+	EpicLinked    bool   `json:"epic_linked"`
+	BoardingError string `json:"boarding_error,omitempty"`
+	EpicLinkError string `json:"epic_link_error,omitempty"`
+	Audited       bool   `json:"audited"`
 }
 
 // handleFileWorkItem implements POST /v0/work-items.
@@ -324,6 +336,21 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A best-effort boarding/epic-link failure stays VISIBLE: WARN-log the
+	// cause (repo + issue url/number + the wrapped placeOnBoard/linkEpic
+	// error) so a genuine org-project misconfig (e.g. a typo'd Status
+	// option) is diagnosable rather than silently swallowed (#1107). The
+	// issue itself was created, so this is not a filing failure.
+	if created.BoardingError != "" || created.EpicLinkError != "" {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "work item filed but enrichment incomplete",
+			slog.String("repo", owner+"/"+name),
+			slog.String("issue_url", created.URL),
+			slog.Int("issue_number", created.Number),
+			slog.String("boarding_error", created.BoardingError),
+			slog.String("epic_link_error", created.EpicLinkError),
+		)
+	}
+
 	audited := s.auditWorkItemFiling(r, activeRun, item, created, id.Subject)
 
 	s.writeJSON(w, r, http.StatusCreated, workItemResponse{
@@ -336,6 +363,10 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		Complexity:    item.Classification.Complexity,
 		Status:        created.Status,
 		BoardColumn:   created.BoardColumn,
+		Boarded:       created.Boarded,
+		EpicLinked:    created.EpicLinked,
+		BoardingError: created.BoardingError,
+		EpicLinkError: created.EpicLinkError,
 		Audited:       audited,
 	})
 }

@@ -120,6 +120,13 @@ func TestProvider_File_FullPath(t *testing.T) {
 	if created.Number != 1234 || created.URL == "" {
 		t.Errorf("created = %+v", created)
 	}
+	// Happy path: both best-effort enrichment steps landed.
+	if !created.Boarded || !created.EpicLinked {
+		t.Errorf("boarded=%v epic_linked=%v, want both true", created.Boarded, created.EpicLinked)
+	}
+	if created.BoardingError != "" || created.EpicLinkError != "" {
+		t.Errorf("unexpected enrichment errors: boarding=%q epic=%q", created.BoardingError, created.EpicLinkError)
+	}
 	if api.createParams.Title != "[E22.7] do the thing" || len(api.createParams.Labels) != 1 {
 		t.Errorf("create params = %+v", api.createParams)
 	}
@@ -156,9 +163,13 @@ func TestProvider_File_NoProjectSkipsBoard(t *testing.T) {
 	if api.fieldsName != "" {
 		t.Errorf("project fields should not be queried when no project configured")
 	}
+	// No project configured: nothing to board, and no boarding error.
+	if created.Boarded || created.BoardingError != "" {
+		t.Errorf("boarded=%v boarding_error=%q, want false with no error", created.Boarded, created.BoardingError)
+	}
 }
 
-func TestProvider_File_UnknownStatusFailsClosed(t *testing.T) {
+func TestProvider_File_UnknownStatusBestEffort(t *testing.T) {
 	api := &fakeAPI{
 		created: &githubclient.CreatedIssue{Number: 5, NodeID: "N", HTMLURL: "https://x/5"},
 		meta:    &githubclient.ProjectMeta{ProjectID: "P", FieldID: "F", StatusOptions: map[string]string{"Done": "OPT"}},
@@ -166,14 +177,48 @@ func TestProvider_File_UnknownStatusFailsClosed(t *testing.T) {
 	}
 	req := baseRequest()
 	req.Item.Relations = workmgmt.Relations{}
-	// Status "Backlog" is not an option on the board.
-	_, err := New(api).File(context.Background(), req)
-	if err == nil || !strings.Contains(err.Error(), "is not a Status option") {
-		t.Fatalf("want unknown-status error, got %v", err)
+	// Status "Backlog" is not an option on the board. Board placement is
+	// best-effort (#1107): the issue is the durable result, so File returns
+	// it with a nil error and Boarded=false + a BoardingError naming the
+	// cause rather than discarding the created issue.
+	created, err := New(api).File(context.Background(), req)
+	if err != nil {
+		t.Fatalf("File should not error on a board-placement failure: %v", err)
 	}
-	// The error must carry the created issue URL for recovery.
-	if !strings.Contains(err.Error(), "https://x/5") {
-		t.Errorf("error should name the created issue url: %v", err)
+	if created == nil || created.Number != 5 || created.URL != "https://x/5" {
+		t.Fatalf("created item not returned: %+v", created)
+	}
+	if created.Boarded {
+		t.Errorf("boarded = true, want false when status is not a board option")
+	}
+	if !strings.Contains(created.BoardingError, "is not a Status option") {
+		t.Errorf("boarding_error should name the cause, got %q", created.BoardingError)
+	}
+}
+
+func TestProvider_File_EpicLinkBestEffort(t *testing.T) {
+	api := &fakeAPI{
+		created: &githubclient.CreatedIssue{Number: 6, NodeID: "N6", HTMLURL: "https://x/6"},
+		meta:    &githubclient.ProjectMeta{ProjectID: "P", FieldID: "F", StatusOptions: map[string]string{"Backlog": "OPT"}},
+		itemID:  "ITEM",
+		subErr:  errors.New("sub-issue API rejected the link"),
+	}
+	req := baseRequest()
+	req.Item.Relations.ParentEpic = "#1005"
+	// Epic linking is best-effort: a link failure files the issue (and
+	// boards it) with EpicLinked=false and an EpicLinkError naming the cause.
+	created, err := New(api).File(context.Background(), req)
+	if err != nil {
+		t.Fatalf("File should not error on an epic-link failure: %v", err)
+	}
+	if !created.Boarded {
+		t.Errorf("boarded = false, want true (board placement succeeded)")
+	}
+	if created.EpicLinked {
+		t.Errorf("epic_linked = true, want false when the link failed")
+	}
+	if !strings.Contains(created.EpicLinkError, "sub-issue API rejected the link") {
+		t.Errorf("epic_link_error should name the cause, got %q", created.EpicLinkError)
 	}
 }
 
