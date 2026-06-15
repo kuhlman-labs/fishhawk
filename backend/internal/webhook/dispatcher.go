@@ -665,6 +665,19 @@ type IssueNotifier interface {
 	NotifyRunRejected(ctx context.Context, repo string, installationID int64, issueNumber int, workflowID, stageID string) error
 }
 
+// BoardSyncer drives the best-effort run-lifecycle board-state transition
+// (#1012). The dispatcher calls it after a run is created (the run_started
+// edge); the concrete implementation lives in the server package (where the
+// conventions loader, provider registry, and audit repo all live), so the
+// dispatcher routes to it through this interface to avoid an import cycle.
+// Nil leaves board sync off — the run still dispatches.
+type BoardSyncer interface {
+	// NotifyBoardTransition advances the work item backing runID along the
+	// named run-lifecycle edge (run_started, …). Best-effort: failures log
+	// inside the implementation and never unwind the dispatch.
+	NotifyBoardTransition(ctx context.Context, runID uuid.UUID, event string)
+}
+
 // ApprovalCommandHandler executes a slash-command approval / reject
 // against the run currently associated with an issue (#238). The
 // concrete implementation lives in the server package where the
@@ -722,6 +735,12 @@ type Dispatcher struct {
 	// but don't unwind the dispatch. Nil leaves the comment-back
 	// path off; the run still dispatches.
 	IssueNotifier IssueNotifier
+
+	// BoardSyncer drives the run-lifecycle board-state transition on
+	// run creation (the run_started edge, #1012). Best-effort: failures
+	// log inside the implementation and never unwind the dispatch. Nil
+	// leaves board sync off.
+	BoardSyncer BoardSyncer
 
 	// ApprovalHandler routes /fishhawk approve and /fishhawk
 	// reject slash commands (#238). Nil leaves these commands
@@ -1043,6 +1062,13 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 				slog.String("error", err.Error()),
 			)
 		}
+	}
+
+	// Board-state sync (#1012): the run_started edge advances the work item to
+	// the in_progress canonical state. Only for issue-triggered runs (the
+	// implementation also no-ops on a non-issue trigger). Best-effort.
+	if d.BoardSyncer != nil && dispatchErr == nil && m.TriggerSource == run.TriggerGitHubIssue {
+		d.BoardSyncer.NotifyBoardTransition(ctx, created.ID, "run_started")
 	}
 
 	// Step 9: log the outcome. Without these lines, operators tailing

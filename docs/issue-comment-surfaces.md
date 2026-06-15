@@ -575,6 +575,26 @@ Notes:
   append failure never fails the response since the item is already filed. No
   sticky status comment is refreshed. Listed here so a future reader grepping
   the audit categories doesn't mistake it for a comment surface.
+- The board-state-sync kind — `work_item_transitioned` (#1012) — is an
+  **internal, audit-only category, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it; it has no Notifier method. It is written under its
+  own category `work_item_transitioned` by the `system` actor in
+  `server/boardsync.go::auditBoardTransition`, which the best-effort
+  `notifyBoardTransition` hook calls after attempting a run-lifecycle board
+  move. The hook fires from four lifecycle points — run created
+  (`run_started`, via the webhook dispatcher's `BoardSyncer`), PR opened
+  (`pr_opened`), run failed (`run_failed`), and PR merged (`run_merged`) — and
+  moves ONLY the project board Status column (the #1005 scope split: labels,
+  fields, and epic links belong to filing). An entry is written for BOTH a
+  landed move AND a deliberate skip (the never-fight-the-human guard: a card a
+  human parked outside the expected source status is left untouched), so the
+  payload — `{trigger, issue_number, canonical_state, from, to, moved, skipped,
+  skip_reason}` — records what happened either way. Unlike `work_item_filed`,
+  this entry is NOT gated on the run being non-terminal: `run_merged` and
+  `run_failed` fire as the run reaches a terminal state. The write is
+  best-effort (the board move, if any, already happened) and never unwinds the
+  run. Listed here so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
 - The product-feedback egress kind — `product_report_filed` (#1006) — is an
   **internal, source-side audit-only category, not a run-thread comment
   surface**. Nothing in `issuecomment` posts it; it has no Notifier method. It

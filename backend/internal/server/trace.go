@@ -1149,6 +1149,16 @@ func (s *Server) advanceAfterFailure(r *http.Request, runID, stageID uuid.UUID) 
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
+		return
+	}
+
+	// Board-state sync (#1012): when the Advance drove the RUN itself to a
+	// terminal failed state, move the work item to the blocked canonical state.
+	// Guarded on the run being failed — a stage failure that leaves sibling
+	// stages running must not park the card in Blocked. Best-effort; the run is
+	// already failed, so a board miss never changes the outcome.
+	if rn, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err == nil && rn.State == run.StateFailed {
+		s.boardTransitionForRun(r.Context(), rn, lifecycleRunFailed)
 	}
 }
 
