@@ -36,13 +36,39 @@ type SurfaceSweepFinding struct {
 	SubPlanTitle    string   `json:"sub_plan_title,omitempty"`
 }
 
+// CrossSliceClaim records which member files of a lockstep pattern one
+// decomposition slice owns. SliceTitle is the sub-plan's title; Files are
+// the pattern-member paths present in that slice's declared scope.files,
+// slash-normalized and sorted.
+type CrossSliceClaim struct {
+	SliceTitle string   `json:"slice_title"`
+	Files      []string `json:"files"`
+}
+
+// CrossSliceCouplingFinding is one cross-slice write-coupling result: a
+// registered multi-surface lockstep pattern's member files are partitioned
+// across 2+ DISTINCT decomposition slices, so completing the seam would
+// force a later slice to modify a file owned by an earlier slice via a
+// runtime scope amendment (which can time out, #1035). This is the INVERSE
+// of the #1062 same-file-in-two-slices gate: there two slices DECLARE the
+// same file; here distinct slices each own different members of a pattern
+// that must move in lockstep. The fix is consolidation (one slice owns the
+// whole seam), not dual declaration. Slices is sorted by SliceTitle.
+type CrossSliceCouplingFinding struct {
+	Pattern string            `json:"pattern"`
+	Slices  []CrossSliceClaim `json:"slices"`
+}
+
 // SurfaceSweepPayload is the audit-payload shape for a plan_surface_sweep
 // entry (#763). Findings is marshalled as an empty array (not null) on a
 // clean sweep, mirroring scope_precheck's "checked and clean vs never
 // checked" rationale. ScannedFiles is the count of scope.files evaluated.
+// CrossSliceFindings carries the cross-slice coupling pass (#1102) and is
+// likewise an empty array (not null) on a clean sweep.
 type SurfaceSweepPayload struct {
-	Findings     []SurfaceSweepFinding `json:"findings"`
-	ScannedFiles int                   `json:"scanned_files"`
+	Findings           []SurfaceSweepFinding       `json:"findings"`
+	ScannedFiles       int                         `json:"scanned_files"`
+	CrossSliceFindings []CrossSliceCouplingFinding `json:"cross_slice_findings"`
 }
 
 // surfacePattern is one entry in the static surface registry: when any
@@ -164,6 +190,24 @@ var surfacePatterns = []surfacePattern{
 			"backend/internal/operatorrole/schemas/operator-role-overlay.schema.json",
 		},
 	},
+	{
+		// #1101/#1006 case 2: the work-management-v0 schema's canonical and
+		// embedded-mirror copies must move in lockstep (scripts/sync-schemas'
+		// work-management-v* case routes the canonical to exactly the one
+		// backend/internal/workmgmt/schemas mirror). Self-referential
+		// (Triggers == Siblings): a field-add touching the canonical without
+		// its mirror flags within a slice; canonical and mirror split across
+		// decomposition slices flags as a cross-slice coupling finding (#1102).
+		Name: "work-management schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/work-management-v0.schema.json",
+			"backend/internal/workmgmt/schemas/work-management-v0.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/work-management-v0.schema.json",
+			"backend/internal/workmgmt/schemas/work-management-v0.schema.json",
+		},
+	},
 }
 
 // evaluateSurfaceSweep is the pure matcher: for each pattern, if any
@@ -215,6 +259,79 @@ func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern) []Surf
 // triggers extends this helper without touching evaluateSurfaceSweep.
 func pathMatches(scope map[string]bool, registryPath string) bool {
 	return scope[filepath.ToSlash(registryPath)]
+}
+
+// evaluateCrossSliceCoupling is the pure cross-slice detector (#1102): for
+// each registered pattern it computes the pattern's member-file set
+// (Triggers ∪ Siblings, slash-normalized, deduped) and which DECLARING
+// decomposition slice owns each present member. When the owned members are
+// claimed by 2+ DISTINCT slices the seam is split across the fan-out, so
+// completing it would need a runtime scope amendment (which can time out,
+// #1035) — it emits one CrossSliceCouplingFinding naming each involved
+// slice and the member files it owns.
+//
+// Only sub-plans that DECLARE a scope are partitioned: an undeclared scope
+// inherits the parent's full scope.files and cannot partition unsoundly —
+// identical rationale to checkCrossSliceSharedFiles (#1062) and the #1077
+// sub-plan sweep. A single slice listing the same member twice collapses to
+// one claimant (map semantics). Output is deterministic: slices sorted by
+// title, files sorted. Returns nil when nothing is split. Pure — no Server
+// receiver, no I/O — exactly like evaluateSurfaceSweep.
+func evaluateCrossSliceCoupling(parsedPlan *plan.Plan, patterns []surfacePattern) []CrossSliceCouplingFinding {
+	if parsedPlan.Decomposition == nil {
+		return nil
+	}
+
+	// Per-slice ownership: sliceFiles[title] is the set of that slice's
+	// declared, slash-normalized scope.files. Only declaring slices count.
+	sliceFiles := make(map[string]map[string]bool)
+	for _, sp := range parsedPlan.Decomposition.SubPlans {
+		if sp.Scope == nil {
+			continue
+		}
+		files := make(map[string]bool, len(sp.Scope.Files))
+		for _, f := range sp.Scope.Files {
+			files[filepath.ToSlash(f.Path)] = true
+		}
+		sliceFiles[sp.Title] = files
+	}
+
+	var findings []CrossSliceCouplingFinding
+	for _, p := range patterns {
+		// Member-file set: Triggers ∪ Siblings, deduped.
+		members := make(map[string]bool, len(p.Triggers)+len(p.Siblings))
+		for _, m := range p.Triggers {
+			members[filepath.ToSlash(m)] = true
+		}
+		for _, m := range p.Siblings {
+			members[filepath.ToSlash(m)] = true
+		}
+
+		// Which member files each declaring slice owns.
+		owned := make(map[string][]string)
+		for title, files := range sliceFiles {
+			for member := range members {
+				if files[member] {
+					owned[title] = append(owned[title], member)
+				}
+			}
+		}
+		if len(owned) < 2 {
+			continue
+		}
+
+		claims := make([]CrossSliceClaim, 0, len(owned))
+		for title, files := range owned {
+			sort.Strings(files)
+			claims = append(claims, CrossSliceClaim{SliceTitle: title, Files: files})
+		}
+		sort.Slice(claims, func(i, j int) bool { return claims[i].SliceTitle < claims[j].SliceTitle })
+		findings = append(findings, CrossSliceCouplingFinding{
+			Pattern: p.Name,
+			Slices:  claims,
+		})
+	}
+	return findings
 }
 
 // runSurfaceSweep evaluates an uploaded plan's scope.files against the
@@ -299,9 +416,20 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 		findings = []SurfaceSweepFinding{}
 	}
 
+	// Cross-slice coupling pass (#1102): when a registered lockstep
+	// pattern's member files are partitioned across distinct decomposition
+	// slices, completing the seam would need a runtime scope amendment that
+	// can time out (#1035). Pure evaluator, guarded on a decomposition;
+	// normalize nil to an empty slice so the payload marshals an array.
+	crossSlice := evaluateCrossSliceCoupling(parsedPlan, surfacePatterns)
+	if crossSlice == nil {
+		crossSlice = []CrossSliceCouplingFinding{}
+	}
+
 	result := &SurfaceSweepPayload{
-		Findings:     findings,
-		ScannedFiles: len(scopeFiles),
+		Findings:           findings,
+		ScannedFiles:       len(scopeFiles),
+		CrossSliceFindings: crossSlice,
 	}
 	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")

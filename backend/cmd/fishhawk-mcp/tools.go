@@ -364,13 +364,33 @@ type SurfaceSweepFinding struct {
 	MissingSiblings []string `json:"missing_siblings"`
 }
 
+// CrossSliceClaim is one decomposition slice's ownership of a lockstep
+// pattern's member files in a cross-slice coupling finding (#1102). Mirrors
+// the server-side CrossSliceClaim shape exactly.
+type CrossSliceClaim struct {
+	SliceTitle string   `json:"slice_title"`
+	Files      []string `json:"files"`
+}
+
+// CrossSliceCouplingFinding is one cross-slice coupling result decoded from
+// a plan_surface_sweep audit entry (#1102): a lockstep pattern's member
+// files are split across 2+ distinct decomposition slices, so completing the
+// seam would otherwise need a runtime scope amendment (which can time out,
+// #1035). Mirrors the server-side CrossSliceCouplingFinding shape exactly.
+type CrossSliceCouplingFinding struct {
+	Pattern string            `json:"pattern"`
+	Slices  []CrossSliceClaim `json:"slices"`
+}
+
 // SurfaceSweep is the plan-gate surface-sweep result decoded from the
 // newest plan_surface_sweep audit entry (#763). Findings is empty when the
 // plan's scope.files touched no incomplete multi-surface pattern;
 // ScannedFiles is the number of scope.files the sweep evaluated.
+// CrossSliceFindings carries the cross-slice coupling pass (#1102).
 type SurfaceSweep struct {
-	Findings     []SurfaceSweepFinding `json:"findings,omitempty" jsonschema:"sibling surfaces the plan omitted; empty when scope.files touched no incomplete multi-surface pattern"`
-	ScannedFiles int                   `json:"scanned_files" jsonschema:"number of scope.files the sweep evaluated"`
+	Findings           []SurfaceSweepFinding       `json:"findings,omitempty" jsonschema:"sibling surfaces the plan omitted; empty when scope.files touched no incomplete multi-surface pattern"`
+	ScannedFiles       int                         `json:"scanned_files" jsonschema:"number of scope.files the sweep evaluated"`
+	CrossSliceFindings []CrossSliceCouplingFinding `json:"cross_slice_findings,omitempty" jsonschema:"plan-gate cross-slice coupling (#1102): lockstep-pattern member files split across 2+ distinct decomposition slices, so completing the seam would otherwise need a runtime scope amendment that can time out (#1035). Each finding names the pattern and which slice owns which member files. The inverse of the same-file-in-two-slices gate (#1062): the fix is consolidating the seam into one slice, not declaring the shared file twice. Empty/absent when no lockstep pattern is split across slices or on older runs predating the pass"`
 }
 
 // ScopePrecheckViolation is one path-constraint mismatch decoded from a

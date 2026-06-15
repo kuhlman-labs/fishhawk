@@ -2379,6 +2379,80 @@ func TestShipPlan_SubPlanCoupling_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestShipPlan_CrossSliceCoupling_EndToEnd is the #1102 cross-boundary
+// check: a decomposed plan that SPLITS a lockstep pattern's members across
+// two slices (the work-management schema's canonical in one slice, its
+// mirror in another) is POSTed through handleShipPlan, and the full path is
+// asserted end to end — the persisted plan_surface_sweep payload carries the
+// cross_slice_findings, AND the SAME finding is consumed by planGateEvidence
+// (result.CrossSliceFindings -> prompt.SurfaceSweepEvidence.CrossSliceFindings)
+// and rendered into the captured plan-review prompt's CROSS-SLICE COUPLING
+// line. This covers the audit-persist -> planGateEvidence -> prompt-render
+// consumer boundary so the mapping cannot silently drop.
+func TestShipPlan_CrossSliceCoupling_EndToEnd(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithConstraints)
+	cf := &contentsFake{dirs: map[string][]string{
+		"backend/internal/server": {"upload.go"},
+	}}
+	instID := int64(42)
+	rr.getRuns[runID].InstallationID = &instID
+	s.cfg.GitHub = newTestSweepGitHub(t, cf)
+	priv, _ := sf.issue(t, runID)
+
+	body := decomposedScopePlanBody(t,
+		[]plan.ScopeFile{{Path: "backend/internal/server/upload.go", Operation: plan.FileOpModify}},
+		[]subPlanScope{
+			{
+				title: "schema slice",
+				files: []plan.ScopeFile{{Path: "docs/spec/work-management-v0.schema.json", Operation: plan.FileOpModify}},
+			},
+			{
+				title: "wiring slice",
+				files: []plan.ScopeFile{{Path: "backend/internal/workmgmt/schemas/work-management-v0.schema.json", Operation: plan.FileOpModify}},
+			},
+		},
+	)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) the surface-sweep audit entry carries the cross-slice finding.
+	surface := lastSurfaceSweepEntry(t, au)
+	if len(surface.CrossSliceFindings) != 1 {
+		t.Fatalf("surface sweep payload missing cross-slice finding: %+v", surface.CrossSliceFindings)
+	}
+	f := surface.CrossSliceFindings[0]
+	if f.Pattern != "work-management schema requires every mirror" || len(f.Slices) != 2 {
+		t.Errorf("cross-slice finding = %+v", f)
+	}
+
+	// (b) the SAME finding is consumed by planGateEvidence and rendered into
+	// the captured plan-review prompt — the persist -> evidence -> render seam.
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	wants := []string{
+		"CROSS-SLICE COUPLING (work-management schema requires every mirror)",
+		"\"schema slice\" owns [docs/spec/work-management-v0.schema.json]",
+		"\"wiring slice\" owns [backend/internal/workmgmt/schemas/work-management-v0.schema.json]",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing cross-slice element %q — persist→evidence→render seam broken:\n%s", want, got)
+		}
+	}
+}
+
 // validClarificationBytes returns a minimal clarification_request artifact
 // (#1057) that validates against clarification-request-v1: the top-level kind
 // discriminator plus ticket_reference / generated_by / summary / questions.

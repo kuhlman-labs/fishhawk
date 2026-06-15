@@ -342,6 +342,11 @@ func TestRunSurfaceSweep_CleanWritesEmptyFindings(t *testing.T) {
 		if got := string(ap.Payload); !strings.Contains(got, `"findings":[]`) {
 			t.Errorf("payload should encode findings as []; got %s", got)
 		}
+		// cross_slice_findings must likewise marshal as [] not null on a
+		// clean / non-decomposed plan (#1102).
+		if got := string(ap.Payload); !strings.Contains(got, `"cross_slice_findings":[]`) {
+			t.Errorf("payload should encode cross_slice_findings as []; got %s", got)
+		}
 	}
 }
 
@@ -447,5 +452,139 @@ func TestRunSurfaceSweep_SubPlanScopeAttributed(t *testing.T) {
 	wantMissing := "cli/internal/spec/schemas/workflow-v0.schema.json"
 	if len(found.MissingSiblings) != 1 || found.MissingSiblings[0] != wantMissing {
 		t.Errorf("MissingSiblings = %v, want [%s]", found.MissingSiblings, wantMissing)
+	}
+}
+
+// crossSlicePlan builds a *plan.Plan with a decomposition from the given
+// sub-plans for the pure evaluateCrossSliceCoupling tests. A nil files slice
+// declares no scope (Scope == nil → inherits parent → excluded).
+func crossSlicePlan(subs []subPlanScope) *plan.Plan {
+	subPlans := make([]plan.SubPlanSummary, 0, len(subs))
+	for _, sp := range subs {
+		summary := plan.SubPlanSummary{Title: sp.title}
+		if sp.files != nil {
+			summary.Scope = &plan.Scope{Files: sp.files}
+		}
+		subPlans = append(subPlans, summary)
+	}
+	return &plan.Plan{Decomposition: &plan.Decomposition{SubPlans: subPlans}}
+}
+
+const (
+	wmCanonical = "docs/spec/work-management-v0.schema.json"
+	wmMirror    = "backend/internal/workmgmt/schemas/work-management-v0.schema.json"
+)
+
+// TestEvaluateCrossSliceCoupling is the pure detector test (#1102): a
+// lockstep pattern split across slices is flagged (a); consolidated into one
+// slice it is not (b); a slice with no declared scope is excluded (c); a
+// single slice listing the same member twice collapses to one claimant (d).
+func TestEvaluateCrossSliceCoupling(t *testing.T) {
+	t.Run("split across two slices is flagged", func(t *testing.T) {
+		p := crossSlicePlan([]subPlanScope{
+			{title: "schema slice", files: []plan.ScopeFile{{Path: wmCanonical, Operation: plan.FileOpModify}}},
+			{title: "wiring slice", files: []plan.ScopeFile{{Path: wmMirror, Operation: plan.FileOpModify}}},
+		})
+		got := evaluateCrossSliceCoupling(p, surfacePatterns)
+		if len(got) != 1 {
+			t.Fatalf("want 1 cross-slice finding, got %+v", got)
+		}
+		f := got[0]
+		if f.Pattern != "work-management schema requires every mirror" {
+			t.Errorf("Pattern = %q", f.Pattern)
+		}
+		if len(f.Slices) != 2 {
+			t.Fatalf("want 2 slice claims, got %+v", f.Slices)
+		}
+		// Sorted by title: "schema slice" < "wiring slice".
+		if f.Slices[0].SliceTitle != "schema slice" || f.Slices[1].SliceTitle != "wiring slice" {
+			t.Errorf("slices not sorted by title: %+v", f.Slices)
+		}
+		if len(f.Slices[0].Files) != 1 || f.Slices[0].Files[0] != wmCanonical {
+			t.Errorf("schema slice files = %v, want [%s]", f.Slices[0].Files, wmCanonical)
+		}
+		if len(f.Slices[1].Files) != 1 || f.Slices[1].Files[0] != wmMirror {
+			t.Errorf("wiring slice files = %v, want [%s]", f.Slices[1].Files, wmMirror)
+		}
+	})
+
+	t.Run("consolidated into one slice is not flagged", func(t *testing.T) {
+		p := crossSlicePlan([]subPlanScope{
+			{title: "schema slice", files: []plan.ScopeFile{
+				{Path: wmCanonical, Operation: plan.FileOpModify},
+				{Path: wmMirror, Operation: plan.FileOpModify},
+			}},
+			{title: "unrelated slice", files: []plan.ScopeFile{{Path: "backend/internal/bar/bar.go", Operation: plan.FileOpModify}}},
+		})
+		if got := evaluateCrossSliceCoupling(p, surfacePatterns); len(got) != 0 {
+			t.Fatalf("want no cross-slice finding when consolidated, got %+v", got)
+		}
+	})
+
+	t.Run("undeclared scope slice is excluded", func(t *testing.T) {
+		// The mirror lives in a slice with no declared scope (inherits the
+		// parent's full scope.files), so it cannot partition the pattern.
+		p := crossSlicePlan([]subPlanScope{
+			{title: "schema slice", files: []plan.ScopeFile{{Path: wmCanonical, Operation: plan.FileOpModify}}},
+			{title: "inherits parent", files: nil},
+		})
+		if got := evaluateCrossSliceCoupling(p, surfacePatterns); len(got) != 0 {
+			t.Fatalf("want no finding when the second slice declares no scope, got %+v", got)
+		}
+	})
+
+	t.Run("same member listed twice in one slice collapses", func(t *testing.T) {
+		p := crossSlicePlan([]subPlanScope{
+			{title: "schema slice", files: []plan.ScopeFile{
+				{Path: wmCanonical, Operation: plan.FileOpModify},
+				{Path: wmCanonical, Operation: plan.FileOpModify},
+			}},
+		})
+		if got := evaluateCrossSliceCoupling(p, surfacePatterns); len(got) != 0 {
+			t.Fatalf("want no finding when one slice lists the same member twice, got %+v", got)
+		}
+	})
+
+	t.Run("nil decomposition returns nil", func(t *testing.T) {
+		if got := evaluateCrossSliceCoupling(&plan.Plan{}, surfacePatterns); got != nil {
+			t.Fatalf("want nil for a non-decomposed plan, got %+v", got)
+		}
+	})
+}
+
+// TestRunSurfaceSweep_CrossSliceFindings is the end-to-end assertion: a
+// decomposition that splits a lockstep pattern's members across two slices
+// records the cross_slice_findings in the plan_surface_sweep audit payload.
+func TestRunSurfaceSweep_CrossSliceFindings(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := decomposedScopePlanBody(t,
+		[]plan.ScopeFile{{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify}},
+		[]subPlanScope{
+			{title: "schema slice", files: []plan.ScopeFile{{Path: wmCanonical, Operation: plan.FileOpModify}}},
+			{title: "wiring slice", files: []plan.ScopeFile{{Path: wmMirror, Operation: plan.FileOpModify}}},
+		},
+	)
+
+	got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result when the sweep ran")
+	}
+
+	recorded := lastSurfaceSweepEntry(t, au)
+	if len(recorded.CrossSliceFindings) != 1 {
+		t.Fatalf("want 1 cross-slice finding in the audit payload, got %+v", recorded.CrossSliceFindings)
+	}
+	f := recorded.CrossSliceFindings[0]
+	if f.Pattern != "work-management schema requires every mirror" {
+		t.Errorf("Pattern = %q", f.Pattern)
+	}
+	if len(f.Slices) != 2 {
+		t.Fatalf("want 2 slice claims, got %+v", f.Slices)
+	}
+	// Returned result matches the recorded payload (the #963 contract).
+	gotJSON, _ := json.Marshal(got.CrossSliceFindings)
+	recordedJSON, _ := json.Marshal(recorded.CrossSliceFindings)
+	if string(gotJSON) != string(recordedJSON) {
+		t.Errorf("returned cross-slice findings diverge from recorded:\nreturned: %s\nrecorded: %s", gotJSON, recordedJSON)
 	}
 }

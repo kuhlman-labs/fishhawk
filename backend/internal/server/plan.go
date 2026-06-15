@@ -1049,6 +1049,16 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 				SubPlanTitle:    f.SubPlanTitle,
 			})
 		}
+		for _, f := range sweep.CrossSliceFindings {
+			cf := prompt.CrossSliceCouplingFindingEvidence{Pattern: f.Pattern}
+			for _, c := range f.Slices {
+				cf.Slices = append(cf.Slices, prompt.CrossSliceClaimEvidence{
+					SliceTitle: c.SliceTitle,
+					Files:      c.Files,
+				})
+			}
+			sw.CrossSliceFindings = append(sw.CrossSliceFindings, cf)
+		}
 		ev.SurfaceSweep = sw
 	}
 	if testSweep != nil {
