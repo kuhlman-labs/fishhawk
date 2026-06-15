@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -24,6 +27,10 @@ type fakeWorkProvider struct {
 	called   bool
 	captured workmgmt.ProviderRequest
 	fileErr  error
+	// failIfNoInstallation mirrors the real github.Provider fail-closed
+	// (#1092's installation_unavailable guard): File errors when the
+	// resolved Target.InstallationID is still 0.
+	failIfNoInstallation bool
 }
 
 func (f *fakeWorkProvider) Name() string { return f.name }
@@ -31,6 +38,9 @@ func (f *fakeWorkProvider) Name() string { return f.name }
 func (f *fakeWorkProvider) File(_ context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
 	f.called = true
 	f.captured = req
+	if f.failIfNoInstallation && req.Target.InstallationID == 0 {
+		return nil, errors.New("installation_unavailable: provider needs an installation token")
+	}
 	if f.fileErr != nil {
 		return nil, f.fileErr
 	}
@@ -574,6 +584,197 @@ func TestFileWorkItem_RunResolutionGuards(t *testing.T) {
 			t.Errorf("code = %q, want body_too_large", env.Error.Code)
 		}
 	})
+}
+
+// newInstallationGitHubClient builds a *githubclient.Client whose
+// GET /repos/{owner}/{repo}/installation endpoint answers with the given
+// installation id, or 404 (App-not-installed -> githubclient.ErrNotInstalled)
+// when notInstalled is true. Mirrors the lineage_test.go stub pattern.
+func newInstallationGitHubClient(t *testing.T, installID int64, notInstalled bool) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+		if notInstalled {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":%d}`, installID)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// TestFileWorkItem_NoRun_ResolvesInstallation is the cross-boundary test
+// for #1095: a run-absent operator filing must resolve the App's
+// installation for the target repo so the provider receives a non-zero
+// Target.InstallationID. It drives a real POST through handleFileWorkItem
+// with a stub installation endpoint and asserts the fakeWorkProvider
+// captured the resolved id — the handler -> GitHub-resolver -> provider
+// seam a per-layer unit would miss.
+func TestFileWorkItem_NoRun_ResolvesInstallation(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	const wantInst = int64(7788)
+	gh := newInstallationGitHubClient(t, wantInst, false)
+	s := New(Config{GitHub: gh})
+
+	// Non-run-bound operator caller, no run and no run_id: the run-absent
+	// ADR-040 follow-up filing path.
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "chore",
+		Summary: "Operator follow-up filing",
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.called {
+		t.Fatal("provider was not called")
+	}
+	if fp.captured.Target.InstallationID != wantInst {
+		t.Errorf("provider Target.InstallationID = %d, want %d (resolved from the stub installation endpoint)",
+			fp.captured.Target.InstallationID, wantInst)
+	}
+}
+
+// TestFileWorkItem_NoRun_NoInstallation_FailsClosed pins the preserved
+// fail-closed for the genuinely-unresolvable case: the App is not
+// installed on the repo (404 -> githubclient.ErrNotInstalled), so the
+// handler leaves InstallationID 0 and proceeds, and the provider fails
+// closed -> 502 work_item_filing_failed at the handler boundary.
+func TestFileWorkItem_NoRun_NoInstallation_FailsClosed(t *testing.T) {
+	fp := &fakeWorkProvider{failIfNoInstallation: true}
+	registerFakeProvider(t, fp)
+
+	gh := newInstallationGitHubClient(t, 0, true) // 404 -> ErrNotInstalled
+	s := New(Config{GitHub: gh})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "chore",
+		Summary: "No installation on this repo",
+	}, "github:operator")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_filing_failed" {
+		t.Errorf("code = %q, want work_item_filing_failed", env.Error.Code)
+	}
+	if fp.captured.Target.InstallationID != 0 {
+		t.Errorf("Target.InstallationID = %d, want 0 (left unresolved on ErrNotInstalled)", fp.captured.Target.InstallationID)
+	}
+}
+
+// TestFileWorkItem_NoRun_ResolutionError_BadGateway pins the distinct
+// handler-side resolution-error branch: a transient/non-ErrNotInstalled
+// GetRepoInstallation failure (the installation endpoint returns a 5xx,
+// which classifyStatus maps to a non-ErrNotInstalled error) is surfaced
+// as 502 work_item_filing_failed by the handler ITSELF, before provider
+// dispatch — not masked as the provider's "no installation" message.
+// This is a different code path than TestFileWorkItem_NoRun_NoInstallation_FailsClosed,
+// which reaches 502 through the ErrNotInstalled-leaves-0 path and the
+// provider's own fail-closed. Assert the provider was NOT dispatched.
+func TestFileWorkItem_NoRun_ResolutionError_BadGateway(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	// Installation endpoint returns 500 -> non-ErrNotInstalled error.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"message":"server error"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	gh := &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+	s := New(Config{GitHub: gh})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "chore",
+		Summary: "Installation lookup is transiently unavailable",
+	}, "github:operator")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_filing_failed" {
+		t.Errorf("code = %q, want work_item_filing_failed", env.Error.Code)
+	}
+	if fp.called {
+		t.Error("provider dispatched despite a resolution error (want handler-side 502 before dispatch)")
+	}
+}
+
+// TestFileWorkItem_RunBound_RunAbsent_Forbidden pins the binding authz
+// condition for #1095: a run-bound agent token (mcp:run:<uuid> subject)
+// that files run-absent (no run_id) MUST be rejected 403 before any
+// GetRepoInstallation call or provider dispatch. The run-absent
+// installation-resolution path is operator-only; a run-bound token must
+// file run-scoped (supply its own repo-consistency-checked run_id) so it
+// cannot resolve an installation for an arbitrary App-installed repo (the
+// confused-deputy egress #1005 closed, via the run-absent door).
+func TestFileWorkItem_RunBound_RunAbsent_Forbidden(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	// A GitHub client whose installation endpoint must NOT be hit: the
+	// authz gate rejects before any resolution.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("GetRepoInstallation called; want rejected before installation resolution")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	gh := &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+	s := New(Config{GitHub: gh})
+
+	// Run-bound agent token but NO run_id supplied: it must not be able to
+	// use the run-absent door.
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "chore",
+		Summary: "Sneak through the run-absent door",
+	}, "mcp:run:"+uuid.New().String())
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "run_scoped_filing_required" {
+		t.Errorf("code = %q, want run_scoped_filing_required", env.Error.Code)
+	}
+	if fp.called {
+		t.Error("provider dispatched for a run-bound run-absent filing")
+	}
 }
 
 // TestFileWorkItem_Anonymous_Unauthorized asserts an unauthenticated
