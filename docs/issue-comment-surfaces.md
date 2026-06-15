@@ -602,7 +602,9 @@ Notes:
   `server/boardsync.go::auditBoardTransition`, which the best-effort
   `notifyBoardTransition` hook calls after attempting a run-lifecycle board
   move. The hook fires from four lifecycle points — run created
-  (`run_started`, via the webhook dispatcher's `BoardSyncer`), PR opened
+  (`run_started`, via the webhook dispatcher's `BoardSyncer` AND, for
+  local-runner / API-created runs, `handleCreateRun` in `server/runs.go` so the
+  edge is no longer webhook-exclusive; #1123), PR opened
   (`pr_opened`), run failed (`run_failed`), and PR merged (`run_merged`) — and
   moves ONLY the project board Status column (the #1005 scope split: labels,
   fields, and epic links belong to filing). An entry is written for BOTH a

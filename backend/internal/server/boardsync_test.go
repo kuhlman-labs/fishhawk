@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/google/uuid"
@@ -224,6 +227,117 @@ func TestNotifyBoardTransition_ProviderError_Swallowed(t *testing.T) {
 	}
 	if len(transitionAudits(au)) != 0 {
 		t.Errorf("audit written despite provider error, want none")
+	}
+}
+
+// TestCreateRun_EmitsRunStartedBoardTransition is the #1123 end-to-end
+// guard: a local-runner / API-created issue run posted through the real
+// handleCreateRun HTTP handler must move its card to In Progress via the
+// run_started board transition, crossing every layer — create handler ->
+// boardTransitionForRun hook -> registered Transitioner -> work_item_transitioned
+// audit. A per-layer unit would pass while this create-handler->hook seam
+// silently no-ops (the exact #1123 failure mode, cf. #618). The webhook
+// dispatcher creates runs via its own internal createRun and never reaches
+// handleCreateRun, so the e2e asserts EXACTLY ONE run_started audit — no
+// double-fire.
+func TestCreateRun_EmitsRunStartedBoardTransition(t *testing.T) {
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	fp := &fakeTransitionProvider{}
+	registerTransitionProvider(t, fp)
+
+	rr := newFakeRepo()
+	au := newAuditFake()
+	s := New(Config{RunRepo: rr, AuditRepo: au})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "kuhlman-labs/fishhawk",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"trigger_ref":    "issue:932",
+		"workflow_spec":  minimalSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	if len(fp.calls) != 1 {
+		t.Fatalf("Transition calls = %d, want 1", len(fp.calls))
+	}
+	got := fp.calls[0]
+	if got.Trigger != lifecycleRunStarted {
+		t.Errorf("trigger = %q, want %q", got.Trigger, lifecycleRunStarted)
+	}
+	if got.CanonicalState != workmgmt.CanonicalStateInProgress {
+		t.Errorf("canonical state = %q, want %q", got.CanonicalState, workmgmt.CanonicalStateInProgress)
+	}
+	if got.IssueNumber != 932 {
+		t.Errorf("issue number = %d, want 932", got.IssueNumber)
+	}
+	containsBacklog := false
+	for _, src := range got.ExpectedSourceStates {
+		if src == workmgmt.CanonicalStateBacklog {
+			containsBacklog = true
+		}
+	}
+	if !containsBacklog {
+		t.Errorf("expected sources = %v, want to contain %q", got.ExpectedSourceStates, workmgmt.CanonicalStateBacklog)
+	}
+
+	audits := transitionAudits(au)
+	if len(audits) != 1 {
+		t.Fatalf("work_item_transitioned audits = %d, want exactly 1", len(audits))
+	}
+	if audits[0]["trigger"] != lifecycleRunStarted || audits[0]["moved"] != true {
+		t.Errorf("audit payload = %v, want trigger=%q moved=true", audits[0], lifecycleRunStarted)
+	}
+}
+
+// TestCreateRun_NonIssueRun_NoBoardTransition pins the internal no-op that
+// keeps the unconditional handleCreateRun emit safe for ad-hoc runs (#1123,
+// condition (3)): a run with no issue: trigger ref produces NO provider
+// Transition call and NO work_item_transitioned audit.
+func TestCreateRun_NonIssueRun_NoBoardTransition(t *testing.T) {
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	fp := &fakeTransitionProvider{}
+	registerTransitionProvider(t, fp)
+
+	rr := newFakeRepo()
+	au := newAuditFake()
+	s := New(Config{RunRepo: rr, AuditRepo: au})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "kuhlman-labs/fishhawk",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  minimalSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	if len(fp.calls) != 0 {
+		t.Errorf("Transition called %d times for non-issue run, want 0", len(fp.calls))
+	}
+	if len(transitionAudits(au)) != 0 {
+		t.Errorf("work_item_transitioned audit written for non-issue run, want none")
 	}
 }
 
