@@ -21,6 +21,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `types` | yes | object: type name → type config | Work-item types, keyed by snake_case name (bug, feature, chore, adr, …). |
 | `states` | no | object: canonical state → provider option | Canonical board-state map for run-lifecycle transitions (#1012). Keys from the closed set `backlog`/`in_progress`/`in_review`/`blocked`/`done`; values are provider option strings. |
 | `transitions` | no | object: lifecycle event → canonical state | Run-lifecycle-event → canonical-state map (#1012). Keys from the closed set `run_started`/`pr_opened`/`run_failed`/`run_merged`; each value must be a key declared in `states` (semantic check). |
+| `product_feedback` | no | object `{enabled: boolean}` | Per-repo kill-switch for upstream product-feedback egress (ADR-029, #1006). Absent means enabled (the default). `enabled: false` → `POST /v0/runs/{id}/product-reports` returns 403 `product_feedback_disabled` and files nothing. Set it as the object form (`product_feedback:` / `  enabled: false`), **not** a bare string. |
 
 ### Per-type fields (`types.<name>`)
 

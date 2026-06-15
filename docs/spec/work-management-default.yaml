@@ -49,6 +49,15 @@ transitions:
   run_failed: blocked
   run_merged: done
 
+# Per-repo kill-switch for upstream product-feedback egress (ADR-029,
+# #1006). Shipped in its enabled (egress-on) position. To hard-disable the
+# product-report endpoint for a repo, set the object's enabled to false:
+#   product_feedback:
+#     enabled: false
+# Omitting the block entirely is equivalent to enabled: true.
+product_feedback:
+  enabled: true
+
 field_hints:
   Summary: One or two sentences naming the motivation and the load-bearing change.
   Done-means: >-
