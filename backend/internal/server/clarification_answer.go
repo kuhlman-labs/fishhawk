@@ -30,6 +30,21 @@ type clarificationResumer interface {
 	ResumeAwaitingInputStage(ctx context.Context, stageID uuid.UUID) (stage *run.Stage, won bool, err error)
 }
 
+// clarificationAnswerCommitter is the optional repo capability that commits
+// the awaiting_input → pending transition AND the clarification_answered audit
+// append in ONE transaction across the run and audit tables (#1090). It
+// supersedes the clarificationResumer + standalone AppendChained two-step on
+// repos that provide it (postgres): an append failure rolls the transition
+// back, so the stage is never left pending without its persisted answer, and
+// the same compare-and-set yields the single-winner 409 for a double-submit.
+// won==false means the stage already left awaiting_input (loser of the race);
+// run.ErrNotFound means the stage does not exist. Type-asserted on the
+// concrete postgres repo like clarificationResumer; in-memory fakes that do
+// not implement it fall back to the two-step path below.
+type clarificationAnswerCommitter interface {
+	ResumeAwaitingInputAndAppend(ctx context.Context, stageID uuid.UUID, p audit.ChainAppendParams) (stage *run.Stage, won bool, err error)
+}
+
 // clarificationAnswerRequest mirrors POST /v0/stages/{stage_id}/
 // clarification's request body in docs/api/v0.openapi.yaml. The operator
 // answers the planner's parked clarification_request questions, keyed by
@@ -145,57 +160,10 @@ func (s *Server) handleAnswerClarification(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Re-open the parked stage FIRST, then persist the audit entry — the
-	// transition is the concurrency gate so only the request that actually
-	// moves the stage out of awaiting_input writes a clarification_answered
-	// entry. Were the audit appended first, two concurrent double-submits
-	// could both pass the awaiting_input read above and both append; the
-	// loser's newer entry would then override the winner's answer in the
-	// resumed plan prompt (loadClarificationAnswers reads newest-first).
-	//
-	// When the repo provides the ResumeAwaitingInputStage compare-and-set
-	// (postgres, under the row lock), use it: the loser observes the stage
-	// already re-opened and is rejected here, before any audit write. A repo
-	// without the capability (test fakes) falls back to the plain transition,
-	// mirroring the runCostRecorder optional-capability pattern.
-	if resumer, ok := s.cfg.RunRepo.(clarificationResumer); ok {
-		resumed, won, rerr := resumer.ResumeAwaitingInputStage(r.Context(), stageID)
-		if rerr != nil {
-			if errors.Is(rerr, run.ErrNotFound) {
-				s.writeError(w, r, http.StatusNotFound, "stage_not_found",
-					"no stage with that id", map[string]any{"stage_id": stageID.String()})
-				return
-			}
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"resume parked stage failed", map[string]any{"error": rerr.Error()})
-			return
-		}
-		if !won {
-			s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
-				"stage is no longer parked at awaiting_input (already answered)",
-				map[string]any{"stage_id": stageID.String()})
-			return
-		}
-		stage = resumed
-	} else {
-		// The transition rule already exists (run/transition.go); map an
-		// unexpected rejection to a 409 like the approval handler.
-		resumed, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stageID, run.StageStatePending, nil)
-		if terr != nil {
-			var inv run.InvalidTransitionError
-			if errors.As(terr, &inv) {
-				s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
-					terr.Error(),
-					map[string]any{"stage_id": stageID.String(), "from": inv.From, "to": inv.To})
-				return
-			}
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"transition stage to pending failed", map[string]any{"error": terr.Error()})
-			return
-		}
-		stage = resumed
-	}
-
+	// Build the clarification_answered audit params up front (before the
+	// transition) so the atomic committer can fold the append into the same
+	// transaction as the re-open. stage.RunID comes from the GetStage
+	// pre-check above; resuming only changes the stage's state, not its run.
 	ident := IdentityFrom(r.Context())
 	subject := ident.Subject
 	if subject == "" {
@@ -213,7 +181,7 @@ func (s *Server) handleAnswerClarification(w http.ResponseWriter, r *http.Reques
 		auditPayload["comment"] = req.Comment
 	}
 	payload, _ := json.Marshal(auditPayload)
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	chainParams := audit.ChainAppendParams{
 		RunID:        stage.RunID,
 		StageID:      &stageID,
 		Timestamp:    time.Now().UTC(),
@@ -221,10 +189,97 @@ func (s *Server) handleAnswerClarification(w http.ResponseWriter, r *http.Reques
 		ActorKind:    &actorKind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	}); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"append clarification_answered audit entry failed", map[string]any{"error": err.Error()})
-		return
+	}
+
+	// Re-open the parked stage and persist the answer. The transition is the
+	// concurrency gate so only the request that actually moves the stage out
+	// of awaiting_input writes a clarification_answered entry. Were the audit
+	// appended first, two concurrent double-submits could both pass the
+	// awaiting_input read above and both append; the loser's newer entry would
+	// then override the winner's answer in the resumed plan prompt
+	// (loadClarificationAnswers reads newest-first).
+	//
+	// Three tiers, in preference order:
+	//
+	//  1. clarificationAnswerCommitter (postgres): the transition AND the
+	//     clarification_answered append commit in ONE transaction. An append
+	//     failure rolls the transition back, so the stage is never left pending
+	//     without its persisted answer (closes the #1090 append-after-transition
+	//     gap). The same compare-and-set under the stage row lock yields the
+	//     single-winner 409 in production — the loser observes the stage already
+	//     re-opened and is rejected here, before and without any audit write.
+	//  2. clarificationResumer (compare-and-set re-open) + standalone append.
+	//  3. plain TransitionStage + standalone append (test fakes).
+	//
+	// Tiers 2 and 3 keep the non-atomic two-step path for in-memory fakes that
+	// don't implement the committer, mirroring the runCostRecorder
+	// optional-capability pattern.
+	switch repo := s.cfg.RunRepo.(type) {
+	case clarificationAnswerCommitter:
+		resumed, won, cerr := repo.ResumeAwaitingInputAndAppend(r.Context(), stageID, chainParams)
+		if cerr != nil {
+			if errors.Is(cerr, run.ErrNotFound) {
+				s.writeError(w, r, http.StatusNotFound, "stage_not_found",
+					"no stage with that id", map[string]any{"stage_id": stageID.String()})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"resume parked stage and append answer failed", map[string]any{"error": cerr.Error()})
+			return
+		}
+		if !won {
+			s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+				"stage is no longer parked at awaiting_input (already answered)",
+				map[string]any{"stage_id": stageID.String()})
+			return
+		}
+		stage = resumed
+	case clarificationResumer:
+		resumed, won, rerr := repo.ResumeAwaitingInputStage(r.Context(), stageID)
+		if rerr != nil {
+			if errors.Is(rerr, run.ErrNotFound) {
+				s.writeError(w, r, http.StatusNotFound, "stage_not_found",
+					"no stage with that id", map[string]any{"stage_id": stageID.String()})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"resume parked stage failed", map[string]any{"error": rerr.Error()})
+			return
+		}
+		if !won {
+			s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+				"stage is no longer parked at awaiting_input (already answered)",
+				map[string]any{"stage_id": stageID.String()})
+			return
+		}
+		stage = resumed
+		if err := s.appendClarificationAnswered(r.Context(), chainParams); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"append clarification_answered audit entry failed", map[string]any{"error": err.Error()})
+			return
+		}
+	default:
+		// The transition rule already exists (run/transition.go); map an
+		// unexpected rejection to a 409 like the approval handler.
+		resumed, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stageID, run.StageStatePending, nil)
+		if terr != nil {
+			var inv run.InvalidTransitionError
+			if errors.As(terr, &inv) {
+				s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+					terr.Error(),
+					map[string]any{"stage_id": stageID.String(), "from": inv.From, "to": inv.To})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"transition stage to pending failed", map[string]any{"error": terr.Error()})
+			return
+		}
+		stage = resumed
+		if err := s.appendClarificationAnswered(r.Context(), chainParams); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"append clarification_answered audit entry failed", map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	// Hand off to the orchestrator so a github_actions/drive run
@@ -248,6 +303,18 @@ func (s *Server) handleAnswerClarification(w http.ResponseWriter, r *http.Reques
 	s.notifyStatusUpdate(r.Context(), stage.RunID, "clarification_answer")
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(stage))
+}
+
+// appendClarificationAnswered writes the clarification_answered chain entry
+// via the standalone AuditRepo. It is the non-atomic two-step tail used by the
+// clarificationResumer and plain-TransitionStage tiers (test fakes); the
+// clarificationAnswerCommitter tier folds the same append into the transition
+// transaction instead.
+func (s *Server) appendClarificationAnswered(ctx context.Context, p audit.ChainAppendParams) error {
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, p); err != nil {
+		return err
+	}
+	return nil
 }
 
 // parkedQuestion is the id + prompt text of one question the planner parked

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -399,5 +400,127 @@ func TestLoadClarificationAnswers_TruncatesOversizedBlob(t *testing.T) {
 	}
 	if !strings.HasSuffix(*got, "...[truncated]") {
 		t.Errorf("truncated blob missing marker suffix: %q", (*got)[len(*got)-32:])
+	}
+}
+
+// committerClarificationRepo wraps promptRunRepo with the
+// ResumeAwaitingInputAndAppend combined committer (#1090): the postgres tier
+// that folds the transition AND the clarification_answered append into one
+// transaction. The fake records the append it receives so the test asserts the
+// standalone AuditRepo.AppendChained is NOT used in this tier (no double write)
+// and that a loser/error path appends nothing.
+type committerClarificationRepo struct {
+	*promptRunRepo
+	won      bool
+	err      error
+	appended []audit.ChainAppendParams
+	calls    int
+}
+
+func (r *committerClarificationRepo) ResumeAwaitingInputAndAppend(_ context.Context, id uuid.UUID, p audit.ChainAppendParams) (*run.Stage, bool, error) {
+	r.calls++
+	if r.err != nil {
+		return nil, false, r.err
+	}
+	st, ok := r.getStages[id]
+	if !ok {
+		return nil, false, run.ErrNotFound
+	}
+	if !r.won {
+		// Loser of the CAS: no transition, no append.
+		return st, false, nil
+	}
+	// Winner: append in the same (notional) tx and report the resumed stage.
+	r.appended = append(r.appended, p)
+	resumed := *st
+	resumed.State = run.StageStatePending
+	r.getStages[id] = &resumed
+	return &resumed, true, nil
+}
+
+func newCommitterServer(t *testing.T, runID, stageID uuid.UUID, won bool, cerr error) (*Server, *committerClarificationRepo, *auditFake) {
+	t.Helper()
+	rr := &committerClarificationRepo{promptRunRepo: newPromptRunRepo(), won: won, err: cerr}
+	au := newAuditFake()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingInput}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change"}
+	seedClarificationRequested(au, runID, stageID)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	return s, rr, au
+}
+
+// TestAnswerClarification_AtomicTier_HappyPath covers the
+// clarificationAnswerCommitter dispatch: the combined committer resumes the
+// stage and persists the answer in one call, so the handler does NOT also call
+// the standalone AuditRepo.AppendChained (no duplicate audit write).
+func TestAnswerClarification_AtomicTier_HappyPath(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, rr, au := newCommitterServer(t, runID, stageID, true, nil)
+
+	w := answerClarification(t, s, stageID,
+		`{"answers":[{"id":"auth-backend","answer":"Postgres"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var got stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != string(run.StageStatePending) {
+		t.Errorf("State = %q, want pending", got.State)
+	}
+	if rr.calls != 1 {
+		t.Errorf("committer calls = %d, want 1", rr.calls)
+	}
+	// The committer folded the append; the standalone AuditRepo must not be
+	// used for the clarification_answered entry.
+	if len(rr.appended) != 1 {
+		t.Errorf("committer appended = %d, want 1", len(rr.appended))
+	}
+	if rr.appended[0].Category != "clarification_answered" {
+		t.Errorf("committed entry category = %q, want clarification_answered", rr.appended[0].Category)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("standalone AuditRepo.AppendChained called %d times in atomic tier, want 0", len(au.appended))
+	}
+}
+
+// TestAnswerClarification_AtomicTier_Loser409 covers the single-winner CAS in
+// the committer tier: won=false (a concurrent double-submit already re-opened
+// the stage) returns 409 invalid_state_transition with no orphaned append.
+func TestAnswerClarification_AtomicTier_Loser409(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, rr, au := newCommitterServer(t, runID, stageID, false, nil)
+
+	w := answerClarification(t, s, stageID,
+		`{"answers":[{"id":"auth-backend","answer":"Postgres"}]}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("invalid_state_transition")) {
+		t.Errorf("missing invalid_state_transition: %s", w.Body.String())
+	}
+	if len(rr.appended) != 0 {
+		t.Errorf("loser appended %d entries, want 0", len(rr.appended))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("loser triggered %d standalone appends, want 0", len(au.appended))
+	}
+}
+
+// TestAnswerClarification_AtomicTier_Error500 covers an unexpected committer
+// error (not ErrNotFound, not a CAS loss) surfacing as a 500.
+func TestAnswerClarification_AtomicTier_Error500(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newCommitterServer(t, runID, stageID, true, errors.New("tx aborted"))
+
+	w := answerClarification(t, s, stageID,
+		`{"answers":[{"id":"auth-backend","answer":"Postgres"}]}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("error path triggered %d standalone appends, want 0", len(au.appended))
 	}
 }
