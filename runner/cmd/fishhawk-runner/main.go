@@ -1242,7 +1242,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// ErrCommitOutOfScope is the post-commit scope assertion (#980):
 				// the staged commit contains a path outside the declared
 				// scope.files, so the drift report disagrees with the commit's
-				// actual content. Everything else (network, git, GitHub API) is
+				// actual content. ErrScopeFilesMissing is the pre-push
+				// scope-completeness (shortfall) gate (#1151), the inverse of
+				// the above: the commit did not touch every declared concrete
+				// scope.files path, so a declared edit was dropped (the #1148
+				// subset PR). Everything else (network, git, GitHub API) is
 				// category-C infra.
 				if errors.Is(err, upload.ErrPullRequestInvalid) ||
 					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
@@ -1250,6 +1254,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					errors.Is(err, gitops.ErrCreatedOutOfScope) ||
 					errors.Is(err, gitops.ErrBaseRebaseConflict) ||
 					errors.Is(err, gitops.ErrCommitOutOfScope) ||
+					errors.Is(err, gitops.ErrScopeFilesMissing) ||
 					errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 					res.FailureCategory = "B"
 				} else {
@@ -3704,6 +3709,33 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 					gitops.ErrCreatedOutOfScope, len(created), strings.Join(created, ", "))
 			}
 		}
+		// Pre-push scope-completeness (shortfall) gate (#1151): the inverse of
+		// the created-out-of-scope (#818/#825) and #980 commit-in-scope
+		// assertions. Assert the commit TOUCHED every concrete declared
+		// scope.files path; a shortfall means the agent dropped a declared edit
+		// (the #1148 subset PR — 8 declared, 6 committed). Runs on the
+		// standalone open-PR push ONLY: NOT fix-ups (which legitimately touch
+		// fewer files than the full scope) and NOT decomposed children (narrowed
+		// slice scope on a shared branch). Fail category-B BEFORE the push
+		// (origin untouched). The v1 gate is STRICT — a deliberately-no-op
+		// declared file fails here by design; an in-band self-exempt is deferred
+		// to #1153.
+		if !isFixup && !isDecomposed && len(gateScopeFiles) > 0 {
+			missing, committed, merr := gitops.MissingScopeFiles(ctx, repoDir, headSHA, gateScopeFiles)
+			if merr != nil {
+				return merr
+			}
+			if len(missing) > 0 {
+				missingJSON, _ := json.Marshal(missing)
+				declaredJSON, _ := json.Marshal(gateScopeFiles)
+				committedJSON, _ := json.Marshal(committed)
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"scope_files_missing","run_id":%q,"stage_id":%q,"head_sha":%q,"declared":%s,"committed":%s,"missing":%s}`+"\n",
+					cfg.runID, cfg.stageID, headSHA, declaredJSON, committedJSON, missingJSON)
+				return fmt.Errorf("%w: %s", gitops.ErrScopeFilesMissing,
+					missingScopeFilesMessage(cfg.scopeFiles, missing, len(gateScopeFiles), len(committed)))
+			}
+		}
 		if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, gateScopeFiles, logSink); err != nil {
 			driftJSON, _ := json.Marshal(drift)
 			// The test phase (#800) shares the gate; emit a test_gate_failed
@@ -4371,6 +4403,35 @@ func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *confi
 // scopePaths extracts the repo-relative path list from the resolved
 // scope.files, dropping entries with an empty path. Used to bound both
 // the policy diff staging and the implement commit.
+// missingScopeFilesMessage builds the category-B recovery message for the
+// pre-push scope-completeness (shortfall) gate (#1151), annotating each missing
+// declared path with its declared operation (create/modify/delete) from
+// scopeFiles. declaredCount/committedCount render the precise "declared N scope
+// file(s), committed M" preamble from real data (the MissingScopeFiles committed
+// return), not a recomputation. The recovery guidance is STRICT: there is no
+// self-exempt for a deliberately-no-op declared file in v1 — replan to drop it,
+// or fishhawk_resume_run; the in-band self-exempt is deferred to #1153.
+func missingScopeFilesMessage(scopeFiles []upload.ScopeFile, missing []string, declaredCount, committedCount int) string {
+	op := make(map[string]string, len(scopeFiles))
+	for _, f := range scopeFiles {
+		op[f.Path] = f.Operation
+	}
+	annotated := make([]string, 0, len(missing))
+	for _, m := range missing {
+		if o := op[m]; o != "" {
+			annotated = append(annotated, fmt.Sprintf("%s (%s)", m, o))
+		} else {
+			annotated = append(annotated, m)
+		}
+	}
+	return fmt.Sprintf("declared %d scope file(s), committed %d; missing: %s. "+
+		"The implement commit did not touch every concrete file the approved plan declared in scope.files — "+
+		"a declared edit was dropped (the subset-PR class). Replan to drop the intentionally-unchanged file, "+
+		"or recover with fishhawk_resume_run; an in-band self-exempt for a deliberately-no-op declared file is "+
+		"deferred to #1153.",
+		declaredCount, committedCount, strings.Join(annotated, ", "))
+}
+
 func scopePaths(files []upload.ScopeFile) []string {
 	if len(files) == 0 {
 		return nil

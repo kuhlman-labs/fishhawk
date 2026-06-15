@@ -826,6 +826,132 @@ func TestUntrackedPaths_SeesPreStagedFileAfterStageScoped(t *testing.T) {
 	}
 }
 
+// TestMissingScopeFiles covers the pre-push scope-completeness (shortfall)
+// gate (#1151): every declared concrete path the commit did NOT touch is
+// returned, the committed set is returned alongside, trailing-slash directory
+// prefixes are never reported, and a declared delete the commit performs counts
+// as touched.
+func TestMissingScopeFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	t.Run("all declared paths committed -> empty", func(t *testing.T) {
+		repo := initRepo(t)
+		// Modify the pre-existing README.md and create a net-new file.
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "pkg/new.go"), []byte("package pkg\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, "add", "-A")
+		mustGit(t, repo, "commit", "-m", "touch both declared paths")
+		head := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+		missing, committed, err := MissingScopeFiles(context.Background(), repo, head, []string{"README.md", "pkg/new.go"})
+		if err != nil {
+			t.Fatalf("MissingScopeFiles: %v", err)
+		}
+		if len(missing) != 0 {
+			t.Errorf("missing = %v, want empty (every declared path committed)", missing)
+		}
+		if !contains(committed, "README.md") || !contains(committed, "pkg/new.go") {
+			t.Errorf("committed = %v, want both README.md and pkg/new.go", committed)
+		}
+	})
+
+	t.Run("declared modify path not committed -> missing", func(t *testing.T) {
+		repo := initRepo(t)
+		// Only README.md is touched; the declared docs/extra.md is dropped (the
+		// #1148 subset-PR class).
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, "add", "-A")
+		mustGit(t, repo, "commit", "-m", "touch only one declared path")
+		head := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+		missing, committed, err := MissingScopeFiles(context.Background(), repo, head, []string{"README.md", "docs/extra.md"})
+		if err != nil {
+			t.Fatalf("MissingScopeFiles: %v", err)
+		}
+		if len(missing) != 1 || missing[0] != "docs/extra.md" {
+			t.Errorf("missing = %v, want [docs/extra.md]", missing)
+		}
+		if !contains(committed, "README.md") {
+			t.Errorf("committed = %v, want it to contain README.md", committed)
+		}
+		if contains(committed, "docs/extra.md") {
+			t.Errorf("committed = %v must not contain the untouched declared path", committed)
+		}
+	})
+
+	t.Run("trailing-slash dir prefix never reported missing", func(t *testing.T) {
+		repo := initRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, "add", "-A")
+		mustGit(t, repo, "commit", "-m", "touch README only")
+		head := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+		// corpus/ is a folded directory prefix; no file beneath it changed, but
+		// a folded dir cannot require any specific touched path -> not missing.
+		missing, _, err := MissingScopeFiles(context.Background(), repo, head, []string{"README.md", "corpus/"})
+		if err != nil {
+			t.Fatalf("MissingScopeFiles: %v", err)
+		}
+		if len(missing) != 0 {
+			t.Errorf("missing = %v, want empty (dir prefix is never required)", missing)
+		}
+	})
+
+	t.Run("declared delete the commit performs counts as touched", func(t *testing.T) {
+		repo := initRepo(t)
+		// Create a second file in the base so the run can delete it.
+		if err := os.WriteFile(filepath.Join(repo, "gone.txt"), []byte("temp\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, "add", "-A")
+		mustGit(t, repo, "commit", "-m", "add gone.txt to base")
+
+		// The run deletes the declared file and modifies README.md.
+		if err := os.Remove(filepath.Join(repo, "gone.txt")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, "add", "-A")
+		mustGit(t, repo, "commit", "-m", "delete gone.txt, modify README")
+		head := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+		missing, committed, err := MissingScopeFiles(context.Background(), repo, head, []string{"README.md", "gone.txt"})
+		if err != nil {
+			t.Fatalf("MissingScopeFiles: %v", err)
+		}
+		if len(missing) != 0 {
+			t.Errorf("missing = %v, want empty (a declared delete is a touched path)", missing)
+		}
+		if !contains(committed, "gone.txt") {
+			t.Errorf("committed = %v, want it to list the deleted path gone.txt", committed)
+		}
+	})
+}
+
+func contains(s []string, v string) bool {
+	for _, e := range s {
+		if e == v {
+			return true
+		}
+	}
+	return false
+}
+
 func TestPorcelainPath(t *testing.T) {
 	cases := map[string]string{
 		" M README.md":        "README.md",
