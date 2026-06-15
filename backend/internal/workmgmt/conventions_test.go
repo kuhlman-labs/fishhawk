@@ -153,6 +153,13 @@ required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: [Summary], default_labels: ["NOT VALID"]}}
 `,
 		"non-object document": `just a string`,
+		// product_feedback:{} omits the required enabled flag, guarding
+		// required:["enabled"] against a regression that would re-introduce
+		// the implicit enabled=false kill-switch footgun (#1132).
+		"product_feedback missing required enabled": minimalConfig + "product_feedback: {}\n",
+		// An unknown nested key under product_feedback guards the nested
+		// object's additionalProperties:false (#1132).
+		"product_feedback unknown nested key": minimalConfig + "product_feedback:\n  enabled: false\n  extra: nope\n",
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
