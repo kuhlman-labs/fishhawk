@@ -567,7 +567,20 @@ func Build(stageType string, t Trigger) (string, error) {
 // upstream half of the same posture. TestBuild_Implement_NeverReingestsUntrusted
 // Comments enforces this contract mechanically — it fails the moment this path
 // starts ingesting raw untrusted comment or body text.
+//
+// Fix-up fork (#1152): when t.FixupConcerns is non-empty the dispatch is an
+// implement-review fix-up pass, not a fresh implement. buildImplement returns
+// the slim buildImplementFixup prompt instead of the full plan-render +
+// budget + PR-description scaffolding — the change already exists on the open
+// PR branch, so a targeted-patch prompt resolves the concerns far cheaper.
+// buildImplementFixup upholds the same never-re-ingest invariant (issue LINK
+// only, never IssueBody / IssueComments). The non-fix-up prompt below is
+// byte-unchanged.
 func buildImplement(t Trigger) string {
+	if len(t.FixupConcerns) > 0 {
+		return buildImplementFixup(t)
+	}
+
 	var b strings.Builder
 	b.WriteString("You are implementing a change in the repository ")
 	b.WriteString(quoteRepo(t.Repo))
@@ -603,17 +616,7 @@ func buildImplement(t Trigger) string {
 	// Approval conditions (#557): when the operator approved the plan with
 	// notes, inject a binding section so the agent sees them before reading
 	// the plan. Conditions AMEND the plan, are MANDATORY, and win on conflict.
-	if t.ApprovalConditions != nil {
-		ac := *t.ApprovalConditions
-		const maxConditionBytes = 4000
-		if len(ac) > maxConditionBytes {
-			ac = ac[:maxConditionBytes] + "...[truncated]"
-		}
-		b.WriteString("### Approval conditions\n\n")
-		b.WriteString("The operator approved this plan with the following conditions. These conditions AMEND the plan, are MANDATORY, and win on conflict with plan steps:\n\n")
-		b.WriteString(ac)
-		b.WriteString("\n\n")
-	}
+	writeApprovalConditions(&b, t)
 
 	// Fix-up concerns (#762): when the operator triggered a bounded implement-
 	// review fix-up pass, inject the selected concerns as binding instructions,
@@ -621,22 +624,7 @@ func buildImplement(t Trigger) string {
 	// fix-up pass is to resolve exactly these concerns on the existing PR
 	// branch — not to re-implement the plan from scratch. The total rendered
 	// size is capped like ApprovalConditions' 4000-byte condition cap.
-	if len(t.FixupConcerns) > 0 {
-		b.WriteString("### Fix-up concerns\n\n")
-		b.WriteString("The operator triggered a fix-up pass to route the following implement-review concerns back to you. These concerns AMEND the plan, are MANDATORY, and win on conflict with plan steps. Resolve each one with the smallest change that addresses it:\n\n")
-		const maxFixupConcernBytes = 4000
-		written := 0
-		for _, c := range t.FixupConcerns {
-			line := "- " + c + "\n"
-			if written+len(line) > maxFixupConcernBytes {
-				b.WriteString("- ...[remaining concerns truncated]\n")
-				break
-			}
-			b.WriteString(line)
-			written += len(line)
-		}
-		b.WriteString("\n")
-	}
+	writeFixupConcerns(&b, t)
 
 	// Plan-as-contract (#223): when the plan stage produced a
 	// standard_v1 artifact and a human approved it, that plan is
@@ -702,16 +690,7 @@ func buildImplement(t Trigger) string {
 	// emits a scope_amendment_pending event the fishhawk_run_stage relay
 	// surfaces in-band, so an operator driving a second session can decide
 	// the request mid-stage and have the agent resume WITH the decision.
-	b.WriteString("### Mid-stage scope amendments\n\n")
-	b.WriteString("If, while implementing, you discover a file that MUST change but is not in the effective scope.files (a coupled test, a registration table, a doc companion), do NOT edit it — an undeclared edit is dropped from the commit and an undeclared created file fails the stage. Instead, request an operator-gated scope amendment:\n")
-	b.WriteString("\n")
-	b.WriteString("1. POST `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` with header `Authorization: Bearer $FISHHAWK_API_TOKEN` and body `{\"paths\": [{\"path\": \"dir/file.ext\", \"operation\": \"modify\"|\"create\"}], \"reason\": \"why each path must change\"}`. Paths are repo-relative; use `create` for net-new files.\n")
-	b.WriteString("2. Await the decision with the bounded long-poll: GET `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments?wait=30` (same bearer). The `?wait=30` makes the server hold the request up to 30 seconds and return as soon as your request's `status` leaves `pending`; re-issue the wait-poll each time it returns still-`pending`. Keep working on in-scope files while you wait. Loop the wait-poll until your request leaves `pending` OR ~15 minutes total have elapsed; at the ~15-minute cap with no decision, proceed as if denied (fail loud if the change is genuinely impossible without the path).\n")
-	b.WriteString("3. On `approved`: the paths are folded into the effective scope — edit them as normal.\n")
-	b.WriteString("4. On `denied` (read the `decision_reason`): adapt within the original scope. If the change is genuinely impossible without the denied file, stop and surface that in your final response (fail loud) rather than working around the boundary.\n")
-	b.WriteString("\n")
-	b.WriteString("You may file at most 2 amendment requests for this stage (denied requests count). Batch every needed path into one request rather than dribbling them. NEVER edit or create a requested file before the approval lands.\n")
-	b.WriteString("\n")
+	writeScopeAmendments(&b)
 
 	// PR description: write to a known path so the runner can lift
 	// it into the GitHub PR's title + body. Format is documented
@@ -737,9 +716,131 @@ func buildImplement(t Trigger) string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString("Do not run `git checkout`, `git branch`, `git commit`, `git add`, `git push`, or any other git command that changes branches or records commits. The runner performs all version-control operations (commit, branch, push, PR) and owns the shared checkout — edit the working tree only.\n")
+	writeGitOpsProhibition(&b)
 	b.WriteString("\n")
 	b.WriteString("When the runner finishes, it will collect the diff, ship the trace bundle to Fishhawk, push your changes to a branch, and open the PR using the title + body you wrote.\n")
+	return b.String()
+}
+
+// writeApprovalConditions renders the binding "### Approval conditions" block
+// (#557) when the operator approved the plan with notes — operator-authored,
+// MANDATORY, and winning on conflict with plan steps. Capped at 4000 bytes.
+// Shared by the full implement prompt and the slim fix-up prompt so the
+// framing and cap stay byte-identical across both paths.
+func writeApprovalConditions(b *strings.Builder, t Trigger) {
+	if t.ApprovalConditions == nil {
+		return
+	}
+	ac := *t.ApprovalConditions
+	const maxConditionBytes = 4000
+	if len(ac) > maxConditionBytes {
+		ac = ac[:maxConditionBytes] + "...[truncated]"
+	}
+	b.WriteString("### Approval conditions\n\n")
+	b.WriteString("The operator approved this plan with the following conditions. These conditions AMEND the plan, are MANDATORY, and win on conflict with plan steps:\n\n")
+	b.WriteString(ac)
+	b.WriteString("\n\n")
+}
+
+// writeFixupConcerns renders the binding "### Fix-up concerns" block (#762)
+// when the operator triggered a bounded implement-review fix-up pass, reusing
+// #558's MANDATORY / win-on-conflict framing. The total rendered size is
+// capped at 4000 bytes like ApprovalConditions, dropping the tail with a
+// truncation marker. Shared by the full implement prompt and the slim fix-up
+// prompt so framing and cap stay byte-identical across both paths.
+func writeFixupConcerns(b *strings.Builder, t Trigger) {
+	if len(t.FixupConcerns) == 0 {
+		return
+	}
+	b.WriteString("### Fix-up concerns\n\n")
+	b.WriteString("The operator triggered a fix-up pass to route the following implement-review concerns back to you. These concerns AMEND the plan, are MANDATORY, and win on conflict with plan steps. Resolve each one with the smallest change that addresses it:\n\n")
+	const maxFixupConcernBytes = 4000
+	written := 0
+	for _, c := range t.FixupConcerns {
+		line := "- " + c + "\n"
+		if written+len(line) > maxFixupConcernBytes {
+			b.WriteString("- ...[remaining concerns truncated]\n")
+			break
+		}
+		b.WriteString(line)
+		written += len(line)
+	}
+	b.WriteString("\n")
+}
+
+// writeScopeAmendments renders the "### Mid-stage scope amendments" block
+// (#961): the operator-gated escape hatch for a genuinely missing scope.files
+// entry. Documented inline because the agent reads the prompt and nothing
+// else. Shared by the full implement prompt and the slim fix-up prompt — the
+// same scope contract governs the fix-up commit.
+func writeScopeAmendments(b *strings.Builder) {
+	b.WriteString("### Mid-stage scope amendments\n\n")
+	b.WriteString("If, while implementing, you discover a file that MUST change but is not in the effective scope.files (a coupled test, a registration table, a doc companion), do NOT edit it — an undeclared edit is dropped from the commit and an undeclared created file fails the stage. Instead, request an operator-gated scope amendment:\n")
+	b.WriteString("\n")
+	b.WriteString("1. POST `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` with header `Authorization: Bearer $FISHHAWK_API_TOKEN` and body `{\"paths\": [{\"path\": \"dir/file.ext\", \"operation\": \"modify\"|\"create\"}], \"reason\": \"why each path must change\"}`. Paths are repo-relative; use `create` for net-new files.\n")
+	b.WriteString("2. Await the decision with the bounded long-poll: GET `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments?wait=30` (same bearer). The `?wait=30` makes the server hold the request up to 30 seconds and return as soon as your request's `status` leaves `pending`; re-issue the wait-poll each time it returns still-`pending`. Keep working on in-scope files while you wait. Loop the wait-poll until your request leaves `pending` OR ~15 minutes total have elapsed; at the ~15-minute cap with no decision, proceed as if denied (fail loud if the change is genuinely impossible without the path).\n")
+	b.WriteString("3. On `approved`: the paths are folded into the effective scope — edit them as normal.\n")
+	b.WriteString("4. On `denied` (read the `decision_reason`): adapt within the original scope. If the change is genuinely impossible without the denied file, stop and surface that in your final response (fail loud) rather than working around the boundary.\n")
+	b.WriteString("\n")
+	b.WriteString("You may file at most 2 amendment requests for this stage (denied requests count). Batch every needed path into one request rather than dribbling them. NEVER edit or create a requested file before the approval lands.\n")
+	b.WriteString("\n")
+}
+
+// writeGitOpsProhibition renders the line forbidding the agent from running
+// any branch/commit-mutating git command — the runner owns all version
+// control and the shared checkout. Shared by the full implement prompt and
+// the slim fix-up prompt.
+func writeGitOpsProhibition(b *strings.Builder) {
+	b.WriteString("Do not run `git checkout`, `git branch`, `git commit`, `git add`, `git push`, or any other git command that changes branches or records commits. The runner performs all version-control operations (commit, branch, push, PR) and owns the shared checkout — edit the working tree only.\n")
+}
+
+// buildImplementFixup renders the SLIM targeted-patch prompt for an implement-
+// review fix-up pass (#1152, lever 1). A fix-up re-dispatches the implement
+// stage, but the change is already implemented and the PR already exists on
+// the run branch — so re-rendering the full implement prompt (approved-plan
+// render, budget context, PR-description scaffolding) makes the agent cold-
+// re-explore the repo and re-implement the plan, costing ~55k tokens for a
+// mechanical concern (#1148). This path keeps only the trust- and scope-
+// relevant pieces — operator approval conditions, the binding fix-up concerns,
+// an issue LINK for grounding, the scope-amendment escape hatch, and the
+// git-ops prohibition — and drops the plan render, budget context, and PR-
+// description block (the PR already exists, so the runner does not open one on
+// a fix-up and the description file is unused).
+//
+// It upholds the same never-re-ingest invariant as buildImplement: it calls
+// only writeIssueLink and MUST NOT render Trigger.IssueBody /
+// Trigger.IssueComments. TestBuild_Implement_NeverReingestsUntrustedComments
+// covers this path via a FixupConcerns sub-case.
+func buildImplementFixup(t Trigger) string {
+	var b strings.Builder
+	b.WriteString("You are resolving reviewer concerns on an existing change in the repository ")
+	b.WriteString(quoteRepo(t.Repo))
+	b.WriteString(".\n\n")
+	b.WriteString("This is a TARGETED fix-up pass. The change is already implemented, the pull request is already open, and its branch is checked out at its current tip. Your task is to resolve the specific reviewer concerns below with the smallest possible change — not to re-implement the plan or re-explore the repository.\n\n")
+
+	// Operator-authored approval conditions still bind on a fix-up: they
+	// originate from the original plan approval and continue to constrain
+	// the work. Reused byte-for-byte from the full implement prompt.
+	writeApprovalConditions(&b, t)
+
+	// The binding fix-up concerns — the whole reason this pass exists.
+	writeFixupConcerns(&b, t)
+
+	// Tight scoping instruction: the smallest-change posture is the point of
+	// this slim prompt, so state it explicitly rather than relying on the
+	// agent inferring it from the absence of a plan render.
+	b.WriteString("### Scope of this fix-up\n\n")
+	b.WriteString("Resolve ONLY the concerns above. The code already exists on the branch — do NOT re-implement the plan from scratch and do NOT re-explore the whole repository. Read only the files each concern references and make the smallest change that resolves it. If a concern is infeasible, or genuinely needs a file it does not name, surface that in your final response rather than diverging from the concerns.\n\n")
+
+	// Issue LINK only (never IssueBody / IssueComments) for grounding —
+	// preserves the never-re-ingest invariant on the fix-up path.
+	b.WriteString("Originating issue (link only — fetch if you need detail):\n\n")
+	writeIssueLink(&b, t)
+
+	// The same scope contract governs the fix-up commit.
+	writeScopeAmendments(&b)
+
+	writeGitOpsProhibition(&b)
 	return b.String()
 }
 
