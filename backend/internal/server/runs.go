@@ -652,6 +652,21 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Emit the run_started board transition for the just-created run
+	// (#1123). This is the local-runner / API run-creation emit point
+	// that parallels the webhook dispatcher's run_started emit
+	// (dispatcher.go) — without it a local-runner/MCP run's card never
+	// leaves Backlog, and every later board edge then SKIPS on the
+	// never-fight-the-human expected-source gate. We call
+	// boardTransitionForRun directly with the already-fetched run (it
+	// carries TriggerRef/Repo/InstallationID) rather than
+	// notifyBoardTransition, avoiding a redundant GetRun. It is
+	// best-effort: the hook no-ops silently for a non-issue TriggerRef
+	// (ad-hoc CLI runs) and for unconfigured conventions, and board
+	// failures only WARN-log — they can never unwind the create-run
+	// response.
+	s.boardTransitionForRun(r.Context(), created, lifecycleRunStarted)
+
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(created))
 }
 
