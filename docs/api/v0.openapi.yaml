@@ -2776,6 +2776,13 @@ paths:
         filing path, ADR-040) — `audited` is then `false`. An audit-append
         failure never fails the response: the item is already filed.
 
+        On the run-absent path the handler resolves the App's installation
+        for the target repo (`GET /repos/{owner}/{repo}/installation`) so
+        GitHub filing works without a run; a repo the App is not installed
+        on fails closed. The run-absent path is operator-only: a run-bound
+        agent token must file run-scoped (supply its own `run_id`) and is
+        rejected with `403 run_scoped_filing_required` if it omits `run_id`.
+
         An unregistered/unimplemented provider id fails closed with `501
         provider_unimplemented` naming the missing provider — never a panic.
       tags: [work-items]

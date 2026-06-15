@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -267,15 +268,49 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},
 		Project: conv.Project,
 	}
-	// InstallationID is sourced only from a consistency-checked active run.
+	// InstallationID is sourced first from a consistency-checked active run.
 	// On the run-absent path (the ADR-040 operator-agent follow-up filing
-	// path) it stays 0: the real GitHub Projects provider cannot mint an
-	// installation token without it, so GitHub filing is run-scoped by
-	// design in v0. Supplying an installation source for run-absent GitHub
-	// filing is a follow-up; non-GitHub providers that don't need an
-	// installation token are unaffected.
+	// path) the run does not supply one, so the handler resolves the App's
+	// installation for the target repo directly (mirroring run-creation at
+	// runs.go:384) — without this the real GitHub Projects provider cannot
+	// mint an installation token and fails closed. Providers that need no
+	// installation token are unaffected (the field is GitHub-specific and
+	// resolution only runs when a GitHub client is wired).
 	if activeRun != nil && activeRun.InstallationID != nil {
 		target.InstallationID = *activeRun.InstallationID
+	}
+	if target.InstallationID == 0 && s.cfg.GitHub != nil {
+		// BINDING authz gate: the run-absent installation-resolution branch
+		// is the operator-agent follow-up path ONLY. A run-bound agent token
+		// (mcp:run:<uuid> subject) MUST file through the run-scoped path —
+		// supply its own run_id, which is repo-consistency-checked above — so
+		// it cannot use the run-absent door to resolve an installation for an
+		// arbitrary App-installed repo (the confused-deputy egress #1005
+		// closed). Reject before any GetRepoInstallation call or provider
+		// dispatch. Non-run-bound operator/session callers proceed (operators
+		// are trusted for App-installed repos in v0).
+		if _, runBound := runBoundTokenRunID(id); runBound {
+			s.writeError(w, r, http.StatusForbidden, "run_scoped_filing_required",
+				"a run-bound agent token must file through the run-scoped path (supply its own run_id); the run-absent installation-resolution path is operator-only",
+				nil)
+			return
+		}
+		instID, rerr := s.cfg.GitHub.GetRepoInstallation(r.Context(), githubclient.RepoRef{Owner: owner, Name: name})
+		switch {
+		case rerr == nil:
+			target.InstallationID = instID
+		case errors.Is(rerr, githubclient.ErrNotInstalled):
+			// App genuinely not installed on the repo: leave InstallationID 0
+			// and proceed so the GitHub provider fails closed with its own
+			// actionable typed error for the unresolvable case.
+		default:
+			// Transient/network failure: surface it rather than masking it as
+			// the misleading provider "no installation" message.
+			s.writeError(w, r, http.StatusBadGateway, "work_item_filing_failed",
+				"could not resolve the GitHub App installation for the target repo",
+				map[string]any{"error": rerr.Error()})
+			return
+		}
 	}
 
 	created, err := provider.File(r.Context(), workmgmt.ProviderRequest{
