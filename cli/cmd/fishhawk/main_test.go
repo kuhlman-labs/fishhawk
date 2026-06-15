@@ -33,6 +33,20 @@ func TestRun_Help(t *testing.T) {
 	}
 }
 
+func TestRun_Help_ListsReportIssue(t *testing.T) {
+	// #1006: the report-issue verb must be discoverable in the usage
+	// listing alongside diagnose.
+	var stdout strings.Builder
+	if got := run([]string{"help"}, &stdout, io.Discard); got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	for _, want := range []string{"diagnose", "report-issue"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("usage missing %q verb:\n%s", want, stdout.String())
+		}
+	}
+}
+
 func TestRun_Version(t *testing.T) {
 	var stdout strings.Builder
 	got := run([]string{"version"}, &stdout, io.Discard)

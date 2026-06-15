@@ -52,6 +52,24 @@ type Conventions struct {
 	RequiredFields   []string            `json:"required_fields"`
 	FieldHints       map[string]string   `json:"field_hints,omitempty"`
 	Types            map[string]ItemType `json:"types"`
+	ProductFeedback  *ProductFeedback    `json:"product_feedback,omitempty"`
+}
+
+// ProductFeedback configures the upstream product-feedback egress path
+// (#1006). It is a per-repo kill-switch: when present with
+// enabled=false the product-report endpoint returns 403
+// product_feedback_disabled and files nothing. Absent (nil) means
+// enabled — egress is on by default, so an existing config keeps working
+// without edits.
+type ProductFeedback struct {
+	Enabled bool `json:"enabled"`
+}
+
+// ProductFeedbackEnabled reports whether upstream product-feedback egress
+// is allowed for this repo. Egress is on by default; only an explicit
+// product_feedback.enabled=false kill-switch disables it.
+func (c Conventions) ProductFeedbackEnabled() bool {
+	return c.ProductFeedback == nil || c.ProductFeedback.Enabled
 }
 
 // Project is the GitHub Projects connection. Owner is the project owner

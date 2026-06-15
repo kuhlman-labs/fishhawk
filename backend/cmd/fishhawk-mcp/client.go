@@ -767,6 +767,128 @@ func (c *apiClient) FileWorkItem(ctx context.Context, req FileWorkItemRequest) (
 	return &out, nil
 }
 
+// DiagnosticBundle mirrors the backend's product-facts-only diagnostic
+// bundle (GET /v0/runs/{run_id}/diagnostics, #1006). Thin local copy —
+// same import-direction rule as the other mirrored shapes here. Every
+// field is a structured product fact safe to surface verbatim; the
+// bundle carries NO diffs, paths, prompts, or free text by construction,
+// so the report tool can echo it as a transparency preview of what its
+// egress attached.
+type DiagnosticBundle struct {
+	RunID              string                  `json:"run_id"`
+	WorkflowID         string                  `json:"workflow_id"`
+	WorkflowSpecHash   string                  `json:"workflow_spec_hash"`
+	RunnerKind         string                  `json:"runner_kind"`
+	RunState           string                  `json:"run_state"`
+	Stages             []DiagnosticStageFact   `json:"stages,omitempty"`
+	FailingStage       *DiagnosticFailingStage `json:"failing_stage,omitempty"`
+	AuditSequenceRange *DiagnosticSeqRange     `json:"audit_sequence_range,omitempty"`
+	Versions           DiagnosticVersions      `json:"versions"`
+}
+
+// DiagnosticStageFact is one stage's position + state in the bundle.
+type DiagnosticStageFact struct {
+	Sequence int    `json:"sequence"`
+	Type     string `json:"type"`
+	State    string `json:"state"`
+}
+
+// DiagnosticFailingStage names which stage failed and how (structured
+// facts only — category + audit-surface enum, never the free-text
+// failure reason).
+type DiagnosticFailingStage struct {
+	Sequence        int    `json:"sequence"`
+	Type            string `json:"type"`
+	FailureCategory string `json:"failure_category"`
+	FailureSurface  string `json:"failure_surface,omitempty"`
+}
+
+// DiagnosticSeqRange is the [min,max] of the run's audit sequence numbers.
+type DiagnosticSeqRange struct {
+	Min int64 `json:"min"`
+	Max int64 `json:"max"`
+}
+
+// DiagnosticVersions carries the backend's build identity.
+type DiagnosticVersions struct {
+	Fishhawkd        DiagnosticComponent `json:"fishhawkd"`
+	MinRunnerVersion string              `json:"min_runner_version"`
+}
+
+// DiagnosticComponent is a single build's version + git SHA.
+type DiagnosticComponent struct {
+	Version string `json:"version"`
+	GitSHA  string `json:"git_sha"`
+}
+
+// GetDiagnostics fetches a run's product-facts-only diagnostic bundle via
+// `GET /v0/runs/{run_id}/diagnostics` (#1006, slice 1). Read-only; the
+// report tool uses it to surface a transparency preview of exactly which
+// structured facts its egress attached. 4xx surfaces as *apiError.
+func (c *apiClient) GetDiagnostics(ctx context.Context, runID uuid.UUID) (*DiagnosticBundle, error) {
+	var b DiagnosticBundle
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+runID.String()+"/diagnostics", nil, &b); err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+// productReportBody mirrors the backend's
+// `POST /v0/runs/{run_id}/product-reports` request body
+// (`backend/internal/server/product_report.go::productReportRequest`).
+// Kind selects the report flavor (bug default; feature). Description is
+// operator free text that crosses the boundary ONLY when IncludeFreeText
+// is true, and is run through backend/internal/redaction server-side
+// first (#1006, slice 3 consent boundary).
+type productReportBody struct {
+	Kind            string `json:"kind,omitempty"`
+	Description     string `json:"description,omitempty"`
+	IncludeFreeText bool   `json:"include_free_text,omitempty"`
+}
+
+// ProductReport mirrors the backend's product-report response: what left
+// the boundary, echoed so the caller renders the outcome without a second
+// fetch. Action is "created" on a dedup miss or "occurrence" on a hit.
+type ProductReport struct {
+	Fingerprint string `json:"fingerprint"`
+	Action      string `json:"action"`
+	Number      int    `json:"number"`
+	URL         string `json:"url"`
+	Destination string `json:"destination"`
+}
+
+// ReportProductIssue files a deduped, audited upstream product report for
+// a run via `POST /v0/runs/{run_id}/product-reports` (#1006). The backend
+// collects the run's product-facts bundle, fingerprints the failure,
+// dedup-searches the fixed product repo, and either files a new
+// fingerprint-marked report or appends an occurrence comment — then writes
+// a source-side product_report_filed audit entry. Free text crosses only
+// when includeFreeText is true (server-side redacted first). 4xx/5xx
+// surface as *apiError; the tool layer reads the code:
+//   - 400 validation_failed (bad run_id / kind, unknown fields)
+//   - 401 authentication_required (anonymous caller)
+//   - 403 run_not_entitled (not the run's own run-bound token)
+//   - 403 product_feedback_disabled (per-repo kill-switch)
+//   - 404 run_not_found
+//   - 501 provider_unimplemented (the configured feedback provider id is
+//     not registered)
+//   - 502 product_report_failed (the dedup search / file / comment failed)
+func (c *apiClient) ReportProductIssue(ctx context.Context, runID uuid.UUID, kind, description string, includeFreeText bool) (*ProductReport, error) {
+	body, err := json.Marshal(productReportBody{
+		Kind:            kind,
+		Description:     description,
+		IncludeFreeText: includeFreeText,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal product-report: %w", err)
+	}
+	var out ProductReport
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/product-reports", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Stage mirrors the wire shape. The fields cover both get_plan's
 // "find the plan stage" use case and get_run_status's "tell me
 // what's happening" view: type/state for the lifecycle, sequence
