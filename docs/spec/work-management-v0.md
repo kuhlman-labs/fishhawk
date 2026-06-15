@@ -31,7 +31,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `body_skeleton` | yes | non-empty string list | Ordered body section headings. Dual-audience: Feature = Summary/Proposal/Done-means/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means. |
 | `default_labels` | no | unique label list | Labels applied before caller-supplied labels are merged. Each label is a bare token (`epic`, `adr`) or namespaced (`area:backend`, `type:feature`). |
 | `default_fields` | no | object | `status` (single-select Status value), `board_column`, and `complexity` (low/medium/high). |
-| `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix`. Required when the type is `adr` (semantic check). |
+| `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix` + optional `pad` (integer 0–12; zero-pads the rendered `{number}` to this minimum width, e.g. `3` → `041`; 0/absent = no padding). Required when the type is `adr` (semantic check). |
 | `epic_link` | no | enum `required` \| `optional` \| `none` | Whether items of this type link to a parent epic. |
 
 Every object level is `additionalProperties: false` — the surface is closed; new sections are additive schema changes within v0.

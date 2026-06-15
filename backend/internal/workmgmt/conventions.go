@@ -105,6 +105,9 @@ type DefaultFields struct {
 type Numbering struct {
 	Scheme string `json:"scheme"`
 	Prefix string `json:"prefix,omitempty"`
+	// Pad is the minimum width to zero-pad the rendered number to
+	// (0 = no padding).
+	Pad int `json:"pad,omitempty"`
 }
 
 // Default returns the shipped default work-management conventions, parsed

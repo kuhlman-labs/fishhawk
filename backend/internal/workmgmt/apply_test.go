@@ -66,9 +66,47 @@ func TestApply_ADRAllocatesNextNumberAndRendersPrefix(t *testing.T) {
 	}
 }
 
+func TestApply_ADRZeroPadsNumberToWidth(t *testing.T) {
+	// pad is an opt-in numbering knob (the shipped default does not pad).
+	// Build an independent conventions copy with pad: 3 to exercise the
+	// padding branch — Default() returns shared state, so we must not mutate
+	// its aliased *Numbering. Existing numbers up to 40 -> next is 41,
+	// rendered [ADR-041], not [ADR-41].
+	conv := testConventions(t)
+	adr := conv.Types["adr"]
+	padded := *adr.Numbering
+	padded.Pad = 3
+	adr.Numbering = &padded
+	types := make(map[string]ItemType, len(conv.Types))
+	for k, v := range conv.Types {
+		types[k] = v
+	}
+	types["adr"] = adr
+	conv.Types = types
+	existing := make([]int, 40)
+	for i := range existing {
+		existing[i] = i + 1
+	}
+	item, num, err := Apply(FilingRequest{
+		Type:            "adr",
+		Summary:         "pad the number",
+		Body:            "## Context\n\n…\n",
+		ExistingNumbers: existing,
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if num != 41 {
+		t.Errorf("next ADR number = %d, want 41", num)
+	}
+	if want := "[ADR-041] pad the number"; item.Title != want {
+		t.Errorf("title = %q, want %q", item.Title, want)
+	}
+}
+
 func TestApply_ADRFirstNumberIsOne(t *testing.T) {
 	conv := testConventions(t)
-	_, num, err := Apply(FilingRequest{
+	item, num, err := Apply(FilingRequest{
 		Type:    "adr",
 		Summary: "first decision",
 		Body:    "## Context\n\n…\n",
@@ -78,6 +116,9 @@ func TestApply_ADRFirstNumberIsOne(t *testing.T) {
 	}
 	if num != 1 {
 		t.Errorf("first ADR number = %d, want 1", num)
+	}
+	if want := "[ADR-1] first decision"; item.Title != want {
+		t.Errorf("title = %q, want %q", item.Title, want)
 	}
 }
 

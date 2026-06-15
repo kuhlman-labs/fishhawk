@@ -83,7 +83,11 @@ func Apply(req FilingRequest, conv Conventions) (WorkItem, int, error) {
 		return WorkItem{}, 0, err
 	}
 
-	title, err := renderTitle(itemType.TitleFormat, req.Summary, number, req.TitleVars)
+	pad := 0
+	if itemType.Numbering != nil {
+		pad = itemType.Numbering.Pad
+	}
+	title, err := renderTitle(itemType.TitleFormat, req.Summary, number, pad, req.TitleVars)
 	if err != nil {
 		return WorkItem{}, 0, err
 	}
@@ -158,13 +162,17 @@ func allocateNumber(itemType ItemType, existing []int) (int, error) {
 // yields the bare summary. Any placeholder left unresolved fails closed,
 // so a feature missing its {epic}/{n} vars is rejected rather than filed
 // with a literal `{epic}` in its title.
-func renderTitle(format, summary string, number int, vars map[string]string) (string, error) {
+func renderTitle(format, summary string, number, pad int, vars map[string]string) (string, error) {
 	if strings.TrimSpace(format) == "" {
 		return summary, nil
 	}
 	subs := map[string]string{"summary": summary}
 	if number > 0 {
-		subs["number"] = fmt.Sprintf("%d", number)
+		if pad > 0 {
+			subs["number"] = fmt.Sprintf("%0*d", pad, number)
+		} else {
+			subs["number"] = fmt.Sprintf("%d", number)
+		}
 	}
 	for k, v := range vars {
 		subs[k] = v
