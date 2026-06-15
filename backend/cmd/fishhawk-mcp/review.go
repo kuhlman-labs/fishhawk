@@ -16,12 +16,21 @@ import (
 //
 //   - "none"     — no review was configured (no *_review_started entry).
 //   - "pending"  — a review was dispatched (a *_review_started entry exists)
-//     but no terminal entry has landed yet. The review is still running.
-//     A reviewer that errors or times out now writes a terminal
-//     *_review_failed entry (#664), so "pending" no longer subsumes a
-//     silent failure — it means genuinely still-in-flight.
-//   - "complete" — at least one *_reviewed verdict landed; Reviews carries
-//     the decoded verdicts.
+//     but fewer than the configured agent count of terminal entries have
+//     landed yet. The round is still running. A reviewer that errors or
+//     times out now writes a terminal *_review_failed entry (#664), so
+//     "pending" no longer subsumes a silent failure — it means genuinely
+//     still-in-flight. Since #1127 "pending" also covers the PARTIAL-LANDING
+//     window in the heterogeneous topology: when the first of N configured
+//     reviewers has landed but the others have not, the status stays
+//     "pending" rather than reporting a half result as "complete".
+//   - "complete" — ALL configured agent reviewers have landed a terminal
+//     verdict (landed_terminal >= configured_agents, the same completeness
+//     rule checkPlanReviewSettled / checkImplementReviewSettled use for the
+//     approval/merge gates) AND at least one is a real *_reviewed verdict;
+//     Reviews carries one row per configured reviewer — the decoded verdicts
+//     (verbatim, incl. approve_with_concerns) plus any synthesized
+//     failed/skipped rows.
 //   - "skipped"  — a *_review_skipped entry exists (configured agent layer
 //     not wired); Reviews carries the synthesized skipped
 //     verdict(s).
@@ -226,30 +235,80 @@ func (r *runResolver) decodeFailedReviews(ctx context.Context, runID uuid.UUID, 
 	return reviews, nil
 }
 
-// hasAuditCategory returns whether at least one audit entry of the given
-// category exists for the run. Used to detect the *_review_started proxy
-// without decoding its payload — a single entry is enough to flip a
-// not-yet-terminal review to 'pending'.
-func (r *runResolver) hasAuditCategory(ctx context.Context, runID uuid.UUID, category string) (bool, error) {
+// decodeLatestStartedConfiguredAgents reads the run's *_review_started entries
+// for the given category and returns the ConfiguredAgents count from the entry
+// with the HIGHEST audit sequence, plus a bool reporting whether any started
+// entry exists (the *_review_started proxy: 'started exists => not none').
+//
+// Reading the highest-sequence entry is load-bearing for the implement stage:
+// a fix-up re-review emits a FRESH implement_review_started, so the latest
+// started entry carries the CURRENT round's ConfiguredAgents and pairs with
+// the sinceSeq-floored terminal count (#1127). The configured count is the
+// completeness threshold reviewStatusFor gates 'complete' on — landed_terminal
+// >= configured_agents — mirroring the checkPlanReviewSettled /
+// checkImplementReviewSettled approval/merge gates (ADR-036) that already wait
+// for the full configured count before resolving.
+//
+// This supersedes the old hasAuditCategory(started) existence check: the bool
+// preserves the same 'started exists' meaning, and a started entry whose
+// payload is absent or fails to decode reports configured == 0 so the caller
+// degrades to the pre-#1127 complete-on-first-verdict predicate rather than
+// stranding on 'pending'.
+func (r *runResolver) decodeLatestStartedConfiguredAgents(ctx context.Context, runID uuid.UUID, category string) (int, bool, error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: category,
-		Limit:    1,
+		Limit:    reviewAuditQueryLimit,
 	})
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
-	return len(entries) > 0, nil
+	var latest *AuditEntry
+	for i := range entries {
+		if latest == nil || entries[i].Sequence > latest.Sequence {
+			latest = &entries[i]
+		}
+	}
+	if latest == nil {
+		return 0, false, nil
+	}
+	if latest.Payload == nil {
+		return 0, true, nil
+	}
+	raw, merr := json.Marshal(latest.Payload)
+	if merr != nil {
+		return 0, true, nil
+	}
+	var p struct {
+		ConfiguredAgents int `json:"configured_agents"`
+	}
+	if uerr := json.Unmarshal(raw, &p); uerr != nil {
+		return 0, true, nil
+	}
+	return p.ConfiguredAgents, true, nil
 }
 
 // reviewStatusFor derives the ReviewStatus for one stage from the audit
-// trail (#600, #664, #894). Precedence: a terminal *_reviewed entry wins
-// (=> complete, with decoded verdicts); else a *_review_skipped entry
-// (=> skipped); else a terminal *_review_failed entry (=> failed, with the
-// synthesized failure reason); else a *_review_started entry (=> pending);
-// else none. The *_review_failed branch (#664) resolves what used to fall
-// through to an ambiguous 'pending' — a reviewer that errored or timed out
-// now writes a terminal entry, so the await/status surface reports a
+// trail (#600, #664, #894, #1127). Completeness is COUNT-GATED: the round is
+// only terminal once landed_terminal >= configured_agents (read from the
+// latest *_review_started entry's ConfiguredAgents), mirroring the
+// checkPlanReviewSettled / checkImplementReviewSettled approval/merge gates
+// (ADR-036). While fewer than the configured count of terminal entries have
+// landed the status is 'pending' — even when some terminal entries are
+// already present — so a poll catching the partial-landing window in the
+// heterogeneous topology (reviewers run sequentially; each takes minutes) no
+// longer reports 'complete' with only the first reviewer's verdict (#1127).
+// Once the round completes, precedence resolves the status (a real *_reviewed
+// verdict => complete; else *_review_skipped => skipped; else *_review_failed
+// => failed) and Reviews is the UNION of every decoded terminal row, one per
+// configured reviewer. The *_review_failed branch (#664) resolves what used
+// to fall through to an ambiguous 'pending' — a reviewer that errored or
+// timed out writes a terminal entry, so the await/status surface reports a
 // definite 'failed' instead of a still-waiting 'pending'.
+//
+// Fallback (#1127): an absent or non-positive ConfiguredAgents (a run
+// predating the field, or a malformed started payload) degrades to the prior
+// complete-on-first-verdict predicate via reviewStatusFallback, never
+// stranding on 'pending'.
 //
 // Fix-up boundary (#894): the three TERMINAL-verdict reads (reviewed /
 // skipped / failed) are floored to entries that landed AFTER the latest
@@ -285,37 +344,83 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 	if err != nil {
 		return nil, err
 	}
-	if len(reviewed) > 0 {
-		return &ReviewStatus{Stage: stage, Status: "complete", Reviews: reviewed}, nil
-	}
-
 	skipped, err := r.decodeSkippedReviews(ctx, runID, cats.skipped, sinceSeq)
 	if err != nil {
 		return nil, err
 	}
-	if len(skipped) > 0 {
-		return &ReviewStatus{Stage: stage, Status: "skipped", Reviews: skipped}, nil
-	}
-
 	failed, err := r.decodeFailedReviews(ctx, runID, cats.failed, sinceSeq)
 	if err != nil {
 		return nil, err
 	}
-	if len(failed) > 0 {
-		return &ReviewStatus{Stage: stage, Status: "failed", Reviews: failed}, nil
-	}
 
-	started, err := r.hasAuditCategory(ctx, runID, cats.started)
+	configured, started, err := r.decodeLatestStartedConfiguredAgents(ctx, runID, cats.started)
 	if err != nil {
 		return nil, err
 	}
-	if started {
-		// 'pending' is the one state where a polling agent should keep
-		// calling — advertise the server-suggested poll cadence (#879).
+
+	// Fallback (#1127): an absent or non-positive configured count — a run
+	// predating the ConfiguredAgents field, or a malformed/undecodable started
+	// payload — degrades to the pre-#1127 complete-on-first-verdict predicate
+	// so the surface never strands on 'pending'. #664 guarantees a terminal
+	// entry per reviewer invocation, so the count-based path below reliably
+	// reaches the threshold; this is defense-in-depth, not the normal path.
+	if configured <= 0 {
+		return r.reviewStatusFallback(stage, reviewed, skipped, failed, started), nil
+	}
+
+	// Count-based completeness (#1127): ANY terminal kind counts toward the
+	// round, matching checkPlanReviewSettled's 'landed_terminal' semantics.
+	// While fewer than the configured agent count of terminal verdicts have
+	// landed the round is still in flight — report 'pending' EVEN when some
+	// reviewed/failed/skipped entries are already present, so a poll that
+	// catches the partial-landing window in the heterogeneous topology no
+	// longer returns 'complete' with only the first reviewer's verdict.
+	landed := len(reviewed) + len(skipped) + len(failed)
+	if landed < configured {
 		return &ReviewStatus{Stage: stage, Status: "pending", PollIntervalSeconds: suggestedReviewPollIntervalSeconds}, nil
 	}
 
-	return &ReviewStatus{Stage: stage, Status: "none"}, nil
+	// Round complete: resolve by the existing kind precedence (complete >
+	// skipped > failed) but build Reviews as the UNION of all decoded terminal
+	// rows — reviewed (verbatim verdicts, incl. approve_with_concerns) then
+	// synthesized failed then synthesized skipped — so every configured
+	// reviewer is represented by exactly one row at the gate the operator acts
+	// on.
+	union := make([]PlanReview, 0, landed)
+	union = append(union, reviewed...)
+	union = append(union, failed...)
+	union = append(union, skipped...)
+	switch {
+	case len(reviewed) > 0:
+		return &ReviewStatus{Stage: stage, Status: "complete", Reviews: union}, nil
+	case len(skipped) > 0:
+		return &ReviewStatus{Stage: stage, Status: "skipped", Reviews: union}, nil
+	default:
+		return &ReviewStatus{Stage: stage, Status: "failed", Reviews: union}, nil
+	}
+}
+
+// reviewStatusFallback is the pre-#1127 complete-on-first-verdict predicate,
+// reached when the *_review_started entry is absent or carries a non-positive
+// ConfiguredAgents (an old/malformed payload). It preserves byte-for-byte the
+// behavior for runs predating the count gate: any reviewed => complete, else
+// any skipped => skipped, else any failed => failed, else a started entry =>
+// pending, else none.
+func (*runResolver) reviewStatusFallback(stage string, reviewed, skipped, failed []PlanReview, started bool) *ReviewStatus {
+	switch {
+	case len(reviewed) > 0:
+		return &ReviewStatus{Stage: stage, Status: "complete", Reviews: reviewed}
+	case len(skipped) > 0:
+		return &ReviewStatus{Stage: stage, Status: "skipped", Reviews: skipped}
+	case len(failed) > 0:
+		return &ReviewStatus{Stage: stage, Status: "failed", Reviews: failed}
+	case started:
+		// 'pending' is the one state where a polling agent should keep
+		// calling — advertise the server-suggested poll cadence (#879).
+		return &ReviewStatus{Stage: stage, Status: "pending", PollIntervalSeconds: suggestedReviewPollIntervalSeconds}
+	default:
+		return &ReviewStatus{Stage: stage, Status: "none"}
+	}
 }
 
 // latestImplementFixupSeq returns the MAX audit Sequence among the run's
@@ -427,10 +532,13 @@ wait synchronously than loop yourself.
 
 Resolves the review_status from the audit trail and:
 
-  - Returns immediately when the review is already "complete", "skipped",
-    "failed", or "none" (no review configured).
-  - On "pending" (a review was dispatched but no terminal entry has landed)
-    polls the audit endpoint until a terminal entry lands, the run itself
+  - Returns immediately when the review is already "complete" (ALL configured
+    agent reviewers have landed a terminal verdict), "skipped", "failed", or
+    "none" (no review configured).
+  - On "pending" (a review was dispatched but the configured reviewers have
+    not all landed yet — including the heterogeneous partial-landing window
+    where some but not all reviewers have returned) polls the audit endpoint
+    until every configured reviewer lands a terminal entry, the run itself
     reaches a terminal state (the review can no longer progress — it never
     strands, ADR-036 #874), or the timeout elapses.
 

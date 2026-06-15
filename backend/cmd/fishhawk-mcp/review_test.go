@@ -888,6 +888,230 @@ func TestReviewStatusFor_Implement_SkippedOrFailedAfterFixup(t *testing.T) {
 	})
 }
 
+// --- count-based completeness (#1127) ---
+//
+// In the heterogeneous topology the reviewers run sequentially in one loop and
+// each invocation takes minutes, so a poll can catch the window after the
+// first reviewer's *_reviewed entry but before the second finishes. Before
+// #1127 reviewStatusFor returned 'complete' on that first verdict, dropping the
+// slower reviewer's verdict from the surface. The fix gates 'complete' on
+// landed_terminal >= configured_agents.
+
+// TestReviewStatusFor_Heterogeneous_PartialIsPending pins the core fix: with
+// configured_agents=2 and only ONE verdict landed, the status is 'pending'
+// (NOT complete) — the partial-landing window keeps polling.
+func TestReviewStatusFor_Heterogeneous_PartialIsPending(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 2, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-8",
+		Authority:     "advisory",
+		Verdict:       "approve_with_concerns",
+		Concerns:      []PlanReviewConcern{{Severity: "medium", Category: "scope", Note: "x"}},
+	})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want pending (1 of 2 configured reviewers landed)", st.Status)
+	}
+	if len(st.Reviews) != 0 {
+		t.Errorf("Reviews = %+v, want empty while the round is in flight", st.Reviews)
+	}
+	if st.PollIntervalSeconds != suggestedReviewPollIntervalSeconds {
+		t.Errorf("PollIntervalSeconds = %d, want %d on pending", st.PollIntervalSeconds, suggestedReviewPollIntervalSeconds)
+	}
+}
+
+// TestReviewStatusFor_Heterogeneous_FullRoundCompletesWithBothVerdicts pins
+// the full round: with configured_agents=2 and BOTH verdicts landed, the
+// status is 'complete' carrying both rows verbatim — approve_with_concerns is
+// NOT collapsed to a bare approve and the reject is present.
+func TestReviewStatusFor_Heterogeneous_FullRoundCompletesWithBothVerdicts(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 2, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-8",
+		Authority:     "advisory",
+		Verdict:       "approve_with_concerns",
+		Concerns:      []PlanReviewConcern{{Severity: "medium", Category: "scope", Note: "x"}},
+	})
+	seedPlanReviewAudit(fb, runID, PlanReview{
+		ReviewerKind:  "agent",
+		ReviewerModel: "gpt-5.5",
+		Authority:     "advisory",
+		Verdict:       "reject",
+	})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Fatalf("Status = %q, want complete once both configured reviewers landed", st.Status)
+	}
+	if len(st.Reviews) != 2 {
+		t.Fatalf("Reviews = %+v, want both reviewer rows", st.Reviews)
+	}
+	var sawOpusConcerns, sawCodexReject bool
+	for _, rev := range st.Reviews {
+		if rev.ReviewerModel == "claude-opus-4-8" && rev.Verdict == "approve_with_concerns" {
+			sawOpusConcerns = true
+		}
+		if rev.ReviewerModel == "gpt-5.5" && rev.Verdict == "reject" {
+			sawCodexReject = true
+		}
+	}
+	if !sawOpusConcerns {
+		t.Errorf("opus approve_with_concerns missing/collapsed; Reviews = %+v", st.Reviews)
+	}
+	if !sawCodexReject {
+		t.Errorf("gpt-5.5 reject missing; Reviews = %+v", st.Reviews)
+	}
+}
+
+// TestReviewStatusFor_MixedTerminal_CompleteWithReviewedAndFailedRows pins that
+// ANY terminal kind counts toward the round: configured_agents=2 with one
+// implement_reviewed approve + one implement_review_failed reaches the
+// threshold and resolves 'complete' (a real verdict exists), with BOTH a
+// reviewed row and a synthesized failed row in the union.
+func TestReviewStatusFor_MixedTerminal_CompleteWithReviewedAndFailedRows(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 2, "advisory")
+	seedImplementReviewAudit(fb, runID, PlanReview{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-8",
+		Authority:     "advisory",
+		Verdict:       "approve",
+	})
+	seedReviewFailedAudit(fb, runID, "implement_review_failed",
+		"review timed out: context deadline exceeded", "gpt-5.5", "advisory")
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Fatalf("Status = %q, want complete (a real verdict exists alongside a failure)", st.Status)
+	}
+	if len(st.Reviews) != 2 {
+		t.Fatalf("Reviews = %+v, want a reviewed row + a synthesized failed row", st.Reviews)
+	}
+	var sawApprove, sawFailed bool
+	for _, rev := range st.Reviews {
+		if rev.Verdict == "approve" {
+			sawApprove = true
+		}
+		if rev.Verdict == "failed" && rev.Reason == "review timed out: context deadline exceeded" {
+			sawFailed = true
+		}
+	}
+	if !sawApprove || !sawFailed {
+		t.Errorf("union must carry both the reviewed approve and the synthesized failed row; Reviews = %+v", st.Reviews)
+	}
+}
+
+// TestReviewStatusFor_SingleReviewer_ResolvesImmediately is the homogeneous
+// regression guard: configured_agents=1 with one reviewed entry still resolves
+// 'complete' immediately (so a single-reviewer run never polls forever).
+func TestReviewStatusFor_SingleReviewer_ResolvesImmediately(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "gating")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "gating", Verdict: "approve"})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Errorf("Status = %q, want complete (1 of 1 configured reviewer landed)", st.Status)
+	}
+	if len(st.Reviews) != 1 || st.Reviews[0].Verdict != "approve" {
+		t.Errorf("Reviews = %+v, want one approve verdict", st.Reviews)
+	}
+}
+
+// TestReviewStatusFor_Fallback_NoStartedEntry pins the fail-safe (step 3): a
+// reviewed entry with NO *_review_started entry (an old-run / malformed-payload
+// path where ConfiguredAgents is absent or <=0) degrades to the prior
+// complete-on-first-verdict predicate rather than stranding on 'pending'.
+func TestReviewStatusFor_Fallback_NoStartedEntry(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// No started entry — configured count is absent.
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Errorf("Status = %q, want complete (fallback predicate, no configured count)", st.Status)
+	}
+	if len(st.Reviews) != 1 {
+		t.Errorf("Reviews = %+v, want the single decoded verdict", st.Reviews)
+	}
+}
+
+// TestReviewStatusFor_Fallback_ZeroConfigured pins that a started entry with a
+// non-positive configured_agents (a malformed/old payload) also degrades to
+// the fallback predicate — never stranding on 'pending'.
+func TestReviewStatusFor_Fallback_ZeroConfigured(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 0, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Errorf("Status = %q, want complete (zero configured => fallback)", st.Status)
+	}
+}
+
+// TestReviewStatusFor_Implement_PartialAfterFixupReadsRound2Count pins the
+// fix-up-round interaction: the count gate must read the LATEST
+// implement_review_started entry's ConfiguredAgents, so a re-review round with
+// 2 configured reviewers stays 'pending' on a partial landing even though the
+// round-1 started entry (also configured) sits below the fix-up floor.
+func TestReviewStatusFor_Implement_PartialAfterFixupReadsRound2Count(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// Round 1: a single-reviewer round completed, then a fix-up re-opened the
+	// stage and dispatched a 2-reviewer re-review round.
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	seedRunFixupTriggeredAudit(fb, runID)
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 2, "advisory")
+	// Only ONE of the re-review round's two reviewers has landed.
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve_with_concerns"})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want pending (re-review round needs 2, only 1 landed)", st.Status)
+	}
+}
+
 // TestRegisterTools_RegistersAwaitReview is a smoke test that the new tool
 // registers without panicking and the SDK accepts its output schema (the
 // harness rejects unrepresentable types, so this also exercises ReviewStatus

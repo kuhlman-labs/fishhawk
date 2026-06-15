@@ -1572,6 +1572,59 @@ func TestGetRunStatus_WithImplementReviews_PopulatesField(t *testing.T) {
 	}
 }
 
+// TestGetRunStatus_Heterogeneous_BothReviewerRowsAcrossStages is the #1127
+// cross-seam test: a full heterogeneous round (configured_agents=2) on BOTH
+// the plan and implement stages must surface BOTH reviewer rows through the
+// getRunStatus output's plan_review_status.reviews[] and
+// implement_review_status.reviews[] — the end-to-end path from the audit store
+// through reviewStatusFor to the tool payload. Before #1127 a poll could catch
+// the partial-landing window and return 'complete' with only the first row.
+func TestGetRunStatus_Heterogeneous_BothReviewerRowsAcrossStages(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+
+	// Plan stage: a full 2-reviewer round.
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 2, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory", Verdict: "approve_with_concerns", Concerns: []PlanReviewConcern{{Severity: "medium", Category: "scope", Note: "x"}}})
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "gpt-5.5", Authority: "advisory", Verdict: "reject"})
+
+	// Implement stage: a full 2-reviewer round.
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 2, "advisory")
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory", Verdict: "approve"})
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "gpt-5.5", Authority: "advisory", Verdict: "approve_with_concerns", Concerns: []PlanReviewConcern{{Severity: "low", Category: "security", Note: "y"}}})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+
+	assertBothModels := func(label string, rs *ReviewStatus) {
+		t.Helper()
+		if rs == nil || rs.Status != "complete" {
+			t.Fatalf("%s = %+v, want complete", label, rs)
+		}
+		if len(rs.Reviews) != 2 {
+			t.Fatalf("%s.Reviews = %+v, want both reviewer rows", label, rs.Reviews)
+		}
+		var sawOpus, sawCodex bool
+		for _, rev := range rs.Reviews {
+			switch rev.ReviewerModel {
+			case "claude-opus-4-8":
+				sawOpus = true
+			case "gpt-5.5":
+				sawCodex = true
+			}
+		}
+		if !sawOpus || !sawCodex {
+			t.Errorf("%s.Reviews must carry both opus and gpt-5.5 rows; got %+v", label, rs.Reviews)
+		}
+	}
+	assertBothModels("plan_review_status", out.PlanReviewStatus)
+	assertBothModels("implement_review_status", out.ImplementReviewStatus)
+}
+
 func TestGetRunStatus_NoImplementReviews_NilField(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
