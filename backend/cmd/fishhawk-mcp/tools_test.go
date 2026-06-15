@@ -4162,6 +4162,65 @@ func TestListRuns_CursorRoundTrip_WalksPagination(t *testing.T) {
 	}
 }
 
+func TestListRuns_DefaultOmitsIssueContext(t *testing.T) {
+	// Compact by default (#1098): a run carrying a populated
+	// issue_context comes back with IssueContext nil so the
+	// omitempty tag drops the heavy field from the marshalled output.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	id := uuid.New()
+	run := sampleRun(id, "x/y", time.Hour)
+	run.IssueContext = &IssueContext{
+		Title:    "long issue",
+		Body:     "a very long body that would overflow the tool-result token cap",
+		Number:   42,
+		Comments: []IssueComment{{Author: "alice", Body: "a comment"}},
+	}
+	fb.listResp = listRunsResult{Items: []Run{run}}
+
+	_, out, err := r.listRuns(context.Background(), nil, ListRunsInput{})
+	if err != nil {
+		t.Fatalf("listRuns: %v", err)
+	}
+	if len(out.Items) != 1 {
+		t.Fatalf("got %d items, want 1", len(out.Items))
+	}
+	if out.Items[0].IssueContext != nil {
+		t.Errorf("IssueContext = %+v, want nil (compact by default)", out.Items[0].IssueContext)
+	}
+}
+
+func TestListRuns_IncludeIssueContext_Preserved(t *testing.T) {
+	// Opt-in (#1098): include_issue_context=true preserves the full
+	// payload — body and comments survive the handler.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	id := uuid.New()
+	run := sampleRun(id, "x/y", time.Hour)
+	run.IssueContext = &IssueContext{
+		Title:    "long issue",
+		Body:     "a very long body",
+		Number:   42,
+		Comments: []IssueComment{{Author: "alice", Body: "a comment"}},
+	}
+	fb.listResp = listRunsResult{Items: []Run{run}}
+
+	_, out, err := r.listRuns(context.Background(), nil, ListRunsInput{IncludeIssueContext: true})
+	if err != nil {
+		t.Fatalf("listRuns: %v", err)
+	}
+	if len(out.Items) != 1 {
+		t.Fatalf("got %d items, want 1", len(out.Items))
+	}
+	ic := out.Items[0].IssueContext
+	if ic == nil {
+		t.Fatal("IssueContext = nil, want preserved when include_issue_context=true")
+	}
+	if ic.Body != "a very long body" || len(ic.Comments) != 1 {
+		t.Errorf("IssueContext payload not preserved: %+v", ic)
+	}
+}
+
 // ── runtime_calibration tool ──────────────────────────────────────────────────
 
 func TestRuntimeCalibration_HappyPath(t *testing.T) {

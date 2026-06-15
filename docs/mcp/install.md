@@ -110,7 +110,7 @@ Two audiences with different scopes:
 | `fishhawk_retry_stage` | Re-fire a failed stage per its category; mirrors `fishhawk run retry`. Categories A/C re-dispatch; B / gate-rejected D surface as `retry_not_applicable`. | `write:stages` |
 | `fishhawk_approve_plan` | Approve the plan stage of a run (resolves stage from run id); mirrors `fishhawk plan approve`. | `write:approvals` |
 | `fishhawk_reject_plan` | Reject the plan stage with optional rationale; mirrors `fishhawk plan reject`. | `write:approvals` |
-| `fishhawk_list_runs` | Enumerate runs with filters (`repo`, `workflow_id`, `state`) + cursor pagination. | `read:runs` |
+| `fishhawk_list_runs` | Enumerate runs with filters (`repo`, `workflow_id`, `state`) + cursor pagination. Each run's `issue_context` (issue body + all comments) is omitted by default to stay within the tool-result token cap; pass `include_issue_context: true` to re-include it. | `read:runs` |
 | `fishhawk_run_stage` | Drive one stage of a local-runner run by spawning `fishhawk-runner` as a subprocess; mirrors `fishhawk runner start`. Events stream as MCP `notifications/progress` when the client provides a progress token; the final result carries the full event list and post-run stage state. Cancellation: SIGTERM + 30s grace + SIGKILL; the runner handles SIGTERM cooperatively ([#435](https://github.com/kuhlman-labs/fishhawk/issues/435)) — exits with code 130 and emits a `runner_cancelled` event. Requires the `fishhawk-runner` binary to resolve on the MCP server's host — see [ADR-024](https://github.com/kuhlman-labs/fishhawk/issues/433). | `write:runs` |
 
 **Auth posture** (today, v0):

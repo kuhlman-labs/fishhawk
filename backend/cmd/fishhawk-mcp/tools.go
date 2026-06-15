@@ -2056,6 +2056,12 @@ type ListRunsInput struct {
 	State      string `json:"state,omitempty" jsonschema:"filter by run state; one of pending, running, succeeded, failed, cancelled"`
 	Limit      int    `json:"limit,omitempty" jsonschema:"max items per page (default 50, capped at 200)"`
 	Cursor     string `json:"cursor,omitempty" jsonschema:"pagination cursor returned by a prior list call as next_cursor"`
+	// IncludeIssueContext opts each returned run's full issue_context
+	// (issue body + every comment) back into the response. Omitted by
+	// default because it can overflow the tool-result token cap on
+	// issues with large bodies/comment threads — a single list_runs over
+	// such issues errors and forces a curl fallback to enumerate run IDs.
+	IncludeIssueContext bool `json:"include_issue_context,omitempty" jsonschema:"include each run's full issue_context (issue body + all comments) in the response; omitted by default because it can overflow the tool-result token cap on issues with large bodies/comment threads. Set true only when the issue payload is actually needed"`
 }
 
 // ListRunsOutput mirrors the OpenAPI paginated list envelope.
@@ -2093,9 +2099,17 @@ Inputs:
                   succeeded, failed, cancelled
   - limit       — default 50, capped at 200
   - cursor      — opaque pagination token from a prior call
+  - include_issue_context — include each run's full issue_context
+                  (issue body + all comments) in the response;
+                  omitted by default. Set true only when the issue
+                  payload is actually needed
 
 Response: items[] (Run shape) + next_cursor (empty when the page
-exhausts the result set).
+exhausts the result set). Each run's issue_context (issue body + all
+comments) is omitted by default to keep the enumeration within the
+tool-result token budget — a single list over issues with large
+bodies/comment threads would otherwise overflow the cap. Set
+include_issue_context=true to re-include it when the payload is needed.
 `),
 	}, resolver.listRuns)
 }
@@ -2117,6 +2131,17 @@ func (r *runResolver) listRuns(ctx context.Context, _ *mcp.CallToolRequest, in L
 	})
 	if err != nil {
 		return nil, ListRunsOutput{}, fmt.Errorf("list runs: %w", err)
+	}
+	// Compact by default: strip each run's heavy issue_context (issue
+	// body + every comment) unless the caller opted in. Run.IssueContext
+	// carries json:"issue_context,omitempty" (client.go), so a nil
+	// pointer drops the field from the marshalled output entirely rather
+	// than emitting "issue_context":null — keeping the enumeration within
+	// the tool-result token budget on fan-out driving (#1098).
+	if !in.IncludeIssueContext {
+		for i := range page.Items {
+			page.Items[i].IssueContext = nil
+		}
 	}
 	return nil, ListRunsOutput{Items: page.Items, NextCursor: page.NextCursor}, nil
 }
