@@ -37,7 +37,7 @@ E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation har
 | `stage` | yes | Stage ID within the workflow (e.g. `plan`, `implement`, `review`). |
 | `agent` | no | Coding-agent provider to invoke (`claude-code`\|`codex`). Defaults to `claude-code`, preserving the historical Claude-only behavior. `codex` spawns the Codex CLI in non-interactive `exec` mode (`internal/agent/codex/`); any other value fails the stage category-A before the agent is invoked. The selected id is stamped into the trace bundle manifest's `agent` field. |
 | `prompt-file` | no | Path to a file containing the constructed prompt. When unset the runner exits 0 without invoking the agent — useful for exercising the dispatch path before E5.2+ are wired upstream. |
-| `working-dir` | no | Agent working directory; defaults to the runner's CWD. |
+| `working-dir` | no | The **repo root the run derives its working tree from**; defaults to the runner's CWD. On the `--fetch-prompt` path the runner provisions a per-run **lineage git worktree** under this repo's shared gitdir (`<git-common-dir>/fishhawk-worktrees/run-<root>`) and relocates the agent's effective working directory into it, so concurrent runs on one local host no longer share a single tree (E22.X / #1137). The worktree lives under `.git`, invisible to `git status`; solo runs get their own worktree, all children of one decomposition parent share one. See `docs/ARCHITECTURE.md` §4. |
 | `max-tokens` | no | Hard cap on agent tokens (input + output); 0 means no cap. |
 | `timeout` | no | Wall-clock cap on the agent invocation, e.g. `15m`. Default 15m. |
 | `bundle-out` | no | Path to write the gzipped trace bundle. When set the runner produces an ADR-007 `*.jsonl.gz` artifact instead of JSONL on stdout. |
