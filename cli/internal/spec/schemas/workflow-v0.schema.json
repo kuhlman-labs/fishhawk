@@ -30,10 +30,35 @@
       "patternProperties": {
         "^[a-z][a-z0-9_]*$": { "$ref": "#/$defs/workflow" }
       }
+    },
+    "test_conventions": {
+      "type": "array",
+      "description": "Optional per-repo test-location conventions that generalize the plan-gate test sweep (#1004) beyond the built-in Go (name.go -> name_test.go) and colocated-TypeScript defaults. Each entry maps production files matching a glob to candidate test-file path templates. Declared entries are ADDITIVE to the built-in defaults (Go + colocated TS stay covered regardless), so a repo typically declares only its Python / Ruby / parallel-tree conventions. Advisory-only and fail-open: the sweep never blocks a plan. Additive optional field within workflow-v0.x — accepted at every advertised version.",
+      "items": { "$ref": "#/$defs/test_convention" }
     }
   },
 
   "$defs": {
+    "test_convention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["match", "candidates"],
+      "description": "One test-location convention: a production file whose repo-relative path matches `match` is expected to have a test at one of `candidates`. The plan-gate test sweep (#1004) flags an existing candidate test that is absent from the plan's scope.files.",
+      "properties": {
+        "match": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Doublestar glob (bmatcuk/doublestar/v4 semantics; `**` crosses directory separators) matched against the repo-relative production-file path, e.g. `**/*.go`, `**/*.{ts,tsx}`, `src/**/*.py`. A scoped file whose basename also matches a candidate's test-file shape is treated as a test, not a production file."
+        },
+        "candidates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Candidate test-file path templates for a matched production file. Template variables: `{dir}` (the production file's directory), `{name}` (basename without its final extension), `{ext}` (final extension without the leading dot), `{relpath}` (full repo-relative path without its final extension). Examples: `{dir}/{name}_test.go`, `tests/test_{name}.py`, `spec/{relpath}_spec.rb`. The sweep reports a candidate that exists on the base ref but is missing from scope.files."
+        }
+      }
+    },
+
     "role": {
       "type": "object",
       "additionalProperties": false,

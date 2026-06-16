@@ -10,10 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // categoryPlanTestSweep is the audit-log category for the entry
@@ -78,11 +80,18 @@ var testSweepPathTriggerRules = []testSweepPathTriggerRule{
 // stay readable without losing the truncation signal.
 const testSweepMaxMissingTests = 10
 
-// testSweepMaxDirs caps the distinct scoped directories runTestSweep
-// lists via the Contents API per plan upload, bounding the network cost
-// added to the upload path. Directories beyond the cap are WARN-skipped
+// testSweepMaxDirs caps the distinct directories runTestSweep lists via
+// the Contents API per plan upload, bounding the network cost added to
+// the upload path. Directories beyond the cap are WARN-skipped
 // (fail-open: no finding, never a block).
-const testSweepMaxDirs = 10
+//
+// Counted AFTER candidate expansion (#1004): a data-driven convention
+// with a parallel-tree candidate (e.g. tests/test_{name}.py,
+// spec/{relpath}_spec.rb) points at directories other than the
+// production file's own, so one production file can contribute several
+// distinct directories. The cap is raised from the original Go-only 10
+// to absorb that fan-out.
+const testSweepMaxDirs = 20
 
 // TestSweepFinding is one test-sweep result: the plan touches TriggerPath
 // but omits existing test files (MissingTests) the named Rule associates
@@ -113,33 +122,156 @@ type TestSweepPayload struct {
 	ListedDirs   int                `json:"listed_dirs"`
 }
 
-// evaluateTestSweep is the pure matcher (#942). dirListings maps a
-// slash-normalized directory path to the base names of the files that
-// exist in it on the base ref; a directory absent from the map was not
-// listed (skipped or failed open) and produces no findings. Three
-// deterministic rules:
+// testConvention is one effective test-location convention used by the
+// sweep matcher: production files whose repo-relative path matches Match
+// (doublestar glob, `**` crosses '/') are expected to have a test at one
+// of Candidates (path templates with {dir}/{name}/{ext}/{relpath}). It
+// is the in-package mirror of spec.TestConvention; effectiveTestConventions
+// converts the declared spec entries and appends them to the defaults.
+type testConvention struct {
+	Match      string
+	Candidates []string
+}
+
+// defaultTestConventions reproduces #1003's hardcoded behavior as data:
+// the Go stem-sibling rule plus colocated TypeScript. They are ALWAYS in
+// effect (declared conventions append, never replace), so a repo that
+// declares only Python/Ruby keeps Go + colocated TS covered, and a spec
+// carrying no test_conventions is byte-identical to the pre-#1004 sweep.
+var defaultTestConventions = []testConvention{
+	{Match: "**/*.go", Candidates: []string{"{dir}/{name}_test.go"}},
+	{Match: "**/*.{ts,tsx}", Candidates: []string{
+		"{dir}/{name}.test.{ext}",
+		"{dir}/{name}.spec.{ext}",
+		"{dir}/__tests__/{name}.test.{ext}",
+	}},
+}
+
+// effectiveTestConventions returns the built-in defaults with the run's
+// declared conventions appended. Declared entries are additive (never
+// replace the defaults) per the #1004 product-design choice.
+func effectiveTestConventions(declared []spec.TestConvention) []testConvention {
+	out := make([]testConvention, 0, len(defaultTestConventions)+len(declared))
+	out = append(out, defaultTestConventions...)
+	for _, d := range declared {
+		out = append(out, testConvention{Match: d.Match, Candidates: d.Candidates})
+	}
+	return out
+}
+
+// expandCandidate substitutes the candidate-template variables for a
+// production-file path p and returns a slash-normalized candidate path:
 //
-//   - stem-sibling: a scoped non-test dir/name.go where dir/name_test.go
-//     exists in the listing and is not itself in scope.
-//   - new-test-in-tested-package: a scoped CREATE of dir/x_test.go in a
-//     directory whose listing already has other *_test.go files — those
-//     existing files (minus any already in scope) are reported sorted,
-//     capped at testSweepMaxMissingTests with OmittedCount carrying the
-//     remainder.
+//   - {dir}     → path.Dir(p)               (the production file's directory)
+//   - {name}    → basename minus final ext  (e.g. "upload" for upload.go)
+//   - {ext}     → final extension, no dot    (e.g. "tsx" for Foo.tsx)
+//   - {relpath} → full path minus final ext  (e.g. "lib/foo/bar" for lib/foo/bar.rb)
+func expandCandidate(tmpl, p string) string {
+	p = filepath.ToSlash(p)
+	base := path.Base(p)
+	ext := path.Ext(base)
+	r := strings.NewReplacer(
+		"{dir}", path.Dir(p),
+		"{name}", strings.TrimSuffix(base, ext),
+		"{ext}", strings.TrimPrefix(ext, "."),
+		"{relpath}", strings.TrimSuffix(p, ext),
+	)
+	return path.Clean(r.Replace(tmpl))
+}
+
+// testFileRecognizers derives, from every convention's candidate
+// templates, a deduped sorted set of basename globs that recognize a
+// test file. Each candidate's final path segment with {name}/{ext}/
+// {relpath} replaced by '*' is the recognizer (e.g. {dir}/{name}_test.go
+// → *_test.go; tests/test_{name}.py → test_*.py). Basename-level so it
+// matches names within a directory listing.
+func testFileRecognizers(conventions []testConvention) []string {
+	set := map[string]bool{}
+	r := strings.NewReplacer("{name}", "*", "{ext}", "*", "{relpath}", "*")
+	for _, c := range conventions {
+		for _, tmpl := range c.Candidates {
+			set[r.Replace(path.Base(tmpl))] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for g := range set {
+		out = append(out, g)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isTestFileBasename reports whether name (a directory-listing basename)
+// matches any recognizer. doublestar.Match errors only on a malformed
+// pattern; recognizers are derived from curated/validated templates, so
+// a bad one simply never matches (fail-open).
+func isTestFileBasename(recognizers []string, name string) bool {
+	for _, g := range recognizers {
+		if ok, _ := doublestar.Match(g, name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupTestSweepFindings collapses findings sharing (rule, trigger path,
+// sub-plan title) to the first occurrence (#1004 amendment 2): an
+// overlapping declared+default convention can otherwise double-report the
+// same trigger. The candidate set is also deduped per production file
+// (in the rule-1 loop) so MissingTests never lists a path twice.
+func dedupTestSweepFindings(findings []TestSweepFinding) []TestSweepFinding {
+	if len(findings) < 2 {
+		return findings
+	}
+	type key struct{ rule, trigger, sub string }
+	seen := make(map[key]bool, len(findings))
+	out := findings[:0]
+	for _, f := range findings {
+		k := key{f.Rule, f.TriggerPath, f.SubPlanTitle}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, f)
+	}
+	return out
+}
+
+// evaluateTestSweep is the pure matcher (#942, generalized to data-driven
+// conventions in #1004). dirListings maps a slash-normalized directory
+// path to the base names of the files that exist in it on the base ref; a
+// directory absent from the map was not listed (skipped or failed open)
+// and produces no findings. conventions are the effective conventions
+// (built-in defaults ++ the run's declared entries). Three deterministic
+// rules:
+//
+//   - stem-sibling: a scoped production file matching a convention's
+//     `match` (and not itself a test file) whose expanded candidate test
+//     exists in its directory listing and is not in scope. The rule id
+//     stays stem_sibling for audit/prompt stability.
+//   - new-test-in-tested-package: a scoped CREATE whose basename is a
+//     recognized test file, in a directory whose listing already has
+//     other recognized test files — those existing files (minus any
+//     already in scope) are reported sorted, capped at
+//     testSweepMaxMissingTests with OmittedCount carrying the remainder.
 //   - path-trigger table rows (testSweepPathTriggerRules, currently
 //     migration_walk): a scoped path matching a row's trigger glob whose
 //     required paths are not all in scope — evaluated against the scope
 //     set only, never dirListings.
 //
 // Paths are slash-normalized like evaluateSurfaceSweep; a scoped test
-// file never flags itself; findings are sorted (rule, then trigger path)
-// for deterministic output.
+// file never flags itself; findings are deduped by (rule, trigger path)
+// and sorted (rule, then trigger path) for deterministic output.
+//
+// With no declared conventions the effective set is the built-in
+// defaults, which reproduce #1003's Go (+ colocated TS) behavior
+// byte-identically.
 //
 // This is NOT call-graph or behavior-coverage analysis: a plan changing
 // behavior in package A whose tests live in package B is out of reach by
 // design (#942 explicitly defers that), exactly as surface_sweep's
 // registry is not call-graph analysis.
-func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]string) []TestSweepFinding {
+func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]string, conventions []testConvention) []TestSweepFinding {
 	scope := make(map[string]bool, len(scopeFiles))
 	for _, f := range scopeFiles {
 		scope[filepath.ToSlash(f.Path)] = true
@@ -157,14 +289,16 @@ func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]str
 		return false
 	}
 
+	recognizers := testFileRecognizers(conventions)
+
 	var findings []TestSweepFinding
 	for _, f := range scopeFiles {
 		p := filepath.ToSlash(f.Path)
 
-		// Path-trigger rules run before the .go filter: their triggers
-		// (migration .sql files) are not Go files. path.Match errors only
-		// on a malformed pattern; the table is curated constants, so a bad
-		// row simply never matches (fail-open, no finding).
+		// Path-trigger rules run independent of the conventions: their
+		// triggers (migration .sql files) are not production source files.
+		// path.Match errors only on a malformed pattern; the table is
+		// curated constants, so a bad row simply never matches (fail-open).
 		for _, rule := range testSweepPathTriggerRules {
 			if matched, _ := path.Match(rule.TriggerGlob, p); !matched {
 				continue
@@ -184,22 +318,38 @@ func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]str
 			}
 		}
 
-		if !strings.HasSuffix(p, ".go") {
-			continue
-		}
-		dir := path.Dir(p)
 		base := path.Base(p)
 
-		if !strings.HasSuffix(base, "_test.go") {
-			// Rule 1: stem-sibling. dir/name.go in scope, dir/name_test.go
-			// exists on the base ref, and the sibling is not in scope.
-			sibling := strings.TrimSuffix(base, ".go") + "_test.go"
-			siblingPath := dir + "/" + sibling
-			if listingHas(dir, sibling) && !scope[siblingPath] {
+		if !isTestFileBasename(recognizers, base) {
+			// Rule 1: stem-sibling, generalized. For every convention the
+			// production file matches, expand its candidates into a deduped
+			// set; report those that exist on the base ref and aren't
+			// scoped. Overlapping declared+default conventions collapse via
+			// the candidate set, so one production file yields one finding.
+			candSet := map[string]bool{}
+			for _, c := range conventions {
+				if ok, _ := doublestar.Match(c.Match, p); !ok {
+					continue
+				}
+				for _, tmpl := range c.Candidates {
+					candSet[expandCandidate(tmpl, p)] = true
+				}
+			}
+			var missing []string
+			for cand := range candSet {
+				if cand == p {
+					continue
+				}
+				if listingHas(path.Dir(cand), path.Base(cand)) && !scope[cand] {
+					missing = append(missing, cand)
+				}
+			}
+			if len(missing) > 0 {
+				sort.Strings(missing)
 				findings = append(findings, TestSweepFinding{
 					Rule:         testSweepRuleStemSibling,
 					TriggerPath:  p,
-					MissingTests: []string{siblingPath},
+					MissingTests: missing,
 				})
 			}
 			continue
@@ -211,9 +361,10 @@ func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]str
 		if f.Operation != plan.FileOpCreate {
 			continue
 		}
+		dir := path.Dir(p)
 		var existing []string
 		for _, n := range dirListings[dir] {
-			if !strings.HasSuffix(n, "_test.go") || n == base {
+			if n == base || !isTestFileBasename(recognizers, n) {
 				continue
 			}
 			full := dir + "/" + n
@@ -241,6 +392,7 @@ func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]str
 		})
 	}
 
+	findings = dedupTestSweepFindings(findings)
 	sort.Slice(findings, func(i, j int) bool {
 		if findings[i].Rule != findings[j].Rule {
 			return findings[i].Rule < findings[j].Rule
@@ -327,24 +479,57 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 		return nil
 	}
 
-	// Collect the distinct directories of scoped .go files, sorted so the
-	// cap below is deterministic. Repo-root .go files are skipped: the
-	// Contents API addresses the root as the empty path, which
-	// ListDirectory rejects, and no registered module keeps Go files there.
-	// Collect directories from the parent scope AND every decomposition
-	// sub-plan scope (#1077): an under-scoped slice's directory must be
-	// listed so its coupling gaps surface at the parent plan gate. The
-	// migration_walk path-trigger rule needs no listing, but the
-	// stem-sibling / new-test rules do.
+	// Resolve the effective test conventions from the run's cached
+	// workflow spec (#1004): declared test_conventions append to the
+	// built-in Go + colocated-TS defaults. Fail open to the defaults
+	// only on an empty or unparseable spec (WARN-log, never block) —
+	// matching the rest of the sweep's degradation contract.
+	var declaredConventions []spec.TestConvention
+	if len(runRow.WorkflowSpec) > 0 {
+		if parsedSpec, perr := spec.ParseBytes(runRow.WorkflowSpec); perr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "test sweep: parse workflow spec failed; using default conventions",
+				slog.String("run_id", runID.String()),
+				slog.String("error", perr.Error()),
+			)
+		} else {
+			declaredConventions = parsedSpec.TestConventions
+		}
+	}
+	conventions := effectiveTestConventions(declaredConventions)
+	recognizers := testFileRecognizers(conventions)
+
+	// Collect the distinct directories the sweep must list, sorted so the
+	// cap below is deterministic. For a production file matching a
+	// convention, that is the directory of every EXPANDED candidate
+	// (#1004): colocated candidates point at the file's own directory,
+	// parallel-tree candidates (tests/, spec/) point elsewhere. For a
+	// scoped test file (rule 2's trigger) it is the file's own directory.
+	// Repo-root files are skipped: the Contents API addresses the root as
+	// the empty path, which ListDirectory rejects. Collect from the parent
+	// scope AND every decomposition sub-plan scope (#1077): an
+	// under-scoped slice's directory must be listed so its coupling gaps
+	// surface at the parent plan gate. The migration_walk path-trigger
+	// rule needs no listing.
 	dirSet := map[string]bool{}
+	addDir := func(dir string) {
+		if dir != "" && dir != "." {
+			dirSet[dir] = true
+		}
+	}
 	collectDirs := func(files []plan.ScopeFile) {
 		for _, f := range files {
 			p := filepath.ToSlash(f.Path)
-			if !strings.HasSuffix(p, ".go") {
+			if isTestFileBasename(recognizers, path.Base(p)) {
+				addDir(path.Dir(p))
 				continue
 			}
-			if dir := path.Dir(p); dir != "." {
-				dirSet[dir] = true
+			for _, c := range conventions {
+				if ok, _ := doublestar.Match(c.Match, p); !ok {
+					continue
+				}
+				for _, tmpl := range c.Candidates {
+					addDir(path.Dir(expandCandidate(tmpl, p)))
+				}
 			}
 		}
 	}
@@ -407,7 +592,7 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 		return nil
 	}
 
-	findings := evaluateTestSweep(parsedPlan.Scope.Files, dirListings)
+	findings := evaluateTestSweep(parsedPlan.Scope.Files, dirListings, conventions)
 
 	// Evaluate each decomposition sub-plan's own scope against the shared
 	// dirListings (#1077), tagging findings with the sub-plan title. The
@@ -418,7 +603,7 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 			if sp.Scope == nil {
 				continue
 			}
-			for _, f := range evaluateTestSweep(sp.Scope.Files, dirListings) {
+			for _, f := range evaluateTestSweep(sp.Scope.Files, dirListings, conventions) {
 				f.SubPlanTitle = sp.Title
 				findings = append(findings, f)
 			}
