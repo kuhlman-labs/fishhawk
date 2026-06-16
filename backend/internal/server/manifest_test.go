@@ -334,6 +334,12 @@ func TestBuildManifest_DefaultPermissions(t *testing.T) {
 		// branch protection + rulesets at run-create time to derive
 		// the required-checks list (consumed by #251).
 		"administration": "read",
+		// organization_projects:write for #1116: the installation
+		// token boards work items on the installing account's
+		// ORG-owned Projects v2 (consumed by fishhawk_file_issue /
+		// fishhawk_report_product_issue). User-owned Projects v2 are
+		// out of reach of any App permission (#1114).
+		"organization_projects": "write",
 	}
 	if len(perms) != len(want) {
 		t.Errorf("permission count = %d, want %d:\n got: %v\nwant: %v",

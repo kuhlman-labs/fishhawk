@@ -26,6 +26,7 @@ Per `MVP_SPEC.md` §5.1.5:
 | `members` | r | Resolve `@org/team` references in role definitions to GitHub-login allowlists for approver checks (E4.4 / #50). |
 | `metadata` | r | Always granted; required for any read access. |
 | `administration` | r | Read branch protection + rulesets to derive the required-checks list (ADR-017 / #249). |
+| `organization_projects` | rw | Board work items on the installing account's **org-owned** Projects v2 via the installation token (`fishhawk_file_issue` / `fishhawk_report_product_issue`, #1116). **Does NOT cover user-owned Projects v2** (e.g. Project #7) — no App permission can; those need a UAT/PAT (#1114). |
 
 Webhook events:
 
@@ -222,7 +223,10 @@ From this point, GitHub itself refuses the merge until Fishhawk reports `success
 
 When the App's permission set changes (e.g. a new `checks: write` requirement), GitHub flags the installation as needing review and existing installations fall back to the old permission set until the customer accepts the new ones. Reinstall via the App's installation page (**Configure** → **Save**) to pick up the new permissions.
 
-The most recent bump (ADR-017 / #249) added `administration: read` so the backend can read branch protection + rulesets at run-create time. Existing installs must re-accept before required-checks derivation will work; the run will fall back to an empty required-checks list otherwise.
+Two recent bumps require re-consent:
+
+- **#1116** added `organization_projects: write` so the installation token can board work items on the installing account's **org-owned** Projects v2 (consumed by `fishhawk_file_issue` / `fishhawk_report_product_issue`). Existing installs must re-accept before board placement works; until then those tools degrade to `boarded:false`. Caveat: this permission reaches org-owned Projects v2 only — user-owned Projects v2 (e.g. Project #7) are out of reach of any App permission and need a UAT/PAT (#1114), so re-consenting does not by itself fix board placement on a user-owned board.
+- **ADR-017 / #249** added `administration: read` so the backend can read branch protection + rulesets at run-create time. Existing installs must re-accept before required-checks derivation will work; the run will fall back to an empty required-checks list otherwise.
 
 **Installing the App is the only repo-side dependency.** Specifically, customers do **not** need to:
 
