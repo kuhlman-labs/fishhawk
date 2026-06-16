@@ -941,6 +941,29 @@ func TestMissingScopeFiles(t *testing.T) {
 			t.Errorf("committed = %v, want it to list the deleted path gone.txt", committed)
 		}
 	})
+
+	t.Run("non-repo-relative declared path skipped, never missing", func(t *testing.T) {
+		repo := initRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, "add", "-A")
+		mustGit(t, repo, "commit", "-m", "touch README only")
+		head := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+		// An absolute /tmp path (and a '..'-traversal path) can never appear in a
+		// repo-relative diff-tree file set, so they must be skipped rather than
+		// reported as a shortfall — guarding against a #730 prose-fold injection
+		// false-tripping the #1151 category-B gate (#1155).
+		missing, _, err := MissingScopeFiles(context.Background(), repo, head,
+			[]string{"README.md", "/tmp/fishhawk-scope-justifications.json", "../etc/secrets.yaml"})
+		if err != nil {
+			t.Fatalf("MissingScopeFiles: %v", err)
+		}
+		if len(missing) != 0 {
+			t.Errorf("missing = %v, want empty (non-repo-relative declared paths are skipped)", missing)
+		}
+	})
 }
 
 func contains(s []string, v string) bool {

@@ -849,7 +849,12 @@ func (p *Pusher) assertCommitInScope(ctx context.Context, repoDir, headSHA strin
 // touched and does not false-trip. Trailing-slash directory-prefix declared
 // entries are skipped (newScopeMatcher's split semantics) — a folded directory
 // cannot require any specific touched path — so only exact-match concrete paths
-// are required. The returned committed set lets the caller render the precise
+// are required. Non-repo-relative declared entries (absolute, or '..'-traversal)
+// are skipped too: a `git diff-tree --name-only` file set is always
+// repo-relative, so such a path can never match a committed path and counting it
+// toward the shortfall would be a guaranteed false-trip — the defensive
+// companion (#1155) to the #730 prose-extractor fix.
+// The returned committed set lets the caller render the precise
 // "declared N scope files, committed M" message and populate the
 // scope_files_missing event from real data rather than a recomputation.
 //
@@ -876,6 +881,13 @@ func MissingScopeFiles(ctx context.Context, repoDir, headSHA string, declared []
 	// keep the missing list order-preserving.
 	for _, d := range declared {
 		if strings.HasSuffix(d, "/") {
+			continue
+		}
+		// A non-repo-relative declared path (absolute, or '..'-traversal) can
+		// never appear in a repo-relative diff-tree file set, so requiring it
+		// would be a guaranteed false-trip. The #730 prose extractor now drops
+		// such tokens at the source; this is the defensive companion (#1155).
+		if strings.HasPrefix(d, "/") || strings.Contains(d, "..") {
 			continue
 		}
 		if !present[d] {
