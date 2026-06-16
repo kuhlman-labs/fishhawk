@@ -510,6 +510,20 @@ components:
             evaluation failure. Advisory on this read — the delegated
             action endpoints re-evaluate the condition server-side at
             action time and never trust a client-supplied verdict.
+        lineage_complete:
+          type: boolean
+          description: |
+            Lineage-completion signal (E22.X / #1137): true when the
+            lineage-root run (a decomposed child's parent, else the run
+            itself) is terminal AND every decomposed child of that root is
+            terminal, derived from the existing `decomposed_from` child
+            graph. The operator-local runner's per-run worktree sweep
+            reads it to reclaim a terminal lineage's shared git worktree
+            (keyed on the lineage root) at the next provision. Emitted by
+            `GET /v0/runs/{run_id}` ONLY (a per-run child-graph query, same
+            single-read posture as `concerns`); omitted on the list
+            endpoint and whenever the graph can't be read (no run repo /
+            read failure).
         created_at:
           type: string
           format: date-time

@@ -43,6 +43,26 @@ func lineageRoot(runID, decomposedFromRunID string) string {
 	return shortID(runID)
 }
 
+// lineageRootFull returns the FULL (un-shortened) lineage-root run id —
+// the parent run id for a decomposed child, else the run's own id. The
+// worktree directory is keyed on the SHORT id (lineageRoot), which the
+// backend's lineage_complete read can't take, so the full id is recorded
+// in a sidecar beside the worktree (writeLineageRunID) for the sweep to
+// resolve the short directory name back to a run id.
+func lineageRootFull(runID, decomposedFromRunID string) string {
+	if decomposedFromRunID != "" {
+		return decomposedFromRunID
+	}
+	return runID
+}
+
+// lineageStatusClient is the backend read sweepTerminalWorktrees needs:
+// whether a lineage-root run is terminal with every decomposed child
+// terminal. *upload.Client satisfies it via RunLineageComplete.
+type lineageStatusClient interface {
+	RunLineageComplete(ctx context.Context, runID string) (bool, error)
+}
+
 // worktreesDir resolves the fishhawk-worktrees directory under the repo's
 // SHARED git dir. It uses `git rev-parse --git-common-dir` (NOT --git-dir)
 // so an operator checkout that is itself a linked worktree still resolves
@@ -247,6 +267,122 @@ func processAlive(pid int) bool {
 		return true
 	}
 	return errors.Is(err, syscall.EPERM)
+}
+
+// lineageRunIDPath returns the sidecar path that records a lineage root's
+// FULL run id beside its worktree. It lives in <worktrees-dir> next to the
+// `run-<root>` worktree and the `run-<root>.lock` lock — never inside the
+// worktree, so it can't be swept into a run's commit.
+func lineageRunIDPath(wtDir, root string) string {
+	return filepath.Join(wtDir, "run-"+root+".runid")
+}
+
+// writeLineageRunID records the lineage root's FULL run id beside its
+// worktree so a later sweepTerminalWorktrees can resolve the short
+// `run-<root>` directory name back to the run id the backend's
+// lineage_complete read takes. Best-effort: a write failure logs a
+// degradation event and never fails the stage — the only consequence is
+// that this lineage's worktree won't be reclaimable by short-id lookup
+// (it stays under .git, invisible to git status).
+func writeLineageRunID(ctx context.Context, repoDir, root, fullRunID string, logSink io.Writer) {
+	wtDir, err := worktreesDir(ctx, repoDir)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"lineage_runid_write_degraded","root":%q,"detail":%q}`+"\n", root, err.Error())
+		return
+	}
+	if err := os.MkdirAll(wtDir, 0o755); err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"lineage_runid_write_degraded","root":%q,"detail":%q}`+"\n", root, err.Error())
+		return
+	}
+	if err := os.WriteFile(lineageRunIDPath(wtDir, root), []byte(fullRunID+"\n"), 0o644); err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"lineage_runid_write_degraded","root":%q,"detail":%q}`+"\n", root, err.Error())
+	}
+}
+
+// readLineageRunID reads the full run id recorded by writeLineageRunID,
+// returning "" when the sidecar is absent or unreadable.
+func readLineageRunID(wtDir, root string) string {
+	data, err := os.ReadFile(lineageRunIDPath(wtDir, root))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// sweepTerminalWorktrees reclaims any lineage worktree whose root run the
+// backend reports terminal-with-all-children-terminal (lineage_complete),
+// the host-side half of the #1137 teardown contract: fishhawkd is the
+// authority on lineage terminality (it can't reach the operator's
+// filesystem), so the runner performs the physical `git worktree remove`
+// lazily at the next provision. A worktree for a terminal lineage
+// therefore lingers until the next run on this host — acceptable: it lives
+// under .git, is invisible to git status, and is cheap.
+//
+// Called at provision start (before adding the new worktree). Entirely
+// best-effort: a missing run-id sidecar, a backend error, or a git error
+// logs a degradation event and is skipped — the sweep never fails the
+// stage, and never removes a worktree it can't prove is reclaimable.
+func sweepTerminalWorktrees(ctx context.Context, repoDir string, client lineageStatusClient, logSink io.Writer) {
+	if client == nil {
+		return
+	}
+	if repoDir == "" {
+		repoDir = "."
+	}
+	wtDir, err := worktreesDir(ctx, repoDir)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"worktree_sweep_degraded","detail":%q}`+"\n", err.Error())
+		return
+	}
+	paths, err := listWorktreePaths(ctx, repoDir)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"worktree_sweep_degraded","detail":%q}`+"\n", err.Error())
+		return
+	}
+	canonWTDir := canonPath(wtDir)
+	for _, p := range paths {
+		// Only sweep worktrees under our fishhawk-worktrees dir — never
+		// the operator's main checkout or an unrelated worktree.
+		if filepath.Dir(canonPath(p)) != canonWTDir {
+			continue
+		}
+		root, ok := strings.CutPrefix(filepath.Base(p), "run-")
+		if !ok {
+			continue
+		}
+		fullID := readLineageRunID(wtDir, root)
+		if fullID == "" {
+			// No sidecar → can't resolve the short name to a run id; leave
+			// the worktree rather than guess.
+			continue
+		}
+		complete, err := client.RunLineageComplete(ctx, fullID)
+		if err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"worktree_sweep_degraded","root":%q,"detail":%q}`+"\n", root, err.Error())
+			continue
+		}
+		if !complete {
+			continue
+		}
+		if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
+			"worktree", "remove", "--force", p).CombinedOutput(); err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"worktree_sweep_degraded","root":%q,"detail":%q}`+"\n",
+				root, strings.TrimSpace(string(out)))
+			continue
+		}
+		// Worktree gone — remove its sidecar + lock so the dir is clean.
+		_ = os.Remove(lineageRunIDPath(wtDir, root))
+		_ = os.Remove(filepath.Join(wtDir, "run-"+root+".lock"))
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"lineage_worktree_swept","root":%q,"path":%q}`+"\n", root, p)
+	}
 }
 
 // gitErr enriches an *exec.ExitError with its captured stderr so a git

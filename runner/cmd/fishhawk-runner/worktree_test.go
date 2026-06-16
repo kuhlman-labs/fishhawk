@@ -188,6 +188,151 @@ func TestProcessAlive(t *testing.T) {
 	}
 }
 
+func TestLineageRootFull(t *testing.T) {
+	const (
+		runID  = "11111111-2222-3333-4444-555555555555"
+		parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	)
+	if got := lineageRootFull(runID, ""); got != runID {
+		t.Errorf("solo lineageRootFull = %q, want %q", got, runID)
+	}
+	if got := lineageRootFull(runID, parent); got != parent {
+		t.Errorf("child lineageRootFull = %q, want %q", got, parent)
+	}
+}
+
+func TestWriteReadLineageRunID_RoundTrip(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	const (
+		root  = "abcd1234"
+		runID = "abcd1234-5678-90ab-cdef-1234567890ab"
+	)
+	writeLineageRunID(ctx, repo, root, runID, io.Discard)
+	wtDir, err := worktreesDir(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readLineageRunID(wtDir, root); got != runID {
+		t.Errorf("readLineageRunID = %q, want %q", got, runID)
+	}
+	// An absent sidecar reads back empty (the sweep then skips it).
+	if got := readLineageRunID(wtDir, "nopesuch"); got != "" {
+		t.Errorf("readLineageRunID(absent) = %q, want empty", got)
+	}
+}
+
+// fakeLineageClient reports lineage completion from a per-run-id map and
+// records every queried id.
+type fakeLineageClient struct {
+	complete map[string]bool
+	err      error
+	queried  []string
+}
+
+func (f *fakeLineageClient) RunLineageComplete(_ context.Context, runID string) (bool, error) {
+	f.queried = append(f.queried, runID)
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.complete[runID], nil
+}
+
+func TestSweepTerminalWorktrees_RemovesTerminalKeepsLive(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+
+	// Two lineages: "done" (terminal) and "live" (still running).
+	const (
+		doneRoot = "done0000"
+		doneID   = "done0000-0000-0000-0000-000000000000"
+		liveRoot = "live0000"
+		liveID   = "live0000-0000-0000-0000-000000000000"
+	)
+	donePath, err := provisionLineageWorktree(ctx, repo, doneRoot, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLineageRunID(ctx, repo, doneRoot, doneID, io.Discard)
+	livePath, err := provisionLineageWorktree(ctx, repo, liveRoot, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLineageRunID(ctx, repo, liveRoot, liveID, io.Discard)
+
+	client := &fakeLineageClient{complete: map[string]bool{doneID: true, liveID: false}}
+	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
+
+	// The terminal lineage's worktree + sidecar are gone; the live one stays.
+	if _, err := os.Stat(donePath); !os.IsNotExist(err) {
+		t.Errorf("terminal worktree still present: stat err = %v", err)
+	}
+	wtDir, _ := worktreesDir(ctx, repo)
+	if got := readLineageRunID(wtDir, doneRoot); got != "" {
+		t.Errorf("terminal lineage sidecar not removed: %q", got)
+	}
+	if st, err := os.Stat(livePath); err != nil || !st.IsDir() {
+		t.Errorf("live worktree was removed: %v", err)
+	}
+	if got := readLineageRunID(wtDir, liveRoot); got != liveID {
+		t.Errorf("live lineage sidecar removed: %q", got)
+	}
+	// Both lineages were queried by their FULL run id.
+	if len(client.queried) != 2 {
+		t.Errorf("queried = %v, want both lineage ids", client.queried)
+	}
+	// The operator's tracked tree stays clean throughout.
+	if status := gitPorcelain(t, repo); status != "" {
+		t.Errorf("operator git status not clean after sweep:\n%s", status)
+	}
+}
+
+func TestSweepTerminalWorktrees_SkipsWhenNoSidecar(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	const root = "nosc0000"
+	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No writeLineageRunID — the sweep can't resolve the short name to a
+	// run id, so it must leave the worktree and never query the backend.
+	client := &fakeLineageClient{complete: map[string]bool{}}
+	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
+	if st, err := os.Stat(path); err != nil || !st.IsDir() {
+		t.Errorf("worktree without a sidecar was removed: %v", err)
+	}
+	if len(client.queried) != 0 {
+		t.Errorf("queried backend without a sidecar: %v", client.queried)
+	}
+}
+
+func TestSweepTerminalWorktrees_BackendErrorIsBestEffort(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	const (
+		root  = "errr0000"
+		runID = "errr0000-0000-0000-0000-000000000000"
+	)
+	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLineageRunID(ctx, repo, root, runID, io.Discard)
+	client := &fakeLineageClient{err: errSweepProbe}
+	// Must not panic and must not remove the worktree on a backend error.
+	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
+	if st, err := os.Stat(path); err != nil || !st.IsDir() {
+		t.Errorf("worktree removed despite backend error: %v", err)
+	}
+}
+
+var errSweepProbe = errProbe("backend down")
+
+type errProbe string
+
+func (e errProbe) Error() string { return string(e) }
+
 // gitPorcelain returns `git status --porcelain` output for dir.
 func gitPorcelain(t *testing.T, dir string) string {
 	t.Helper()

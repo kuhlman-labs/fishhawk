@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -648,3 +649,72 @@ func extractStatusCommentID(payload json.RawMessage) int64 {
 	}
 	return p.GithubCommentID
 }
+
+// lineageChildScanLimit bounds the child-graph read lineageComplete
+// performs. Decomposition fan-outs are a handful of children per parent
+// (ADR-025); a generous cap reads every child in one page without
+// pagination while staying far under any pathological row count.
+const lineageChildScanLimit = 1000
+
+// lineageComplete computes the run's lineage-completion signal for the
+// single-run read (E22.X / #1137): true when the lineage-root run (a
+// decomposed child's parent, else the run itself) is terminal AND every
+// decomposed child of that root is terminal, derived from the existing
+// parent_run_id / decomposed_from child graph (see run.go:244-246). The
+// local-loop runner's worktree sweep reads it to reclaim a terminal
+// lineage's shared worktree (keyed on the lineage root) at the next
+// provision.
+//
+// Returns nil — the field is omitted — when no run repository is wired or
+// a parent/child read fails (best-effort, mirroring the Concerns / drive
+// degradation: never fail the run read over this advisory signal).
+func (s *Server) lineageComplete(ctx context.Context, runRow *run.Run) *bool {
+	if s.cfg.RunRepo == nil {
+		return nil
+	}
+	// Resolve the lineage root: a decomposed child's root is its parent;
+	// a solo run (or a decomposition parent) is its own root.
+	root := runRow
+	if runRow.DecomposedFrom != nil {
+		parent, err := s.cfg.RunRepo.GetRun(ctx, *runRow.DecomposedFrom)
+		if err != nil {
+			s.cfg.Logger.Warn("lineage_complete: get parent run failed; omitting field",
+				"run_id", runRow.ID.String(),
+				"parent_run_id", runRow.DecomposedFrom.String(),
+				"error", err.Error())
+			return nil
+		}
+		root = parent
+	}
+	if !root.State.IsTerminal() {
+		return boolPtr(false)
+	}
+	children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &root.ID,
+		Limit:          lineageChildScanLimit,
+	})
+	if err != nil {
+		s.cfg.Logger.Warn("lineage_complete: list children failed; omitting field",
+			"run_id", runRow.ID.String(),
+			"root_run_id", root.ID.String(),
+			"error", err.Error())
+		return nil
+	}
+	for _, c := range children {
+		// Guard each row is genuinely a child of root: redundant with the
+		// repo's decomposed_from filter in production, but keeps the count
+		// correct against a partial repo and naturally excludes the root
+		// itself (whose decomposed_from is nil).
+		if c.DecomposedFrom == nil || *c.DecomposedFrom != root.ID {
+			continue
+		}
+		if !c.State.IsTerminal() {
+			return boolPtr(false)
+		}
+	}
+	return boolPtr(true)
+}
+
+// boolPtr returns a pointer to b, for the optional *bool wire fields
+// that distinguish a computed value from an omitted one.
+func boolPtr(b bool) *bool { return &b }

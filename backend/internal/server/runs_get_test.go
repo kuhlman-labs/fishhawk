@@ -89,6 +89,78 @@ func TestGetRun_EchoesDrive(t *testing.T) {
 	}
 }
 
+// TestGetRun_LineageComplete asserts GET /v0/runs/{id} computes the
+// E22.X / #1137 lineage_complete signal across solo and decomposed
+// graphs: a terminal solo run is complete; a non-terminal run is not; a
+// decomposition parent (or any of its children) is complete only when the
+// root AND every child are terminal.
+func TestGetRun_LineageComplete(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	get := func(id uuid.UUID) *bool {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", id), nil)
+		s.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp runResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp.LineageComplete
+	}
+
+	// Solo, non-terminal → false.
+	solo, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+	})
+	solo.State = run.StateRunning
+	if lc := get(solo.ID); lc == nil || *lc {
+		t.Errorf("solo running: lineage_complete = %v, want false", lc)
+	}
+
+	// Solo, terminal, no children → true.
+	solo.State = run.StateSucceeded
+	if lc := get(solo.ID); lc == nil || !*lc {
+		t.Errorf("solo succeeded: lineage_complete = %v, want true", lc)
+	}
+
+	// Decomposition: a terminal parent with one terminal + one
+	// non-terminal child is incomplete; the child read resolves the same
+	// root via decomposed_from and agrees.
+	parent, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+	})
+	parent.State = run.StateSucceeded
+	childDone := &run.Run{ID: uuid.New(), Repo: "x/y", DecomposedFrom: &parent.ID, State: run.StateSucceeded}
+	childOpen := &run.Run{ID: uuid.New(), Repo: "x/y", DecomposedFrom: &parent.ID, State: run.StateRunning}
+	repo.runs[childDone.ID] = childDone
+	repo.runs[childOpen.ID] = childOpen
+
+	if lc := get(parent.ID); lc == nil || *lc {
+		t.Errorf("parent with open child: lineage_complete = %v, want false", lc)
+	}
+	if lc := get(childOpen.ID); lc == nil || *lc {
+		t.Errorf("open child: lineage_complete = %v, want false", lc)
+	}
+	if lc := get(childDone.ID); lc == nil || *lc {
+		t.Errorf("done child (sibling still open): lineage_complete = %v, want false", lc)
+	}
+
+	// Close the open child → the whole lineage is complete, read from
+	// either the parent or a child.
+	childOpen.State = run.StateFailed
+	if lc := get(parent.ID); lc == nil || !*lc {
+		t.Errorf("parent all-children-terminal: lineage_complete = %v, want true", lc)
+	}
+	if lc := get(childDone.ID); lc == nil || !*lc {
+		t.Errorf("child all-siblings-terminal: lineage_complete = %v, want true", lc)
+	}
+}
+
 func TestGetRun_NotFound(t *testing.T) {
 	s := newServer(t, newFakeRepo())
 	id := uuid.New()

@@ -195,6 +195,13 @@ type fakeUploader struct {
 	gotMCPTokenArgs  *upload.FetchMCPTokenArgs
 	gotRetryArgs     []upload.RetryStageArgs
 
+	// Lineage-completion read seam (#1137): lineageComplete maps a run id
+	// to its reported completion; lineageCompleteErr forces an error;
+	// gotLineageQueries records every queried id.
+	lineageComplete    map[string]bool
+	lineageCompleteErr error
+	gotLineageQueries  []string
+
 	// Scope-amendment refresh seam (#961): amendments is what
 	// FetchScopeAmendments returns; gotAmendmentArgs records the call
 	// so tests can assert the run-bound bearer is reused.
@@ -348,6 +355,17 @@ func (f *fakeUploader) FetchScopeAmendments(_ context.Context, args upload.Fetch
 func (f *fakeUploader) RetryStage(_ context.Context, args upload.RetryStageArgs) error {
 	f.gotRetryArgs = append(f.gotRetryArgs, args)
 	return f.retryStageErr
+}
+
+// RunLineageComplete stubs the #1137 lineage-completion read the worktree
+// sweep uses. Returns f.lineageComplete keyed by run id (default false);
+// records every queried id so tests can assert which lineages were checked.
+func (f *fakeUploader) RunLineageComplete(_ context.Context, runID string) (bool, error) {
+	f.gotLineageQueries = append(f.gotLineageQueries, runID)
+	if f.lineageCompleteErr != nil {
+		return false, f.lineageCompleteErr
+	}
+	return f.lineageComplete[runID], nil
 }
 
 // withFakeUploader swaps newUploadClient. Caller restores via

@@ -1186,3 +1186,50 @@ func (c *Client) RetryStage(ctx context.Context, args RetryStageArgs) error {
 		return statusError("retry stage", resp)
 	}
 }
+
+// RunLineageComplete reports whether the run's lineage is fully terminal —
+// the lineage-root run terminal AND every decomposed child terminal — by
+// reading the `lineage_complete` field off GET /v0/runs/{run_id} (E22.X /
+// #1137). The local-loop runner's worktree sweep calls it with a lineage
+// root's run id to decide whether to reclaim that lineage's shared
+// worktree.
+//
+// An absent `lineage_complete` field (an older backend that predates the
+// signal) decodes to false, so the sweep degrades to "not reclaimable"
+// and leaves the worktree in place rather than removing a possibly-live
+// checkout. Single-attempt and unsigned: the run read is an anonymous GET
+// on the local loop, and the sweep treats any error as best-effort (it
+// logs and skips), so retrying here would only delay provisioning.
+func (c *Client) RunLineageComplete(ctx context.Context, runID string) (bool, error) {
+	if runID == "" {
+		return false, errors.New("upload: run_id required")
+	}
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s", c.BaseURL, url.PathEscape(runID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, fmt.Errorf("upload: build run request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("upload: get run: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var out struct {
+			LineageComplete *bool `json:"lineage_complete"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return false, fmt.Errorf("upload: decode run response: %w", err)
+		}
+		return out.LineageComplete != nil && *out.LineageComplete, nil
+	case http.StatusNotFound:
+		return false, ErrNotFound
+	default:
+		return false, statusError("get run", resp)
+	}
+}

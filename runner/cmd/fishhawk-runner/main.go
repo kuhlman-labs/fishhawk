@@ -87,6 +87,7 @@ type uploadClient interface {
 	FetchMCPToken(ctx context.Context, args upload.FetchMCPTokenArgs) (*upload.FetchMCPTokenResult, error)
 	FetchScopeAmendments(ctx context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error)
 	RetryStage(ctx context.Context, args upload.RetryStageArgs) error
+	RunLineageComplete(ctx context.Context, runID string) (bool, error)
 }
 
 // newUploadClient returns the production uploadClient for the
@@ -336,12 +337,22 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if baseRepoDir == "" {
 			baseRepoDir = "."
 		}
+		// Reclaim worktrees of terminal lineages before provisioning a new
+		// one (#1137). Best-effort: it never fails the stage and never
+		// removes a worktree whose lineage the backend doesn't report
+		// complete.
+		sweepTerminalWorktrees(ctx, baseRepoDir, client, logSink)
 		wt, provErr := provisionLineageWorktree(ctx, baseRepoDir, root, logSink)
 		if provErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"worktree_provision","detail":%q}`+"\n", provErr.Error())
 			return exitFailure
 		}
+		// Record the lineage root's FULL run id beside the worktree so a
+		// later sweep can resolve the short `run-<root>` dir name back to a
+		// run id for the lineage_complete read (best-effort).
+		writeLineageRunID(ctx, baseRepoDir, root,
+			lineageRootFull(cfg.runID, cfg.decomposedFromRunID), logSink)
 		release, lockErr := acquireLineageLock(ctx, baseRepoDir, root, cfg.runID, logSink)
 		if lockErr != nil {
 			_, _ = fmt.Fprintf(logSink,
