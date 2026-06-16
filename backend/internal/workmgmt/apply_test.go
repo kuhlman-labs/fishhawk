@@ -61,7 +61,48 @@ func TestApply_ADRAllocatesNextNumberAndRendersPrefix(t *testing.T) {
 	if num != 36 {
 		t.Errorf("next ADR number = %d, want 36", num)
 	}
+	// The shipped default leaves numbering.pad unset, so the {number}
+	// substitution renders the bare integer ([ADR-36], not [ADR-036]).
+	// Zero-padding is an opt-in per-repo capability — see
+	// TestApply_ADRZeroPadsWhenPadConfigured (#1148).
 	if want := "[ADR-36] use postgres"; item.Title != want {
+		t.Errorf("title = %q, want %q", item.Title, want)
+	}
+}
+
+// TestApply_ADRZeroPadsWhenPadConfigured is the #1148 opt-in case: a repo
+// whose adr type sets numbering.pad: 3 renders the zero-padded [ADR-041]
+// form. It exercises the Numbering.Pad -> renderTitle %0*d chain against a
+// per-repo conventions that opts into padding (the shipped default leaves
+// pad unset, so this builds an explicit Pad:3 type rather than Default()).
+func TestApply_ADRZeroPadsWhenPadConfigured(t *testing.T) {
+	conv := Conventions{
+		Types: map[string]ItemType{
+			"adr": {
+				TitleFormat:   "[ADR-{number}] {summary}",
+				DefaultFields: DefaultFields{Complexity: "medium"},
+				Numbering:     &Numbering{Scheme: "sequential", Prefix: "ADR-", Pad: 3},
+				EpicLink:      "none",
+			},
+		},
+	}
+	existing := make([]int, 0, 40)
+	for n := 1; n <= 40; n++ {
+		existing = append(existing, n)
+	}
+	item, num, err := Apply(FilingRequest{
+		Type:            "adr",
+		Summary:         "zero-pad adr numbers",
+		Body:            "## Context\n\n…\n",
+		ExistingNumbers: existing,
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if num != 41 {
+		t.Errorf("next ADR number = %d, want 41", num)
+	}
+	if want := "[ADR-041] zero-pad adr numbers"; item.Title != want {
 		t.Errorf("title = %q, want %q", item.Title, want)
 	}
 }

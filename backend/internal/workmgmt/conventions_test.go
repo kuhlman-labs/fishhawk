@@ -57,6 +57,11 @@ func TestDefaultRoundTrip(t *testing.T) {
 	if adr.Numbering.Prefix != "ADR-" {
 		t.Errorf("types.adr.numbering.prefix = %q, want ADR-", adr.Numbering.Prefix)
 	}
+	// The shipped default leaves numbering.pad unset: ADR titles render
+	// unpadded ([ADR-36]). Padding is an opt-in per-repo capability (#1148).
+	if adr.Numbering.Pad != 0 {
+		t.Errorf("types.adr.numbering.pad = %d, want 0 (unpadded default, #1148)", adr.Numbering.Pad)
+	}
 	if d.Types["feature"].EpicLink != "required" {
 		t.Errorf("types.feature.epic_link = %q, want required", d.Types["feature"].EpicLink)
 	}

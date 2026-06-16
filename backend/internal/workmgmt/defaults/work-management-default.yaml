@@ -127,4 +127,7 @@ types:
     numbering:
       scheme: sequential
       prefix: ADR-
+      # `pad` (zero-pad width for the rendered {number}) is available per-repo
+      # but left unset in the shipped default: ADR titles render unpadded
+      # ([ADR-36]). A repo that wants the [ADR-041] form sets numbering.pad (#1148).
     epic_link: none
