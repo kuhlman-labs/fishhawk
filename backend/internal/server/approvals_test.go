@@ -1103,6 +1103,76 @@ func TestSubmitApproval_AddScopeFiles_OmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+// TestSubmitApproval_BindingAssertions_RecordedInAuditPayload pins the #1171
+// persistence seam: an approve carrying binding_assertions records those exact
+// typed checks under the `binding_assertions` key of the approval_submitted
+// audit payload, where the prompt builder reads them back. The
+// DisallowUnknownFields decoder accepting the field is implicitly proven by
+// the 200.
+func TestSubmitApproval_BindingAssertions_RecordedInAuditPayload(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","binding_assertions":[{"type":"file_contains","path":"backend/internal/yaml/pad.go","literal":"pad: 3"},{"type":"test_asserts","path":"backend/internal/yaml/pad_test.go","literal":"TestPad"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	raw, ok := payload["binding_assertions"].([]any)
+	if !ok {
+		t.Fatalf("binding_assertions missing or not an array: %v", payload["binding_assertions"])
+	}
+	if len(raw) != 2 {
+		t.Fatalf("binding_assertions len = %d, want 2: %v", len(raw), raw)
+	}
+	first, ok := raw[0].(map[string]any)
+	if !ok {
+		t.Fatalf("binding_assertions[0] not an object: %v", raw[0])
+	}
+	if first["type"] != "file_contains" || first["path"] != "backend/internal/yaml/pad.go" || first["literal"] != "pad: 3" {
+		t.Errorf("binding_assertions[0] = %v, want {file_contains, pad.go, pad: 3}", first)
+	}
+}
+
+// TestSubmitApproval_BindingAssertions_MalformedRejected confirms a malformed
+// declaration (here, an unknown type) is rejected 400 validation_failed BEFORE
+// any approval row is recorded, so a retry with a corrected declaration flows
+// normally.
+func TestSubmitApproval_BindingAssertions_MalformedRejected(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","binding_assertions":[{"type":"file_matches","path":"a/b.go","literal":"x"}]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on malformed binding_assertions:\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" {
+			t.Errorf("approval_submitted recorded despite malformed declaration: %v", e)
+		}
+	}
+}
+
+// TestSubmitApproval_BindingAssertions_OmittedWhenEmpty confirms the key is
+// absent when no assertions are supplied — the byte-identical no-declaration
+// path.
+func TestSubmitApproval_BindingAssertions_OmittedWhenEmpty(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"lgtm"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["binding_assertions"]; ok {
+		t.Errorf("binding_assertions should be absent when not supplied: %v", payload)
+	}
+}
+
 // fakeStageCheckRepo lets the approval-handler tests exercise the
 // blocking-check enforcement without touching Postgres. Returns
 // canned states keyed by (stage_id, check_name).

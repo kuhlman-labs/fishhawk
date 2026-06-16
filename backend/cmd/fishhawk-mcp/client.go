@@ -260,6 +260,11 @@ type approvalRequest struct {
 	// decoder on the backend requires the field be declared here too; reject
 	// and conditionless approve callers pass nil (omitempty).
 	AddScopeFiles []string `json:"add_scope_files,omitempty"`
+	// BindingAssertions is the operator-declared binding-assertion list (#1171)
+	// the backend validates pre-Submit and records on the approval audit
+	// payload. The DisallowUnknownFields decoder requires the field be declared
+	// here too; reject and assertion-less approve callers pass nil (omitempty).
+	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty"`
 }
 
 // approvalResult is the decoded 200 body of POST /v0/stages/{id}/
@@ -285,9 +290,14 @@ type approvalResult struct {
 // for issue-thread `@`-mention rendering while keeping the token
 // subject as the provenance identity. `addScopeFiles` is the structured
 // scope amendment (#824) folded into the implement stage's scope.files on
-// approve; nil on reject and conditionless approve. Returns the updated Stage. 4xx
+// approve; nil on reject and conditionless approve. `bindingAssertions` is the
+// operator-declared binding-assertion list (#1171) the backend validates
+// pre-Submit and records on the approval audit payload; nil on reject and
+// assertion-less approve. Returns the updated Stage. 4xx
 // surfaces:
-//   - 400 validation_failed (decision other than approve/reject)
+//   - 400 validation_failed (decision other than approve/reject; a malformed
+//     binding_assertions declaration — unknown type, empty literal, a
+//     test_asserts path not ending in _test.go)
 //   - 404 stage_not_found
 //   - 409 review_stage_managed_by_github (review-stage approvals
 //     live on GitHub per ADR-018; not relevant for the MCP plan-
@@ -307,12 +317,13 @@ type approvalResult struct {
 //     max_files_changed; re-scope the plan or include
 //     --override-scope-cap in the comment. Also pre-insert and
 //     override-retryable, same as plan_violates_budget)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string) (*approvalResult, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []BindingAssertion) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:            decision,
 		Comment:             comment,
 		ApproverGithubLogin: approverGithubLogin,
 		AddScopeFiles:       addScopeFiles,
+		BindingAssertions:   bindingAssertions,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)

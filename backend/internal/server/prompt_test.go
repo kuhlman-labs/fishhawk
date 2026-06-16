@@ -3824,3 +3824,172 @@ func TestResolveApprovalAddScopeFiles_ParentRunIDFallback(t *testing.T) {
 		}
 	})
 }
+
+// makeApproveWithBindingAssertionsEntry builds an approval_submitted audit
+// entry with decision=approve carrying the binding_assertions slice (#1171)
+// that loadApprovalBindingAssertions reads back.
+func makeApproveWithBindingAssertionsEntry(runID uuid.UUID, assertions []bindingAssertion) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"decision":           "approve",
+		"binding_assertions": assertions,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
+}
+
+// TestGetStagePrompt_Implement_BindingAssertionsEchoedOnResponse crosses the
+// full #1171 read-back seam: persisted approval_submitted.binding_assertions ->
+// resolveApprovalBindingAssertions -> promptResponse.BindingAssertions. The
+// declared assertions must surface verbatim on the rendered implement-prompt
+// response; a run with no declaration omits the field (byte-identical to today).
+func TestGetStagePrompt_Implement_BindingAssertionsEchoedOnResponse(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+	assertions := []bindingAssertion{
+		{Type: "file_contains", Path: "backend/internal/yaml/pad.go", Literal: "pad: 3"},
+		{Type: "test_asserts", Path: "backend/internal/yaml/pad_test.go", Literal: "TestPad"},
+	}
+
+	seed := func(t *testing.T, entries []*audit.Entry) promptResponse {
+		t.Helper()
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		planStageID := uuid.New()
+		implStageID := uuid.New()
+
+		p := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "scoped plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+			},
+		}
+		planBytes, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       planStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo:    &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: entries}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp
+	}
+
+	t.Run("declared assertions echoed on response", func(t *testing.T) {
+		resp := seed(t, []*audit.Entry{makeApproveWithBindingAssertionsEntry(uuid.New(), assertions)})
+		if !reflect.DeepEqual(resp.BindingAssertions, assertions) {
+			t.Errorf("resp.BindingAssertions = %#v, want %#v", resp.BindingAssertions, assertions)
+		}
+	})
+
+	t.Run("no declaration omits the field", func(t *testing.T) {
+		// An approval_submitted entry with no binding_assertions key.
+		entry := func() *audit.Entry {
+			payload, _ := json.Marshal(map[string]any{"decision": "approve"})
+			rid := uuid.New()
+			return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
+		}()
+		resp := seed(t, []*audit.Entry{entry})
+		if resp.BindingAssertions != nil {
+			t.Errorf("resp.BindingAssertions = %#v, want nil when none declared", resp.BindingAssertions)
+		}
+	})
+}
+
+// TestResolveApprovalBindingAssertions_ParentRunIDFallback mirrors the
+// add_scope_files fallback test for the #1171 binding_assertions slice across
+// the decomposition and #978 ParentRunID boundaries.
+func TestResolveApprovalBindingAssertions_ParentRunIDFallback(t *testing.T) {
+	parentID := uuid.New()
+	decompParentID := uuid.New()
+	own := []bindingAssertion{{Type: "file_contains", Path: "own/a.go", Literal: "x"}}
+	parent := []bindingAssertion{{Type: "file_contains", Path: "parent/b.go", Literal: "y"}}
+	decomp := []bindingAssertion{{Type: "test_asserts", Path: "decomp/d_test.go", Literal: "z"}}
+
+	newSrv := func(byRun map[uuid.UUID][]*audit.Entry) *Server {
+		return New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{byRunID: byRun}})
+	}
+
+	t.Run("own entries win over parent", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			runID:    {makeApproveWithBindingAssertionsEntry(runID, own)},
+			parentID: {makeApproveWithBindingAssertionsEntry(parentID, parent)},
+		})
+		got := s.resolveApprovalBindingAssertions(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID})
+		if !reflect.DeepEqual(got, own) {
+			t.Errorf("got %v, want own %v", got, own)
+		}
+	})
+
+	t.Run("parent inherited when own absent", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			parentID: {makeApproveWithBindingAssertionsEntry(parentID, parent)},
+		})
+		got := s.resolveApprovalBindingAssertions(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID})
+		if !reflect.DeepEqual(got, parent) {
+			t.Errorf("got %v, want parent %v", got, parent)
+		}
+	})
+
+	t.Run("DecomposedFrom precedence preserved", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{
+			decompParentID: {makeApproveWithBindingAssertionsEntry(decompParentID, decomp)},
+			parentID:       {makeApproveWithBindingAssertionsEntry(parentID, parent)},
+		})
+		got := s.resolveApprovalBindingAssertions(context.Background(), &run.Run{
+			ID: runID, ParentRunID: &parentID, DecomposedFrom: &decompParentID,
+		})
+		if !reflect.DeepEqual(got, decomp) {
+			t.Errorf("got %v, want decomposition parent's %v", got, decomp)
+		}
+	})
+
+	t.Run("nil when neither", func(t *testing.T) {
+		runID := uuid.New()
+		s := newSrv(map[uuid.UUID][]*audit.Entry{})
+		if got := s.resolveApprovalBindingAssertions(context.Background(), &run.Run{ID: runID, ParentRunID: &parentID}); got != nil {
+			t.Errorf("got %v, want nil", got)
+		}
+	})
+}

@@ -3849,6 +3849,56 @@ func TestApprovePlan_AddScopeFiles_PlumbedToSubmitApproval(t *testing.T) {
 	}
 }
 
+// TestApprovePlan_BindingAssertions_PlumbedToSubmitApproval pins the #1171
+// wire seam: ApprovePlanInput.BindingAssertions must reach the approvals
+// request body the backend decodes (MCP input -> client approvalRequest ->
+// HTTP body), with the type/path/literal tags preserved.
+func TestApprovePlan_BindingAssertions_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	assertions := []BindingAssertion{
+		{Type: "file_contains", Path: "backend/internal/yaml/pad.go", Literal: "pad: 3"},
+		{Type: "test_asserts", Path: "backend/internal/yaml/pad_test.go", Literal: "TestPad"},
+	}
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:             runID.String(),
+		Reason:            "enforce the pad invariant",
+		BindingAssertions: assertions,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !reflect.DeepEqual(fb.approvalsBody.BindingAssertions, assertions) {
+		t.Errorf("binding_assertions = %v, want %v", fb.approvalsBody.BindingAssertions, assertions)
+	}
+}
+
+// TestApprovePlan_NoBindingAssertions_OmitsFieldOnTheWire confirms the
+// byte-identical no-declaration path: an approve without binding_assertions
+// leaves the field nil on the request body the backend decodes.
+func TestApprovePlan_NoBindingAssertions_OmitsFieldOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.BindingAssertions != nil {
+		t.Errorf("binding_assertions = %v, want nil when none declared", fb.approvalsBody.BindingAssertions)
+	}
+}
+
 func TestRejectPlan_HappyPath_ResolvesAndPostsReject(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)

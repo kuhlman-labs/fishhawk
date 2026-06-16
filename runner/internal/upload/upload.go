@@ -356,6 +356,18 @@ type FetchedPrompt struct {
 	// Empty when no approved plan was available — the runner falls
 	// back to staging every change.
 	ScopeFiles []ScopeFile `json:"scope_files,omitempty"`
+	// BindingAssertions is the operator-declared binding-assertion list
+	// (#1171), echoed by the backend on implement stages only when an
+	// approved plan declared them. Each entry is a deterministic,
+	// post-implement substring check the runner evaluates against the
+	// committed scope-only tree before the push; an unsatisfied assertion
+	// fails the stage category-B. Empty (the byte-identical default) when
+	// no assertions were declared — the gate is a no-op. The json tags
+	// (type/path/literal) are byte-identical to the backend's
+	// bindingAssertion prompt-response struct so the declaration
+	// round-trips approve-request → audit payload → prompt-response →
+	// this decoder unchanged.
+	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty"`
 	// CommitAuthorName / CommitAuthorEmail are the GitHub App bot
 	// account's git commit identity, resolved backend-side from the App
 	// (slug + bot user-id) so App-backed commits attribute to the App's
@@ -395,6 +407,20 @@ type FetchedPrompt struct {
 type ScopeFile struct {
 	Path      string `json:"path"`
 	Operation string `json:"operation"`
+}
+
+// BindingAssertion is one entry in FetchedPrompt.BindingAssertions: a
+// typed, operator-declared deterministic substring check (#1171). v0
+// types are file_contains and test_asserts (the type field is a plain
+// string — an open enum validated backend-side at declaration time, so
+// the runner treats both identically and a future type decodes without a
+// wire-shape break). The json tags (type/path/literal) are byte-identical
+// to the backend's bindingAssertion struct, the runner↔backend wire
+// contract for the declaration round-trip.
+type BindingAssertion struct {
+	Type    string `json:"type"`
+	Path    string `json:"path"`
+	Literal string `json:"literal"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an

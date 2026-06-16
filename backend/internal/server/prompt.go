@@ -70,6 +70,15 @@ type promptResponse struct {
 	// when no approved plan is available (plan_missing_for_implement) —
 	// the runner falls back to staging every change.
 	ScopeFiles []scopeFile `json:"scope_files,omitempty"`
+	// BindingAssertions is the operator-declared binding-assertion list
+	// (#1171) echoed on implement stages so the runner can decode and
+	// evaluate each deterministic substring check against the committed
+	// scope-only tree post-implement (slice 2). Empty/omitted when no
+	// assertions were declared at approval time — byte-identical to today.
+	// Resolved across the decomposition fan-out boundary so children inherit
+	// the parent's declared assertions. The wire tags (type/path/literal)
+	// match the runner's upload.BindingAssertion decoder.
+	BindingAssertions []bindingAssertion `json:"binding_assertions,omitempty"`
 	// CommitAuthorName / CommitAuthorEmail are the GitHub App bot account's
 	// git commit identity, resolved from the App (slug + bot user-id) and
 	// echoed so the runner attributes App-backed commits to the App's bot
@@ -514,6 +523,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// issue-only template and emit `plan_missing_for_implement` so
 	// the audit log captures the gap.
 	var scopeFiles []scopeFile
+	var bindingAssertions []bindingAssertion
 	var fixup bool
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
@@ -547,6 +557,16 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		// Binding-assertion declaration (#1171): echo the operator's declared
+		// assertions on the implement prompt-response so the runner can decode
+		// and evaluate them post-implement (slice 2). Only when an approved
+		// plan exists — a plan_missing_for_implement fallback carries no
+		// declaration. Resolved across the decomposition fan-out boundary so
+		// children inherit the parent's assertions exactly as they inherit
+		// add_scope_files / ApprovalConditions.
+		if approvedPlan != nil {
+			bindingAssertions = s.resolveApprovalBindingAssertions(r.Context(), runRow)
+		}
 		// Fold the authoritative add_scope_files paths a reviewer named at
 		// approval time into the effective scope set (#824). This is the
 		// structured, lossless replacement for the #730 prose scrape: it
@@ -661,6 +681,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
 		ScopeFiles:           scopeFiles,
+		BindingAssertions:    bindingAssertions,
 		CommitAuthorName:     commitAuthorName,
 		CommitAuthorEmail:    commitAuthorEmail,
 		Fixup:                fixup,
@@ -745,6 +766,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	// issue-only template and emit `plan_missing_for_implement` so
 	// the audit log captures the gap.
 	var scopeFiles []scopeFile
+	var bindingAssertions []bindingAssertion
 	var fixup bool
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
@@ -778,6 +800,16 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		// Binding-assertion declaration (#1171): echo the operator's declared
+		// assertions on the implement prompt-response so the runner can decode
+		// and evaluate them post-implement (slice 2). Only when an approved
+		// plan exists — a plan_missing_for_implement fallback carries no
+		// declaration. Resolved across the decomposition fan-out boundary so
+		// children inherit the parent's assertions exactly as they inherit
+		// add_scope_files / ApprovalConditions.
+		if approvedPlan != nil {
+			bindingAssertions = s.resolveApprovalBindingAssertions(r.Context(), runRow)
+		}
 		// Fold the authoritative add_scope_files paths a reviewer named at
 		// approval time into the effective scope set (#824). This is the
 		// structured, lossless replacement for the #730 prose scrape: it
@@ -889,6 +921,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
 		ScopeFiles:           scopeFiles,
+		BindingAssertions:    bindingAssertions,
 		CommitAuthorName:     commitAuthorName,
 		CommitAuthorEmail:    commitAuthorEmail,
 		Fixup:                fixup,
@@ -2299,4 +2332,80 @@ func (s *Server) resolveApprovalAddScopeFiles(ctx context.Context, runRow *run.R
 		)
 	}
 	return paths
+}
+
+// loadApprovalBindingAssertions scans the run's approval_submitted audit
+// entries (newest-first) for the first entry where decision=="approve" and
+// returns its structured binding_assertions slice (#1171). Returns nil when
+// none is found. Best-effort: WARN-logs and returns nil on any error.
+func (s *Server) loadApprovalBindingAssertions(ctx context.Context, runID uuid.UUID) []bindingAssertion {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list approval_submitted for binding_assertions failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Decision          string             `json:"decision"`
+			BindingAssertions []bindingAssertion `json:"binding_assertions"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Decision == "approve" && len(payload.BindingAssertions) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded binding_assertions for implement prompt-response",
+				slog.String("run_id", runID.String()),
+				slog.Int("count", len(payload.BindingAssertions)),
+			)
+			return payload.BindingAssertions
+		}
+	}
+	return nil
+}
+
+// resolveApprovalBindingAssertions returns the operator-declared binding
+// assertions for an implement-stage prompt, resolving across the decomposition
+// fan-out boundary (#1171, mirroring resolveApprovalAddScopeFiles / #824). It
+// reads the run's own approval_submitted entries first; for a decomposed child
+// with no gate of its own that yields nil, so it falls back to the PARENT
+// run's declared assertions so they reach implement-only decomposed children.
+//
+// CI-retry / category-B recovery children (#978) carry ParentRunID instead of
+// DecomposedFrom and get the same single-level fallback: the parent's declared
+// assertions were part of its effective approval contract and must reach the
+// recovery implement stage too.
+func (s *Server) resolveApprovalBindingAssertions(ctx context.Context, runRow *run.Run) []bindingAssertion {
+	if a := s.loadApprovalBindingAssertions(ctx, runRow.ID); len(a) > 0 {
+		return a
+	}
+	if runRow.DecomposedFrom != nil {
+		a := s.loadApprovalBindingAssertions(ctx, *runRow.DecomposedFrom)
+		if len(a) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: inherited binding_assertions from decomposition parent",
+				slog.String("child_run_id", runRow.ID.String()),
+				slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+			)
+		}
+		return a
+	}
+	if runRow.ParentRunID == nil {
+		return nil
+	}
+	a := s.loadApprovalBindingAssertions(ctx, *runRow.ParentRunID)
+	if len(a) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: inherited binding_assertions from retry/recovery parent",
+			slog.String("child_run_id", runRow.ID.String()),
+			slog.String("parent_run_id", runRow.ParentRunID.String()),
+		)
+	}
+	return a
 }

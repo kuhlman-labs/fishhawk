@@ -563,6 +563,138 @@ func TestFetchPrompt_ScopeFilesOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesBindingAssertions confirms the client decodes the
+// backend's binding_assertions response field (#1171) into
+// FetchedPrompt.BindingAssertions, preserving type/path/literal order.
+func TestFetchPrompt_DecodesBindingAssertions(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"binding_assertions": [
+			{"type": "file_contains", "path": "internal/foo/layout.yaml", "literal": "pad: 3"},
+			{"type": "test_asserts", "path": "internal/foo/foo_test.go", "literal": "TestPadWidth"}
+		]
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if len(got.BindingAssertions) != 2 {
+		t.Fatalf("BindingAssertions len = %d, want 2: %+v", len(got.BindingAssertions), got.BindingAssertions)
+	}
+	if got.BindingAssertions[0] != (BindingAssertion{Type: "file_contains", Path: "internal/foo/layout.yaml", Literal: "pad: 3"}) {
+		t.Errorf("BindingAssertions[0] = %+v", got.BindingAssertions[0])
+	}
+	if got.BindingAssertions[1] != (BindingAssertion{Type: "test_asserts", Path: "internal/foo/foo_test.go", Literal: "TestPadWidth"}) {
+		t.Errorf("BindingAssertions[1] = %+v", got.BindingAssertions[1])
+	}
+}
+
+// TestFetchPrompt_BindingAssertionsOmittedWhenAbsent confirms BindingAssertions
+// decodes to nil when the backend omits the field (no declared assertions, or a
+// non-implement stage), so the runner's binding-assertion gate is a no-op —
+// byte-identical to behavior before #1171.
+func TestFetchPrompt_BindingAssertionsOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.BindingAssertions != nil {
+		t.Errorf("BindingAssertions = %+v, want nil when absent", got.BindingAssertions)
+	}
+}
+
+// TestBindingAssertions_BackendEmitRunnerDecodeRoundTrip pins the backend
+// prompt-response binding_assertions JSON serialization against this package's
+// FetchedPrompt decoder (#1171 approval condition 1), the binding-assertion
+// analogue of the gateevidence↔bundle wire-contract test. The backend's
+// server.bindingAssertion struct serializes with the json tags
+// type/path/literal; backendBindingAssertion below replicates that exact shape
+// (a runner test cannot import the backend module without inverting the
+// dependency, so the tags are mirrored here and pinned). Marshalling the
+// backend shape and decoding it through FetchedPrompt must reproduce the
+// declaration field-for-field; a silent zero value means a tag drifted across
+// the module boundary that per-side unit tests cannot catch.
+func TestBindingAssertions_BackendEmitRunnerDecodeRoundTrip(t *testing.T) {
+	// Mirror of backend server.bindingAssertion (json: type/path/literal).
+	type backendBindingAssertion struct {
+		Type    string `json:"type"`
+		Path    string `json:"path"`
+		Literal string `json:"literal"`
+	}
+	// Mirror of the relevant subset of the backend's promptResponse: the
+	// binding_assertions field carries the slice with omitempty, exactly as
+	// the runner's FetchedPrompt expects it.
+	type backendPromptResponse struct {
+		StageID           string                    `json:"stage_id"`
+		StageType         string                    `json:"stage_type"`
+		Prompt            string                    `json:"prompt"`
+		PromptHash        string                    `json:"prompt_hash"`
+		BindingAssertions []backendBindingAssertion `json:"binding_assertions,omitempty"`
+	}
+
+	emitted := backendPromptResponse{
+		StageID:    "stage-xyz",
+		StageType:  "implement",
+		Prompt:     "p",
+		PromptHash: "h",
+		BindingAssertions: []backendBindingAssertion{
+			{Type: "file_contains", Path: "docs/api/v0.md", Literal: "binding_assertions"},
+			{Type: "test_asserts", Path: "backend/internal/server/approvals_test.go", Literal: "TestApprove_RecordsBindingAssertions"},
+		},
+	}
+	wire, err := json.Marshal(emitted)
+	if err != nil {
+		t.Fatalf("marshal backend prompt-response: %v", err)
+	}
+
+	var decoded FetchedPrompt
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatalf("decode into FetchedPrompt: %v", err)
+	}
+	if len(decoded.BindingAssertions) != len(emitted.BindingAssertions) {
+		t.Fatalf("decoded %d assertions, want %d (wire: %s)",
+			len(decoded.BindingAssertions), len(emitted.BindingAssertions), wire)
+	}
+	for i, want := range emitted.BindingAssertions {
+		got := decoded.BindingAssertions[i]
+		if got.Type != want.Type || got.Path != want.Path || got.Literal != want.Literal {
+			t.Errorf("assertion[%d] = %+v, want {%s %s %s} — wire tag drift",
+				i, got, want.Type, want.Path, want.Literal)
+		}
+	}
+
+	// And the reverse: the runner's BindingAssertion must marshal back to the
+	// same wire keys, so the contract holds in both directions.
+	reMarshaled, err := json.Marshal(decoded.BindingAssertions[0])
+	if err != nil {
+		t.Fatalf("marshal runner BindingAssertion: %v", err)
+	}
+	var backFromRunner backendBindingAssertion
+	if err := json.Unmarshal(reMarshaled, &backFromRunner); err != nil {
+		t.Fatalf("decode runner-marshaled assertion into backend shape: %v", err)
+	}
+	if backFromRunner != emitted.BindingAssertions[0] {
+		t.Errorf("runner→backend re-decode = %+v, want %+v", backFromRunner, emitted.BindingAssertions[0])
+	}
+}
+
 // TestFetchPrompt_DecodesFixup confirms the client decodes the backend's
 // fixup/fixup_branch response fields (#762) so the runner routes a fix-up
 // pass's commit onto the existing PR branch.

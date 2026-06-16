@@ -739,6 +739,10 @@ func gateEvidenceLine(t *testing.T, seq int) Line {
 				"files":      []string{".github/workflows/ci.yml"},
 			},
 		},
+		"binding_assertions": []map[string]any{
+			{"type": "file_contains", "path": "docs/api/v0.md", "literal": "binding_assertions", "satisfied": true},
+			{"type": "test_asserts", "path": "x_test.go", "literal": "TestX", "satisfied": false},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -815,6 +819,19 @@ func TestExtractGateEvidence_HappyPath(t *testing.T) {
 		pv.Detail != "path matches forbidden glob" ||
 		len(pv.Files) != 1 || pv.Files[0] != ".github/workflows/ci.yml" {
 		t.Errorf("PolicyViolations[0] = %+v, want the forbidden_paths entry", pv)
+	}
+	// Binding-assertion evidence (#1171) round-trips the runner's
+	// binding_assertions digest field-for-field — a silent zero value here
+	// means the runner↔backend wire tags diverged.
+	if len(got.BindingAssertions) != 2 {
+		t.Fatalf("got %d binding assertions, want 2", len(got.BindingAssertions))
+	}
+	wantBA := BindingAssertionEvidence{Type: "file_contains", Path: "docs/api/v0.md", Literal: "binding_assertions", Satisfied: true}
+	if got.BindingAssertions[0] != wantBA {
+		t.Errorf("BindingAssertions[0] = %+v, want %+v", got.BindingAssertions[0], wantBA)
+	}
+	if got.BindingAssertions[1].Type != "test_asserts" || got.BindingAssertions[1].Satisfied {
+		t.Errorf("BindingAssertions[1] = %+v, want test_asserts satisfied=false", got.BindingAssertions[1])
 	}
 }
 

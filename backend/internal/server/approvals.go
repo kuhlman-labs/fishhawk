@@ -52,6 +52,18 @@ type approvalRequest struct {
 	// the #730 prose fold remains as a fallback. Declared here so the
 	// DisallowUnknownFields decode accepts it; callers omit it (omitempty).
 	AddScopeFiles []string `json:"add_scope_files,omitempty"`
+	// BindingAssertions is an OPTIONAL list of operator-declared,
+	// deterministic binding-assertion checks (#1171). Each is a typed
+	// substring assertion (file_contains | test_asserts) the operator
+	// attaches at approval time so an explicit approval condition becomes
+	// machine-checkable post-implement. Recorded on the approval audit
+	// payload alongside add_scope_files and echoed on the implement
+	// prompt-response; the runner decodes and evaluates them (slice 2).
+	// Declared here so the DisallowUnknownFields decode accepts it; callers
+	// omit it (omitempty) and stay byte-identical to today. Validated
+	// pre-Submit via validateBindingAssertions — no enforcement happens at
+	// approve time, only declaration validation.
+	BindingAssertions []bindingAssertion `json:"binding_assertions,omitempty"`
 	// Delegated opts the submission into the ADR-040 delegated-action
 	// path (#1026): the operator agent asserts it acts under the
 	// workflow's operator_agent.may_approve knob. The server NEVER
@@ -226,6 +238,21 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		delegatedRule = rule
 	}
 
+	// Binding-assertion declaration validation (#1171): when an approve
+	// carries binding_assertions, validate the typed open enum BEFORE
+	// ApprovalRepo.Submit — like the other pre-Submit gates, a malformed
+	// declaration inserts no approval row, so a retry with a corrected
+	// declaration flows normally. No enforcement runs here; the runner
+	// evaluates the assertions post-implement (slice 2). Reject/empty
+	// approves skip this and stay byte-identical to today.
+	if decision == approval.DecisionApprove && len(req.BindingAssertions) > 0 {
+		if err := validateBindingAssertions(req.BindingAssertions); err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				err.Error(), map[string]any{"field": "binding_assertions"})
+			return
+		}
+	}
+
 	// ADR-036 (#875): refuse a plan-stage approve while a configured
 	// agent plan review is still in-flight. Placed BEFORE
 	// ApprovalRepo.Submit (not in the res.Inserted block) so a refused
@@ -306,7 +333,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles, delegatedRule)
+	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles, req.BindingAssertions, delegatedRule)
 
 	// Hand off to the orchestrator on both approve AND reject
 	// — approve dispatches the next stage; reject walks the
@@ -603,7 +630,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // delegated path (#1026) and the payload records `delegated: "<rule>"`
 // — the condition checkDelegation re-evaluated and found met. Token-
 // subject attribution for the operator agent is #1027's scope.
-func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, delegatedRule string) {
+func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule string) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -631,6 +658,14 @@ func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *appr
 	// the prompt builder reads this back via loadApprovalAddScopeFiles.
 	if app.Decision == approval.DecisionApprove && len(addScopeFiles) > 0 {
 		auditPayload["add_scope_files"] = addScopeFiles
+	}
+	// Binding-assertion declaration (#1171): record the operator's declared
+	// assertions so the prompt builder reads them back via
+	// loadApprovalBindingAssertions. Only on approve with a non-empty slice;
+	// the key is omitted otherwise so a no-declaration approve is
+	// byte-identical to today.
+	if app.Decision == approval.DecisionApprove && len(bindingAssertions) > 0 {
+		auditPayload["binding_assertions"] = bindingAssertions
 	}
 	if delegatedRule != "" {
 		auditPayload["delegated"] = delegatedRule

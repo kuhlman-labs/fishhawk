@@ -719,6 +719,15 @@ func buildImplement(t Trigger) string {
 	writeGitOpsProhibition(&b)
 	b.WriteString("\n")
 	b.WriteString("When the runner finishes, it will collect the diff, ship the trace bundle to Fishhawk, push your changes to a branch, and open the PR using the title + body you wrote.\n")
+
+	// Binding-conditions reinforcement (#1171, ask-1): restate the operator's
+	// approval conditions verbatim at the TAIL of the prompt and instruct the
+	// agent to confirm each one explicitly in its PR Notes. Complementary to
+	// the pre-plan writeApprovalConditions block above — repetition at the end
+	// counters the implement agent disregarding the #558-injected conditions.
+	// Guarded by the same nil check, so it is a byte-identical no-op when no
+	// conditions were attached.
+	writeApprovalConditionsReinforcement(&b, t)
 	return b.String()
 }
 
@@ -740,6 +749,30 @@ func writeApprovalConditions(b *strings.Builder, t Trigger) {
 	b.WriteString("The operator approved this plan with the following conditions. These conditions AMEND the plan, are MANDATORY, and win on conflict with plan steps:\n\n")
 	b.WriteString(ac)
 	b.WriteString("\n\n")
+}
+
+// writeApprovalConditionsReinforcement renders the tail "### Binding
+// conditions — confirm each in your PR Notes" block (#1171, ask-1). It
+// restates the operator's approval conditions verbatim and instructs the agent
+// to confirm each one explicitly in its PR Notes, reusing the same 4000-byte
+// cap and nil guard as writeApprovalConditions so it is a byte-identical no-op
+// when no conditions were attached. Repeating the conditions at the END of the
+// prompt — after the agent has read the plan and the task — counters the
+// implement agent disregarding the conditions injected near the top (the #1171
+// failure mode).
+func writeApprovalConditionsReinforcement(b *strings.Builder, t Trigger) {
+	if t.ApprovalConditions == nil {
+		return
+	}
+	ac := *t.ApprovalConditions
+	const maxConditionBytes = 4000
+	if len(ac) > maxConditionBytes {
+		ac = ac[:maxConditionBytes] + "...[truncated]"
+	}
+	b.WriteString("\n### Binding conditions — confirm each in your PR Notes\n\n")
+	b.WriteString("Before you finish, re-read the operator's binding approval conditions below. They are MANDATORY and win on conflict with the plan. In your PR `## Notes` section, add a numbered checklist that restates each condition and states explicitly how your change satisfies it (or, if a condition could not be met, say so and why):\n\n")
+	b.WriteString(ac)
+	b.WriteString("\n")
 }
 
 // writeFixupConcerns renders the binding "### Fix-up concerns" block (#762)
