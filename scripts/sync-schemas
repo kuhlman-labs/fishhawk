@@ -10,6 +10,12 @@ for schema in "$REPO_ROOT"/docs/spec/*.schema.json; do
       cp "$schema" "$REPO_ROOT/backend/internal/plan/schemas/$base"
       cp "$schema" "$REPO_ROOT/runner/internal/plan/schemas/$base"
       ;;
+    clarification-request-*.schema.json)
+      # The standard_v1 SIBLING schema (#1080) is embedded into the
+      # backend plan validator only; the runner handles the
+      # clarification_request outcome semantically and does not embed it.
+      cp "$schema" "$REPO_ROOT/backend/internal/plan/schemas/$base"
+      ;;
     workflow-v*.schema.json)
       cp "$schema" "$REPO_ROOT/backend/internal/spec/schemas/$base"
       cp "$schema" "$REPO_ROOT/cli/internal/spec/schemas/$base"
