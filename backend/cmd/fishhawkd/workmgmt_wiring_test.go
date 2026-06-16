@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
+	workmgmtjira "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/jira"
 )
 
 // stubTokenProvider is a fixed-token githubapp.TokenProvider for wiring the
@@ -50,13 +52,24 @@ var _ workmgmtgithub.FeedbackAPI = feedbackAPIAdapter{}
 // BOTH registries carry github_projects, directly pinning the registration
 // production lacked (#1104).
 func TestRegisterWorkmgmtProviders_RegistersGitHubProjects(t *testing.T) {
-	registerWorkmgmtProviders(&githubclient.Client{})
+	registerWorkmgmtProviders(&githubclient.Client{}, nil)
 
 	if !slices.Contains(workmgmt.Registered(), workmgmtgithub.ProviderName) {
 		t.Errorf("work-item registry = %v, want it to contain %q", workmgmt.Registered(), workmgmtgithub.ProviderName)
 	}
 	if !slices.Contains(workmgmt.RegisteredFeedback(), workmgmtgithub.FeedbackProviderName) {
 		t.Errorf("feedback registry = %v, want it to contain %q", workmgmt.RegisteredFeedback(), workmgmtgithub.FeedbackProviderName)
+	}
+}
+
+// TestRegisterWorkmgmtProviders_RegistersJira asserts a configured Jira
+// client registers the jira work-item provider, independently of GitHub:
+// passing a nil GitHub client must still register jira (#1094).
+func TestRegisterWorkmgmtProviders_RegistersJira(t *testing.T) {
+	registerWorkmgmtProviders(nil, jiraclient.New("https://acme.atlassian.net", "e@x.com", "tok"))
+
+	if !slices.Contains(workmgmt.Registered(), workmgmtjira.ProviderName) {
+		t.Errorf("work-item registry = %v, want it to contain %q", workmgmt.Registered(), workmgmtjira.ProviderName)
 	}
 }
 
@@ -70,7 +83,7 @@ func TestRegisterWorkmgmtProviders_NilClientNoOp(t *testing.T) {
 	beforeWork := slices.Clone(workmgmt.Registered())
 	beforeFeedback := slices.Clone(workmgmt.RegisteredFeedback())
 
-	registerWorkmgmtProviders(nil)
+	registerWorkmgmtProviders(nil, nil)
 
 	if got := workmgmt.Registered(); !slices.Equal(got, beforeWork) {
 		t.Errorf("work-item registry changed on nil client: before=%v after=%v", beforeWork, got)
