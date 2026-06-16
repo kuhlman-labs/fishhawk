@@ -91,6 +91,17 @@ type runResponse struct {
 	// (fail-closed — today's responses byte-identical), on terminal
 	// runs, and best-effort on any evaluation failure.
 	Delegation *runDelegationPayload `json:"delegation,omitempty"`
+	// LineageComplete is the run's lineage-completion signal (E22.X /
+	// #1137): true when the lineage-root run (a decomposed child's
+	// parent, else the run itself) is terminal AND every decomposed
+	// child of that root is terminal. The local-loop runner's worktree
+	// sweep reads it to reclaim a terminal lineage's shared worktree at
+	// the next provision. Populated by handleGetRun ONLY (a per-run
+	// child-graph query, same single-read posture as Concerns); a
+	// pointer so omitempty omits it on the list endpoint and whenever
+	// the graph can't be read (no run repo / read failure), while still
+	// distinguishing a computed false from absent.
+	LineageComplete *bool `json:"lineage_complete,omitempty"`
 }
 
 // runNextActionPayload mirrors drive.NextAction on the wire. Kept
@@ -735,6 +746,10 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// spec declares no operator_agent block, on terminal runs, and
 	// best-effort on any evaluation failure.
 	resp.Delegation = s.buildDelegationPayload(r.Context(), got)
+	// Lineage-completion signal (E22.X / #1137): single-run read ONLY,
+	// same posture as Concerns. Omitted (nil) when no run repo is wired
+	// or the child-graph read fails (best-effort).
+	resp.LineageComplete = s.lineageComplete(r.Context(), got)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 

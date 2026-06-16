@@ -171,7 +171,11 @@ type Line struct {
 // gitDiffPayload (runner/cmd/fishhawk-runner/main.go) — this is the
 // runner↔backend wire contract, not a JSON Schema, so the two sides
 // move in lockstep. Patch is additive: older bundles omit it and
-// decode to an empty string (#585).
+// decode to an empty string (#585). Insertions/Deletions are likewise
+// additive and `omitempty` (#1137): they carry the staged-diff numstat
+// totals so the MCP server reports diff stats from the event rather than
+// re-deriving them from the operator checkout's HEAD, which per-run
+// worktree isolation no longer carries the run's commit.
 type gitDiffPayload struct {
 	Kind           string         `json:"kind"`
 	BaseRef        string         `json:"base_ref"`
@@ -179,6 +183,8 @@ type gitDiffPayload struct {
 	NumFiles       int            `json:"num_files"`
 	Patch          string         `json:"patch,omitempty"`
 	PatchTruncated bool           `json:"patch_truncated,omitempty"`
+	Insertions     int            `json:"insertions,omitempty"`
+	Deletions      int            `json:"deletions,omitempty"`
 }
 
 type gitDiffEntry struct {

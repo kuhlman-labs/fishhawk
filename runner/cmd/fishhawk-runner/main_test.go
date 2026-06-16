@@ -76,6 +76,16 @@ type fakeInvoker struct {
 	// loop tests (#651) use it to mutate the working tree between invocations
 	// so the committed scope-only tree changes across iterations.
 	onInvoke func(callIdx int, inv agent.Invocation)
+
+	// mirrorWorkingTreeFrom, when set, mirrors that directory's working-tree
+	// files (excluding .git) into the Invocation's WorkingDir AFTER each
+	// onInvoke. Per-run worktree isolation (#1137) relocates WorkingDir into a
+	// fresh detached checkout, so tests that simulate the agent by writing
+	// edits into the operator checkout must have those edits reflected into the
+	// isolated worktree — exactly as the real agent edits inside the worktree.
+	// Set this to the test's operator repo so its mustWrite-to-repo seeds and
+	// onInvoke fixes land where the runner's git sequence reads them.
+	mirrorWorkingTreeFrom string
 }
 
 func (f *fakeInvoker) Invoke(_ context.Context, inv agent.Invocation) (agent.Result, error) {
@@ -85,6 +95,10 @@ func (f *fakeInvoker) Invoke(_ context.Context, inv agent.Invocation) (agent.Res
 	f.callIdx++
 	if f.onInvoke != nil {
 		f.onInvoke(idx, inv)
+	}
+	if f.mirrorWorkingTreeFrom != "" && inv.WorkingDir != "" &&
+		f.mirrorWorkingTreeFrom != inv.WorkingDir {
+		mirrorWorkingTree(f.mirrorWorkingTreeFrom, inv.WorkingDir)
 	}
 	if len(f.cannedSeq) > 0 {
 		si := idx
@@ -98,6 +112,42 @@ func (f *fakeInvoker) Invoke(_ context.Context, inv agent.Invocation) (agent.Res
 		return f.cannedSeq[si], err
 	}
 	return f.canned, f.returnErr
+}
+
+// mirrorWorkingTree copies every regular file under src (excluding the .git
+// directory) into dst, preserving relative paths. It models the agent
+// producing its edits inside the isolated run worktree (#1137): tests write
+// their simulated edits into the operator checkout, and this reflects them
+// into inv.WorkingDir where the runner's git sequence reads them. Panics on
+// any IO error — a copy failure is a broken test, not a tolerated condition.
+func mirrorWorkingTree(src, dst string) {
+	err := filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
+	if err != nil {
+		panic(fmt.Sprintf("mirrorWorkingTree %s -> %s: %v", src, dst, err))
+	}
 }
 
 // withFakeInvoker swaps the package's newInvoker for one that
@@ -144,6 +194,13 @@ type fakeUploader struct {
 	gotInstTokenArgs *upload.FetchInstallationTokenArgs
 	gotMCPTokenArgs  *upload.FetchMCPTokenArgs
 	gotRetryArgs     []upload.RetryStageArgs
+
+	// Lineage-completion read seam (#1137): lineageComplete maps a run id
+	// to its reported completion; lineageCompleteErr forces an error;
+	// gotLineageQueries records every queried id.
+	lineageComplete    map[string]bool
+	lineageCompleteErr error
+	gotLineageQueries  []string
 
 	// Scope-amendment refresh seam (#961): amendments is what
 	// FetchScopeAmendments returns; gotAmendmentArgs records the call
@@ -298,6 +355,17 @@ func (f *fakeUploader) FetchScopeAmendments(_ context.Context, args upload.Fetch
 func (f *fakeUploader) RetryStage(_ context.Context, args upload.RetryStageArgs) error {
 	f.gotRetryArgs = append(f.gotRetryArgs, args)
 	return f.retryStageErr
+}
+
+// RunLineageComplete stubs the #1137 lineage-completion read the worktree
+// sweep uses. Returns f.lineageComplete keyed by run id (default false);
+// records every queried id so tests can assert which lineages were checked.
+func (f *fakeUploader) RunLineageComplete(_ context.Context, runID string) (bool, error) {
+	f.gotLineageQueries = append(f.gotLineageQueries, runID)
+	if f.lineageCompleteErr != nil {
+		return false, f.lineageCompleteErr
+	}
+	return f.lineageComplete[runID], nil
 }
 
 // withFakeUploader swaps newUploadClient. Caller restores via
@@ -1217,7 +1285,7 @@ func TestMakeGitDiffEvent_CarriesPatch(t *testing.T) {
 	d := constraint.Diff{ChangedFiles: []constraint.ChangedFile{
 		{Path: "a.go", Status: constraint.StatusModified},
 	}}
-	ev := makeGitDiffEvent("main", d, "diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-x\n+y\n", true)
+	ev := makeGitDiffEventStats("main", d, "diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-x\n+y\n", true, 12, 4)
 
 	var payload gitDiffPayload
 	if err := json.Unmarshal(ev.Payload, &payload); err != nil {
@@ -1229,7 +1297,12 @@ func TestMakeGitDiffEvent_CarriesPatch(t *testing.T) {
 	if !payload.PatchTruncated {
 		t.Error("payload.PatchTruncated = false, want true")
 	}
-	// Absent patch round-trips to the empty/false zero values.
+	// Numstat totals (#1137) ride on the event so the MCP server reads
+	// diff stats without re-shelling git in the operator checkout.
+	if payload.Insertions != 12 || payload.Deletions != 4 {
+		t.Errorf("payload ins/dels = %d/%d, want 12/4", payload.Insertions, payload.Deletions)
+	}
+	// The zero-arg shim omits the numstat (and patch) — zero values.
 	ev2 := makeGitDiffEvent("main", d, "", false)
 	var payload2 gitDiffPayload
 	if err := json.Unmarshal(ev2.Payload, &payload2); err != nil {
@@ -5469,7 +5542,14 @@ func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeInfraExhausted(t *testing
 // tree. fixup toggles the fix-up prompt path; decomposed routes the run as a
 // decomposed child (the gate is excluded on that path). fixup and decomposed
 // are mutually exclusive.
-func captureImplementVerifyCommit(t *testing.T, repo string, fixup, decomposed bool) func(context.Context, string, []string) error {
+// captureImplementVerifyCommit returns the VerifyCommit closure the runner
+// wired into CommitAndPush, AND the worktree directory the closure operates
+// on. Per-run worktree isolation (#1137) relocates cfg.workingDir into a
+// lineage worktree, so the closure inspects THAT tree — callers must stage
+// their drift shapes there (the returned dir), not in the operator checkout.
+// The worktree path is deterministic from the (fixed) run id and the repo's
+// shared gitdir.
+func captureImplementVerifyCommit(t *testing.T, repo string, fixup, decomposed bool) (string, func(context.Context, string, []string) error) {
 	t.Helper()
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
@@ -5508,7 +5588,16 @@ func captureImplementVerifyCommit(t *testing.T, repo string, fixup, decomposed b
 	if fp.gotArgs == nil || fp.gotArgs.VerifyCommit == nil {
 		t.Fatal("VerifyCommit hook not captured")
 	}
-	return fp.gotArgs.VerifyCommit
+	// Recompute the lineage worktree dir the closure was bound to (#1137).
+	root := lineageRoot("11111111-2222-3333-4444-555555555555", "")
+	if decomposed {
+		root = lineageRoot("11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	}
+	wtParent, err := worktreesDir(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("worktreesDir: %v", err)
+	}
+	return filepath.Join(wtParent, "run-"+root), fp.gotArgs.VerifyCommit
 }
 
 // TestRun_ImplementStage_FixupCreatedOutOfScopeGate exercises the
@@ -5531,10 +5620,10 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
 		runGit("add", "-A")
 		runGit("commit", "-m", "init")
-		mustWrite(t, filepath.Join(repo, "newfile.go"), "package x\n") // untracked, out of scope
 		head := gitHead(t, repo)
 
-		vc := captureImplementVerifyCommit(t, repo, true, false)
+		wt, vc := captureImplementVerifyCommit(t, repo, true, false)
+		mustWrite(t, filepath.Join(wt, "newfile.go"), "package x\n") // untracked, out of scope
 		err := vc(context.Background(), head, []string{"newfile.go"})
 		if !errors.Is(err, gitops.ErrFixupCreatedOutOfScope) {
 			t.Fatalf("err = %v, want ErrFixupCreatedOutOfScope", err)
@@ -5553,7 +5642,7 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 		runGit("commit", "-m", "init")
 		head := gitHead(t, repo)
 
-		vc := captureImplementVerifyCommit(t, repo, true, false)
+		_, vc := captureImplementVerifyCommit(t, repo, true, false)
 		if err := vc(context.Background(), head, nil); err != nil {
 			t.Errorf("empty drift must pass the gate, got: %v", err)
 		}
@@ -5567,10 +5656,10 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
 		runGit("add", "-A")
 		runGit("commit", "-m", "init")
-		mustWrite(t, filepath.Join(repo, "README.md"), "# modified\n") // tracked, modified
 		head := gitHead(t, repo)
 
-		vc := captureImplementVerifyCommit(t, repo, true, false)
+		wt, vc := captureImplementVerifyCommit(t, repo, true, false)
+		mustWrite(t, filepath.Join(wt, "README.md"), "# modified\n") // tracked, modified
 		if err := vc(context.Background(), head, []string{"README.md"}); err != nil {
 			t.Errorf("modified-out-of-scope drift must stay flag-only, got: %v", err)
 		}
@@ -5585,10 +5674,10 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
 		runGit("add", "-A")
 		runGit("commit", "-m", "init")
-		mustWrite(t, filepath.Join(repo, "newfile.go"), "package x\n") // untracked, out of scope
 		head := gitHead(t, repo)
 
-		vc := captureImplementVerifyCommit(t, repo, false, false)
+		wt, vc := captureImplementVerifyCommit(t, repo, false, false)
+		mustWrite(t, filepath.Join(wt, "newfile.go"), "package x\n") // untracked, out of scope
 		err := vc(context.Background(), head, []string{"newfile.go"})
 		if !errors.Is(err, gitops.ErrCreatedOutOfScope) {
 			t.Fatalf("err = %v, want ErrCreatedOutOfScope", err)
@@ -5614,10 +5703,10 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
 		runGit("add", "-A")
 		runGit("commit", "-m", "init")
-		mustWrite(t, filepath.Join(repo, "README.md"), "# modified\n") // tracked, modified
 		head := gitHead(t, repo)
 
-		vc := captureImplementVerifyCommit(t, repo, false, false)
+		wt, vc := captureImplementVerifyCommit(t, repo, false, false)
+		mustWrite(t, filepath.Join(wt, "README.md"), "# modified\n") // tracked, modified
 		if err := vc(context.Background(), head, []string{"README.md"}); err != nil {
 			t.Errorf("modified-out-of-scope drift must stay flag-only on the open-PR path, got: %v", err)
 		}
@@ -5631,7 +5720,7 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 		runGit("commit", "-m", "init")
 		head := gitHead(t, repo)
 
-		vc := captureImplementVerifyCommit(t, repo, false, false)
+		_, vc := captureImplementVerifyCommit(t, repo, false, false)
 		if err := vc(context.Background(), head, nil); err != nil {
 			t.Errorf("empty drift must pass the open-PR gate, got: %v", err)
 		}
@@ -5647,10 +5736,10 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 		mustWrite(t, filepath.Join(repo, "README.md"), "# init\n")
 		runGit("add", "-A")
 		runGit("commit", "-m", "init")
-		mustWrite(t, filepath.Join(repo, "newfile.go"), "package x\n") // untracked, out of scope
 		head := gitHead(t, repo)
 
-		vc := captureImplementVerifyCommit(t, repo, false, true)
+		wt, vc := captureImplementVerifyCommit(t, repo, false, true)
+		mustWrite(t, filepath.Join(wt, "newfile.go"), "package x\n") // untracked, out of scope
 		if err := vc(context.Background(), head, []string{"newfile.go"}); err != nil {
 			t.Errorf("decomposed-child push must not trip the created-out-of-scope gate, got: %v", err)
 		}
@@ -6072,7 +6161,8 @@ func TestRun_VerifyFixLoop_FailThenPass_CommittedTree(t *testing.T) {
 		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
 
 	invoker := &fakeInvoker{
-		canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		mirrorWorkingTreeFrom: repo, // reflect agent edits into the isolated worktree (#1137)
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
 		onInvoke: func(idx int, _ agent.Invocation) {
 			// idx 0 is the initial agent (files seeded above). idx 1 is the fix
 			// re-invoke: bring the fix into a SCOPE file so the committed
@@ -6191,7 +6281,8 @@ func TestRun_VerifyFixLoop_ReemitsReconciledGitDiff(t *testing.T) {
 		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
 
 	invoker := &fakeInvoker{
-		canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		mirrorWorkingTreeFrom: repo, // reflect agent edits into the isolated worktree (#1137)
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
 		onInvoke: func(idx int, _ agent.Invocation) {
 			if idx == 1 {
 				mustWrite(t, regPath, regGetFixed)
@@ -6252,7 +6343,8 @@ func TestRun_VerifyFixLoop_PassFirstIteration_SingleGitDiff(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
 	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
-	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
 	withFakeInvoker(t, invoker)
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	fu := newFakeUploader(t)
@@ -6294,7 +6386,8 @@ func TestRun_VerifyGateCommitted_SingleShot_SingleGitDiff(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
 	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
-	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
 	withFakeInvoker(t, invoker)
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	fu := newFakeUploader(t)
@@ -6337,7 +6430,8 @@ func TestRun_VerifyFixLoop_Exhaustion_TerminalNoRetry(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
 	invoker := &fakeInvoker{
-		canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		mirrorWorkingTreeFrom: repo, // reflect agent edits into the isolated worktree (#1137)
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
 		// No onInvoke fix: the failure persists across all iterations.
 	}
 	withFakeInvoker(t, invoker)
@@ -6410,6 +6504,7 @@ func TestRun_VerifyFixLoop_TransientFixInvokeError_RetriesWithoutBudgetBurn(t *t
 		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
 
 	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo, // reflect agent edits into the isolated worktree (#1137)
 		// idx 0: initial agent. idx 1: fix re-invoke #1 -> infra error (retried in
 		// place). idx 2: fix re-invoke retry -> success.
 		cannedSeq: []agent.Result{
@@ -6568,7 +6663,8 @@ func TestRun_VerifyFixLoop_InfraFlakeRetry_NoBudgetBurn(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
 	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
-	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
 	withFakeInvoker(t, invoker)
 
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
@@ -6645,7 +6741,8 @@ func TestRun_VerifyFixLoop_PersistentInfraFlake_FallsThroughToFixLoop(t *testing
 	script := filepath.Join(dir, "verify.sh")
 	mustWrite(t, script, "#!/bin/sh\necho '"+flakeEchoLine+"'\nexit 1\n")
 
-	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
 	withFakeInvoker(t, invoker)
 
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
@@ -6712,7 +6809,8 @@ func TestRun_VerifyGateCommitted_InfraFlakeRetry_PassProceeds(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
 	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
-	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
 	withFakeInvoker(t, invoker)
 
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
@@ -6790,6 +6888,7 @@ func TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip(t *testing.T
 	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
 	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo, // reflect agent edits into the isolated worktree (#1137)
 		// idx 0: initial agent (success). idx >= 1: every fix re-invoke errors
 		// (errSeq's last entry repeats once the slice is exhausted).
 		cannedSeq: []agent.Result{
@@ -6883,6 +6982,7 @@ func TestRun_VerifyFixLoop_InfraExhaustedReinvoke_ReemitsIdenticalDiff(t *testin
 	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
 	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo, // reflect agent edits into the isolated worktree (#1137)
 		cannedSeq: []agent.Result{
 			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
 			{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
@@ -6946,7 +7046,8 @@ func TestRun_VerifyGateCommitted_DriftExcludedFailureBlocks(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
 		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
 
-	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
 	withFakeInvoker(t, invoker)
 
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
@@ -7027,7 +7128,8 @@ func TestRun_VerifyGateCommitted_PassProceeds(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
 	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
-	invoker := &fakeInvoker{canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
 	withFakeInvoker(t, invoker)
 
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")

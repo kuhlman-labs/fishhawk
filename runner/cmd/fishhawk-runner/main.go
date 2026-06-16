@@ -87,6 +87,7 @@ type uploadClient interface {
 	FetchMCPToken(ctx context.Context, args upload.FetchMCPTokenArgs) (*upload.FetchMCPTokenResult, error)
 	FetchScopeAmendments(ctx context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error)
 	RetryStage(ctx context.Context, args upload.RetryStageArgs) error
+	RunLineageComplete(ctx context.Context, runID string) (bool, error)
 }
 
 // newUploadClient returns the production uploadClient for the
@@ -321,6 +322,45 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.agentSelfRetry = agentSelfRetry
 		cfg.maxRetriesSnapshot = maxRetriesSnapshot
 		cfg.retryAttempt = retryAttempt
+
+		// Per-run working-tree isolation (E22.X / #1137). This is the first
+		// point the runner knows decomposedFromRunID, so it is where the
+		// lineage worktree is provisioned. Compute the lineage root (parent
+		// id for a decomposed child so siblings share a tree, else this run's
+		// id), provision/reuse the worktree against the ORIGINAL operator
+		// checkout, take the same-lineage lock, and relocate cfg.workingDir
+		// into the worktree — every downstream `repoDir := cfg.workingDir`
+		// git op then runs in isolation with no further change. The lock is
+		// released at stage end via defer.
+		root := lineageRoot(cfg.runID, cfg.decomposedFromRunID)
+		baseRepoDir := cfg.workingDir
+		if baseRepoDir == "" {
+			baseRepoDir = "."
+		}
+		// Reclaim worktrees of terminal lineages before provisioning a new
+		// one (#1137). Best-effort: it never fails the stage and never
+		// removes a worktree whose lineage the backend doesn't report
+		// complete.
+		sweepTerminalWorktrees(ctx, baseRepoDir, client, logSink)
+		wt, provErr := provisionLineageWorktree(ctx, baseRepoDir, root, logSink)
+		if provErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"worktree_provision","detail":%q}`+"\n", provErr.Error())
+			return exitFailure
+		}
+		// Record the lineage root's FULL run id beside the worktree so a
+		// later sweep can resolve the short `run-<root>` dir name back to a
+		// run id for the lineage_complete read (best-effort).
+		writeLineageRunID(ctx, baseRepoDir, root,
+			lineageRootFull(cfg.runID, cfg.decomposedFromRunID), logSink)
+		release, lockErr := acquireLineageLock(ctx, baseRepoDir, root, cfg.runID, logSink)
+		if lockErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"lineage_lock","detail":%q}`+"\n", lockErr.Error())
+			return exitFailure
+		}
+		defer release()
+		cfg.workingDir = wt
 	}
 
 	if cfg.promptFile == "" {
@@ -1697,7 +1737,8 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 			baseRef, perr.Error())
 		patch, truncated = "", false
 	}
-	events = append(events, makeGitDiffEvent(baseRef, d, patch, truncated))
+	ins, dels := computeDiffNumstat(context.Background(), baseRef, repoDir, logSink)
+	events = append(events, makeGitDiffEventStats(baseRef, d, patch, truncated, ins, dels))
 	return d, events, nil
 }
 
@@ -1792,7 +1833,8 @@ func reemitScopedGitDiff(cfg config, logSink io.Writer) []agent.Event {
 			baseRef, perr.Error())
 		patch, truncated = "", false
 	}
-	return []agent.Event{makeGitDiffEvent(baseRef, d, patch, truncated)}
+	ins, dels := computeDiffNumstat(context.Background(), baseRef, repoDir, logSink)
+	return []agent.Event{makeGitDiffEventStats(baseRef, d, patch, truncated, ins, dels)}
 }
 
 // enforceConstraints reads the constraints config and evaluates
@@ -1881,6 +1923,14 @@ type gitDiffFile struct {
 // json tags MUST stay identical to backend/internal/bundle/bundle.go's
 // gitDiffPayload mirror — this is the runner↔backend wire contract,
 // not a JSON Schema, so the two sides agree field-by-field in lockstep.
+//
+// Insertions/Deletions carry the `git diff --cached --numstat <base>`
+// totals (E22.X / #1137). They moved onto the wire because per-run
+// worktree isolation relocates the run's commit off the operator
+// checkout's HEAD, so the MCP server can no longer recompute the diff
+// stats by shelling `git show --numstat HEAD` in working_dir — it reads
+// them from this event instead. Additive and `omitempty`: older bundles
+// omit them and decode to zero.
 type gitDiffPayload struct {
 	Kind           string        `json:"kind"`
 	BaseRef        string        `json:"base_ref"`
@@ -1888,6 +1938,8 @@ type gitDiffPayload struct {
 	NumFiles       int           `json:"num_files"`
 	Patch          string        `json:"patch,omitempty"`
 	PatchTruncated bool          `json:"patch_truncated,omitempty"`
+	Insertions     int           `json:"insertions,omitempty"`
+	Deletions      int           `json:"deletions,omitempty"`
 }
 
 // makeGitDiffEvent converts a constraint.Diff into the bundle event
@@ -1896,6 +1948,17 @@ type gitDiffPayload struct {
 // hunk text (empty when capture failed); truncated marks a capped
 // patch.
 func makeGitDiffEvent(baseRef string, d constraint.Diff, patch string, truncated bool) agent.Event {
+	return makeGitDiffEventStats(baseRef, d, patch, truncated, 0, 0)
+}
+
+// makeGitDiffEventStats is makeGitDiffEvent with the staged-diff numstat
+// totals (#1137). The diff-producing paths (computeAndEmitDiff,
+// reemitScopedGitDiff) carry the real insertion/deletion counts so the
+// MCP server reports diff stats from the event rather than re-shelling
+// git in the operator checkout — which per-run worktree isolation makes
+// stale. The zero-arg makeGitDiffEvent shim is retained for synthetic
+// events (gate-evidence tests) that don't compute numstat.
+func makeGitDiffEventStats(baseRef string, d constraint.Diff, patch string, truncated bool, insertions, deletions int) agent.Event {
 	files := make([]gitDiffFile, 0, len(d.ChangedFiles))
 	for _, f := range d.ChangedFiles {
 		files = append(files, gitDiffFile{Path: f.Path, Status: string(f.Status)})
@@ -1909,8 +1972,60 @@ func makeGitDiffEvent(baseRef string, d constraint.Diff, patch string, truncated
 			NumFiles:       len(files),
 			Patch:          patch,
 			PatchTruncated: truncated,
+			Insertions:     insertions,
+			Deletions:      deletions,
 		}),
 	}
+}
+
+// computeDiffNumstat sums the insertion/deletion totals of the staged diff
+// against baseRef via `git diff --cached --numstat <base>`, the same staged
+// index the name-status and patch captures see. It rides onto the git_diff
+// event so the MCP server can report diff stats without re-deriving them
+// from the operator checkout's HEAD, which per-run worktree isolation no
+// longer carries the run's commit (#1137). Best-effort: a git failure logs
+// a degradation line and yields (0, 0) — the diff stats are advisory.
+func computeDiffNumstat(ctx context.Context, baseRef, repoDir string, logSink io.Writer) (insertions, deletions int) {
+	out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "diff", "--cached", "--numstat", baseRef).Output()
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"git_diff_numstat_failed","base_ref":%q,"detail":%q}`+"\n",
+			baseRef, gitErr(err).Error())
+		return 0, 0
+	}
+	return parseDiffNumstat(string(out))
+}
+
+// parseDiffNumstat parses `git diff --numstat` output and sums insertions
+// and deletions across all rows, skipping binary-file rows where either
+// column is '-'. Mirrors the backend's parseNumstat shape
+// (backend/cmd/fishhawk-mcp/run_stage.go) so the two sides agree on the
+// stat semantics.
+func parseDiffNumstat(output string) (insertions, deletions int) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		if parts[0] == "-" || parts[1] == "-" {
+			continue // binary file — columns are not numeric
+		}
+		ins, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		del, err := strconv.Atoi(parts[1])
+		if err != nil {
+			continue
+		}
+		insertions += ins
+		deletions += del
+	}
+	return
 }
 
 // validatePlan reads the plan artifact at path and validates it

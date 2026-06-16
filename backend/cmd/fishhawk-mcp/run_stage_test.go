@@ -1379,21 +1379,17 @@ func TestRunStage_DiffSummary_NilWhenNoGitDiffEvent(t *testing.T) {
 }
 
 // TestRunStage_DiffSummary_PopulatedFromGitDiffEvent verifies
-// acceptance criterion (b): when the runner emits a git_diff event and
-// git show --numstat succeeds, DiffSummary is populated with correct
-// FilesChanged, Insertions, and Deletions. Binary rows are skipped.
+// acceptance criterion (b): when the runner emits a git_diff event,
+// DiffSummary is populated with FilesChanged, Insertions, and Deletions
+// read straight from the event payload (#1137) — NOT recomputed by
+// shelling git in working_dir, which per-run worktree isolation makes
+// stale (the run's commit no longer lands on this process's HEAD).
 func TestRunStage_DiffSummary_PopulatedFromGitDiffEvent(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
-	// Runner emits git_diff event with two changed files.
-	withFakeRunner(t, `printf '%s\n' '{"kind":"git_diff","changed_files":["a.go","b.go"]}' >&2`)
-
-	// Inject fake numstat: two normal rows + one binary row.
-	origNumstat := runStageGitNumstat
-	runStageGitNumstat = func(_ string) (string, error) {
-		return "5\t3\ta.go\n10\t7\tb.go\n-\t-\timage.png\n", nil
-	}
-	t.Cleanup(func() { runStageGitNumstat = origNumstat })
+	// Runner emits git_diff event with two changed files and the staged
+	// numstat totals carried on the event itself.
+	withFakeRunner(t, `printf '%s\n' '{"kind":"git_diff","changed_files":["a.go","b.go"],"insertions":15,"deletions":10}' >&2`)
 
 	runID := uuid.New()
 	stageID := uuid.New()

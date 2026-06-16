@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,25 +52,12 @@ var runStageGitRemoteOriginURL = func(dir string) (string, error) {
 // shorten it.
 var runStageGracePeriod = 30 * time.Second
 
-// runStageGitNumstat runs `git show --numstat HEAD` in dir and returns
-// the raw output. Exposed as a var so tests can inject fake output
-// without needing a real git repo.
-var runStageGitNumstat = func(dir string) (string, error) {
-	cmd := exec.Command("git", "show", "--numstat", "HEAD")
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
 // DiffSummary reports the diff stats for the commit the runner made.
-// Present only when the runner emitted a git_diff event and
-// git show --numstat HEAD succeeded; nil otherwise (e.g. plan stages,
-// or runners that exited without committing).
+// Present only when the runner emitted a git_diff event; nil otherwise
+// (e.g. plan stages, or runners that exited without committing). The
+// insertion/deletion totals are read from the git_diff event payload
+// (#1137), not recomputed here — per-run worktree isolation moves the
+// run's commit off this process's checkout HEAD.
 type DiffSummary struct {
 	FilesChanged int `json:"files_changed"`
 	Insertions   int `json:"insertions"`
@@ -596,19 +582,23 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// Populate DiffSummary: gate on the git_diff runner event being
 	// present so plan stages (which never emit git_diff) always yield
 	// nil, and failed implement stages that didn't commit also yield nil.
+	// Diff stats are read straight from the git_diff event payload
+	// (#1137). They previously came from shelling `git show --numstat HEAD`
+	// in working_dir, but per-run worktree isolation relocates the run's
+	// commit off the operator checkout's HEAD, so that shell-out would
+	// report a stale/empty diff. The runner now carries the numstat totals
+	// on the git_diff event (insertions/deletions), keeping this server
+	// worktree-unaware.
 	var diffSummary *DiffSummary
 	if gitDiffPayload := findGitDiffPayload(events); gitDiffPayload != nil {
 		filesChanged := 0
 		if cf, ok := gitDiffPayload["changed_files"].([]any); ok {
 			filesChanged = len(cf)
 		}
-		if numstatOut, numstatErr := runStageGitNumstat(workingDir); numstatErr == nil {
-			ins, dels := parseNumstat(numstatOut)
-			diffSummary = &DiffSummary{
-				FilesChanged: filesChanged,
-				Insertions:   ins,
-				Deletions:    dels,
-			}
+		diffSummary = &DiffSummary{
+			FilesChanged: filesChanged,
+			Insertions:   jsonInt(gitDiffPayload["insertions"]),
+			Deletions:    jsonInt(gitDiffPayload["deletions"]),
 		}
 	}
 
@@ -1022,34 +1012,22 @@ func findGitDiffPayload(events []RunnerEvent) map[string]any {
 	return nil
 }
 
-// parseNumstat parses `git show --numstat HEAD` output and sums
-// insertions and deletions across all file rows, skipping binary-file
-// rows where either column is '-'.
-func parseNumstat(output string) (insertions, deletions int) {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) < 2 {
-			continue
-		}
-		if parts[0] == "-" || parts[1] == "-" {
-			continue // binary file — columns are not numeric
-		}
-		ins, err := strconv.Atoi(parts[0])
-		if err != nil {
-			continue
-		}
-		del, err := strconv.Atoi(parts[1])
-		if err != nil {
-			continue
-		}
-		insertions += ins
-		deletions += del
+// jsonInt coerces a decoded-JSON number to int. JSON numbers decode to
+// float64 through encoding/json; an absent field (nil) or a non-numeric
+// value yields 0. Used to read the git_diff event's insertion/deletion
+// totals from the untyped payload map (#1137).
+func jsonInt(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i)
+	default:
+		return 0
 	}
-	return
 }
 
 // runStageParseGitHubRemote turns a remote URL into (owner, name).

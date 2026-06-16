@@ -928,3 +928,67 @@ func TestFetchScopeAmendments_RejectsMissingInputs(t *testing.T) {
 		t.Errorf("err = %v, want mcp token error", err)
 	}
 }
+
+// runLineageServer spins a httptest server whose GET /v0/runs/{run_id}
+// returns body for any run id, and returns a Client pointed at it.
+func runLineageServer(t *testing.T, status int, body string) *Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return New(srv.URL)
+}
+
+func TestRunLineageComplete_True(t *testing.T) {
+	c := runLineageServer(t, http.StatusOK, `{"id":"r","lineage_complete":true}`)
+	ok, err := c.RunLineageComplete(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Errorf("complete = false, want true")
+	}
+}
+
+func TestRunLineageComplete_False(t *testing.T) {
+	c := runLineageServer(t, http.StatusOK, `{"id":"r","lineage_complete":false}`)
+	ok, err := c.RunLineageComplete(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Errorf("complete = true, want false")
+	}
+}
+
+// TestRunLineageComplete_FieldAbsent asserts an older backend that omits
+// lineage_complete decodes to false (not reclaimable) rather than erroring.
+func TestRunLineageComplete_FieldAbsent(t *testing.T) {
+	c := runLineageServer(t, http.StatusOK, `{"id":"r","state":"running"}`)
+	ok, err := c.RunLineageComplete(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Errorf("complete = true, want false when field absent")
+	}
+}
+
+func TestRunLineageComplete_NotFound(t *testing.T) {
+	c := runLineageServer(t, http.StatusNotFound, `{"error":"run_not_found"}`)
+	if _, err := c.RunLineageComplete(context.Background(), "run-abc"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRunLineageComplete_RejectsEmptyRunID(t *testing.T) {
+	c := New("http://unused")
+	if _, err := c.RunLineageComplete(context.Background(), ""); err == nil {
+		t.Errorf("want error on empty run id")
+	}
+}
