@@ -40,7 +40,10 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -503,6 +506,202 @@ func TestE2E_MCPLoop_OperatorWritePath_StartRun(t *testing.T) {
 	if got.WorkflowSHA != "deadbeef-mcp-e2e" {
 		t.Errorf("DB row WorkflowSHA = %q, want deadbeef-mcp-e2e", got.WorkflowSHA)
 	}
+}
+
+// TestE2E_BindingAssertions_PersistedAndEchoedOnPrompt drives the #1171
+// declaration end-to-end (real MCP binary → real backend HTTP → real
+// Postgres): fishhawk_approve_plan carrying binding_assertions must (a) persist
+// them on the approval_submitted audit payload AND (b) surface them on the
+// subsequent implement prompt-response. This writer→audit→read-back→response
+// seam is the one per-side unit tests cannot cover (#618).
+func TestE2E_BindingAssertions_PersistedAndEchoedOnPrompt(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Second backend over the SAME pool with ArtifactRepo + GitHub wired so
+	// the implement prompt can load the approved plan (the echo is guarded on
+	// approvedPlan != nil). The fixture's own server has neither.
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approval.NewPostgresRepository(fx.pool),
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// 1. Plan stage parked at the approval gate carrying an approved
+	// standard_v1 plan (the echo needs a loadable approved plan).
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	planContent, err := json.Marshal(map[string]any{
+		"plan_version": "standard_v1",
+		"summary":      "scoped plan",
+		"verification": map[string]any{"test_strategy": "ts", "rollback_plan": "rb"},
+		"scope": map[string]any{
+			"files": []map[string]any{
+				{"path": "backend/internal/server/prompt.go", "operation": "modify"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	sum := sha256.Sum256(planContent)
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planContent,
+		ContentHash:   hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	// 2. Implement stage left pending (a runnable state for prompt-render).
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:        fx.runID,
+		Sequence:     2,
+		Type:         runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent,
+		ExecutorRef:  "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+
+	// 3. Approve the plan through the real MCP binary, declaring one
+	// file_contains and one test_asserts assertion.
+	wantAssertions := []struct{ Type, Path, Literal string }{
+		{"file_contains", "backend/internal/server/prompt.go", "BindingAssertions"},
+		{"test_asserts", "backend/internal/server/prompt_test.go", "TestResolveApprovalBindingAssertions"},
+	}
+	args := make([]map[string]any, 0, len(wantAssertions))
+	for _, a := range wantAssertions {
+		args = append(args, map[string]any{"type": a.Type, "path": a.Path, "literal": a.Literal})
+	}
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_approve_plan",
+		Arguments: map[string]any{
+			"run_id":             fx.runID.String(),
+			"reason":             "enforce the binding-assertion invariants",
+			"binding_assertions": args,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_approve_plan: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("approve tool returned error: %s", toolContentString(t, result))
+	}
+
+	// 4. Persistence half: the approval_submitted payload carries the exact
+	// declared assertions.
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, "approval_submitted")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	var persisted []struct {
+		Type    string `json:"type"`
+		Path    string `json:"path"`
+		Literal string `json:"literal"`
+	}
+	found := false
+	for _, e := range entries {
+		var payload struct {
+			Decision          string `json:"decision"`
+			BindingAssertions []struct {
+				Type    string `json:"type"`
+				Path    string `json:"path"`
+				Literal string `json:"literal"`
+			} `json:"binding_assertions"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Decision == "approve" && len(payload.BindingAssertions) > 0 {
+			persisted = payload.BindingAssertions
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no approval_submitted entry carried binding_assertions; entries=%d", len(entries))
+	}
+	if len(persisted) != len(wantAssertions) {
+		t.Fatalf("persisted binding_assertions len = %d, want %d: %+v", len(persisted), len(wantAssertions), persisted)
+	}
+	for i, w := range wantAssertions {
+		if persisted[i].Type != w.Type || persisted[i].Path != w.Path || persisted[i].Literal != w.Literal {
+			t.Errorf("persisted[%d] = %+v, want {%s %s %s}", i, persisted[i], w.Type, w.Path, w.Literal)
+		}
+	}
+
+	// 5. Read-back half: the implement prompt-response echoes them.
+	echoed := getPromptRenderBindingAssertions(t, ctx, httpSrv.URL, implStage.ID)
+	if len(echoed) != len(wantAssertions) {
+		t.Fatalf("echoed binding_assertions len = %d, want %d: %+v", len(echoed), len(wantAssertions), echoed)
+	}
+	for i, w := range wantAssertions {
+		if echoed[i].Type != w.Type || echoed[i].Path != w.Path || echoed[i].Literal != w.Literal {
+			t.Errorf("echoed[%d] = %+v, want {%s %s %s}", i, echoed[i], w.Type, w.Path, w.Literal)
+		}
+	}
+}
+
+// bindingAssertionView mirrors the prompt-response binding_assertions wire
+// shape so the integration test can decode it off the prompt-render endpoint.
+type bindingAssertionView struct {
+	Type    string `json:"type"`
+	Path    string `json:"path"`
+	Literal string `json:"literal"`
+}
+
+// getPromptRenderBindingAssertions fetches GET /v0/stages/{id}/prompt-render
+// and returns the echoed binding_assertions (#1171), in order.
+func getPromptRenderBindingAssertions(t *testing.T, ctx context.Context, baseURL string, stageID uuid.UUID) []bindingAssertionView {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		baseURL+"/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	if err != nil {
+		t.Fatalf("build prompt-render request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("prompt-render request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prompt-render status %d: %s", resp.StatusCode, raw)
+	}
+	var out struct {
+		BindingAssertions []bindingAssertionView `json:"binding_assertions"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode prompt-render response: %v", err)
+	}
+	return out.BindingAssertions
 }
 
 // nextActionsView mirrors the MCP server's NextActions output shape so

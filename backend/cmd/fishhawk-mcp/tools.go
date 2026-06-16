@@ -1801,6 +1801,23 @@ type ApprovePlanInput struct {
 	// misses directories, extensionless/repo-root files, and described-not-spelled
 	// paths.
 	AddScopeFiles []string `json:"add_scope_files,omitempty" jsonschema:"optional authoritative list of repo-relative paths to fold into the implement stage's scope.files; preferred over naming paths in 'reason'. A trailing slash marks a directory (e.g. 'pkg/testdata/corpus/') whose created files all stage; handles extensionless and repo-root files (e.g. 'go.work') the prose fallback misses"`
+	// BindingAssertions is the OPTIONAL list of operator-declared,
+	// deterministic binding-assertion checks (#1171) — the machine-checkable
+	// half of an approval condition. Each is evaluated by the runner
+	// post-implement against the committed scope-only tree; an unsatisfied
+	// assertion fails the implement stage category-B (park for re-scope/
+	// re-plan). Deterministic substring matching only — never parses prose.
+	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty" jsonschema:"optional list of deterministic binding-assertion checks the operator declares so an explicit approval condition becomes machine-checkable post-implement. Each check has type ('file_contains' or 'test_asserts'), path (repo-relative; must end in _test.go for test_asserts), and literal (a substring that must appear in the committed file). Evaluated by the runner against the committed scope-only tree; any unsatisfied assertion fails the implement stage category-B. Substring matching only — choose a literal specific enough to be meaningful"`
+}
+
+// BindingAssertion is one operator-declared binding-assertion check passed to
+// fishhawk_approve_plan (#1171). The wire tags (type/path/literal) are
+// byte-identical to the backend's bindingAssertion and the runner's
+// upload.BindingAssertion so the declaration round-trips unchanged.
+type BindingAssertion struct {
+	Type    string `json:"type" jsonschema:"the assertion type: 'file_contains' (literal must appear in the committed file at path) or 'test_asserts' (same substring check, but path must name a Go test file)"`
+	Path    string `json:"path" jsonschema:"repo-relative path of the committed file the literal must appear in; for type 'test_asserts' it must end in _test.go"`
+	Literal string `json:"literal" jsonschema:"the substring that must be present (deterministic match) in the committed content of path"`
 }
 
 // ApprovePlanOutput surfaces the post-approve Stage row plus the
@@ -1877,6 +1894,19 @@ gates did NOT re-run. Never read a duplicate as an effective
 approval. The 422 budget/scope-cap refusals fire BEFORE any approval
 row is recorded, so retrying with --override-budget /
 --override-scope-cap in the reason flows normally.
+
+binding_assertions (#1171, optional): declare deterministic,
+machine-checkable conditions alongside (or instead of) free-text in
+'reason'. Each is a typed substring check — type 'file_contains' or
+'test_asserts', a repo-relative path, and a literal that must appear
+in the committed file. The runner evaluates them post-implement
+against the committed scope-only tree; any unsatisfied assertion
+fails the implement stage category-B (park for re-scope/re-plan).
+Use this when an approval condition can be expressed as "file X must
+contain literal Y" so the condition is enforced rather than merely
+restated. A malformed declaration (unknown type, empty literal, a
+test_asserts path not ending in _test.go) is rejected 400
+validation_failed before any approval row is recorded.
 `),
 	}, resolver.approvePlan)
 }
@@ -1920,7 +1950,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.BindingAssertions)
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -1970,7 +2000,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan for the rationale. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil)
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}

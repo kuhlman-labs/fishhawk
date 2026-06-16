@@ -1400,6 +1400,60 @@ func TestBuild_Implement_ApprovalConditions_Nil_Absent(t *testing.T) {
 	}
 }
 
+// TestBuild_Implement_BindingConditionsReinforcement_Rendered pins the #1171
+// ask-1 tail reinforcement: when ApprovalConditions is set, the implement
+// prompt repeats the conditions verbatim at the TAIL under a "### Binding
+// conditions — confirm each in your PR Notes" heading that appears AFTER the
+// pre-plan "### Approval conditions" block, so the agent re-reads them at the
+// end and confirms each in its PR Notes.
+func TestBuild_Implement_BindingConditionsReinforcement_Rendered(t *testing.T) {
+	cond := "add the cross-branch rejection test"
+	got, err := Build("implement", Trigger{
+		Repo:               "o/r",
+		IssueNumber:        42,
+		ApprovedPlan:       fixturePlan(),
+		ApprovalConditions: &cond,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	const tailHeading = "### Binding conditions — confirm each in your PR Notes"
+	if !strings.Contains(got, tailHeading) {
+		t.Errorf("prompt missing tail reinforcement heading %q\n---\n%s", tailHeading, got)
+	}
+	if !strings.Contains(got, "PR `## Notes`") {
+		t.Errorf("tail reinforcement must instruct the agent to confirm in PR Notes\n---\n%s", got)
+	}
+	// The condition text appears twice: once in the pre-plan block, once in
+	// the tail reinforcement.
+	if n := strings.Count(got, cond); n < 2 {
+		t.Errorf("condition text appears %d times, want >= 2 (pre-plan + tail):\n%s", n, got)
+	}
+	// The tail reinforcement must come AFTER the pre-plan approval-conditions
+	// block AND after the PR-description block.
+	preIdx := strings.Index(got, "### Approval conditions")
+	prIdx := strings.Index(got, "write a pull-request description")
+	tailIdx := strings.Index(got, tailHeading)
+	if preIdx < 0 || prIdx < 0 || tailIdx < 0 || tailIdx < preIdx || tailIdx < prIdx {
+		t.Errorf("tail reinforcement must be last (preIdx=%d prIdx=%d tailIdx=%d):\n%s",
+			preIdx, prIdx, tailIdx, got)
+	}
+}
+
+func TestBuild_Implement_BindingConditionsReinforcement_Nil_Absent(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// ApprovalConditions deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Binding conditions — confirm each in your PR Notes") {
+		t.Errorf("tail reinforcement must not appear when ApprovalConditions is nil:\n%s", got)
+	}
+}
+
 func TestBuild_Implement_FixupConcerns_Rendered(t *testing.T) {
 	concerns := []string{
 		"[high/security] missing authz check on the fixup endpoint",

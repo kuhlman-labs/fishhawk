@@ -3463,6 +3463,47 @@ paths:
                     policy gate: a folded path matching `forbidden_paths`
                     still fails category-B against the produced diff.
                     Honored only on `approve`; ignored on `reject`.
+                binding_assertions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, path, literal]
+                    properties:
+                      type:
+                        type: string
+                        enum: [file_contains, test_asserts]
+                        description: |
+                          The assertion type. `file_contains` checks the
+                          literal appears in the committed file at `path`;
+                          `test_asserts` is the identical substring check but
+                          `path` must name a Go test file. Open enum — an
+                          unknown type is rejected `400 validation_failed`.
+                      path:
+                        type: string
+                        description: |
+                          Repo-relative path of the committed file the
+                          literal must appear in. For `test_asserts` it must
+                          end in `_test.go`.
+                      literal:
+                        type: string
+                        description: |
+                          The non-empty substring that must be present in the
+                          committed content of `path` (deterministic match).
+                  description: |
+                    Optional list of operator-declared, deterministic
+                    binding-assertion checks (#1171) — the machine-checkable
+                    half of an approval condition. Each typed substring
+                    assertion is recorded on the approval audit payload
+                    alongside `add_scope_files`, echoed on the implement
+                    prompt-response, and evaluated by the runner
+                    post-implement against the committed scope-only tree; any
+                    unsatisfied assertion fails the implement stage
+                    category-B. Substring matching only — never parses prose.
+                    A malformed declaration (unknown `type`, empty `literal`,
+                    a `test_asserts` `path` not ending in `_test.go`) is
+                    rejected `400 validation_failed` before any approval row
+                    is recorded. Honored only on `approve`; ignored on
+                    `reject`. Omitting the field is byte-identical to today.
                 delegated:
                   type: boolean
                   default: false
