@@ -114,10 +114,13 @@ type DefaultFields struct {
 }
 
 // Numbering is a type's numbering rule. Scheme is the allocation scheme
-// (sequential in v0); Prefix is rendered into the title (e.g. ADR-).
+// (sequential in v0); Prefix is rendered into the title (e.g. ADR-); Pad is
+// the zero-pad minimum width for the {number} substitution (e.g. 3 -> 041),
+// 0/absent meaning no padding.
 type Numbering struct {
 	Scheme string `json:"scheme"`
 	Prefix string `json:"prefix,omitempty"`
+	Pad    int    `json:"pad,omitempty"`
 }
 
 // Default returns the shipped default work-management conventions, parsed

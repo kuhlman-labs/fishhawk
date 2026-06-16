@@ -127,4 +127,7 @@ types:
     numbering:
       scheme: sequential
       prefix: ADR-
+      # Zero-pad the rendered {number} to 3 digits so ADR titles match the
+      # established [ADR-NNN] series ([ADR-041], not [ADR-41]) (#1148).
+      pad: 3
     epic_link: none

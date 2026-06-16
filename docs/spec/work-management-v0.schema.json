@@ -191,6 +191,12 @@
             "prefix": {
               "type": "string",
               "description": "Number prefix rendered into the title (e.g. ADR-)."
+            },
+            "pad": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 12,
+              "description": "Zero-pad the rendered {number} to this minimum width (e.g. 3 -> 041). 0/absent means no padding. Bounded 0..12 so a runaway pad cannot allocate an oversized title string; 12 exceeds any realistic numbering width."
             }
           }
         },
