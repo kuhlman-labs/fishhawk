@@ -61,7 +61,38 @@ func TestApply_ADRAllocatesNextNumberAndRendersPrefix(t *testing.T) {
 	if num != 36 {
 		t.Errorf("next ADR number = %d, want 36", num)
 	}
-	if want := "[ADR-36] use postgres"; item.Title != want {
+	// The shipped default sets numbering.pad: 3 (#1148), so the {number}
+	// substitution zero-pads to width 3 ([ADR-036], not the bare [ADR-36]).
+	if want := "[ADR-036] use postgres"; item.Title != want {
+		t.Errorf("title = %q, want %q", item.Title, want)
+	}
+}
+
+// TestApply_ADRZeroPadsViaDefault is the #1148 done-means: filing an adr
+// through the SHIPPED Default() conventions (numbering.pad: 3) with existing
+// numbers up to 40 renders the zero-padded [ADR-041] form — exactly what
+// fishhawk_file_issue produces. It pins the shipped default, not a hand-built
+// Pad:3 copy, exercising the default yaml -> Numbering.Pad -> renderTitle
+// %0*d chain end to end.
+func TestApply_ADRZeroPadsViaDefault(t *testing.T) {
+	conv := testConventions(t)
+	existing := make([]int, 0, 40)
+	for n := 1; n <= 40; n++ {
+		existing = append(existing, n)
+	}
+	item, num, err := Apply(FilingRequest{
+		Type:            "adr",
+		Summary:         "zero-pad adr numbers",
+		Body:            "## Context\n\n…\n",
+		ExistingNumbers: existing,
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if num != 41 {
+		t.Errorf("next ADR number = %d, want 41", num)
+	}
+	if want := "[ADR-041] zero-pad adr numbers"; item.Title != want {
 		t.Errorf("title = %q, want %q", item.Title, want)
 	}
 }

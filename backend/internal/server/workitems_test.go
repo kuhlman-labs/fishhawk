@@ -293,8 +293,8 @@ func TestFileWorkItem_NumberedType_AllocatesAndDispatches(t *testing.T) {
 	if fp.captured.Number != 36 {
 		t.Errorf("ProviderRequest.Number = %d, want 36", fp.captured.Number)
 	}
-	if fp.captured.Item.Title != "[ADR-36] Record the provider boundary" {
-		t.Errorf("title = %q, want ADR-36 rendered", fp.captured.Item.Title)
+	if fp.captured.Item.Title != "[ADR-036] Record the provider boundary" {
+		t.Errorf("title = %q, want ADR-036 rendered", fp.captured.Item.Title)
 	}
 }
 

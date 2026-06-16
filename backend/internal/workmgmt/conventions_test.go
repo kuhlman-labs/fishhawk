@@ -57,6 +57,11 @@ func TestDefaultRoundTrip(t *testing.T) {
 	if adr.Numbering.Prefix != "ADR-" {
 		t.Errorf("types.adr.numbering.prefix = %q, want ADR-", adr.Numbering.Prefix)
 	}
+	// The shipped default sets numbering.pad: 3 so ADR titles render in the
+	// established zero-padded [ADR-NNN] series ([ADR-036], [ADR-041]) (#1148).
+	if adr.Numbering.Pad != 3 {
+		t.Errorf("types.adr.numbering.pad = %d, want 3 (zero-padded default, #1148)", adr.Numbering.Pad)
+	}
 	if d.Types["feature"].EpicLink != "required" {
 		t.Errorf("types.feature.epic_link = %q, want required", d.Types["feature"].EpicLink)
 	}
