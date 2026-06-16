@@ -1383,6 +1383,71 @@ workflows:
 	}
 }
 
+// --- test_conventions (#1004) ---
+
+func TestParse_TestConventions_RoundTrip(t *testing.T) {
+	// The fixture declares two conventions (Python + Ruby). They decode
+	// into Spec.TestConventions — and because ParseBytes round-trips
+	// through json.DisallowUnknownFields, this only passes if the struct
+	// field exists alongside the schema property (the load-bearing
+	// coupling the #1004 plan calls out).
+	s, err := spec.ParseBytes(readFixture(t, "valid/test-conventions.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got, want := len(s.TestConventions), 2; got != want {
+		t.Fatalf("TestConventions count = %d, want %d", got, want)
+	}
+	py := s.TestConventions[0]
+	if py.Match != "src/**/*.py" {
+		t.Errorf("TestConventions[0].Match = %q, want src/**/*.py", py.Match)
+	}
+	if len(py.Candidates) != 1 || py.Candidates[0] != "tests/test_{name}.py" {
+		t.Errorf("TestConventions[0].Candidates = %v, want [tests/test_{name}.py]", py.Candidates)
+	}
+	rb := s.TestConventions[1]
+	if rb.Match != "lib/**/*.rb" {
+		t.Errorf("TestConventions[1].Match = %q, want lib/**/*.rb", rb.Match)
+	}
+	if len(rb.Candidates) != 1 || rb.Candidates[0] != "spec/{relpath}_spec.rb" {
+		t.Errorf("TestConventions[1].Candidates = %v, want [spec/{relpath}_spec.rb]", rb.Candidates)
+	}
+}
+
+func TestParse_TestConventions_Absent_NilSlice(t *testing.T) {
+	// No test_conventions block → Spec.TestConventions is nil; the sweep
+	// falls back to its built-in defaults.
+	s, err := spec.ParseBytes(readFixture(t, "valid/minimal.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.TestConventions != nil {
+		t.Errorf("TestConventions = %v, want nil for an absent block", s.TestConventions)
+	}
+}
+
+func TestParse_TestConventions_MissingCandidates_Rejected(t *testing.T) {
+	// candidates is required on a convention entry; its absence is a
+	// schema error refused before the spec lands on a run row.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.3"
+test_conventions:
+  - match: "src/**/*.py"
+workflows:
+  feature_change:
+    stages:
+      - id: x
+        type: implement
+        executor: { agent: claude-code }
+        produces:
+          - artifact: pull_request
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
 // --- Parse via io.Reader ---
 
 func TestParse_ReaderRoundTrip(t *testing.T) {

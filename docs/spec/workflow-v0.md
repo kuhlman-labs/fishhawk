@@ -19,6 +19,7 @@ version: "0.3" # required; "0.3", "0.4" (adds workflow.budgets), or "0.5" (adds 
 roles: # optional; named groups referenced by gates
   <role_id>:
     members: ["@org/team", "@user"]
+test_conventions: [...] # optional; per-repo test-location rules for the plan-gate test sweep (#1004)
 workflows: # required; at least one workflow
   <workflow_id>:
     description: "..."
@@ -386,10 +387,39 @@ workflows:
 
 - `may_merge` is evaluated and surfaced but has no backend merge endpoint to enforce in v0 — merge happens on GitHub; enforcement attaches when a merge action surface exists.
 
+## Test conventions (#1004)
+
+An optional **top-level** `test_conventions` array that makes test-location rules per-repo data for the plan-gate test sweep (`backend/internal/server/test_sweep.go`). Each entry maps production files matching a glob to candidate test-file path templates; the sweep flags a candidate test that **exists on the base ref but is missing from the plan's `scope.files`** (the class the runner would otherwise `scope_drift`-exclude). Advisory-only and fail-open — it never blocks a plan.
+
+```yaml
+version: "0.3"
+test_conventions:
+  - match: "src/**/*.py" # doublestar glob; ** crosses directory separators
+    candidates:
+      - "tests/test_{name}.py"
+  - match: "lib/**/*.rb"
+    candidates:
+      - "spec/{relpath}_spec.rb"
+workflows:
+  feature_change:
+    stages: […]
+```
+
+- **`match`** — a [doublestar](https://github.com/bmatcuk/doublestar) glob (`**` crosses `/`, unlike `path.Match`) matched against the repo-relative production-file path. A scoped file whose basename matches a candidate's test-file shape is treated as a test, not a production file.
+- **`candidates`** — one or more test-file path templates (`minItems: 1`) for a matched production file. Template variables:
+  - `{dir}` — the production file's directory (`path.Dir`)
+  - `{name}` — basename without its final extension (`upload` for `upload.go`)
+  - `{ext}` — final extension without the leading dot (`tsx` for `Foo.tsx`)
+  - `{relpath}` — the full repo-relative path without its final extension (`lib/foo/bar` for `lib/foo/bar.rb`)
+- **Built-in defaults, always on.** The sweep ships defaults reproducing the Go rule (`**/*.go` → `{dir}/{name}_test.go`) and colocated TypeScript (`**/*.{ts,tsx}` → `{dir}/{name}.test.{ext}`, `{dir}/{name}.spec.{ext}`, `{dir}/__tests__/{name}.test.{ext}`). Declared conventions **append** to these — they never replace them — so a repo declaring only Python/Ruby keeps Go + colocated TS covered, and a spec with no `test_conventions` is byte-identical to the pre-#1004 sweep.
+- **Additive within workflow-v0.x** — optional top-level field, no version bump; accepted at every advertised `version`. Specs without it parse unchanged.
+
 ## Identifier namespaces
 
 | Field                       | Pattern / values                                                             | Notes                                                                                               |
 | --------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `test_conventions[].match`  | non-empty doublestar glob                                                    | per-repo test-location rule for the plan-gate test sweep (#1004); `**` crosses `/`; additive to built-in Go + TS defaults |
+| `test_conventions[].candidates` | array of non-empty path templates, `minItems: 1`                         | template vars `{dir}` / `{name}` / `{ext}` / `{relpath}`                                            |
 | `version`                   | `"0.3"` \| `"0.4"` \| `"0.5"`                                               | 0.5 adds `operator_agent` (ADR-040 / #1026); 0.4 adds workflow-level `budgets` (ADR-030 / #688); 0.3 adds `on_ci_failure.max_retries` (#277); 0.2 dropped `blocking_checks` |
 | `budgets[].period`          | `weekly` \| `monthly`                                                        | workflow-level periodic budget reset cadence (v0.4+)                                                |
 | `budgets[].enforcement`     | `advisory` \| `blocking`                                                     | advisory warns; blocking refuses a new run at admission                                             |

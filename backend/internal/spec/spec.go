@@ -99,6 +99,25 @@ type Spec struct {
 	Version   string              `json:"version" yaml:"version"`
 	Roles     map[string]Role     `json:"roles,omitempty" yaml:"roles,omitempty"`
 	Workflows map[string]Workflow `json:"workflows" yaml:"workflows"`
+	// TestConventions are optional per-repo test-location conventions
+	// that generalize the plan-gate test sweep (#1004) beyond the
+	// built-in Go + colocated-TS defaults. Declared entries are
+	// additive to the defaults. Empty/absent → the sweep uses the
+	// built-in defaults only. Round-trips through ParseBytes'
+	// DisallowUnknownFields decode, so this field MUST stay in lockstep
+	// with the schema's top-level test_conventions property.
+	TestConventions []TestConvention `json:"test_conventions,omitempty" yaml:"test_conventions,omitempty"`
+}
+
+// TestConvention is one test-location convention (#1004): production
+// files whose repo-relative path matches Match are expected to have a
+// test at one of Candidates. Candidates are path templates with the
+// variables {dir}, {name}, {ext}, {relpath}; see the workflow-v0 schema
+// $defs/test_convention for their meaning. Consumed by the plan-gate
+// test sweep (backend/internal/server/test_sweep.go).
+type TestConvention struct {
+	Match      string   `json:"match" yaml:"match"`
+	Candidates []string `json:"candidates" yaml:"candidates"`
 }
 
 // Role names a group of GitHub user/team references that gates can

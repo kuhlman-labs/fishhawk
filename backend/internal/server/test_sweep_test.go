@@ -31,10 +31,14 @@ func TestEvaluateTestSweep(t *testing.T) {
 		return names
 	}
 	tests := []struct {
-		name     string
-		scope    []plan.ScopeFile
-		listings map[string][]string
-		want     []TestSweepFinding
+		name string
+		// conventions are the effective conventions passed to the matcher;
+		// nil uses defaultTestConventions (the no-config byte-identical
+		// path) so the pre-#1004 cases stay unchanged.
+		conventions []testConvention
+		scope       []plan.ScopeFile
+		listings    map[string][]string
+		want        []TestSweepFinding
 	}{
 		{
 			// #885: the changed production file has an existing stem-sibling
@@ -230,12 +234,130 @@ func TestEvaluateTestSweep(t *testing.T) {
 				},
 			},
 		},
+		{
+			// Colocated TypeScript via the built-in defaults: Foo.tsx has an
+			// existing Foo.test.tsx (colocated) and __tests__/Foo.test.tsx
+			// (subdir) the plan didn't scope. One finding, MissingTests
+			// sorted across both candidate directories.
+			name:  "colocated ts via defaults flags existing sibling tests",
+			scope: []plan.ScopeFile{{Path: "frontend/src/Foo.tsx", Operation: plan.FileOpModify}},
+			listings: map[string][]string{
+				"frontend/src":           {"Foo.tsx", "Foo.test.tsx"},
+				"frontend/src/__tests__": {"Foo.test.tsx"},
+			},
+			want: []TestSweepFinding{
+				{
+					Rule:        testSweepRuleStemSibling,
+					TriggerPath: "frontend/src/Foo.tsx",
+					MissingTests: []string{
+						"frontend/src/Foo.test.tsx",
+						"frontend/src/__tests__/Foo.test.tsx",
+					},
+				},
+			},
+		},
+		{
+			// Declared Python parallel-tree convention: src/pkg/mod.py →
+			// tests/test_mod.py. Exercises {name} and a candidate directory
+			// other than the production file's own.
+			name: "declared python parallel tree flags missing test",
+			conventions: append(append([]testConvention{}, defaultTestConventions...),
+				testConvention{Match: "src/**/*.py", Candidates: []string{"tests/test_{name}.py"}}),
+			scope:    []plan.ScopeFile{{Path: "src/pkg/mod.py", Operation: plan.FileOpModify}},
+			listings: map[string][]string{"tests": {"test_mod.py"}},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleStemSibling,
+					TriggerPath:  "src/pkg/mod.py",
+					MissingTests: []string{"tests/test_mod.py"},
+				},
+			},
+		},
+		{
+			// Declared Ruby convention exercising {relpath} (full path minus
+			// final extension): lib/foo/bar.rb → spec/lib/foo/bar_spec.rb.
+			name: "declared ruby relpath convention flags missing spec",
+			conventions: append(append([]testConvention{}, defaultTestConventions...),
+				testConvention{Match: "lib/**/*.rb", Candidates: []string{"spec/{relpath}_spec.rb"}}),
+			scope:    []plan.ScopeFile{{Path: "lib/foo/bar.rb", Operation: plan.FileOpModify}},
+			listings: map[string][]string{"spec/lib/foo": {"bar_spec.rb"}},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleStemSibling,
+					TriggerPath:  "lib/foo/bar.rb",
+					MissingTests: []string{"spec/lib/foo/bar_spec.rb"},
+				},
+			},
+		},
+		{
+			// Rule 2 for a non-Go shape: a declared Python convention makes
+			// test_*.py a recognized test file, so a CREATE of a new
+			// tests/test_new.py in a directory with other test_*.py files
+			// surfaces the existing ones.
+			name: "rule 2 fires for a non-go test shape",
+			conventions: append(append([]testConvention{}, defaultTestConventions...),
+				testConvention{Match: "src/**/*.py", Candidates: []string{"tests/test_{name}.py"}}),
+			scope:    []plan.ScopeFile{{Path: "tests/test_new.py", Operation: plan.FileOpCreate}},
+			listings: map[string][]string{"tests": {"test_alpha.py", "test_new.py", "conftest.py"}},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleNewTestInTestedPackage,
+					TriggerPath:  "tests/test_new.py",
+					MissingTests: []string{"tests/test_alpha.py"},
+				},
+			},
+		},
+		{
+			// #1004 amendment 2: a declared convention overlapping a default
+			// (same Go match+candidate) must not double-report — the
+			// candidate set + finding dedup collapse it to a single finding.
+			name: "declared convention overlapping a default yields single finding",
+			conventions: append(append([]testConvention{}, defaultTestConventions...),
+				testConvention{Match: "**/*.go", Candidates: []string{"{dir}/{name}_test.go"}}),
+			scope:    []plan.ScopeFile{{Path: dir + "/upload.go", Operation: plan.FileOpModify}},
+			listings: map[string][]string{dir: {"upload.go", "upload_test.go"}},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleStemSibling,
+					TriggerPath:  dir + "/upload.go",
+					MissingTests: []string{dir + "/upload_test.go"},
+				},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := evaluateTestSweep(tt.scope, tt.listings)
+			conventions := tt.conventions
+			if conventions == nil {
+				conventions = defaultTestConventions
+			}
+			got := evaluateTestSweep(tt.scope, tt.listings, conventions)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("evaluateTestSweep() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExpandCandidate covers all four template variables of the
+// data-driven candidate generator (#1004).
+func TestExpandCandidate(t *testing.T) {
+	cases := []struct {
+		name string
+		tmpl string
+		path string
+		want string
+	}{
+		{"dir and name colocated go", "{dir}/{name}_test.go", "backend/internal/server/upload.go", "backend/internal/server/upload_test.go"},
+		{"name and ext colocated ts", "{dir}/{name}.test.{ext}", "frontend/src/Foo.tsx", "frontend/src/Foo.test.tsx"},
+		{"name into a parallel tree", "tests/test_{name}.py", "src/pkg/mod.py", "tests/test_mod.py"},
+		{"relpath into a parallel tree", "spec/{relpath}_spec.rb", "lib/foo/bar.rb", "spec/lib/foo/bar_spec.rb"},
+		{"subdir candidate", "{dir}/__tests__/{name}.test.{ext}", "frontend/src/Foo.tsx", "frontend/src/__tests__/Foo.test.tsx"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := expandCandidate(tc.tmpl, tc.path); got != tc.want {
+				t.Errorf("expandCandidate(%q, %q) = %q, want %q", tc.tmpl, tc.path, got, tc.want)
 			}
 		})
 	}
@@ -505,9 +627,9 @@ func TestRunTestSweep_PartialListingFailureStillRecords(t *testing.T) {
 	}
 }
 
-// TestRunTestSweep_DirectoryCap asserts the 11th distinct scoped
-// directory is skipped without error: only testSweepMaxDirs listings are
-// requested and the sweep still records.
+// TestRunTestSweep_DirectoryCap asserts the directory beyond the cap is
+// skipped without error: only testSweepMaxDirs listings are requested and
+// the sweep still records.
 func TestRunTestSweep_DirectoryCap(t *testing.T) {
 	dirs := map[string][]string{}
 	var files []plan.ScopeFile
@@ -529,6 +651,97 @@ func TestRunTestSweep_DirectoryCap(t *testing.T) {
 	recorded := lastTestSweepEntry(t, au)
 	if recorded.ListedDirs != testSweepMaxDirs {
 		t.Errorf("ListedDirs = %d, want %d", recorded.ListedDirs, testSweepMaxDirs)
+	}
+}
+
+// specPythonConventions declares a Python parallel-tree test convention
+// (src/**/*.py → tests/test_{name}.py) on top of the built-in defaults,
+// for the runTestSweep-level wiring tests.
+var specPythonConventions = []byte(`version: "0.3"
+test_conventions:
+  - match: "src/**/*.py"
+    candidates:
+      - "tests/test_{name}.py"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+
+// TestRunTestSweep_DeclaredConventionDrivesFinding is the #1004 amendment-1
+// cross-boundary integration test for the load-bearing seam
+// runRow.WorkflowSpec → spec.ParseBytes → declared TestConventions →
+// evaluateTestSweep. It seeds a WorkflowSpec declaring a Python convention
+// and asserts a finding driven by the DECLARED convention (not a default),
+// proving the parse+thread wiring works.
+func TestRunTestSweep_DeclaredConventionDrivesFinding(t *testing.T) {
+	cf := &contentsFake{dirs: map[string][]string{
+		"tests": {"test_mod.py"},
+	}}
+	s, au, runRow := newScopePrecheckServer(t, specPythonConventions)
+	instID := int64(42)
+	runRow.InstallationID = &instID
+	s.cfg.GitHub = newTestSweepGitHub(t, cf)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "src/pkg/mod.py", Operation: plan.FileOpModify},
+	})
+
+	got := s.runTestSweep(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result when the sweep ran")
+	}
+	recorded := lastTestSweepEntry(t, au)
+	if len(recorded.Findings) != 1 {
+		t.Fatalf("want 1 finding driven by the declared convention, got %+v", recorded.Findings)
+	}
+	f := recorded.Findings[0]
+	if f.Rule != testSweepRuleStemSibling || f.TriggerPath != "src/pkg/mod.py" {
+		t.Errorf("finding = %+v, want a stem_sibling for src/pkg/mod.py", f)
+	}
+	if len(f.MissingTests) != 1 || f.MissingTests[0] != "tests/test_mod.py" {
+		t.Errorf("MissingTests = %v, want [tests/test_mod.py]", f.MissingTests)
+	}
+}
+
+// TestRunTestSweep_FailsOpenToDefaultsOnBadSpec pins the #1004 amendment-1
+// degradation contract: an empty or unparseable WorkflowSpec falls open to
+// the built-in defaults (WARN-logged, never blocks), so the Go default
+// stem-sibling rule still fires.
+func TestRunTestSweep_FailsOpenToDefaultsOnBadSpec(t *testing.T) {
+	cases := []struct {
+		name string
+		spec []byte
+	}{
+		{"empty workflow spec", nil},
+		{"malformed workflow spec", []byte("version: \"0.3\"\nworkflows: [oops")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cf := &contentsFake{dirs: map[string][]string{
+				"backend/internal/server": {"upload.go", "upload_test.go"},
+			}}
+			s, au, runRow := newScopePrecheckServer(t, tc.spec)
+			instID := int64(42)
+			runRow.InstallationID = &instID
+			s.cfg.GitHub = newTestSweepGitHub(t, cf)
+			body := scopePlanBody(t, []plan.ScopeFile{
+				{Path: "backend/internal/server/upload.go", Operation: plan.FileOpModify},
+			})
+
+			got := s.runTestSweep(context.Background(), runRow.ID, runRow.ID, body)
+			if got == nil {
+				t.Fatal("sweep must still run on a bad spec (fail open to defaults)")
+			}
+			recorded := lastTestSweepEntry(t, au)
+			if len(recorded.Findings) != 1 || recorded.Findings[0].Rule != testSweepRuleStemSibling {
+				t.Fatalf("want the Go default stem_sibling finding, got %+v", recorded.Findings)
+			}
+		})
 	}
 }
 

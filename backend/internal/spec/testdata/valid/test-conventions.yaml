@@ -1,0 +1,22 @@
+# A spec declaring per-repo test_conventions (#1004). The block is an
+# additive, optional top-level field: declared conventions append to the
+# built-in Go + colocated-TS defaults, so this repo declares only its
+# Python and Ruby parallel-tree conventions.
+version: "0.3"
+test_conventions:
+  - match: "src/**/*.py"
+    candidates:
+      - "tests/test_{name}.py"
+  - match: "lib/**/*.rb"
+    candidates:
+      - "spec/{relpath}_spec.rb"
+workflows:
+  feature_change:
+    description: "feature change with declared test conventions"
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
