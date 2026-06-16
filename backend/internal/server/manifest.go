@@ -234,6 +234,15 @@ func buildManifest(backendURL, webhookURL, name string) map[string]any {
 			// #251). Read-only — we don't manage protection from
 			// Fishhawk.
 			"administration": "read",
+			// organization_projects:write lets the installation token
+			// board work items on the installing account's ORG-owned
+			// Projects v2 (#1116, consumed by fishhawk_file_issue /
+			// fishhawk_report_product_issue, #1005/#1107). NOTE: this
+			// reaches ORG-owned Projects v2 only — user-owned Projects
+			// v2 are out of reach of ANY App permission and need a
+			// UAT/PAT (#1114), so this does NOT cover the current
+			// user-owned Project #7.
+			"organization_projects": "write",
 		},
 		"default_events": []string{
 			"issues",

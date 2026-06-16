@@ -22,7 +22,8 @@
     "workflows": "write",
     "members": "read",
     "metadata": "read",
-    "administration": "read"
+    "administration": "read",
+    "organization_projects": "write"
   },
   "default_events": [
     "issues",
