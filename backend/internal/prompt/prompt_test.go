@@ -3608,6 +3608,14 @@ func TestBuild_ScopeAmendmentSection_ImplementOnly(t *testing.T) {
 		"scope-amendments?wait=30",
 		"~15 minutes total",
 		"proceed as if denied",
+		// Fail-loud-over-done-means-violation (#1170, run 5aaf89fa): an
+		// in-scope adaptation is acceptable ONLY if it still satisfies the
+		// issue's done-means; a green-but-wrong no-op touch is forbidden and
+		// the agent must stop and surface it rather than ship the workaround.
+		"ONLY if the adaptation still satisfies the issue's done-means",
+		"no-op touch of an in-scope file substituted for the real edit",
+		"is a silent wrong-fix and is FORBIDDEN",
+		"commit NO done-means-violating implementation",
 	} {
 		if !strings.Contains(impl, want) {
 			t.Errorf("implement prompt missing %q", want)
