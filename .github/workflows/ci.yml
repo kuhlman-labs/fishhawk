@@ -95,17 +95,18 @@ jobs:
       - name: Schema sync (docs/spec ↔ embedded copies)
         if: steps.have-modules.outputs.yes == 'true'
         run: |
-          # Each schema has a canonical copy under docs/spec/ and an
-          # embedded copy under backend/internal/<pkg>/schemas/. CI
-          # fails if they drift; update both in the same PR.
-          diff -u docs/spec/workflow-v0.schema.json \
-                  backend/internal/spec/schemas/workflow-v0.schema.json
-          diff -u docs/spec/workflow-v0.schema.json \
-                  cli/internal/spec/schemas/workflow-v0.schema.json
-          diff -u docs/spec/plan-standard-v1.schema.json \
-                  backend/internal/plan/schemas/plan-standard-v1.schema.json
-          diff -u docs/spec/plan-standard-v1.schema.json \
-                  runner/internal/plan/schemas/plan-standard-v1.schema.json
+          # Each canonical schema/default under docs/spec/ is mirrored into
+          # one or more embedded copies vendored into the Go modules.
+          # scripts/sync-schemas is the single source of truth for those
+          # pairs; re-run it and fail if anything changed, so a newly added
+          # pair (e.g. operator-role, work-management) is covered here
+          # automatically without editing this gate. Update both sides in
+          # the same PR and run scripts/sync-schemas before committing.
+          scripts/sync-schemas
+          if ! git diff --exit-code; then
+            echo "::error::Embedded schema copies drifted from docs/spec/. Run scripts/sync-schemas and commit the result." >&2
+            exit 1
+          fi
 
       - name: Install golangci-lint
         if: steps.have-modules.outputs.yes == 'true'
