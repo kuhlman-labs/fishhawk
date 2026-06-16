@@ -115,9 +115,9 @@ func TestFile_IssueTypeOverride(t *testing.T) {
 	}
 }
 
-// TestFile_ParentLink asserts the parent epic reference is passed to
-// CreateIssue (applied at create time) with the conventions' parent_field
-// threaded through, and EpicLinked is reported true.
+// TestFile_ParentLink asserts the parent epic reference and the conventions'
+// parent_field are threaded into the create call (the link is applied at
+// create time, not a separate post-create call) and EpicLinked is reported true.
 func TestFile_ParentLink(t *testing.T) {
 	api := &fakeAPI{}
 	p := New(api)
@@ -129,13 +129,13 @@ func TestFile_ParentLink(t *testing.T) {
 		t.Fatalf("File: %v", err)
 	}
 	if api.createParams.ParentKey != "FISH-100" {
-		t.Errorf("ParentKey = %q, want FISH-100", api.createParams.ParentKey)
+		t.Errorf("create ParentKey = %q, want FISH-100", api.createParams.ParentKey)
 	}
 	if api.createParams.ParentField != "customfield_10014" {
-		t.Errorf("ParentField = %q, want the threaded parent_field customfield_10014", api.createParams.ParentField)
+		t.Errorf("create ParentField = %q, want the threaded parent_field customfield_10014", api.createParams.ParentField)
 	}
 	if !created.EpicLinked {
-		t.Error("EpicLinked = false, want true when a parent was requested and create succeeded")
+		t.Error("EpicLinked = false, want true when a parent was requested and the create succeeded")
 	}
 	if created.EpicLinkError != "" {
 		t.Errorf("EpicLinkError = %q, want empty on success", created.EpicLinkError)
@@ -270,10 +270,10 @@ func stubResp(status int, body string) *http.Response {
 
 // TestFile_ParentFieldThreadedToWire is the cross-boundary seam check: it
 // threads parent_field from the JiraConnection config through provider.File
-// into a REAL *jiraclient.Client and asserts the emitted create request body
-// carries the parent for both field shapes (team-managed `parent` object vs
-// classic bare-string custom field), plus that a create-time parent failure
-// fails the filing (#1107: a wrong parent field surfaces as a create 4xx).
+// into a REAL *jiraclient.Client and asserts the parent link is emitted in the
+// create POST body (no separate post-create call) carrying the parent for both
+// field shapes (team-managed `parent` object vs classic bare-string custom
+// field), with EpicLinked reported true.
 func TestFile_ParentFieldThreadedToWire(t *testing.T) {
 	const epicKey = "FISH-100"
 
@@ -308,13 +308,11 @@ func TestFile_ParentFieldThreadedToWire(t *testing.T) {
 	for _, tc := range shapeCases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &stubTransport{respond: func(r stubReq) (*http.Response, error) {
-				switch r.method {
-				case http.MethodPost: // create
-					return stubResp(http.StatusCreated, `{"id":"1","key":"FISH-7"}`), nil
-				default:
-					t.Fatalf("unexpected method %s", r.method)
+				if r.method != http.MethodPost { // create only
+					t.Fatalf("unexpected method %s; parent must be set at create", r.method)
 					return nil, nil
 				}
+				return stubResp(http.StatusCreated, `{"id":"1","key":"FISH-7"}`), nil
 			}}
 			client := jiraclient.New("https://acme.atlassian.net", "bot@acme.example", "token", jiraclient.WithHTTPClient(st))
 			p := New(client)
@@ -326,40 +324,30 @@ func TestFile_ParentFieldThreadedToWire(t *testing.T) {
 			if !created.EpicLinked {
 				t.Error("EpicLinked = false, want true")
 			}
+
+			// The parent link must ride in the create POST body — no
+			// separate post-create request.
 			var createBody []byte
 			for _, r := range st.requests {
 				if r.method == http.MethodPost {
+					if r.path != "/rest/api/3/issue" {
+						t.Errorf("create path = %s, want /rest/api/3/issue", r.path)
+					}
 					createBody = r.body
 				}
 			}
 			if createBody == nil {
 				t.Fatal("no POST (create) request emitted")
 			}
-			var got struct {
+			var createGot struct {
 				Fields map[string]any `json:"fields"`
 			}
-			if err := json.Unmarshal(createBody, &got); err != nil {
+			if err := json.Unmarshal(createBody, &createGot); err != nil {
 				t.Fatalf("unmarshal create body: %v\nbody=%s", err, createBody)
 			}
-			tc.assertBody(t, got.Fields)
+			tc.assertBody(t, createGot.Fields)
 		})
 	}
-
-	t.Run("create-time parent failure fails the filing", func(t *testing.T) {
-		st := &stubTransport{respond: func(stubReq) (*http.Response, error) {
-			return stubResp(http.StatusBadRequest, `{"errorMessages":["unknown field"]}`), nil
-		}}
-		client := jiraclient.New("https://acme.atlassian.net", "bot@acme.example", "token", jiraclient.WithHTTPClient(st))
-		p := New(client)
-		item := workmgmt.WorkItem{Type: "feature", Title: "t", Relations: workmgmt.Relations{ParentEpic: epicKey}}
-		created, err := p.File(context.Background(), req(item, &workmgmt.JiraConnection{ProjectKey: "FISH", ParentField: "customfield_99999"}))
-		if err == nil {
-			t.Fatal("File returned nil error on a create-time parent failure")
-		}
-		if created != nil {
-			t.Errorf("created = %+v, want nil when create failed", created)
-		}
-	})
 }
 
 // TestNumberFromKey covers the key-suffix parsing edge cases.

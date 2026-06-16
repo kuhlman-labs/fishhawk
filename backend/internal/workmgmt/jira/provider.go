@@ -1,7 +1,8 @@
 // Package jira implements the work-management Provider (#1094, deferred
-// from #1005) against Jira Cloud: it creates the issue (labels and the
-// optional parent/epic reference applied at creation) and best-effort
-// moves it to the conventions' board status via a workflow transition.
+// from #1005) against Jira Cloud: it creates the issue (with labels and
+// the optional parent/epic reference applied at create time via the
+// conventions' configurable parent_field), then best-effort moves it to
+// the conventions' board status via a workflow transition.
 // The REST calls live in backend/internal/jiraclient; this package is the
 // orchestration that turns a resolved workmgmt.ProviderRequest into them.
 //
@@ -52,18 +53,20 @@ func (*Provider) Name() string { return ProviderName }
 // File creates the issue and applies the conventions-resolved placement.
 // The issue is created first — it is the durable result and the only fatal
 // step: a CreateIssue failure (or a failed pre-create guard) returns a nil
-// item and an error, because no issue exists. The parent/epic reference is
-// applied at create time via the conventions' parent_field (empty/"parent" =
-// the team-managed fields.parent reference, otherwise a classic project's
-// Epic Link custom field), so a requested parent that survives create is
-// linked; a wrong parent field for the project surfaces as a create-time 4xx
-// (#1107 best-effort: the caller's concern). Board placement is a best-effort
-// workflow transition (#1107): a created issue lands in the project's
-// default status, and reaching the
-// conventions' status requires a separate transition call — once the issue
-// exists File always returns it with a nil error, recording whether the
-// transition landed in CreatedItem.Boarded and the cause in BoardingError
-// when it did not (matching the github provider's #1107 posture).
+// item and an error, because no issue exists. Once the issue exists File
+// always returns it with a nil error; the remaining steps are best-effort
+// (#1107) and record their cause on the CreatedItem rather than failing the
+// filing:
+//
+//   - Parent/epic link: when Relations.ParentEpic is set, the reference is
+//     applied at create time via the conventions' parent_field (empty/"parent"
+//     = the team-managed fields.parent reference, otherwise a classic project's
+//     Epic Link custom field). A requested parent that survives create sets
+//     EpicLinked; an empty parent links nothing (EpicLinked false, no error).
+//   - Board placement: a created issue lands in the project's default status,
+//     and reaching the conventions' status requires a separate transition
+//     call, recorded in CreatedItem.Boarded with the cause in BoardingError
+//     when it did not land (matching the github provider's #1107 posture).
 func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
 	if p.api == nil {
 		return nil, errors.New("workmgmt/jira: provider missing API client")
@@ -98,7 +101,7 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		Status:        req.Item.BoardPlacement.Status,
 		BoardColumn:   req.Item.BoardPlacement.BoardColumn,
 	}
-	// The parent reference is applied at create time via the conventions'
+	// The parent reference is applied at create time via the configurable
 	// parent_field, so a requested parent that survived create is linked; an
 	// empty parent means nothing to link (EpicLinked false with no error).
 	created.EpicLinked = parentKey != ""

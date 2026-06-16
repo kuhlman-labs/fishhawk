@@ -147,8 +147,8 @@ func TestCreateIssue_RequestShapeAndResult(t *testing.T) {
 }
 
 // TestCreateIssue_ParentTeamManagedShape asserts that an empty/"parent"
-// ParentField links the parent at create time via the team-managed
-// issue-reference object shape {"parent":{"key":KEY}} (#1107).
+// ParentField links the parent in the create body using the team-managed
+// issue-reference object shape {"parent":{"key":KEY}}.
 func TestCreateIssue_ParentTeamManagedShape(t *testing.T) {
 	for _, field := range []string{"", "parent"} {
 		stub := &stubDoer{t: t}
@@ -159,6 +159,7 @@ func TestCreateIssue_ParentTeamManagedShape(t *testing.T) {
 			if rec.path != "/rest/api/3/issue" {
 				t.Errorf("path = %s, want /rest/api/3/issue", rec.path)
 			}
+			assertBasicAuth(t, rec.header)
 			var got struct {
 				Fields struct {
 					Parent *struct{ Key string } `json:"parent"`
@@ -174,11 +175,8 @@ func TestCreateIssue_ParentTeamManagedShape(t *testing.T) {
 		}
 		c := New(testBaseURL, testEmail, testToken, WithHTTPClient(stub))
 		if _, err := c.CreateIssue(context.Background(), CreateIssueParams{
-			ProjectKey:  "ENG",
-			IssueType:   "Task",
-			Summary:     "child",
-			ParentKey:   "ENG-1",
-			ParentField: field,
+			ProjectKey: "ENG", IssueType: "Task", Summary: "s",
+			ParentKey: "ENG-1", ParentField: field,
 		}); err != nil {
 			t.Fatalf("CreateIssue(field=%q): %v", field, err)
 		}
@@ -187,12 +185,18 @@ func TestCreateIssue_ParentTeamManagedShape(t *testing.T) {
 
 // TestCreateIssue_ParentClassicCustomFieldShape asserts a classic project's
 // Epic Link custom field links the epic key as a bare string under that field
-// id at create time, with no `parent` object present. Decodes generically so
-// the bare-string value is visible (a typed struct would only surface a
+// id in the create body, with no `parent` object present. Decodes generically
+// so the bare-string value is visible (a typed struct would only surface a
 // `parent` object).
 func TestCreateIssue_ParentClassicCustomFieldShape(t *testing.T) {
 	stub := &stubDoer{t: t}
 	stub.handler = func(rec *recordedRequest) (*http.Response, error) {
+		if rec.method != http.MethodPost {
+			t.Errorf("method = %s, want POST", rec.method)
+		}
+		if rec.path != "/rest/api/3/issue" {
+			t.Errorf("path = %s, want /rest/api/3/issue", rec.path)
+		}
 		var got struct {
 			Fields map[string]any `json:"fields"`
 		}
@@ -209,11 +213,8 @@ func TestCreateIssue_ParentClassicCustomFieldShape(t *testing.T) {
 	}
 	c := New(testBaseURL, testEmail, testToken, WithHTTPClient(stub))
 	if _, err := c.CreateIssue(context.Background(), CreateIssueParams{
-		ProjectKey:  "ENG",
-		IssueType:   "Task",
-		Summary:     "child",
-		ParentKey:   "EPIC-1",
-		ParentField: "customfield_10014",
+		ProjectKey: "ENG", IssueType: "Task", Summary: "s",
+		ParentKey: "EPIC-1", ParentField: "customfield_10014",
 	}); err != nil {
 		t.Fatalf("CreateIssue: %v", err)
 	}
