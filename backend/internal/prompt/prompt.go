@@ -1070,6 +1070,13 @@ func buildPlan(t Trigger) string {
 		"the entry MUST include either a citation (URL, man page, RFC number) or a concrete test that would fail if the assumption is wrong. " +
 		"An unsupported claim that looks well-reasoned disarms the reviewer's check reflex — if it sounds plausible, reviewers stop verifying.\n")
 	b.WriteString("\n")
+	b.WriteString("Done-means test rule: for a conventions / config / numbering / default-value change (e.g. a YAML default value, an enum member, " +
+		"a rendered identifier format) whose correctness is NOT structurally enforced by compilation, verification.test_strategy MUST name a " +
+		"behavioral done-means test that asserts the SHIPPED behavior — the observable output of the change — and runs in the committed-tree verify. " +
+		"The pre-PR scope-completeness gate (#1151) proves only that a declared scope.files path was TOUCHED, not that the required edit was made, " +
+		"so a comment-only / no-op touch satisfies presence while the real change is silently dropped (run 5aaf89fa: an explanatory comment was added to " +
+		"the numbering block instead of wiring the value). A test that asserts the shipped behavior fails on that no-op touch where the presence gate passes (#1169).\n")
+	b.WriteString("\n")
 	b.WriteString("Counter-examples from production bugs:\n")
 	b.WriteString("- SIGKILL and orphan file descriptors: SIGKILL kills only the direct child process; grandchildren that inherited stdout " +
 		"via fork keep the pipe writer alive, preventing EOF on the reader. Fix: set syscall.SysProcAttr Setpgid:true and send " +

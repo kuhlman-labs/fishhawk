@@ -431,6 +431,29 @@ func TestBuild_Plan_CitationOrTestRule(t *testing.T) {
 	}
 }
 
+func TestBuild_Plan_DoneMeansTestRule(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Done-means test rule",
+		"behavioral",
+		"committed-tree verify",
+		"#1151",
+		"#1169",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing done-means test rule string %q\n---\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_Plan_BudgetHintWithTimeouts(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		IssueNumber:           7,
