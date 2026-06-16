@@ -5549,16 +5549,17 @@ func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeInfraExhausted(t *testing
 // their drift shapes there (the returned dir), not in the operator checkout.
 // The worktree path is deterministic from the (fixed) run id and the repo's
 // shared gitdir.
-func captureImplementVerifyCommit(t *testing.T, repo string, fixup, decomposed bool) (string, func(context.Context, string, []string) error) {
+func captureImplementVerifyCommit(t *testing.T, repo string, fixup, decomposed bool, bindingAssertions ...upload.BindingAssertion) (string, func(context.Context, string, []string) error) {
 	t.Helper()
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 	fu := newFakeUploader(t)
 	pr := &upload.FetchedPrompt{
-		StageID:    "22222222-3333-4444-5555-666666666666",
-		StageType:  "implement",
-		Prompt:     "implement",
-		PromptHash: "h",
+		StageID:           "22222222-3333-4444-5555-666666666666",
+		StageType:         "implement",
+		Prompt:            "implement",
+		PromptHash:        "h",
+		BindingAssertions: bindingAssertions,
 	}
 	if fixup {
 		pr.Fixup = true
@@ -5744,6 +5745,119 @@ func TestRun_ImplementStage_FixupCreatedOutOfScopeGate(t *testing.T) {
 			t.Errorf("decomposed-child push must not trip the created-out-of-scope gate, got: %v", err)
 		}
 	})
+}
+
+// TestRun_ImplementStage_BindingAssertionGate exercises the binding-assertion
+// gate decision (#1171) directly through the wired verifyCommit closure against
+// a real committed tree. The "fails BEFORE push (origin untouched)" property is
+// the contract of CommitAndPush (a VerifyCommit error aborts before the push);
+// here we prove the closure returns ErrBindingAssertionUnsatisfied for an
+// unsatisfied declared assertion, nil when satisfied, nil when none declared
+// (byte-identical to before #1171), and never trips on a fix-up or decomposed
+// child even with a would-fail assertion.
+func TestRun_ImplementStage_BindingAssertionGate(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	commitWith := func(t *testing.T, runGit func(...string), repo, content string) string {
+		t.Helper()
+		mustWrite(t, filepath.Join(repo, "layout.yaml"), content)
+		runGit("add", "-A")
+		runGit("commit", "-m", "committed tree")
+		return gitHead(t, repo)
+	}
+
+	// (a) Open-PR push with a declared assertion the committed tree does NOT
+	// satisfy fails category-B with ErrBindingAssertionUnsatisfied, naming the
+	// path + literal, and emits the binding_assertion_unsatisfied event.
+	t.Run("unsatisfied_fails", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		head := commitWith(t, runGit, repo, "layout:\n  pad: 3\n")
+
+		_, vc := captureImplementVerifyCommit(t, repo, false, false,
+			upload.BindingAssertion{Type: "file_contains", Path: "layout.yaml", Literal: "pad: 99"})
+		err := vc(context.Background(), head, nil)
+		if !errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) {
+			t.Fatalf("err = %v, want ErrBindingAssertionUnsatisfied", err)
+		}
+		if !strings.Contains(err.Error(), "layout.yaml") || !strings.Contains(err.Error(), "pad: 99") {
+			t.Errorf("error should name the path + unsatisfied literal: %v", err)
+		}
+	})
+
+	// (b) Open-PR push whose committed tree satisfies the declared assertion
+	// passes the gate.
+	t.Run("satisfied_passes", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		head := commitWith(t, runGit, repo, "layout:\n  pad: 3\n")
+
+		_, vc := captureImplementVerifyCommit(t, repo, false, false,
+			upload.BindingAssertion{Type: "file_contains", Path: "layout.yaml", Literal: "pad: 3"})
+		if err := vc(context.Background(), head, nil); err != nil {
+			t.Errorf("satisfied assertion must pass the gate, got: %v", err)
+		}
+	})
+
+	// (c) HARD INVARIANT: NO declared assertions → the gate is a no-op,
+	// byte-identical to before #1171 (no event, push not blocked).
+	t.Run("none_declared_is_noop", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		head := commitWith(t, runGit, repo, "layout:\n  pad: 3\n")
+
+		_, vc := captureImplementVerifyCommit(t, repo, false, false)
+		if err := vc(context.Background(), head, nil); err != nil {
+			t.Errorf("no declared assertions must be a no-op, got: %v", err)
+		}
+	})
+
+	// (d) A fix-up does NOT trip the gate even with a would-fail assertion: the
+	// guard is `!isFixup && !isDecomposed`, matching MissingScopeFiles, so a
+	// fix-up's legitimately-narrower commit cannot false-trip.
+	t.Run("fixup_does_not_trip", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		head := commitWith(t, runGit, repo, "layout:\n  pad: 3\n")
+
+		_, vc := captureImplementVerifyCommit(t, repo, true, false,
+			upload.BindingAssertion{Type: "file_contains", Path: "layout.yaml", Literal: "pad: 99"})
+		if err := vc(context.Background(), head, nil); err != nil {
+			t.Errorf("fix-up must not trip the binding-assertion gate, got: %v", err)
+		}
+	})
+
+	// (e) A decomposed child does NOT trip the gate even with a would-fail
+	// assertion: a child's narrowed slice may target a sibling's file.
+	t.Run("decomposed_child_does_not_trip", func(t *testing.T) {
+		repo, runGit := compileGateRepo(t)
+		head := commitWith(t, runGit, repo, "layout:\n  pad: 3\n")
+
+		_, vc := captureImplementVerifyCommit(t, repo, false, true,
+			upload.BindingAssertion{Type: "file_contains", Path: "layout.yaml", Literal: "pad: 99"})
+		if err := vc(context.Background(), head, nil); err != nil {
+			t.Errorf("decomposed child must not trip the binding-assertion gate, got: %v", err)
+		}
+	})
+}
+
+// TestBindingAssertionUnsatisfied_ClassifiesCategoryB pins that a wrapped
+// ErrBindingAssertionUnsatisfied matches the category-B classification chain's
+// errors.Is test (the same chain ErrScopeFilesMissing uses), so the runner
+// stamps category-B and reports the failure rather than treating it as
+// category-C infra.
+func TestBindingAssertionUnsatisfied_ClassifiesCategoryB(t *testing.T) {
+	err := fmt.Errorf("%w: detail", gitops.ErrBindingAssertionUnsatisfied)
+	categoryB := errors.Is(err, upload.ErrPullRequestInvalid) ||
+		errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
+		errors.Is(err, gitops.ErrCommittedTestsFailed) ||
+		errors.Is(err, gitops.ErrCreatedOutOfScope) ||
+		errors.Is(err, gitops.ErrBaseRebaseConflict) ||
+		errors.Is(err, gitops.ErrCommitOutOfScope) ||
+		errors.Is(err, gitops.ErrScopeFilesMissing) ||
+		errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) ||
+		errors.Is(err, gitops.ErrPushedTreeNotVerified)
+	if !categoryB {
+		t.Error("wrapped ErrBindingAssertionUnsatisfied must classify category-B")
+	}
 }
 
 // --- Verify gate (#441) ---
@@ -9061,7 +9175,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 
 	// The re-verify command fails → the push must be blocked.
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
 	}
@@ -9105,7 +9219,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	logs := logSink.String()
@@ -9178,7 +9292,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMatch_NoReverify(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	if lines := countLines(t, counter); lines != 1 {
@@ -9211,7 +9325,7 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, ""); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", nil); err != nil {
 		t.Fatalf("empty verifiedTreeSHA must disable the check, got: %v\n%s", err, logSink.String())
 	}
 	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified", "verify_run"} {
@@ -9328,7 +9442,7 @@ exit 0
 	}
 
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified\n%s", err, logSink.String())
 	}

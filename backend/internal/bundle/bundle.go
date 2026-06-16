@@ -241,6 +241,24 @@ type GateEvidence struct {
 	// PolicyViolations digests constraint-violation policy_events
 	// (check + detail), excluding scope_drift which ScopeFacts carries.
 	PolicyViolations []PolicyViolationEvidence `json:"policy_violations,omitempty"`
+	// BindingAssertions digests the operator-declared binding-assertion
+	// checks (#1171) the runner evaluated against the committed scope-only
+	// tree, each with its satisfied verdict, so the implement review sees
+	// which binding conditions were machine-verified. Nil when no
+	// assertions were declared.
+	BindingAssertions []BindingAssertionEvidence `json:"binding_assertions,omitempty"`
+}
+
+// BindingAssertionEvidence is one digested binding-assertion check (#1171):
+// the operator-declared type/path/literal plus whether the committed tree
+// satisfied it. Mirrors the runner's bindingAssertionEvidence — the json tags
+// MUST stay identical to the composer, same lockstep wire contract as the
+// parent payload.
+type BindingAssertionEvidence struct {
+	Type      string `json:"type"`
+	Path      string `json:"path"`
+	Literal   string `json:"literal"`
+	Satisfied bool   `json:"satisfied"`
 }
 
 // VerifyRunEvidence is one digested verify_run attempt. Field names

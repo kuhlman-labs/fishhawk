@@ -10,6 +10,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/redaction"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 )
 
 // diffOf builds a constraint.Diff of modified files for makeGitDiffEvent.
@@ -50,6 +51,39 @@ func TestComposeGateEvidence_NilWhenNoGateRan(t *testing.T) {
 	}
 	if ev := composeGateEvidence(nil, 0); ev != nil {
 		t.Fatalf("expected nil for empty events, got %s", ev.Payload)
+	}
+}
+
+func TestComposeGateEvidence_FoldsBindingAssertions(t *testing.T) {
+	// A binding_assertion event (#1171) is a gate on its own, and its
+	// per-assertion satisfied verdicts fold into gate_evidence.
+	events := []agent.Event{
+		bindingAssertionEvidenceEvent([]gitops.BindingAssertionResult{
+			{Type: "file_contains", Path: "docs/api/v0.md", Literal: "binding_assertions", Satisfied: true},
+			{Type: "test_asserts", Path: "x_test.go", Literal: "TestX", Satisfied: false},
+		}),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 2))
+	if len(p.BindingAssertions) != 2 {
+		t.Fatalf("binding_assertions = %d, want 2", len(p.BindingAssertions))
+	}
+	if p.BindingAssertions[0] != (bindingAssertionEvidence{Type: "file_contains", Path: "docs/api/v0.md", Literal: "binding_assertions", Satisfied: true}) {
+		t.Errorf("assertion[0] = %+v", p.BindingAssertions[0])
+	}
+	if p.BindingAssertions[1].Satisfied {
+		t.Errorf("assertion[1] satisfied = true, want false: %+v", p.BindingAssertions[1])
+	}
+}
+
+func TestComposeGateEvidence_NoBindingAssertionsField(t *testing.T) {
+	// A stage with a verify gate but no binding_assertion event adds no
+	// binding_assertions field — byte-identical to before #1171.
+	events := []agent.Event{
+		verifyRunEvent("scripts/test", "", "", 0, "ok\n", "passed"),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 0))
+	if p.BindingAssertions != nil {
+		t.Errorf("BindingAssertions = %+v, want nil when no event", p.BindingAssertions)
 	}
 }
 

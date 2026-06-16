@@ -252,6 +252,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// entirely within run().
 	var fixupExpectedHeadSHA string
 
+	// bindingAssertions is the fetched prompt's binding_assertions (#1171):
+	// the operator-declared deterministic substring checks the runner
+	// evaluates against the committed scope-only tree. It is surfaced in the
+	// pre-push gate evidence and enforced in openPRAndShipArtifact's
+	// verifyCommit closure (category-B before the push on any unsatisfied
+	// assertion). Empty (no declaration, older backend, or no --fetch-prompt)
+	// makes both a no-op — byte-identical to behavior before #1171.
+	// Function-scoped like fixupExpectedHeadSHA: produced and consumed within
+	// run().
+	var bindingAssertions []upload.BindingAssertion
+
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
 	// a temp file. Sets cfg.promptFile so the rest of the path is
@@ -272,7 +283,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -295,6 +306,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.fixup = fixup
 		cfg.fixupBranch = fixupBranch
 		fixupExpectedHeadSHA = expectedHeadSHA
+		bindingAssertions = promptBindingAssertions
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
@@ -968,6 +980,33 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Binding-assertion gate evidence (#1171). The authoritative gate runs in
+	// openPRAndShipArtifact's verifyCommit closure (category-B before the
+	// push), but that closure executes AFTER the trace bundle is shipped, so a
+	// gate_evidence event must be emitted HERE, before composeGateEvidence
+	// packs the bundle, for the implement review to see which binding
+	// assertions were declared and whether the committed tree satisfied them.
+	// We evaluate against verifiedTreeSHA — the same tree object the
+	// committed-tree gate verified and the #960 invariant proves equal to the
+	// pushed commit's tree (`git show <tree>:<path>` accepts a tree-ish), so
+	// this evidence reflects exactly what the push will carry. Guarded to the
+	// standalone open-PR implement path (not fix-ups or decomposed children,
+	// matching the enforcement gate) and skipped when no tree was verified
+	// (verifyCmd unset/skip) — evidence is best-effort, the verifyCommit gate
+	// is the enforcement of record. EVIDENCE ONLY: it never demotes res.OK, so
+	// it cannot bypass the explicit verifyCommit→reportPullRequestFailure
+	// category-B report path.
+	if res.OK && stageType == "implement" && !cfg.noPR && cfg.decomposedFromRunID == "" && !cfg.fixup &&
+		verifiedTreeSHA != "" && len(bindingAssertions) > 0 {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		if results, berr := gitops.EvaluateBindingAssertions(ctx, repoDir, verifiedTreeSHA, toGitopsBindingAssertions(bindingAssertions)); berr == nil {
+			res.Events = append(res.Events, bindingAssertionEvidenceEvent(results))
+		}
+	}
+
 	// Emit the GenAI observability span for this stage as soon as the
 	// agent invocation (and any self-retries) settled — before bundle
 	// packing / upload, so a downstream upload failure doesn't lose
@@ -1228,7 +1267,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA)
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, bindingAssertions)
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
@@ -1247,7 +1286,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			if prErr != nil && errors.Is(prErr, gitops.ErrBaseRebaseConflict) &&
 				(willOpenPR || willPushChild) {
 				if rerr := reinvokeOnBaseRebaseConflict(ctx, cfg, invoker, inv, &res, prErr, logSink); rerr == nil {
-					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA)
+					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, bindingAssertions)
 				} else {
 					// Re-invoke infra exhaustion (or checkout failure): log and
 					// fall through to the unchanged category-B failure path
@@ -1286,8 +1325,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// scope-completeness (shortfall) gate (#1151), the inverse of
 				// the above: the commit did not touch every declared concrete
 				// scope.files path, so a declared edit was dropped (the #1148
-				// subset PR). Everything else (network, git, GitHub API) is
-				// category-C infra.
+				// subset PR). ErrBindingAssertionUnsatisfied is the binding-
+				// assertion gate (#1171): a deterministic operator-declared
+				// substring check the committed tree did not satisfy — the
+				// artifact does not meet a declared binding condition, so park
+				// for re-scope/re-plan. Everything else (network, git, GitHub
+				// API) is category-C infra.
 				if errors.Is(err, upload.ErrPullRequestInvalid) ||
 					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
 					errors.Is(err, gitops.ErrCommittedTestsFailed) ||
@@ -1295,6 +1338,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					errors.Is(err, gitops.ErrBaseRebaseConflict) ||
 					errors.Is(err, gitops.ErrCommitOutOfScope) ||
 					errors.Is(err, gitops.ErrScopeFilesMissing) ||
+					errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) ||
 					errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 					res.FailureCategory = "B"
 				} else {
@@ -1487,13 +1531,13 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -1501,20 +1545,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -3605,7 +3649,7 @@ func resolveImplementBranchRouting(ctx context.Context, cfg config, repoDir, bas
 // enforces the verified-SHA invariant (#960) against it — see the closure
 // below. Empty disables the check (no committed-tree gate ran: plan stage,
 // --no-pr, verifyCmd unset, or gate skipped).
-func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string) error {
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, bindingAssertions []upload.BindingAssertion) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -3849,6 +3893,33 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 					cfg.runID, cfg.stageID, headSHA, declaredJSON, committedJSON, missingJSON)
 				return fmt.Errorf("%w: %s", gitops.ErrScopeFilesMissing,
 					missingScopeFilesMessage(cfg.scopeFiles, missing, len(gateScopeFiles), len(committed)))
+			}
+		}
+		// Binding-assertion gate (#1171): the operator-declared deterministic
+		// substring checks (fishhawk_approve_plan binding_assertions) are
+		// evaluated against the committed scope-only tree at headSHA. Any
+		// unsatisfied assertion fails category-B BEFORE the push (origin
+		// untouched) — the artifact does not meet a declared binding condition,
+		// so park for re-scope/re-plan, the same disposition as the
+		// scope-completeness gate above. Guarded `!isFixup && !isDecomposed`
+		// exactly like MissingScopeFiles: a fix-up legitimately touches fewer
+		// files, and a decomposed child's narrowed slice may target a sibling's
+		// file, so neither can false-trip. A no-op when none were declared.
+		if !isFixup && !isDecomposed && len(bindingAssertions) > 0 {
+			results, berr := gitops.EvaluateBindingAssertions(ctx, repoDir, headSHA, toGitopsBindingAssertions(bindingAssertions))
+			if berr != nil {
+				return berr
+			}
+			if unsatisfied := gitops.UnsatisfiedBindingAssertions(results); len(unsatisfied) > 0 {
+				unsatisfiedJSON, _ := json.Marshal(unsatisfied)
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"binding_assertion_unsatisfied","run_id":%q,"stage_id":%q,"head_sha":%q,"unsatisfied":%s}`+"\n",
+					cfg.runID, cfg.stageID, headSHA, unsatisfiedJSON)
+				return fmt.Errorf("%w: %d of %d declared binding assertion(s) not satisfied by the committed tree: %s. "+
+					"The operator attached these deterministic checks at plan approval; the committed scope-only tree "+
+					"did not contain the declared literal(s). Recover by making the implement output satisfy the "+
+					"declared condition(s), or replan/re-approve with corrected binding_assertions",
+					gitops.ErrBindingAssertionUnsatisfied, len(unsatisfied), len(results), gitops.FormatUnsatisfied(unsatisfied))
 			}
 		}
 		if err := verifyCommittedTreeCompiles(ctx, repoDir, headSHA, drift, gateScopeFiles, logSink); err != nil {
@@ -4545,6 +4616,45 @@ func missingScopeFilesMessage(scopeFiles []upload.ScopeFile, missing []string, d
 		"or recover with fishhawk_resume_run; an in-band self-exempt for a deliberately-no-op declared file is "+
 		"deferred to #1153.",
 		declaredCount, committedCount, strings.Join(annotated, ", "))
+}
+
+// toGitopsBindingAssertions converts the decoded prompt-response
+// binding-assertion list into the gitops gate's input shape, keeping the
+// gitops package free of the upload import (#1171).
+func toGitopsBindingAssertions(assertions []upload.BindingAssertion) []gitops.BindingAssertion {
+	if len(assertions) == 0 {
+		return nil
+	}
+	out := make([]gitops.BindingAssertion, 0, len(assertions))
+	for _, a := range assertions {
+		out = append(out, gitops.BindingAssertion{Type: a.Type, Path: a.Path, Literal: a.Literal})
+	}
+	return out
+}
+
+// bindingAssertionEvidenceEvent builds the binding_assertion event
+// composeGateEvidence folds into gate_evidence (#1171). The payload carries
+// the count checked plus each assertion's type/path/literal and whether the
+// committed tree satisfied it, so the implement review sees which operator
+// binding conditions were machine-verified.
+func bindingAssertionEvidenceEvent(results []gitops.BindingAssertionResult) agent.Event {
+	type assertion struct {
+		Type      string `json:"type"`
+		Path      string `json:"path"`
+		Literal   string `json:"literal"`
+		Satisfied bool   `json:"satisfied"`
+	}
+	assertions := make([]assertion, 0, len(results))
+	for _, r := range results {
+		assertions = append(assertions, assertion{Type: r.Type, Path: r.Path, Literal: r.Literal, Satisfied: r.Satisfied})
+	}
+	return agent.Event{
+		Kind: "binding_assertion",
+		Payload: agent.MakePayload(map[string]any{
+			"checked":    len(results),
+			"assertions": assertions,
+		}),
+	}
 }
 
 func scopePaths(files []upload.ScopeFile) []string {
