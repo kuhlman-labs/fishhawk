@@ -204,10 +204,25 @@ func scopeFilesFromScope(sc *plan.Scope) []scopeFile {
 // "README" (no slash) out of the extraction.
 var conditionPathPattern = regexp.MustCompile(`[A-Za-z0-9_./-]+\.[A-Za-z0-9]+`)
 
+// isRepoRelativePath reports whether p is a clean repo-relative path: not
+// absolute (no leading '/') and free of any '..' parent-traversal segment. It
+// mirrors validateAllowCreate's repo-relative contract (backend/internal/server/
+// fixup.go) so the #730 prose fold below and the #1151 shortfall gate
+// (runner MissingScopeFiles) agree on what token can name a real scope.files
+// entry — a git diff-tree file set is always repo-relative, so an absolute or
+// traversal token can never match a committed path (#1155).
+func isRepoRelativePath(p string) bool {
+	return !strings.HasPrefix(p, "/") && !strings.Contains(p, "..")
+}
+
 // extractScopePathsFromConditions pulls repo-relative path tokens out of the
 // free-text approve-with-conditions comment. Surrounding backticks, quotes,
-// parentheses, and trailing punctuation are trimmed off each match. Returns
-// de-duplicated paths in first-seen order; nil for empty input.
+// parentheses, and trailing punctuation are trimmed off each match. Only clean
+// repo-relative tokens are returned: absolute paths (leading '/') and
+// '..'-traversal tokens are silently dropped (#1155) — this is best-effort
+// prose scraping, not a validated param, so a non-repo-relative token is
+// skipped rather than 400'd. Returns de-duplicated paths in first-seen order;
+// nil for empty input.
 func extractScopePathsFromConditions(text string) []string {
 	if text == "" {
 		return nil
@@ -226,6 +241,14 @@ func extractScopePathsFromConditions(text string) []string {
 		// A token must still contain a slash and an extension after trimming
 		// (trailing-dot stripping can erase the extension, e.g. "foo.").
 		if !strings.Contains(p, "/") || !strings.Contains(p, ".") {
+			continue
+		}
+		// Drop non-repo-relative tokens (absolute, or '..'-traversal): they can
+		// never name a real scope.files entry and an injected /tmp path would
+		// false-trip the #1151 shortfall gate as category-B (#1155). Path-vs-repo
+		// filtering alone fixes the observed greedy fold; negation-context
+		// detection is out of scope.
+		if !isRepoRelativePath(p) {
 			continue
 		}
 		if _, ok := seen[p]; ok {

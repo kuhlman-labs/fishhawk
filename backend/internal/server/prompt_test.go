@@ -2972,6 +2972,29 @@ func TestExtractScopePathsFromConditions(t *testing.T) {
 			in:   `Update ("dir/sub/file.ts"), and also (lib/x/y.rb).`,
 			want: []string{"dir/sub/file.ts", "lib/x/y.rb"},
 		},
+		{
+			// The observed run d560291c reason: a do-NOT-add instruction naming
+			// an absolute /tmp path. The absolute token must be dropped, not
+			// folded as a phantom scope entry (#1155).
+			name: "drops absolute /tmp path named for exclusion",
+			in:   "Do NOT add /tmp/fishhawk-scope-justifications.json to the scope.",
+			want: nil,
+		},
+		{
+			// A mixed reason: one repo-relative path folds, the /tmp absolute
+			// path is dropped.
+			name: "keeps repo-relative path and drops absolute path",
+			in:   "Also touch backend/internal/server/prompt.go but never /tmp/scratch.json.",
+			want: []string{"backend/internal/server/prompt.go"},
+		},
+		{
+			// A '..'-traversal token that satisfies the slash+extension
+			// requirement (ends in a real extension) so it reaches the new
+			// traversal guard — it must be dropped, not folded (#1155).
+			name: "drops dotdot-traversal token",
+			in:   "Edit ../../etc/secrets.yaml outside the tree.",
+			want: nil,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

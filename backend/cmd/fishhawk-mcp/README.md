@@ -278,6 +278,7 @@ Prefer it over naming paths in the free-text `reason`. The `reason` fold ([#730]
 - **directories** — pass a trailing slash (e.g. `pkg/testdata/corpus/`); every created file under that prefix stages.
 - **extensionless and repo-root files** — e.g. `go.work`, `Makefile`.
 - **described-but-not-spelled paths** — anything the prose names in words rather than as a literal path token.
+- **absolute / non-repo-relative tokens** — the fold now silently skips any token that is absolute (leading `/`) or contains a `..` traversal segment ([#1155](https://github.com/kuhlman-labs/fishhawk/issues/1155)), so naming a `/tmp` path or an exclusion in prose no longer injects a phantom scope entry. Only clean repo-relative paths fold; use `add_scope_files` for an authoritative add.
 
 `reason` and `add_scope_files` compose: the structured paths fold first (authoritative), then the prose fold runs as a fallback, both deduping by path. Both no-op when the plan declares an empty scope, preserving the runner's `git add -A` fallback. `add_scope_files` does **not** weaken the policy gate — a folded path that matches `forbidden_paths` still fails category-B against the produced diff.
 
