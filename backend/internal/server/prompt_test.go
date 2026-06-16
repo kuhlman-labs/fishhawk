@@ -3187,6 +3187,137 @@ func TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope(t *testing.T) {
 	})
 }
 
+// makeStageRetriedEntry builds a stage_retried audit entry (#1176 fixture)
+// recording that the run's implement stage was re-dispatched in place. It does
+// not feed the prompt renderer — loadApprovalConditions reads only the
+// approval_submitted entry — and exists solely so the fixture faithfully models
+// the post-retry_stage state the regression below guards.
+func makeStageRetriedEntry(runID uuid.UUID) *audit.Entry {
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: CategoryStageRetried, RunID: &rid}
+}
+
+// TestGetStagePrompt_Implement_Retried_ReinjectsApprovalConditions is a
+// REGRESSION GUARD, not a test of a retry-specific code branch. It locks the
+// invariant that a retried implement stage's prompt is byte-equivalent to first
+// dispatch with respect to the operator's #558 approval-condition amendments.
+//
+// Diagnostic finding (#1176): the issue's premise — that retry_stage DROPS the
+// approval conditions and rebuilds the overruled plan — is contradicted by the
+// code. The implement prompt-construction path re-injects approval conditions
+// purely by runID on EVERY fetch: prompt.go sets
+// trigger.ApprovalConditions = s.resolveApprovalConditions(runRow)
+// unconditionally in the implement branch, with NO RetryAttempt/SelfRetryCount
+// gating and NO first-dispatch prompt snapshot; loadApprovalConditions scans the
+// run's approval_submitted audit entries newest-first by runID. Both render
+// blocks fire purely on ApprovalConditions != nil. So nothing today consults
+// SelfRetryCount when re-injecting — the fixture sets it only to model the
+// post-retry state, and this test does not exercise a retry-only path. Evidence
+// run 000ae761 predates the #1171/#1185 agent-disregard fix, so #1176 is largely
+// a duplicate of #1171 (root cause fixed by #1185) and is converted here into a
+// permanent regression guarantee. This test will FAIL if a future prompt-path
+// refactor reintroduces retry-conditional gating or a first-dispatch snapshot
+// that would let a retry diverge from first dispatch. Cross-reference
+// #1171/#1185/#1176.
+func TestGetStagePrompt_Implement_Retried_ReinjectsApprovalConditions(t *testing.T) {
+	// A distinctive sentinel so its verbatim survival across the retry is
+	// unambiguous in the rendered prompt body.
+	const condition = "Best-effort POST-create parent linking; record EpicLinkError on failure but still return the created issue."
+
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+	}
+	rr.getRuns[runID] = &run.Run{
+		ID:            runID,
+		Repo:          "o/r",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+	}
+	// Model a RETRIED implement stage: SelfRetryCount>0 plus a stage_retried
+	// audit entry, i.e. the post-retry_stage state #1176 describes.
+	rr.getStages[implStageID] = &run.Stage{
+		ID:             implStageID,
+		RunID:          runID,
+		Type:           run.StageTypeImplement,
+		SelfRetryCount: 1,
+	}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {
+				makeApproveWithCommentEntry(runID, condition),
+				makeStageRetriedEntry(runID),
+			},
+		}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Both blocks plus the verbatim sentinel must survive the retry.
+	for _, want := range []string{
+		"### Approval conditions",
+		"### Binding conditions — confirm each in your PR Notes",
+		condition,
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("retried implement prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+
+	// Ordering: the pre-plan "### Approval conditions" block must precede the
+	// #1185 tail reinforcement block, mirroring first-dispatch rendering.
+	pre := strings.Index(resp.Prompt, "### Approval conditions")
+	reinforce := strings.Index(resp.Prompt, "### Binding conditions — confirm each in your PR Notes")
+	if pre < 0 || reinforce < 0 || pre >= reinforce {
+		t.Errorf("approval-condition blocks out of order: pre-plan idx=%d, reinforcement idx=%d\n---\n%s", pre, reinforce, resp.Prompt)
+	}
+}
+
 // makeApproveWithScopeFilesEntry builds an approval_submitted audit entry with
 // decision=approve carrying the structured add_scope_files slice (#824) that
 // loadApprovalAddScopeFiles reads back.
