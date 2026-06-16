@@ -31,6 +31,21 @@ cd "$ROOT"
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_SYSTEM=/dev/null
 
+# Disable the testcontainers ryuk reaper (#972 cascade). Each postgres_test.go
+# already tears its container down via t.Cleanup -> Container.Terminate, so the
+# ryuk reaper is a redundant backstop — but it is a SHARED, single-point-of-
+# failure container: under Docker-daemon load the reaper itself times out
+# starting ("reaper: new reaper: run container: ... context deadline exceeded"),
+# and every package that then tries to register with the dead reaper fails
+# ("No such container: <reaper-id>"), cascading one flake into a whole-suite
+# red. Disabling ryuk removes that shared dependency so a slow container start
+# can at worst flake ONE package (which the runner's verify gate absorbs),
+# never the cascade. Safe here: tests Terminate their own containers, and both
+# CI runners and `scripts/dev` are ephemeral / pruned, so orphan reaping is not
+# relied upon. Covers the runner's `scripts/test verify` too, since it sources
+# this script.
+export TESTCONTAINERS_RYUK_DISABLED=true
+
 modules() {
   go work edit -json | jq -r '.Use[].DiskPath'
 }
@@ -43,8 +58,15 @@ modules() {
 # many test binaries run concurrently (tests within one binary are serial
 # unless they call t.Parallel()), so this caps concurrent container starts.
 # Modules run sequentially below, making the bound effectively global.
-# Operator override: FISHHAWK_TEST_P. `single` runs are left unbounded.
-TEST_P="${FISHHAWK_TEST_P:-4}"
+#
+# Lowered 4 -> 2 (#972): at -p 4 the daemon still single-flaked a container
+# start (observed cascading a whole verify red before the ryuk-disable above;
+# now at worst one package). Halving concurrent container starts cuts the base
+# contention flake rate. The runner's verify gate still absorbs one residual
+# flake. Wall-clock cost: more serialization on high-core machines — raise it
+# back with FISHHAWK_TEST_P (e.g. FISHHAWK_TEST_P=4). `single` runs are
+# unbounded.
+TEST_P="${FISHHAWK_TEST_P:-2}"
 
 cmd_test() {
   while IFS= read -r m; do
