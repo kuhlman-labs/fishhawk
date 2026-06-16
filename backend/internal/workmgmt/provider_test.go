@@ -40,17 +40,18 @@ func TestRegistry_RegisterAndGet(t *testing.T) {
 }
 
 func TestRegistry_UnknownProviderFailsClosed(t *testing.T) {
-	// jira is interface-only in v0 — never registered. An attempt to file
-	// against it must fail closed with a typed error naming the id.
-	_, err := Get("jira")
+	// An unregistered provider id (a config typo, or a backend not yet
+	// implemented — jira is now real, so use a genuinely-never-registered
+	// placeholder) must fail closed with a typed error naming the id.
+	_, err := Get("gitlab")
 	var upe *UnknownProviderError
 	if !errors.As(err, &upe) {
 		t.Fatalf("want *UnknownProviderError, got %v", err)
 	}
-	if upe.ID != "jira" {
-		t.Errorf("error ID = %q, want jira", upe.ID)
+	if upe.ID != "gitlab" {
+		t.Errorf("error ID = %q, want gitlab", upe.ID)
 	}
-	if !strings.Contains(upe.Error(), "jira") {
+	if !strings.Contains(upe.Error(), "gitlab") {
 		t.Errorf("error message must name the missing provider: %q", upe.Error())
 	}
 }

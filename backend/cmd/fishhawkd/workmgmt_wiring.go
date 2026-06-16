@@ -4,33 +4,40 @@ import (
 	"context"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
+	workmgmtjira "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/jira"
 )
 
-// registerWorkmgmtProviders wires the GitHub Projects work-item and
-// product-feedback providers into the global workmgmt registries at
-// startup. Without this, both registries are empty in production — the
-// only registrations happen in tests against fakes — so fishhawk_file_issue
-// and fishhawk_report_product_issue return 501 provider_unimplemented even
-// though the providers exist (#1104; same tests-green/production-broken
-// class as #735).
+// registerWorkmgmtProviders wires the work-management providers into the
+// global workmgmt registries at startup. Without this, the registries are
+// empty in production — the only registrations happen in tests against
+// fakes — so fishhawk_file_issue and fishhawk_report_product_issue return
+// 501 provider_unimplemented even though the providers exist (#1104; same
+// tests-green/production-broken class as #735).
 //
-// gated on gh != nil: an unconfigured GitHub client (no App id/key) leaves
-// both registries unregistered and the two endpoints continue to return
-// 501 — the intended v0 not-yet-wired posture, matching the surrounding
-// cfg.GitHub-gated wiring (role resolver, webhook dispatcher).
-func registerWorkmgmtProviders(gh *githubclient.Client) {
-	if gh == nil {
-		return
+// Each provider is gated on its own client being configured, independently:
+// an unconfigured GitHub client (no App id/key) leaves the github_projects
+// + feedback registrations off, and an unconfigured Jira client (no
+// FISHHAWKD_JIRA_* env) leaves the jira registration off — in either case
+// the affected endpoint/provider continues to return 501, the intended v0
+// not-yet-wired posture.
+func registerWorkmgmtProviders(gh *githubclient.Client, jira *jiraclient.Client) {
+	if gh != nil {
+		// *githubclient.Client satisfies the work-item API directly (all six
+		// methods exist with matching signatures), so no adapter is needed.
+		workmgmt.Register(workmgmtgithub.New(gh))
+		// The feedback provider needs an adapter: FeedbackAPI.SearchOpenIssues
+		// returns []workmgmtgithub.MatchedIssue, a workmgmt/github type the
+		// client cannot return without an import cycle.
+		workmgmt.RegisterFeedback(workmgmtgithub.NewFeedback(feedbackAPIAdapter{gh}))
 	}
-	// *githubclient.Client satisfies the work-item API directly (all six
-	// methods exist with matching signatures), so no adapter is needed.
-	workmgmt.Register(workmgmtgithub.New(gh))
-	// The feedback provider needs an adapter: FeedbackAPI.SearchOpenIssues
-	// returns []workmgmtgithub.MatchedIssue, a workmgmt/github type the
-	// client cannot return without an import cycle.
-	workmgmt.RegisterFeedback(workmgmtgithub.NewFeedback(feedbackAPIAdapter{gh}))
+	if jira != nil {
+		// *jiraclient.Client satisfies the jira work-item API directly
+		// (CreateIssue + Transition), so no adapter is needed.
+		workmgmt.Register(workmgmtjira.New(jira))
+	}
 }
 
 // feedbackAPIAdapter adapts *githubclient.Client to the feedback

@@ -279,6 +279,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 	target := workmgmt.Target{
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},
 		Project: conv.Project,
+		Jira:    conv.Jira,
 	}
 	// InstallationID is sourced first from a consistency-checked active run.
 	// On the run-absent path (the ADR-040 operator-agent follow-up filing

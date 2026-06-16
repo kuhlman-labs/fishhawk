@@ -15,6 +15,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `spec_version` | yes | enum `work-management-v0` | Single-value enum per the versioning rules below. |
 | `provider` | yes | enum `github_projects` \| `jira` | Work-management backend. `github_projects` is the only concrete provider in v0; `jira` is reserved at the interface level (no implementation) and an unimplemented provider must fail closed at filing time. |
 | `project` | conditional | object | GitHub Projects connection (`owner`, `owner_type`, `number`). Required when `provider` is `github_projects` (semantic check). |
+| `jira` | conditional | object | Jira connection (`project_key` + optional `issue_types` map). Required when `provider` is `jira` (semantic check). Selects only the target project — the instance base URL and credentials are server-side env (see below), **not** in this checked-in config. |
 | `complexity_levels` | no | object: `low`/`medium`/`high` → prose | The complexity prior: concrete file/coupling definitions for each level. Optional in a repo config; shipped in the default. |
 | `required_fields` | yes | non-empty unique string list | Fields every filed item must carry. Must include the mandatory trio Summary, Done-means, complexity (semantic check). |
 | `field_hints` | no | object: field name → prose | Per-field authoring hints. The Done-means hint states the condition must be testable. |
@@ -35,6 +36,17 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `epic_link` | no | enum `required` \| `optional` \| `none` | Whether items of this type link to a parent epic. |
 
 Every object level is `additionalProperties: false` — the surface is closed; new sections are additive schema changes within v0.
+
+### Jira connection (`jira`)
+
+The `jira` block is the connection for `provider: jira`. It carries **only non-secret project selection**:
+
+| Field | Required | Shape | Meaning |
+|---|---|---|---|
+| `project_key` | yes | string | Jira project key (e.g. `FISH`) that filed issues are created under. |
+| `issue_types` | no | object: canonical type → Jira issue-type name | Maps a canonical work-item type (`bug`, `feature`, …) to its Jira issue-type name (`Bug`, `Story`, …). An absent entry falls back to a title-cased default in the provider. |
+
+The Jira **instance base URL and credentials are server-side env**, never in this checked-in config: `FISHHAWKD_JIRA_BASE_URL`, `FISHHAWKD_JIRA_EMAIL`, `FISHHAWKD_JIRA_API_TOKEN`. This matches the `FISHHAWKD_PROJECTS_TOKEN` single-instance, secrets-never-in-repo precedent — the repo config selects only the project, the server holds the one instance and its creds. `provider: jira` still fails closed at filing time until the concrete provider and its server wiring land.
 
 ## Required-field discipline
 
@@ -59,7 +71,7 @@ The cross-reference is a semantic rule (`workmgmt.Parse`): **every `transitions`
 `workmgmt.Parse` validates in two stages and returns a typed error:
 
 - `*SchemaError` — a structural violation (unknown key, wrong enum, malformed label, empty `body_skeleton`). Carries a JSON Pointer path.
-- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, a type named `adr` has no `numbering` rule, or a `transitions` value names a canonical state not declared in `states`.
+- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, `jira` is missing its `jira` block, a type named `adr` has no `numbering` rule, or a `transitions` value names a canonical state not declared in `states`.
 - `*YAMLError` — unparseable, empty, or multi-document input (the config must be a single YAML document; a trailing document would bypass validation).
 
 The shipped default is validated against the schema at backend package init, so the product artifact can never drift from its own schema.

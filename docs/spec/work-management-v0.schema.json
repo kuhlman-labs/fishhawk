@@ -23,7 +23,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["owner", "number"],
-      "description": "GitHub Projects connection. Required when provider is github_projects. Jira will add its own connection block additively when implemented.",
+      "description": "GitHub Projects connection. Required when provider is github_projects. The jira provider has its own connection block (`jira`).",
       "properties": {
         "owner": {
           "type": "string",
@@ -40,6 +40,24 @@
           "type": "integer",
           "minimum": 1,
           "description": "Project number (the integer in the project URL)."
+        }
+      }
+    },
+    "jira": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_key"],
+      "description": "Jira connection. Required when provider is jira (semantic check). This block selects ONLY the target project; the Jira instance base URL and credentials are server-side env (FISHHAWKD_JIRA_BASE_URL / FISHHAWKD_JIRA_EMAIL / FISHHAWKD_JIRA_API_TOKEN), NOT in this checked-in config — matching the FISHHAWKD_PROJECTS_TOKEN single-instance, secrets-never-in-repo precedent.",
+      "properties": {
+        "project_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Jira project key (e.g. FISH) that filed issues are created under."
+        },
+        "issue_types": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "description": "Optional map from canonical work-item type (bug, feature, chore, adr, …) to the Jira issue-type name (Bug, Story, Task, …). An absent entry falls back to a title-cased default in the provider."
         }
       }
     },

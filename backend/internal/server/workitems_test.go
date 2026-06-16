@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,8 +16,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	workmgmtjira "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/jira"
 )
 
 // fakeWorkProvider is a workmgmt.Provider test double: it records the
@@ -296,11 +299,14 @@ func TestFileWorkItem_NumberedType_AllocatesAndDispatches(t *testing.T) {
 }
 
 // TestFileWorkItem_UnimplementedProvider_FailsClosed asserts an
-// unregistered/unimplemented provider id (jira is interface-only in v0)
-// returns a typed 501 naming the missing provider rather than panicking.
+// unregistered/unimplemented provider id returns a typed 501 naming the
+// missing provider rather than panicking. jira is now a real provider, so
+// this uses a genuinely-never-registered placeholder ("gitlab") — the
+// registry is process-global, and the end-to-end jira test below registers
+// the jira provider, so a stale "jira" id here would resolve.
 func TestFileWorkItem_UnimplementedProvider_FailsClosed(t *testing.T) {
 	conv := workmgmt.Default()
-	conv.Provider = "jira" // never registered
+	conv.Provider = "gitlab" // never registered
 	prev := conventionsLoader
 	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
@@ -309,7 +315,7 @@ func TestFileWorkItem_UnimplementedProvider_FailsClosed(t *testing.T) {
 	rec := fileWorkItem(t, s, workItemRequest{
 		Repo:      "kuhlman-labs/fishhawk",
 		Type:      "chore",
-		Summary:   "Try the jira path",
+		Summary:   "Try an unimplemented provider",
 		TitleVars: map[string]string{"epic": "22", "n": "7"},
 	}, "github:operator")
 
@@ -323,8 +329,106 @@ func TestFileWorkItem_UnimplementedProvider_FailsClosed(t *testing.T) {
 	if env.Error.Code != "provider_unimplemented" {
 		t.Errorf("code = %q, want provider_unimplemented", env.Error.Code)
 	}
-	if env.Error.Details["provider"] != "jira" {
-		t.Errorf("details.provider = %v, want jira", env.Error.Details["provider"])
+	if env.Error.Details["provider"] != "gitlab" {
+		t.Errorf("details.provider = %v, want gitlab", env.Error.Details["provider"])
+	}
+}
+
+// TestFileWorkItem_Jira_EndToEnd is the #1094 cross-boundary seam: the
+// Target.Jira field spans config-parse -> filing endpoint -> provider ->
+// REST client. It injects a provider: jira conventions (with a jira block)
+// through conventionsLoader and registers the REAL jira provider backed by
+// a *jiraclient.Client pointed at a stubbed HTTP transport, then POSTs a
+// file-issue request and asserts (a) the created Jira issue key/URL is
+// returned and (b) the conventions-resolved title/body/labels reached the
+// transport — the seam a per-layer unit (Target.Jira left unpopulated)
+// would miss (cf. #618).
+func TestFileWorkItem_Jira_EndToEnd(t *testing.T) {
+	var createBody map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /rest/api/3/issue", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&createBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"id":"10042","key":"FISH-42"}`)
+	})
+	mux.HandleFunc("GET /rest/api/3/issue/{key}/transitions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"transitions":[{"id":"11","name":"To Backlog","to":{"name":"Backlog"}}]}`)
+	})
+	mux.HandleFunc("POST /rest/api/3/issue/{key}/transitions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	workmgmt.Register(workmgmtjira.New(jiraclient.New(srv.URL, "e@x.com", "tok")))
+
+	conv := workmgmt.Default()
+	conv.Provider = workmgmtjira.ProviderName
+	conv.Jira = &workmgmt.JiraConnection{ProjectKey: "FISH"}
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	s := New(Config{})
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Add the widget endpoint",
+		TitleVars: map[string]string{"epic": "22", "n": "5"},
+		Relations: &workItemRelations{ParentEpic: "FISH-100"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Provider != workmgmtjira.ProviderName {
+		t.Errorf("provider = %q, want %q", resp.Provider, workmgmtjira.ProviderName)
+	}
+	if !resp.EpicLinked {
+		t.Errorf("epic_linked = false, want true (parent FISH-100 set at create): %+v", resp)
+	}
+	// The created Jira issue key/URL is returned: Number is the key's numeric
+	// suffix, URL the browse URL carrying the full key.
+	if resp.Number != 42 {
+		t.Errorf("number = %d, want 42 (suffix of FISH-42)", resp.Number)
+	}
+	if resp.URL != srv.URL+"/browse/FISH-42" {
+		t.Errorf("url = %q, want the FISH-42 browse URL", resp.URL)
+	}
+	if !resp.Boarded {
+		t.Errorf("boarded = false, want true (the Backlog transition succeeded): %+v", resp)
+	}
+
+	// Transport seam: the conventions-resolved title/body/labels reached the
+	// Jira create call.
+	if createBody == nil {
+		t.Fatal("create transport was not hit")
+	}
+	fields, _ := createBody["fields"].(map[string]any)
+	if fields == nil {
+		t.Fatalf("create body missing fields: %v", createBody)
+	}
+	if got, _ := fields["summary"].(string); got != "[E22.5] Add the widget endpoint" {
+		t.Errorf("transport summary = %q, want the rendered title", got)
+	}
+	if proj, _ := fields["project"].(map[string]any); proj["key"] != "FISH" {
+		t.Errorf("transport project.key = %v, want FISH", proj["key"])
+	}
+	if it, _ := fields["issuetype"].(map[string]any); it["name"] != "Feature" {
+		t.Errorf("transport issuetype.name = %v, want Feature", it["name"])
+	}
+	labels, _ := fields["labels"].([]any)
+	if len(labels) == 0 || labels[0] != "type:feature" {
+		t.Errorf("transport labels = %v, want the resolved default type:feature", labels)
+	}
+	if parent, _ := fields["parent"].(map[string]any); parent["key"] != "FISH-100" {
+		t.Errorf("transport parent.key = %v, want FISH-100 (epic linked at create)", parent["key"])
+	}
+	if _, ok := fields["description"]; !ok {
+		t.Errorf("transport body (description) not sent: %v", fields)
 	}
 }
 

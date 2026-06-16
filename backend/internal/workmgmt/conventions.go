@@ -48,6 +48,7 @@ type Conventions struct {
 	SpecVersion      string              `json:"spec_version"`
 	Provider         string              `json:"provider"`
 	Project          *Project            `json:"project,omitempty"`
+	Jira             *JiraConnection     `json:"jira,omitempty"`
 	ComplexityLevels map[string]string   `json:"complexity_levels,omitempty"`
 	RequiredFields   []string            `json:"required_fields"`
 	FieldHints       map[string]string   `json:"field_hints,omitempty"`
@@ -81,6 +82,18 @@ type Project struct {
 	Owner     string `json:"owner"`
 	OwnerType string `json:"owner_type,omitempty"`
 	Number    int    `json:"number"`
+}
+
+// JiraConnection is the Jira connection. ProjectKey selects the target
+// Jira project (e.g. FISH) that filed issues are created under; IssueTypes
+// optionally maps a canonical work-item type to the Jira issue-type name,
+// with absent entries defaulting to a title-cased fallback in the provider.
+// The Jira instance base URL and credentials are server-side env
+// (FISHHAWKD_JIRA_*), never in this checked-in config, so this block
+// carries no secrets and no base URL.
+type JiraConnection struct {
+	ProjectKey string            `json:"project_key"`
+	IssueTypes map[string]string `json:"issue_types,omitempty"`
 }
 
 // ItemType is the conventions for one work-item type.
@@ -230,8 +243,8 @@ func parse(data []byte) (Conventions, error) {
 }
 
 // validateSemantics enforces the cross-field rules the JSON Schema can't
-// express: the mandatory required-field trio, the github_projects
-// connection requirement, ADR numbering, the complexity cross-reference,
+// express: the mandatory required-field trio, the github_projects and jira
+// connection requirements, ADR numbering, the complexity cross-reference,
 // and the transitions->states cross-reference (every configured transition
 // target must name a canonical state declared in the states map).
 func validateSemantics(c Conventions) error {
@@ -243,6 +256,10 @@ func validateSemantics(c Conventions) error {
 
 	if c.Provider == "github_projects" && c.Project == nil {
 		return &SemanticError{Msg: "provider github_projects requires a project connection block (owner + number)"}
+	}
+
+	if c.Provider == "jira" && c.Jira == nil {
+		return &SemanticError{Msg: "provider jira requires a jira connection block (project_key)"}
 	}
 
 	// Type keys are deterministically ordered so the first failure is
