@@ -53,11 +53,13 @@ func (*Provider) Name() string { return ProviderName }
 // The issue is created first — it is the durable result and the only fatal
 // step: a CreateIssue failure (or a failed pre-create guard) returns a nil
 // item and an error, because no issue exists. The parent/epic reference is
-// applied at create time via the team-managed `fields.parent` reference
-// (#1107 best-effort: a wrong parent for a classic project surfaces as a
-// create-time 4xx), so a requested parent that survives create is linked.
-// Board placement is a best-effort workflow transition (#1107): a created
-// issue lands in the project's default status, and reaching the
+// applied at create time via the conventions' parent_field (empty/"parent" =
+// the team-managed fields.parent reference, otherwise a classic project's
+// Epic Link custom field), so a requested parent that survives create is
+// linked; a wrong parent field for the project surfaces as a create-time 4xx
+// (#1107 best-effort: the caller's concern). Board placement is a best-effort
+// workflow transition (#1107): a created issue lands in the project's
+// default status, and reaching the
 // conventions' status requires a separate transition call — once the issue
 // exists File always returns it with a nil error, recording whether the
 // transition landed in CreatedItem.Boarded and the cause in BoardingError
@@ -82,6 +84,7 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		Description: req.Item.Body,
 		Labels:      req.Item.Classification.Labels,
 		ParentKey:   parentKey,
+		ParentField: strings.TrimSpace(conn.ParentField),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/jira: create issue: %w", err)
@@ -95,9 +98,9 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		Status:        req.Item.BoardPlacement.Status,
 		BoardColumn:   req.Item.BoardPlacement.BoardColumn,
 	}
-	// The parent reference is applied at create time via fields.parent, so a
-	// requested parent that survived create is linked; an empty parent means
-	// nothing to link (EpicLinked false with no error).
+	// The parent reference is applied at create time via the conventions'
+	// parent_field, so a requested parent that survived create is linked; an
+	// empty parent means nothing to link (EpicLinked false with no error).
 	created.EpicLinked = parentKey != ""
 
 	// Board placement is best-effort (#1107): no configured status means

@@ -129,6 +129,7 @@ spec_version: work-management-v0
 provider: jira
 jira:
   project_key: FISH
+  parent_field: customfield_10014
   issue_types:
     feature: Story
     bug: Bug
@@ -147,6 +148,9 @@ types: {feature: {body_skeleton: [Summary]}}
 	}
 	if c.Jira.ProjectKey != "FISH" {
 		t.Errorf("Jira.ProjectKey = %q, want FISH", c.Jira.ProjectKey)
+	}
+	if c.Jira.ParentField != "customfield_10014" {
+		t.Errorf("Jira.ParentField = %q, want customfield_10014", c.Jira.ParentField)
 	}
 	if c.Jira.IssueTypes["feature"] != "Story" || c.Jira.IssueTypes["bug"] != "Bug" {
 		t.Errorf("Jira.IssueTypes = %v, want {feature:Story bug:Bug}", c.Jira.IssueTypes)

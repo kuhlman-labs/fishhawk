@@ -1,8 +1,8 @@
 // Package jiraclient is the backend's minimal typed wrapper around the
 // Jira Cloud REST API v3 for the small set of operations the Fishhawk
 // work-management jira provider (#1094, deferred from #1005) needs:
-// creating an issue (optionally linked to a parent/epic) and moving an
-// issue through a workflow transition.
+// creating an issue (optionally linked to a parent/epic at create time)
+// and moving an issue through a workflow transition.
 //
 // Auth is HTTP Basic with `email:api_token` (the documented Jira Cloud
 // server-to-server scheme — see
@@ -99,9 +99,14 @@ func New(baseURL, email, apiToken string, opts ...Option) *Client {
 
 // CreateIssueParams describes a single issue to create. ProjectKey,
 // IssueType, and Summary are required; the rest are optional. ParentKey,
-// when set, links the new issue to a parent/epic via the team-managed
-// `fields.parent` reference (best-effort per #1107 — a wrong field for a
-// classic project is the caller's concern, the API surfaces it as a 4xx).
+// when set, links the new issue to a parent/epic at create time (#1107); the
+// emitted field shape is selected by ParentField — an empty or "parent"
+// value is the team-managed issue-reference field, emitted as the object
+// shape {"parent":{"key":KEY}}, while any other value is a classic /
+// company-managed project's Epic Link custom field id (e.g.
+// customfield_10014), under which the epic key is emitted as a bare string
+// {ParentField: KEY}. A wrong field for the project surfaces as a create-time
+// 4xx, which fails the filing (the caller's concern).
 type CreateIssueParams struct {
 	ProjectKey  string
 	IssueType   string
@@ -109,6 +114,7 @@ type CreateIssueParams struct {
 	Description string
 	Labels      []string
 	ParentKey   string
+	ParentField string
 }
 
 // CreatedIssue is the result of CreateIssue.
@@ -158,7 +164,11 @@ func (c *Client) CreateIssue(ctx context.Context, p CreateIssueParams) (*Created
 		fields["labels"] = p.Labels
 	}
 	if p.ParentKey != "" {
-		fields["parent"] = map[string]string{"key": p.ParentKey}
+		if field := strings.TrimSpace(p.ParentField); field == "" || field == "parent" {
+			fields["parent"] = map[string]string{"key": p.ParentKey}
+		} else {
+			fields[field] = p.ParentKey
+		}
 	}
 
 	resp, err := c.do(ctx, http.MethodPost, "/rest/api/3/issue", map[string]any{"fields": fields})

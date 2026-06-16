@@ -45,6 +45,7 @@ The `jira` block is the connection for `provider: jira`. It carries **only non-s
 |---|---|---|---|
 | `project_key` | yes | string | Jira project key (e.g. `FISH`) that filed issues are created under. |
 | `issue_types` | no | object: canonical type → Jira issue-type name | Maps a canonical work-item type (`bug`, `feature`, …) to its Jira issue-type name (`Bug`, `Story`, …). An absent entry falls back to a title-cased default in the provider. |
+| `parent_field` | no | string (default `parent`) | Field used to link a filed issue to its parent epic, applied best-effort after create. Default `parent` is the team-managed issue-reference field (`{"parent":{"key":…}}`). A classic/company-managed project sets this to its Epic Link custom field id (e.g. `customfield_10014`); the epic key is then emitted as a bare string under that key. |
 
 The Jira **instance base URL and credentials are server-side env**, never in this checked-in config: `FISHHAWKD_JIRA_BASE_URL`, `FISHHAWKD_JIRA_EMAIL`, `FISHHAWKD_JIRA_API_TOKEN`. This matches the `FISHHAWKD_PROJECTS_TOKEN` single-instance, secrets-never-in-repo precedent — the repo config selects only the project, the server holds the one instance and its creds. `provider: jira` still fails closed at filing time until the concrete provider and its server wiring land.
 

@@ -88,12 +88,17 @@ type Project struct {
 // Jira project (e.g. FISH) that filed issues are created under; IssueTypes
 // optionally maps a canonical work-item type to the Jira issue-type name,
 // with absent entries defaulting to a title-cased fallback in the provider.
-// The Jira instance base URL and credentials are server-side env
-// (FISHHAWKD_JIRA_*), never in this checked-in config, so this block
-// carries no secrets and no base URL.
+// ParentField selects the field used to link a filed issue to its parent
+// epic: empty or "parent" is the team-managed issue-reference field (the
+// object shape {"parent":{"key":…}}), while a classic/company-managed
+// project sets it to its Epic Link custom field id (e.g. customfield_10014),
+// under which the epic key is emitted as a bare string. The Jira instance
+// base URL and credentials are server-side env (FISHHAWKD_JIRA_*), never in
+// this checked-in config, so this block carries no secrets and no base URL.
 type JiraConnection struct {
-	ProjectKey string            `json:"project_key"`
-	IssueTypes map[string]string `json:"issue_types,omitempty"`
+	ProjectKey  string            `json:"project_key"`
+	IssueTypes  map[string]string `json:"issue_types,omitempty"`
+	ParentField string            `json:"parent_field,omitempty"`
 }
 
 // ItemType is the conventions for one work-item type.

@@ -2,7 +2,11 @@ package jira
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
@@ -112,21 +116,29 @@ func TestFile_IssueTypeOverride(t *testing.T) {
 }
 
 // TestFile_ParentLink asserts the parent epic reference is passed to
-// CreateIssue (fields.parent) and EpicLinked is reported true.
+// CreateIssue (applied at create time) with the conventions' parent_field
+// threaded through, and EpicLinked is reported true.
 func TestFile_ParentLink(t *testing.T) {
 	api := &fakeAPI{}
 	p := New(api)
 	item := workmgmt.WorkItem{Type: "feature", Title: "t", Relations: workmgmt.Relations{ParentEpic: "FISH-100"}}
+	conn := &workmgmt.JiraConnection{ProjectKey: "FISH", ParentField: "customfield_10014"}
 
-	created, err := p.File(context.Background(), req(item, &workmgmt.JiraConnection{ProjectKey: "FISH"}))
+	created, err := p.File(context.Background(), req(item, conn))
 	if err != nil {
 		t.Fatalf("File: %v", err)
 	}
 	if api.createParams.ParentKey != "FISH-100" {
 		t.Errorf("ParentKey = %q, want FISH-100", api.createParams.ParentKey)
 	}
+	if api.createParams.ParentField != "customfield_10014" {
+		t.Errorf("ParentField = %q, want the threaded parent_field customfield_10014", api.createParams.ParentField)
+	}
 	if !created.EpicLinked {
 		t.Error("EpicLinked = false, want true when a parent was requested and create succeeded")
+	}
+	if created.EpicLinkError != "" {
+		t.Errorf("EpicLinkError = %q, want empty on success", created.EpicLinkError)
 	}
 }
 
@@ -222,6 +234,132 @@ func TestFile_MissingAPIClient(t *testing.T) {
 	if _, err := p.File(context.Background(), req(workmgmt.WorkItem{Type: "bug", Title: "t"}, &workmgmt.JiraConnection{ProjectKey: "FISH"})); err == nil {
 		t.Fatal("File returned nil error with no API client")
 	}
+}
+
+// stubTransport is a jiraclient.Doer that records every request and answers
+// it via respond. It lets the integrated test drive a REAL *jiraclient.Client
+// through provider.File and assert the on-the-wire request body.
+type stubTransport struct {
+	requests []stubReq
+	respond  func(stubReq) (*http.Response, error)
+}
+
+type stubReq struct {
+	method string
+	path   string
+	body   []byte
+}
+
+func (s *stubTransport) Do(r *http.Request) (*http.Response, error) {
+	var body []byte
+	if r.Body != nil {
+		body, _ = io.ReadAll(r.Body)
+	}
+	rec := stubReq{method: r.Method, path: r.URL.Path, body: body}
+	s.requests = append(s.requests, rec)
+	return s.respond(rec)
+}
+
+func stubResp(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+	}
+}
+
+// TestFile_ParentFieldThreadedToWire is the cross-boundary seam check: it
+// threads parent_field from the JiraConnection config through provider.File
+// into a REAL *jiraclient.Client and asserts the emitted create request body
+// carries the parent for both field shapes (team-managed `parent` object vs
+// classic bare-string custom field), plus that a create-time parent failure
+// fails the filing (#1107: a wrong parent field surfaces as a create 4xx).
+func TestFile_ParentFieldThreadedToWire(t *testing.T) {
+	const epicKey = "FISH-100"
+
+	shapeCases := []struct {
+		name        string
+		parentField string
+		assertBody  func(t *testing.T, fields map[string]any)
+	}{
+		{
+			name:        "team-managed default emits parent object",
+			parentField: "",
+			assertBody: func(t *testing.T, fields map[string]any) {
+				obj, ok := fields["parent"].(map[string]any)
+				if !ok || obj["key"] != epicKey {
+					t.Errorf("parent = %v, want object {key:%s}", fields["parent"], epicKey)
+				}
+			},
+		},
+		{
+			name:        "classic custom field emits bare string",
+			parentField: "customfield_10014",
+			assertBody: func(t *testing.T, fields map[string]any) {
+				if v, ok := fields["customfield_10014"].(string); !ok || v != epicKey {
+					t.Errorf("customfield_10014 = %v, want bare string %s", fields["customfield_10014"], epicKey)
+				}
+				if _, ok := fields["parent"]; ok {
+					t.Error("parent object present for a classic custom-field link")
+				}
+			},
+		},
+	}
+	for _, tc := range shapeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &stubTransport{respond: func(r stubReq) (*http.Response, error) {
+				switch r.method {
+				case http.MethodPost: // create
+					return stubResp(http.StatusCreated, `{"id":"1","key":"FISH-7"}`), nil
+				default:
+					t.Fatalf("unexpected method %s", r.method)
+					return nil, nil
+				}
+			}}
+			client := jiraclient.New("https://acme.atlassian.net", "bot@acme.example", "token", jiraclient.WithHTTPClient(st))
+			p := New(client)
+			item := workmgmt.WorkItem{Type: "feature", Title: "t", Relations: workmgmt.Relations{ParentEpic: epicKey}}
+			created, err := p.File(context.Background(), req(item, &workmgmt.JiraConnection{ProjectKey: "FISH", ParentField: tc.parentField}))
+			if err != nil {
+				t.Fatalf("File: %v", err)
+			}
+			if !created.EpicLinked {
+				t.Error("EpicLinked = false, want true")
+			}
+			var createBody []byte
+			for _, r := range st.requests {
+				if r.method == http.MethodPost {
+					createBody = r.body
+				}
+			}
+			if createBody == nil {
+				t.Fatal("no POST (create) request emitted")
+			}
+			var got struct {
+				Fields map[string]any `json:"fields"`
+			}
+			if err := json.Unmarshal(createBody, &got); err != nil {
+				t.Fatalf("unmarshal create body: %v\nbody=%s", err, createBody)
+			}
+			tc.assertBody(t, got.Fields)
+		})
+	}
+
+	t.Run("create-time parent failure fails the filing", func(t *testing.T) {
+		st := &stubTransport{respond: func(stubReq) (*http.Response, error) {
+			return stubResp(http.StatusBadRequest, `{"errorMessages":["unknown field"]}`), nil
+		}}
+		client := jiraclient.New("https://acme.atlassian.net", "bot@acme.example", "token", jiraclient.WithHTTPClient(st))
+		p := New(client)
+		item := workmgmt.WorkItem{Type: "feature", Title: "t", Relations: workmgmt.Relations{ParentEpic: epicKey}}
+		created, err := p.File(context.Background(), req(item, &workmgmt.JiraConnection{ProjectKey: "FISH", ParentField: "customfield_99999"}))
+		if err == nil {
+			t.Fatal("File returned nil error on a create-time parent failure")
+		}
+		if created != nil {
+			t.Errorf("created = %+v, want nil when create failed", created)
+		}
+	})
 }
 
 // TestNumberFromKey covers the key-suffix parsing edge cases.
