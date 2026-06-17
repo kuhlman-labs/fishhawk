@@ -1891,21 +1891,22 @@ func TestGetStagePrompt_Implement_FixupConcerns_FoldsScope(t *testing.T) {
 		}
 	}
 
-	// The fix-up scope folds the concern surface INTO the plan scope (#1162):
-	// the concern-named file is added, and the plan-scope file remains present
-	// so a concern-authorized edit ships as a declared path.
+	// The concern surface folds INTO the inherited plan scope (#1162): the
+	// concern-named file is added, and the plan-scope file
+	// backend/internal/server/prompt.go — which the fix-up may still need to
+	// edit — remains present alongside it.
 	paths := map[string]bool{}
 	for _, f := range resp.ScopeFiles {
 		paths[f.Path] = true
 	}
 	if !paths["backend/internal/run/fixup_test.go"] {
-		t.Errorf("concern-named file missing from folded scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("concern-named file missing from scope_files: %+v", resp.ScopeFiles)
 	}
 	if !paths["backend/internal/server/prompt.go"] {
-		t.Errorf("plan scope file must remain in the folded fix-up scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("plan scope file missing from scope_files: %+v", resp.ScopeFiles)
 	}
 	if len(resp.ScopeFiles) != 2 {
-		t.Errorf("folded scope_files must contain the plan scope plus the concern surface (2 files), got %+v", resp.ScopeFiles)
+		t.Errorf("scope_files must contain the plan scope plus the concern surface (2 files), got %+v", resp.ScopeFiles)
 	}
 
 	// Cross-boundary assertion (#784): the response carries the fix-up wire
@@ -1930,11 +1931,11 @@ func TestGetStagePrompt_Implement_FixupConcerns_FoldsScope(t *testing.T) {
 }
 
 // TestGetStagePrompt_Implement_FixupConcerns_EmptyConcernSurface covers the
-// no-foldable-surface case (#1162): a fix-up whose concern Note names NO
-// parseable repo-relative path and declares no allow_create / approved
-// amendments folds nothing, so the effective scope is the FULL plan scope
-// unchanged. This asserts the plan scope is preserved for the
-// unparseable-concern case.
+// empty-surface case (#1162): a fix-up whose concern Note names NO parseable
+// repo-relative path and declares no allow_create / approved amendments folds
+// nothing, so foldFixupScope returns the inherited plan scope unchanged rather
+// than emitting an empty scope (which the runner would read as "no scope" and
+// git add -A the whole tree).
 func TestGetStagePrompt_Implement_FixupConcerns_EmptyConcernSurface(t *testing.T) {
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
@@ -2024,13 +2025,15 @@ func TestGetStagePrompt_Implement_FixupConcerns_EmptyConcernSurface(t *testing.T
 }
 
 // TestGetStagePrompt_Implement_FixupConcerns_PartialParse covers the PARTIAL-
-// PARSE branch of mergeFixupScope (binding approval condition, #1162): a
+// PARSE branch of foldFixupScope (binding approval condition, #1162): a
 // concern Note that names ONE file in repo-relative form AND references a second
 // needed file only by basename/backtick. extractScopePathsFromConditions drops
 // the basename-only token (#1155 — it requires both a slash and an extension),
-// so the repo-relative path is folded into the scope while the basename-only
-// file is silently excluded. The mid-stage scope-amendment escape hatch is the
-// supported path to widen the fix-up if that excluded file truly must change.
+// so the repo-relative path is admitted into the effective scope while the
+// basename-only file is silently excluded — documenting that a basename-only
+// reference is dropped and that widening past it is the operator's mid-stage
+// scope-amendment escape hatch. The repo-relative concern path folds in
+// alongside the inherited plan scope file, which remains present.
 func TestGetStagePrompt_Implement_FixupConcerns_PartialParse(t *testing.T) {
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
@@ -2110,23 +2113,26 @@ func TestGetStagePrompt_Implement_FixupConcerns_PartialParse(t *testing.T) {
 		t.Fatalf("partial-parse fix-up scope must be non-empty")
 	}
 	if !paths["backend/internal/run/fixup_test.go"] {
-		t.Errorf("repo-relative concern path missing from folded scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("repo-relative concern path missing from scope_files: %+v", resp.ScopeFiles)
 	}
 	// The basename-only reference is silently excluded (dropped at extraction).
+	// Widening past it is the operator's mid-stage scope-amendment escape hatch.
 	if paths["helper.go"] {
-		t.Errorf("basename-only reference must NOT be folded into scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("basename-only reference must NOT be admitted into scope_files: %+v", resp.ScopeFiles)
 	}
-	// The plan scope file remains present alongside the folded concern path.
+	// The inherited plan-scope file remains present alongside the folded
+	// concern path.
 	if !paths["backend/internal/server/prompt.go"] {
-		t.Errorf("plan scope file must remain in the folded fix-up scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("plan scope file missing from scope_files: %+v", resp.ScopeFiles)
 	}
 }
 
 // TestGetStagePrompt_Implement_FixupConcerns_AmendmentIncluded covers the
-// approved-scope-amendment branch of mergeFixupScope (#1162): a path approved
+// approved-scope-amendment branch of foldFixupScope (#1162): a path approved
 // via the mid-stage scope-amendment escape hatch is folded into the effective
 // scope_files even though no concern references it — the supported way to widen
-// a fix-up's blast radius beyond the concern surface.
+// a fix-up's blast radius beyond the concern surface. It folds in alongside the
+// concern surface and the inherited plan scope.
 func TestGetStagePrompt_Implement_FixupConcerns_AmendmentIncluded(t *testing.T) {
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
@@ -2218,14 +2224,15 @@ func TestGetStagePrompt_Implement_FixupConcerns_AmendmentIncluded(t *testing.T) 
 		paths[f.Path] = true
 	}
 	if !paths["backend/internal/run/fixup_test.go"] {
-		t.Errorf("concern-named file missing from folded scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("concern-named file missing from scope_files: %+v", resp.ScopeFiles)
 	}
 	if !paths["backend/internal/server/amended.go"] {
-		t.Errorf("approved scope-amendment path missing from folded scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("approved scope-amendment path missing from scope_files: %+v", resp.ScopeFiles)
 	}
-	// The plan scope file remains present alongside the folded surfaces.
+	// The inherited plan-scope file remains present alongside the concern
+	// surface and the approved amendment.
 	if !paths["backend/internal/server/prompt.go"] {
-		t.Errorf("plan scope file must remain in the folded fix-up scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("plan scope file missing from scope_files: %+v", resp.ScopeFiles)
 	}
 }
 
@@ -2302,7 +2309,7 @@ func TestGetStagePrompt_Implement_NoFixup_OmitsWireFlag(t *testing.T) {
 	if resp.FixupExpectedHeadSHA != "" {
 		t.Errorf("fixup_expected_head_sha = %q, want empty for a normal implement dispatch", resp.FixupExpectedHeadSHA)
 	}
-	// A normal implement dispatch never reaches mergeFixupScope (gated on the
+	// A normal implement dispatch never reaches foldFixupScope (gated on the
 	// fix-up branch), so scope_files is the FULL plan scope unchanged (#1162).
 	if len(resp.ScopeFiles) != 1 || resp.ScopeFiles[0].Path != "backend/internal/server/prompt.go" {
 		t.Errorf("non-fix-up dispatch must carry the full plan scope, got %+v", resp.ScopeFiles)
@@ -2628,10 +2635,10 @@ func TestResolveFixupAllowCreate(t *testing.T) {
 // TestGetStagePrompt_Implement_FixupAllowCreate_Folded confirms an operator-
 // declared net-new file (allow_create, #823) is included in the effective
 // scope.files — the exact set the runner's #818 created-out-of-scope gate diffs
-// against — alongside the inherited plan scope, while an undeclared path stays
-// absent. Under the fix-up fold (#1162) the allow_create surface is added to
-// the plan scope; the plan-scope file remains present and the undeclared file
-// is still absent so the #818 silent-strip hole stays closed.
+// against — while an undeclared path stays absent. The allow_create surface
+// folds INTO the inherited plan scope (#1162), so it is present alongside the
+// plan-only file; the undeclared file is still absent so the #818 silent-strip
+// hole stays closed.
 func TestGetStagePrompt_Implement_FixupAllowCreate_Folded(t *testing.T) {
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
@@ -2704,14 +2711,15 @@ func TestGetStagePrompt_Implement_FixupAllowCreate_Folded(t *testing.T) {
 	for _, f := range resp.ScopeFiles {
 		paths[f.Path] = true
 	}
-	// The declared net-new file is in the effective scope (allow_create fold).
+	// The declared net-new file folds into the effective scope (allow_create
+	// surface).
 	if !paths["backend/internal/server/helper.go"] {
-		t.Errorf("allow_create file missing from folded scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("allow_create file missing from scope_files: %+v", resp.ScopeFiles)
 	}
-	// The plan scope file remains present alongside the folded allow_create
-	// surface — the fold unions the concern surface into the plan scope.
+	// The inherited plan-scope file remains present alongside the allow_create
+	// surface.
 	if !paths["backend/internal/server/prompt.go"] {
-		t.Errorf("plan scope file must remain in the folded fix-up scope_files: %+v", resp.ScopeFiles)
+		t.Errorf("plan scope file missing from scope_files: %+v", resp.ScopeFiles)
 	}
 	// An undeclared path is NOT in the effective scope — the #818 gate would
 	// still trip for it (the silent-strip hole stays closed).
