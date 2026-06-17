@@ -242,13 +242,16 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 // persist → prompt renderer's effective scope.files. It proves both
 // directions at once:
 //
-//   - a path DECLARED via allow_create folds into the implement prompt's
-//     scope.files — the exact union the runner's #818 created-out-of-scope
-//     gate diffs created files against — so the runner stages it and the
-//     gate no longer trips for it;
-//   - a path NOT declared (nor in the approved plan scope) does NOT appear
-//     in the effective scope.files, so the #818 silent-strip hole stays
-//     closed: an undeclared created file is still category-B.
+//   - a path DECLARED via allow_create is part of the implement prompt's
+//     NARROWED scope.files (#1162) — the exact set the runner's #818
+//     created-out-of-scope gate diffs created files against — so the runner
+//     stages it and the gate no longer trips for it;
+//   - the plan-only file NOT named by the routed concern is ABSENT (#1162):
+//     fix-up scope is narrowed to the concern surface, so a stray edit to a
+//     plan-only file surfaces as scope_drift rather than shipping silently;
+//   - a path NOT declared (nor named by a concern) does NOT appear in the
+//     effective scope.files, so the #818 silent-strip hole stays closed: an
+//     undeclared created file is still category-B.
 func TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -373,18 +376,19 @@ func TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope(t *testing.T) {
 	}
 
 	// 6. The end-to-end assertion: the implement prompt's effective
-	// scope.files CONTAINS the declared path (folded in alongside the plan
-	// scope file) and does NOT contain the undeclared sibling.
+	// scope.files is NARROWED to the routed concern surface (#1162) — it
+	// CONTAINS the declared allow_create path, EXCLUDES the plan-only file
+	// not named by the concern, and does NOT contain the undeclared sibling.
 	scopeFiles := getPromptRenderScopeFiles(t, ctx, httpSrv.URL, implStage.ID)
 	inScope := map[string]bool{}
 	for _, p := range scopeFiles {
 		inScope[p] = true
 	}
-	if !inScope["backend/internal/server/prompt.go"] {
-		t.Errorf("plan scope file missing from effective scope.files: %v", scopeFiles)
+	if inScope["backend/internal/server/prompt.go"] {
+		t.Errorf("plan-only file not named by the concern must be ABSENT from the narrowed effective scope.files: %v", scopeFiles)
 	}
 	if !inScope[declared] {
-		t.Errorf("declared allow_create path %q not folded into effective scope.files: %v", declared, scopeFiles)
+		t.Errorf("declared allow_create path %q missing from narrowed effective scope.files: %v", declared, scopeFiles)
 	}
 	if inScope[undeclared] {
 		t.Errorf("undeclared path %q leaked into effective scope.files — #818 silent-strip hole reopened: %v", undeclared, scopeFiles)
@@ -1852,7 +1856,7 @@ func getPromptRender(t *testing.T, ctx context.Context, baseURL string, stageID 
 }
 
 // getPromptRenderScopeFiles fetches GET /v0/stages/{id}/prompt-render and
-// returns the effective scope.files paths (the union the runner's #818
+// returns the effective scope.files paths (the set the runner's #818
 // created-out-of-scope gate diffs against), in order.
 func getPromptRenderScopeFiles(t *testing.T, ctx context.Context, baseURL string, stageID uuid.UUID) []string {
 	t.Helper()
