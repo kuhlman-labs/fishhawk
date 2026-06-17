@@ -107,11 +107,20 @@ type runResult struct {
 // for a decomposed child.
 func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, client lineageStatusClient) (wt string, release func(), err error) {
 	root := lineageRoot(runID, decomposedFrom)
-	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
-	wt, err = provisionLineageWorktree(ctx, repo, root, io.Discard)
+	// Cross-lineage worktree-admin lock (#1181): serialize the fast
+	// sweep+provision critical section against sibling lineages, then release
+	// before the (here, simulated) long stage — exactly as main.go wires it.
+	adminRelease, err := acquireWorktreeAdminLock(ctx, repo, io.Discard)
 	if err != nil {
 		return "", nil, err
 	}
+	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
+	wt, err = provisionLineageWorktree(ctx, repo, root, io.Discard)
+	if err != nil {
+		adminRelease()
+		return "", nil, err
+	}
+	adminRelease()
 	writeLineageRunID(ctx, repo, root, lineageRootFull(runID, decomposedFrom), io.Discard)
 	release, err = acquireLineageLock(ctx, repo, root, runID, io.Discard)
 	if err != nil {
@@ -375,6 +384,108 @@ func TestWorktreeIsolation_Integration(t *testing.T) {
 	// invariant holds across provisioning, sharing, AND sweep).
 	if status := gitPorcelain(t, repo); status != "" {
 		t.Errorf("operator git status not clean after sweep:\n%s", status)
+	}
+}
+
+// TestWorktreeAdminLock_ConcurrentSweepWithLiveSibling is the load-bearing
+// safety assertion for #1181 condition (2): it interleaves a sweep-remove of
+// a TERMINAL lineage's worktree with a live sibling lineage's `git worktree
+// add` against the SAME shared gitdir, and asserts both succeed, the live
+// sibling survives + stays registered, the terminal worktree is gone, the
+// operator tree stays clean, and neither commit cross-contaminated. Run under
+// -race (with -count to repeat), an unguarded interleave — a `git worktree
+// remove --force` racing a `git worktree add`/`list` — would trip here.
+func TestWorktreeAdminLock_ConcurrentSweepWithLiveSibling(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	client := &syncLineageClient{complete: map[string]bool{}}
+
+	seed := gitPorcelainHead(t, repo)
+	if status := gitPorcelain(t, repo); status != "" {
+		t.Fatalf("operator tree dirty before any run:\n%s", status)
+	}
+
+	const (
+		termID    = "1eb11a10-0000-0000-0000-0000000000aa"
+		sweeperID = "5deeb000-0000-0000-0000-0000000000bb"
+		sweepStg  = "55aaee00-0000-0000-0000-0000000000b1"
+		liveID    = "11ee0000-0000-0000-0000-0000000000cc"
+		liveStg   = "11aaee00-0000-0000-0000-0000000000c1"
+	)
+
+	// Pre-provision a terminal lineage's worktree + sidecar, then mark it
+	// complete so the next provision's sweep removes it.
+	termRoot := lineageRoot(termID, "")
+	termPath, err := provisionLineageWorktree(ctx, repo, termRoot, io.Discard)
+	if err != nil {
+		t.Fatalf("provision terminal lineage: %v", err)
+	}
+	writeLineageRunID(ctx, repo, termRoot, termID, io.Discard)
+	client.setComplete(termID, true)
+
+	// Concurrently: (i) a fresh solo run whose provision sweeps the terminal
+	// worktree and adds its own; (ii) a fresh solo run of a DIFFERENT lineage
+	// doing its own `git worktree add` against the same gitdir.
+	var (
+		wg                sync.WaitGroup
+		sweepRes, liveRes runResult
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		sweepRes = simulateSolo(ctx, repo, sweeperID, sweepStg, "s.txt", "S\n", client)
+	}()
+	go func() {
+		defer wg.Done()
+		liveRes = simulateSolo(ctx, repo, liveID, liveStg, "l.txt", "L\n", client)
+	}()
+	wg.Wait()
+
+	if sweepRes.err != nil {
+		t.Fatalf("sweeping run failed: %v", sweepRes.err)
+	}
+	if liveRes.err != nil {
+		t.Fatalf("live sibling run failed: %v", liveRes.err)
+	}
+
+	// The terminal lineage's worktree was swept away.
+	if _, err := os.Stat(termPath); !os.IsNotExist(err) {
+		t.Errorf("terminal worktree not swept: stat err = %v", err)
+	}
+	// The live sibling's worktree exists AND is registered against the gitdir
+	// (the add was not corrupted by the concurrent remove).
+	if st, err := os.Stat(liveRes.wt); err != nil || !st.IsDir() {
+		t.Errorf("live sibling worktree missing: %v", err)
+	}
+	registered, err := listWorktreePaths(ctx, repo)
+	if err != nil {
+		t.Fatalf("list worktrees: %v", err)
+	}
+	if !isRegisteredWorktree(liveRes.wt, registered) {
+		t.Errorf("live sibling worktree not registered: %q not in %v", liveRes.wt, registered)
+	}
+	if !isRegisteredWorktree(sweepRes.wt, registered) {
+		t.Errorf("sweeping run's worktree not registered: %q not in %v", sweepRes.wt, registered)
+	}
+
+	// Neither commit cross-contaminated: each carries only its own file.
+	if got := commitFiles(t, repo, sweepRes.commit); !equalStrings(got, []string{"s.txt"}) {
+		t.Errorf("sweeping run commit diff = %v, want [s.txt]", got)
+	}
+	if got := commitFiles(t, repo, liveRes.commit); !equalStrings(got, []string{"l.txt"}) {
+		t.Errorf("live sibling commit diff = %v, want [l.txt]", got)
+	}
+	if tree := treeFiles(t, repo, liveRes.commit); containsStr(tree, "s.txt") {
+		t.Errorf("live sibling tree leaked the sweeper's file: %v", tree)
+	}
+
+	// The operator's tracked tree stayed clean through the concurrent
+	// sweep+add, and its HEAD never moved.
+	if status := gitPorcelain(t, repo); status != "" {
+		t.Errorf("operator git status not clean after concurrent sweep+add:\n%s", status)
+	}
+	if head := gitPorcelainHead(t, repo); head != seed {
+		t.Errorf("operator HEAD moved: %q, want seed %q", head, seed)
 	}
 }
 

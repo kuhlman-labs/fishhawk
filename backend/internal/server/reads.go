@@ -700,6 +700,20 @@ func (s *Server) lineageComplete(ctx context.Context, runRow *run.Run) *bool {
 			"error", err.Error())
 		return nil
 	}
+	// Truncation guard (#1181): the child read is capped at
+	// lineageChildScanLimit, so a full page means a non-terminal child may
+	// have been dropped beyond the cap — completeness cannot be proven.
+	// Return NOT complete (the safe direction: the runner merely LEAVES the
+	// lineage's worktree in place rather than sweeping a possibly-live one; a
+	// false TRUE is the dangerous direction, letting it remove a live
+	// worktree). boolPtr(false), never nil.
+	if len(children) >= lineageChildScanLimit {
+		s.cfg.Logger.Warn("lineage_complete: child scan hit limit; reporting not complete",
+			"run_id", runRow.ID.String(),
+			"root_run_id", root.ID.String(),
+			"limit", lineageChildScanLimit)
+		return boolPtr(false)
+	}
 	for _, c := range children {
 		// Guard each row is genuinely a child of root: redundant with the
 		// repo's decomposed_from filter in production, but keeps the count

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Per-run working-tree isolation (E22.X / #1137).
@@ -233,6 +234,97 @@ func acquireLineageLock(ctx context.Context, repoDir, root, runID string, logSin
 		}
 	}
 	return nil, fmt.Errorf("acquireLineageLock: lineage %s lock still contended after reclaim", root)
+}
+
+const (
+	// worktreeAdminLockName is the single per-gitdir lockfile that serializes
+	// cross-lineage worktree-admin operations. It sits BESIDE the worktrees
+	// under <worktrees-dir> (never inside a worktree), so it is never swept
+	// into a run's commit — the same placement invariant as the lineage lock
+	// and the run-id sidecar.
+	worktreeAdminLockName = ".worktree-admin.lock"
+	// worktreeAdminLockMaxWait bounds how long acquireWorktreeAdminLock blocks
+	// on a LIVE holder before returning an actionable timeout error rather
+	// than hanging the stage forever.
+	worktreeAdminLockMaxWait = 30 * time.Second
+	// worktreeAdminLockBackoff is the poll interval between contended acquire
+	// attempts.
+	worktreeAdminLockBackoff = 25 * time.Millisecond
+)
+
+// acquireWorktreeAdminLock serializes the cross-lineage worktree-admin
+// critical section — the provision-time sweep (`git worktree remove
+// --force`) plus the `git worktree list`/`add` ops — against the repo's
+// shared gitdir.
+//
+// Cross-lineage safety decision (#1181, issue option (b)): git's
+// worktree-admin subcommands are NOT a documented mutual-exclusion contract
+// across concurrent invocations on a shared gitdir, and whatever internal
+// locking they take varies by git version. Rather than audit git internals
+// and depend on those version-specific guarantees (option (a)), we add our
+// own deterministic, version-independent serialization here: a sibling run
+// of a DIFFERENT lineage can no longer interleave a `git worktree remove
+// --force` of a terminal lineage with another lineage's `git worktree
+// add`/`list` on the same gitdir.
+//
+// Unlike acquireLineageLock — which fails LOUD because same-lineage
+// concurrency is a decomposition bug — cross-lineage concurrent provisions
+// are the feature's EXPECTED steady state on a multi-run host, so this lock
+// BLOCKS rather than fails: it retries on contention with a short backoff,
+// reclaims a stale lock whose recorded pid is no longer alive, and is
+// bounded by a max-wait (and the caller's context deadline) so a wedged
+// holder yields an actionable error instead of hanging the stage forever.
+// The caller MUST hold it ONLY around the fast sweep+provision critical
+// section (acquire before the sweep, release the moment provision returns,
+// before the long stage).
+//
+// Records os.Getpid() on the first line (the format readLockPID parses) for
+// diagnosis. The returned release func removes the lockfile.
+func acquireWorktreeAdminLock(ctx context.Context, repoDir string, logSink io.Writer) (func(), error) {
+	wtDir, err := worktreesDir(ctx, repoDir)
+	if err != nil {
+		return nil, fmt.Errorf("acquireWorktreeAdminLock: %w", err)
+	}
+	if err := os.MkdirAll(wtDir, 0o755); err != nil {
+		return nil, fmt.Errorf("acquireWorktreeAdminLock: mkdir worktrees dir: %w", err)
+	}
+	lockPath := filepath.Join(wtDir, worktreeAdminLockName)
+	deadline := time.Now().Add(worktreeAdminLockMaxWait)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	for {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
+			_ = f.Close()
+			return func() { _ = os.Remove(lockPath) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("acquireWorktreeAdminLock: open lock: %w", err)
+		}
+		// Contended. Reclaim a lock whose recorded holder has died (a crashed
+		// prior stage), else back off and retry until the bounded deadline.
+		pid := readLockPID(lockPath)
+		if pid <= 0 || !processAlive(pid) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"worktree_admin_lock_reclaimed","stale_pid":%d}`+"\n", pid)
+			if rmErr := os.Remove(lockPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("acquireWorktreeAdminLock: reclaim stale lock: %w", rmErr)
+			}
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf(
+				"acquireWorktreeAdminLock: worktree-admin lock held by live pid %d "+
+					"still contended after %s max-wait", pid, worktreeAdminLockMaxWait)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("acquireWorktreeAdminLock: %w", ctx.Err())
+		case <-time.After(worktreeAdminLockBackoff):
+		}
+	}
 }
 
 // readLockPID reads the pid recorded on the first line of a lockfile.
