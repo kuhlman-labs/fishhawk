@@ -171,9 +171,18 @@ func (e *SchemaError) Error() string {
 // SemanticError is returned when the config satisfies the schema but
 // violates a cross-field rule the schema can't express (the mandatory
 // required-field trio, the github_projects connection requirement, ADR
-// numbering, complexity cross-reference).
+// numbering, complexity cross-reference). It is also the apply-time error
+// for a filing that violates its type's conventions (an unresolved title
+// placeholder, an off-skeleton sections key).
+//
+// Details optionally carries machine-readable structure for the caller's
+// 422 work_item_invalid response (e.g. missing_placeholders,
+// unknown_sections, expected_sections). It defaults nil so Error() and
+// every existing errors.As(&sem) call site are unchanged — the field is
+// purely additive.
 type SemanticError struct {
-	Msg string
+	Msg     string
+	Details map[string]any
 }
 
 func (e *SemanticError) Error() string {

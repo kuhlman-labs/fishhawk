@@ -30,8 +30,8 @@ type FileIssueInput struct {
 	Summary         string              `json:"summary" jsonschema:"mandatory one-liner: fills the {summary} title placeholder and is the required Summary field"`
 	Body            string              `json:"body,omitempty" jsonschema:"verbatim body; when omitted the body is assembled from the type's skeleton plus sections"`
 	Repo            string              `json:"repo,omitempty" jsonschema:"target repo as owner/name; falls back to GITHUB_REPOSITORY env when omitted"`
-	Sections        map[string]string   `json:"sections,omitempty" jsonschema:"per-skeleton-section content keyed by section name; used only when body is empty"`
-	TitleVars       map[string]string   `json:"title_vars,omitempty" jsonschema:"title placeholders beyond {summary}/{number} (e.g. epic, n); an unresolved placeholder fails the filing"`
+	Sections        map[string]string   `json:"sections,omitempty" jsonschema:"per-skeleton-section content keyed by section name; used only when body is empty. Keys MUST match the type's body skeleton exactly — an off-skeleton key fails the filing with work_item_invalid (the content is never silently dropped)"`
+	TitleVars       map[string]string   `json:"title_vars,omitempty" jsonschema:"title placeholders beyond {summary}/{number} (e.g. epic, n); an unresolved placeholder fails the filing. For a child type whose title_format is [E{epic}.{n}], the {epic} placeholder is auto-derived from the parent_epic relation, so you need only supply {n}"`
 	Labels          []string            `json:"labels,omitempty" jsonschema:"labels merged on top of the type's default_labels"`
 	Complexity      string              `json:"complexity,omitempty" jsonschema:"overrides the type's default complexity; must be a declared level (e.g. low, medium, high)"`
 	Status          string              `json:"status,omitempty" jsonschema:"overrides the type's default board status/column"`
@@ -71,8 +71,13 @@ relations, and dispatches to the registered provider (GitHub Projects in v0).
 Inputs: type + summary are required; repo and run_id fall back to
 GITHUB_REPOSITORY / FISHHAWK_RUN_ID env when omitted (the in-runner case).
 body is optional — when omitted the body is assembled from the type's
-skeleton plus per-section content. relations carries the parent epic,
-supersedes, companion, and evidence-run links.
+skeleton plus per-section content; sections keys must match the type's body
+skeleton exactly (an off-skeleton key fails work_item_invalid rather than
+being silently dropped). relations carries the parent epic, supersedes,
+companion, and evidence-run links. For a child type whose title_format is
+[E{epic}.{n}], the {epic} placeholder is auto-derived from the parent_epic
+relation, so title_vars need only supply {n}; a 422 work_item_invalid lists
+the still-missing placeholders in details.missing_placeholders.
 
 When run_id names an in-flight, non-terminal run a best-effort
 work_item_filed audit entry is appended to it; filing still succeeds with no

@@ -222,6 +222,91 @@ func TestApply_ComplexityOverrideWins(t *testing.T) {
 	}
 }
 
+// TestApply_OffSkeletonSectionFailsLoud is the #1184 silent-drop fix: a
+// Sections key that matches no body_skeleton section must fail loud (the
+// caller's content would otherwise vanish), naming the unknown key and the
+// expected skeleton names in both the message and structured Details.
+func TestApply_OffSkeletonSectionFailsLoud(t *testing.T) {
+	conv := testConventions(t)
+	_, _, err := Apply(FilingRequest{
+		Type:      "chore",
+		Summary:   "bump deps",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Sections: map[string]string{
+			"Summary": "bump the pinned tools",
+			"Impact":  "this content would be silently dropped", // off-skeleton
+		},
+	}, conv)
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *SemanticError, got %v", err)
+	}
+	if !strings.Contains(se.Error(), "Impact") {
+		t.Errorf("error should name the unknown section, got %q", se.Error())
+	}
+	// chore's skeleton is [Summary, Done-means]; the expected names appear.
+	if !strings.Contains(se.Error(), "Done-means") {
+		t.Errorf("error should name the expected skeleton sections, got %q", se.Error())
+	}
+	unknown, _ := se.Details["unknown_sections"].([]string)
+	if len(unknown) != 1 || unknown[0] != "Impact" {
+		t.Errorf("Details.unknown_sections = %v, want [Impact]", se.Details["unknown_sections"])
+	}
+	expected, _ := se.Details["expected_sections"].([]string)
+	if len(expected) != 2 || expected[0] != "Summary" || expected[1] != "Done-means" {
+		t.Errorf("Details.expected_sections = %v, want [Summary Done-means]", se.Details["expected_sections"])
+	}
+}
+
+// TestApply_ValidSkeletonSectionsStillRender pins that the fail-loud guard
+// does not regress the happy path: every Sections key on-skeleton assembles
+// the body as before.
+func TestApply_ValidSkeletonSectionsStillRender(t *testing.T) {
+	conv := testConventions(t)
+	item, _, err := Apply(FilingRequest{
+		Type:      "chore",
+		Summary:   "bump deps",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Sections: map[string]string{
+			"Summary":    "bump the pinned tools",
+			"Done-means": "CI green on the bump PR",
+		},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	for _, want := range []string{"## Summary", "bump the pinned tools", "## Done-means", "CI green on the bump PR"} {
+		if !strings.Contains(item.Body, want) {
+			t.Errorf("assembled body missing %q:\n%s", want, item.Body)
+		}
+	}
+}
+
+// TestApply_MissingPlaceholderCarriesDetails asserts renderTitle's
+// SemanticError carries the structured missing-placeholder list (#1184) so
+// the handler can surface details.missing_placeholders, while the human Msg
+// is unchanged.
+func TestApply_MissingPlaceholderCarriesDetails(t *testing.T) {
+	conv := testConventions(t)
+	// feature title_format "[E{epic}.{n}] {summary}"; omit both vars.
+	_, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "x",
+		Relations: Relations{ParentEpic: "#1"},
+	}, conv)
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *SemanticError, got %v", err)
+	}
+	if !strings.Contains(se.Error(), "unresolved placeholder") {
+		t.Errorf("Msg = %q, want the verbatim unresolved-placeholder message", se.Error())
+	}
+	missing, _ := se.Details["missing_placeholders"].([]string)
+	if len(missing) != 2 || missing[0] != "epic" || missing[1] != "n" {
+		t.Errorf("Details.missing_placeholders = %v, want [epic n]", se.Details["missing_placeholders"])
+	}
+}
+
 func TestMergeLabels_DedupsPreservingOrder(t *testing.T) {
 	got := mergeLabels([]string{"type:bug", "x"}, []string{"x", "y", ""})
 	want := []string{"type:bug", "x", "y"}

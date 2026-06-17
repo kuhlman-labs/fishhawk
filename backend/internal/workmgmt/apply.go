@@ -99,6 +99,9 @@ func Apply(req FilingRequest, conv Conventions) (WorkItem, int, error) {
 
 	body := req.Body
 	if strings.TrimSpace(body) == "" {
+		if err := validateSections(req.Sections, itemType.BodySkeleton); err != nil {
+			return WorkItem{}, 0, err
+		}
 		body = assembleBody(itemType.BodySkeleton, req.Sections)
 	}
 
@@ -188,8 +191,18 @@ func renderTitle(format, summary string, number, pad int, vars map[string]string
 	})
 	if len(missing) > 0 {
 		sort.Strings(missing)
-		return "", &SemanticError{Msg: fmt.Sprintf(
-			"title_format %q has unresolved placeholder(s): %s", format, strings.Join(dedup(missing), ", "))}
+		missing = dedup(missing)
+		// Carry the structured missing-placeholder list so the handler can
+		// surface it in details.missing_placeholders (#1184) — the human Msg
+		// is kept verbatim so existing substring assertions still pass.
+		return "", &SemanticError{
+			Msg: fmt.Sprintf(
+				"title_format %q has unresolved placeholder(s): %s", format, strings.Join(missing, ", ")),
+			Details: map[string]any{
+				"missing_placeholders": missing,
+				"title_format":         format,
+			},
+		}
 	}
 	return out, nil
 }
@@ -230,6 +243,45 @@ func assembleBody(skeleton []string, sections map[string]string) string {
 		}
 	}
 	return b.String()
+}
+
+// validateSections fails loud when the caller keys Sections off the type's
+// body_skeleton (#1184). assembleBody renders only skeleton sections and
+// looks each up by exact name, so a section keyed off-skeleton would be
+// silently dropped — the caller's content vanishing with no error. This
+// rejects that path: any Sections key matching no skeleton section returns
+// a SemanticError naming the unknown key(s) and the expected skeleton
+// names, with structured Details for the 422 response. Exact-match is
+// deliberate (consistent with assembleBody's sections[section] lookup) so a
+// near-miss like "Done means" vs skeleton "Done-means" is reported rather
+// than rendered under the wrong heading. An empty Sections is a no-op.
+func validateSections(sections map[string]string, skeleton []string) error {
+	if len(sections) == 0 {
+		return nil
+	}
+	known := make(map[string]bool, len(skeleton))
+	for _, s := range skeleton {
+		known[s] = true
+	}
+	var unknown []string
+	for key := range sections {
+		if !known[key] {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return &SemanticError{
+		Msg: fmt.Sprintf(
+			"sections key(s) %s do not match the type's body skeleton; expected one of: %s",
+			strings.Join(unknown, ", "), strings.Join(skeleton, ", ")),
+		Details: map[string]any{
+			"unknown_sections":  unknown,
+			"expected_sections": skeleton,
+		},
+	}
 }
 
 // mergeLabels concatenates default + extra labels, deduplicating while
