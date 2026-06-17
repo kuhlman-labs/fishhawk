@@ -189,6 +189,18 @@ func TestBuild_Implement_NeverReingestsUntrustedComments(t *testing.T) {
 			c.FixupConcerns = []string{"[high] resolve the missing authz check"}
 			return c
 		}()},
+		// #1163: the slim fix-up path WITH the prior diff present must still
+		// ingest no untrusted body/comment text. The prior diff is sourced from
+		// the redacted trace bundle (repo code only), so injecting it cannot
+		// reintroduce attacker-controlled issue text.
+		{"fix-up slim path with prior diff", func() Trigger {
+			c := base
+			c.ApprovedPlan = fixturePlan()
+			c.FixupConcerns = []string{"[high] resolve the missing authz check"}
+			c.FixupPriorDiff = "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n@@ -1 +1 @@\n+clean repo code only\n"
+			c.FixupPriorDiffFiles = "- M pkg/bar/bar.go\n"
+			return c
+		}()},
 	}
 
 	for _, tc := range cases {
@@ -211,6 +223,89 @@ func TestBuild_Implement_NeverReingestsUntrustedComments(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuild_ImplementFixup_PriorDiff_Rendered(t *testing.T) {
+	// #1163: a within-cap FixupPriorDiff renders the "### The change you are
+	// amending" section with a ```diff fence containing the hunks.
+	const hunk = "diff --git a/pkg/bar/foo.go b/pkg/bar/foo.go\n@@ -1,3 +1,4 @@\n+added line\n"
+	got, err := Build("implement", Trigger{
+		Repo:           "kuhlman-labs/example",
+		IssueNumber:    7,
+		IssueURL:       "https://github.com/kuhlman-labs/example/issues/7",
+		ApprovedPlan:   fixturePlan(),
+		FixupConcerns:  []string{"[high/correctness] fix the nil deref"},
+		FixupPriorDiff: hunk,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### The change you are amending") {
+		t.Errorf("expected the change-under-amendment section:\n%s", got)
+	}
+	if !strings.Contains(got, "```diff\n") {
+		t.Errorf("expected a fenced diff block:\n%s", got)
+	}
+	if !strings.Contains(got, "+added line") {
+		t.Errorf("expected the hunk text inside the fence:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementFixup_PriorDiff_OversizeFallsBackToFileList(t *testing.T) {
+	// #1163: a FixupPriorDiff over maxFixupPriorDiffBytes falls back to the
+	// changed-file list and the fenced hunks are ABSENT.
+	oversize := "diff --git a/x b/x\n" + strings.Repeat("+padding line\n", maxFixupPriorDiffBytes/13+1)
+	if len(oversize) <= maxFixupPriorDiffBytes {
+		t.Fatalf("test fixture not over the cap: %d <= %d", len(oversize), maxFixupPriorDiffBytes)
+	}
+	const fileList = "- M pkg/bar/bar.go\n- A pkg/bar/foo.go\n"
+	got, err := Build("implement", Trigger{
+		Repo:                "kuhlman-labs/example",
+		IssueNumber:         7,
+		IssueURL:            "https://github.com/kuhlman-labs/example/issues/7",
+		ApprovedPlan:        fixturePlan(),
+		FixupConcerns:       []string{"[high/correctness] fix the nil deref"},
+		FixupPriorDiff:      oversize,
+		FixupPriorDiffFiles: fileList,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### The change you are amending") {
+		t.Errorf("expected the change-under-amendment section:\n%s", got)
+	}
+	if strings.Contains(got, "```diff") {
+		t.Errorf("oversize patch must NOT render a fenced diff block:\n%s", got)
+	}
+	for _, want := range []string{"- M pkg/bar/bar.go", "- A pkg/bar/foo.go", "too large to inline"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected file-list fallback content %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "+padding line") {
+		t.Errorf("oversize hunk text must not be inlined:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementFixup_PriorDiff_EmptyOmitsSection(t *testing.T) {
+	// #1163: both prior-diff fields empty omits the section entirely — the
+	// pre-#1163 slim fix-up prompt is preserved.
+	got, err := Build("implement", Trigger{
+		Repo:          "kuhlman-labs/example",
+		IssueNumber:   7,
+		IssueURL:      "https://github.com/kuhlman-labs/example/issues/7",
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []string{"[high/correctness] fix the nil deref"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### The change you are amending") {
+		t.Errorf("empty prior diff must omit the change-under-amendment section:\n%s", got)
+	}
+	if strings.Contains(got, "```diff") {
+		t.Errorf("empty prior diff must not render a fenced diff block:\n%s", got)
 	}
 }
 

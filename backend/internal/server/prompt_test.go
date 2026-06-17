@@ -1,12 +1,15 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -18,12 +21,14 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
 
 // promptRunRepo is a run.Repository fake that supports GetStage +
@@ -2644,6 +2649,322 @@ func TestResolveFixupAllowCreate(t *testing.T) {
 			t.Errorf("got %v, want nil (no allow_create on the entry)", got)
 		}
 	})
+}
+
+// priorDiffTraceStore is a configurable tracestore.Storage for the #1163 fix-up
+// prior-diff tests: Get returns the configured body (or getErr). Put/Stat/List
+// are unused.
+type priorDiffTraceStore struct {
+	body   []byte
+	getErr error
+}
+
+func (s *priorDiffTraceStore) Put(context.Context, tracestore.BundleRef, io.Reader) error { return nil }
+func (s *priorDiffTraceStore) Get(_ context.Context, _ tracestore.BundleRef) (io.ReadCloser, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	return io.NopCloser(bytes.NewReader(s.body)), nil
+}
+func (s *priorDiffTraceStore) Stat(context.Context, tracestore.BundleRef) (tracestore.Stat, error) {
+	return tracestore.Stat{}, errors.New("priorDiffTraceStore: Stat not used")
+}
+func (s *priorDiffTraceStore) List(context.Context, uuid.UUID) ([]tracestore.BundleRef, error) {
+	return nil, errors.New("priorDiffTraceStore: List not used")
+}
+
+// makeRedactedDiffBundle builds a gzipped JSONL trace bundle carrying a single
+// git_diff event with the given patch + changed files — the shape
+// bundle.ExtractDiff parses. The bytes are pre-redacted repo code only (no issue
+// text), mirroring the runner's redacted variant.
+func makeRedactedDiffBundle(t *testing.T, patch string, files []map[string]string) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		TS   time.Time       `json:"ts"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diffData, err := json.Marshal(map[string]any{
+		"kind": "git_diff", "base_ref": "main", "files": files, "num_files": len(files), "patch": patch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []line{
+		{Seq: 1, Kind: bundle.EventKindManifest, Data: mdata},
+		{Seq: 2, Kind: bundle.EventKindGitDiff, Data: diffData},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, err := json.Marshal(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// TestGetStagePrompt_Implement_FixupPriorDiff_Rendered is the cross-boundary
+// end-to-end test for #1163: it seeds a TraceStore + a trace_uploaded audit
+// entry pointing at a real redacted bundle whose git_diff event carries a known
+// patch, triggers a fix-up (a stage_fixup_triggered concern), and asserts the
+// rendered prompt contains the seeded diff hunks under the change-under-amendment
+// section. This crosses the trace-store -> resolver -> Trigger field ->
+// prompt-render seam end to end, not just per-layer units.
+func TestGetStagePrompt_Implement_FixupPriorDiff_Rendered(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityHigh, Category: "correctness",
+			Note: "fix the nil deref in backend/internal/server/prompt.go"},
+	}
+	hash := strings.Repeat("a", 64)
+	const patch = "diff --git a/backend/internal/server/prompt.go b/backend/internal/server/prompt.go\n" +
+		"@@ -1,2 +1,3 @@\n+SENTINEL_HUNK_LINE\n"
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		runID: {
+			makeFixupEntry(runID, implStageID, concerns),
+			makeTraceUploadedEntry(t, 1, runID, implStageID, "redacted", hash),
+		},
+	}
+
+	ts := &priorDiffTraceStore{
+		body: makeRedactedDiffBundle(t, patch, []map[string]string{
+			{"path": "backend/internal/server/prompt.go", "status": "modified"},
+		}),
+	}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+		TraceStore:   ts,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for _, want := range []string{
+		"### The change you are amending",
+		"```diff",
+		"SENTINEL_HUNK_LINE",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+}
+
+// TestResolveFixupPriorDiff_NoTrace_ReturnsEmpty: no redacted trace for the
+// stage → ("", "") and the bundle Get is never reached.
+func TestResolveFixupPriorDiff_NoTrace_ReturnsEmpty(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	s := New(Config{
+		Addr:       "127.0.0.1:0",
+		AuditRepo:  &feedbackAuditRepo{}, // no trace_uploaded entries
+		TraceStore: &priorDiffTraceStore{getErr: errors.New("must not be called")},
+	})
+	patch, fileList := s.resolveFixupPriorDiff(context.Background(), runID, stageID)
+	if patch != "" || fileList != "" {
+		t.Errorf("got (%q, %q), want (\"\", \"\")", patch, fileList)
+	}
+}
+
+// TestResolveFixupPriorDiff_TraceStoreError_ReturnsEmpty: a redacted trace
+// exists but TraceStore.Get errors → ("", "") (best-effort WARN-and-proceed).
+func TestResolveFixupPriorDiff_TraceStoreError_ReturnsEmpty(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	hash := strings.Repeat("a", 64)
+	s := New(Config{
+		Addr: "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeTraceUploadedEntry(t, 1, runID, stageID, "redacted", hash)},
+		}},
+		TraceStore: &priorDiffTraceStore{getErr: errors.New("storage down")},
+	})
+	patch, fileList := s.resolveFixupPriorDiff(context.Background(), runID, stageID)
+	if patch != "" || fileList != "" {
+		t.Errorf("got (%q, %q), want (\"\", \"\") on Get error", patch, fileList)
+	}
+}
+
+// TestResolveFixupPriorDiff_Unconfigured_ReturnsEmpty: a nil AuditRepo or nil
+// TraceStore short-circuits to ("", "").
+func TestResolveFixupPriorDiff_Unconfigured_ReturnsEmpty(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	t.Run("nil AuditRepo", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", TraceStore: &priorDiffTraceStore{}})
+		patch, fileList := s.resolveFixupPriorDiff(context.Background(), runID, stageID)
+		if patch != "" || fileList != "" {
+			t.Errorf("got (%q, %q), want (\"\", \"\")", patch, fileList)
+		}
+	})
+
+	t.Run("nil TraceStore", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{}})
+		patch, fileList := s.resolveFixupPriorDiff(context.Background(), runID, stageID)
+		if patch != "" || fileList != "" {
+			t.Errorf("got (%q, %q), want (\"\", \"\")", patch, fileList)
+		}
+	})
+}
+
+// TestResolveFixupPriorDiff_AuditListError_ReturnsEmpty: a ListForRunByCategory
+// error degrades to ("", "") (best-effort WARN-and-proceed).
+func TestResolveFixupPriorDiff_AuditListError_ReturnsEmpty(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	s := New(Config{
+		Addr:       "127.0.0.1:0",
+		AuditRepo:  &feedbackAuditRepo{listErr: errors.New("audit down")},
+		TraceStore: &priorDiffTraceStore{getErr: errors.New("must not be called")},
+	})
+	patch, fileList := s.resolveFixupPriorDiff(context.Background(), runID, stageID)
+	if patch != "" || fileList != "" {
+		t.Errorf("got (%q, %q), want (\"\", \"\") on audit list error", patch, fileList)
+	}
+}
+
+// TestResolveFixupPriorDiff_NoDiffEvent_ReturnsEmpty: a redacted bundle that
+// parses but carries no git_diff event (bundle.ExtractDiff → ErrNoDiffEvent)
+// degrades to ("", "").
+func TestResolveFixupPriorDiff_NoDiffEvent_ReturnsEmpty(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	hash := strings.Repeat("a", 64)
+	// A bundle with only a manifest line — no git_diff event.
+	ts := &priorDiffTraceStore{body: makeRedactedDiffBundleManifestOnly(t)}
+	s := New(Config{
+		Addr: "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeTraceUploadedEntry(t, 1, runID, stageID, "redacted", hash)},
+		}},
+		TraceStore: ts,
+	})
+	patch, fileList := s.resolveFixupPriorDiff(context.Background(), runID, stageID)
+	if patch != "" || fileList != "" {
+		t.Errorf("got (%q, %q), want (\"\", \"\") on ErrNoDiffEvent", patch, fileList)
+	}
+}
+
+// makeRedactedDiffBundleManifestOnly builds a gzipped JSONL bundle with a
+// manifest line but no git_diff event, so bundle.ExtractDiff returns
+// ErrNoDiffEvent.
+func makeRedactedDiffBundleManifestOnly(t *testing.T) []byte {
+	t.Helper()
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(map[string]any{"seq": 1, "kind": bundle.EventKindManifest, "data": json.RawMessage(mdata)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(append(line, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// TestResolveFixupPriorDiff_HappyPath_ReturnsPatchAndFileList: a redacted bundle
+// with a git_diff event yields the patch and the rendered changed-file list.
+func TestResolveFixupPriorDiff_HappyPath_ReturnsPatchAndFileList(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	hash := strings.Repeat("a", 64)
+	const patch = "diff --git a/x.go b/x.go\n@@ -1 +1 @@\n+changed\n"
+	ts := &priorDiffTraceStore{
+		body: makeRedactedDiffBundle(t, patch, []map[string]string{
+			{"path": "x.go", "status": "modified"},
+		}),
+	}
+	s := New(Config{
+		Addr: "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeTraceUploadedEntry(t, 1, runID, stageID, "redacted", hash)},
+		}},
+		TraceStore: ts,
+	})
+	gotPatch, gotFiles := s.resolveFixupPriorDiff(context.Background(), runID, stageID)
+	if gotPatch != patch {
+		t.Errorf("patch = %q, want %q", gotPatch, patch)
+	}
+	if !strings.Contains(gotFiles, "x.go") {
+		t.Errorf("file list = %q, want it to contain %q", gotFiles, "x.go")
+	}
 }
 
 // TestGetStagePrompt_Implement_FixupAllowCreate_Folded confirms an operator-

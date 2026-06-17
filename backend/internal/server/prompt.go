@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"path"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -27,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
@@ -773,6 +776,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			scopeFiles = s.narrowFixupScope(r.Context(), scopeFiles, joined,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
+			// Inject the prior implement commit's diff (#1163) so the slim
+			// fix-up prompt shows the agent the change it is amending. Sourced
+			// from the stage's newest redacted trace bundle (repo code only).
+			trigger.FixupPriorDiff, trigger.FixupPriorDiffFiles = s.resolveFixupPriorDiff(r.Context(), runRow.ID, stage.ID)
 			// Emit the fix-up routing flag (#784): point the runner at the
 			// stage's existing PR branch so it takes the RebaseFromRemote
 			// same-branch path instead of `checkout -b <existing branch>`.
@@ -1026,6 +1033,10 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			scopeFiles = s.narrowFixupScope(r.Context(), scopeFiles, joined,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
+			// Inject the prior implement commit's diff (#1163), identical
+			// derivation to the dispatch path so the rendered view matches the
+			// runner-facing prompt byte-for-byte.
+			trigger.FixupPriorDiff, trigger.FixupPriorDiffFiles = s.resolveFixupPriorDiff(r.Context(), runRow.ID, stage.ID)
 			// Emit the fix-up routing flag (#784) so the rendered prompt view
 			// and the runner-facing response stay byte-consistent. The SPA path
 			// is read-only and never drives a commit; the same derivation keeps
@@ -1992,6 +2003,79 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		return rendered, strings.Join(notes, "\n")
 	}
 	return nil, ""
+}
+
+// resolveFixupPriorDiff returns the prior implement commit's diff for a fix-up
+// pass (#1163): the full unified-diff patch and the rendered changed-file list,
+// sourced from the stage's newest REDACTED trace bundle via the same
+// pickRedactedTraceHash + TraceStore.Get + bundle.ExtractDiff seam the
+// implement-review prompt consumes (server/trace.go). Injected into the slim
+// fix-up prompt so the fresh fix-up agent sees the change it is amending without
+// cold-re-exploring the repo.
+//
+// The redacted bundle is pre-redacted by the runner and carries only repo-code
+// diff — never IssueBody / IssueComments — so feeding it to the network-and-
+// state-capable implement agent upholds the never-re-ingest invariant (ADR-029).
+// The Variant is pinned to VariantRedacted (never the raw variant) for exactly
+// this reason.
+//
+// Returns ("", "") when AuditRepo or TraceStore is unconfigured, no redacted
+// trace exists for the stage, the bundle has no git_diff event (ErrNoDiffEvent),
+// or on any list / get / read / extract error — best-effort WARN-and-proceed,
+// the same posture as the other fix-up resolvers; it never blocks the dispatch.
+func (s *Server) resolveFixupPriorDiff(ctx context.Context, runID, stageID uuid.UUID) (patch, fileList string) {
+	if s.cfg.AuditRepo == nil || s.cfg.TraceStore == nil {
+		return "", ""
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "trace_uploaded")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list trace_uploaded audit for fixup prior diff failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return "", ""
+	}
+	hash, ok := pickRedactedTraceHash(entries, stageID)
+	if !ok {
+		// No redacted trace for this stage yet — nothing to amend against.
+		return "", ""
+	}
+	body, err := s.cfg.TraceStore.Get(ctx, tracestore.BundleRef{
+		RunID:       runID,
+		Variant:     tracestore.VariantRedacted,
+		ContentHash: hash,
+	})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: get redacted trace bundle for fixup prior diff failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return "", ""
+	}
+	defer func() { _ = body.Close() }()
+	bundleBytes, err := io.ReadAll(body)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: read redacted trace bundle for fixup prior diff failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return "", ""
+	}
+	diff, err := bundle.ExtractDiff(bundleBytes)
+	if err != nil {
+		// ErrNoDiffEvent (older bundle / no diff) and any parse error degrade to
+		// no injection — the slim prompt simply omits the section.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: extract diff from redacted trace for fixup prior diff failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return "", ""
+	}
+	return diff.Patch, renderDiffForReview(diff)
 }
 
 // resolveFixupExpectedHeadSHA returns the run's recorded head SHA — the
