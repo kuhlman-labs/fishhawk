@@ -3178,6 +3178,155 @@ func TestMergeApprovalConditionScopeFiles(t *testing.T) {
 	})
 }
 
+// TestResolveImplementBaseRef directly exercises resolveImplementBaseRef
+// (prompt.go:390), the PR-base-resolution branch shipped in #1191/PR#1196. The
+// existing scope-fold tests inject the ref straight into
+// mergeApprovalConditionScopeFiles, so this is the only coverage of the live
+// GetPullRequest resolution and each of its fail-open arms (#1197). It uses a
+// real githubclient.Client pointed at an httptest server — the concrete
+// s.cfg.GitHub seam, NOT the issueGetter interface — reusing
+// newLineageGitHubClient from lineage_test.go (same package).
+func TestResolveImplementBaseRef(t *testing.T) {
+	repo := githubclient.RepoRef{Owner: "o", Name: "r"}
+	prURL := "https://github.com/o/r/pull/42"
+	newRun := func() *run.Run {
+		return &run.Run{
+			ID:             uuid.New(),
+			Repo:           "o/r",
+			InstallationID: instID(99),
+			PullRequestURL: &prURL,
+		}
+	}
+
+	t.Run("PR base ref resolved (success arm)", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "release/v2"}
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
+		if ref != "release/v2" || !resolved {
+			t.Errorf("got (%q, %v), want (%q, true)", ref, resolved, "release/v2")
+		}
+		if !stub.prCalled {
+			t.Errorf("GetPullRequest must be consulted to prove the non-default ref came from the PR base")
+		}
+	})
+
+	t.Run("no PR yet → default-branch check (empty ref, resolved)", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "release/v2"}
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
+		runRow := newRun()
+		runRow.PullRequestURL = nil
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), runRow, instID(99), repo)
+		if ref != "" || !resolved {
+			t.Errorf("got (%q, %v), want (\"\", true) for the no-PR default-branch path", ref, resolved)
+		}
+		if stub.prCalled {
+			t.Errorf("no-PR path must not consult GetPullRequest")
+		}
+	})
+
+	t.Run("GetPullRequest error fails open", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "release/v2", prStatus: http.StatusInternalServerError}
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
+		if ref != "" || resolved {
+			t.Errorf("got (%q, %v), want (\"\", false) on GetPullRequest error", ref, resolved)
+		}
+	})
+
+	t.Run("empty PR base ref fails open", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: ""} // 200 response with empty base.ref
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
+		if ref != "" || resolved {
+			t.Errorf("got (%q, %v), want (\"\", false) on empty base ref", ref, resolved)
+		}
+		if !stub.prCalled {
+			t.Errorf("empty-base-ref arm must have consulted GetPullRequest")
+		}
+	})
+
+	t.Run("nil GitHub client fails open (no panic)", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0"}) // s.cfg.GitHub == nil
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
+		if ref != "" || resolved {
+			t.Errorf("got (%q, %v), want (\"\", false) with nil GitHub client", ref, resolved)
+		}
+	})
+
+	t.Run("nil installation id fails open", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "release/v2"}
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), nil, repo)
+		if ref != "" || resolved {
+			t.Errorf("got (%q, %v), want (\"\", false) with nil installation id", ref, resolved)
+		}
+		if stub.prCalled {
+			t.Errorf("nil installation id must short-circuit before GetPullRequest")
+		}
+	})
+
+	t.Run("empty repo ref fails open", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "release/v2"}
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), githubclient.RepoRef{})
+		if ref != "" || resolved {
+			t.Errorf("got (%q, %v), want (\"\", false) with empty repo ref", ref, resolved)
+		}
+		if stub.prCalled {
+			t.Errorf("empty repo ref must short-circuit before GetPullRequest")
+		}
+	})
+
+	t.Run("unparseable PR URL → no-PR default-branch path", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "release/v2"}
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
+		runRow := newRun()
+		bad := "not-a-pr-url"
+		runRow.PullRequestURL = &bad
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), runRow, instID(99), repo)
+		if ref != "" || !resolved {
+			t.Errorf("got (%q, %v), want (\"\", true) when the PR URL yields no PR number", ref, resolved)
+		}
+		if stub.prCalled {
+			t.Errorf("unparseable PR URL must take the no-PR path, not call GetPullRequest")
+		}
+	})
+
+	// Forwarding subtest (binding condition 2 / done-means a): the resolved
+	// non-default PR base ref must be the ref handed to the existence check, and
+	// a path that EXISTS on that base must be KEPT, not dropped. Wires the real
+	// cfg.GitHub (httptest, base release/v2) for resolveImplementBaseRef together
+	// with a stubIssueGetter existence seam, then feeds the resolved ref straight
+	// into mergeApprovalConditionScopeFiles.
+	t.Run("resolved ref forwarded to existence check; existing path kept", func(t *testing.T) {
+		stub := &lineageGitHub{baseRef: "release/v2"}
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
+		gh := &stubIssueGetter{} // defaults every path to EXISTS, records getFileGotRef
+		const onBasePath = "pkg/onbase/exists.go"
+		base := []scopeFile{{Path: "a/b.go", Operation: "modify"}}
+		conds := func(v string) *string { return &v }("Also edit `" + onBasePath + "` per review.")
+
+		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
+		if ref != "release/v2" || !resolved {
+			t.Fatalf("resolveImplementBaseRef got (%q, %v), want (%q, true)", ref, resolved, "release/v2")
+		}
+		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, instID(99), repo, ref, resolved, base, conds)
+
+		if gh.getFileGotRef != "release/v2" {
+			t.Errorf("existence check ref = %q, want the resolved PR base %q", gh.getFileGotRef, "release/v2")
+		}
+		kept := false
+		for _, f := range got {
+			if f.Path == onBasePath {
+				kept = true
+			}
+		}
+		if !kept {
+			t.Errorf("path existing on the resolved base %q must be KEPT, got %#v", onBasePath, got)
+		}
+	})
+}
+
 // TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope crosses the full
 // audit-load -> resolveApprovalConditions -> mergeConditionScopeFiles ->
 // promptResponse.ScopeFiles seam (#730): an approved plan declares one scope
