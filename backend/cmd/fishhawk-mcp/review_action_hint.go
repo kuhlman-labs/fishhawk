@@ -33,6 +33,15 @@ const fixupCeiling = 3
 // layer counts those entries to derive the remaining fix-up budget.
 const categoryStageFixupTriggered = "stage_fixup_triggered"
 
+// categoryPlanRevised mirrors backend server.CategoryPlanRevised
+// (backend/internal/server/revise.go). KEEP IN SYNC: it is the durable
+// audit record of a fishhawk_revise_plan re-open — the plan-stage analog of
+// stage_fixup_triggered. The MCP review-status layer floors the plan stage's
+// terminal-verdict reads to the latest such entry so a stale pre-revision
+// plan-review verdict no longer reads as the current round's terminal state
+// (#1201).
+const categoryPlanRevised = "plan_revised"
+
 // categoryFixupNoChanges mirrors the backend report category written by
 // server.succeedFixupNoChangesStage (backend/internal/server/pullrequest.go)
 // when a fix-up re-dispatch produces no commit. KEEP IN SYNC: it is the

@@ -825,11 +825,12 @@ func TestReviewStatusFor_Implement_CompleteWithRound2Verdict(t *testing.T) {
 	}
 }
 
-// TestReviewStatusFor_Plan_FloorExempt confirms the fix-up floor applies ONLY
-// to the implement stage: a plan stage with a landed verdict resolves to
-// 'complete' even when an unrelated stage_fixup_triggered entry (a sequence
-// above the plan verdict) exists. The plan path passes sinceSeq=0, so the
-// behavior is byte-for-byte unchanged from today.
+// TestReviewStatusFor_Plan_FloorExempt confirms the stage_fixup_triggered
+// floor applies ONLY to the implement stage: a plan stage with a landed verdict
+// resolves to 'complete' even when an unrelated stage_fixup_triggered entry (a
+// sequence above the plan verdict) exists. The plan stage floors to plan_revised
+// (#1201), NOT stage_fixup_triggered, and no plan_revised entry exists here, so
+// the plan floor is 0 and the behavior is byte-for-byte unchanged.
 func TestReviewStatusFor_Plan_FloorExempt(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
@@ -886,6 +887,85 @@ func TestReviewStatusFor_Implement_SkippedOrFailedAfterFixup(t *testing.T) {
 			t.Errorf("Status = %q, want failed (round-1 verdict floored out)", st.Status)
 		}
 	})
+}
+
+// --- plan-revision-boundary flooring (#1201) ---
+
+// seedRunPlanRevisedAudit appends a RUN-scoped plan_revised audit entry — the
+// plan-revision boundary reviewStatusFor / loadPlanReviews floor the plan
+// stage's terminal-verdict reads to (#1201). Mirrors seedRunFixupTriggeredAudit:
+// the entry's Sequence lands after every previously seeded entry, so a revise
+// seeded after a round-1 plan_reviewed correctly floors that verdict out. It is
+// the plan-stage analog of stage_fixup_triggered.
+func seedRunPlanRevisedAudit(fb *fakeBackend, runID uuid.UUID) {
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: categoryPlanRevised,
+	})
+	fb.mu.Unlock()
+}
+
+// TestReviewStatusFor_Plan_PendingAfterRevise is the #1201 regression (the
+// plan-stage analog of TestReviewStatusFor_Implement_PendingAfterFixup): after
+// a fishhawk_revise_plan re-opens the plan gate, the stale round-1 plan_reviewed
+// verdict must NOT read as terminal 'complete'. The terminal reads floor to the
+// latest plan_revised, but the round-1 plan_review_started proxy stays unfloored,
+// so with no re-review yet the status resolves to 'pending'. Before the fix this
+// returned the stale round-1 verdict.
+func TestReviewStatusFor_Plan_PendingAfterRevise(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// Round 1: a review was dispatched and landed a reject verdict, then the
+	// operator revised the plan to re-open the gate.
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	seedRunPlanRevisedAudit(fb, runID)
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want pending (the stale pre-revision verdict must not read complete)", st.Status)
+	}
+	if len(st.Reviews) != 0 {
+		t.Errorf("Reviews = %+v, want empty while the re-review is in flight", st.Reviews)
+	}
+}
+
+// TestReviewStatusFor_Plan_CompleteWithRound2Verdict pins that once the
+// re-review of the revised plan lands, the status resolves to 'complete'
+// carrying ONLY the round-2 verdict — the floored-out round-1 reject does not
+// leak into Reviews.
+func TestReviewStatusFor_Plan_CompleteWithRound2Verdict(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"}) // round 1: stale
+	seedRunPlanRevisedAudit(fb, runID)
+	// Round 2: the re-review of the revised plan lands a clean approve, with a
+	// fresh started entry carrying the current round's configured count.
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Fatalf("Status = %q, want complete once the re-review lands", st.Status)
+	}
+	if len(st.Reviews) != 1 {
+		t.Fatalf("Reviews = %+v, want only the round-2 verdict", st.Reviews)
+	}
+	if st.Reviews[0].Verdict != "approve" {
+		t.Errorf("Reviews[0].Verdict = %q, want approve (round-2); the round-1 reject must be floored out", st.Reviews[0].Verdict)
+	}
 }
 
 // --- count-based completeness (#1127) ---
