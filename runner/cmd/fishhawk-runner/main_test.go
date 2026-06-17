@@ -168,14 +168,23 @@ func withFakeInvoker(t *testing.T, fake *fakeInvoker) {
 // assertions can confirm the runner wired the right
 // run/stage/variant/bundle.
 type fakeUploader struct {
-	issueErr      error
-	shipErr       error
-	promptErr     error
-	planErr       error
-	prErr         error
-	instTokenErr  error
-	mcpTokenErr   error
-	retryStageErr error
+	issueErr error
+	// issueErrAfterN fails IssueKey only AFTER the Nth successful call
+	// (0 = disabled): the first N issuances succeed and the (N+1)th onward
+	// return a transient-shaped error. This is the seam issueErr lacks —
+	// issueErr fails EVERY call (so the start-of-stage issuance already
+	// fails and control never reaches reissueSigningKeyForTerminalUpload's
+	// else-branch), whereas issueErrAfterN=1 lets the start-of-stage
+	// issuance succeed and fails ONLY the pre-terminal refresh issuance,
+	// exercising the best-effort degrade branch (#1193 / PR #1192).
+	issueErrAfterN int
+	shipErr        error
+	promptErr      error
+	planErr        error
+	prErr          error
+	instTokenErr   error
+	mcpTokenErr    error
+	retryStageErr  error
 
 	// Recorded calls.
 	gotIssueRunID string
@@ -247,6 +256,12 @@ func (f *fakeUploader) IssueKey(_ context.Context, runID string, _ time.Duration
 	f.gotIssueCount++
 	if f.issueErr != nil {
 		return nil, f.issueErr
+	}
+	// Fail only after the Nth successful issuance (issueErr above keeps
+	// precedence as the fail-every seam). issueErrAfterN=1 succeeds at
+	// start-of-stage and fails the pre-terminal refresh (#1193).
+	if f.issueErrAfterN > 0 && f.gotIssueCount > f.issueErrAfterN {
+		return nil, errors.New("backend unreachable")
 	}
 	priv := f.priv
 	if f.freshKeyPerIssue {
@@ -1977,14 +1992,68 @@ func TestRun_FetchPrompt_PlusUploadTrace_RefreshesKeyForTerminalEgress(t *testin
 	}
 }
 
+func TestRun_FetchPrompt_UploadTrace_RefreshDegrades_KeepsStartOfStageKey(t *testing.T) {
+	// Best-effort degrade branch of reissueSigningKeyForTerminalUpload
+	// (#1193 / PR #1192): when the pre-terminal refresh issuance FAILS, the
+	// helper must log signing_key_refresh_degraded, RETAIN the start-of-stage
+	// key, and let terminal egress proceed on that key — the never-worse-than
+	// -before guarantee. freshKeyPerIssue stays OFF so the single shared
+	// f.priv is accepted at ShipTrace (rejectIfStaleKey returns nil), which is
+	// the exact condition that makes the retained-key egress observable.
+	// issueErrAfterN=1 lets the start-of-stage issuance succeed and fails ONLY
+	// the second (pre-terminal refresh) issuance.
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true,
+		Events: []agent.Event{{Kind: "system.init"}}}})
+	fu := newFakeUploader(t)
+	fu.issueErrAfterN = 1
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u",
+		"--workflow", "w", "--stage", "s",
+		"--stage-id", "stage-1",
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	// Never worse than before: terminal egress succeeds on the RETAINED
+	// start-of-stage key despite the refresh failure.
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (terminal egress must survive a failed refresh on the retained key):\n%s", got, stderr.String())
+	}
+	// Start-of-stage issuance succeeded; the pre-terminal refresh was
+	// ATTEMPTED (and failed) — proving the refresh seam fired, not skipped.
+	if fu.gotIssueCount != 2 {
+		t.Errorf("IssueKey calls = %d, want 2 (start-of-stage succeeded + pre-terminal refresh attempted and failed)", fu.gotIssueCount)
+	}
+	// The degrade path was taken, not the success path.
+	if !strings.Contains(stderr.String(), `"event":"signing_key_refresh_degraded"`) {
+		t.Errorf("missing signing_key_refresh_degraded event:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"signing_key_refreshed"`) {
+		t.Errorf("unexpected signing_key_refreshed event (refresh should have failed):\n%s", stderr.String())
+	}
+	// Terminal egress reached.
+	if fu.gotShipArgs == nil {
+		t.Error("ShipTrace not called")
+	}
+}
+
 func TestRun_FetchPrompt_UploadTrace_RefreshesSigningKeyBeforeTerminalEgress(t *testing.T) {
 	// Done-means test for #1182: a stage whose wall-clock outlives the
 	// start-of-stage signing key TTL must still ship its terminal trace
 	// upload. The fake backend mints a fresh keypair per IssueKey and
-	// REJECTS any signature made with a non-latest key (freshKeyPerIssue),
-	// so the stale start-of-stage key would be rejected at ShipTrace ->
-	// category-C on the unfixed single-key code. With the pre-terminal
-	// refresh, the trace ships with the freshly-minted key.
+	// REJECTS any signature made with a non-latest key (freshKeyPerIssue).
+	//
+	// Staleness model: rejectIfStaleKey treats a key as stale when it is
+	// NOT the most-recently-issued key (compares against latestPriv), NOT by
+	// wall-clock TTL expiry. On the UNFIXED single-key code only ONE IssueKey
+	// call occurs, so the start-of-stage key IS latestPriv and ShipTrace would
+	// ACCEPT it — the regression is therefore caught by the load-bearing
+	// gotIssueCount==2 assertion below (the second, pre-terminal issuance is
+	// exactly what unfixed code omits), not by a ShipTrace rejection. With the
+	// pre-terminal refresh present, two keys are issued and the trace ships
+	// with the freshly-minted latest key.
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true,
 		Events: []agent.Event{{Kind: "system.init"}}}})
 	fu := newFakeUploader(t)
