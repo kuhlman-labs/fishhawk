@@ -454,6 +454,34 @@ func TestBuild_Plan_DoneMeansTestRule(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_PerFailureModeTestRule pins the #1199 plan-prompt rule: when
+// an approval condition or the plan's verification enumerates multiple failure
+// modes, verification.test_strategy must name one behavioral test per named
+// mode. Asserts the rule's distinctive substrings (not a vacuous presence
+// check), itself honoring the #1169 done-means discipline it codifies.
+func TestBuild_Plan_PerFailureModeTestRule(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Per-failure-mode test rule",
+		"one behavioral test per named mode",
+		"not just the happy path plus a subset",
+		"#1184",
+		"#1169",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing per-failure-mode test rule string %q\n---\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_Plan_BudgetHintWithTimeouts(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		IssueNumber:           7,
@@ -1474,6 +1502,58 @@ func TestBuild_Implement_BindingConditionsReinforcement_Nil_Absent(t *testing.T)
 	}
 	if strings.Contains(got, "### Binding conditions — confirm each in your PR Notes") {
 		t.Errorf("tail reinforcement must not appear when ApprovalConditions is nil:\n%s", got)
+	}
+}
+
+// TestBuild_Implement_FailureModeTestChecklist_Rendered pins the #1199 implement
+// checklist: the full implement prompt instructs the agent to enumerate the
+// fail-closed / defensive branches it added and confirm each has a test in PR
+// `## Notes`. Unlike the #1171 binding-conditions reinforcement, this block is
+// unconditional — it renders even when ApprovalConditions is nil — so the test
+// deliberately leaves ApprovalConditions unset to distinguish the two blocks.
+func TestBuild_Implement_FailureModeTestChecklist_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+		// ApprovalConditions deliberately nil: the checklist is unconditional.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	const heading = "### Per-failure-mode test checklist — confirm in your PR Notes"
+	if !strings.Contains(got, heading) {
+		t.Errorf("implement prompt missing failure-mode checklist heading %q\n---\n%s", heading, got)
+	}
+	if !strings.Contains(got, "PR `## Notes`") {
+		t.Errorf("failure-mode checklist must instruct the agent to report in PR Notes\n---\n%s", got)
+	}
+	if !strings.Contains(got, "every named mode needs its own assertion") {
+		t.Errorf("failure-mode checklist must demand one assertion per named mode\n---\n%s", got)
+	}
+	// The binding-conditions reinforcement must be ABSENT here (nil conditions),
+	// proving the checklist renders independently of it.
+	if strings.Contains(got, "### Binding conditions — confirm each in your PR Notes") {
+		t.Errorf("binding reinforcement should be absent with nil conditions; checklist must not depend on it:\n%s", got)
+	}
+}
+
+// TestBuild_Implement_FailureModeTestChecklist_Absent_OnFixup pins binding
+// condition 2 (#1199): the checklist MUST NOT add noise to the slim fix-up
+// pass. A fix-up dispatch (FixupConcerns non-empty) renders buildImplementFixup,
+// which does not call writeFailureModeTestChecklist, so the heading is absent.
+func TestBuild_Implement_FailureModeTestChecklist_Absent_OnFixup(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   42,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []string{"[medium/coverage] no test for the bound-exhausted path"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Per-failure-mode test checklist") {
+		t.Errorf("failure-mode checklist must NOT appear on the slim fix-up path:\n%s", got)
 	}
 }
 
