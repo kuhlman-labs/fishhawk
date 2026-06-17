@@ -113,6 +113,22 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 		"stage_id":    implementStageID,
 		"concern_ids": "run.concerns.items[].id",
 	}
+	// deferConcern is always legal while a concern is open and consumes NO
+	// fix-up budget (#1202): it files a pre-drafted follow-up and resolves
+	// the concern. It sits between routing the concern back (fix-up) and
+	// accepting it as-is (merge-with-follow-up). parent_epic + n are the
+	// non-derivable title coordinates the operator supplies.
+	deferConcern := SuggestedAction{
+		Action: "fishhawk_defer_concern",
+		Params: map[string]string{
+			"concern_ids": "run.concerns.items[].id",
+			"parent_epic": "<epic the follow-up rolls up to, e.g. #1196>",
+			"n":           "<child number for the [E<epic>.<n>] title>",
+		},
+		Precondition: "the concern is worth a separate change but should not block the merge",
+		Consumes:     consumesNone,
+		Reason:       fmt.Sprintf("%d open concern(s) — file a pre-drafted follow-up work item and resolve the concern in one call (no fix-up budget spent)", h.Concerns),
+	}
 	mergeWithFollowUp := SuggestedAction{
 		Action:       "merge_and_file_follow_up",
 		Params:       prParams(run),
@@ -121,7 +137,8 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 		Reason:       fmt.Sprintf("%d open concern(s) — approve the PR with an operator verdict, merge, and file a follow-up issue for what was not routed back", h.Concerns),
 	}
 
-	// Below the normal budget: route the concerns back, or approve to merge.
+	// Below the normal budget: route the concerns back, defer into a
+	// follow-up, or approve to merge.
 	if h.RemainingFixupBudget > 0 {
 		return []SuggestedAction{
 			{
@@ -131,12 +148,13 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 				Consumes:     consumesFixupBudget,
 				Reason:       fmt.Sprintf("%d open concern(s) from the implement review; %d normal fix-up pass(es) remain", h.Concerns, h.RemainingFixupBudget),
 			},
+			deferConcern,
 			mergeWithFollowUp,
 		}
 	}
 
-	// Budget spent, ceiling open: merge-with-follow-up or the bounded
-	// operator override (#860).
+	// Budget spent, ceiling open: merge-with-follow-up, defer into a
+	// follow-up, or the bounded operator override (#860).
 	if h.OverrideAvailable {
 		forcedParams := map[string]string{
 			"stage_id":              implementStageID,
@@ -145,6 +163,7 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 		}
 		return []SuggestedAction{
 			mergeWithFollowUp,
+			deferConcern,
 			{
 				Action:       "fishhawk_fixup_stage",
 				Params:       forcedParams,

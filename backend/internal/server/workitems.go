@@ -300,78 +300,13 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Auto-derive the {epic} title placeholder from the parent_epic relation
-	// (#1184) before Apply renders the title, so a child type need only supply
-	// {n}. Fails closed (leaves epic unset) on every failure mode, so Apply's
-	// renderTitle returns the structured missing-placeholder 422 rather than a
-	// wrong title or a crash.
-	s.deriveEpicTitleVar(r.Context(), &filing, conv, target.InstallationID, owner, name)
-
-	item, number, err := workmgmt.Apply(filing, conv)
-	if err != nil {
-		var sem *workmgmt.SemanticError
-		if errors.As(err, &sem) {
-			// Surface the conventions layer's structured detail
-			// (missing_placeholders / unknown_sections / expected_sections)
-			// alongside type so the caller can act on it (#1184). Details
-			// defaults nil, so a SemanticError without it is unchanged.
-			details := map[string]any{"type": req.Type}
-			for k, v := range sem.Details {
-				details[k] = v
-			}
-			s.writeError(w, r, http.StatusUnprocessableEntity, "work_item_invalid",
-				sem.Error(), details)
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not apply work-management conventions", map[string]any{"error": err.Error()})
+	item, created, werr := s.applyAndFileWorkItem(r.Context(), filing, conv, target, owner, name)
+	if werr != nil {
+		s.writeError(w, r, werr.status, werr.code, werr.msg, werr.details)
 		return
 	}
 
-	provider, err := workmgmt.Get(conv.Provider)
-	if err != nil {
-		var unk *workmgmt.UnknownProviderError
-		if errors.As(err, &unk) {
-			// Fail closed: an unimplemented provider (jira is interface-only
-			// in v0) or a config typo names the missing id rather than
-			// panicking on a nil dispatch.
-			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
-				unk.Error(),
-				map[string]any{"provider": unk.ID, "registered": unk.Known})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not resolve work-item provider", map[string]any{"error": err.Error()})
-		return
-	}
-
-	created, err := provider.File(r.Context(), workmgmt.ProviderRequest{
-		Item:   item,
-		Number: number,
-		Target: target,
-	})
-	if err != nil {
-		s.writeError(w, r, http.StatusBadGateway, "work_item_filing_failed",
-			"provider could not file the work item", map[string]any{"error": err.Error()})
-		return
-	}
-
-	// A best-effort boarding/epic-link failure stays VISIBLE: WARN-log the
-	// cause (repo + issue url/number + the wrapped placeOnBoard/linkEpic
-	// error) so a genuine org-project misconfig (e.g. a typo'd Status
-	// option) is diagnosable rather than silently swallowed (#1107). The
-	// issue itself was created, so this is not a filing failure.
-	if created.BoardingError != "" || created.EpicLinkError != "" {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "work item filed but enrichment incomplete",
-			slog.String("repo", owner+"/"+name),
-			slog.String("issue_url", created.URL),
-			slog.Int("issue_number", created.Number),
-			slog.String("boarding_error", created.BoardingError),
-			slog.String("epic_link_error", created.EpicLinkError),
-		)
-	}
-
-	audited := s.auditWorkItemFiling(r, activeRun, item, created, id.Subject)
+	audited := s.auditWorkItemFiling(r, activeRun, *item, created, id.Subject)
 
 	s.writeJSON(w, r, http.StatusCreated, workItemResponse{
 		Type:          item.Type,
@@ -389,6 +324,117 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		EpicLinkError: created.EpicLinkError,
 		Audited:       audited,
 	})
+}
+
+// workItemError carries one failure branch of the work-item filing
+// pipeline as a structured value, so both handleFileWorkItem and
+// handleDeferConcern map the same Apply/provider error modes onto the
+// same HTTP status + code without duplicating the branch ladder.
+type workItemError struct {
+	status  int
+	code    string
+	msg     string
+	details map[string]any
+}
+
+// applyAndFileWorkItem is the conventions-Apply -> provider-File core
+// shared by the POST /v0/work-items handler and the defer-concern
+// handler. It auto-derives the {epic} title var, applies the repo's
+// conventions, resolves the registered provider, dispatches the filing,
+// and WARN-logs an incomplete boarding/epic-link enrichment. It returns
+// the canonical item + the created result, or a *workItemError naming
+// the failure branch (work_item_invalid/422, provider_unimplemented/501,
+// work_item_filing_failed/502, internal_error/500) — the SAME mapping
+// the inline handler used before the extraction, so the behavior is
+// preserved verbatim.
+//
+// It does NOT enforce any caller-to-run entitlement: those #1005
+// confused-deputy egress gates (run-id entitlement, run-to-repo
+// consistency, the run-bound run-absent-installation rejection) live in
+// handleFileWorkItem BEFORE this is called and must stay there. The
+// defer handler resolves its already-authorized run's installation into
+// the target itself.
+func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target, owner, name string) (*workmgmt.WorkItem, *workmgmt.CreatedItem, *workItemError) {
+	// Auto-derive the {epic} title placeholder from the parent_epic relation
+	// (#1184) before Apply renders the title, so a child type need only supply
+	// {n}. Fails closed (leaves epic unset) on every failure mode, so Apply's
+	// renderTitle returns the structured missing-placeholder 422 rather than a
+	// wrong title or a crash.
+	s.deriveEpicTitleVar(ctx, &filing, conv, target.InstallationID, owner, name)
+
+	item, number, err := workmgmt.Apply(filing, conv)
+	if err != nil {
+		var sem *workmgmt.SemanticError
+		if errors.As(err, &sem) {
+			// Surface the conventions layer's structured detail
+			// (missing_placeholders / unknown_sections / expected_sections)
+			// alongside type so the caller can act on it (#1184). Details
+			// defaults nil, so a SemanticError without it is unchanged.
+			details := map[string]any{"type": filing.Type}
+			for k, v := range sem.Details {
+				details[k] = v
+			}
+			return nil, nil, &workItemError{
+				status: http.StatusUnprocessableEntity, code: "work_item_invalid",
+				msg: sem.Error(), details: details,
+			}
+		}
+		return nil, nil, &workItemError{
+			status: http.StatusInternalServerError, code: "internal_error",
+			msg:     "could not apply work-management conventions",
+			details: map[string]any{"error": err.Error()},
+		}
+	}
+
+	provider, err := workmgmt.Get(conv.Provider)
+	if err != nil {
+		var unk *workmgmt.UnknownProviderError
+		if errors.As(err, &unk) {
+			// Fail closed: an unimplemented provider (jira is interface-only
+			// in v0) or a config typo names the missing id rather than
+			// panicking on a nil dispatch.
+			return nil, nil, &workItemError{
+				status: http.StatusNotImplemented, code: "provider_unimplemented",
+				msg:     unk.Error(),
+				details: map[string]any{"provider": unk.ID, "registered": unk.Known},
+			}
+		}
+		return nil, nil, &workItemError{
+			status: http.StatusInternalServerError, code: "internal_error",
+			msg:     "could not resolve work-item provider",
+			details: map[string]any{"error": err.Error()},
+		}
+	}
+
+	created, err := provider.File(ctx, workmgmt.ProviderRequest{
+		Item:   item,
+		Number: number,
+		Target: target,
+	})
+	if err != nil {
+		return nil, nil, &workItemError{
+			status: http.StatusBadGateway, code: "work_item_filing_failed",
+			msg:     "provider could not file the work item",
+			details: map[string]any{"error": err.Error()},
+		}
+	}
+
+	// A best-effort boarding/epic-link failure stays VISIBLE: WARN-log the
+	// cause (repo + issue url/number + the wrapped placeOnBoard/linkEpic
+	// error) so a genuine org-project misconfig (e.g. a typo'd Status
+	// option) is diagnosable rather than silently swallowed (#1107). The
+	// issue itself was created, so this is not a filing failure.
+	if created.BoardingError != "" || created.EpicLinkError != "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "work item filed but enrichment incomplete",
+			slog.String("repo", owner+"/"+name),
+			slog.String("issue_url", created.URL),
+			slog.Int("issue_number", created.Number),
+			slog.String("boarding_error", created.BoardingError),
+			slog.String("epic_link_error", created.EpicLinkError),
+		)
+	}
+
+	return &item, created, nil
 }
 
 // epicTitleRE extracts the epic number from a parent epic's leading

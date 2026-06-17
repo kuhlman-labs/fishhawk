@@ -404,17 +404,27 @@ func TestReviewActionHint_SuggestedActions(t *testing.T) {
 	run := &Run{ID: uuid.NewString(), State: "running"}
 	stageID := uuid.NewString()
 
-	t.Run("below budget -> fixup first, consuming fixup_budget", func(t *testing.T) {
+	t.Run("below budget -> fixup, defer, merge; fixup consumes fixup_budget", func(t *testing.T) {
 		h := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
 		actions := h.suggestedActions(run, stageID)
-		if len(actions) != 2 || actions[0].Action != "fishhawk_fixup_stage" || actions[1].Action != "merge_and_file_follow_up" {
-			t.Fatalf("actions = %+v, want [fishhawk_fixup_stage merge_and_file_follow_up]", actions)
+		if len(actions) != 3 ||
+			actions[0].Action != "fishhawk_fixup_stage" ||
+			actions[1].Action != "fishhawk_defer_concern" ||
+			actions[2].Action != "merge_and_file_follow_up" {
+			t.Fatalf("actions = %+v, want [fishhawk_fixup_stage fishhawk_defer_concern merge_and_file_follow_up]", actions)
 		}
 		if actions[0].Consumes != consumesFixupBudget {
 			t.Errorf("fixup consumes = %q, want fixup_budget", actions[0].Consumes)
 		}
 		if actions[0].Params["stage_id"] != stageID {
 			t.Errorf("fixup params.stage_id = %q, want %s", actions[0].Params["stage_id"], stageID)
+		}
+		// defer is always legal while a concern is open and consumes nothing.
+		if actions[1].Consumes != consumesNone {
+			t.Errorf("defer consumes = %q, want none", actions[1].Consumes)
+		}
+		if actions[1].Params["concern_ids"] != "run.concerns.items[].id" {
+			t.Errorf("defer params.concern_ids = %q, want the items source", actions[1].Params["concern_ids"])
 		}
 		// The remaining-budget number rides on the reason — the figure the
 		// integration test cross-checks against the hint itself.
@@ -426,14 +436,20 @@ func TestReviewActionHint_SuggestedActions(t *testing.T) {
 		}
 	})
 
-	t.Run("budget spent, override available -> forced fixup offered", func(t *testing.T) {
+	t.Run("budget spent, override available -> merge, defer, forced fixup", func(t *testing.T) {
 		h := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 0, OverrideAvailable: true}
 		actions := h.suggestedActions(run, stageID)
-		if len(actions) != 2 || actions[0].Action != "merge_and_file_follow_up" || actions[1].Action != "fishhawk_fixup_stage" {
-			t.Fatalf("actions = %+v, want [merge_and_file_follow_up fishhawk_fixup_stage]", actions)
+		if len(actions) != 3 ||
+			actions[0].Action != "merge_and_file_follow_up" ||
+			actions[1].Action != "fishhawk_defer_concern" ||
+			actions[2].Action != "fishhawk_fixup_stage" {
+			t.Fatalf("actions = %+v, want [merge_and_file_follow_up fishhawk_defer_concern fishhawk_fixup_stage]", actions)
 		}
-		if actions[1].Params["force_additional_pass"] != "true" {
-			t.Errorf("override fixup params = %v, want force_additional_pass=true", actions[1].Params)
+		if actions[1].Consumes != consumesNone {
+			t.Errorf("defer consumes = %q, want none", actions[1].Consumes)
+		}
+		if actions[2].Params["force_additional_pass"] != "true" {
+			t.Errorf("override fixup params = %v, want force_additional_pass=true", actions[2].Params)
 		}
 	})
 
