@@ -728,6 +728,17 @@ func buildImplement(t Trigger) string {
 	// Guarded by the same nil check, so it is a byte-identical no-op when no
 	// conditions were attached.
 	writeApprovalConditionsReinforcement(&b, t)
+
+	// Per-failure-mode test checklist (#1199): instruct the agent to enumerate
+	// the fail-closed / defensive branches it added and confirm each has a test,
+	// surfaced in PR `## Notes`. Unlike writeApprovalConditionsReinforcement this
+	// is NOT gated on ApprovalConditions — defensive branches arise from the
+	// plan/issue too, so it renders unconditionally on the full implement path.
+	// It is deliberately ABSENT on the slim fix-up path: buildImplementFixup
+	// returns before reaching here (early-dispatched at the top of buildImplement
+	// via FixupConcerns) and does not call this helper, so a fix-up pass is never
+	// re-demanded a full fresh-branch defensive-branch enumeration.
+	writeFailureModeTestChecklist(&b)
 	return b.String()
 }
 
@@ -773,6 +784,21 @@ func writeApprovalConditionsReinforcement(b *strings.Builder, t Trigger) {
 	b.WriteString("Before you finish, re-read the operator's binding approval conditions below. They are MANDATORY and win on conflict with the plan. In your PR `## Notes` section, add a numbered checklist that restates each condition and states explicitly how your change satisfies it (or, if a condition could not be met, say so and why):\n\n")
 	b.WriteString(ac)
 	b.WriteString("\n")
+}
+
+// writeFailureModeTestChecklist renders the tail "### Per-failure-mode test
+// checklist" block (#1199): the implement-side complement to the plan-prompt
+// Per-failure-mode test rule. It instructs the agent to enumerate the
+// fail-closed / defensive branches it added and confirm each has a test,
+// reporting the branch→test mapping in PR `## Notes`. Unlike
+// writeApprovalConditionsReinforcement it is NOT nil-gated on ApprovalConditions
+// — defensive branches arise from the plan/issue, not only from operator
+// conditions — so it renders unconditionally on the full implement path. It is
+// intentionally NOT called from buildImplementFixup, keeping the slim fix-up
+// pass free of a full fresh-branch enumeration demand.
+func writeFailureModeTestChecklist(b *strings.Builder) {
+	b.WriteString("\n### Per-failure-mode test checklist — confirm in your PR Notes\n\n")
+	b.WriteString("Before you finish: enumerate the fail-closed / defensive / error branches you added or changed (each guard that returns early, rejects, degrades, or falls back), and confirm EACH one has a test asserting its observable behavior — not just the happy path plus a subset. If the plan's verification or an approval condition names multiple failure modes, every named mode needs its own assertion (#1199, sibling of the plan-stage Per-failure-mode test rule). In your PR `## Notes` section, add a short checklist mapping each defensive branch to the test that asserts it (or state explicitly why a branch is genuinely untestable). This is the recurring reviewer concern (#1193, #1197): branches enumerated in prose but only partly tested.\n")
 }
 
 // writeFixupConcerns renders the binding "### Fix-up concerns" block (#762)
@@ -1077,6 +1103,12 @@ func buildPlan(t Trigger) string {
 		"The pre-PR scope-completeness gate (#1151) proves only that a declared scope.files path was TOUCHED, not that the required edit was made, " +
 		"so a comment-only / no-op touch satisfies presence while the real change is silently dropped (run 5aaf89fa: an explanatory comment was added to " +
 		"the numbering block instead of wiring the value). A test that asserts the shipped behavior fails on that no-op touch where the presence gate passes (#1169).\n")
+	b.WriteString("\n")
+	b.WriteString("Per-failure-mode test rule: when an approval condition OR the plan's verification/test_strategy enumerates N failure / fail-closed / defensive modes, " +
+		"verification.test_strategy MUST name one behavioral test per named mode that asserts THAT branch's observable behavior — one assertion per named branch, " +
+		"not just the happy path plus a subset of the modes. Enumerating the modes in prose while testing only some of them is exactly the gap reviewers keep catching " +
+		"post-hoc and deferring to a per-issue follow-up (#1182/PR#1192, #1191/PR#1196, #1184/PR#1198). Sibling rules: the Done-means test rule above (#1169) and the " +
+		"binding_assertions discipline (#1185) — this rule extends them from 'the change has a behavioral test' to 'EACH enumerated failure mode has one'.\n")
 	b.WriteString("\n")
 	b.WriteString("Counter-examples from production bugs:\n")
 	b.WriteString("- SIGKILL and orphan file descriptors: SIGKILL kills only the direct child process; grandchildren that inherited stdout " +
