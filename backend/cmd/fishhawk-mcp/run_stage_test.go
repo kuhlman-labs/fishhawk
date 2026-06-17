@@ -1020,6 +1020,35 @@ func TestRunStage_ContextCancelSendsSIGTERM(t *testing.T) {
 
 // --- helpers + parsers ---
 
+// TestJSONInt covers each jsonInt branch directly (#1181 concern 3). The
+// git_diff JSON-decode feeder only ever delivers float64 (encoding/json
+// decodes every JSON number to float64), so the int / json.Number / nil /
+// non-numeric branches are never reached through that path — these assertions
+// pin them.
+func TestJSONInt(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want int
+	}{
+		{"float64 whole", float64(7), 7},
+		// Go spec, Conversions: converting float→int discards the fraction
+		// (truncation toward zero), which the float64 branch relies on.
+		{"float64 truncates toward zero", float64(7.9), 7},
+		{"int", 5, 5},
+		{"json.Number", json.Number("42"), 42},
+		{"nil", nil, 0},
+		{"non-numeric string", "x", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := jsonInt(tc.in); got != tc.want {
+				t.Errorf("jsonInt(%#v) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunStageParseGitHubRemote(t *testing.T) {
 	cases := []struct {
 		in    string

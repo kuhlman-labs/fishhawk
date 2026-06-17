@@ -161,6 +161,56 @@ func TestGetRun_LineageComplete(t *testing.T) {
 	}
 }
 
+// scanLimitRepo wraps fakeRepo to return a fixed slice of children from
+// ListRuns, honoring the caller's Limit like the production repo's LIMIT
+// clause. It exercises lineageComplete's #1181 scan-limit truncation guard
+// at exactly the boundary, independent of fakeRepo's unfiltered ListRuns.
+type scanLimitRepo struct {
+	*fakeRepo
+	children []*run.Run
+}
+
+func (r *scanLimitRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.Run, error) {
+	if fil.Limit > 0 && len(r.children) > fil.Limit {
+		return r.children[:fil.Limit], nil
+	}
+	return r.children, nil
+}
+
+// TestLineageComplete_ChildScanTruncationGuard pins #1181 condition (3): at
+// exactly lineageChildScanLimit returned children the page may have dropped a
+// non-terminal child beyond the cap, so lineageComplete returns false (NOT
+// nil) — the safe direction — even when every returned child is terminal; one
+// under the limit the whole page is provably read and it returns true.
+func TestLineageComplete_ChildScanTruncationGuard(t *testing.T) {
+	rootRun := &run.Run{ID: uuid.New(), Repo: "x/y", State: run.StateSucceeded}
+	makeTerminalChildren := func(n int) []*run.Run {
+		kids := make([]*run.Run, n)
+		for i := range kids {
+			rootID := rootRun.ID
+			kids[i] = &run.Run{ID: uuid.New(), Repo: "x/y", DecomposedFrom: &rootID, State: run.StateSucceeded}
+		}
+		return kids
+	}
+
+	// At the scan limit → truncation guard fires → false (not nil), despite
+	// every returned child being terminal.
+	atLimit := New(Config{Addr: "127.0.0.1:0", RunRepo: &scanLimitRepo{
+		fakeRepo: newFakeRepo(), children: makeTerminalChildren(lineageChildScanLimit),
+	}})
+	if lc := atLimit.lineageComplete(context.Background(), rootRun); lc == nil || *lc {
+		t.Errorf("at scan limit: lineage_complete = %v, want false (truncation guard)", lc)
+	}
+
+	// One under the limit → the page is provably complete → true.
+	underLimit := New(Config{Addr: "127.0.0.1:0", RunRepo: &scanLimitRepo{
+		fakeRepo: newFakeRepo(), children: makeTerminalChildren(lineageChildScanLimit - 1),
+	}})
+	if lc := underLimit.lineageComplete(context.Background(), rootRun); lc == nil || !*lc {
+		t.Errorf("one under scan limit: lineage_complete = %v, want true", lc)
+	}
+}
+
 func TestGetRun_NotFound(t *testing.T) {
 	s := newServer(t, newFakeRepo())
 	id := uuid.New()

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // initRepo creates a throwaway git repo with one commit so HEAD exists
@@ -177,6 +178,114 @@ func TestAcquireLineageLock_ReclaimsStale(t *testing.T) {
 	if pid := readLockPID(lockPath); pid != os.Getpid() {
 		t.Errorf("lock pid after reclaim = %d, want %d", pid, os.Getpid())
 	}
+}
+
+func TestAcquireWorktreeAdminLock(t *testing.T) {
+	ctx := context.Background()
+
+	// (a) acquire → release round-trip leaves no lockfile.
+	t.Run("RoundTripLeavesNoFile", func(t *testing.T) {
+		repo := initRepo(t)
+		release, err := acquireWorktreeAdminLock(ctx, repo, io.Discard)
+		if err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		wtDir, err := worktreesDir(ctx, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lockPath := filepath.Join(wtDir, worktreeAdminLockName)
+		if _, err := os.Stat(lockPath); err != nil {
+			t.Fatalf("lockfile missing while held: %v", err)
+		}
+		release()
+		if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+			t.Errorf("lockfile present after release: stat err = %v", err)
+		}
+	})
+
+	// (b) a second acquire BLOCKS while the first is held and SUCCEEDS once
+	// released — cross-lineage contention must wait, not fail loud.
+	t.Run("BlocksThenSucceedsAfterRelease", func(t *testing.T) {
+		repo := initRepo(t)
+		release1, err := acquireWorktreeAdminLock(ctx, repo, io.Discard)
+		if err != nil {
+			t.Fatalf("first acquire: %v", err)
+		}
+		acquired := make(chan error, 1)
+		go func() {
+			r2, err := acquireWorktreeAdminLock(ctx, repo, io.Discard)
+			if err == nil {
+				r2()
+			}
+			acquired <- err
+		}()
+		// While the first lock is held the second acquire must still be
+		// blocked (not yet sent on the channel).
+		select {
+		case err := <-acquired:
+			t.Fatalf("second acquire returned (%v) while first lock held; want block", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+		release1()
+		// After release the blocked acquire proceeds within a few backoffs.
+		select {
+		case err := <-acquired:
+			if err != nil {
+				t.Fatalf("second acquire after release: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("second acquire did not succeed after release")
+		}
+	})
+
+	// (c) a stale lock whose recorded pid is dead is reclaimed.
+	t.Run("ReclaimsStale", func(t *testing.T) {
+		repo := initRepo(t)
+		wtDir, err := worktreesDir(ctx, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(wtDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		lockPath := filepath.Join(wtDir, worktreeAdminLockName)
+		// PID 0x7FFFFFFF is far above any real pid on these platforms.
+		if err := os.WriteFile(lockPath, []byte("2147483647\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		release, err := acquireWorktreeAdminLock(ctx, repo, io.Discard)
+		if err != nil {
+			t.Fatalf("acquire over stale lock: %v", err)
+		}
+		defer release()
+		if pid := readLockPID(lockPath); pid != os.Getpid() {
+			t.Errorf("lock pid after reclaim = %d, want %d", pid, os.Getpid())
+		}
+	})
+
+	// (d) a lock held by a LIVE pid times out within the bounded deadline and
+	// returns an error rather than hanging the stage forever.
+	t.Run("TimesOutOnLiveHolder", func(t *testing.T) {
+		repo := initRepo(t)
+		release, err := acquireWorktreeAdminLock(ctx, repo, io.Discard)
+		if err != nil {
+			t.Fatalf("first acquire: %v", err)
+		}
+		defer release()
+		// The first lock records THIS (live) process's pid, so the reclaim
+		// path can't fire; a bounded context makes the contended acquire
+		// return an error instead of blocking forever.
+		bounded, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		if _, err := acquireWorktreeAdminLock(bounded, repo, io.Discard); err == nil {
+			t.Fatal("contended acquire succeeded against a live holder; want timeout error")
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("contended acquire took %s; want bounded by the deadline", elapsed)
+		}
+	})
 }
 
 func TestProcessAlive(t *testing.T) {

@@ -349,6 +349,21 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if baseRepoDir == "" {
 			baseRepoDir = "."
 		}
+		// Cross-lineage worktree-admin safety (#1181, issue option (b)): a
+		// sibling run of a DIFFERENT lineage must not interleave its
+		// `git worktree add`/`list` with this run's sweep `git worktree
+		// remove --force` on the shared gitdir — git gives no
+		// cross-invocation mutual-exclusion guarantee, so we serialize the
+		// fast sweep+provision critical section ourselves. The lock BLOCKS
+		// (cross-lineage concurrency is the feature's expected steady state,
+		// not a bug) and is held ONLY here — released the moment provision
+		// returns, before the long stage.
+		adminRelease, adminErr := acquireWorktreeAdminLock(ctx, baseRepoDir, logSink)
+		if adminErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"worktree_admin_lock","detail":%q}`+"\n", adminErr.Error())
+			return exitFailure
+		}
 		// Reclaim worktrees of terminal lineages before provisioning a new
 		// one (#1137). Best-effort: it never fails the stage and never
 		// removes a worktree whose lineage the backend doesn't report
@@ -356,10 +371,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		sweepTerminalWorktrees(ctx, baseRepoDir, client, logSink)
 		wt, provErr := provisionLineageWorktree(ctx, baseRepoDir, root, logSink)
 		if provErr != nil {
+			adminRelease()
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"worktree_provision","detail":%q}`+"\n", provErr.Error())
 			return exitFailure
 		}
+		// Critical section done — release the cross-lineage admin lock before
+		// the long stage; the per-lineage lock below independently guards
+		// same-lineage serialization.
+		adminRelease()
 		// Record the lineage root's FULL run id beside the worktree so a
 		// later sweep can resolve the short `run-<root>` dir name back to a
 		// run id for the lineage_complete read (best-effort).
