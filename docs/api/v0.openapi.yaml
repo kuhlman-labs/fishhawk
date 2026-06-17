@@ -142,11 +142,27 @@ components:
         sections:
           type: object
           additionalProperties: { type: string }
-          description: Per-skeleton-section content keyed by section name; used only when `body` is empty.
+          description: >-
+            Per-skeleton-section content keyed by section name; used only when
+            `body` is empty. Keys MUST match the type's body skeleton exactly —
+            an off-skeleton key fails the filing with `422 work_item_invalid`
+            (the content is never silently dropped), and the unknown vs expected
+            section names are reported in `details.unknown_sections` /
+            `details.expected_sections`.
         title_vars:
           type: object
           additionalProperties: { type: string }
-          description: Title placeholders beyond `{summary}`/`{number}` (e.g. `epic`, `n`). An unresolved placeholder fails the filing.
+          description: >-
+            Title placeholders beyond `{summary}`/`{number}` (e.g. `epic`, `n`).
+            An unresolved placeholder fails the filing with `422
+            work_item_invalid`, listing the still-missing names in
+            `details.missing_placeholders`. For a child type whose
+            `title_format` is `[E{epic}.{n}]`, the `{epic}` placeholder is
+            auto-derived from the `parent_epic` relation (the parent epic
+            issue's leading `[E<n>]` title token is read server-side), so you
+            need only supply `{n}`. Derivation fails closed: if the parent has
+            no parseable `[E<n>]` token, `{epic}` is left unresolved and the 422
+            above is returned rather than a wrong title.
         labels:
           type: array
           items: { type: string }
@@ -2805,6 +2821,21 @@ paths:
         title placeholder and is the required Summary field. The same call
         shape works for any repo because only the conventions differ.
 
+        **Epic auto-derivation.** For a child type whose `title_format`
+        references `{epic}` (e.g. `[E{epic}.{n}]`), when `relations.parent_epic`
+        is set and `title_vars` omits `epic`, the handler reads the parent epic
+        issue's title server-side and parses its leading `[E<n>]` token into the
+        `{epic}` placeholder — so the caller need only supply `{n}`. This fails
+        closed: if no GitHub client/installation is available, the parent ref is
+        unparseable, the issue fetch errors, or the parent title carries no
+        `[E<n>]` token, `{epic}` is left unresolved and the `422` below is
+        returned rather than a wrong title.
+
+        **Sections fail loud.** When `body` is omitted, every `sections` key
+        must match the type's `body_skeleton` exactly. An off-skeleton key
+        returns `422 work_item_invalid` rather than silently dropping the
+        content.
+
         When `run_id` names a run that is **in flight** (not terminal), a
         best-effort `work_item_filed` audit entry is appended to that run.
         Filing succeeds with no `run_id` (the operator-agent follow-up
@@ -2856,7 +2887,12 @@ paths:
           description: |
             `work_item_invalid` — the request violates the conventions for
             its type (unknown type, missing complexity, unresolved title
-            placeholder, or an `epic_link` rule violation).
+            placeholder, an off-skeleton `sections` key, or an `epic_link`
+            rule violation). Structured `details` accompany the relevant
+            cases: `details.missing_placeholders` (the unresolved title
+            placeholders, e.g. `["epic"]` when epic derivation failed closed)
+            and `details.unknown_sections` / `details.expected_sections` (the
+            off-skeleton key(s) and the type's skeleton section names).
         '501':
           description: |
             `provider_unimplemented` — the conventions name a provider that

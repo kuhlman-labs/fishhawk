@@ -962,6 +962,205 @@ func TestFileWorkItem_RunBound_RunAbsent_Forbidden(t *testing.T) {
 	}
 }
 
+// newEpicGitHubClient builds a *githubclient.Client whose installation
+// endpoint answers with installID and whose single-issue endpoint answers
+// with epicTitle — the harness for the #1184 epic auto-derivation seam
+// (handler -> GetRepoInstallation -> GetIssue -> title render).
+func newEpicGitHubClient(t *testing.T, installID int64, epicTitle string) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{name}/installation", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":%d}`, installID)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{name}/issues/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := json.Marshal(map[string]any{"number": 389, "title": epicTitle, "state": "open"})
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// TestFileWorkItem_EpicDerivedFromParent is the #1184 cross-boundary seam:
+// a child filing supplies only {n} and parent_epic; the handler reads the
+// parent epic issue's [E22] title via GetIssue and derives the {epic} var,
+// so the rendered title is [E22.1]. Drives the full handler ->
+// GetRepoInstallation -> GetIssue -> Apply.renderTitle -> provider chain.
+func TestFileWorkItem_EpicDerivedFromParent(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	gh := newEpicGitHubClient(t, 7788, "[E22] The parent epic")
+	s := New(Config{GitHub: gh})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "bug",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"}, // epic omitted, auto-derived
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Title != "[E22.1] Fix the widget" {
+		t.Errorf("title = %q, want [E22.1] Fix the widget (epic derived from parent)", resp.Title)
+	}
+	if fp.captured.Item.Title != "[E22.1] Fix the widget" {
+		t.Errorf("provider Item.Title = %q, want the derived title", fp.captured.Item.Title)
+	}
+}
+
+// TestFileWorkItem_EpicDerived_TitleVarsOmitted is the binding condition (1)
+// nil-map-guard path: title_vars omitted ENTIRELY with parent_epic set must
+// derive {epic} into a freshly-allocated map, render the title, and not
+// panic. Uses a conventions type whose title_format references only {epic}
+// so the rendered title needs no {n}.
+func TestFileWorkItem_EpicDerived_TitleVarsOmitted(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	conv := workmgmt.Conventions{
+		Provider: workmgmt.Default().Provider, // github_projects -> the fake resolves
+		Types: map[string]workmgmt.ItemType{
+			"feature": {
+				TitleFormat:   "[E{epic}] {summary}",
+				BodySkeleton:  []string{"Summary"},
+				DefaultLabels: []string{"type:feature"},
+				DefaultFields: workmgmt.DefaultFields{Status: "Backlog", Complexity: "medium"},
+				EpicLink:      "optional",
+			},
+		},
+	}
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	gh := newEpicGitHubClient(t, 7788, "[E22] The parent epic")
+	s := New(Config{GitHub: gh})
+
+	// title_vars omitted entirely (nil map): the nil-map guard must allocate.
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Ship it",
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, no panic (body=%s)", rec.Code, rec.Body.String())
+	}
+	if resp := decodeWorkItem(t, rec); resp.Title != "[E22] Ship it" {
+		t.Errorf("title = %q, want [E22] Ship it", resp.Title)
+	}
+}
+
+// TestFileWorkItem_EpicDerivation_FailsClosed pins binding condition (3):
+// every epic-derivation failure mode leaves {epic} unset so the title fails
+// closed with the structured missing-placeholder 422 — never a wrong title
+// or a crash. Covers a GitHub client absent and a parent title with no
+// [E<n>] token; both assert details.missing_placeholders includes "epic".
+func TestFileWorkItem_EpicDerivation_FailsClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		gh   func(t *testing.T) *githubclient.Client
+	}{
+		{"github absent", func(*testing.T) *githubclient.Client { return nil }},
+		{"parent title has no [E..] token", func(t *testing.T) *githubclient.Client {
+			return newEpicGitHubClient(t, 7788, "A plain title with no epic token")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := &fakeWorkProvider{}
+			registerFakeProvider(t, fp)
+			s := New(Config{GitHub: tc.gh(t)})
+
+			rec := fileWorkItem(t, s, workItemRequest{
+				Repo:      "kuhlman-labs/fishhawk",
+				Type:      "bug",
+				Summary:   "Fix the widget",
+				TitleVars: map[string]string{"n": "1"}, // epic cannot be derived
+				Relations: &workItemRelations{ParentEpic: "#389"},
+			}, "github:operator")
+
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+			}
+			var env errorEnvelope
+			_ = json.Unmarshal(rec.Body.Bytes(), &env)
+			if env.Error.Code != "work_item_invalid" {
+				t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+			}
+			missing, _ := env.Error.Details["missing_placeholders"].([]any)
+			if !containsStr(missing, "epic") {
+				t.Errorf("details.missing_placeholders = %v, want it to include epic", env.Error.Details["missing_placeholders"])
+			}
+			if fp.called {
+				t.Error("provider dispatched despite a fail-closed title render")
+			}
+		})
+	}
+}
+
+// TestFileWorkItem_OffSkeletonSection_Unprocessable pins binding condition
+// (2): a sections key off the type's body skeleton fails loud with a 422
+// work_item_invalid carrying details.unknown_sections — never a silent drop.
+func TestFileWorkItem_OffSkeletonSection_Unprocessable(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Tidy up",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Sections: map[string]string{
+			"Summary": "the real content",
+			"Impact":  "off-skeleton content that must not be silently dropped",
+		},
+	}, "github:operator")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	unknown, _ := env.Error.Details["unknown_sections"].([]any)
+	if !containsStr(unknown, "Impact") {
+		t.Errorf("details.unknown_sections = %v, want it to include Impact", env.Error.Details["unknown_sections"])
+	}
+	if _, ok := env.Error.Details["expected_sections"]; !ok {
+		t.Errorf("details.expected_sections missing: %v", env.Error.Details)
+	}
+	if fp.called {
+		t.Error("provider dispatched despite an off-skeleton section")
+	}
+}
+
+// containsStr reports whether the JSON-decoded []any slice contains want.
+func containsStr(xs []any, want string) bool {
+	for _, x := range xs {
+		if s, ok := x.(string); ok && s == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestFileWorkItem_Anonymous_Unauthorized asserts an unauthenticated
 // caller is rejected.
 func TestFileWorkItem_Anonymous_Unauthorized(t *testing.T) {

@@ -2,11 +2,15 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,36 +190,6 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	item, number, err := workmgmt.Apply(filing, conv)
-	if err != nil {
-		var sem *workmgmt.SemanticError
-		if errors.As(err, &sem) {
-			s.writeError(w, r, http.StatusUnprocessableEntity, "work_item_invalid",
-				sem.Error(), map[string]any{"type": req.Type})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not apply work-management conventions", map[string]any{"error": err.Error()})
-		return
-	}
-
-	provider, err := workmgmt.Get(conv.Provider)
-	if err != nil {
-		var unk *workmgmt.UnknownProviderError
-		if errors.As(err, &unk) {
-			// Fail closed: an unimplemented provider (jira is interface-only
-			// in v0) or a config typo names the missing id rather than
-			// panicking on a nil dispatch.
-			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
-				unk.Error(),
-				map[string]any{"provider": unk.ID, "registered": unk.Known})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not resolve work-item provider", map[string]any{"error": err.Error()})
-		return
-	}
-
 	// Resolve the optional active run up front: it supplies the
 	// installation id the provider needs to act on the repo and is the
 	// target of the work_item_filed audit. run_id is an
@@ -326,6 +300,51 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Auto-derive the {epic} title placeholder from the parent_epic relation
+	// (#1184) before Apply renders the title, so a child type need only supply
+	// {n}. Fails closed (leaves epic unset) on every failure mode, so Apply's
+	// renderTitle returns the structured missing-placeholder 422 rather than a
+	// wrong title or a crash.
+	s.deriveEpicTitleVar(r.Context(), &filing, conv, target.InstallationID, owner, name)
+
+	item, number, err := workmgmt.Apply(filing, conv)
+	if err != nil {
+		var sem *workmgmt.SemanticError
+		if errors.As(err, &sem) {
+			// Surface the conventions layer's structured detail
+			// (missing_placeholders / unknown_sections / expected_sections)
+			// alongside type so the caller can act on it (#1184). Details
+			// defaults nil, so a SemanticError without it is unchanged.
+			details := map[string]any{"type": req.Type}
+			for k, v := range sem.Details {
+				details[k] = v
+			}
+			s.writeError(w, r, http.StatusUnprocessableEntity, "work_item_invalid",
+				sem.Error(), details)
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not apply work-management conventions", map[string]any{"error": err.Error()})
+		return
+	}
+
+	provider, err := workmgmt.Get(conv.Provider)
+	if err != nil {
+		var unk *workmgmt.UnknownProviderError
+		if errors.As(err, &unk) {
+			// Fail closed: an unimplemented provider (jira is interface-only
+			// in v0) or a config typo names the missing id rather than
+			// panicking on a nil dispatch.
+			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
+				unk.Error(),
+				map[string]any{"provider": unk.ID, "registered": unk.Known})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not resolve work-item provider", map[string]any{"error": err.Error()})
+		return
+	}
+
 	created, err := provider.File(r.Context(), workmgmt.ProviderRequest{
 		Item:   item,
 		Number: number,
@@ -370,6 +389,72 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		EpicLinkError: created.EpicLinkError,
 		Audited:       audited,
 	})
+}
+
+// epicTitleRE extracts the epic number from a parent epic's leading
+// `[E<digits>]` title token (the Project #7 `[EX] desc` epic title format).
+// `\d+` stops at the first non-digit, so a `[E22.X]`-style title still
+// yields "22".
+var epicTitleRE = regexp.MustCompile(`^\s*\[E(\d+)`)
+
+// deriveEpicTitleVar auto-derives the {epic} title placeholder from the
+// parent_epic relation (#1184). When the type's title_format references
+// {epic}, parent_epic is set, title_vars omits epic, a GitHub client is
+// wired, and an installation id is available, it fetches the parent epic
+// issue and parses its leading [E<n>] token into filing.TitleVars["epic"]
+// so a child type need only supply {n}.
+//
+// It fails CLOSED on every failure mode — no client, no installation, an
+// unparseable parent ref, a GetIssue error, or a parent title with no
+// [E<n>] token — by leaving epic unset, so Apply's renderTitle returns the
+// structured missing-placeholder 422 rather than a wrong title or a crash.
+// It mutates filing in place; the caller passes a pointer.
+func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, installID int64, owner, name string) {
+	itemType, ok := conv.Types[filing.Type]
+	if !ok || !strings.Contains(itemType.TitleFormat, "{epic}") {
+		return
+	}
+	if strings.TrimSpace(filing.Relations.ParentEpic) == "" {
+		return
+	}
+	if _, set := filing.TitleVars["epic"]; set {
+		return
+	}
+	if s.cfg.GitHub == nil || installID == 0 {
+		return
+	}
+	number, err := parseEpicRef(filing.Relations.ParentEpic)
+	if err != nil {
+		return
+	}
+	issue, err := s.cfg.GitHub.GetIssue(ctx, installID, githubclient.RepoRef{Owner: owner, Name: name}, number)
+	if err != nil {
+		return
+	}
+	m := epicTitleRE.FindStringSubmatch(issue.Title)
+	if m == nil {
+		return
+	}
+	// MANDATORY nil-map guard (#1184): allocate before assigning so a filing
+	// that omits title_vars entirely does not panic.
+	if filing.TitleVars == nil {
+		filing.TitleVars = map[string]string{}
+	}
+	filing.TitleVars["epic"] = m[1]
+}
+
+// parseEpicRef parses "#123" or "123" into the issue number, mirroring the
+// github provider's parser so a parent_epic relation resolves consistently.
+func parseEpicRef(ref string) (int, error) {
+	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ref), "#"))
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("not a numeric issue reference: %q", ref)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("issue number must be > 0: %q", ref)
+	}
+	return n, nil
 }
 
 // auditWorkItemFiling writes a work_item_filed entry onto activeRun when
