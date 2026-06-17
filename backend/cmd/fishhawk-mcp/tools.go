@@ -606,11 +606,21 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 // payload is absent or malformed are silently skipped — a review
 // with a corrupt payload is not a reason to fail the whole plan
 // fetch. Returns nil when no plan_reviewed entries exist.
+//
+// Floored to the latest plan_revised boundary (#1201): the get_plan Reviews[]
+// field reads the CURRENT revision's verdicts only, identically to
+// plan_review_status (reviewStatusFor). A fishhawk_revise_plan re-opens the
+// plan gate and writes a plan_revised entry; flooring past its sequence drops
+// the stale pre-revision round so a fresh re-review is not masked by old
+// verdicts. When no plan_revised entry exists the floor is 0 (a no-op since
+// sequences are >= 1), so the no-revise plan path is byte-for-byte unchanged.
 func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]PlanReview, error) {
-	// sinceSeq=0: this listing surface is not fix-up-scoped — it returns
-	// every recorded verdict. Only reviewStatusFor floors to the latest
-	// fix-up (#894).
-	reviews, err := r.decodeReviewVerdicts(ctx, runID, "plan_reviewed", 0)
+	sinceSeq, err := r.latestPlanRevisedSeq(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+
+	reviews, err := r.decodeReviewVerdicts(ctx, runID, "plan_reviewed", sinceSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -619,8 +629,9 @@ func (r *runResolver) loadPlanReviews(ctx context.Context, runID uuid.UUID) ([]P
 	// configured agent layer that was not wired on the backend. Each
 	// surfaces as a synthesized PlanReview with verdict "skipped" so
 	// an agent reading the response can tell a degraded gate from a
-	// real verdict without a separate audit query.
-	skipped, err := r.decodeSkippedReviews(ctx, runID, "plan_review_skipped", 0)
+	// real verdict without a separate audit query. Floored to the same
+	// plan_revised boundary as the verdict read above.
+	skipped, err := r.decodeSkippedReviews(ctx, runID, "plan_review_skipped", sinceSeq)
 	if err != nil {
 		return nil, err
 	}

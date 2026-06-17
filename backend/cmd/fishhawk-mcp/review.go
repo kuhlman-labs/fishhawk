@@ -310,31 +310,43 @@ func (r *runResolver) decodeLatestStartedConfiguredAgents(ctx context.Context, r
 // complete-on-first-verdict predicate via reviewStatusFallback, never
 // stranding on 'pending'.
 //
-// Fix-up boundary (#894): the three TERMINAL-verdict reads (reviewed /
-// skipped / failed) are floored to entries that landed AFTER the latest
-// stage_fixup_triggered audit sequence, so once a fix-up re-opens the
-// implement stage the stale pre-fix-up verdict no longer reads as terminal.
-// The *_review_started proxy check stays UNFLOORED on purpose: the round-1
-// started entry (at a sequence below the fix-up boundary) is still present,
-// so 'started exists' remains true and the precedence falls through to
-// 'pending' in the window between the fix-up and the re-review's terminal
-// entry — which is exactly what fishhawk_await_review must report while the
-// re-review of the fix-up head is in flight, the analogous sibling to the
-// #870 stale-input fix. sinceSeq is 0 for the plan stage (plan stages never
-// fix-up, so the extra audit query is skipped) and for an implement stage
-// with no prior fix-up; a 0 floor is a no-op (sequences are >= 1), so both
-// the plan path and the no-fix-up implement path are byte-for-byte unchanged.
+// Re-open boundary (#894, #1201): the three TERMINAL-verdict reads (reviewed /
+// skipped / failed) are floored to entries that landed AFTER the latest stage
+// re-open audit sequence — stage_fixup_triggered for the implement stage
+// (latestImplementFixupSeq, #894), plan_revised for the plan stage
+// (latestPlanRevisedSeq, #1201, the plan-stage analog: a fishhawk_revise_plan
+// re-opens the plan gate) — so once a stage is re-opened the stale pre-re-open
+// verdict no longer reads as terminal. The *_review_started proxy check stays
+// UNFLOORED on purpose: the round-1 started entry (at a sequence below the
+// boundary) is still present, so 'started exists' remains true and the
+// precedence falls through to 'pending' in the window between the re-open and
+// the re-review's terminal entry — which is exactly what fishhawk_await_review
+// must report while the re-review is in flight, the analogous sibling to the
+// #870 stale-input fix. sinceSeq is 0 for an implement stage with no prior
+// fix-up and for a plan stage with no prior revise; a 0 floor is a no-op
+// (sequences are >= 1), so both the no-fix-up implement path and the no-revise
+// plan path are byte-for-byte unchanged.
 func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stage string) (*ReviewStatus, error) {
 	cats, err := categoriesForStage(stage)
 	if err != nil {
 		return nil, err
 	}
 
-	// Only the implement stage can be re-opened by a fix-up; for the plan
-	// stage keep sinceSeq at 0 and avoid the extra audit query.
+	// Resolve the per-stage round boundary the terminal-verdict reads are
+	// floored to: the implement stage is re-opened by a fix-up
+	// (stage_fixup_triggered), the plan stage by a revise (plan_revised). When
+	// no such entry exists the floor is 0 — a no-op since sequences are >= 1 —
+	// so a no-fix-up implement stage and a no-revise plan stage are both
+	// byte-for-byte unchanged.
 	var sinceSeq int64
-	if stage == "implement" {
+	switch stage {
+	case "implement":
 		sinceSeq, err = r.latestImplementFixupSeq(ctx, runID)
+		if err != nil {
+			return nil, err
+		}
+	case "plan":
+		sinceSeq, err = r.latestPlanRevisedSeq(ctx, runID)
 		if err != nil {
 			return nil, err
 		}
@@ -435,6 +447,32 @@ func (*runResolver) reviewStatusFallback(stage string, reviewed, skipped, failed
 func (r *runResolver) latestImplementFixupSeq(ctx context.Context, runID uuid.UUID) (int64, error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: categoryStageFixupTriggered,
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return 0, err
+	}
+	var latestSeq int64
+	for _, e := range entries {
+		if e.Sequence > latestSeq {
+			latestSeq = e.Sequence
+		}
+	}
+	return latestSeq, nil
+}
+
+// latestPlanRevisedSeq returns the MAX audit Sequence among the run's
+// plan_revised entries (0 when none exist), the plan-revision boundary
+// reviewStatusFor floors the plan stage's terminal-verdict reads to (#1201).
+// It is the plan-stage analog of latestImplementFixupSeq: a fishhawk_revise_plan
+// re-opens the plan gate and writes one plan_revised entry per revise pass, so
+// the MAX sequence floors past the LAST revise when multiple have run. RUN-scoped
+// to match reviewStatusFor's existing run-scoped audit reads (decodeReviewVerdicts
+// filters by runID+category only). Reuses categoryPlanRevised from
+// review_action_hint.go.
+func (r *runResolver) latestPlanRevisedSeq(ctx context.Context, runID uuid.UUID) (int64, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryPlanRevised,
 		Limit:    reviewAuditQueryLimit,
 	})
 	if err != nil {

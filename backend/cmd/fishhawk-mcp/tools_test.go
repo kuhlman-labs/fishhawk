@@ -1813,6 +1813,67 @@ func TestGetPlan_NoReviewAuditEntries_ReviewsAbsent(t *testing.T) {
 	}
 }
 
+// TestGetPlan_AfterRevise_SurfacesOnlyRound2Reviews is the #1201 end-to-end
+// done-means test: after a fishhawk_revise_plan re-opens the plan gate and a
+// fresh round-2 review lands, getPlan must surface ONLY the post-revision
+// verdicts through BOTH out.Reviews (loadPlanReviews) and
+// out.PlanReviewStatus.Reviews (reviewStatusFor) — the stale round-1 reject
+// must never leak into either. It crosses the full audit-read -> loadPlanReviews
+// + reviewStatusFor -> GetPlanOutput seam. Before #1201 both surfaces returned
+// the pre-revision round.
+func TestGetPlan_AfterRevise_SurfacesOnlyRound2Reviews(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// Round 1: a full 2-reviewer round that landed an approve_with_concerns and
+	// a reject — the verdicts that prompted the operator to revise.
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 2, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory", Verdict: "approve_with_concerns", Concerns: []PlanReviewConcern{{Severity: "medium", Category: "scope", Note: "x"}}})
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "gpt-5.5", Authority: "advisory", Verdict: "reject"})
+
+	// The operator revises the plan, re-opening the gate.
+	seedRunPlanRevisedAudit(fb, runID)
+
+	// Round 2: a fresh 2-reviewer round on the revised plan, both clean approves.
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 2, "advisory")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory", Verdict: "approve"})
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "gpt-5.5", Authority: "advisory", Verdict: "approve"})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" {
+		t.Fatalf("Status = %q, want available", out.Status)
+	}
+
+	// noReject asserts a Reviews slice carries exactly the two round-2 approves
+	// and never the round-1 reject.
+	noReject := func(label string, reviews []PlanReview) {
+		t.Helper()
+		if len(reviews) != 2 {
+			t.Fatalf("%s = %+v, want exactly the two round-2 verdicts", label, reviews)
+		}
+		for _, rev := range reviews {
+			if rev.Verdict != "approve" {
+				t.Errorf("%s carries verdict %q, want only round-2 approve (the round-1 %q must be floored out)", label, rev.Verdict, rev.Verdict)
+			}
+		}
+	}
+	noReject("out.Reviews", out.Reviews)
+
+	if out.PlanReviewStatus == nil || out.PlanReviewStatus.Status != "complete" {
+		t.Fatalf("PlanReviewStatus = %+v, want complete", out.PlanReviewStatus)
+	}
+	noReject("out.PlanReviewStatus.Reviews", out.PlanReviewStatus.Reviews)
+}
+
 // seedScopePrecheckAudit marshals a SERVER-side ScopePrecheckPayload and
 // feeds it back through the fake backend as a plan_scope_precheck audit
 // entry. Using the real server type is the point of the seam test: it
