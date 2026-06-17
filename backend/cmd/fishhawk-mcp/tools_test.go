@@ -201,6 +201,20 @@ type fakeBackend struct {
 	waiveErrBody    string
 	waiveCalledByID map[uuid.UUID]int
 
+	// #1202 fixtures: POST /v0/concerns/{id}/defer.
+	// deferBody captures the last decoded request body (the title
+	// coordinates + overrides). deferResp seeds the defer result keyed by
+	// concern id; default is a minimal result with the concern in state
+	// deferred and a stub filed issue. deferStatus drives the HTTP status
+	// (default 200). deferErrBody, when set, is written verbatim — drives
+	// the 4xx / 5xx error-path tests. deferCalledByID counts defer calls
+	// per concern id.
+	deferBody       deferConcernRequest
+	deferResp       map[uuid.UUID]DeferredConcernResult
+	deferStatus     int
+	deferErrBody    string
+	deferCalledByID map[uuid.UUID]int
+
 	// #961 fixtures: GET /v0/runs/{id}/scope-amendments + the decision
 	// POST. amendmentsByRun seeds the list response; decideResp seeds the
 	// decided row keyed by amendment id; decideBody captures the last
@@ -293,6 +307,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		waiveResp:                map[uuid.UUID]WaivedConcern{},
 		waiveStatus:              http.StatusOK,
 		waiveCalledByID:          map[uuid.UUID]int{},
+		deferResp:                map[uuid.UUID]DeferredConcernResult{},
+		deferStatus:              http.StatusOK,
+		deferCalledByID:          map[uuid.UUID]int{},
 		amendmentsByRun:          map[uuid.UUID][]ScopeAmendmentItem{},
 		amendmentsStatus:         http.StatusOK,
 		decideAmendmentResp:      map[uuid.UUID]ScopeAmendmentItem{},
@@ -466,6 +483,35 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if !ok {
 			resp = WaivedConcern{ID: id.String(), State: "waived", StateReason: body.Reason}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/concerns/{concern_id}/defer", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("concern_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body deferConcernRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.deferCalledByID[id]++
+		fb.deferBody = body
+		status := fb.deferStatus
+		errBody := fb.deferErrBody
+		resp, ok := fb.deferResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = DeferredConcernResult{
+				Concern: DeferredConcern{ID: id.String(), State: "deferred", StateReason: "deferred to #4242"},
+				Issue:   DeferFiledIssue{Type: "chore", Number: 4242, URL: "https://github.com/kuhlman-labs/fishhawk/issues/4242"},
+			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -1101,7 +1147,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 26
+	const wantToolCount = 27
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

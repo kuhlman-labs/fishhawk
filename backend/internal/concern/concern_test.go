@@ -10,15 +10,16 @@ import (
 func TestTransition_FullMatrix(t *testing.T) {
 	states := []State{
 		StateRaised, StateAddressedPending, StateAddressed,
-		StateReopened, StateWaived, StateSuperseded,
+		StateReopened, StateWaived, StateSuperseded, StateDeferred,
 	}
 	allowed := map[State][]State{
-		StateRaised:           {StateAddressedPending, StateWaived, StateSuperseded},
-		StateAddressedPending: {StateAddressed, StateReopened, StateWaived, StateSuperseded},
+		StateRaised:           {StateAddressedPending, StateWaived, StateSuperseded, StateDeferred},
+		StateAddressedPending: {StateAddressed, StateReopened, StateWaived, StateSuperseded, StateDeferred},
 		StateAddressed:        {StateReopened},
-		StateReopened:         {StateAddressedPending, StateWaived, StateSuperseded},
+		StateReopened:         {StateAddressedPending, StateWaived, StateSuperseded, StateDeferred},
 		StateWaived:           {},
 		StateSuperseded:       {},
+		StateDeferred:         {},
 	}
 	for _, from := range states {
 		want := map[State]bool{}
@@ -88,7 +89,7 @@ func TestTransition_ReopenWinsOverConfirm(t *testing.T) {
 
 func TestStateIsOpen(t *testing.T) {
 	open := []State{StateRaised, StateAddressedPending, StateReopened}
-	closed := []State{StateAddressed, StateWaived, StateSuperseded, State("bogus")}
+	closed := []State{StateAddressed, StateWaived, StateSuperseded, StateDeferred, State("bogus")}
 	for _, s := range open {
 		if !s.IsOpen() {
 			t.Errorf("%s.IsOpen() = false, want true", s)

@@ -230,6 +230,33 @@ What a waive does:
 
 Error surfaces propagated as tool errors: `validation_failed` (400 — empty reason / bad UUID, both also caught locally before the HTTP hop), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — the concern is already `waived`/`superseded`/`addressed`; details carry the rejected `from`/`to` pair), `concern_store_unconfigured` (503).
 
+## Concern defer (`fishhawk_defer_concern`)
+
+`fishhawk_defer_concern` (E22.X / [#1202](https://github.com/kuhlman-labs/fishhawk/issues/1202)) converts one **open** review concern (`raised`, `addressed_pending`, or `reopened`) into a conventions-complete, boarded, epic-linked **follow-up work item** AND transitions the concern to the terminal `deferred` state — in a single call. It is the "not now, but track it" verb, sitting between `fishhawk_fixup_stage` (route the concern back to the agent now) and `fishhawk_waive_concern` (resolve with no follow-up). It consumes **no** fix-up budget. It wraps `POST /v0/concerns/{concern_id}/defer`.
+
+The follow-up body is **auto-drafted** server-side from the concern — its note, severity, category, the reviewer model, the evidence run id, and the source PR link — so you do not hand-author it (the friction this replaces: ~7 hand-authored follow-ups via `fishhawk_file_issue` in one loop session). You supply only the title coordinates the concern cannot carry.
+
+Inputs:
+
+| Field | Required | Notes |
+|---|---|---|
+| `concern_id` | **yes** | The stable concern UUID, from `fishhawk_get_run_status`'s `run.concerns.items[].id`. |
+| `parent_epic` | **yes** | The epic the follow-up rolls up to (an issue reference like `#1196`); its leading `[E<n>]` title token is fetched to derive the `{epic}` placeholder. Operator judgment — not derivable from the concern. |
+| `n` | **yes** | The child number for the `[E<epic>.<n>]` title. Operator judgment, mirroring how `fishhawk_file_issue` takes `{n}`. |
+| `type` | no | Override the auto-selected work-item type (`bug` for a defect category, else `chore`). |
+| `labels` | no | Labels merged on top of the type's default labels. |
+| `note` | no | Operator addendum folded into the follow-up body and the concern's `state_reason`. |
+
+What a defer does:
+
+- Files the follow-up work item, then transitions the concern to the **terminal** `deferred` state: it leaves `run.concerns` (the open block), can no longer be selected by `fishhawk_fixup_stage`'s `concern_ids`, and its `state_reason` names the filed issue.
+- **Orphan-issue-safe.** An already-resolved concern is rejected **before** any issue is filed (`concern_defer_conflict`, 422). A filing failure leaves the concern **open** (no transition) so you can retry. The success `concern_deferred` audit entry is written only **after** the transition succeeds; a post-filing transition race emits only a corrective `concern_defer_failed` entry (naming the actual state + the orphaned issue url) and returns 422.
+- **Auth:** byte-identical to waive — same write-scope pair (`write:stages` or `write:fixups`); a run-bound token may defer only its own run's concerns (`cross_run_defer`, 403).
+
+Returns the filed follow-up issue (`{type, title, number, url, provider, applied_labels}`) and the updated concern row (state `deferred`, `state_reason` naming the issue).
+
+Error surfaces propagated as tool errors: `validation_failed` (400 / bad UUID, caught locally before the HTTP hop), `cross_run_defer` (403), `concern_not_found` (404), `concern_defer_conflict` (422 — non-open concern or a post-filing race), `work_item_invalid` (422), `provider_unimplemented` (501), `work_item_filing_failed` (502 — the concern stays open), `concern_store_unconfigured` (503).
+
 ## Run-branch reset (`fishhawk_reset_run_branch`)
 
 `fishhawk_reset_run_branch` ([ADR-035](https://github.com/kuhlman-labs/fishhawk/issues/857) / [#867](https://github.com/kuhlman-labs/fishhawk/issues/867)) is the **destructive, operator-gated** remediation for a foreign commit pushed **ON TOP** of a run's own commits on the open PR branch. It force-rewinds the run/PR branch back to its **last run-authored HEAD** (the newest commit attributable to the run's reported-head ledger), dropping the on-top foreign commit, then re-parks the review gate so CI + the merge reconciler re-evaluate the rewound head. It wraps `POST /v0/runs/{run_id}/reset-branch`.

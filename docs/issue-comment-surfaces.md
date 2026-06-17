@@ -431,6 +431,27 @@ Notes:
   implement-review prompts as the waived concern's not-re-litigable context.
   Listed here only so a future reader grepping the audit categories doesn't
   mistake them for comment surfaces.
+
+- The concern-defer audit kinds — `concern_deferred` and its corrective
+  companion `concern_defer_failed` (#1202) — are **internal audit kinds, not
+  issue-comment surfaces**. Nothing in `issuecomment` posts them; they have no
+  Notifier method. The defer handler (`server/defer_concern.go::handleDeferConcern`,
+  `POST /v0/concerns/{concern_id}/defer`) converts an open concern into a
+  follow-up work item and transitions it to terminal `deferred`. Unlike the
+  waiver's audit-before-mutation contract, defer is **audit-AFTER-transition**
+  (a GitHub issue is a durable side effect, so the issue is filed first, the
+  concern transitions, and only THEN is the success fact recorded): the handler
+  writes `concern_deferred` with the acting token's subject + a kind selected
+  from it (`user`/`agent`, as for waive) and payload `{concern_id, prior_state,
+  reason, stage_kind, severity, category, issue_number, issue_url, issue_type,
+  issue_title, issue_provider}` ONLY AFTER the state transition succeeds — so the
+  entry is a fact, never an attempt. When the transition fails after a successful
+  filing (a concurrent writer raced it), the handler appends ONLY the
+  `system`-actor `concern_defer_failed` corrective entry `{concern_id,
+  intended_state, actual_state, issue_number, issue_url, error}` (best-effort,
+  naming the orphaned issue) and returns 422 — never a success `concern_deferred`
+  entry for a transition that did not happen. Listed here only so a future reader
+  grepping the audit categories doesn't mistake them for comment surfaces.
 - The fix-up failure-recovery audit kind — `stage_fixup_recovered` (#788) — is an
   **internal, system-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. `server/fixup.go::maybeRecoverFixupFailure`

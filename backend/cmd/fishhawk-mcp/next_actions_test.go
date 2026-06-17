@@ -243,8 +243,8 @@ func TestNextActions_StateTable(t *testing.T) {
 			implRS:       naReviewStatus("implement", "complete"),
 			hint:         &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1},
 			wantState:    "implement_concerns_open",
-			wantActions:  []string{"fishhawk_fixup_stage", "merge_and_file_follow_up"},
-			wantConsumes: []string{consumesFixupBudget, consumesNone},
+			wantActions:  []string{"fishhawk_fixup_stage", "fishhawk_defer_concern", "merge_and_file_follow_up"},
+			wantConsumes: []string{consumesFixupBudget, consumesNone, consumesNone},
 		},
 		{
 			name:         "h_concerns_open_budget_spent_override_available",
@@ -253,8 +253,8 @@ func TestNextActions_StateTable(t *testing.T) {
 			implRS:       naReviewStatus("implement", "complete"),
 			hint:         &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 0, OverrideAvailable: true},
 			wantState:    "implement_concerns_open",
-			wantActions:  []string{"merge_and_file_follow_up", "fishhawk_fixup_stage"},
-			wantConsumes: []string{consumesNone, consumesFixupBudget},
+			wantActions:  []string{"merge_and_file_follow_up", "fishhawk_defer_concern", "fishhawk_fixup_stage"},
+			wantConsumes: []string{consumesNone, consumesNone, consumesFixupBudget},
 		},
 		{
 			name:         "h_concerns_open_ceiling_reached",

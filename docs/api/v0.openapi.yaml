@@ -769,6 +769,66 @@ components:
           type: string
           description: The operator's audited waive reason.
 
+    DeferredConcernResult:
+      type: object
+      description: |
+        The result returned by `POST /v0/concerns/{concern_id}/defer`
+        (#1202): the filed follow-up work `issue` plus the now-deferred
+        `concern` row.
+      required: [concern, issue]
+      properties:
+        concern:
+          type: object
+          description: |
+            The updated concern row, now in the terminal `deferred`
+            state with `state_reason` naming the filed follow-up issue.
+          required: [id, run_id, stage_id, stage_kind, severity, category, note, state, state_reason]
+          properties:
+            id:
+              $ref: '#/components/schemas/UUID'
+            run_id:
+              $ref: '#/components/schemas/UUID'
+            stage_id:
+              $ref: '#/components/schemas/UUID'
+            stage_kind:
+              type: string
+              enum: [plan, implement]
+            severity:
+              type: string
+            category:
+              type: string
+            note:
+              type: string
+              description: The reviewer's original concern note.
+            state:
+              type: string
+              description: Always `deferred` on a successful defer.
+            state_reason:
+              type: string
+              description: |
+                The audited reason, of the form
+                `deferred to #<n>: <note>`, naming the filed issue.
+        issue:
+          type: object
+          description: The filed follow-up work item.
+          required: [type, title, number, url, provider]
+          properties:
+            type:
+              type: string
+              description: The work-item type (bug for a defect category, else chore).
+            title:
+              type: string
+            number:
+              type: integer
+            url:
+              type: string
+              format: uri
+            provider:
+              type: string
+            applied_labels:
+              type: array
+              items: { type: string }
+
     IssueContext:
       type: object
       description: |
@@ -4377,6 +4437,157 @@ paths:
           description: |
             Concern or audit store not configured on this deployment.
             Body's `error` is `concern_store_unconfigured`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/concerns/{concern_id}/defer:
+    post:
+      operationId: deferConcern
+      summary: Defer an open review concern into a follow-up work item
+      description: |
+        Converts one OPEN review concern (`raised`, `addressed_pending`,
+        or `reopened`) into a conventions-complete, boarded, epic-linked
+        follow-up work item AND transitions the concern to the terminal
+        `deferred` state in a single call (E22.X / #1202) — the operator
+        verb that sits between routing the concern back to the agent
+        (`POST /v0/stages/{stage_id}/fixup`) and resolving it with no
+        follow-up (`POST /v0/concerns/{concern_id}/waive`). Deferring
+        consumes NO fix-up budget.
+
+        The follow-up body is fully AUTO-DRAFTED server-side from the
+        persisted concern + its run (the concern note, severity,
+        category, the reviewer model, the evidence run id, and the
+        source PR link). The operator supplies only the non-derivable
+        title coordinates — `parent_epic` (the epic the follow-up rolls
+        up to) and `n` (the child number) — mirroring the work-item
+        filing endpoint; `type` defaults to `bug` for a defect category
+        else `chore`, and `labels` are merged on top of the type
+        defaults.
+
+        **Orphan-issue safety + audit-ordering:** a GitHub issue is a
+        durable external side effect, so the handler (1) PRE-CHECKS the
+        concern is open BEFORE any filing — the provider's File is never
+        called for an already-resolved concern (422
+        `concern_defer_conflict`, no issue created); (2) files the issue
+        FIRST, then transitions the concern; a filing failure leaves the
+        concern OPEN (no transition, no audit) so the operator can retry;
+        (3) appends the success `concern_deferred` audit entry ONLY AFTER
+        the transition succeeds (the entry is a fact, not an attempt). If
+        the transition fails after a successful filing (a concurrent
+        writer raced it), the ONLY audit entry is a corrective
+        `concern_defer_failed` naming the actual state AND the orphaned
+        issue url, and the request returns 422 — never a success
+        `concern_deferred` entry for a transition that did not happen.
+
+        Effects of a successful defer: the concern stops appearing in
+        `GET /v0/runs/{run_id}`'s open-states-only `concerns` block, can
+        no longer be selected by the fix-up endpoint's `concern_ids`, and
+        its `state_reason` names the filed issue. The defer is terminal.
+
+        Auth mirrors the waive endpoint: `write:stages` or `write:fixups`
+        scope; an mcp run-bound token (subject `mcp:run:<uuid>`) may
+        defer only its own run's concerns (403 `cross_run_defer`
+        otherwise).
+      tags: [stages]
+      parameters:
+        - { name: concern_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                parent_epic:
+                  type: string
+                  description: |
+                    The epic the follow-up rolls up to (an issue
+                    reference like `#1196`); its leading `[E<n>]` title
+                    token is fetched to derive the `{epic}` title
+                    placeholder. Operator judgment — not derivable from
+                    the concern.
+                n:
+                  type: string
+                  description: |
+                    The child number for the `[E<epic>.<n>]` title.
+                    Operator judgment, mirroring how the work-item filing
+                    endpoint takes `{n}` as a caller title var.
+                type:
+                  type: string
+                  description: |
+                    Optional override of the auto-selected work-item type
+                    (`bug` for a defect category, else `chore`).
+                labels:
+                  type: array
+                  items: { type: string }
+                  description: Optional labels merged on top of the type's default labels.
+                note:
+                  type: string
+                  description: |
+                    Optional operator addendum folded into the follow-up
+                    body and the concern's `state_reason`.
+      responses:
+        '200':
+          description: |
+            Concern deferred; the filed follow-up issue + updated concern
+            row in body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeferredConcernResult' }
+        '400':
+          description: |
+            Malformed body or a non-UUID `concern_id`. Body's `error` is
+            `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            Possible error codes: (1) bearer token lacks both
+            `write:stages` and `write:fixups` scope — body `error` is
+            `insufficient_scope`; (2) caller is an mcp token (subject
+            `mcp:run:<uuid>`) whose run scope does not match the
+            concern's `run_id` — body `error` is `cross_run_defer`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            Either the concern is not in an open state — already
+            `waived`, `superseded`, `deferred`, or `addressed` (the
+            open-state pre-check; no issue filed) — or the issue was
+            filed but the state transition then failed (a post-filing
+            race; a corrective `concern_defer_failed` audit entry names
+            the orphaned issue url). Body's `error` is
+            `concern_defer_conflict`. The auto-drafted follow-up could
+            also violate the type's conventions — body `error` is
+            `work_item_invalid` with `details`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: |
+            The configured work-item provider is not registered. Body's
+            `error` is `provider_unimplemented`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            The provider could not file the follow-up issue — the
+            concern stays OPEN (no transition). Body's `error` is
+            `work_item_filing_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            Concern, audit, or run store not configured on this
+            deployment. Body's `error` is `concern_store_unconfigured`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

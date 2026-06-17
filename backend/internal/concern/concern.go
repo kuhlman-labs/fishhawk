@@ -30,7 +30,12 @@ type State string
 
 // States. Raised is the creation state. The open states (raised,
 // addressed_pending, reopened) are the ones the run-status surface
-// lists and fix-up routing accepts.
+// lists and fix-up routing accepts. waived, superseded, and deferred
+// are terminal: waived is the operator "this does not block" judgment,
+// superseded the re-review supersession, and deferred the operator
+// "file a follow-up and resolve" verb (E22.X / #1202) — a concern
+// converted into a tracked work item, its state_reason naming the
+// filed issue.
 const (
 	StateRaised           State = "raised"
 	StateAddressedPending State = "addressed_pending"
@@ -38,6 +43,7 @@ const (
 	StateReopened         State = "reopened"
 	StateWaived           State = "waived"
 	StateSuperseded       State = "superseded"
+	StateDeferred         State = "deferred"
 )
 
 // StageKind values for the stage a concern originated from.
@@ -76,19 +82,22 @@ func (e InvalidTransitionError) Error() string {
 //
 // addressed (confirm) is only reachable from addressed_pending. A
 // reopened concern can be routed through another fix-up
-// (reopened -> addressed_pending). waived/superseded are terminal and
-// reachable from every open state (the deferred waive verb's edges).
+// (reopened -> addressed_pending). waived/superseded/deferred are
+// terminal and reachable from every open state (the operator waive and
+// defer verbs' edges).
 var validTransitions = map[State]map[State]struct{}{
 	StateRaised: {
 		StateAddressedPending: {},
 		StateWaived:           {},
 		StateSuperseded:       {},
+		StateDeferred:         {},
 	},
 	StateAddressedPending: {
 		StateAddressed:  {},
 		StateReopened:   {},
 		StateWaived:     {},
 		StateSuperseded: {},
+		StateDeferred:   {},
 	},
 	StateAddressed: {
 		StateReopened: {},
@@ -97,9 +106,11 @@ var validTransitions = map[State]map[State]struct{}{
 		StateAddressedPending: {},
 		StateWaived:           {},
 		StateSuperseded:       {},
+		StateDeferred:         {},
 	},
 	StateWaived:     {},
 	StateSuperseded: {},
+	StateDeferred:   {},
 }
 
 // Transition validates a state change against the lifecycle machine.
@@ -112,7 +123,10 @@ func Transition(from, to State) error {
 }
 
 // IsOpen reports whether the state counts as unresolved: listed by the
-// run-status surface and addressable by fix-up routing.
+// run-status surface and addressable by fix-up routing. The terminal
+// states (addressed, waived, superseded, deferred) return false — a
+// deferred concern has been converted into a follow-up work item and no
+// longer appears on the open-concerns surface.
 func (s State) IsOpen() bool {
 	switch s {
 	case StateRaised, StateAddressedPending, StateReopened:

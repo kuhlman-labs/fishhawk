@@ -548,6 +548,86 @@ func (c *apiClient) WaiveConcern(ctx context.Context, id uuid.UUID, reason strin
 	return &out, nil
 }
 
+// deferConcernRequest mirrors the backend's defer 200 request body
+// (`backend/internal/server/defer_concern.go::deferConcernRequest`). The
+// follow-up body is auto-drafted server-side; the operator supplies only
+// the title coordinates + optional overrides.
+type deferConcernRequest struct {
+	ParentEpic string   `json:"parent_epic,omitempty"`
+	N          string   `json:"n,omitempty"`
+	Type       string   `json:"type,omitempty"`
+	Labels     []string `json:"labels,omitempty"`
+	Note       string   `json:"note,omitempty"`
+}
+
+// DeferConcernParams bundles the caller-supplied defer inputs the tool
+// layer collects, so DeferConcern's signature stays readable.
+type DeferConcernParams struct {
+	ParentEpic string
+	N          string
+	Type       string
+	Labels     []string
+	Note       string
+}
+
+// DeferredConcern mirrors the backend defer 200 body's `concern` block:
+// the updated concern row, now in state deferred with state_reason
+// naming the filed follow-up issue.
+type DeferredConcern struct {
+	ID          string `json:"id"`
+	RunID       string `json:"run_id"`
+	StageID     string `json:"stage_id"`
+	StageKind   string `json:"stage_kind"`
+	Severity    string `json:"severity"`
+	Category    string `json:"category"`
+	Note        string `json:"note"`
+	State       string `json:"state"`
+	StateReason string `json:"state_reason"`
+}
+
+// DeferFiledIssue mirrors the backend defer 200 body's `issue` block: the
+// filed follow-up work item.
+type DeferFiledIssue struct {
+	Type          string   `json:"type"`
+	Title         string   `json:"title"`
+	Number        int      `json:"number"`
+	URL           string   `json:"url"`
+	Provider      string   `json:"provider"`
+	AppliedLabels []string `json:"applied_labels,omitempty"`
+}
+
+// DeferredConcernResult mirrors the backend defer 200 body: the filed
+// follow-up work item plus the now-deferred concern row.
+type DeferredConcernResult struct {
+	Concern DeferredConcern `json:"concern"`
+	Issue   DeferFiledIssue `json:"issue"`
+}
+
+// DeferConcern converts one open review concern into a follow-up work
+// item and transitions the concern to the terminal deferred state via
+// `POST /v0/concerns/{concern_id}/defer` (E22.X / #1202). 4xx/5xx
+// surfaces:
+//   - 403 cross_run_defer (a run-bound token reaching another run's
+//     concern) or insufficient_scope
+//   - 404 concern_not_found
+//   - 422 concern_defer_conflict (the concern is not open, or a
+//     post-filing transition race — details may carry the filed issue url)
+//   - 422 work_item_invalid (the follow-up violates the type's conventions)
+//   - 501 provider_unimplemented / 502 work_item_filing_failed (the
+//     provider could not file — the concern stays OPEN, no transition)
+//   - 503 concern_store_unconfigured
+func (c *apiClient) DeferConcern(ctx context.Context, id uuid.UUID, p DeferConcernParams) (*DeferredConcernResult, error) {
+	body, err := json.Marshal(deferConcernRequest(p))
+	if err != nil {
+		return nil, fmt.Errorf("marshal defer: %w", err)
+	}
+	var out DeferredConcernResult
+	if err := c.do(ctx, http.MethodPost, "/v0/concerns/"+id.String()+"/defer", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // resetBranchRequest mirrors the backend's
 // `POST /v0/runs/{run_id}/reset-branch` body
 // (`backend/internal/server/reset_branch.go::resetBranchRequest`).

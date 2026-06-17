@@ -50,6 +50,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerFileIssue(srv, resolver)
 	registerFixupStage(srv, resolver)
 	registerWaiveConcern(srv, resolver)
+	registerDeferConcern(srv, resolver)
 	registerListScopeAmendments(srv, resolver)
 	registerDecideScopeAmendment(srv, resolver)
 	registerApprovePlan(srv, resolver)
