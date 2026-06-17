@@ -338,6 +338,13 @@ type GateVerifyRun struct {
 	OutputTail string
 	// TailTruncated marks a tail the runner cut to its line/byte bounds.
 	TailTruncated bool
+	// Superseded marks a verify run the verify-fix loop absorbed and re-ran
+	// (#1205): an earlier iteration on a stale tree followed by a passing
+	// terminal run. The renderer flags it so its failure is NOT read as a
+	// committed-tree blocker — only the terminal (non-superseded) run or a
+	// verify_summary outcome of `failed` is. The last/terminal run is never
+	// marked.
+	Superseded bool
 }
 
 // GateVerifySummary is the stage's once-per-stage verify summary:
@@ -1697,10 +1704,14 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	b.WriteString("The runner's deterministic gates produced the machine-verified results below. They are ground " +
 		"truth about the committed tree's compile/test state and the scope enforcement that shaped the diff — " +
 		"they outrank any text-level reading of the diff. These rules are BINDING:\n\n")
-	b.WriteString("- A FAILED verify run (e.g. a tail naming [build failed]) means the committed tree does NOT " +
-		"pass the named command. You MUST record it as a `high`-severity concern, name it FIRST in `concerns`, " +
-		"and you MAY shortcut the remaining review lenses — a head that does not build or test green cannot be " +
-		"salvaged by stylistic findings.\n")
+	b.WriteString("- A TERMINAL (non-superseded) FAILED verify run (e.g. a tail naming [build failed]), OR a " +
+		"verify_summary outcome of `failed`, means the committed tree does NOT pass the named command. You MUST " +
+		"record it as a `high`-severity concern, name it FIRST in `concerns`, and you MAY shortcut the remaining " +
+		"review lenses — a head that does not build or test green cannot be salvaged by stylistic findings.\n")
+	b.WriteString("- The verify_summary outcome (and the LAST/terminal verify run) is authoritative for the " +
+		"committed tree. A verify run marked SUPERSEDED is an earlier iteration the verify-fix loop absorbed and " +
+		"re-ran on a newer tree — its failure MUST NOT be treated as a committed-tree blocker. An absorbed-then-" +
+		"passed iteration is NOT a blocker; a terminal failure still is.\n")
 	b.WriteString("- A divergence between the declared and staged scope (counts below, or drift-excluded paths) " +
 		"likewise outranks stylistic findings — name it before them.\n")
 	b.WriteString("- A SKIPPED verify run means compile/test state is UNVERIFIED. Do NOT assume the change is " +
@@ -1713,7 +1724,11 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		b.WriteString("Verify runs (committed-tree gate):\n\n")
 		for _, vr := range ev.VerifyRuns {
 			fmt.Fprintf(b, "- command: %s\n", vr.Command)
-			fmt.Fprintf(b, "  outcome: %s (exit code %d)\n", vr.Outcome, vr.ExitCode)
+			supersededNote := ""
+			if vr.Superseded {
+				supersededNote = " — SUPERSEDED (absorbed by the verify-fix loop; NOT the committed-tree result; see verify summary below)"
+			}
+			fmt.Fprintf(b, "  outcome: %s (exit code %d)%s\n", vr.Outcome, vr.ExitCode, supersededNote)
 			if vr.OutputTail != "" {
 				truncNote := ""
 				if vr.TailTruncated {

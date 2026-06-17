@@ -280,6 +280,15 @@ type VerifyRunEvidence struct {
 	// bounds — the prompt flags it so a reviewer knows the output is
 	// partial.
 	TailTruncated bool `json:"tail_truncated,omitempty"`
+	// Superseded is true when a LATER verify_run iteration superseded this
+	// one in the verify-fix loop (#1205): an earlier absorbed iteration that
+	// ran on a stale tree and was followed by a passing terminal run, so it
+	// is NOT the committed-tree result. Only the LAST verify_run is the
+	// terminal/authoritative attempt and is never marked. Mirrors the
+	// runner's verifyRunEvidence — the json tag MUST stay identical to the
+	// composer, same lockstep wire contract as the parent payload. Additive/
+	// omitempty: older bundles decode to false (not superseded).
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // VerifySummaryEvidence digests the verify_summary event (#804).

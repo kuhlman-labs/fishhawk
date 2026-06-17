@@ -362,6 +362,78 @@ func TestComposeGateEvidence_CountsFlakeRetries(t *testing.T) {
 	}
 }
 
+func TestComposeGateEvidence_AbsorbedRunMarkedSuperseded(t *testing.T) {
+	// Absorbed-then-passed: the verify-fix loop ran the gate, it failed, the
+	// agent fixed the tree, and the re-run passed (#1205). The first
+	// (absorbed) run operated on a stale tree → Superseded; the LAST run is
+	// the terminal/authoritative attempt matching verify_summary → NOT marked,
+	// so an absorbed iteration is not surfaced as a committed-tree blocker.
+	events := []agent.Event{
+		verifyRunEvent("scripts/test verify", "h1", "t1", 1, "[build failed]", "failed"),
+		verifyRunEvent("scripts/test verify", "h2", "t2", 0, "ok", "passed"),
+		{Kind: "verify_summary", Payload: agent.MakePayload(map[string]any{
+			"outcome": "passed", "iterations": 2, "max_iterations": 3,
+		})},
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 1))
+	if len(p.VerifyRuns) != 2 {
+		t.Fatalf("verify_runs = %d, want 2", len(p.VerifyRuns))
+	}
+	if !p.VerifyRuns[0].Superseded {
+		t.Error("absorbed (first) run Superseded = false, want true")
+	}
+	if p.VerifyRuns[1].Superseded {
+		t.Error("terminal (last) run Superseded = true, want false")
+	}
+	if p.VerifyRuns[1].Outcome != "passed" {
+		t.Errorf("terminal outcome = %q, want passed", p.VerifyRuns[1].Outcome)
+	}
+}
+
+func TestComposeGateEvidence_TerminalFailNotSuperseded(t *testing.T) {
+	// Budget-exhausted [fail,fail]: every iteration failed and the loop
+	// terminated still red (#1205). The earlier run is marked superseded, but
+	// the LAST run is the genuine terminal failure and MUST stay unmarked so
+	// it remains a committed-tree HIGH blocker (the Superseded marking must
+	// never mask a real terminal failure).
+	events := []agent.Event{
+		verifyRunEvent("scripts/test verify", "h1", "t1", 1, "[build failed] first", "failed"),
+		verifyRunEvent("scripts/test verify", "h2", "t2", 1, "[build failed] last", "failed"),
+		{Kind: "verify_summary", Payload: agent.MakePayload(map[string]any{
+			"outcome": "failed", "iterations": 2, "max_iterations": 2,
+		})},
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 1))
+	if len(p.VerifyRuns) != 2 {
+		t.Fatalf("verify_runs = %d, want 2", len(p.VerifyRuns))
+	}
+	if !p.VerifyRuns[0].Superseded {
+		t.Error("first run Superseded = false, want true")
+	}
+	if p.VerifyRuns[1].Superseded {
+		t.Error("terminal failing run Superseded = true, want false — would mask a real committed-tree failure")
+	}
+	if p.VerifySummary == nil || p.VerifySummary.Outcome != "failed" {
+		t.Errorf("verify_summary outcome = %+v, want failed", p.VerifySummary)
+	}
+}
+
+func TestComposeGateEvidence_SingleRunNeverSuperseded(t *testing.T) {
+	// A lone verify_run is the terminal run by definition (len == 1), so it is
+	// never marked superseded — the omitempty field stays false (back-compat
+	// with the pre-#1205 single-iteration rendering).
+	events := []agent.Event{
+		verifyRunEvent("scripts/test verify", "h1", "t1", 0, "ok", "passed"),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 1))
+	if len(p.VerifyRuns) != 1 {
+		t.Fatalf("verify_runs = %d, want 1", len(p.VerifyRuns))
+	}
+	if p.VerifyRuns[0].Superseded {
+		t.Error("single run Superseded = true, want false")
+	}
+}
+
 func TestComposeGateEvidence_SkipsUndecodablePayloadsBestEffort(t *testing.T) {
 	events := []agent.Event{
 		{Kind: "verify_run", Payload: json.RawMessage(`{not json`)},
