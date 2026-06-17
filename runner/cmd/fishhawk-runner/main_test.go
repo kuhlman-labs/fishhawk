@@ -217,6 +217,20 @@ type fakeUploader struct {
 	// success keyed off the same key so a real signature is
 	// unnecessary in tests.
 	priv ed25519.PrivateKey
+
+	// Stale-key simulation seam (#1182). When freshKeyPerIssue is true,
+	// IssueKey mints a NEW ed25519 keypair on each call and records it as
+	// latestPriv (the latest issued key is the only accepted key,
+	// modelling the backend's GetLatestSigningKey + TTL-expiry of older
+	// rows). The signed-egress methods (ShipTrace, ShipPlan,
+	// FetchInstallationToken, ShipPullRequest) then reject any call whose
+	// PrivateKey is not the most-recently-issued key with a
+	// signing_key_expired-shaped error — faithfully modelling a stage that
+	// outlived its start-of-stage key, where only the refreshed (latest)
+	// key is accepted at terminal egress. Default off, so existing tests
+	// reuse the single f.priv and stay byte-identical.
+	freshKeyPerIssue bool
+	latestPriv       ed25519.PrivateKey
 }
 
 func newFakeUploader(t *testing.T) *fakeUploader {
@@ -234,13 +248,37 @@ func (f *fakeUploader) IssueKey(_ context.Context, runID string, _ time.Duration
 	if f.issueErr != nil {
 		return nil, f.issueErr
 	}
+	priv := f.priv
+	if f.freshKeyPerIssue {
+		_, fresh, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		priv = fresh
+		f.latestPriv = fresh
+	}
 	return &upload.IssuedKey{
 		RunID:      runID,
-		PrivateKey: f.priv,
-		PublicKey:  f.priv.Public().(ed25519.PublicKey),
+		PrivateKey: priv,
+		PublicKey:  priv.Public().(ed25519.PublicKey),
 		IssuedAt:   time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC),
 		ExpiresAt:  time.Date(2026, 5, 2, 12, 30, 0, 0, time.UTC),
 	}, nil
+}
+
+// rejectIfStaleKey models the backend rejecting a signature made with any
+// key that is not the most-recently-issued one: once freshKeyPerIssue is on,
+// only latestPriv (the refreshed terminal-egress key) verifies; an older
+// start-of-stage key is treated as expired. Returns nil when the simulation
+// is off so existing tests are unaffected.
+func (f *fakeUploader) rejectIfStaleKey(priv ed25519.PrivateKey) error {
+	if !f.freshKeyPerIssue {
+		return nil
+	}
+	if !priv.Equal(f.latestPriv) {
+		return errors.New("signing_key_expired: signature made with a non-latest signing key")
+	}
+	return nil
 }
 
 func (f *fakeUploader) FetchPrompt(_ context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error) {
@@ -272,6 +310,9 @@ func (f *fakeUploader) ShipTrace(_ context.Context, args upload.ShipArgs) (*uplo
 		// gotShipCalls slice is the canonical record of every call.
 		f.gotShipArgs = &a
 	}
+	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
+		return nil, err
+	}
 	if f.shipErr != nil {
 		return nil, f.shipErr
 	}
@@ -286,6 +327,9 @@ func (f *fakeUploader) ShipTrace(_ context.Context, args upload.ShipArgs) (*uplo
 func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*upload.ShipPlanResult, error) {
 	a := args
 	f.gotPlanArgs = &a
+	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
+		return nil, err
+	}
 	if f.planErr != nil {
 		return nil, f.planErr
 	}
@@ -300,6 +344,9 @@ func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*u
 func (f *fakeUploader) ShipPullRequest(_ context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error) {
 	a := args
 	f.gotPRArgs = &a
+	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
+		return nil, err
+	}
 	if f.prErr != nil {
 		return nil, f.prErr
 	}
@@ -316,6 +363,9 @@ func (f *fakeUploader) ShipPullRequest(_ context.Context, args upload.ShipPullRe
 func (f *fakeUploader) FetchInstallationToken(_ context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error) {
 	a := args
 	f.gotInstTokenArgs = &a
+	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
+		return nil, err
+	}
 	if f.instTokenErr != nil {
 		return nil, f.instTokenErr
 	}
@@ -1892,10 +1942,14 @@ func TestRun_FetchPrompt_IssueKeyFailure(t *testing.T) {
 	}
 }
 
-func TestRun_FetchPrompt_PlusUploadTrace_OnlyOneIssueKeyCall(t *testing.T) {
-	// Critical invariant: signing-key endpoint is one-shot per run.
-	// Combining --fetch-prompt with --upload-trace must reuse the
-	// same key issued at fetch-prompt time, not call IssueKey twice.
+func TestRun_FetchPrompt_PlusUploadTrace_RefreshesKeyForTerminalEgress(t *testing.T) {
+	// Combining --fetch-prompt with --upload-trace issues the signing key
+	// TWICE: once at fetch-prompt (start of stage) and once immediately
+	// before the terminal signed-egress sequence (#1182). The pre-terminal
+	// refresh decouples terminal egress from the start-of-stage key TTL so
+	// a long stage doesn't fail category-C at the end-of-stage trace
+	// upload. Multi-call issuance is supported by the backend (migration
+	// 0012; Verify uses the latest unexpired key).
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true,
 		Events: []agent.Event{{Kind: "system.init"}}}})
 	fu := newFakeUploader(t)
@@ -1912,14 +1966,90 @@ func TestRun_FetchPrompt_PlusUploadTrace_OnlyOneIssueKeyCall(t *testing.T) {
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
 	}
-	if fu.gotIssueCount != 1 {
-		t.Errorf("IssueKey calls = %d, want 1", fu.gotIssueCount)
+	if fu.gotIssueCount != 2 {
+		t.Errorf("IssueKey calls = %d, want 2 (start-of-stage + pre-terminal refresh)", fu.gotIssueCount)
 	}
 	if fu.gotPromptArgs == nil {
 		t.Error("FetchPrompt not called")
 	}
 	if fu.gotShipArgs == nil {
 		t.Error("ShipTrace not called")
+	}
+}
+
+func TestRun_FetchPrompt_UploadTrace_RefreshesSigningKeyBeforeTerminalEgress(t *testing.T) {
+	// Done-means test for #1182: a stage whose wall-clock outlives the
+	// start-of-stage signing key TTL must still ship its terminal trace
+	// upload. The fake backend mints a fresh keypair per IssueKey and
+	// REJECTS any signature made with a non-latest key (freshKeyPerIssue),
+	// so the stale start-of-stage key would be rejected at ShipTrace ->
+	// category-C on the unfixed single-key code. With the pre-terminal
+	// refresh, the trace ships with the freshly-minted key.
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true,
+		Events: []agent.Event{{Kind: "system.init"}}}})
+	fu := newFakeUploader(t)
+	fu.freshKeyPerIssue = true
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u",
+		"--workflow", "w", "--stage", "s",
+		"--stage-id", "stage-1",
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (terminal egress must use the refreshed key):\n%s", got, stderr.String())
+	}
+	if fu.gotIssueCount != 2 {
+		t.Errorf("IssueKey calls = %d, want exactly 2 (start-of-stage + pre-terminal refresh)", fu.gotIssueCount)
+	}
+	if fu.gotShipArgs == nil {
+		t.Error("ShipTrace not called")
+	}
+}
+
+func TestRun_FetchPrompt_UploadTrace_Implement_RefreshedKeyFlowsToPREgress(t *testing.T) {
+	// Implement-stage variant of the #1182 done-means test: the refreshed
+	// key must also flow through openPRAndShipArtifact's
+	// FetchInstallationToken + ShipPullRequest so PR egress succeeds despite
+	// the stale start-of-stage key. The single pre-terminal refresh at the
+	// top of the upload block reassigns the shared issuedKey, covering trace
+	// AND PR egress.
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.freshKeyPerIssue = true
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (PR egress must use the refreshed key):\n%s", got, stderr.String())
+	}
+	if fu.gotIssueCount != 2 {
+		t.Errorf("IssueKey calls = %d, want exactly 2 (start-of-stage + pre-terminal refresh)", fu.gotIssueCount)
+	}
+	if fu.gotInstTokenArgs == nil {
+		t.Error("FetchInstallationToken not called (PR egress did not run)")
+	}
+	if fu.gotPRArgs == nil {
+		t.Error("ShipPullRequest not called (PR egress did not run)")
 	}
 }
 
