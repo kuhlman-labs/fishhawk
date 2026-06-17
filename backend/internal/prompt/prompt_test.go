@@ -2045,6 +2045,45 @@ func TestBuild_Plan_CrossSliceSeamGuidance(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_PerSliceCouplingGuidance is binding condition: the decomposer
+// prompt must carry the per-slice coupling rule (#1183) so each sub-plan's OWN
+// scope.files includes the coupled response-struct-plus-handler file (the
+// #1137 runResponse + handleGetRun case) instead of relying on a runtime
+// scope amendment. The behavioral assertion (rule renders on the PLAN prompt
+// and is ABSENT from the implement prompt, exercising the API-field-plus-
+// handler coupling shape) models the #1169 done-means-test rule: a comment-
+// only / no-op touch of prompt.go would fail it.
+func TestBuild_Plan_PerSliceCouplingGuidance(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 1183,
+		IssueTitle:  "Plan a decomposed change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Per-slice coupling rule",
+		"EACH sub-plan's OWN scope.files",
+		"runResponse struct + handleGetRun in backend/internal/server/runs.go",
+		"each slice must INCLUDE its own coupled definition file",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing per-slice-coupling guidance %q\n---\n%s", w, got)
+		}
+	}
+
+	// The rule is plan-stage only — it must not bleed into the implement prompt.
+	impl, err := Build("implement", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build implement: %v", err)
+	}
+	if strings.Contains(impl, "Per-slice coupling rule") {
+		t.Errorf("per-slice-coupling rule must not render in the implement prompt:\n%s", impl)
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_TestSweepCleanAndNil verifies the
 // "checked and clean" line for an empty-findings test sweep and the
 // additive property: a nil TestSweep omits the block entirely.
