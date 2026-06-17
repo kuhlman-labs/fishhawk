@@ -293,6 +293,122 @@ func (s *Server) mergeConditionScopeFiles(ctx context.Context, scopeFiles []scop
 	return s.foldScopePaths(ctx, scopeFiles, paths, "approval-condition")
 }
 
+// mergeApprovalConditionScopeFiles is the existence-checked variant of
+// mergeConditionScopeFiles used for the approval-conditions PROSE fold (#730).
+// It mirrors mergeConditionScopeFiles' empty-scope / nil-conditions guards,
+// then verifies each scraped repo-relative token actually EXISTS in the repo at
+// the run's base ref before folding it as a `modify` target
+// (dropNonexistentModifyTargets). A repo-relative-but-nonexistent token (an
+// illustrative path in the operator's reason, never a real file) is dropped
+// with a logged warning instead of folded — folding it would declare an
+// unsatisfiable scope.files entry the implement commit can never touch,
+// guaranteeing the runner's #1151/#1183 scope-completeness gate fails
+// category-B (#1191).
+//
+// This applies ONLY to the approval-conditions prose fold. The #824 structured
+// add_scope_files fold and the fixup-concern fold keep using
+// mergeConditionScopeFiles: their existence semantics are the PR branch (a
+// fixup may modify a file created earlier in the PR; add_scope_files may
+// intentionally declare a not-yet-existing create target), not the base branch.
+func (s *Server) mergeApprovalConditionScopeFiles(ctx context.Context, github issueGetter, installationID *int64, repo githubclient.RepoRef, ref string, refResolved bool, scopeFiles []scopeFile, conditions *string) []scopeFile {
+	if len(scopeFiles) == 0 || conditions == nil {
+		return scopeFiles
+	}
+	paths := extractScopePathsFromConditions(*conditions)
+	paths = s.dropNonexistentModifyTargets(ctx, github, installationID, repo, ref, refResolved, paths)
+	return s.foldScopePaths(ctx, scopeFiles, paths, "approval-condition")
+}
+
+// dropNonexistentModifyTargets filters a list of repo-relative candidate scope
+// paths down to those that demonstrably EXIST in the repo at ref, dropping (and
+// logging a warning for) any that return a definitive not-found (#1191).
+//
+// MANDATORY fail-OPEN-on-ambiguity (binding condition 2): a candidate is dropped
+// ONLY on a definitive `githubclient.ErrNotFound` against a SUCCESSFULLY
+// resolved repo AND ref. Every ambiguous path KEEPS the token (today's behavior
+// — never silently narrow scope): nil github client, nil installation id,
+// unparseable/empty repo ref, an unresolved base ref (refResolved == false), or
+// any non-not-found error (forbidden, transport, timeout). The check inherits
+// the request context deadline (binding condition 3) so a slow contents API
+// cannot stall prompt rendering. Returns the filtered slice in first-seen order.
+func (s *Server) dropNonexistentModifyTargets(ctx context.Context, github issueGetter, installationID *int64, repo githubclient.RepoRef, ref string, refResolved bool, paths []string) []string {
+	if len(paths) == 0 {
+		return paths
+	}
+	// Ambiguous-resolution guards: when we cannot confidently check existence,
+	// keep every token (fail open) rather than risk a false drop.
+	if github == nil || installationID == nil || repo.Owner == "" || repo.Name == "" || !refResolved {
+		return paths
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		_, err := github.GetFile(ctx, *installationID, repo, p, ref)
+		switch {
+		case err == nil:
+			// Exists at the resolved ref → fold it.
+			out = append(out, p)
+		case errors.Is(err, githubclient.ErrNotFound):
+			// Definitive not-found against a resolved repo+ref → drop.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: dropped non-existent approval-condition scope target",
+				slog.String("source", "approval-condition"),
+				slog.String("path", p),
+				slog.String("ref", ref),
+				slog.String("repo", repo.String()),
+			)
+		default:
+			// Any other error (forbidden, transport, timeout) is ambiguous —
+			// keep the token (fail open).
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: approval-condition existence check inconclusive; keeping path",
+				slog.String("source", "approval-condition"),
+				slog.String("path", p),
+				slog.String("ref", ref),
+				slog.String("repo", repo.String()),
+				slog.String("error", err.Error()),
+			)
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// resolveImplementBaseRef resolves the git ref to check approval-condition
+// scope candidates against, plus whether that resolution is confident enough to
+// drop a definitively-absent path (#1191 binding conditions 1+2).
+//
+// The run's ACTUAL implement base is the PR base ref when a PR already exists (a
+// follow-up / fix-up run may sit on a non-default branch); resolving it avoids
+// false-dropping a path that lives only on that base. The common
+// implement-dispatch case has no PR yet — the implement stage branches from the
+// repo default branch, which the contents API resolves for an EMPTY ref — so an
+// empty ref with refResolved=true is the deliberate default-branch check, NOT a
+// fail-open. Only when a PR exists but its base ref genuinely cannot be read
+// (nil client / installation, empty repo, GetPullRequest error, empty base ref)
+// do we return refResolved=false so the caller fails open rather than checking
+// the wrong (default) branch.
+func (s *Server) resolveImplementBaseRef(ctx context.Context, runRow *run.Run, installationID *int64, repo githubclient.RepoRef) (string, bool) {
+	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
+	if prNumber <= 0 {
+		// No PR yet → check against the repo default branch (empty ref). A
+		// definitive not-found there is trustworthy for the common case.
+		return "", true
+	}
+	if s.cfg.GitHub == nil || installationID == nil || repo.Owner == "" || repo.Name == "" {
+		return "", false
+	}
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, *installationID, repo, prNumber)
+	if err != nil || pr.BaseRef == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: resolve implement base ref failed; failing open on existence check",
+			slog.String("run_id", runRow.ID.String()),
+			slog.Int("pr_number", prNumber),
+		)
+		return "", false
+	}
+	return pr.BaseRef, true
+}
+
 // mergeStructuredScopeFiles folds the authoritative add_scope_files paths a
 // reviewer named at approval time (#824) into the implement stage's effective
 // scope set. Unlike mergeConditionScopeFiles it takes the structured slice
@@ -436,6 +552,12 @@ func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, pat
 type issueGetter interface {
 	GetIssue(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) (*githubclient.Issue, error)
 	ListIssueComments(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
+	// GetFile is consumed by the approval-condition existence check (#1191):
+	// a repo-relative token scraped from an operator's approve reason is folded
+	// as a `modify` scope target only when it actually exists in the repo at the
+	// run's base ref. *githubclient.Client already implements GetFile, so the
+	// production resolver satisfies this unchanged.
+	GetFile(ctx context.Context, installationID int64, repo githubclient.RepoRef, path, ref string) (*githubclient.FileContent, error)
 }
 
 // handleGetStagePrompt implements GET /v0/stages/{stage_id}/prompt.
@@ -578,9 +700,23 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		scopeFiles = s.mergeStructuredScopeFiles(r.Context(), scopeFiles, s.resolveApprovalAddScopeFiles(r.Context(), runRow))
 		// Fold files named by the approval conditions into the effective
 		// scope set so a condition-authorized edit ships as a declared
-		// path rather than benign scope_drift (#730). No-op when scope is
-		// empty (keeps the runner's git add -A fallback).
-		scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, trigger.ApprovalConditions)
+		// path rather than benign scope_drift (#730). Each scraped
+		// modify-target is verified to exist in the repo at the run's base
+		// ref before folding; a repo-relative-but-nonexistent token is
+		// dropped (logged warning) rather than folded as an unsatisfiable
+		// scope entry that guarantees a category-B subset-PR failure (#1191).
+		// Fails open on every ambiguous path. No-op when scope is empty
+		// (keeps the runner's git add -A fallback).
+		condRepo, condRepoErr := parseRepoOwnerName(runRow.Repo)
+		if condRepoErr != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"prompt: parse repo for approval-condition existence check failed; failing open",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("repo", runRow.Repo),
+				slog.String("error", condRepoErr.Error()))
+		}
+		condBaseRef, condBaseRefResolved := s.resolveImplementBaseRef(r.Context(), runRow, runRow.InstallationID, condRepo)
+		scopeFiles = s.mergeApprovalConditionScopeFiles(r.Context(), github, runRow.InstallationID, condRepo, condBaseRef, condBaseRefResolved, scopeFiles, trigger.ApprovalConditions)
 		// Fold the operator-approved mid-stage scope amendment paths (#961)
 		// into the effective scope so a stage restart or fix-up prompt
 		// carries the amended scope. No-op on an empty scope (keeps the
@@ -821,9 +957,23 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		scopeFiles = s.mergeStructuredScopeFiles(r.Context(), scopeFiles, s.resolveApprovalAddScopeFiles(r.Context(), runRow))
 		// Fold files named by the approval conditions into the effective
 		// scope set so a condition-authorized edit ships as a declared
-		// path rather than benign scope_drift (#730). No-op when scope is
-		// empty (keeps the runner's git add -A fallback).
-		scopeFiles = s.mergeConditionScopeFiles(r.Context(), scopeFiles, trigger.ApprovalConditions)
+		// path rather than benign scope_drift (#730). Each scraped
+		// modify-target is verified to exist in the repo at the run's base
+		// ref before folding; a repo-relative-but-nonexistent token is
+		// dropped (logged warning) rather than folded as an unsatisfiable
+		// scope entry that guarantees a category-B subset-PR failure (#1191).
+		// Fails open on every ambiguous path. No-op when scope is empty
+		// (keeps the runner's git add -A fallback).
+		condRepo, condRepoErr := parseRepoOwnerName(runRow.Repo)
+		if condRepoErr != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"prompt: parse repo for approval-condition existence check failed; failing open",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("repo", runRow.Repo),
+				slog.String("error", condRepoErr.Error()))
+		}
+		condBaseRef, condBaseRefResolved := s.resolveImplementBaseRef(r.Context(), runRow, runRow.InstallationID, condRepo)
+		scopeFiles = s.mergeApprovalConditionScopeFiles(r.Context(), github, runRow.InstallationID, condRepo, condBaseRef, condBaseRefResolved, scopeFiles, trigger.ApprovalConditions)
 		// Fold the operator-approved mid-stage scope amendment paths (#961),
 		// same derivation as the dispatch path so the rendered view matches.
 		scopeFiles = s.mergeApprovedScopeAmendments(r.Context(), scopeFiles, runRow.ID, stage.ID)

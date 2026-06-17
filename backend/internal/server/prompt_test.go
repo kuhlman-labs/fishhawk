@@ -225,6 +225,16 @@ type stubIssueGetter struct {
 	commentsGotInst int64
 	commentsGotRepo githubclient.RepoRef
 	commentsGotNum  int
+
+	// GetFile seam for the approval-condition existence check (#1191).
+	// notFoundPaths marks specific repo-relative paths as 404 → ErrNotFound;
+	// getFileErr forces a blanket non-not-found error (fail-open assertion).
+	// Every other path defaults to EXISTS so existing fold tests stay green.
+	// getFileCalledPaths records each requested path for assertion.
+	notFoundPaths      map[string]bool
+	getFileErr         error
+	getFileCalledPaths []string
+	getFileGotRef      string
 }
 
 func (s *stubIssueGetter) GetIssue(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
@@ -236,6 +246,24 @@ func (s *stubIssueGetter) GetIssue(_ context.Context, installationID int64, repo
 		return nil, s.getErr
 	}
 	return s.issue, nil
+}
+
+// GetFile satisfies issueGetter for the approval-condition existence check
+// (#1191). It defaults to reporting EXISTS (non-nil FileContent, nil error) so
+// handler-level fold tests that fold a real file stay green; a test opts a
+// specific path into not-found via notFoundPaths, or forces an ambiguous
+// (non-not-found) failure via getFileErr. Records every requested path and the
+// ref it was asked at.
+func (s *stubIssueGetter) GetFile(_ context.Context, installationID int64, repo githubclient.RepoRef, path, ref string) (*githubclient.FileContent, error) {
+	s.getFileCalledPaths = append(s.getFileCalledPaths, path)
+	s.getFileGotRef = ref
+	if s.getFileErr != nil {
+		return nil, s.getFileErr
+	}
+	if s.notFoundPaths[path] {
+		return nil, githubclient.ErrNotFound
+	}
+	return &githubclient.FileContent{Path: path}, nil
 }
 
 func (s *stubIssueGetter) ListIssueComments(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
@@ -3054,6 +3082,102 @@ func TestMergeConditionScopeFiles(t *testing.T) {
 	})
 }
 
+// TestMergeApprovalConditionScopeFiles is the done-means test for the #1191
+// existence-checked prose fold: a conditions string naming one EXISTING path
+// (folded as modify) and one NON-EXISTENT path (DROPPED, absent from result),
+// plus the MANDATORY fail-open guards (binding condition 2) where every
+// ambiguous resolution KEEPS the token: nil github, nil installation id, empty
+// repo ref, unresolved base ref, and a non-not-found GetFile error. It fails on
+// the pre-change code (which folds the non-existent token) and passes only when
+// the drop ships.
+func TestMergeApprovalConditionScopeFiles(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	strptr := func(v string) *string { return &v }
+	inst := int64(7)
+	repo := githubclient.RepoRef{Owner: "o", Name: "r"}
+	// One declared file, plus an approve reason naming an existing and a
+	// non-existent repo-relative token.
+	base := []scopeFile{{Path: "a/b.go", Operation: "modify"}}
+	const existPath = "pkg/real/exists.go"
+	const ghostPath = "pkg/ghost/missing.go"
+	conds := strptr("Also edit `" + existPath + "` and `" + ghostPath + "` per review.")
+
+	pathsOf := func(files []scopeFile) map[string]bool {
+		out := make(map[string]bool, len(files))
+		for _, f := range files {
+			out[f.Path] = true
+		}
+		return out
+	}
+
+	t.Run("existing path folded, non-existent path dropped", func(t *testing.T) {
+		gh := &stubIssueGetter{notFoundPaths: map[string]bool{ghostPath: true}}
+		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, repo, "", true, base, conds)
+		p := pathsOf(got)
+		if !p["a/b.go"] || !p[existPath] {
+			t.Errorf("declared + existing path must be present, got %#v", got)
+		}
+		if p[ghostPath] {
+			t.Errorf("non-existent path %q must be DROPPED, got %#v", ghostPath, got)
+		}
+	})
+
+	t.Run("nil github fails open (keeps both)", func(t *testing.T) {
+		got := s.mergeApprovalConditionScopeFiles(context.Background(), nil, &inst, repo, "", true, base, conds)
+		p := pathsOf(got)
+		if !p[existPath] || !p[ghostPath] {
+			t.Errorf("nil github must keep both paths (fail open), got %#v", got)
+		}
+	})
+
+	t.Run("nil installation id fails open (keeps both)", func(t *testing.T) {
+		gh := &stubIssueGetter{notFoundPaths: map[string]bool{ghostPath: true}}
+		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, nil, repo, "", true, base, conds)
+		p := pathsOf(got)
+		if !p[existPath] || !p[ghostPath] {
+			t.Errorf("nil installation id must keep both paths (fail open), got %#v", got)
+		}
+		if len(gh.getFileCalledPaths) != 0 {
+			t.Errorf("nil installation id must not call GetFile, got %v", gh.getFileCalledPaths)
+		}
+	})
+
+	t.Run("empty repo ref fails open (keeps both)", func(t *testing.T) {
+		gh := &stubIssueGetter{notFoundPaths: map[string]bool{ghostPath: true}}
+		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, githubclient.RepoRef{}, "", true, base, conds)
+		p := pathsOf(got)
+		if !p[existPath] || !p[ghostPath] {
+			t.Errorf("empty repo ref must keep both paths (fail open), got %#v", got)
+		}
+	})
+
+	t.Run("unresolved base ref fails open (keeps both)", func(t *testing.T) {
+		gh := &stubIssueGetter{notFoundPaths: map[string]bool{ghostPath: true}}
+		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, repo, "", false, base, conds)
+		p := pathsOf(got)
+		if !p[existPath] || !p[ghostPath] {
+			t.Errorf("unresolved base ref must keep both paths (fail open), got %#v", got)
+		}
+	})
+
+	t.Run("non-not-found GetFile error fails open (keeps both)", func(t *testing.T) {
+		gh := &stubIssueGetter{getFileErr: githubclient.ErrForbidden}
+		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, repo, "", true, base, conds)
+		p := pathsOf(got)
+		if !p[existPath] || !p[ghostPath] {
+			t.Errorf("non-not-found error must keep both paths (fail open), got %#v", got)
+		}
+	})
+
+	t.Run("non-default base ref is passed to the existence check", func(t *testing.T) {
+		gh := &stubIssueGetter{}
+		_ = s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, repo, "release/v2", true, base, conds)
+		if gh.getFileGotRef != "release/v2" {
+			t.Errorf("existence check ref = %q, want %q", gh.getFileGotRef, "release/v2")
+		}
+	})
+}
+
 // TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope crosses the full
 // audit-load -> resolveApprovalConditions -> mergeConditionScopeFiles ->
 // promptResponse.ScopeFiles seam (#730): an approved plan declares one scope
@@ -3185,6 +3309,105 @@ func TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope(t *testing.T) {
 			t.Errorf("plan-missing run must keep empty scope (git add -A fallback), got %#v", resp.ScopeFiles)
 		}
 	})
+}
+
+// TestGetStagePrompt_Implement_NonexistentConditionPathDropped crosses the same
+// audit-load -> resolveApprovalConditions -> mergeApprovalConditionScopeFiles ->
+// promptResponse.ScopeFiles seam as the #730 fold test, but reproduces run
+// 6b12fcb6 / #1183: the approve-with-conditions comment names a third
+// path-SHAPED token that does NOT exist in the repo. The rendered implement
+// prompt's scope_files must carry ONLY the two real planned files — the bogus
+// token dropped — proving the guaranteed category-B subset-PR failure is
+// averted (#1191). The two real files come straight from the plan scope, so
+// only the bogus condition token is routed through the existence check.
+func TestGetStagePrompt_Implement_NonexistentConditionPathDropped(t *testing.T) {
+	const realFileA = "backend/internal/server/prompt.go"
+	const realFileB = "backend/internal/server/runs.go"
+	// An illustrative, non-repo-relative-looking-but-shaped token of exactly
+	// the kind that wedged run 6b12fcb6 (#1183).
+	const bogusFile = "runResponse/handleGetRun-in-runs.go"
+
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: realFileA, Operation: plan.FileOpModify},
+				{Path: realFileB, Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+	}
+	inst := int64(99)
+	rr.getRuns[runID] = &run.Run{
+		ID:             runID,
+		Repo:           "o/r",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		InstallationID: &inst,
+	}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	condition := "Refine `" + realFileA + "` and verify the `" + bogusFile + "` shape (illustrative)."
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeApproveWithCommentEntry(runID, condition)},
+		}},
+	})
+	// The bogus token reports not-found; everything else (the existence check
+	// never sees the real planned files — they're already in scope) exists.
+	s.promptIssueGetterOverride = &stubIssueGetter{notFoundPaths: map[string]bool{bogusFile: true}}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := make(map[string]bool, len(resp.ScopeFiles))
+	for _, f := range resp.ScopeFiles {
+		got[f.Path] = true
+	}
+	for _, want := range []string{realFileA, realFileB} {
+		if !got[want] {
+			t.Errorf("resp.ScopeFiles missing real file %q; got %#v", want, resp.ScopeFiles)
+		}
+	}
+	if got[bogusFile] {
+		t.Errorf("non-existent condition token %q must be DROPPED from scope_files; got %#v", bogusFile, resp.ScopeFiles)
+	}
 }
 
 // makeStageRetriedEntry builds a stage_retried audit entry (#1176 fixture)
