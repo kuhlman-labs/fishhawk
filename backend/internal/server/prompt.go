@@ -285,7 +285,7 @@ func extractScopePathsFromConditions(text string) []string {
 //
 // This existence check applies ONLY to the approval-conditions prose fold. The
 // #824 structured add_scope_files fold (mergeStructuredScopeFiles) and the
-// fixup-concern fold (foldFixupScope) skip it deliberately: their
+// fixup-concern narrowing (narrowFixupScope) skip it deliberately: their
 // existence semantics are the PR branch (a fixup may modify a file created
 // earlier in the PR; add_scope_files may intentionally declare a
 // not-yet-existing create target), not the base branch.
@@ -424,7 +424,7 @@ func (s *Server) mergeApprovedScopeAmendments(ctx context.Context, scopeFiles []
 // authoritative).
 func (s *Server) resolveApprovedScopeAmendments(ctx context.Context, runID, stageID uuid.UUID) []string {
 	// Guard the unconfigured repo here (not only in mergeApprovedScopeAmendments)
-	// so foldFixupScope can call this directly on a server with no
+	// so narrowFixupScope can call this directly on a server with no
 	// ScopeAmendmentRepo wired without a nil deref (#1162).
 	if s.cfg.ScopeAmendmentRepo == nil {
 		return nil
@@ -488,7 +488,7 @@ func coupledTestSiblings(files []scopeFile) []string {
 // scope set with Operation=modify, dedups, and info-logs the additions. It is
 // the shared body behind mergeApprovalConditionScopeFiles (#730 prose fold),
 // mergeStructuredScopeFiles (#824 structured fold), mergeApprovedScopeAmendments
-// (#961), and foldFixupScope (#1162). Callers own the empty-scope and
+// (#961), and narrowFixupScope (#1162). Callers own the empty-scope and
 // empty-paths guards.
 func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, paths []string, source string) []scopeFile {
 	if len(paths) == 0 {
@@ -518,13 +518,15 @@ func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, pat
 	return scopeFiles
 }
 
-// foldFixupScope computes the effective scope for an implement-review fix-up
-// dispatch (#1162). It folds the routed concern surface INTO the inherited plan
-// scope so a concern-authorized edit ships as a declared path rather than
-// surfacing as benign scope_drift, while the plan's own scope files remain
-// present — a fix-up that, say, extracts a helper into a new file must still be
-// able to edit the plan-scope source it extracts FROM, so narrowing to only the
-// concern-named files would strand the edit. The folded surface is:
+// narrowFixupScope computes the effective scope for an implement-review fix-up
+// dispatch (#1162). It NARROWS the committed blast radius to ONLY the routed
+// concern surface: it builds a fresh scope set starting from an empty slice and
+// folds in just the concern-named paths (plus operator-declared creates and
+// approved amendments), so plan-scope files NOT named by a routed concern are
+// ABSENT from the fix-up scope. A stray edit to such a plan-only file then
+// surfaces as scope_drift rather than shipping silently — the enforcement
+// boundary of a fix-up is bounded to what the reviewer actually flagged. The
+// narrowed surface is:
 //   - the repo-relative paths the routed concerns reference, scraped from the
 //     joined concern notes via extractScopePathsFromConditions (planreview.Concern
 //     carries only a prose Note, no structured file field — the same regex the
@@ -541,21 +543,37 @@ func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, pat
 // silent-strip hole stays closed — an undeclared create still fails category-B
 // at the runner's created-out-of-scope gate (#818/#825).
 //
+// Empty-narrow fail-safe: if narrowing resolves to NOTHING (no concern note
+// names a repo-relative path, no allow_create, no approved amendment), fall back
+// to the inherited plan scope rather than emit an empty scope — an empty scope
+// drops the runner to its git add -A fallback (the BROADEST blast radius), the
+// opposite of narrowing. The fix-up then behaves as today (bounded to plan
+// scope) instead of unbounding it.
+//
 // An empty plan scope STAYS empty (a plan_missing_for_implement fix-up keeps the
 // runner's git add -A fallback; we do not synthesize a scope).
-func (s *Server) foldFixupScope(ctx context.Context, planScope []scopeFile, joinedConcernNotes string, allowCreate, amendmentPaths []string) []scopeFile {
+func (s *Server) narrowFixupScope(ctx context.Context, planScope []scopeFile, joinedConcernNotes string, allowCreate, amendmentPaths []string) []scopeFile {
 	if len(planScope) == 0 {
 		// Empty plan scope stays empty (keeps the runner's git add -A fallback).
 		return planScope
 	}
 	concernPaths := extractScopePathsFromConditions(joinedConcernNotes)
-	// Fold the routed concern surface INTO the inherited plan scope so the
-	// plan's own files remain declared alongside the concern-authorized paths.
-	scoped := s.foldScopePaths(ctx, planScope, concernPaths, "fixup-concern")
+	// Build a fresh scope set from an empty slice, folding in ONLY the concern
+	// surface — plan-scope files not named by a concern are deliberately excluded.
+	scoped := s.foldScopePaths(ctx, nil, concernPaths, "fixup-concern")
 	scoped = s.foldScopePaths(ctx, scoped, allowCreate, "fixup-allow-create")
 	scoped = s.foldScopePaths(ctx, scoped, amendmentPaths, "scope-amendment")
+	if len(scoped) == 0 {
+		// Empty-narrow fail-safe: nothing resolved to a declarable path; fall back
+		// to the inherited plan scope rather than an empty (git add -A) scope.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: fix-up scope narrowing produced no concern paths; falling back to plan scope",
+			slog.Int("plan_scope_count", len(planScope)),
+		)
+		return planScope
+	}
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-		"prompt: folded fix-up concern surface into the implement scope",
+		"prompt: narrowed fix-up scope to the routed concern surface",
 		slog.Int("scoped_count", len(scoped)),
 		slog.Int("plan_scope_count", len(planScope)),
 	)
@@ -742,18 +760,17 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		scopeFiles = s.mergeApprovedScopeAmendments(r.Context(), scopeFiles, runRow.ID, stage.ID)
 		// Fix-up pass (#762): when the operator routed implement-review
 		// concerns back to this stage, deliver them as binding instructions
-		// (reusing #558's framing) and fold the routed concern surface INTO the
-		// effective scope (#1162) — the files the routed concerns reference, the
-		// operator-declared net-new files (#823), and the stage's approved
-		// mid-pass scope amendments (#961) — alongside the inherited plan scope,
-		// so a concern-authorized edit ships as a declared path rather than
-		// benign scope_drift while the plan's own files (which the fix-up may
-		// still need to edit) remain in scope. An undeclared create still fails
-		// category-B at the runner's #818 gate. No-op for a normal (non-fix-up)
-		// implement dispatch.
+		// (reusing #558's framing) and NARROW the effective scope to ONLY the
+		// routed concern surface (#1162) — the files the routed concerns
+		// reference, the operator-declared net-new files (#823), and the stage's
+		// approved mid-pass scope amendments (#961) — so plan-scope files not
+		// named by a concern are absent and a stray edit to them surfaces as
+		// scope_drift rather than shipping silently. An undeclared create still
+		// fails category-B at the runner's #818 gate. No-op for a normal
+		// (non-fix-up) implement dispatch.
 		if rendered, joined := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
-			scopeFiles = s.foldFixupScope(r.Context(), scopeFiles, joined,
+			scopeFiles = s.narrowFixupScope(r.Context(), scopeFiles, joined,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
 			// Emit the fix-up routing flag (#784): point the runner at the
@@ -998,15 +1015,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		scopeFiles = s.mergeApprovedScopeAmendments(r.Context(), scopeFiles, runRow.ID, stage.ID)
 		// Fix-up pass (#762): when the operator routed implement-review
 		// concerns back to this stage, deliver them as binding instructions
-		// (reusing #558's framing) and fold the routed concern surface INTO the
-		// effective scope (#1162), identical derivation to the dispatch path so
-		// the rendered view matches byte-for-byte — the files the routed concerns
-		// reference, allow_create (#823), and the stage's approved mid-pass scope
-		// amendments (#961) — alongside the inherited plan scope. No-op for a
-		// normal (non-fix-up) implement dispatch.
+		// (reusing #558's framing) and NARROW the effective scope to ONLY the
+		// routed concern surface (#1162), identical derivation to the dispatch
+		// path so the rendered view matches byte-for-byte — the files the routed
+		// concerns reference, allow_create (#823), and the stage's approved
+		// mid-pass scope amendments (#961). No-op for a normal (non-fix-up)
+		// implement dispatch.
 		if rendered, joined := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
-			scopeFiles = s.foldFixupScope(r.Context(), scopeFiles, joined,
+			scopeFiles = s.narrowFixupScope(r.Context(), scopeFiles, joined,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
 			// Emit the fix-up routing flag (#784) so the rendered prompt view
@@ -1924,8 +1941,8 @@ func (s *Server) loadPriorSchemaValidationError(ctx context.Context, runID uuid.
 // Returns (nil, "") when the AuditRepo is unconfigured, the stage carries no
 // fix-up trigger (the common, non-fix-up case), or on any error — best-effort,
 // same WARN-and-proceed posture as the other prompt resolvers. The joined
-// string is the input to foldFixupScope (#1162) so a concern that names a
-// repo-relative file admits that path into the effective fix-up scope set.
+// string is the input to narrowFixupScope (#1162) so a concern that names a
+// repo-relative file admits that path into the narrowed fix-up scope set.
 func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.UUID) (rendered []string, joined string) {
 	if s.cfg.AuditRepo == nil {
 		return nil, ""
