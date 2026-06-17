@@ -1194,6 +1194,20 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				return exitFailure
 			}
 			issuedKey = key
+		} else {
+			// The fetch-prompt path already minted a key at stage start.
+			// A long stage (agent runtime + scope-amendment blocks +
+			// verify reinvokes) can outlive that key's TTL before this
+			// terminal upload, which would fail category-C and discard
+			// all completed work (#1182). Re-issue a fresh key here so
+			// the TTL clock restarts at egress time. Because trace,
+			// plan (uploadPlan), openPRAndShipArtifact (FetchInstallationToken
+			// + ShipPullRequest), and reportPullRequestFailure all read
+			// this same issuedKey, this single refresh at the top of the
+			// block covers every terminal signed-egress path. Best-effort:
+			// on a pre-0012 / transient failure the helper returns the
+			// existing start-of-stage key unchanged — never worse than before.
+			issuedKey = reissueSigningKeyForTerminalUpload(ctx, client, cfg, logSink, issuedKey)
 		}
 
 		// Ship raw first so the audit log records the unredacted
@@ -1502,6 +1516,43 @@ func issueSigningKey(ctx context.Context, client uploadClient, cfg config, logSi
 		issued.RunID, issued.ExpiresAt.Format(time.RFC3339),
 	)
 	return issued, nil
+}
+
+// reissueSigningKeyForTerminalUpload mints a FRESH signing key immediately
+// before the terminal signed-egress sequence (trace/plan/PR-artifact/
+// installation-token), so a stage whose wall-clock (agent runtime +
+// scope-amendment blocking waits + verify reinvokes + the upload itself)
+// outlives the start-of-stage key's TTL still signs its terminal uploads
+// with an unexpired key (#1182). The refreshed key's TTL clock starts at
+// issuance time, so its expiry comfortably exceeds the few seconds the
+// terminal uploads take.
+//
+// Multi-call safety: the backend's signing Issue is multi-call against
+// migration 0012+ (0012_signing_keys_allow_rotation appends a new row per
+// invocation) and Verify always uses the latest unexpired key, so a second
+// issuance before terminal egress is safe and authoritative — no 409 on a
+// 0012+ backend.
+//
+// Best-effort by design: on upload.ErrAlreadyIssued (a pre-0012 backend that
+// cannot multi-issue) or any other issuance error, it logs a
+// signing_key_refresh_degraded warning and returns the existing
+// start-of-stage key unchanged so the caller is never worse than the
+// pre-#1182 behavior. The caller assigns the return value to its shared
+// issued key unconditionally — a refresh failure is a no-op, not fatal.
+func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient, cfg config, logSink io.Writer, existing *upload.IssuedKey) *upload.IssuedKey {
+	issued, err := client.IssueKey(ctx, cfg.runID, 0)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"signing_key_refresh_degraded","run_id":%q,"detail":%q}`+"\n",
+			cfg.runID, err.Error(),
+		)
+		return existing
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"signing_key_refreshed","run_id":%q,"expires_at":%q}`+"\n",
+		issued.RunID, issued.ExpiresAt.Format(time.RFC3339),
+	)
+	return issued
 }
 
 // fetchPromptToFile pulls the constructed prompt from the backend,
