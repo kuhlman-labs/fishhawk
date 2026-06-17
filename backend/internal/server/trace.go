@@ -2836,6 +2836,7 @@ func gateEvidenceForReview(ev bundle.GateEvidence) *prompt.GateEvidence {
 			Outcome:       vr.Outcome,
 			OutputTail:    vr.OutputTail,
 			TailTruncated: vr.TailTruncated,
+			Superseded:    vr.Superseded,
 		})
 	}
 	if ev.VerifySummary != nil {

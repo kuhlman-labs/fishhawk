@@ -81,6 +81,14 @@ type verifyRunEvidence struct {
 	TreeSHA       string `json:"tree_sha,omitempty"`
 	OutputTail    string `json:"output_tail,omitempty"`
 	TailTruncated bool   `json:"tail_truncated,omitempty"`
+	// Superseded is true when a LATER verify_run iteration superseded this
+	// one in the verify-fix loop (#651/#800), so it is NOT the committed-tree
+	// result — the loop re-ran the SAME gate on a newer tree and only the
+	// LAST verify_run reflects the pushed/committed tree (it agrees with
+	// verify_summary.Outcome). The terminal (last) run is NEVER marked, so a
+	// genuine terminal failure stays a committed-tree blocker (#1205).
+	// Additive/omitempty: older bundles decode to false (not superseded).
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // verifySummaryEvidence mirrors the verify-fix loop's verify_summary
@@ -247,6 +255,20 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 			// #870 post-fix-loop re-emit supersedes the pre-reconcile diff.
 			n := w.NumFiles
 			payload.ScopeFacts.StagedFiles = &n
+		}
+	}
+
+	// Mark every verify_run EXCEPT the last as superseded (#1205). The
+	// verify-fix loop re-runs the SAME committed-tree gate per iteration; an
+	// earlier failing iteration that the loop then absorbed and re-ran green
+	// operates on a stale tree, so surfacing it as the committed-tree result
+	// false-rejects the review (run fa5a6416/#1199). Only the LAST verify_run
+	// reflects the pushed/committed tree and agrees with verify_summary.Outcome,
+	// so it is NEVER marked — a genuine terminal failure (including a
+	// budget-exhausted [fail,fail] loop) still surfaces as a blocker.
+	if len(payload.VerifyRuns) > 1 {
+		for i := 0; i < len(payload.VerifyRuns)-1; i++ {
+			payload.VerifyRuns[i].Superseded = true
 		}
 	}
 

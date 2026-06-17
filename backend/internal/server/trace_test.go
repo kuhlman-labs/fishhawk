@@ -2533,6 +2533,31 @@ func TestGateEvidenceForReview_MapsUndeclaredCategorized(t *testing.T) {
 	}
 }
 
+// TestGateEvidenceForReview_PropagatesSuperseded pins the bundle→prompt
+// mapping for the verify-run Superseded flag (#1205): the absorbed
+// (non-terminal) run crosses gateEvidenceForReview into prompt.GateVerifyRun
+// as Superseded=true and the terminal run as false, so the render can mark
+// only the absorbed iteration and the reviewer never reads it as a
+// committed-tree blocker.
+func TestGateEvidenceForReview_PropagatesSuperseded(t *testing.T) {
+	ev := bundle.GateEvidence{
+		VerifyRuns: []bundle.VerifyRunEvidence{
+			{Command: "scripts/test verify", ExitCode: 1, Outcome: "failed", Superseded: true},
+			{Command: "scripts/test verify", ExitCode: 0, Outcome: "passed", Superseded: false},
+		},
+	}
+	got := gateEvidenceForReview(ev)
+	if len(got.VerifyRuns) != 2 {
+		t.Fatalf("VerifyRuns = %d, want 2", len(got.VerifyRuns))
+	}
+	if !got.VerifyRuns[0].Superseded {
+		t.Error("VerifyRuns[0].Superseded = false, want true (absorbed run)")
+	}
+	if got.VerifyRuns[1].Superseded {
+		t.Error("VerifyRuns[1].Superseded = true, want false (terminal run)")
+	}
+}
+
 // cannedComparePatchClient builds a githubclient.Client whose compare
 // endpoint returns the given canned JSON, for the #1060 consolidated-review
 // dispatch tests.

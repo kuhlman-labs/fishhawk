@@ -707,6 +707,10 @@ func gateEvidenceLine(t *testing.T, seq int) Line {
 				"outcome":        "failed",
 				"output_tail":    "FAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/foo [build failed]",
 				"tail_truncated": true,
+				// Absorbed-then-passed iteration the verify-fix loop superseded
+				// (#1205); the `superseded` json tag is the runner↔backend wire
+				// contract pinned by the happy-path round-trip below.
+				"superseded": true,
 			},
 			{
 				"command":   "scripts/test",
@@ -780,8 +784,17 @@ func TestExtractGateEvidence_HappyPath(t *testing.T) {
 	if !vr.TailTruncated {
 		t.Error("verify run 0 TailTruncated = false, want true")
 	}
+	// Superseded round-trips across the JSONL wire (#1205): the absorbed
+	// run decodes true, the terminal run false — a silent zero here means the
+	// `superseded` json tag diverged from the runner composer.
+	if !vr.Superseded {
+		t.Error("verify run 0 Superseded = false, want true (absorbed iteration)")
+	}
 	if got.VerifyRuns[1].Outcome != "skipped" || got.VerifyRuns[1].OutputTail != "stage_scoped: worktree busy" {
 		t.Errorf("verify run 1 = %+v, want skipped with skip reason in tail", got.VerifyRuns[1])
+	}
+	if got.VerifyRuns[1].Superseded {
+		t.Error("verify run 1 Superseded = true, want false (terminal run)")
 	}
 	if got.VerifySummary == nil {
 		t.Fatal("VerifySummary = nil, want populated")

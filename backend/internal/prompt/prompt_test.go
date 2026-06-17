@@ -3056,6 +3056,12 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 		"you MAY shortcut the remaining review lenses",
 		"A SKIPPED verify run means compile/test state is UNVERIFIED",
 		"does NOT certify test quality",
+		// #1205: the rule is qualified to the TERMINAL (non-superseded) failed
+		// run / verify_summary=failed, and a SUPERSEDED run is explicitly not a
+		// committed-tree blocker.
+		"A TERMINAL (non-superseded) FAILED verify run",
+		"verify_summary outcome of `failed`",
+		"its failure MUST NOT be treated as a committed-tree blocker",
 		// Verify run facts including the bounded failing tail (with its
 		// truncation marker) and the skip reason.
 		"- command: scripts/test",
@@ -3088,6 +3094,56 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 	// build truth the gates already knew.
 	if strings.Contains(got, "Mechanical correctness is already gated upstream") {
 		t.Errorf("evidence-present prompt must not assert unconditional upstream gating:\n%s", got)
+	}
+	// Neither run in this fixture is superseded, so the per-run SUPERSEDED
+	// marker must NOT appear — only an absorbed iteration carries it (#1205).
+	if strings.Contains(got, "— SUPERSEDED (absorbed by the verify-fix loop") {
+		t.Errorf("no run is superseded here; SUPERSEDED marker must be absent:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_GateEvidence_AbsorbedThenPassed(t *testing.T) {
+	// #1205 end-to-end render: a verify-fix loop that absorbed a first failing
+	// iteration and re-ran green. The absorbed (superseded) run must carry the
+	// SUPERSEDED marker, the terminal run must NOT, the verify_summary reads
+	// passed, and the qualified binding rule must make clear an absorbed
+	// iteration is not a committed-tree blocker — so the reviewer does not
+	// false-reject HIGH on the absorbed failure (run fa5a6416/#1199).
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			VerifyRuns: []GateVerifyRun{
+				{Command: "scripts/test verify", ExitCode: 1, Outcome: "failed",
+					OutputTail: "FAIL [build failed]", Superseded: true},
+				{Command: "scripts/test verify", ExitCode: 0, Outcome: "passed",
+					OutputTail: "ok", Superseded: false},
+			},
+			VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 2, MaxIterations: 3},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		// The absorbed run carries the SUPERSEDED marker on its outcome line.
+		"outcome: failed (exit code 1) — SUPERSEDED (absorbed by the verify-fix loop; NOT the committed-tree result; see verify summary below)",
+		// The terminal run reads passed with NO marker.
+		"outcome: passed (exit code 0)\n",
+		// The verify_summary (authoritative for the committed tree) reads passed.
+		"Verify summary: outcome=passed (iterations 2/3)",
+		// The qualified binding rule.
+		"A TERMINAL (non-superseded) FAILED verify run",
+		"its failure MUST NOT be treated as a committed-tree blocker",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("absorbed-then-passed prompt missing %q:\n%s", w, got)
+		}
+	}
+	// The terminal passed run must not be marked superseded.
+	if strings.Contains(got, "outcome: passed (exit code 0) — SUPERSEDED") {
+		t.Errorf("terminal passed run must not carry the SUPERSEDED marker:\n%s", got)
 	}
 }
 
