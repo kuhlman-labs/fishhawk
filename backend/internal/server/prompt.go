@@ -562,6 +562,15 @@ func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, pat
 //     #818 created-out-of-scope gate stages them rather than failing category-B,
 //   - the stage's operator-approved mid-pass scope amendments (#961).
 //
+// On the non-empty narrowed path, the surface ADDITIONALLY includes the coupled
+// *_test.go stem-sibling of each narrowed source file (#1214), mirroring
+// resolveDecomposedScopeFiles (#1083): a fix-up whose routed concern names only
+// the production file (e.g. main.go) still lands the agent's sibling test
+// (main_test.go) in the same commit instead of having it stripped as
+// scope_drift and pushed to a follow-up. The sibling fold runs only on the
+// non-empty narrowed path, so the empty-narrow fail-safe below is unchanged
+// (siblings of an empty set are empty).
+//
 // A created file NOT declared via allow_create (or named by an approved
 // amendment) is still absent from the effective scope, so the #818
 // silent-strip hole stays closed — an undeclared create still fails category-B
@@ -596,6 +605,16 @@ func (s *Server) narrowFixupScope(ctx context.Context, planScope []scopeFile, jo
 		)
 		return planScope
 	}
+	// Fold the coupled stem-sibling *_test.go for each narrowed source file into
+	// the scope so a fix-up's "fix + test" pass lands the sibling test in the
+	// same commit instead of having it stripped as scope_drift (#1214). Mirrors
+	// resolveDecomposedScopeFiles (#1083) — the runner's narrowed slice
+	// auto-folds coupled tests for the identical "fix and test must land
+	// together" reason. Runs only on the non-empty narrowed path, so the
+	// empty-narrow fail-safe above is untouched (siblings of an empty set are
+	// empty anyway). foldScopePaths dedups an already-scoped sibling and defaults
+	// net-new ones to operation=modify.
+	scoped = s.foldScopePaths(ctx, scoped, coupledTestSiblings(scoped), "fixup-coupled-test-sibling")
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 		"prompt: narrowed fix-up scope to the routed concern surface",
 		slog.Int("scoped_count", len(scoped)),
