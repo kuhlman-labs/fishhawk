@@ -5643,6 +5643,100 @@ func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeSucceeds(t *testing.T) {
 	}
 }
 
+// TestRun_ImplementStage_BaseRebaseConflict_Reinvoke_ReloadsExemptions is the
+// #1153 fail-closed-freshness regression for the base-rebase re-invoke path: a
+// SECOND agent invocation within the SAME stage must NOT inherit attempt 1's
+// validated self-exemptions. Attempt 1's agent writes a valid exemption sidecar
+// (loaded + consumed before the first push); the push fails ErrBaseRebaseConflict;
+// the re-invoked agent writes a DIFFERENT (here: stale-keyed) sidecar. The runner
+// must re-derive the exemptions from the re-invoked agent's sidecar before the
+// retried push, re-validating it fail-closed — so the stale sidecar is rejected
+// and the post-reinvoke scope gate reverts to strict rather than silently reusing
+// attempt 1's exemption. Proven by the scope_justification_stale log, which only
+// the post-reinvoke reload can emit (attempt 1 read a valid, matching sidecar).
+func TestRun_ImplementStage_BaseRebaseConflict_Reinvoke_ReloadsExemptions(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	const (
+		runID   = "11111111-2222-3333-4444-555555555555"
+		stageID = "22222222-3333-4444-5555-666666666666"
+	)
+	// Redirect the sidecar dir so the agent fakes and run() share one keyed path.
+	dir := t.TempDir()
+	origDir := scopeJustificationDir
+	scopeJustificationDir = dir
+	t.Cleanup(func() { scopeJustificationDir = origDir })
+	sidecarPath := scopeJustificationPath(runID, stageID)
+
+	fi := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(callIdx int, _ agent.Invocation) {
+			if callIdx == 0 {
+				// Attempt 1's agent justifies the lone declared shortfall — a valid,
+				// matching, concretely-declared sidecar the first load consumes.
+				if werr := os.WriteFile(sidecarPath, []byte(fmt.Sprintf(
+					`{"run_id":%q,"stage_id":%q,"exemptions":[{"path":"a.go","reason":"already correct"}]}`,
+					runID, stageID)), 0o600); werr != nil {
+					t.Fatal(werr)
+				}
+				return
+			}
+			// The re-invoked agent writes a STALE-keyed sidecar; the runner's
+			// post-reinvoke reload must re-validate it fail-closed (reject it),
+			// never carry attempt 1's exemption into the retried push.
+			if werr := os.WriteFile(sidecarPath, []byte(
+				`{"run_id":"OTHER","stage_id":"OTHER","exemptions":[{"path":"a.go","reason":"stale"}]}`), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+		},
+	}
+	withFakeInvoker(t, fi)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    stageID,
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+		ScopeFiles: []upload.ScopeFile{{Path: "a.go", Operation: "modify"}},
+	}
+	withFakeUploader(t, fu)
+
+	fp := &fakePusher{errSeq: []error{gitops.ErrBaseRebaseConflict, nil}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fi.callIdx != 2 {
+		t.Errorf("invoker called %d times, want 2 (base invoke + one re-invoke)", fi.callIdx)
+	}
+	if fp.calls != 2 {
+		t.Errorf("CommitAndPush called %d times, want 2 (conflict + retry)", fp.calls)
+	}
+	// The post-reinvoke reload re-read AND re-validated the re-invoked agent's
+	// sidecar fail-closed: the stale-keyed sidecar is rejected, so attempt 1's
+	// exemption can never carry into the retried push's scope gate. This line is
+	// emitted ONLY by that reload — absent if the retry reused the old set.
+	if !strings.Contains(stderr.String(), `"event":"scope_justification_stale"`) {
+		t.Errorf("expected the post-reinvoke reload to re-validate (and reject) the re-invoked agent's stale sidecar:\n%s", stderr.String())
+	}
+	// The re-invoked agent's sidecar must be consumed by the reload, never left
+	// behind to bleed into a later read (binding condition 4).
+	if _, serr := os.Stat(sidecarPath); !os.IsNotExist(serr) {
+		t.Errorf("re-invoked agent's sidecar must be consumed by the reload, stat err = %v", serr)
+	}
+}
+
 // TestRun_ImplementStage_Fixup_BaseRebaseConflict_NoReinvoke pins the #989
 // fix-up exclusion: a fix-up pass hitting the same conflict error must NOT
 // re-invoke the agent — it keeps the existing immediate category-B failure

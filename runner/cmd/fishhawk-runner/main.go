@@ -1467,7 +1467,26 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// reaches origin (#969 stamps the re-verified tree).
 			if prErr != nil && errors.Is(prErr, gitops.ErrBaseRebaseConflict) &&
 				(willOpenPR || willPushChild) {
+				// Fail-closed exemption freshness across the re-invoke (#1153). The
+				// base-rebase re-invoke runs a SECOND agent within this stage, so
+				// attempt 1's validatedExemptions (loaded + consumed at run() line
+				// ~1172) must NOT shape the post-reinvoke scope-completeness gate.
+				// Sweep any leftover sidecar before the re-invoke and re-derive the
+				// exemptions from whatever the re-invoked agent writes AFTER it — nil
+				// when it justifies nothing, which restores the strict gate. Gated to
+				// the open-PR path: only it runs the gate with exemptions (decomposed
+				// children are isDecomposed-excluded and carry an empty set). The trace
+				// bundle — and its gate_evidence scope_files_exempted fold — already
+				// shipped above (#742 forward gating), so this re-emits NO event
+				// (binding condition 1's single-emission holds); the reload feeds the
+				// enforcement gate only.
+				if willOpenPR {
+					sweepStaleScopeJustification(cfg, logSink)
+				}
 				if rerr := reinvokeOnBaseRebaseConflict(ctx, cfg, invoker, inv, &res, prErr, logSink); rerr == nil {
+					if willOpenPR {
+						validatedExemptions = loadScopeExemptions(cfg, scopePaths(cfg.scopeFiles), logSink)
+					}
 					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, validatedExemptions)
 				} else {
 					// Re-invoke infra exhaustion (or checkout failure): log and
