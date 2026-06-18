@@ -534,6 +534,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// invariant. Hoisted here (was a gate-region local) so the #1165 apply
 		// block, which runs its verify gate before the agent loop, can set it.
 		verifiedTreeSHA string
+		// applyPath is the near-deterministic fix-up apply provenance (#1165):
+		// "agent" (default — no apply-list served / agent re-derived), "applied"
+		// (deterministic git-apply, no agent), "apply_failed_fellback" (apply-list
+		// served, apply/gate failed, reset cleanly, agent ran), or
+		// "apply_failed_reset_failed". Hoisted here (was a fixup-dispatch local)
+		// so openPRAndShipArtifact's fixup_pushed report can carry it onto the
+		// audit entry. Default "agent" for non-fix-up paths, which never reach the
+		// fixup_pushed report, so the value is unused there (omitempty drops it).
+		applyPath = "agent"
 		// fixupApplyEvents carries the #1165 deterministic-apply trace (apply +
 		// verify-gate events, plus the scope-only git_diff on a clean apply).
 		// Collected before the agent loop but appended to res.Events AFTER it,
@@ -721,8 +730,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// path runs. The default "agent" stands when no apply-list was served (a
 		// non-mechanical / mixed fix-up) or no verify gate is configured (we
 		// cannot confirm the apply, so we conservatively re-derive with the
-		// agent). Provenance is recorded in the trace bundle below.
-		applyPath := "agent"
+		// agent). Provenance is recorded in the trace bundle below and (since
+		// #1213) on the fixup_pushed audit entry via the hoisted applyPath.
 		if len(fixupApplyPatches) > 0 && cfg.verifyCmd != "" && !cfg.noPR {
 			ok, tree, evs, ap := attemptDeterministicFixup(ctx, cfg, fixupApplyPatches, tipSHA, logSink)
 			fixupApplyEvents = evs
@@ -759,13 +768,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// Record the fix-up apply provenance (#1165) in the trace bundle for every
 		// fix-up dispatch — "applied" (deterministic git-apply, no agent), "agent"
 		// (no apply-list served, the agent re-derived), or "apply_failed_fellback"
-		// (an apply-list was served but reset + the agent ran). The runtime value
-		// is deliberately NOT sent on the fixup_pushed report: the backend's
-		// /pull-request handler uses DisallowUnknownFields, so an unknown body
-		// field would 400 and break the report. Persisting this discriminator onto
-		// the fixup_pushed AUDIT entry is a follow-up gated on succeedFixupPushStage
-		// (backend/internal/server/pullrequest.go), out of this slice's scope; the
-		// trace bundle is the durable in-scope provenance until then.
+		// (an apply-list was served but reset + the agent ran). Since #1213 the same
+		// runtime value is ALSO threaded onto the fixup_pushed /pull-request report
+		// (openPRAndShipArtifact's ShipPullRequestArgs.ApplyPath) and persisted onto
+		// the fixup_pushed AUDIT entry by succeedFixupPushStage — the backend's
+		// pullRequestBody now declares apply_path as an omitempty field, so the
+		// DisallowUnknownFields decoder accepts it. The trace bundle event remains
+		// the in-trace provenance for the apply-attempt timeline.
 		fixupApplyEvents = append(fixupApplyEvents, agent.Event{
 			Kind:    "fixup_apply_path",
 			Payload: agent.MakePayload(map[string]any{"apply_path": applyPath}),
@@ -1406,7 +1415,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, bindingAssertions)
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions)
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
@@ -1425,7 +1434,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			if prErr != nil && errors.Is(prErr, gitops.ErrBaseRebaseConflict) &&
 				(willOpenPR || willPushChild) {
 				if rerr := reinvokeOnBaseRebaseConflict(ctx, cfg, invoker, inv, &res, prErr, logSink); rerr == nil {
-					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, bindingAssertions)
+					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions)
 				} else {
 					// Re-invoke infra exhaustion (or checkout failure): log and
 					// fall through to the unchanged category-B failure path
@@ -3937,7 +3946,7 @@ func resolveImplementBranchRouting(ctx context.Context, cfg config, repoDir, bas
 // enforces the verified-SHA invariant (#960) against it — see the closure
 // below. Empty disables the check (no committed-tree gate ran: plan stage,
 // --no-pr, verifyCmd unset, or gate skipped).
-func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, bindingAssertions []upload.BindingAssertion) error {
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, applyPath string, bindingAssertions []upload.BindingAssertion) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -4524,6 +4533,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			HeadSHA:           cap.HeadSHA,
 			BaseSHA:           cap.BaseSHA,
 			FilesChangedCount: filesChanged,
+			ApplyPath:         applyPath,
 		}); err != nil {
 			return fmt.Errorf("report fix-up push: %w", err)
 		}

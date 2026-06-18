@@ -739,6 +739,16 @@ type ShipPullRequestArgs struct {
 	HeadSHA           string
 	BaseSHA           string
 	FilesChangedCount int
+
+	// ApplyPath carries the near-deterministic fix-up apply provenance (#1165)
+	// for the Outcome=="fixup_pushed" report: "applied" (a clean git-apply of
+	// every routed concern's suggested_patch, no agent), "agent" (no apply-list
+	// served / fell back to the agent), "apply_failed_fellback" (an apply-list
+	// was served, the apply or its verify gate failed, the worktree reset
+	// cleanly, and the agent re-derived), or "apply_failed_reset_failed". Only
+	// the fixup_pushed report populates it; with the json omitempty tag below the
+	// "pushed" child-push and "fixup_no_changes" bodies stay byte-identical.
+	ApplyPath string
 }
 
 // pullRequestFailureBody is the failure-report wire shape ShipPullRequest
@@ -764,6 +774,10 @@ type pullRequestChildPushBody struct {
 	HeadSHA           string `json:"head_sha"`
 	BaseSHA           string `json:"base_sha"`
 	FilesChangedCount int    `json:"files_changed_count"`
+	// ApplyPath is the fix-up apply provenance (#1165), populated only on the
+	// "fixup_pushed" report. omitempty keeps the "pushed" child-push and
+	// "fixup_no_changes" bodies byte-identical when it is unset.
+	ApplyPath string `json:"apply_path,omitempty"`
 }
 
 // ShipPullRequestResult is what the backend echoes back. Idempotent
@@ -821,6 +835,7 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			HeadSHA:           args.HeadSHA,
 			BaseSHA:           args.BaseSHA,
 			FilesChangedCount: args.FilesChangedCount,
+			ApplyPath:         args.ApplyPath,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request push body: %w", err)

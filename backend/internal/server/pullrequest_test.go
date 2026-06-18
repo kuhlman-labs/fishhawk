@@ -602,6 +602,103 @@ func TestShipPullRequest_FixupPushOutcome_DrivesTerminal(t *testing.T) {
 	}
 }
 
+// fixupPushedPayload pulls the apply_path out of the single fixup_pushed audit
+// entry's payload; ok reports whether the key was present at all.
+func fixupPushedApplyPath(t *testing.T, au *auditFake) (value string, present bool) {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category != "fixup_pushed" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal fixup_pushed payload: %v", err)
+		}
+		v, ok := payload["apply_path"]
+		if !ok {
+			return "", false
+		}
+		s, _ := v.(string)
+		return s, true
+	}
+	t.Fatal("no fixup_pushed audit entry recorded")
+	return "", false
+}
+
+// TestShipPullRequest_FixupPushOutcome_PersistsApplyPath pins the #1165/#1213
+// apply-provenance persist: a fixup_pushed report carrying a recognized
+// apply_path records it onto the fixup_pushed audit entry, so an operator can see
+// whether the fix-up collapsed to a deterministic git-apply or fell back to the
+// agent.
+func TestShipPullRequest_FixupPushOutcome_PersistsApplyPath(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"head_sha":            "head-abc",
+		"base_sha":            "base-def",
+		"files_changed_count": 2,
+		"apply_path":          "applied",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	value, present := fixupPushedApplyPath(t, au)
+	if !present {
+		t.Fatal("fixup_pushed audit entry missing apply_path despite a reported value")
+	}
+	if value != "applied" {
+		t.Errorf("apply_path = %q, want applied", value)
+	}
+}
+
+// TestShipPullRequest_FixupPushOutcome_OmitsAbsentApplyPath asserts the inverse:
+// a fixup_pushed report with NO apply_path (an older runner, or the
+// fixup_no_changes shape promoted) leaves the key off the audit entry rather than
+// persisting an empty discriminator.
+func TestShipPullRequest_FixupPushOutcome_OmitsAbsentApplyPath(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"head_sha":            "head-abc",
+		"base_sha":            "base-def",
+		"files_changed_count": 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	if _, present := fixupPushedApplyPath(t, au); present {
+		t.Error("fixup_pushed audit entry must omit apply_path when the report carries none")
+	}
+}
+
 // TestShipPullRequest_FixupPushOutcome_IsIdempotent pins the #794 guard
 // (mirroring #776 for child push): a runner retry or duplicate delivery of an
 // identical fixup_pushed report must NOT append a second fixup_pushed audit
