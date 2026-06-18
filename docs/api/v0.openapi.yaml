@@ -577,7 +577,7 @@ components:
     RunConcernItem:
       type: object
       description: One open review concern.
-      required: [id, stage_kind, severity, category, state]
+      required: [id, stage_kind, severity, category, state, has_suggested_patch]
       properties:
         id:
           $ref: '#/components/schemas/UUID'
@@ -608,6 +608,14 @@ components:
             operator-reachable via `POST /v0/concerns/{concern_id}/waive`
             (#984); `addressed`/`reopened`/`superseded` are reached by
             reviewer `concern_resolutions` on a re-review.
+        has_suggested_patch:
+          type: boolean
+          description: |
+            Whether the reviewer attached a mechanical `suggested_patch`
+            (a unified diff) to this concern (#1165). Only the boolean is
+            surfaced — the diff text stays elided like the note. A routed
+            fix-up whose concerns all carry a patch can be resolved by the
+            near-deterministic apply path instead of a full agent loop.
 
     RunNextAction:
       type: object

@@ -4,9 +4,9 @@
 -- name: InsertReviewConcern :one
 INSERT INTO review_concerns (
     id, run_id, stage_id, stage_kind, origin_review_sequence,
-    reviewer_model, severity, category, note
+    reviewer_model, severity, category, note, suggested_patch
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING *;
 
 -- name: GetReviewConcernsByIDs :many

@@ -39,6 +39,15 @@ type Concern struct {
 	Severity ConcernSeverity `json:"severity"`
 	Category string          `json:"category"`
 	Note     string          `json:"note"`
+
+	// SuggestedPatch optionally carries a unified diff that applies to the
+	// PR branch and mechanically resolves the concern (E22.X / #1165).
+	// Implement reviewers populate it ONLY for mechanical concerns whose
+	// fix is a small self-contained diff; it is the input to the
+	// near-deterministic fix-up apply path. omitempty keeps reviewer
+	// output predating the field byte-identical, and encoding/json ignores
+	// the absent member in both directions so old verdicts decode unchanged.
+	SuggestedPatch string `json:"suggested_patch,omitempty"`
 }
 
 // Usage is the token usage a reviewer backend reports for one review

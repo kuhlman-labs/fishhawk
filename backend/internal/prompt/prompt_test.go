@@ -2815,6 +2815,44 @@ func TestBuild_ImplementReview_OrthogonalLenses(t *testing.T) {
 	}
 }
 
+func TestBuild_ImplementReview_SuggestedPatch_MechanicalOnly(t *testing.T) {
+	// #1165: the implement-review verdict schema offers an optional
+	// suggested_patch member on each concern, with binding guidance that it
+	// is populated ONLY for mechanical concerns whose fix is a small,
+	// self-contained diff.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		// The schema member itself.
+		`"suggested_patch": "<optional unified diff that applies to the PR branch>"`,
+		// The mechanical-only guidance.
+		"Populate `suggested_patch` ONLY for a mechanical concern",
+		"small, self-contained",
+		"leave it absent",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+
+	// buildPlanReview is unchanged — plan-review concerns are about the plan
+	// artifact, not code, so the schema must NOT offer suggested_patch.
+	planGot := buildPlanReview(Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+	})
+	if strings.Contains(planGot, "suggested_patch") {
+		t.Errorf("plan_review prompt must NOT mention suggested_patch:\n%s", planGot)
+	}
+}
+
 func TestBuild_ImplementReview_ScopeDrift_RendersSection(t *testing.T) {
 	// #695: when the trace handler threads runner-reported scope_drift paths
 	// onto the Trigger, the implement-review prompt names them flagged

@@ -148,8 +148,13 @@ type Concern struct {
 	Note                 string
 	State                State
 	StateReason          string
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// SuggestedPatch is the reviewer-emitted unified diff that mechanically
+	// resolves the concern (#1165), empty when the reviewer left it absent.
+	// Persisted verbatim; it is the input to the near-deterministic fix-up
+	// apply path.
+	SuggestedPatch string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // RaisedConcern is one concern as decoded from a review verdict, before
@@ -159,6 +164,9 @@ type RaisedConcern struct {
 	Severity string
 	Category string
 	Note     string
+	// SuggestedPatch is the reviewer-emitted unified diff carried through
+	// from the decoded verdict (#1165); empty when absent.
+	SuggestedPatch string
 }
 
 // InsertRaisedParams bundles the inputs to InsertRaised: every concern

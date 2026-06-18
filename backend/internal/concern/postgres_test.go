@@ -168,6 +168,58 @@ func TestPostgres_InsertRaised_RoundTrips(t *testing.T) {
 	}
 }
 
+// TestPostgres_SuggestedPatch_RoundTrips covers the #1165 additive column:
+// a concern inserted WITH a suggested_patch returns it verbatim through
+// GetByIDs and ListByRun, and a concern inserted WITHOUT one defaults to the
+// empty string (the column is NOT NULL with an empty-string default) rather
+// than erroring or returning NULL.
+func TestPostgres_SuggestedPatch_RoundTrips(t *testing.T) {
+	h := newHarness(t)
+	const patch = "--- a/foo.go\n+++ b/foo.go\n@@ -1 +1 @@\n-x\n+y\n"
+	rows := h.insert(t, 9,
+		concern.RaisedConcern{Severity: "low", Category: "correctness", Note: "typo", SuggestedPatch: patch},
+		concern.RaisedConcern{Severity: "medium", Category: "scope", Note: "no patch"},
+	)
+	if len(rows) != 2 {
+		t.Fatalf("len = %d, want 2", len(rows))
+	}
+	if rows[0].SuggestedPatch != patch {
+		t.Errorf("InsertRaised[0].SuggestedPatch = %q, want %q verbatim", rows[0].SuggestedPatch, patch)
+	}
+	if rows[1].SuggestedPatch != "" {
+		t.Errorf("InsertRaised[1].SuggestedPatch = %q, want empty default", rows[1].SuggestedPatch)
+	}
+
+	got, err := h.repo.GetByIDs(context.Background(), []uuid.UUID{rows[0].ID, rows[1].ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	if got[0].SuggestedPatch != patch {
+		t.Errorf("GetByIDs[0].SuggestedPatch = %q, want %q verbatim", got[0].SuggestedPatch, patch)
+	}
+	if got[1].SuggestedPatch != "" {
+		t.Errorf("GetByIDs[1].SuggestedPatch = %q, want empty default", got[1].SuggestedPatch)
+	}
+
+	all, err := h.repo.ListByRun(context.Background(), h.runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("ListByRun len = %d, want 2", len(all))
+	}
+	byID := make(map[uuid.UUID]string, 2)
+	for _, c := range all {
+		byID[c.ID] = c.SuggestedPatch
+	}
+	if byID[rows[0].ID] != patch {
+		t.Errorf("ListByRun patch row SuggestedPatch = %q, want %q verbatim", byID[rows[0].ID], patch)
+	}
+	if byID[rows[1].ID] != "" {
+		t.Errorf("ListByRun no-patch row SuggestedPatch = %q, want empty default", byID[rows[1].ID])
+	}
+}
+
 func TestPostgres_GetByIDs_InputOrderAndNotFound(t *testing.T) {
 	h := newHarness(t)
 	a := h.insert(t, 1)[0]

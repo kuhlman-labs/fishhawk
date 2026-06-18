@@ -1665,7 +1665,8 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("    {\n")
 	b.WriteString("      \"severity\": \"high\" | \"medium\" | \"low\",\n")
 	b.WriteString("      \"category\": \"<short classifier, e.g. scope | correctness | regression | verification>\",\n")
-	b.WriteString("      \"note\": \"<free-form explanation of the concern>\"\n")
+	b.WriteString("      \"note\": \"<free-form explanation of the concern>\",\n")
+	b.WriteString("      \"suggested_patch\": \"<optional unified diff that applies to the PR branch>\"\n")
 	b.WriteString("    }\n")
 	b.WriteString("  ],\n")
 	if len(t.PriorConcerns) > 0 {
@@ -1679,6 +1680,9 @@ func buildImplementReview(t Trigger) string {
 	}
 	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
 	b.WriteString("}\n\n")
+	b.WriteString("Populate `suggested_patch` ONLY for a mechanical concern whose fix is a small, self-contained " +
+		"unified diff that applies cleanly to the PR branch (a missing nil-check, a typo, a one-line guard); " +
+		"leave it absent for any concern whose resolution needs judgement or touches multiple call sites.\n\n")
 
 	// Review criteria — what the agent should assess. The lens is aimed at
 	// what the deterministic gates CANNOT see (#703); see the non-goals below.
