@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -685,14 +686,7 @@ func runServe(args []string, logSink io.Writer) int {
 	// awaiting_children. Either being nil disables the fanout
 	// silently — the parent's implement stage dispatches as today.
 	if cfg.RunRepo != nil {
-		cfg.Orchestrator = &orchestrator.Orchestrator{
-			Runs:                cfg.RunRepo,
-			GitHub:              cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
-			Logger:              logger,
-			Artifacts:           cfg.ArtifactRepo,
-			Audit:               cfg.AuditRepo,
-			MaxParallelChildren: cfg.MaxParallelChildren,
-		}
+		cfg.Orchestrator = newStageOrchestrator(cfg, logger)
 		logger.Info("stage orchestrator configured")
 	}
 
@@ -999,14 +993,7 @@ func runServe(args []string, logSink io.Writer) int {
 		case cfg.Orchestrator == nil:
 			logger.Warn("--enable-child-completion-sweeper set but Orchestrator unconfigured; sweeper not started")
 		default:
-			sweeper := &childcompletion.Sweeper{
-				Runs:      cfg.RunRepo,
-				Audit:     cfg.AuditRepo,
-				Advance:   childCompletionAdvancer{cfg.Orchestrator},
-				Integrate: childCompletionAdvancer{cfg.Orchestrator},
-				Logger:    logger,
-				Interval:  *childCompletionInterval,
-			}
+			sweeper := newChildCompletionSweeper(cfg, logger, *childCompletionInterval)
 			go func() {
 				if err := sweeper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 					logger.Error("child-completion sweeper exited with error", slog.String("error", err.Error()))
@@ -1156,6 +1143,54 @@ func (a childCompletionAdvancer) IntegrateSlices(ctx context.Context, parentRunI
 		ChildRunID: conflict.ChildRunID,
 		Detail:     conflict.Detail,
 	}, nil
+}
+
+// DispatchChildren satisfies childcompletion.ChildDispatcher by
+// delegating to the orchestrator's concurrent decomposed-child dispatch
+// (E24.3 / #1143) — the sweeper's fail-closed backstop. Returns (0, nil)
+// when the orchestrator is unconfigured, matching the other adapter
+// methods' nil-safe posture.
+func (a childCompletionAdvancer) DispatchChildren(ctx context.Context, parentRunID uuid.UUID) (int, error) {
+	if a.o == nil {
+		return 0, nil
+	}
+	return a.o.DispatchDecomposedChildren(ctx, parentRunID)
+}
+
+// newStageOrchestrator builds the stage orchestrator from cfg. Extracted
+// from runServe so the wiring is unit-testable: in particular the Drive
+// engine that emits the RuleChildrenDispatch run_auto_advanced trail for
+// concurrent decomposed-child dispatch (E24.3 / #1143) must be set, so a
+// miswiring fails a serve-level test rather than passing behind the
+// orchestrator-fake behavioral tests. Drive is nil-safe (Engine.Record/
+// Recorded guard a nil receiver); it mirrors server.go's drive wiring.
+func newStageOrchestrator(cfg server.Config, logger *slog.Logger) *orchestrator.Orchestrator {
+	return &orchestrator.Orchestrator{
+		Runs:                cfg.RunRepo,
+		GitHub:              cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
+		Logger:              logger,
+		Artifacts:           cfg.ArtifactRepo,
+		Audit:               cfg.AuditRepo,
+		MaxParallelChildren: cfg.MaxParallelChildren,
+		Drive:               &drive.Engine{Audit: cfg.AuditRepo, Logger: logger},
+	}
+}
+
+// newChildCompletionSweeper builds the child-completion sweeper from cfg.
+// Extracted from runServe so the wiring is unit-testable: the Dispatch
+// backstop (childCompletionAdvancer, E24.3 / #1143) must be wired non-nil
+// so the fail-closed concurrent-dispatch top-up can't be silently omitted.
+func newChildCompletionSweeper(cfg server.Config, logger *slog.Logger, interval time.Duration) *childcompletion.Sweeper {
+	adapter := childCompletionAdvancer{cfg.Orchestrator}
+	return &childcompletion.Sweeper{
+		Runs:      cfg.RunRepo,
+		Audit:     cfg.AuditRepo,
+		Advance:   adapter,
+		Integrate: adapter,
+		Dispatch:  adapter,
+		Logger:    logger,
+		Interval:  interval,
+	}
 }
 
 // advanceFuncFor wraps the orchestrator's Advance method as a plain

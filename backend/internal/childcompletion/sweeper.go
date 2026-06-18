@@ -58,6 +58,18 @@ type Integrator interface {
 	IntegrateSlices(ctx context.Context, parentRunID uuid.UUID) (*SliceConflict, error)
 }
 
+// ChildDispatcher is the slice of orchestrator.Orchestrator the sweeper
+// calls as the fail-closed backstop for decomposed-child dispatch (E24.3
+// / #1143): when a parent's children are not all terminal, it re-tops-up
+// the concurrent dispatch to the resolved cap so a parent whose initial
+// fanout dispatch partially failed (or whose backend restarted mid-fanout)
+// recovers within one tick. Extracted as an interface for the same
+// import-graph reason as Advancer/Integrator — childcompletion never
+// imports orchestrator.
+type ChildDispatcher interface {
+	DispatchChildren(ctx context.Context, parentRunID uuid.UUID) (int, error)
+}
+
 // Sweeper periodically resolves awaiting_children parent stages.
 // All dependencies are required; a nil Repository, Audit, or
 // Advancer is a configuration error rather than a graceful skip
@@ -76,6 +88,14 @@ type Sweeper struct {
 	// integration entirely, preserving the pre-#1142 resolve behavior for
 	// dev posture and existing tests.
 	Integrate Integrator
+
+	// Dispatch is the fail-closed backstop for concurrent decomposed-child
+	// dispatch (E24.3 / #1143): when a parent's children are not all
+	// terminal, the sweeper re-tops-up the dispatch to the resolved cap so
+	// a parent whose initial dispatch partially failed re-converges within
+	// one tick. Nil-safe: a nil Dispatch disables the backstop, preserving
+	// the pre-#1143 posture for dev and existing tests.
+	Dispatch ChildDispatcher
 }
 
 // Run blocks until ctx is cancelled, ticking every Interval to
@@ -171,6 +191,21 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		}
 	}
 	if !allTerminal {
+		// Fail-closed backstop (E24.3 / #1143): the parent stays parked
+		// (some child is still in flight), but a slot may be free — re-top
+		// the concurrent dispatch to the resolved cap so a parent whose
+		// initial fanout dispatch partially failed, or whose backend
+		// restarted, re-converges within one tick. Best-effort
+		// WARN-on-error; nil Dispatch disables the backstop.
+		if s.Dispatch != nil {
+			if _, derr := s.Dispatch.DispatchChildren(ctx, parentRunID); derr != nil {
+				s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: backstop child dispatch failed",
+					slog.String("parent_run_id", parentRunID.String()),
+					slog.String("parent_stage_id", parentStage.ID.String()),
+					slog.String("error", derr.Error()),
+				)
+			}
+		}
 		return nil
 	}
 

@@ -55,6 +55,7 @@ func TestMechanical_RuleTable(t *testing.T) {
 		RuleFixupRereviewRepark,
 		RuleChecksGreenAwaitingMerge,
 		RuleCIFailed,
+		RuleChildrenDispatch,
 	} {
 		if !Mechanical(rule) {
 			t.Errorf("Mechanical(%q) = false, want true", rule)
@@ -84,6 +85,26 @@ func TestEvaluatePlanApproved_GitHubActions_Advances(t *testing.T) {
 
 func TestEvaluatePlanApproved_Local_ParksWithNextAction(t *testing.T) {
 	out := EvaluatePlanApproved(run.RunnerKindLocal)
+	if out.Advance {
+		t.Fatal("Advance = true, want false: the backend cannot spawn the host-side runner (ADR-024)")
+	}
+	if out.NextAction == nil || out.NextAction.Action != "run_implement_stage" {
+		t.Fatalf("NextAction = %+v, want action run_implement_stage", out.NextAction)
+	}
+}
+
+func TestEvaluateChildrenDispatch_GitHubActions_Advances(t *testing.T) {
+	out := EvaluateChildrenDispatch(run.RunnerKindGitHubActions)
+	if !out.Advance {
+		t.Fatal("Advance = false, want true for runner_kind github_actions")
+	}
+	if out.NextAction != nil {
+		t.Errorf("NextAction = %+v, want nil (nothing for the operator to do)", out.NextAction)
+	}
+}
+
+func TestEvaluateChildrenDispatch_Local_ParksWithNextAction(t *testing.T) {
+	out := EvaluateChildrenDispatch(run.RunnerKindLocal)
 	if out.Advance {
 		t.Fatal("Advance = true, want false: the backend cannot spawn the host-side runner (ADR-024)")
 	}
