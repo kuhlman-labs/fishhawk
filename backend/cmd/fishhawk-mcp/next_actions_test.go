@@ -631,3 +631,45 @@ func TestNextActions_CIFailedFoldsDriveNextActionFirst(t *testing.T) {
 		t.Errorf("actions[0] = %q, want the drive next_action classify_ci_failure folded first", na.Actions[0].Action)
 	}
 }
+
+// TestNextActions_SliceIntegrationConflict pins the ADR-041 / #1142 arm:
+// a decomposed PARENT whose implement (awaiting_children) stage failed
+// category-B with the stable "slice integration conflict" reason prefix
+// classifies slices_integration_conflict and points fishhawk_resume_run at
+// the CONFLICTING child via a field-path POINTER into the structured
+// slice_integration_conflict audit payload (conflicting_child_run_id) — the
+// resume target is sourced from structured data, NOT parsed from the reason
+// string. (The field-path-pointer idiom mirrors ci_failed's concern_ids.)
+func TestNextActions_SliceIntegrationConflict(t *testing.T) {
+	run := naRun("failed")
+	stages := []Stage{
+		naStage("plan", "succeeded"),
+		naFailedImplement("B", "slice integration conflict: slice 2 could not merge"),
+		naStage("review", "pending"),
+	}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	if na.State != "slices_integration_conflict" {
+		t.Fatalf("state = %q, want slices_integration_conflict", na.State)
+	}
+	resume := findAction(t, na, "fishhawk_resume_run")
+	// The resume target is a field-path pointer at the STRUCTURED audit
+	// field, never the reason string.
+	if got := resume.Params["parent_run_id"]; !strings.Contains(got, "slice_integration_conflict") || !strings.Contains(got, "conflicting_child_run_id") {
+		t.Errorf("resume params.parent_run_id = %q, want a field-path pointer into the slice_integration_conflict audit payload's conflicting_child_run_id", got)
+	}
+}
+
+// TestNextActions_OrdinaryCategoryBParentUnaffected pins that an ordinary
+// category-B parent failure (no slice-conflict reason prefix) still routes
+// to the existing implement_failed_category_b arm — the conflict arm wins
+// ONLY for the conflict-prefixed reason.
+func TestNextActions_OrdinaryCategoryBParentUnaffected(t *testing.T) {
+	run := naRun("failed")
+	stages := []Stage{naStage("plan", "succeeded"), naFailedImplement("B", "undeclared created file")}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	if na.State != "implement_failed_category_b" {
+		t.Errorf("state = %q, want implement_failed_category_b for an ordinary category-B failure", na.State)
+	}
+}

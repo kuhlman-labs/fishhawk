@@ -327,6 +327,35 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 	}
 	switch category {
 	case "B":
+		// Slice integration conflict (ADR-041 / #1142): the PARENT's
+		// implement (awaiting_children) stage failed category-B because a
+		// slice branch could not merge onto the consolidated branch during
+		// fan-in. Recognized by the stable failure-reason PREFIX (human
+		// display only); the machine resume target is SOURCED FROM the
+		// structured slice_integration_conflict audit payload, NOT parsed
+		// from the free-form reason. The conflicting child id is surfaced as
+		// a field-path pointer into that payload (the same idiom ci_failed
+		// uses for concern_ids) so the consumer reads the real value from
+		// the structured entry — `conflicting_child_run_id`. Placed BEFORE
+		// the generic category-B parent arms so it wins for the parent run.
+		if impl.FailureReason != nil && strings.HasPrefix(*impl.FailureReason, sliceIntegrationConflictReasonPrefix) {
+			return &NextActions{
+				State: "slices_integration_conflict",
+				Actions: []SuggestedAction{{
+					Action: "fishhawk_resume_run",
+					// resume_run's parent_run_id param holds the conflicting
+					// child's OWN id for an in-place decomposition re-drive
+					// (#1081). The value is a field-path pointer: read
+					// conflicting_child_run_id from the latest
+					// slice_integration_conflict audit entry — structured data,
+					// never the reason string.
+					Params:       map[string]string{"parent_run_id": "recent_audit[category=slice_integration_conflict].payload.conflicting_child_run_id"},
+					Precondition: "the parent implement (awaiting_children) stage failed category-B with a slice integration conflict; read the conflicting child id from the latest slice_integration_conflict audit entry's structured payload (conflicting_child_run_id), NOT from the failure reason string",
+					Consumes:     consumesNone,
+					Reason:       "slice integration conflict during fan-in: the consolidated branch already holds the earlier slices, so re-drive ONLY the conflicting slice child in place (fishhawk_resume_run pointed at conflicting_child_run_id from the slice_integration_conflict audit) to resolve the conflict and resume fan-in — pointing resume at the parent would replan from scratch and discard the succeeded sibling slices",
+				}},
+			}
+		}
 		// A failed DECOMPOSITION CHILD recovers IN PLACE (#1081): point
 		// fishhawk_resume_run at THIS child's own id and the backend
 		// re-drives the SAME run on the shared parent branch — not a new
@@ -607,6 +636,14 @@ func stageByType(stages []Stage, stageType string) *Stage {
 	}
 	return nil
 }
+
+// sliceIntegrationConflictReasonPrefix is the stable prefix the fan-in
+// step stamps on the parent implement stage's failure reason (ADR-041 /
+// #1142). The next_actions arm keys on it to recognize the conflict
+// state; the machine resume target is sourced from the structured
+// slice_integration_conflict audit payload, not parsed from this string.
+// MUST match orchestrator.sliceIntegrationConflictReasonPrefix.
+const sliceIntegrationConflictReasonPrefix = "slice integration conflict"
 
 // citedFlakeEvent returns the known flake trace-event name the stage's
 // failure reason cites, or "" when none does.
