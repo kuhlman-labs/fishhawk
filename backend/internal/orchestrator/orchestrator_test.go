@@ -1919,3 +1919,145 @@ func TestIntegrateSlices_BaseRefMissing_Errors(t *testing.T) {
 		t.Errorf("conflict = %+v, want nil (absent base is an error, not a conflict)", conflict)
 	}
 }
+
+// TestAdvance_Fanout_ResolvesEffectiveMaxParallel drives the concurrency
+// cap end-to-end (E24.6 / #1146): the decomposition.max_parallel knob is set
+// in raw workflow YAML BYTES on run.WorkflowSpec, parsed by the REAL
+// spec.ParseBytes inside fanoutIfDecomposed, and the resolved effective cap
+// is asserted via the plan_decomposed audit payload — NOT a hand-built
+// cached spec. It covers the precedence (per-workflow knob wins over the
+// global default) and every degradation branch of resolveEffectiveMaxParallel
+// (absent spec, unparseable spec, workflow-not-in-spec) all falling through
+// to the global default.
+func TestAdvance_Fanout_ResolvesEffectiveMaxParallel(t *testing.T) {
+	const specWithKnob = `version: "0.6"
+workflows:
+  feature_change:
+    decomposition:
+      max_parallel: 2
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	const specNoKnob = `version: "0.6"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+	tests := []struct {
+		name          string
+		workflowSpec  string
+		workflowID    string // override seed default "feature_change" when non-empty
+		globalDefault int
+		want          float64
+	}{
+		{
+			// success branch: per-workflow knob (2) wins over the global (9).
+			name:          "per-workflow knob wins over global",
+			workflowSpec:  specWithKnob,
+			globalDefault: 9,
+			want:          2,
+		},
+		{
+			// success branch, EffectiveMaxParallel fallthrough: no knob => global.
+			name:          "no knob falls through to global default",
+			workflowSpec:  specNoKnob,
+			globalDefault: 5,
+			want:          5,
+		},
+		{
+			// branch 1: absent cached spec degrades to the global default.
+			name:          "absent spec degrades to global default",
+			workflowSpec:  "",
+			globalDefault: 6,
+			want:          6,
+		},
+		{
+			// branch 2: unparseable spec degrades to the global default (WARN).
+			name:          "unparseable spec degrades to global default",
+			workflowSpec:  "this is not: valid: workflow: yaml: : :",
+			globalDefault: 4,
+			want:          4,
+		},
+		{
+			// branch 3: workflow id not in the parsed spec degrades to global.
+			name:          "workflow not in spec degrades to global default",
+			workflowSpec:  specWithKnob,
+			workflowID:    "not_feature_change",
+			globalDefault: 3,
+			want:          3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs := newFanoutRunsRepo()
+			parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+				{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+				{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+				{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+			})
+			parent.WorkflowSpec = []byte(tt.workflowSpec)
+			if tt.workflowID != "" {
+				parent.WorkflowID = tt.workflowID
+			}
+			planStage := stages[0]
+
+			schemaV := "standard_v1"
+			arts := &fakeArtifacts{
+				byStage: map[uuid.UUID][]*artifact.Artifact{
+					planStage.ID: {{
+						ID:            uuid.New(),
+						StageID:       planStage.ID,
+						Kind:          artifact.KindPlan,
+						SchemaVersion: &schemaV,
+						Content:       decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"}),
+						CreatedAt:     time.Now().UTC(),
+					}},
+				},
+			}
+			au := &recordingAudit{}
+			o := &Orchestrator{
+				Runs:                rs,
+				Logger:              slog.Default(),
+				Artifacts:           arts,
+				Audit:               au,
+				MaxParallelChildren: tt.globalDefault,
+			}
+
+			out, err := o.Advance(context.Background(), parent.ID)
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if out != OutcomeDecomposed {
+				t.Fatalf("Advance outcome = %q, want %q", out, OutcomeDecomposed)
+			}
+
+			// All children are still minted — #1146 surfaces the cap, it does
+			// not throttle the fan-out (that is E24.3 / #1143).
+			if got := len(rs.createdRuns); got != 3 {
+				t.Errorf("minted children = %d, want 3 (cap is surfaced, not enforced)", got)
+			}
+
+			payload := auditPayload(t, au, "plan_decomposed")
+			got, ok := payload["effective_max_parallel"].(float64)
+			if !ok {
+				t.Fatalf("plan_decomposed payload missing effective_max_parallel: %v", payload)
+			}
+			if got != tt.want {
+				t.Errorf("effective_max_parallel = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

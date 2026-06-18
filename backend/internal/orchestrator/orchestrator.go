@@ -34,6 +34,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // GitHubAPI is the slice of githubclient.Client the orchestrator
@@ -125,6 +126,17 @@ type Orchestrator struct {
 	// present (#1060). Nil disables the dispatch — ordinary (non-
 	// decomposed) runs and the CLI/dev posture are unaffected.
 	ConsolidatedReview ConsolidatedReviewDispatcher
+
+	// MaxParallelChildren is the global default cap on how many decomposed
+	// child runs may dispatch concurrently (E24.6 / #1146), wired from
+	// server.Config.MaxParallelChildren (FISHHAWKD_MAX_PARALLEL_CHILDREN).
+	// fanoutIfDecomposed resolves the effective cap from the run's cached
+	// workflow spec via spec.EffectiveMaxParallel(MaxParallelChildren) and
+	// surfaces it (log + plan_decomposed payload). 0 = unlimited. This is
+	// the cap RESOLUTION seam only; concurrency throttling that consumes
+	// the resolved value lands in E24.3 (#1143) — all children are still
+	// minted here.
+	MaxParallelChildren int
 }
 
 // Outcome describes what Advance did. Useful for telemetry and
@@ -960,13 +972,53 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 		return false, fmt.Errorf("transition parent implement to awaiting_children: %w", err)
 	}
 
-	o.emitPlanDecomposed(ctx, parent.ID, planStageID, childIDs, approvedPlan.Decomposition.Rationale)
+	// Resolve the effective concurrency cap from the run's cached workflow
+	// spec (E24.6 / #1146): the per-workflow decomposition.max_parallel knob
+	// wins, else the global FISHHAWKD_MAX_PARALLEL_CHILDREN default (0 =
+	// unlimited). We RESOLVE and SURFACE it here (log + plan_decomposed
+	// payload) so E24.3 (#1143) can consume it; this does NOT throttle
+	// minting — every child above was already created.
+	effectiveMaxParallel := o.resolveEffectiveMaxParallel(ctx, parent)
+
+	o.emitPlanDecomposed(ctx, parent.ID, planStageID, childIDs, approvedPlan.Decomposition.Rationale, effectiveMaxParallel)
 	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parent parked awaiting children",
 		slog.String("parent_run_id", parent.ID.String()),
 		slog.String("parent_stage_id", parentImplement.ID.String()),
 		slog.Int("child_count", len(childIDs)),
+		slog.Int("effective_max_parallel", effectiveMaxParallel),
 	)
 	return true, nil
+}
+
+// resolveEffectiveMaxParallel computes the decomposition concurrency cap
+// for the parent run (E24.6 / #1146) by parsing the run's cached workflow
+// spec, looking up the run's workflow, and resolving the per-workflow
+// decomposition.max_parallel knob against the global
+// MaxParallelChildren default (0 = unlimited). Best-effort: an absent
+// spec, a parse failure, or a workflow not found in the spec degrades to
+// the global default with a WARN — never blocking the fanout that has
+// already minted the children.
+func (o *Orchestrator) resolveEffectiveMaxParallel(ctx context.Context, parent *run.Run) int {
+	if len(parent.WorkflowSpec) == 0 {
+		return o.MaxParallelChildren
+	}
+	parsed, err := spec.ParseBytes(parent.WorkflowSpec)
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn,
+			"orchestrator: parse cached workflow spec for max_parallel failed — using global default",
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.String("error", err.Error()))
+		return o.MaxParallelChildren
+	}
+	wf, ok := parsed.Workflows[parent.WorkflowID]
+	if !ok {
+		o.logger().LogAttrs(ctx, slog.LevelWarn,
+			"orchestrator: workflow not in cached spec for max_parallel — using global default",
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.String("workflow_id", parent.WorkflowID))
+		return o.MaxParallelChildren
+	}
+	return wf.EffectiveMaxParallel(o.MaxParallelChildren)
 }
 
 // loadApprovedPlan returns the parsed standard_v1 plan from the
@@ -1029,20 +1081,22 @@ func childIssueContextFromSubPlan(parent *run.Run, sub plan.SubPlanSummary) *run
 	return &out
 }
 
-// emitPlanDecomposed writes a plan_decomposed audit entry naming
-// the child run IDs and the rationale string. Best-effort: a failure
-// here logs and returns; the fanout has already taken effect at the
-// data layer.
-func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, parentStageID uuid.UUID, childIDs []string, rationale string) {
+// emitPlanDecomposed writes a plan_decomposed audit entry naming the
+// child run IDs, the rationale string, and the resolved
+// effective_max_parallel concurrency cap (E24.6 / #1146 — 0 = unlimited).
+// Best-effort: a failure here logs and returns; the fanout has already
+// taken effect at the data layer.
+func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, parentStageID uuid.UUID, childIDs []string, rationale string, effectiveMaxParallel int) {
 	if o.Audit == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping plan_decomposed entry",
 			slog.String("parent_run_id", parentRunID.String()))
 		return
 	}
 	payload, err := json.Marshal(map[string]any{
-		"child_run_ids":   childIDs,
-		"rationale":       rationale,
-		"parent_stage_id": parentStageID.String(),
+		"child_run_ids":          childIDs,
+		"rationale":              rationale,
+		"parent_stage_id":        parentStageID.String(),
+		"effective_max_parallel": effectiveMaxParallel,
 	})
 	if err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal plan_decomposed payload failed",

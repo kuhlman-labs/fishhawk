@@ -15,7 +15,7 @@ Reference for `.fishhawk/workflows.yaml`. The canonical schema is [`workflow-v0.
 ## Top-level shape
 
 ```yaml
-version: "0.3" # required; "0.3", "0.4" (adds workflow.budgets), or "0.5" (adds operator_agent)
+version: "0.3" # required; "0.3", "0.4" (adds workflow.budgets), "0.5" (adds operator_agent), or "0.6" (adds workflow.decomposition.max_parallel)
 roles: # optional; named groups referenced by gates
   <role_id>:
     members: ["@org/team", "@user"]
@@ -28,6 +28,8 @@ workflows: # required; at least one workflow
     budgets: [...] # optional; periodic per-workflow cost ceilings (ADR-030, v0.4+)
     drive: false # optional; auto-advance mechanical transitions (#1023)
     operator_agent: {...} # optional; delegation knobs for the operator agent (ADR-040, v0.5+)
+    decomposition: # optional; decomposition controls (E24.6, v0.6+)
+      max_parallel: 0 # 0 = unlimited; overrides FISHHAWKD_MAX_PARALLEL_CHILDREN
     stages: [...]
 ```
 
@@ -386,6 +388,27 @@ workflows:
 **Authority unchanged (ADR-027).** Delegation changes *who* may act at a gate, not what gates exist or how reviewer authority resolves. The condition evaluation, API surfacing, and delegated-action enforcement are backend follow-ups (#1026 sibling slices); v0.5 of the schema defines the authoring surface and the parsed types.
 
 - `may_merge` is evaluated and surfaced but has no backend merge endpoint to enforce in v0 — merge happens on GitHub; enforcement attaches when a merge action surface exists.
+
+## Decomposition controls (v0.6+)
+
+A workflow-level `decomposition` block (E24.6 / #1146) holding decomposition controls. v0.6 ships a single knob:
+
+```yaml
+version: "0.6"
+workflows:
+  feature_change:
+    decomposition:
+      max_parallel: 3 # 0 = unlimited
+    stages: […]
+```
+
+- **`max_parallel`** — integer, `minimum: 0`. The maximum number of decomposed child runs that may dispatch **concurrently** for a run of this workflow. `0` (and an absent block) means **unlimited**. It is a per-workflow override of the global `FISHHAWKD_MAX_PARALLEL_CHILDREN` operator default: when `max_parallel > 0` the knob wins, otherwise the global default applies. Resolution lives in `spec.Workflow.EffectiveMaxParallel(globalDefault)`, and `0 = unlimited` is kept consistent with `budget.ParallelDecision`'s cap semantics.
+- **Mechanism vs. enforcement.** v0.6 declares the cap and the orchestrator **resolves and surfaces** it (a log line plus `effective_max_parallel` in the `plan_decomposed` audit payload). It does **not** yet throttle the fan-out — every child is still minted. The concurrency throttle that consumes the resolved cap lands in E24.3 (#1143).
+- **Additive within workflow-v0.x** — optional field, no new required field, no major bump (no `x-intended-required`). Specs without it parse unchanged at every advertised `version`.
+
+### Notes — soak window
+
+`workflow.decomposition.max_parallel` is introduced as a new **optional** field within `workflow-v0.x` (version enum gains `0.6`). It is **not** slated to become required, so no `x-intended-required` annotation is set and no required-promotion soak is owed. The compatibility soak here is the standard additive-change window: during it the backend validates both the prior schema versions (`0.3`–`0.5`) and `0.6`, so specs authored against either continue to parse. Duration is per-PR; no minimum is set yet (TBD in the follow-up tracked by the AGENTS.md schema-change checklist).
 
 ## Test conventions (#1004)
 

@@ -1469,3 +1469,130 @@ workflows:
 		t.Errorf("unexpected parse result: %+v", s)
 	}
 }
+
+func TestParse_Decomposition_RoundTrip(t *testing.T) {
+	// A workflow with decomposition.max_parallel decodes onto
+	// Workflow.Decomposition through the real ParseBytes path
+	// (DisallowUnknownFields), proving the schema + Go type stay in
+	// lockstep. version 0.6 advertises the field.
+	yml := []byte(`
+version: "0.6"
+workflows:
+  feature_change:
+    decomposition:
+      max_parallel: 3
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf := s.Workflows["feature_change"]
+	if wf.Decomposition == nil {
+		t.Fatal("Decomposition = nil, want decoded block")
+	}
+	if got, want := wf.Decomposition.MaxParallel, 3; got != want {
+		t.Errorf("Decomposition.MaxParallel = %d, want %d", got, want)
+	}
+}
+
+func TestParse_Decomposition_Absent_NilPointer(t *testing.T) {
+	// No decomposition block → Workflow.Decomposition is nil, so
+	// EffectiveMaxParallel falls through to the global default.
+	s, err := spec.ParseBytes(readFixture(t, "valid/minimal.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if wf := s.Workflows["trivial"]; wf.Decomposition != nil {
+		t.Errorf("Decomposition = %v, want nil for an absent block", wf.Decomposition)
+	}
+}
+
+func TestParse_Decomposition_NegativeMaxParallel_Rejected(t *testing.T) {
+	// max_parallel has minimum 0 in the schema; a negative value is a
+	// schema error refused before the spec lands on a run row.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.6"
+workflows:
+  feature_change:
+    decomposition:
+      max_parallel: -1
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`))
+	if err == nil {
+		t.Fatal("Parse: want error for negative max_parallel, got nil")
+	}
+}
+
+func TestEffectiveMaxParallel(t *testing.T) {
+	knob := func(n int) *spec.Decomposition { return &spec.Decomposition{MaxParallel: n} }
+	tests := []struct {
+		name          string
+		decomposition *spec.Decomposition
+		globalDefault int
+		want          int
+	}{
+		{
+			// Per-workflow knob > 0 wins over the global default.
+			name:          "knob wins over global",
+			decomposition: knob(2),
+			globalDefault: 9,
+			want:          2,
+		},
+		{
+			// Knob 0 (explicitly unlimited / unset) falls through to global.
+			name:          "knob zero falls through to global",
+			decomposition: knob(0),
+			globalDefault: 5,
+			want:          5,
+		},
+		{
+			// Absent block (nil) falls through to global.
+			name:          "nil block falls through to global",
+			decomposition: nil,
+			globalDefault: 4,
+			want:          4,
+		},
+		{
+			// Both zero → 0, the unlimited sentinel.
+			name:          "both zero is unlimited",
+			decomposition: knob(0),
+			globalDefault: 0,
+			want:          0,
+		},
+		{
+			// Knob set with a zero global still wins.
+			name:          "knob with zero global",
+			decomposition: knob(7),
+			globalDefault: 0,
+			want:          7,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wf := spec.Workflow{Decomposition: tt.decomposition}
+			if got := wf.EffectiveMaxParallel(tt.globalDefault); got != tt.want {
+				t.Errorf("EffectiveMaxParallel(%d) = %d, want %d", tt.globalDefault, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveMaxParallel_NilReceiver(t *testing.T) {
+	// A nil *Workflow degrades to the global default (defensive: the
+	// resolver is called on the orchestrator's looked-up workflow).
+	var wf *spec.Workflow
+	if got := wf.EffectiveMaxParallel(6); got != 6 {
+		t.Errorf("EffectiveMaxParallel on nil receiver = %d, want 6", got)
+	}
+}

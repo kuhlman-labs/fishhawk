@@ -2958,3 +2958,328 @@ func TestDispatchConsolidatedReview_TruncatedDiff_EmitsDegradationAndStillReview
 		t.Errorf("implement_review_started entries = %d, want 1 (review still dispatched on partial diff)", len(started))
 	}
 }
+
+// TestShipTrace_RunBudgetTripwire_FamilyAggregateHalts is the family-budget
+// aggregation end-to-end (E24.6 / #1146): a decomposed CHILD whose own
+// cost_usd_total stays under the per-run ceiling is still halted because the
+// decomposition family (parent + child) aggregate is over. It drives the real
+// trace-upload path so checkRunBudget runs over the summed family figure, not
+// the child's own.
+func TestShipTrace_RunBudgetTripwire_FamilyAggregateHalts(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+	rr := newOrchestratorRepo()
+
+	// Decomposition family: a parent (root) and one child. The child is the
+	// run uploading the trace.
+	parent := rr.seedRun()
+	child := rr.seedRun()
+	child.DecomposedFrom = &parent.ID
+
+	stage := rr.seedStage(child.ID, 0, run.StageStateDispatched)
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	bundleUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok || bundleUSD <= 0 {
+		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, bundleUSD)
+	}
+	// Ceiling sits ABOVE the child's own post-bundle cost (1x bundleUSD) but
+	// BELOW the family aggregate (parent 2x + child 1x = 3x).
+	ceiling := bundleUSD * 2.5
+	parent.CostUSDTotal = bundleUSD * 2.0
+	// child starts at 0; the bundle's rolled cost brings it to 1x bundleUSD —
+	// still under the ceiling on its own, so only the family sum trips.
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        child.ID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+		MaxRunUSD:    ceiling,
+	})
+
+	priv, _ := sf.issue(t, child.ID)
+	w := shipRequest(t, s, child.ID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// Sanity: the child's OWN cost stayed under the ceiling — the halt is the
+	// family aggregate, not the child alone.
+	gotChild, err := rr.GetRun(t.Context(), child.ID)
+	if err != nil {
+		t.Fatalf("GetRun child: %v", err)
+	}
+	if gotChild.CostUSDTotal >= ceiling {
+		t.Fatalf("child own cost = %v, want < ceiling %v (test must isolate family aggregation)", gotChild.CostUSDTotal, ceiling)
+	}
+	// The child run is halted (cancelled) by the family tripwire.
+	if gotChild.State != run.StateCancelled {
+		t.Errorf("child run.State = %q, want %q (family aggregate over ceiling halts)", gotChild.State, run.StateCancelled)
+	}
+
+	// run_budget_exceeded audit entry, with cost_usd_total reflecting the
+	// summed family (>= ceiling), not the child's own figure.
+	au.mu.Lock()
+	var be *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "run_budget_exceeded" {
+			be = &au.appended[i]
+			break
+		}
+	}
+	au.mu.Unlock()
+	if be == nil {
+		t.Fatal("no run_budget_exceeded audit entry written for the family aggregate breach")
+	}
+	var bp struct {
+		Dimension    string  `json:"dimension"`
+		CostUSDTotal float64 `json:"cost_usd_total"`
+	}
+	if err := json.Unmarshal(be.Payload, &bp); err != nil {
+		t.Fatalf("decode run_budget_exceeded payload: %v", err)
+	}
+	if bp.Dimension != "usd" {
+		t.Errorf("dimension = %q, want usd", bp.Dimension)
+	}
+	if bp.CostUSDTotal < ceiling {
+		t.Errorf("cost_usd_total = %v, want >= ceiling %v (must be the family sum)", bp.CostUSDTotal, ceiling)
+	}
+}
+
+// TestShipTrace_RunBudgetTripwire_NonDecomposedFamilyIsSelf is the
+// regression guard paired with the family-aggregate test (#1146): a
+// NON-decomposed run with the SAME own cost as the halted child above
+// (1x bundleUSD, under the 2.5x ceiling) must NOT trip, because its family
+// is just itself — proving the aggregation reduces to the prior single-run
+// figure for ordinary runs.
+func TestShipTrace_RunBudgetTripwire_NonDecomposedFamilyIsSelf(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+	rr := newOrchestratorRepo()
+
+	runRow := rr.seedRun() // DecomposedFrom nil, no children
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	stage.RequiresApproval = true // advances to awaiting_approval on no-trip
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	bundleUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok || bundleUSD <= 0 {
+		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v", model, ok, bundleUSD)
+	}
+	ceiling := bundleUSD * 2.5 // identical ceiling to the family test
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        runRow.ID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+		MaxRunUSD:    ceiling,
+	})
+
+	priv, _ := sf.issue(t, runRow.ID)
+	w := shipRequest(t, s, runRow.ID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.State == run.StateCancelled {
+		t.Errorf("run.State = cancelled, want not-cancelled (family==self, own cost under ceiling must not trip)")
+	}
+	au.mu.Lock()
+	for i := range au.appended {
+		if au.appended[i].Category == "run_budget_exceeded" {
+			t.Errorf("unexpected run_budget_exceeded entry for a single-run family under ceiling")
+			break
+		}
+	}
+	au.mu.Unlock()
+}
+
+// listErrRepo wraps orchestratorRepo to force a ListRuns error, exercising
+// familyRuns' best-effort children-list degradation branch (#1146) without
+// editing the shared approvals_test fixture.
+type listErrRepo struct {
+	*orchestratorRepo
+	listErr error
+}
+
+func (r *listErrRepo) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run, error) {
+	return nil, r.listErr
+}
+
+// TestFamilyRuns covers familyRuns' family assembly and its two best-effort
+// degradation branches (#1146): a non-decomposed run is its own family; a
+// parent's children are gathered with the root first; a parent-GetRun failure
+// and a children-ListRuns failure both degrade to the single run.
+func TestFamilyRuns(t *testing.T) {
+	t.Run("non-decomposed run is its own family", func(t *testing.T) {
+		rr := newOrchestratorRepo()
+		runRow := rr.seedRun()
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+		fam := s.familyRuns(t.Context(), runRow)
+		if len(fam) != 1 || fam[0].ID != runRow.ID {
+			t.Fatalf("family = %v, want exactly [self]", fam)
+		}
+	})
+
+	t.Run("parent gathers root-first with children", func(t *testing.T) {
+		rr := newOrchestratorRepo()
+		parent := rr.seedRun()
+		c1 := rr.seedRun()
+		c1.DecomposedFrom = &parent.ID
+		c2 := rr.seedRun()
+		c2.DecomposedFrom = &parent.ID
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+
+		fam := s.familyRuns(t.Context(), parent)
+		if len(fam) != 3 {
+			t.Fatalf("family size = %d, want 3 (parent + 2 children)", len(fam))
+		}
+		if fam[0].ID != parent.ID {
+			t.Errorf("family[0] = %s, want root %s", fam[0].ID, parent.ID)
+		}
+		ids := map[uuid.UUID]bool{fam[1].ID: true, fam[2].ID: true}
+		if !ids[c1.ID] || !ids[c2.ID] {
+			t.Errorf("family children = %v, want {%s,%s}", ids, c1.ID, c2.ID)
+		}
+	})
+
+	t.Run("child resolves the same family from a sibling", func(t *testing.T) {
+		rr := newOrchestratorRepo()
+		parent := rr.seedRun()
+		child := rr.seedRun()
+		child.DecomposedFrom = &parent.ID
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+
+		fam := s.familyRuns(t.Context(), child)
+		if len(fam) != 2 || fam[0].ID != parent.ID {
+			t.Fatalf("family = %v, want [parent, child] with parent first", fam)
+		}
+	})
+
+	t.Run("parent GetRun failure degrades to single run", func(t *testing.T) {
+		rr := newOrchestratorRepo()
+		child := rr.seedRun()
+		missingParent := uuid.New() // never seeded → GetRun ErrNotFound
+		child.DecomposedFrom = &missingParent
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+
+		fam := s.familyRuns(t.Context(), child)
+		if len(fam) != 1 || fam[0].ID != child.ID {
+			t.Fatalf("family = %v, want [child] after parent lookup failure", fam)
+		}
+	})
+
+	t.Run("children ListRuns failure degrades to single run", func(t *testing.T) {
+		rr := newOrchestratorRepo()
+		runRow := rr.seedRun()
+		repo := &listErrRepo{orchestratorRepo: rr, listErr: errors.New("boom")}
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+
+		fam := s.familyRuns(t.Context(), runRow)
+		if len(fam) != 1 || fam[0].ID != runRow.ID {
+			t.Fatalf("family = %v, want [self] after children-list failure", fam)
+		}
+	})
+}
+
+// TestCheckSpendAlert_FamilyFanOutAggregates is the fan-out spend-alert
+// assertion (#1146): cost_recorded entries spread across decomposition
+// family members in the current hour aggregate into the detector's
+// latest-hour sample, so a fan-out spike over the rolling baseline fires the
+// spend_alert. checkSpendAlert reads the ledger across runs, so the whole
+// family's spend is reflected without narrowing the cross-run baseline.
+func TestCheckSpendAlert_FamilyFanOutAggregates(t *testing.T) {
+	au := newAuditFake()
+	rr := newOrchestratorRepo()
+
+	parent := rr.seedRun()
+	c1 := rr.seedRun()
+	c1.DecomposedFrom = &parent.ID
+	c2 := rr.seedRun()
+	c2.DecomposedFrom = &parent.ID
+
+	now := time.Now().UTC()
+	// Three prior hours of low baseline spend.
+	seeded := []*audit.Entry{
+		seedCostEntry(t, now.Add(-3*time.Hour), 0.01),
+		seedCostEntry(t, now.Add(-2*time.Hour), 0.01),
+		seedCostEntry(t, now.Add(-1*time.Hour), 0.01),
+	}
+	// Current hour: spend spread across the three family members. Each member
+	// is modest; the family SUM (0.15) is the spike the detector must see.
+	for i, member := range []*run.Run{parent, c1, c2} {
+		e := seedCostEntry(t, now.Add(-time.Duration(i)*time.Minute), 0.05)
+		rid := member.ID
+		e.RunID = &rid
+		seeded = append(seeded, e)
+	}
+	au.seeded = seeded
+
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr})
+
+	s.checkSpendAlert(t.Context(), c1.ID, uuid.New(), "claude-opus-4-8")
+
+	au.mu.Lock()
+	var alert *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "spend_alert" {
+			alert = &au.appended[i]
+			break
+		}
+	}
+	au.mu.Unlock()
+	if alert == nil {
+		t.Fatal("no spend_alert for a family fan-out hour exceeding the baseline")
+	}
+	var ap struct {
+		LatestHourUSD float64 `json:"latest_hour_usd"`
+		PriorHours    int     `json:"prior_hours"`
+	}
+	if err := json.Unmarshal(alert.Payload, &ap); err != nil {
+		t.Fatalf("decode spend_alert payload: %v", err)
+	}
+	// The latest-hour sample is the SUM across the family (0.15), not any one
+	// member's 0.05 — proof the fan-out aggregates.
+	if ap.LatestHourUSD < 0.15-1e-9 {
+		t.Errorf("latest_hour_usd = %v, want >= 0.15 (sum across family members)", ap.LatestHourUSD)
+	}
+	if ap.PriorHours != 3 {
+		t.Errorf("prior_hours = %d, want 3", ap.PriorHours)
+	}
+}

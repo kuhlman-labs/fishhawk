@@ -146,6 +146,38 @@ type Workflow struct {
 	// — fail-closed, every judgment pages the human. A gate-level
 	// block overrides it wholesale; see EffectiveOperatorAgent.
 	OperatorAgent *OperatorAgent `json:"operator_agent,omitempty" yaml:"operator_agent,omitempty"`
+	// Decomposition holds the per-workflow decomposition controls
+	// (E24.6 / #1146). Nil means the block was absent — no per-workflow
+	// override, so EffectiveMaxParallel falls through to the global
+	// default. Round-trips through ParseBytes' DisallowUnknownFields
+	// decode, so this field MUST stay in lockstep with the schema's
+	// workflow.decomposition property.
+	Decomposition *Decomposition `json:"decomposition,omitempty" yaml:"decomposition,omitempty"`
+}
+
+// Decomposition is the per-workflow decomposition control block (E24.6 /
+// #1146). MaxParallel bounds how many decomposed child runs may dispatch
+// concurrently for a run of the workflow; 0 (and an absent block) means
+// unlimited. It is a per-workflow override of the global
+// FISHHAWKD_MAX_PARALLEL_CHILDREN — see Workflow.EffectiveMaxParallel.
+type Decomposition struct {
+	MaxParallel int `json:"max_parallel,omitempty" yaml:"max_parallel,omitempty"`
+}
+
+// EffectiveMaxParallel resolves the concurrency cap for the workflow's
+// decomposed children (E24.6 / #1146). Precedence: the per-workflow
+// decomposition.max_parallel knob wins when set to a positive value;
+// otherwise the supplied globalDefault (wired from
+// FISHHAWKD_MAX_PARALLEL_CHILDREN) applies. The result is interpreted as
+// 0 = unlimited — consistent with budget.ParallelDecision's cap semantics
+// — so a zero knob and a zero global both resolve to unlimited. This
+// resolves and surfaces the cap; concurrency enforcement that consumes it
+// lands in E24.3 (#1143).
+func (w *Workflow) EffectiveMaxParallel(globalDefault int) int {
+	if w != nil && w.Decomposition != nil && w.Decomposition.MaxParallel > 0 {
+		return w.Decomposition.MaxParallel
+	}
+	return globalDefault
 }
 
 // DelegationCondition names a backend-evaluable predicate under which
