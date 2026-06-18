@@ -747,6 +747,9 @@ func gateEvidenceLine(t *testing.T, seq int) Line {
 			{"type": "file_contains", "path": "docs/api/v0.md", "literal": "binding_assertions", "satisfied": true},
 			{"type": "test_asserts", "path": "x_test.go", "literal": "TestX", "satisfied": false},
 		},
+		"scope_exemptions": []map[string]any{
+			{"path": "backend/internal/foo/foo.go", "reason": "already correct, no change needed"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -845,6 +848,16 @@ func TestExtractGateEvidence_HappyPath(t *testing.T) {
 	}
 	if got.BindingAssertions[1].Type != "test_asserts" || got.BindingAssertions[1].Satisfied {
 		t.Errorf("BindingAssertions[1] = %+v, want test_asserts satisfied=false", got.BindingAssertions[1])
+	}
+	// Scope-exemption evidence (#1153) round-trips the runner's scope_exemptions
+	// digest field-for-field through PackBytes — a silent zero value here means
+	// the runner↔backend wire tags diverged.
+	if len(got.ScopeExemptions) != 1 {
+		t.Fatalf("got %d scope exemptions, want 1", len(got.ScopeExemptions))
+	}
+	wantEx := ScopeExemptionEvidence{Path: "backend/internal/foo/foo.go", Reason: "already correct, no change needed"}
+	if got.ScopeExemptions[0] != wantEx {
+		t.Errorf("ScopeExemptions[0] = %+v, want %+v", got.ScopeExemptions[0], wantEx)
 	}
 }
 

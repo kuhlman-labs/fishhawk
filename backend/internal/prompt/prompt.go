@@ -63,6 +63,22 @@ const PlanArtifactPath = "/tmp/fishhawk-plan.json"
 // Hardcoded for v0 — same rationale as PlanArtifactPath. (#206.)
 const PullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
 
+// ScopeJustificationPath is the run/stage-keyed path the implement agent
+// writes its scope self-exempt sidecar to (#1153) and the runner reads it
+// from. The path is keyed by the FULL run id + stage id (not shortened) so
+// a leftover sidecar from a different run/stage can never collide with this
+// run's path — the first of three independent freshness defenses (the others
+// being the embedded-id validation and the pre-invoke delete in the runner).
+//
+// The runner mirrors this EXACT format string in scopeJustificationPath
+// (runner/cmd/fishhawk-runner/main.go) — the same independent-module
+// coordination as PullRequestDescriptionPath / pullRequestDescriptionPath.
+// A one-sided edit to either format string is caught by the prompt-render
+// test (asserts the literal substituted path) plus the runner gate test.
+func ScopeJustificationPath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-scope-justifications-%s-%s.json", runID, stageID)
+}
+
 // CalibrationBand holds accuracy statistics for a single confidence level
 // (high / medium / low) within a calibration window.
 type CalibrationBand struct {
@@ -321,6 +337,17 @@ type Trigger struct {
 	// omits the section and keeps the prompt byte-identical to today.
 	GateEvidence *GateEvidence
 
+	// ImplementRunID and ImplementStageID are the run/stage UUIDs of the
+	// implement stage being dispatched (#1153). Populated ONLY for implement-
+	// stage prompts (the two buildImplement-feeding handler call sites); empty
+	// for plan / review prompts. buildImplement renders the run/stage-keyed
+	// scope self-exempt sidecar path (ScopeJustificationPath) and the literal
+	// run_id/stage_id the agent must embed in the sidecar from these. Both empty
+	// (a non-implement or older trigger) omits the self-exempt section, keeping
+	// those prompts byte-identical.
+	ImplementRunID   string
+	ImplementStageID string
+
 	// PlanGateEvidence carries the backend-computed plan-gate results —
 	// the plan_scope_precheck verdict against the implement stage's path
 	// constraints and the plan_surface_sweep sibling-surface findings —
@@ -344,6 +371,21 @@ type GateEvidence struct {
 	FlakeRetries     int
 	ScopeFacts       *GateScopeFacts
 	PolicyViolations []GatePolicyViolation
+	// ScopeExemptions carries the agent's validated scope self-exemptions
+	// (#1153): declared scope.files paths the agent deliberately left
+	// unchanged and justified in-band, each with its reason. writeGateEvidence
+	// renders them so the implement reviewer judges whether each justification
+	// is sound. Nil (no sidecar, all entries failed validation, or any
+	// non-implement build) omits the section.
+	ScopeExemptions []GateScopeExemption
+}
+
+// GateScopeExemption is one validated scope self-exemption (#1153): a declared
+// scope.files path the agent deliberately left unchanged plus the reason it is
+// correctly unchanged. The prompt-side mirror of bundle.ScopeExemptionEvidence.
+type GateScopeExemption struct {
+	Path   string
+	Reason string
 }
 
 // GateVerifyRun is one committed-tree verify attempt: the command the
@@ -718,6 +760,20 @@ func buildImplement(t Trigger) string {
 	// the request mid-stage and have the agent resume WITH the decision.
 	writeScopeAmendments(&b)
 
+	// Scope self-exempt (#1153): the standalone open-PR path's escape hatch for
+	// a declared scope.files path the agent DELIBERATELY leaves unchanged. The
+	// pre-push scope-completeness gate (#1151/#1154) is otherwise strict — every
+	// concrete declared path must be touched or the stage fails category-B. This
+	// lets the agent justify a deliberately-no-op declared file in-band instead
+	// of forcing an operator replan. Rendered ONLY on the standalone path
+	// (ScopeConstraint == nil): decomposed children are excluded from the gate,
+	// and the fix-up path returns via buildImplementFixup before reaching here.
+	// Guarded on the populated run/stage ids so a trigger missing them omits the
+	// section rather than rendering a malformed path.
+	if t.ScopeConstraint == nil && t.ImplementRunID != "" && t.ImplementStageID != "" {
+		writeScopeSelfExempt(&b, t)
+	}
+
 	// PR description: write to a known path so the runner can lift
 	// it into the GitHub PR's title + body. Format is documented
 	// here in the prompt itself (rather than a separate spec doc)
@@ -910,6 +966,41 @@ func writeScopeAmendments(b *strings.Builder) {
 	b.WriteString("\n")
 	b.WriteString("You may file at most 2 amendment requests for this stage (denied requests count). Batch every needed path into one request rather than dribbling them. NEVER edit or create a requested file before the approval lands.\n")
 	b.WriteString("\n")
+}
+
+// writeScopeSelfExempt renders the "### Deliberately-unchanged declared scope
+// files" block (#1153): the in-band escape hatch for a declared scope.files
+// path the agent intentionally leaves unchanged. The agent writes a JSON
+// sidecar to the run/stage-keyed ScopeJustificationPath; the runner validates
+// freshness (well-formed JSON, embedded run_id/stage_id matching this stage,
+// each path concretely declared, each reason non-empty), then subtracts the
+// validated exemptions from the pre-push scope-completeness gate's missing set.
+// Anything malformed, stale, undeclared, or empty-reason is ignored and the
+// gate stays strict (fail-closed). Standalone-path only — the caller guards on
+// ScopeConstraint == nil and the populated run/stage ids.
+func writeScopeSelfExempt(b *strings.Builder, t Trigger) {
+	path := ScopeJustificationPath(t.ImplementRunID, t.ImplementStageID)
+	b.WriteString("### Deliberately-unchanged declared scope files\n\n")
+	b.WriteString("The approved plan's scope.files lists every file you are expected to touch. A pre-push gate " +
+		"checks that the commit actually changed every concrete declared file; if it dropped one, the stage fails. " +
+		"If you deliberately leave a declared file unchanged because — after implementing — it genuinely needs no " +
+		"edit, justify it in-band instead of forcing a replan:\n\n")
+	fmt.Fprintf(b, "Write a JSON sidecar to `%s` with this shape:\n\n", path)
+	b.WriteString("```json\n")
+	fmt.Fprintf(b, "{\"run_id\":%q,\"stage_id\":%q,\"exemptions\":[{\"path\":\"<declared concrete path>\",\"reason\":\"<why it is correctly left unchanged>\"}]}\n",
+		t.ImplementRunID, t.ImplementStageID)
+	b.WriteString("```\n\n")
+	b.WriteString("Rules — each is fail-closed (a violation means the exemption is ignored and the gate stays strict, " +
+		"so the dropped file still fails the stage):\n\n")
+	b.WriteString("- `run_id` and `stage_id` MUST be exactly the values shown above. A mismatch (a stale sidecar from " +
+		"another run) is rejected wholesale.\n")
+	b.WriteString("- Only a CONCRETE declared scope.files path can be exempted — not a directory entry, not a path " +
+		"absent from scope.files.\n")
+	b.WriteString("- `reason` MUST be non-empty and specific: state why the file correctly needs no change. An empty " +
+		"or whitespace reason drops that entry.\n")
+	b.WriteString("- Do NOT use this to skip work: a file that genuinely needs an edit must be edited. The exemption is " +
+		"for a declared file that, after you implemented the change, correctly needs no modification. Your reasons are " +
+		"surfaced to the reviewer.\n\n")
 }
 
 // writeGitOpsProhibition renders the line forbidding the agent from running
@@ -1868,6 +1959,18 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 					fmt.Fprintf(b, "  - %s\n", p)
 				}
 			}
+		}
+		b.WriteString("\n")
+	}
+
+	if len(ev.ScopeExemptions) > 0 {
+		b.WriteString("Self-exempted declared scope files (agent justified leaving these unchanged):\n\n")
+		b.WriteString("The agent declared these scope.files paths but deliberately left them unchanged, " +
+			"justifying each in-band rather than forcing a replan. The pre-push scope-completeness gate honored " +
+			"these exemptions. You MUST judge whether each justification is sound: a path that genuinely needed an " +
+			"edit but was exempted with a hollow reason is a concern — name it.\n\n")
+		for _, ex := range ev.ScopeExemptions {
+			fmt.Fprintf(b, "- %s — %s\n", ex.Path, ex.Reason)
 		}
 		b.WriteString("\n")
 	}

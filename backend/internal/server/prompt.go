@@ -730,6 +730,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	var fixupExpectedHeadSHA string
 	var fixupApplyPatches []fixupApplyPatch
 	if stage.Type == run.StageTypeImplement {
+		// Run/stage ids for the implement prompt's scope self-exempt sidecar
+		// path (#1153). Populated only on the implement path; plan/review
+		// triggers leave them empty so buildImplement omits the section.
+		trigger.ImplementRunID = runRow.ID.String()
+		trigger.ImplementStageID = stage.ID.String()
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -998,6 +1003,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	var fixupExpectedHeadSHA string
 	var fixupApplyPatches []fixupApplyPatch
 	if stage.Type == run.StageTypeImplement {
+		// Run/stage ids for the implement prompt's scope self-exempt sidecar
+		// path (#1153). Populated only on the implement path; plan/review
+		// triggers leave them empty so buildImplement omits the section.
+		trigger.ImplementRunID = runRow.ID.String()
+		trigger.ImplementStageID = stage.ID.String()
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",

@@ -2558,6 +2558,114 @@ func TestGateEvidenceForReview_PropagatesSuperseded(t *testing.T) {
 	}
 }
 
+// TestGateEvidenceForReview_MapsScopeExemptions pins the bundle→prompt mapping
+// for the scope self-exemptions (#1153): each validated path/reason crosses
+// gateEvidenceForReview into prompt.GateScopeExemption so writeGateEvidence can
+// render them for the reviewer.
+func TestGateEvidenceForReview_MapsScopeExemptions(t *testing.T) {
+	ev := bundle.GateEvidence{
+		ScopeExemptions: []bundle.ScopeExemptionEvidence{
+			{Path: "a.go", Reason: "already correct"},
+			{Path: "b.go", Reason: "no change needed"},
+		},
+	}
+	got := gateEvidenceForReview(ev)
+	want := []prompt.GateScopeExemption{
+		{Path: "a.go", Reason: "already correct"},
+		{Path: "b.go", Reason: "no change needed"},
+	}
+	if len(got.ScopeExemptions) != len(want) {
+		t.Fatalf("ScopeExemptions = %+v, want %+v", got.ScopeExemptions, want)
+	}
+	for i, w := range want {
+		if got.ScopeExemptions[i] != w {
+			t.Errorf("ScopeExemptions[%d] = %+v, want %+v", i, got.ScopeExemptions[i], w)
+		}
+	}
+
+	ev.ScopeExemptions = nil
+	if none := gateEvidenceForReview(ev); none.ScopeExemptions != nil {
+		t.Errorf("nil exemptions input mapped to %+v, want nil", none.ScopeExemptions)
+	}
+}
+
+// TestScopeExemption_GateEvidence_EndToEnd is the #1153 cross-boundary
+// integration test (binding condition 3): a validated exemption set flows
+// across EVERY serialized seam in one test — the runner's gate_evidence wire
+// payload (the exact JSON composeGateEvidence emits, scope_exemptions tag and
+// all) -> bundle.ExtractGateEvidence (bundle.GateEvidence) ->
+// gateEvidenceForReview (prompt.GateEvidence) -> the writeGateEvidence-rendered
+// implement-review text. A drift in any json tag or mapping along the chain
+// breaks the rendered assertion, unlike the four independent per-layer tests.
+func TestScopeExemption_GateEvidence_EndToEnd(t *testing.T) {
+	// The runner's gate_evidence wire payload (composeGateEvidence output shape).
+	gatePayload, err := json.Marshal(map[string]any{
+		"scope_facts": map[string]any{"declared_files": 3},
+		"scope_exemptions": []map[string]any{
+			{"path": "pkg/foo/foo.go", "reason": "already correct after the helper change"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type line struct {
+		Seq  int             `json:"seq"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	lines := []line{
+		{Seq: 1, Kind: bundle.EventKindManifest, Data: mdata},
+		{Seq: 2, Kind: bundle.EventKindGateEvidence, Data: gatePayload},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, merr := json.Marshal(l)
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, werr := w.Write(raw.Bytes()); werr != nil {
+		t.Fatal(werr)
+	}
+	if cerr := w.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+
+	// Seam 1: runner wire JSON -> bundle.GateEvidence.
+	ev, err := bundle.ExtractGateEvidence(gz.Bytes())
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if len(ev.ScopeExemptions) != 1 || ev.ScopeExemptions[0].Path != "pkg/foo/foo.go" {
+		t.Fatalf("bundle.GateEvidence.ScopeExemptions = %+v", ev.ScopeExemptions)
+	}
+	// Seam 2: bundle.GateEvidence -> prompt.GateEvidence.
+	pe := gateEvidenceForReview(ev)
+	// Seam 3: prompt.GateEvidence -> writeGateEvidence-rendered reviewer text.
+	got, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: &plan.Plan{PlanVersion: "standard_v1", Summary: "scope-exempt e2e"},
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: pe,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	if !strings.Contains(got, "Self-exempted declared scope files") ||
+		!strings.Contains(got, "pkg/foo/foo.go — already correct after the helper change") {
+		t.Errorf("end-to-end exemption did not reach the rendered reviewer text:\n%s", got)
+	}
+}
+
 // cannedComparePatchClient builds a githubclient.Client whose compare
 // endpoint returns the given canned JSON, for the #1060 consolidated-review
 // dispatch tests.

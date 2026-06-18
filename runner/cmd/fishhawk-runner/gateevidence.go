@@ -55,6 +55,22 @@ type gateEvidencePayload struct {
 	// binding conditions were machine-verified. Absent (the byte-identical
 	// default) when no assertions were declared.
 	BindingAssertions []bindingAssertionEvidence `json:"binding_assertions,omitempty"`
+	// ScopeExemptions digests the agent's validated scope self-exemptions
+	// (#1153): declared scope.files paths deliberately left unchanged and
+	// justified in-band, folded from the scope_files_exempted event. Absent
+	// when none were validated. The json tag MUST stay identical to the
+	// backend's bundle.ScopeExemptionEvidence mirror.
+	ScopeExemptions []scopeExemptionEvidence `json:"scope_exemptions,omitempty"`
+}
+
+// scopeExemptionEvidence is one validated scope self-exemption (#1153): a
+// declared scope.files path the agent deliberately left unchanged plus the
+// reason. The json tags MUST stay identical to the backend's
+// bundle.ScopeExemptionEvidence mirror — the same lockstep runner↔backend wire
+// contract as the parent payload.
+type scopeExemptionEvidence struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // bindingAssertionEvidence is one digested binding-assertion check (#1171):
@@ -154,7 +170,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 	gateRan := false
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted":
 			gateRan = true
 		}
 	}
@@ -244,6 +260,14 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 				continue
 			}
 			payload.BindingAssertions = append(payload.BindingAssertions, w.Assertions...)
+		case "scope_files_exempted":
+			var w struct {
+				Exemptions []scopeExemptionEvidence `json:"exemptions"`
+			}
+			if json.Unmarshal(e.Payload, &w) != nil {
+				continue
+			}
+			payload.ScopeExemptions = append(payload.ScopeExemptions, w.Exemptions...)
 		case "git_diff":
 			var w struct {
 				NumFiles int `json:"num_files"`

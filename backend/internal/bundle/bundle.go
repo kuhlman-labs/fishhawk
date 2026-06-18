@@ -247,6 +247,21 @@ type GateEvidence struct {
 	// which binding conditions were machine-verified. Nil when no
 	// assertions were declared.
 	BindingAssertions []BindingAssertionEvidence `json:"binding_assertions,omitempty"`
+	// ScopeExemptions digests the agent's validated scope self-exemptions
+	// (#1153): declared scope.files paths the agent deliberately left
+	// unchanged and justified in-band, each with its reason, so the implement
+	// review sees what was self-exempted and why. Nil when none were validated.
+	ScopeExemptions []ScopeExemptionEvidence `json:"scope_exemptions,omitempty"`
+}
+
+// ScopeExemptionEvidence is one validated scope self-exemption (#1153): a
+// declared scope.files path the agent deliberately left unchanged plus the
+// reason. Mirrors the runner's scopeExemptionEvidence — the json tags MUST
+// stay identical to the composer, same lockstep wire contract as the parent
+// payload.
+type ScopeExemptionEvidence struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // BindingAssertionEvidence is one digested binding-assertion check (#1171):

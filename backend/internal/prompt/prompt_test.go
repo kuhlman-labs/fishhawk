@@ -1444,6 +1444,77 @@ func TestBuild_Implement_ScopeConstraint_Nil_SectionAbsent(t *testing.T) {
 	}
 }
 
+func TestBuild_Implement_ScopeSelfExempt_RendersKeyedPath(t *testing.T) {
+	// #1153: the standalone implement prompt renders the scope self-exempt
+	// section with the run/stage-keyed sidecar path and the literal run_id /
+	// stage_id the agent must embed. Condition 2 (format-drift): the test
+	// asserts the LITERAL path string with concrete substituted ids — NOT the
+	// output of ScopeJustificationPath — so a one-sided edit to either module's
+	// format string is caught.
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		ImplementRunID:   runID,
+		ImplementStageID: stageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wantPath := "/tmp/fishhawk-scope-justifications-" + runID + "-" + stageID + ".json"
+	for _, w := range []string{
+		"### Deliberately-unchanged declared scope files",
+		wantPath,
+		`"run_id":"` + runID + `"`,
+		`"stage_id":"` + stageID + `"`,
+		"Only a CONCRETE declared scope.files path can be exempted",
+		"fail-closed",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("self-exempt prompt missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Implement_ScopeSelfExempt_AbsentForDecomposedChild(t *testing.T) {
+	// #1153: a decomposed child (ScopeConstraint != nil) is excluded from the
+	// scope-completeness gate, so it is never instructed to write a sidecar —
+	// the section is omitted even when the run/stage ids are populated.
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		ImplementRunID:   "11112222333344445555666677778888",
+		ImplementStageID: "99990000aaaabbbbccccddddeeeeffff",
+		ScopeConstraint: &ScopeConstraint{
+			ScopeHint:   "Implement the foo helper in pkg/bar.",
+			ParentRunID: "00000000-0000-0000-0000-000000000009",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Deliberately-unchanged declared scope files") {
+		t.Errorf("self-exempt section must be absent for a decomposed child:\n%s", got)
+	}
+}
+
+func TestBuild_Implement_ScopeSelfExempt_AbsentWhenIDsUnset(t *testing.T) {
+	// #1153: a trigger missing the run/stage ids omits the section rather than
+	// rendering a malformed path.
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// ImplementRunID / ImplementStageID deliberately empty.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Deliberately-unchanged declared scope files") {
+		t.Errorf("self-exempt section must be absent when run/stage ids are unset:\n%s", got)
+	}
+}
+
 func TestBuild_Implement_ScopeConstraint_AppearsBeforePlan(t *testing.T) {
 	got, err := Build("implement", Trigger{
 		Repo:         "o/r",
@@ -3232,6 +3303,57 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 	// marker must NOT appear — only an absorbed iteration carries it (#1205).
 	if strings.Contains(got, "— SUPERSEDED (absorbed by the verify-fix loop") {
 		t.Errorf("no run is superseded here; SUPERSEDED marker must be absent:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_GateEvidence_RendersScopeExemptions(t *testing.T) {
+	// #1153: the Gate evidence section renders the agent's validated scope
+	// self-exemptions — each declared path it deliberately left unchanged plus
+	// the reason — with the binding instruction that the reviewer must judge
+	// whether each justification is sound.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 3},
+			ScopeExemptions: []GateScopeExemption{
+				{Path: "pkg/foo/foo.go", Reason: "already correct after the helper change"},
+				{Path: "pkg/foo/bar.go", Reason: "interface unchanged"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"Self-exempted declared scope files (agent justified leaving these unchanged):",
+		"You MUST judge whether each justification is sound",
+		"- pkg/foo/foo.go — already correct after the helper change",
+		"- pkg/foo/bar.go — interface unchanged",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("scope-exemption render missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_GateEvidence_NoScopeExemptionsSection(t *testing.T) {
+	// #1153 additive property: with no exemptions the self-exemption block is
+	// absent (the section header text never appears).
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 3},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Self-exempted declared scope files") {
+		t.Errorf("self-exemption block must be absent when none were exempted:\n%s", got)
 	}
 }
 
