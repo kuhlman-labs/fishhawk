@@ -611,6 +611,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// attempt. (The keyed path + embedded-id validation are the other two
 		// independent defenses.)
 		sweepStaleScopeJustification(cfg, logSink)
+		// Pre-invoke fix-up self-report sweep (#1210): delete any leftover
+		// self-report sidecar at THIS run/stage's keyed path before the agent
+		// runs, so a same-keyed leftover from a prior retry of this run/stage
+		// cannot bleed a stale claim into a fresh attempt. No-ops on every
+		// non-fix-up implement stage (the sidecar is fix-up-only).
+		sweepStaleFixupSelfReport(cfg, logSink)
 	}
 
 	// Run()-level restore net (#953, the #941 residual): the restore defers
@@ -1172,6 +1178,26 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		validatedExemptions = loadScopeExemptions(cfg, scopePaths(cfg.scopeFiles), logSink)
 		if len(validatedExemptions) > 0 {
 			res.Events = append(res.Events, scopeFilesExemptedEvent(cfg, validatedExemptions))
+		}
+	}
+
+	// Fix-up self-report divergence (#1210). On a fix-up pass — the complement
+	// of the scope self-exempt block's `!cfg.fixup` guard — read the agent's
+	// structured self-report sidecar (loadFixupSelfReport always consumes/sweeps
+	// it, even when no comparison is possible), compute the committed-tree verify
+	// outcome the runner ALREADY computed for this stage (the same value
+	// composeGateEvidence digests), and on a determinate disagreement append an
+	// ADVISORY fixup_selfreport_divergence event for the implement review to
+	// arbitrate. Placed AFTER the verify gates (runVerifyFixLoop /
+	// runVerifyGateCommitted) leave their events on res.Events and BEFORE
+	// composeGateEvidence folds it into gate_evidence. EVIDENCE ONLY: this block
+	// NEVER touches res.OK / res.FailureCategory / budget (that would reintroduce
+	// the #1150 budget-wedge family).
+	if stageType == "implement" && cfg.fixup {
+		claimed := loadFixupSelfReport(cfg, logSink)
+		actual := terminalVerifyOutcome(res.Events)
+		if fixupSelfReportDiverges(claimed, actual) {
+			res.Events = append(res.Events, fixupSelfReportDivergenceEvent(cfg, claimed, actual))
 		}
 	}
 
@@ -5138,6 +5164,156 @@ func scopeFilesExemptedEvent(cfg config, exemptions []scopeExemption) agent.Even
 			"run_id":     cfg.runID,
 			"stage_id":   cfg.stageID,
 			"exemptions": out,
+		}),
+	}
+}
+
+// fixupSelfReportDir is the directory the run/stage-keyed fix-up self-report
+// sidecar lives in (#1210). var (not const) so tests can redirect it to a
+// t.TempDir, avoiding /tmp pollution / parallel-test races — the same seam
+// pattern as scopeJustificationDir.
+var fixupSelfReportDir = "/tmp"
+
+// fixupSelfReportPath mirrors prompt.FixupSelfReportPath in the backend: the
+// run/stage-keyed path the fix-up agent writes its claimed verify outcome to
+// and the runner reads it from (#1210). The format string is hardcoded in both
+// independent modules by design — the same coordination as
+// scopeJustificationPath / ScopeJustificationPath. The FULL run + stage ids key
+// the path so a leftover sidecar from another run/stage can never collide (the
+// first of three freshness defenses; the others are the embedded-id validation
+// in loadFixupSelfReport and the pre-invoke sweep in run()).
+func fixupSelfReportPath(runID, stageID string) string {
+	return filepath.Join(fixupSelfReportDir, fmt.Sprintf("fishhawk-fixup-selfreport-%s-%s.json", runID, stageID))
+}
+
+// fixupSelfReport is the agent's structured self-report of its claimed verify
+// outcome on a fix-up pass (#1210). The json tags match the sidecar shape the
+// backend's writeFixupSelfReport instructs the agent to write: RunID/StageID
+// are the embedded freshness ids validated against cfg, VerifyStatus is the
+// claimed committed-tree verify verdict ("passed" | "failed").
+type fixupSelfReport struct {
+	RunID        string `json:"run_id"`
+	StageID      string `json:"stage_id"`
+	VerifyStatus string `json:"verify_status"`
+}
+
+// sweepStaleFixupSelfReport deletes any leftover fix-up self-report sidecar at
+// this run/stage's keyed path before the agent is invoked (#1210) — the
+// pre-invoke freshness defense mirroring sweepStaleScopeJustification. Best-
+// effort: a not-exist (the common case, including every non-fix-up implement
+// stage) is silent; a leftover actually removed emits fixup_selfreport_swept.
+func sweepStaleFixupSelfReport(cfg config, logSink io.Writer) {
+	path := fixupSelfReportPath(cfg.runID, cfg.stageID)
+	if rerr := os.Remove(path); rerr == nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"fixup_selfreport_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+	}
+}
+
+// loadFixupSelfReport reads + validates the agent's fix-up self-report sidecar
+// (#1210) fail-closed, mirroring loadScopeExemptions byte-for-byte in shape. An
+// absent (or unreadable) sidecar returns "" — the common no-op, no log. On a
+// present sidecar it deletes the file on EVERY return path (consumed/malformed/
+// stale all clean up, so an invalid sidecar is never left behind to bleed into a
+// later read), and:
+//   - fails closed ("") on malformed JSON, logging fixup_selfreport_invalid;
+//   - fails closed ("") when the embedded run_id/stage_id do not match cfg,
+//     logging fixup_selfreport_stale (a leftover from another run/stage);
+//   - fails closed ("") when verify_status is not in {"passed","failed"}
+//     (including absent/empty), logging fixup_selfreport_status_ignored.
+//
+// Returns the validated claimed verify status ("passed" | "failed") or "".
+func loadFixupSelfReport(cfg config, logSink io.Writer) string {
+	path := fixupSelfReportPath(cfg.runID, cfg.stageID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		// Absent sidecar is the common no-op (the agent reported nothing); any
+		// other read error is fail-closed too. Only an existing file's content
+		// can claim anything, so no log on the not-exist path.
+		return ""
+	}
+	// A present sidecar is consumed regardless of outcome: remove it on every
+	// return path so a malformed/stale/parsed sidecar is never left behind.
+	defer func() { _ = os.Remove(path) }()
+
+	var doc fixupSelfReport
+	if json.Unmarshal(raw, &doc) != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"fixup_selfreport_invalid","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+		return ""
+	}
+	if doc.RunID != cfg.runID || doc.StageID != cfg.stageID {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"fixup_selfreport_stale","run_id":%q,"stage_id":%q,"sidecar_run_id":%q,"sidecar_stage_id":%q}`+"\n",
+			cfg.runID, cfg.stageID, doc.RunID, doc.StageID)
+		return ""
+	}
+	if doc.VerifyStatus != "passed" && doc.VerifyStatus != "failed" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"fixup_selfreport_status_ignored","run_id":%q,"stage_id":%q,"verify_status":%q}`+"\n",
+			cfg.runID, cfg.stageID, doc.VerifyStatus)
+		return ""
+	}
+	return doc.VerifyStatus
+}
+
+// terminalVerifyOutcome returns the committed-tree verify verdict already on the
+// bundle for this stage (#1210): the verify_summary.Outcome when a verify_summary
+// event is present (the fix-loop's authoritative terminal outcome), else the LAST
+// verify_run.Outcome (which agrees with verify_summary and is the non-superseded
+// committed-tree result per the #1205 comment), else "" when no verify gate ran.
+// The vocabulary is the production verify literals "passed" | "failed" | "skipped"
+// emitted by runVerifyFixLoop's verify_summary and verifyRunEvent; "" and
+// "skipped" are indeterminate to the divergence detector below.
+func terminalVerifyOutcome(events []agent.Event) string {
+	lastRun := ""
+	for _, e := range events {
+		switch e.Kind {
+		case "verify_summary":
+			var w struct {
+				Outcome string `json:"outcome"`
+			}
+			if json.Unmarshal(e.Payload, &w) == nil && w.Outcome != "" {
+				return w.Outcome
+			}
+		case "verify_run":
+			var w struct {
+				Outcome string `json:"outcome"`
+			}
+			if json.Unmarshal(e.Payload, &w) == nil {
+				lastRun = w.Outcome
+			}
+		}
+	}
+	return lastRun
+}
+
+// fixupSelfReportDiverges is the pure advisory divergence decision (#1210):
+// true iff BOTH the claimed and actual verify statuses are determinate
+// ("passed" | "failed") AND they disagree. Any indeterminate side (actual ""/
+// "skipped", an absent/invalid claim "") yields false — conservative, near-zero
+// false positives (the indeterminate sides never fire a spurious honesty flag).
+func fixupSelfReportDiverges(claimed, actual string) bool {
+	determinate := func(s string) bool { return s == "passed" || s == "failed" }
+	return determinate(claimed) && determinate(actual) && claimed != actual
+}
+
+// fixupSelfReportDivergenceEvent builds the advisory fixup_selfreport_divergence
+// trace event (#1210) composeGateEvidence folds into gate_evidence. The payload
+// carries the agent's CLAIMED verify status and the runner's ACTUAL committed-
+// tree verify outcome so the implement review can arbitrate the honesty flag.
+// ADVISORY ONLY: it never demotes res.OK / res.FailureCategory and never affects
+// budget.
+func fixupSelfReportDivergenceEvent(cfg config, claimed, actual string) agent.Event {
+	return agent.Event{
+		Kind: "fixup_selfreport_divergence",
+		Payload: agent.MakePayload(map[string]any{
+			"run_id":                cfg.runID,
+			"stage_id":              cfg.stageID,
+			"claimed_verify_status": claimed,
+			"actual_verify_status":  actual,
 		}),
 	}
 }

@@ -61,6 +61,24 @@ type gateEvidencePayload struct {
 	// when none were validated. The json tag MUST stay identical to the
 	// backend's bundle.ScopeExemptionEvidence mirror.
 	ScopeExemptions []scopeExemptionEvidence `json:"scope_exemptions,omitempty"`
+	// FixupSelfReportDivergence digests the ADVISORY fix-up self-report
+	// divergence (#1210): on a fix-up pass the agent CLAIMED a verify outcome
+	// (via its structured sidecar) that disagreed with the committed-tree verify
+	// outcome the runner computed. Folded from the fixup_selfreport_divergence
+	// event. Absent (the byte-identical default) when there was no fix-up pass,
+	// no claim, or claim and reality agreed. The json tag MUST stay identical to
+	// the backend's bundle.FixupSelfReportDivergenceEvidence mirror.
+	FixupSelfReportDivergence *fixupSelfReportDivergenceEvidence `json:"fixup_selfreport_divergence,omitempty"`
+}
+
+// fixupSelfReportDivergenceEvidence digests an advisory fix-up self-report
+// divergence (#1210): the agent's claimed verify status vs the runner's actual
+// committed-tree verify outcome. The json tags MUST stay identical to the
+// backend's bundle.FixupSelfReportDivergenceEvidence mirror — the same lockstep
+// runner↔backend wire contract as the parent payload.
+type fixupSelfReportDivergenceEvidence struct {
+	ClaimedVerifyStatus string `json:"claimed_verify_status"`
+	ActualVerifyStatus  string `json:"actual_verify_status"`
 }
 
 // scopeExemptionEvidence is one validated scope self-exemption (#1153): a
@@ -170,7 +188,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 	gateRan := false
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence":
 			gateRan = true
 		}
 	}
@@ -268,6 +286,18 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 				continue
 			}
 			payload.ScopeExemptions = append(payload.ScopeExemptions, w.Exemptions...)
+		case "fixup_selfreport_divergence":
+			var w struct {
+				ClaimedVerifyStatus string `json:"claimed_verify_status"`
+				ActualVerifyStatus  string `json:"actual_verify_status"`
+			}
+			if json.Unmarshal(e.Payload, &w) != nil {
+				continue
+			}
+			payload.FixupSelfReportDivergence = &fixupSelfReportDivergenceEvidence{
+				ClaimedVerifyStatus: w.ClaimedVerifyStatus,
+				ActualVerifyStatus:  w.ActualVerifyStatus,
+			}
 		case "git_diff":
 			var w struct {
 				NumFiles int `json:"num_files"`

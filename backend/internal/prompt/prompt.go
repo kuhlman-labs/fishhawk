@@ -79,6 +79,22 @@ func ScopeJustificationPath(runID, stageID string) string {
 	return fmt.Sprintf("/tmp/fishhawk-scope-justifications-%s-%s.json", runID, stageID)
 }
 
+// FixupSelfReportPath is the run/stage-keyed path the fix-up agent writes its
+// claimed verify-outcome sidecar to (#1210) and the runner reads it from. Keyed
+// by the FULL run id + stage id (same rationale as ScopeJustificationPath) so a
+// leftover sidecar from a different run/stage can never collide — the first of
+// three freshness defenses (the others being the embedded-id validation and the
+// pre-invoke delete in the runner).
+//
+// The runner mirrors this EXACT format string in fixupSelfReportPath
+// (runner/cmd/fishhawk-runner/main.go) — the same independent-module
+// coordination as ScopeJustificationPath / scopeJustificationPath. A one-sided
+// edit to either format string is caught by the prompt-render test (asserts the
+// literal substituted path) plus the runner load test.
+func FixupSelfReportPath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-fixup-selfreport-%s-%s.json", runID, stageID)
+}
+
 // CalibrationBand holds accuracy statistics for a single confidence level
 // (high / medium / low) within a calibration window.
 type CalibrationBand struct {
@@ -378,6 +394,22 @@ type GateEvidence struct {
 	// is sound. Nil (no sidecar, all entries failed validation, or any
 	// non-implement build) omits the section.
 	ScopeExemptions []GateScopeExemption
+	// FixupSelfReportDivergence carries the ADVISORY fix-up self-report
+	// divergence (#1210): on a fix-up pass the agent CLAIMED a verify outcome
+	// that disagreed with the committed-tree verify outcome the runner computed.
+	// writeGateEvidence renders it as an honesty flag for the reviewer to
+	// arbitrate. Nil (no fix-up pass, no claim, or claim and reality agreed)
+	// omits the section. Advisory only — it never failed or re-opened the pass.
+	FixupSelfReportDivergence *GateFixupSelfReportDivergence
+}
+
+// GateFixupSelfReportDivergence is the advisory fix-up self-report divergence
+// (#1210): the agent's claimed verify status vs the runner's actual committed-
+// tree verify outcome. The prompt-side mirror of
+// bundle.FixupSelfReportDivergenceEvidence.
+type GateFixupSelfReportDivergence struct {
+	ClaimedVerifyStatus string
+	ActualVerifyStatus  string
 }
 
 // GateScopeExemption is one validated scope self-exemption (#1153): a declared
@@ -1003,6 +1035,35 @@ func writeScopeSelfExempt(b *strings.Builder, t Trigger) {
 		"surfaced to the reviewer.\n\n")
 }
 
+// writeFixupSelfReport renders the "### Report your verify outcome" block for
+// the slim fix-up prompt (#1210): the agent writes a tiny run/stage-keyed JSON
+// sidecar to FixupSelfReportPath declaring the verify outcome it claims its
+// change produced. The runner validates the sidecar fail-closed (well-formed
+// JSON, embedded run_id/stage_id matching this stage, verify_status one of the
+// two recognized literals) and deterministically compares the claim against the
+// committed-tree verify outcome it already computed; a determinate disagreement
+// is surfaced to the reviewer as an ADVISORY honesty cross-check. It NEVER fails,
+// re-opens, or re-budgets the pass — stated plainly so the agent is not nudged to
+// game it. Fix-up-only: NOT rendered by the full buildImplement prompt.
+func writeFixupSelfReport(b *strings.Builder, t Trigger) {
+	path := FixupSelfReportPath(t.ImplementRunID, t.ImplementStageID)
+	b.WriteString("### Report your verify outcome\n\n")
+	b.WriteString("After you have made your change, run the project's verify gate and report the outcome you " +
+		"observed by writing a small JSON sidecar. This is an advisory honesty cross-check: the runner compares " +
+		"your claimed outcome against the verify outcome it independently computes on the committed tree, and " +
+		"surfaces any disagreement to the reviewer. It does NOT fail, re-open, or re-budget this pass — report " +
+		"truthfully.\n\n")
+	fmt.Fprintf(b, "Write a JSON sidecar to `%s` with this shape:\n\n", path)
+	b.WriteString("```json\n")
+	fmt.Fprintf(b, "{\"run_id\":%q,\"stage_id\":%q,\"verify_status\":\"passed\"}\n",
+		t.ImplementRunID, t.ImplementStageID)
+	b.WriteString("```\n\n")
+	b.WriteString("Rules:\n\n")
+	b.WriteString("- `run_id` and `stage_id` MUST be exactly the values shown above. A mismatch is ignored.\n")
+	b.WriteString("- `verify_status` MUST be one of exactly `passed` (the verify gate passed on your change) or " +
+		"`failed` (it did not). Any other value, or an absent sidecar, is ignored — no divergence is reported.\n\n")
+}
+
 // writeGitOpsProhibition renders the line forbidding the agent from running
 // any branch/commit-mutating git command — the runner owns all version
 // control and the shared checkout. Shared by the full implement prompt and
@@ -1067,6 +1128,15 @@ func buildImplementFixup(t Trigger) string {
 
 	// The same scope contract governs the fix-up commit.
 	writeScopeAmendments(&b)
+
+	// Advisory verify-outcome self-report (#1210): fix-up-only honesty cross-
+	// check, surfaced to the reviewer via gate_evidence. Placed after the scope
+	// block and before the git-ops prohibition. Guarded on the populated run/
+	// stage ids so a trigger missing them omits the section rather than rendering
+	// a malformed (run/stage-unkeyed) sidecar path the runner would never read.
+	if t.ImplementRunID != "" && t.ImplementStageID != "" {
+		writeFixupSelfReport(&b, t)
+	}
 
 	writeGitOpsProhibition(&b)
 	return b.String()
@@ -1973,6 +2043,18 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 			fmt.Fprintf(b, "- %s — %s\n", ex.Path, ex.Reason)
 		}
 		b.WriteString("\n")
+	}
+
+	if ev.FixupSelfReportDivergence != nil {
+		b.WriteString("### Fix-up self-report divergence (advisory honesty flag)\n\n")
+		fmt.Fprintf(b, "On this fix-up pass the agent CLAIMED the verify gate `%s`, but the runner's "+
+			"committed-tree verify gate `%s`. The agent's self-reported outcome disagrees with the machine-"+
+			"verified outcome of the committed tree.\n\n",
+			ev.FixupSelfReportDivergence.ClaimedVerifyStatus, ev.FixupSelfReportDivergence.ActualVerifyStatus)
+		b.WriteString("This is an ADVISORY signal — it did NOT fail or re-open the pass. Arbitrate it: the " +
+			"committed-tree verify outcome above is authoritative, so weigh whether the agent's change actually " +
+			"does what its PR body claims, and name a concern if the divergence indicates an unsound or " +
+			"misrepresented change.\n\n")
 	}
 
 	if len(ev.PolicyViolations) > 0 {
