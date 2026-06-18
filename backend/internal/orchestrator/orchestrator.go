@@ -1769,6 +1769,21 @@ func pullRequestNumberFromURL(u string) (int, error) {
 // fireDispatch builds a RepoRef + dispatch inputs and calls the
 // GitHub client. Skips silently when GitHub or InstallationID
 // isn't configured (e.g., trigger_source=cli runs).
+//
+// This same runner-kind-aware path OWNS Actions decomposed-child dispatch
+// (E24.5 / #1145). Each github_actions decomposed child auto-advances
+// through here via DispatchDecomposedChildren -> Advance and fires its OWN
+// workflow_dispatch carrying its own run_id/stage_id against the base ref
+// (o.DefaultRef) — so the child runner checks out its own sole-writer slice
+// branch fishhawk/run-<parent>/slice-<idx> and pushes a distinct branch
+// name, never colliding with a sibling. The runner — NOT the dispatch —
+// derives that slice branch by fetching decomposed_from + slice_index from
+// the stage-details endpoint keyed by run_id; no NEW workflow_dispatch input
+// is added because GitHub rejects inputs not declared in the customer-side
+// .github/workflows/fishhawk.yml with a 422 "Unexpected inputs provided",
+// and the existing run_id/stage_id inputs are already sufficient. For a
+// decomposed child the dispatch is annotated with structured slice_index /
+// decomposed_from log fields so the per-slice fan-out is observable.
 func (o *Orchestrator) fireDispatch(ctx context.Context, r *run.Run, next *run.Stage) error {
 	if o.GitHub == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping workflow_dispatch",
@@ -1795,6 +1810,21 @@ func (o *Orchestrator) fireDispatch(ctx context.Context, r *run.Run, next *run.S
 	actionsFile := o.ActionsWorkflowFile
 	if actionsFile == "" {
 		actionsFile = "fishhawk.yml"
+	}
+
+	// E24.5: annotate a decomposed child's workflow_dispatch with its slice
+	// provenance so the per-slice Actions fan-out is observable. Each child
+	// fires its OWN dispatch (own run_id/stage_id, base ref) and the runner
+	// derives the sole-writer slice branch from the stage-details endpoint —
+	// no new dispatch input is added (see the doc comment).
+	if r.DecomposedFrom != nil && r.SliceIndex != nil {
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator dispatching decomposed-child workflow_dispatch",
+			slog.String("run_id", r.ID.String()),
+			slog.String("stage_id", next.ID.String()),
+			slog.Int("slice_index", *r.SliceIndex),
+			slog.String("decomposed_from", r.DecomposedFrom.String()),
+			slog.String("ref", ref),
+		)
 	}
 
 	return o.GitHub.DispatchWorkflow(ctx, *r.InstallationID, repo,

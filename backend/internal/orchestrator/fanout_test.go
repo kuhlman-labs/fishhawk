@@ -861,6 +861,219 @@ func TestFanout_BestEffortDispatchDoesNotUnwind(t *testing.T) {
 	}
 }
 
+// --- E24.5 / #1145: GitHub Actions parallel child dispatch ----------------
+
+// implStageID returns the id of runID's implement stage.
+func implStageID(t *testing.T, rs *fanoutRunsRepo, runID uuid.UUID) uuid.UUID {
+	t.Helper()
+	stages, err := rs.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	for _, s := range stages {
+		if s.Type == run.StageTypeImplement {
+			return s.ID
+		}
+	}
+	t.Fatalf("no implement stage for run %s", runID)
+	return uuid.Nil
+}
+
+// setChildInstallation stamps installationID on each child run so its
+// fireDispatch reaches the real DispatchWorkflow arm. mintPendingChildren's
+// CreateRunParams does NOT propagate the parent's InstallationID to children
+// (production fanoutIfDecomposed does), and fireDispatch reads the CHILD
+// run's InstallationID — so setting it on the seeded parent alone would skip
+// the dispatch arm and len(stub.calls)==childCount would fail (#1145).
+func setChildInstallation(children []*run.Run, installationID int64) {
+	for _, c := range children {
+		id := installationID
+		c.InstallationID = &id
+	}
+}
+
+// TestDispatchDecomposedChildren_GitHubActions_FiresPerChildDispatch is the
+// DONE-MEANS test at the orchestrator->GitHubAPI seam: a github_actions
+// decomposed parent with an unlimited cap (0) fires exactly ONE
+// workflow_dispatch per child — each carrying that child's own run_id and
+// implement stage_id (pairwise distinct across calls, proving each child
+// checks out its own slice branch and pushes a distinct branch with no
+// collision) against the base ref (o.DefaultRef).
+func TestDispatchDecomposedChildren_GitHubActions_FiresPerChildDispatch(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	children := mintPendingChildren(t, rs, parent.ID, 3, run.RunnerKindGitHubActions)
+	setChildInstallation(children, 42)
+
+	gh := &stubGitHub{}
+	au := &recordingAudit{}
+	o := &Orchestrator{
+		Runs:                rs,
+		GitHub:              gh,
+		Logger:              slog.Default(),
+		Audit:               au,
+		DefaultRef:          "main",
+		MaxParallelChildren: 0, // unlimited
+		Drive:               &drive.Engine{Audit: au},
+	}
+
+	n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("DispatchDecomposedChildren: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("dispatched = %d, want 3", n)
+	}
+
+	gh.mu.Lock()
+	calls := append([]dispatchCall(nil), gh.calls...)
+	gh.mu.Unlock()
+	if len(calls) != len(children) {
+		t.Fatalf("workflow_dispatch calls = %d, want %d (one per child)", len(calls), len(children))
+	}
+
+	// Build the expected run_id -> implement stage_id map for the children.
+	wantStageByRun := map[string]string{}
+	for _, c := range children {
+		wantStageByRun[c.ID.String()] = implStageID(t, rs, c.ID).String()
+	}
+
+	seenRun := map[string]bool{}
+	seenStage := map[string]bool{}
+	for i, call := range calls {
+		if call.Ref != o.DefaultRef {
+			t.Errorf("call %d Ref = %q, want %q (the base each slice cuts from)", i, call.Ref, o.DefaultRef)
+		}
+		if call.InstallationID != 42 {
+			t.Errorf("call %d InstallationID = %d, want 42", i, call.InstallationID)
+		}
+		runID := call.Inputs["run_id"]
+		stageID := call.Inputs["stage_id"]
+		wantStage, ok := wantStageByRun[runID]
+		if !ok {
+			t.Errorf("call %d run_id = %q is not a minted child", i, runID)
+			continue
+		}
+		if stageID != wantStage {
+			t.Errorf("call %d stage_id = %q, want %q (child %s implement stage)", i, stageID, wantStage, runID)
+		}
+		// Pairwise distinct run_id + stage_id across calls — proves per-slice
+		// independence (no shared branch target).
+		if seenRun[runID] {
+			t.Errorf("call %d run_id = %q duplicated across dispatch calls", i, runID)
+		}
+		if seenStage[stageID] {
+			t.Errorf("call %d stage_id = %q duplicated across dispatch calls", i, stageID)
+		}
+		seenRun[runID] = true
+		seenStage[stageID] = true
+	}
+}
+
+// TestDispatchDecomposedChildren_GitHubActions_CapThrottlesDispatch is the
+// Actions analogue of TestDispatchDecomposedChildren_CapThrottles asserted at
+// the dispatch-CALL boundary: cap=2 with 5 children fires exactly 2
+// workflow_dispatch calls (the two earliest slice indices) and leaves 3
+// children pending.
+func TestDispatchDecomposedChildren_GitHubActions_CapThrottlesDispatch(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	children := mintPendingChildren(t, rs, parent.ID, 5, run.RunnerKindGitHubActions)
+	setChildInstallation(children, 42)
+
+	gh := &stubGitHub{}
+	au := &recordingAudit{}
+	o := &Orchestrator{
+		Runs:                rs,
+		GitHub:              gh,
+		Logger:              slog.Default(),
+		Audit:               au,
+		DefaultRef:          "main",
+		MaxParallelChildren: 2,
+		Drive:               &drive.Engine{Audit: au},
+	}
+
+	n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("DispatchDecomposedChildren: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("dispatched = %d, want 2 (cap binds)", n)
+	}
+
+	gh.mu.Lock()
+	calls := append([]dispatchCall(nil), gh.calls...)
+	gh.mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("workflow_dispatch calls = %d, want 2 (throttled at the dispatch boundary)", len(calls))
+	}
+
+	// The two dispatched calls are the two earliest slices (0, 1).
+	wantRuns := map[string]bool{}
+	for _, c := range children {
+		if *c.SliceIndex < 2 {
+			wantRuns[c.ID.String()] = true
+		}
+	}
+	for i, call := range calls {
+		runID := call.Inputs["run_id"]
+		if !wantRuns[runID] {
+			t.Errorf("call %d run_id = %q, want one of the two earliest slices", i, runID)
+		}
+	}
+	if got := countByState(children, run.StatePending); got != 3 {
+		t.Errorf("pending children = %d, want 3 (throttled)", got)
+	}
+}
+
+// TestDispatchDecomposedChildren_GitHubActions_NilInstallationSkipsDispatch
+// asserts fireDispatch's graceful-skip arm: a github_actions child with nil
+// InstallationID records ZERO workflow_dispatch calls but still advances run
+// state (run running, implement stage dispatched).
+func TestDispatchDecomposedChildren_GitHubActions_NilInstallationSkipsDispatch(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	children := mintPendingChildren(t, rs, parent.ID, 1, run.RunnerKindGitHubActions)
+	// Deliberately leave the child's InstallationID nil to exercise the skip
+	// arm — fireDispatch must not reach DispatchWorkflow.
+
+	gh := &stubGitHub{}
+	au := &recordingAudit{}
+	o := &Orchestrator{
+		Runs:                rs,
+		GitHub:              gh,
+		Logger:              slog.Default(),
+		Audit:               au,
+		DefaultRef:          "main",
+		MaxParallelChildren: 0,
+		Drive:               &drive.Engine{Audit: au},
+	}
+
+	n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("DispatchDecomposedChildren: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("dispatched = %d, want 1 (run-state advance even without installation)", n)
+	}
+
+	gh.mu.Lock()
+	got := len(gh.calls)
+	gh.mu.Unlock()
+	if got != 0 {
+		t.Errorf("workflow_dispatch calls = %d, want 0 (nil installation skips dispatch)", got)
+	}
+
+	// Run state still advanced: child running, implement stage dispatched.
+	child := children[0]
+	if child.State != run.StateRunning {
+		t.Errorf("child state = %q, want running (advanced despite skipped dispatch)", child.State)
+	}
+	if st := implState(t, rs, child.ID); st != run.StageStateDispatched {
+		t.Errorf("child implement state = %q, want dispatched", st)
+	}
+}
+
 // ensure plan parses the schema_version field as we expect.
 func TestDecomposedPlanShape(t *testing.T) {
 	b := decomposedPlanBytes(t, []string{"A"})
