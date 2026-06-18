@@ -31,6 +31,8 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -137,6 +139,15 @@ type Orchestrator struct {
 	// the resolved value lands in E24.3 (#1143) — all children are still
 	// minted here.
 	MaxParallelChildren int
+
+	// Drive, when wired, emits the run_auto_advanced audit trail for the
+	// decomposed-child dispatch (RuleChildrenDispatch, E24.3 / #1143) so
+	// each concurrent child dispatch is attributable to a named rule.
+	// Nil-safe: Engine.Record/Recorded guard a nil receiver, so an
+	// unwired Drive disables the audit while DispatchDecomposedChildren
+	// still dispatches the children (the dispatch is the shipped
+	// behavior; the audit is pure observability).
+	Drive *drive.Engine
 }
 
 // Outcome describes what Advance did. Useful for telemetry and
@@ -987,6 +998,19 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 		slog.Int("child_count", len(childIDs)),
 		slog.Int("effective_max_parallel", effectiveMaxParallel),
 	)
+
+	// Initial concurrent dispatch (E24.3 / #1143): dispatch the freshly
+	// minted children up to the resolved cap rather than leaving them
+	// pending for serial operator drive. Best-effort — a dispatch error
+	// does NOT unwind the fanout (the children are already minted and the
+	// parent is parked; the event-driven refill and the sweeper backstop
+	// will retry the undispatched ones).
+	if _, err := o.DispatchDecomposedChildren(ctx, parent.ID); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: initial decomposed-child dispatch failed; sweeper backstop will retry",
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 	return true, nil
 }
 
@@ -1019,6 +1043,154 @@ func (o *Orchestrator) resolveEffectiveMaxParallel(ctx context.Context, parent *
 		return o.MaxParallelChildren
 	}
 	return wf.EffectiveMaxParallel(o.MaxParallelChildren)
+}
+
+// DispatchDecomposedChildren dispatches a decomposed parent's pending
+// child runs concurrently, up to the resolved concurrency cap (E24.3 /
+// ADR-041 / #1143). It is the backend-agnostic orchestration seam: the
+// per-backend dispatch mechanics (local host-spawn vs Actions
+// workflow_dispatch) stay owned by the existing runner-kind-aware
+// Advance/fireDispatch path (E24.4 / E24.5).
+//
+// It lists ALL children, partitions them into pending / in-flight /
+// terminal, resolves the cap, and consumes budget.ParallelDecision with
+// requested = the active (pending+in-flight) fan-out width. Headroom is
+// Allowed - in-flight, so as in-flight children settle the next pending
+// children dispatch to hold the active count at the cap. Pending
+// children dispatch in ascending SliceIndex order via o.Advance (the
+// same edge plan-approval dispatch uses). Returns the count dispatched.
+//
+// Best-effort + idempotent: in-flight children are counted from current
+// run state, so re-entrant/concurrent calls (fanout + the event-driven
+// refill + the sweeper backstop can overlap) bound to the cap, and
+// Advance same-state transitions no-op. The cap is a soft target — a
+// benign one-slot overshoot in a tight race is acceptable and never
+// strands or double-runs a child. A per-child Advance error is
+// WARN-logged and skipped so one undispatchable child cannot block the
+// others; only a parent-load or child-listing failure is returned.
+func (o *Orchestrator) DispatchDecomposedChildren(ctx context.Context, parentRunID uuid.UUID) (int, error) {
+	if o.Runs == nil {
+		return 0, errors.New("orchestrator: Runs is nil")
+	}
+	parent, err := o.Runs.GetRun(ctx, parentRunID)
+	if err != nil {
+		return 0, fmt.Errorf("orchestrator: get parent run: %w", err)
+	}
+	children, err := o.listAllDecomposedChildren(ctx, parentRunID)
+	if err != nil {
+		return 0, fmt.Errorf("orchestrator: list decomposed children: %w", err)
+	}
+
+	var pending, inFlight []*run.Run
+	for _, c := range children {
+		switch {
+		case c.State == run.StatePending:
+			pending = append(pending, c)
+		case !c.State.IsTerminal():
+			inFlight = append(inFlight, c)
+		}
+	}
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	cap := o.resolveEffectiveMaxParallel(ctx, parent)
+	decision := budget.ParallelDecision(len(pending)+len(inFlight), cap)
+	headroom := decision.Allowed - len(inFlight)
+	if headroom <= 0 {
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator: decomposed children at concurrency cap; no dispatch headroom",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.Int("pending", len(pending)),
+			slog.Int("in_flight", len(inFlight)),
+			slog.Int("allowed", decision.Allowed),
+			slog.Int("cap", cap),
+		)
+		return 0, nil
+	}
+
+	// Dispatch pending children in ascending slice-index order so the
+	// cap admits the earliest slices first (a nil SliceIndex sorts last).
+	sort.SliceStable(pending, func(i, j int) bool {
+		si, sj := pending[i].SliceIndex, pending[j].SliceIndex
+		switch {
+		case si == nil && sj == nil:
+			return pending[i].ID.String() < pending[j].ID.String()
+		case si == nil:
+			return false
+		case sj == nil:
+			return true
+		default:
+			return *si < *sj
+		}
+	})
+
+	dispatched := 0
+	for _, child := range pending {
+		if dispatched >= headroom {
+			break
+		}
+		if _, err := o.Advance(ctx, child.ID); err != nil {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: dispatch decomposed child failed",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("child_run_id", child.ID.String()),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		dispatched++
+		o.recordChildDispatch(ctx, child)
+	}
+
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator dispatched decomposed children",
+		slog.String("parent_run_id", parentRunID.String()),
+		slog.Int("dispatched", dispatched),
+		slog.Int("pending_before", len(pending)),
+		slog.Int("in_flight_before", len(inFlight)),
+		slog.Int("allowed", decision.Allowed),
+		slog.Bool("capped", decision.Capped),
+		slog.Int("cap", cap),
+	)
+	return dispatched, nil
+}
+
+// recordChildDispatch emits the RuleChildrenDispatch run_auto_advanced
+// entry for one dispatched child (E24.3 / #1143), anchored to the
+// child's implement stage. Best-effort + idempotent: a nil Drive engine
+// no-ops, Engine.Recorded dedups a re-dispatch, and the entry's
+// Parked/NextAction shape comes from drive.EvaluateChildrenDispatch
+// (local parks for a host-side dispatch; github_actions advances).
+func (o *Orchestrator) recordChildDispatch(ctx context.Context, child *run.Run) {
+	if o.Drive == nil {
+		return
+	}
+	var implStageID *uuid.UUID
+	if stages, err := o.Runs.ListStagesForRun(ctx, child.ID); err == nil {
+		for _, s := range stages {
+			if s.Type == run.StageTypeImplement {
+				id := s.ID
+				implStageID = &id
+				break
+			}
+		}
+	}
+	if o.Drive.Recorded(ctx, child.ID, implStageID, drive.RuleChildrenDispatch) {
+		return
+	}
+	out := drive.EvaluateChildrenDispatch(child.RunnerKind)
+	adv := drive.Advance{
+		Rule: drive.RuleChildrenDispatch,
+		From: "implement:awaiting_children_child",
+	}
+	if out.Advance {
+		adv.To = "implement:dispatched"
+		adv.Event = "decomposed parent dispatched child run via the runner-kind-aware Advance edge"
+	} else {
+		adv.To = "implement:ready"
+		adv.Event = "decomposed parent: runner_kind local parks the child for a host-side dispatch"
+		adv.Parked = true
+		adv.NextAction = out.NextAction
+	}
+	o.Drive.Record(ctx, child.ID, implStageID, adv)
 }
 
 // loadApprovedPlan returns the parsed standard_v1 plan from the
@@ -1185,6 +1357,18 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 	var failedChildren []*run.Run
 	for _, c := range children {
 		if !c.State.IsTerminal() {
+			// Event-driven refill (E24.3 / #1143): not all children are
+			// terminal yet, so the parent stays parked — but a child just
+			// settled, which may have freed a concurrency slot. Top up the
+			// dispatch to the cap before returning so the next pending
+			// children start as in-flight ones finish. Best-effort
+			// WARN-on-error; the sweeper backstop covers a miss.
+			if _, derr := o.DispatchDecomposedChildren(ctx, parentRunID); derr != nil {
+				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: event-driven decomposed-child refill failed",
+					slog.String("parent_run_id", parentRunID.String()),
+					slog.String("error", derr.Error()),
+				)
+			}
 			return
 		}
 		if c.State == run.StateFailed {

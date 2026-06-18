@@ -64,6 +64,18 @@ const (
 	// never advances — the remediation (fix-up, an operator commit +
 	// vouch, or a checks re-run) stays the operator's call.
 	RuleCIFailed Rule = "ci_failed"
+	// RuleChildrenDispatch covers a decomposed parent parked in
+	// awaiting_children dispatching its pending child runs up to the
+	// resolved concurrency cap (E24.3 / ADR-041). The orchestrator's
+	// DispatchDecomposedChildren picks how many pending children to
+	// dispatch (consuming the E24.6 budget.ParallelDecision contract)
+	// and advances each via the existing runner-kind-aware Advance path:
+	// github_actions auto-advances (the Advance handoff IS the dispatch);
+	// local parks each child with a host-side run_implement_stage next
+	// action (the backend cannot host-spawn the local runner, ADR-024).
+	// This rule is the observability/classification layer only — it
+	// performs no state transition.
+	RuleChildrenDispatch Rule = "children_dispatch"
 )
 
 // Judgment points — never auto-advanced, drive or not. Enumerated so
@@ -87,6 +99,7 @@ var mechanical = map[Rule]bool{
 	RuleFixupRereviewRepark:      true,
 	RuleChecksGreenAwaitingMerge: true,
 	RuleCIFailed:                 true,
+	RuleChildrenDispatch:         true,
 	RuleGateApproval:             false,
 	RuleConcernRouting:           false,
 	RuleMerge:                    false,
@@ -129,6 +142,28 @@ func EvaluatePlanApproved(runnerKind string) Outcome {
 			NextAction: &NextAction{
 				Action: "run_implement_stage",
 				Detail: "runner_kind local: dispatch the implement stage from the operator host (fishhawk_run_stage implement)",
+			},
+		}
+	}
+	return Outcome{Advance: true}
+}
+
+// EvaluateChildrenDispatch classifies one decomposed child's
+// awaiting_children → dispatched transition for the child's runner
+// kind, mirroring EvaluatePlanApproved (the dispatch primitive is the
+// same runner-kind-aware Advance edge). github_actions auto-advances
+// (the orchestrator's Advance handoff fires the child's
+// workflow_dispatch); local parks with a ready-to-run next action
+// because the runner is a host-spawned subprocess (ADR-024) the
+// backend cannot start. It is the observability/classification layer
+// only — DispatchDecomposedChildren performs the transition.
+func EvaluateChildrenDispatch(runnerKind string) Outcome {
+	if runnerKind == run.RunnerKindLocal {
+		return Outcome{
+			Advance: false,
+			NextAction: &NextAction{
+				Action: "run_implement_stage",
+				Detail: "runner_kind local: dispatch the decomposed child's implement stage from the operator host (fishhawk_run_stage implement)",
 			},
 		}
 	}

@@ -599,3 +599,108 @@ func TestRun_RequiresAllDeps(t *testing.T) {
 func errIsMissingDeps(err error) bool {
 	return err != nil && err.Error() == "childcompletion: Runs, Audit, and Advance must all be set"
 }
+
+// recordingDispatcher records DispatchChildren calls for the backstop tests.
+type recordingDispatcher struct {
+	mu        sync.Mutex
+	calls     []uuid.UUID
+	returnN   int
+	returnErr error
+}
+
+func (d *recordingDispatcher) DispatchChildren(_ context.Context, parentRunID uuid.UUID) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = append(d.calls, parentRunID)
+	return d.returnN, d.returnErr
+}
+
+// TestResolveParent_BackstopDispatchesWhenNotAllTerminal asserts the
+// fail-closed backstop (#1143): when a parent's children are not all
+// terminal, the sweeper re-tops-up the concurrent dispatch via the wired
+// Dispatcher before returning (the parent stays parked, no transition).
+func TestResolveParent_BackstopDispatchesWhenNotAllTerminal(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {
+				mkChild(uuid.New(), run.StateRunning),
+				mkChild(uuid.New(), run.StatePending),
+			},
+		},
+	}
+	disp := &recordingDispatcher{returnN: 1}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, Dispatch: disp, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	disp.mu.Lock()
+	defer disp.mu.Unlock()
+	if len(disp.calls) != 1 || disp.calls[0] != parentRun {
+		t.Errorf("DispatchChildren calls = %v, want one for parent %s", disp.calls, parentRun)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 (parent stays parked)", len(rs.transitions))
+	}
+}
+
+// TestResolveParent_BackstopDispatchErrorIsBestEffort asserts a backstop
+// DispatchChildren error is WARN-logged and swallowed: the tick returns nil
+// and the parent stays parked (no transition), so a transient dispatch
+// failure never wedges the sweep.
+func TestResolveParent_BackstopDispatchErrorIsBestEffort(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {
+				mkChild(uuid.New(), run.StateRunning),
+				mkChild(uuid.New(), run.StatePending),
+			},
+		},
+	}
+	disp := &recordingDispatcher{returnErr: errors.New("boom")}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, Dispatch: disp, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick should swallow the backstop error, got: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 (parent stays parked)", len(rs.transitions))
+	}
+}
+
+// TestResolveParent_NilDispatchIsNoOp asserts a nil Dispatch disables the
+// backstop entirely (pre-#1143 posture): the not-all-terminal branch still
+// returns cleanly with no transition and no panic.
+func TestResolveParent_NilDispatchIsNoOp(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {
+				mkChild(uuid.New(), run.StateRunning),
+				mkChild(uuid.New(), run.StatePending),
+			},
+		},
+	}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, Logger: slog.Default()} // Dispatch nil
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 (parent stays parked, no backstop)", len(rs.transitions))
+	}
+}

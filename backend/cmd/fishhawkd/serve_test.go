@@ -3,7 +3,11 @@ package main
 import (
 	"flag"
 	"io"
+	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
 // resolveMaxParallelChildren mirrors runServe's --max-parallel-children
@@ -85,4 +89,41 @@ func TestEnvOrInt_MaxParallelChildren(t *testing.T) {
 			t.Errorf("got %d, want 5", got)
 		}
 	})
+}
+
+// TestNewStageOrchestrator_WiresDriveEngine pins the construction-site
+// wiring (E24.3 / #1143): the orchestrator runServe builds must carry a
+// non-nil Drive engine, so the RuleChildrenDispatch run_auto_advanced
+// trail for concurrent decomposed-child dispatch can't be silently
+// dropped behind the orchestrator-fake behavioral tests.
+func TestNewStageOrchestrator_WiresDriveEngine(t *testing.T) {
+	o := newStageOrchestrator(server.Config{}, slog.Default())
+	if o == nil {
+		t.Fatal("newStageOrchestrator returned nil")
+	}
+	if o.Drive == nil {
+		t.Error("orchestrator Drive engine is nil; the RuleChildrenDispatch trail would be dropped")
+	}
+}
+
+// TestNewChildCompletionSweeper_WiresDispatchBackstop pins the
+// construction-site wiring (E24.3 / #1143): the sweeper runServe builds
+// must carry a non-nil Dispatch backstop (the childCompletionAdvancer
+// adapter), so the fail-closed concurrent-dispatch top-up can't be
+// silently omitted. Advance + Integrate are asserted alongside so the
+// extraction can't regress the pre-existing wiring either.
+func TestNewChildCompletionSweeper_WiresDispatchBackstop(t *testing.T) {
+	sw := newChildCompletionSweeper(server.Config{}, slog.Default(), time.Minute)
+	if sw == nil {
+		t.Fatal("newChildCompletionSweeper returned nil")
+	}
+	if sw.Dispatch == nil {
+		t.Error("sweeper Dispatch backstop is nil; the fail-closed dispatch top-up would be omitted")
+	}
+	if sw.Advance == nil {
+		t.Error("sweeper Advance adapter is nil")
+	}
+	if sw.Integrate == nil {
+		t.Error("sweeper Integrate adapter is nil")
+	}
 }

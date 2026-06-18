@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -49,6 +51,7 @@ func (r *fanoutRunsRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*r
 		InstallationID: p.InstallationID,
 		ParentRunID:    p.ParentRunID,
 		DecomposedFrom: p.DecomposedFrom,
+		SliceIndex:     p.SliceIndex,
 		RunnerKind:     p.RunnerKind,
 		IssueContext:   p.IssueContext,
 		WorkflowSpec:   p.WorkflowSpec,
@@ -84,14 +87,18 @@ func (r *fanoutRunsRepo) CreateStage(_ context.Context, p run.CreateStageParams)
 	return st, nil
 }
 
-func (r *fanoutRunsRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+func (r *fanoutRunsRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.listFilters = append(r.listFilters, f)
-	if r.listResult != nil {
-		return r.listResult, nil
+	preset := r.listResult
+	r.mu.Unlock()
+	if preset != nil {
+		return preset, nil
 	}
-	return nil, nil
+	// No preset: fall back to the embedded stub's DecomposedFrom filter so
+	// the inline + refill + backstop dispatch paths actually observe the
+	// children CreateRun recorded (honoring Offset/Limit like the real repo).
+	return r.stubRuns.ListRuns(ctx, f)
 }
 
 // fakeArtifacts is a minimal artifact.Repository returning a fixed
@@ -155,8 +162,23 @@ func (r *recordingAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
 func (r *recordingAudit) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, audit.ErrNotFound
 }
-func (r *recordingAudit) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
-	return nil, nil
+func (r *recordingAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*audit.Entry
+	for _, p := range r.appended {
+		if p.RunID == runID && p.Category == category {
+			rid := p.RunID
+			out = append(out, &audit.Entry{
+				ID:       uuid.New(),
+				RunID:    &rid,
+				StageID:  p.StageID,
+				Category: p.Category,
+				Payload:  p.Payload,
+			})
+		}
+	}
+	return out, nil
 }
 func (r *recordingAudit) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, nil
@@ -446,6 +468,396 @@ func TestAdvance_ChildRunSkipsFanout(t *testing.T) {
 	}
 	if out == OutcomeDecomposed {
 		t.Errorf("child run incorrectly fanned out: outcome = %q", out)
+	}
+}
+
+// --- E24.3 / #1143: concurrent decomposed-child dispatch ------------------
+
+// seedAwaitingChildrenParent seeds a parent run already parked in
+// awaiting_children (plan succeeded, implement awaiting_children) so the
+// per-mode DispatchDecomposedChildren tests can drive the dispatch seam
+// directly without re-running the fanout mint.
+func seedAwaitingChildrenParent(t *testing.T, rs *fanoutRunsRepo) *run.Run {
+	t.Helper()
+	parent, _ := rs.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateAwaitingChildren},
+	})
+	return parent
+}
+
+// mintPendingChildren creates n pending decomposed children (each with a
+// single pending implement stage) under parentID, in ascending slice
+// order, with the given runner kind.
+func mintPendingChildren(t *testing.T, rs *fanoutRunsRepo, parentID uuid.UUID, n int, runnerKind string) []*run.Run {
+	t.Helper()
+	children := make([]*run.Run, 0, n)
+	for i := 0; i < n; i++ {
+		idx := i
+		pid := parentID
+		c, err := rs.CreateRun(context.Background(), run.CreateRunParams{
+			Repo:           "example/repo",
+			WorkflowID:     "feature_change",
+			ParentRunID:    &pid,
+			DecomposedFrom: &pid,
+			SliceIndex:     &idx,
+			RunnerKind:     runnerKind,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun child %d: %v", i, err)
+		}
+		if _, err := rs.CreateStage(context.Background(), run.CreateStageParams{
+			RunID:        c.ID,
+			Sequence:     0,
+			Type:         run.StageTypeImplement,
+			ExecutorKind: run.ExecutorAgent,
+			ExecutorRef:  "claude-code",
+		}); err != nil {
+			t.Fatalf("CreateStage child %d: %v", i, err)
+		}
+		children = append(children, c)
+	}
+	return children
+}
+
+// implState returns the state of runID's implement stage.
+func implState(t *testing.T, rs *fanoutRunsRepo, runID uuid.UUID) run.StageState {
+	t.Helper()
+	stages, err := rs.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	for _, s := range stages {
+		if s.Type == run.StageTypeImplement {
+			return s.State
+		}
+	}
+	t.Fatalf("no implement stage for run %s", runID)
+	return ""
+}
+
+// countDriveDispatchEntries counts run_auto_advanced audit entries that
+// name RuleChildrenDispatch.
+func countDriveDispatchEntries(au *recordingAudit) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, p := range au.appended {
+		if p.Category != "run_auto_advanced" {
+			continue
+		}
+		var adv struct {
+			Rule string `json:"rule"`
+		}
+		if json.Unmarshal(p.Payload, &adv) == nil && adv.Rule == "children_dispatch" {
+			n++
+		}
+	}
+	return n
+}
+
+func countByState(children []*run.Run, state run.State) int {
+	n := 0
+	for _, c := range children {
+		if c.State == state {
+			n++
+		}
+	}
+	return n
+}
+
+// TestDispatchDecomposedChildren_DispatchesUpToCap is the DONE-MEANS test:
+// a decomposed parent with an unlimited cap (0) dispatches EVERY child —
+// each child run transitions pending -> running and its implement stage to
+// dispatched — driven end-to-end through the fanout -> dispatch ->
+// drive-record seam, with one RuleChildrenDispatch run_auto_advanced entry
+// per child and no per-child operator call.
+func TestDispatchDecomposedChildren_DispatchesUpToCap(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	planStage, implementStage := stages[0], stages[1]
+
+	planBytes := decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"})
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		planStage.ID: {{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &schemaV, Content: planBytes, CreatedAt: time.Now().UTC()}},
+	}}
+	au := &recordingAudit{}
+	o := &Orchestrator{
+		Runs:                rs,
+		Logger:              slog.Default(),
+		Artifacts:           arts,
+		Audit:               au,
+		MaxParallelChildren: 0, // unlimited
+		Drive:               &drive.Engine{Audit: au, Logger: slog.Default()},
+	}
+
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDecomposed {
+		t.Fatalf("outcome = %q, want %q", out, OutcomeDecomposed)
+	}
+
+	// Parent implement stays parked awaiting children.
+	if implementStage.State != run.StageStateAwaitingChildren {
+		t.Errorf("parent implement state = %q, want awaiting_children", implementStage.State)
+	}
+
+	rs.mu.Lock()
+	children := append([]*run.Run(nil), rs.createdRuns...)
+	rs.mu.Unlock()
+	if len(children) != 3 {
+		t.Fatalf("createdRuns = %d, want 3", len(children))
+	}
+	// Every child dispatched: run running + implement stage dispatched.
+	for i, c := range children {
+		if c.State != run.StateRunning {
+			t.Errorf("child %d state = %q, want running (dispatched)", i, c.State)
+		}
+		if st := implState(t, rs, c.ID); st != run.StageStateDispatched {
+			t.Errorf("child %d implement state = %q, want dispatched", i, st)
+		}
+	}
+	// One RuleChildrenDispatch entry per child.
+	if got := countDriveDispatchEntries(au); got != 3 {
+		t.Errorf("RuleChildrenDispatch entries = %d, want 3", got)
+	}
+}
+
+// TestDispatchDecomposedChildren_CapThrottles asserts a finite cap binds:
+// cap=2 with 5 pending children dispatches exactly 2 and leaves 3 pending
+// (budget.ParallelDecision.Allowed honored).
+func TestDispatchDecomposedChildren_CapThrottles(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	children := mintPendingChildren(t, rs, parent.ID, 5, "")
+	au := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Audit: au, MaxParallelChildren: 2, Drive: &drive.Engine{Audit: au}}
+
+	n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("DispatchDecomposedChildren: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("dispatched = %d, want 2 (cap binds)", n)
+	}
+	if got := countByState(children, run.StateRunning); got != 2 {
+		t.Errorf("running children = %d, want 2", got)
+	}
+	if got := countByState(children, run.StatePending); got != 3 {
+		t.Errorf("pending children = %d, want 3 (throttled)", got)
+	}
+	// The two earliest slices (0,1) are the ones dispatched.
+	for _, c := range children {
+		want := run.StatePending
+		if *c.SliceIndex < 2 {
+			want = run.StateRunning
+		}
+		if c.State != want {
+			t.Errorf("slice %d state = %q, want %q", *c.SliceIndex, c.State, want)
+		}
+	}
+}
+
+// TestDispatchDecomposedChildren_UnlimitedCap asserts cap=0 dispatches all.
+func TestDispatchDecomposedChildren_UnlimitedCap(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	children := mintPendingChildren(t, rs, parent.ID, 4, "")
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Audit: &recordingAudit{}, MaxParallelChildren: 0}
+
+	n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("DispatchDecomposedChildren: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("dispatched = %d, want 4 (unlimited)", n)
+	}
+	if got := countByState(children, run.StateRunning); got != 4 {
+		t.Errorf("running children = %d, want 4", got)
+	}
+}
+
+// TestDispatchDecomposedChildren_AtCapNoHeadroom asserts the headroom<=0
+// guard: re-invoking while the in-flight count already equals the cap
+// dispatches 0 more even though pending children remain.
+func TestDispatchDecomposedChildren_AtCapNoHeadroom(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	children := mintPendingChildren(t, rs, parent.ID, 5, "")
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Audit: &recordingAudit{}, MaxParallelChildren: 2}
+
+	if n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID); err != nil || n != 2 {
+		t.Fatalf("initial dispatch = (%d, %v), want (2, nil)", n, err)
+	}
+	// Two children are now in-flight (running) == cap; no slot is free even
+	// though 3 children remain pending.
+	n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("re-dispatch at cap: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("re-dispatch at cap = %d, want 0 (no headroom)", n)
+	}
+	if got := countByState(children, run.StatePending); got != 3 {
+		t.Errorf("pending children = %d, want 3 (held at cap)", got)
+	}
+}
+
+// TestDispatchDecomposedChildren_EventDrivenRefill asserts the
+// maybeAdvanceDecomposedParent event path tops up the dispatch as in-flight
+// children settle: after a cap=2 throttle, settling one running child
+// dispatches exactly one more pending child, holding the active count at 2.
+func TestDispatchDecomposedChildren_EventDrivenRefill(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	children := mintPendingChildren(t, rs, parent.ID, 5, "")
+	au := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Audit: au, MaxParallelChildren: 2, Drive: &drive.Engine{Audit: au}}
+
+	if n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID); err != nil || n != 2 {
+		t.Fatalf("initial dispatch = (%d, %v), want (2, nil)", n, err)
+	}
+
+	// Settle slice 0 (one of the two in-flight children) to terminal.
+	children[0].State = run.StateSucceeded
+
+	// Drive the event-driven refill via the maybeAdvanceDecomposedParent
+	// path (fires on each child terminal transition).
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+
+	// Exactly one more pending child dispatched (slice 2), holding the
+	// active (running) count at the cap of 2.
+	if got := countByState(children, run.StateRunning); got != 2 {
+		t.Errorf("running children after refill = %d, want 2 (held at cap)", got)
+	}
+	if got := countByState(children, run.StatePending); got != 2 {
+		t.Errorf("pending children after refill = %d, want 2", got)
+	}
+	if children[2].State != run.StateRunning {
+		t.Errorf("slice 2 state = %q, want running (refilled)", children[2].State)
+	}
+}
+
+// TestDispatchDecomposedChildren_IdempotentReDispatch asserts a second
+// invocation against unchanged child state dispatches 0 more children and
+// records no duplicate drive entry.
+func TestDispatchDecomposedChildren_IdempotentReDispatch(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	mintPendingChildren(t, rs, parent.ID, 3, "")
+	au := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Audit: au, MaxParallelChildren: 0, Drive: &drive.Engine{Audit: au}}
+
+	if n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID); err != nil || n != 3 {
+		t.Fatalf("first dispatch = (%d, %v), want (3, nil)", n, err)
+	}
+	if got := countDriveDispatchEntries(au); got != 3 {
+		t.Fatalf("drive entries after first dispatch = %d, want 3", got)
+	}
+
+	// Second call: children are all running now, so nothing pending.
+	n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("second DispatchDecomposedChildren: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("second dispatch = %d, want 0 (idempotent)", n)
+	}
+	if got := countDriveDispatchEntries(au); got != 3 {
+		t.Errorf("drive entries after second dispatch = %d, want 3 (no duplicates)", got)
+	}
+}
+
+// TestDispatchDecomposedChildren_LocalRunnerParks asserts a local-runner
+// child's recorded drive entry is Parked with a run_implement_stage next
+// action (the backend cannot host-spawn the local runner, ADR-024).
+func TestDispatchDecomposedChildren_LocalRunnerParks(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent := seedAwaitingChildrenParent(t, rs)
+	mintPendingChildren(t, rs, parent.ID, 1, run.RunnerKindLocal)
+	au := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Audit: au, MaxParallelChildren: 0, Drive: &drive.Engine{Audit: au}}
+
+	if n, err := o.DispatchDecomposedChildren(context.Background(), parent.ID); err != nil || n != 1 {
+		t.Fatalf("dispatch = (%d, %v), want (1, nil)", n, err)
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, p := range au.appended {
+		if p.Category != "run_auto_advanced" {
+			continue
+		}
+		var adv drive.Advance
+		if err := json.Unmarshal(p.Payload, &adv); err != nil {
+			t.Fatalf("unmarshal drive payload: %v", err)
+		}
+		if adv.Rule != drive.RuleChildrenDispatch {
+			continue
+		}
+		found = true
+		if !adv.Parked {
+			t.Errorf("local child drive entry Parked = false, want true")
+		}
+		if adv.NextAction == nil || adv.NextAction.Action != "run_implement_stage" {
+			t.Errorf("local child next action = %+v, want run_implement_stage", adv.NextAction)
+		}
+	}
+	if !found {
+		t.Fatal("no RuleChildrenDispatch entry recorded for the local child")
+	}
+}
+
+// TestFanout_BestEffortDispatchDoesNotUnwind asserts a dispatch failure at
+// the fanout call site does NOT unwind the parked parent: the parent stays
+// awaiting_children and the minted children remain.
+func TestFanout_BestEffortDispatchDoesNotUnwind(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	planStage, implementStage := stages[0], stages[1]
+	planBytes := decomposedPlanBytes(t, []string{"Part A", "Part B"})
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		planStage.ID: {{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &schemaV, Content: planBytes, CreatedAt: time.Now().UTC()}},
+	}}
+	au := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: au, MaxParallelChildren: 0, Drive: &drive.Engine{Audit: au}}
+
+	// Force every child Advance to fail at its run pending->running step.
+	// fanoutIfDecomposed transitions only stages (not runs) and the parent
+	// is already running, so the fanout mint + park still succeeds.
+	rs.transitionRunErr = errors.New("boom")
+
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDecomposed {
+		t.Fatalf("outcome = %q, want %q (fanout not unwound)", out, OutcomeDecomposed)
+	}
+	if implementStage.State != run.StageStateAwaitingChildren {
+		t.Errorf("parent implement state = %q, want awaiting_children (not unwound)", implementStage.State)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.createdRuns) != 2 {
+		t.Errorf("createdRuns = %d, want 2 (children remain minted)", len(rs.createdRuns))
+	}
+	for i, c := range rs.createdRuns {
+		if c.State != run.StatePending {
+			t.Errorf("child %d state = %q, want pending (dispatch failed, child untouched)", i, c.State)
+		}
 	}
 }
 
