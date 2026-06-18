@@ -1980,9 +1980,21 @@ func (s *Server) checkRunBudget(ctx context.Context, runID, stageID uuid.UUID) b
 		return false
 	}
 
-	tokens := s.sumRunTokens(ctx, runID)
+	// Aggregate cost + tokens across the decomposition family (E24.6 /
+	// #1146): a wide fan-out can blow the run budget even when no single
+	// child is over, so the tripwire sums the parent + every child. A
+	// non-decomposed run's family is just itself (familyRuns returns
+	// [runRow]), so its figure is byte-identical to the pre-#1146 single-run
+	// behavior.
+	family := s.familyRuns(ctx, runRow)
+	var costUSD float64
+	var tokens int64
+	for _, m := range family {
+		costUSD += m.CostUSDTotal
+		tokens += s.sumRunTokens(ctx, m.ID)
+	}
 
-	d := budget.EvaluateRun(runRow.CostUSDTotal, tokens, s.cfg.MaxRunUSD, s.cfg.MaxRunTokens)
+	d := budget.EvaluateRun(costUSD, tokens, s.cfg.MaxRunUSD, s.cfg.MaxRunTokens)
 	if !d.Over {
 		return false
 	}
@@ -2062,6 +2074,66 @@ func (s *Server) sumRunTokens(ctx context.Context, runID uuid.UUID) int64 {
 		total += p.InputTokens + p.OutputTokens
 	}
 	return total
+}
+
+// familyAggregationLimit bounds the ListRuns page the family-aggregation
+// helper fetches (the Postgres adapter rejects a non-positive limit). A
+// decomposition fan-out is small (bounded by the plan's sub_plans), so this
+// generous cap never truncates a real family; if a pathological fan-out ever
+// exceeded it the aggregate would undercount rather than over-halt — the safe
+// direction for a tripwire.
+const familyAggregationLimit = 1000
+
+// familyRuns returns the decomposition family the given run belongs to
+// (E24.6 / #1146): the family root — runRow itself when it is a parent
+// (DecomposedFrom == nil), else the parent named by *DecomposedFrom — plus
+// every child minted from that root (ListRuns by DecomposedFrom). The
+// returned slice always begins with the root and contains no duplicates
+// (the root is a parent, so it never appears in its own children list).
+//
+// A NON-decomposed run is its own family: DecomposedFrom is nil and the
+// root has no children, so the result is exactly [runRow]. This is the
+// regression guard that keeps checkRunBudget's figure unchanged for
+// ordinary runs.
+//
+// Best-effort, consistent with the rest of this handler: a root GetRun or
+// a children ListRuns failure logs at WARN and degrades to the single run
+// ([runRow]) rather than unwinding the upload — the family aggregate just
+// falls back to the per-run figure, never false-halting on a read error.
+func (s *Server) familyRuns(ctx context.Context, runRow *run.Run) []*run.Run {
+	rootID := runRow.ID
+	root := runRow
+	if runRow.DecomposedFrom != nil {
+		rootID = *runRow.DecomposedFrom
+		r, err := s.cfg.RunRepo.GetRun(ctx, rootID)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"family aggregation: get parent run failed — using single run",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("parent_run_id", rootID.String()),
+				slog.String("error", err.Error()))
+			return []*run.Run{runRow}
+		}
+		root = r
+	}
+
+	children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &rootID,
+		Limit:          familyAggregationLimit,
+	})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"family aggregation: list children failed — using single run",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("root_run_id", rootID.String()),
+			slog.String("error", err.Error()))
+		return []*run.Run{runRow}
+	}
+
+	family := make([]*run.Run, 0, len(children)+1)
+	family = append(family, root)
+	family = append(family, children...)
+	return family
 }
 
 // consolidatedReviewTruncatedCategory records that a decomposed parent's

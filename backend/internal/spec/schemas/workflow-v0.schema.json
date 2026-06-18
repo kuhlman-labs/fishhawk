@@ -11,8 +11,8 @@
   "properties": {
     "version": {
       "type": "string",
-      "enum": ["0.3", "0.4", "0.5"],
-      "description": "Spec syntax version. 0.5 adds operator_agent — delegation knobs for the operator agent, declarable at workflow level and per approval gate (ADR-040 / #1026), additive within workflow-v0.x. 0.4 adds workflow.budgets — periodic per-workflow cost ceilings (ADR-030 / #688), additive within workflow-v0.x. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
+      "enum": ["0.3", "0.4", "0.5", "0.6"],
+      "description": "Spec syntax version. 0.6 adds workflow.decomposition.max_parallel — a per-workflow override of FISHHAWKD_MAX_PARALLEL_CHILDREN bounding how many decomposed child runs dispatch concurrently (E24.6 / #1146), additive within workflow-v0.x. 0.5 adds operator_agent — delegation knobs for the operator agent, declarable at workflow level and per approval gate (ADR-040 / #1026), additive within workflow-v0.x. 0.4 adds workflow.budgets — periodic per-workflow cost ceilings (ADR-030 / #688), additive within workflow-v0.x. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
     },
     "roles": {
       "type": "object",
@@ -100,7 +100,21 @@
           "description": "Periodic per-workflow cost ceilings (ADR-030 / #688). Each entry caps total USD spend across all runs of this workflow within a calendar period, resetting at the period boundary. Distinct from the per-stage `budget` ($defs/budget: token/runtime caps on one stage execution). Requires version 0.4+.",
           "items": { "$ref": "#/$defs/periodic_budget" }
         },
-        "operator_agent": { "$ref": "#/$defs/operator_agent" }
+        "operator_agent": { "$ref": "#/$defs/operator_agent" },
+        "decomposition": { "$ref": "#/$defs/decomposition" }
+      }
+    },
+
+    "decomposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-workflow decomposition controls (E24.6 / #1146). Requires version 0.6+.",
+      "properties": {
+        "max_parallel": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum number of decomposed child runs that may dispatch concurrently for a run of this workflow. 0 = unlimited. Per-workflow override of the global FISHHAWKD_MAX_PARALLEL_CHILDREN; when > 0 it wins, otherwise the global default applies. This declares the cap; concurrency throttling that consumes it lands in E24.3 (#1143)."
+        }
       }
     },
 

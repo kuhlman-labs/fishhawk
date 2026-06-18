@@ -429,6 +429,12 @@ func runServe(args []string, logSink io.Writer) int {
 		"warn-only spend-anomaly threshold (#649): the trace handler emits a spend_alert audit "+
 			"entry when the current hour's estimated model spend exceeds this multiple of the "+
 			"rolling average of prior hours. Never gates a run")
+	maxParallelChildren := fs.Int("max-parallel-children",
+		envOrInt("FISHHAWKD_MAX_PARALLEL_CHILDREN", 0),
+		"global default cap on how many decomposed child runs may dispatch concurrently for a "+
+			"single run (E24.6 / #1146). The per-workflow decomposition.max_parallel knob overrides "+
+			"it when set. 0 (the default) = unlimited. This resolves and surfaces the cap; concurrency "+
+			"enforcement that consumes it lands in E24.3 (#1143)")
 	budgetTimezone := fs.String("budget-timezone",
 		envOr("FISHHAWKD_BUDGET_TIMEZONE", "UTC"),
 		"IANA timezone (e.g. America/New_York) the advisory periodic-budget evaluator (#688) "+
@@ -471,7 +477,7 @@ func runServe(args []string, logSink io.Writer) int {
 		slog.Duration("cap", reviewBudget.Cap),
 		slog.String("ref", "#747"))
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren}
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a
@@ -680,11 +686,12 @@ func runServe(args []string, logSink io.Writer) int {
 	// silently — the parent's implement stage dispatches as today.
 	if cfg.RunRepo != nil {
 		cfg.Orchestrator = &orchestrator.Orchestrator{
-			Runs:      cfg.RunRepo,
-			GitHub:    cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
-			Logger:    logger,
-			Artifacts: cfg.ArtifactRepo,
-			Audit:     cfg.AuditRepo,
+			Runs:                cfg.RunRepo,
+			GitHub:              cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
+			Logger:              logger,
+			Artifacts:           cfg.ArtifactRepo,
+			Audit:               cfg.AuditRepo,
+			MaxParallelChildren: cfg.MaxParallelChildren,
 		}
 		logger.Info("stage orchestrator configured")
 	}

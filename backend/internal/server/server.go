@@ -288,6 +288,16 @@ type Config struct {
 	// disables the token tripwire. When both ceilings are set and both are
 	// breached, US$ is reported as the breached dimension.
 	MaxRunTokens int64
+
+	// MaxParallelChildren is the global default cap on how many decomposed
+	// child runs may dispatch concurrently for a single run (E24.6 / #1146).
+	// It is the fall-through default behind the per-workflow
+	// decomposition.max_parallel knob (the knob wins when > 0; see
+	// spec.Workflow.EffectiveMaxParallel). 0 (the default) = unlimited.
+	// Wired from FISHHAWKD_MAX_PARALLEL_CHILDREN in serve.go onto the
+	// orchestrator, which resolves and surfaces the effective cap;
+	// concurrency enforcement that consumes it lands in E24.3 (#1143).
+	MaxParallelChildren int
 }
 
 // Server wraps an http.Server with the routes and middleware stack
