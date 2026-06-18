@@ -99,6 +99,34 @@ func TestComposeGateEvidence_FoldsScopeExemptions(t *testing.T) {
 	}
 }
 
+func TestComposeGateEvidence_FoldsFixupSelfReportDivergence(t *testing.T) {
+	// A fixup_selfreport_divergence event (#1210) is a gate on its own, and its
+	// claimed/actual statuses fold into gate_evidence.FixupSelfReportDivergence.
+	cfg := config{runID: "r1", stageID: "s1"}
+	events := []agent.Event{
+		fixupSelfReportDivergenceEvent(cfg, "passed", "failed"),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 0))
+	if p.FixupSelfReportDivergence == nil {
+		t.Fatal("FixupSelfReportDivergence = nil, want folded event")
+	}
+	if *p.FixupSelfReportDivergence != (fixupSelfReportDivergenceEvidence{ClaimedVerifyStatus: "passed", ActualVerifyStatus: "failed"}) {
+		t.Errorf("FixupSelfReportDivergence = %+v", *p.FixupSelfReportDivergence)
+	}
+}
+
+func TestComposeGateEvidence_NoFixupSelfReportDivergenceField(t *testing.T) {
+	// A stage with a verify gate but no divergence event leaves the field nil —
+	// byte-identical to before #1210.
+	events := []agent.Event{
+		verifyRunEvent("scripts/test", "", "", 0, "ok\n", "passed"),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 0))
+	if p.FixupSelfReportDivergence != nil {
+		t.Errorf("FixupSelfReportDivergence = %+v, want nil when no event", p.FixupSelfReportDivergence)
+	}
+}
+
 func TestComposeGateEvidence_NoBindingAssertionsField(t *testing.T) {
 	// A stage with a verify gate but no binding_assertion event adds no
 	// binding_assertions field — byte-identical to before #1171.

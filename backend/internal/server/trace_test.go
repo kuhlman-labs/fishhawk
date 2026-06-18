@@ -2589,6 +2589,107 @@ func TestGateEvidenceForReview_MapsScopeExemptions(t *testing.T) {
 	}
 }
 
+// TestGateEvidenceForReview_MapsFixupSelfReportDivergence pins the bundle→prompt
+// mapping for the advisory fix-up self-report divergence (#1210): the claimed/
+// actual statuses cross gateEvidenceForReview into prompt.GateFixupSelfReportDivergence,
+// and a nil input maps to nil out.
+func TestGateEvidenceForReview_MapsFixupSelfReportDivergence(t *testing.T) {
+	ev := bundle.GateEvidence{
+		FixupSelfReportDivergence: &bundle.FixupSelfReportDivergenceEvidence{
+			ClaimedVerifyStatus: "passed", ActualVerifyStatus: "failed",
+		},
+	}
+	got := gateEvidenceForReview(ev)
+	if got.FixupSelfReportDivergence == nil {
+		t.Fatal("FixupSelfReportDivergence mapped to nil, want populated")
+	}
+	want := prompt.GateFixupSelfReportDivergence{ClaimedVerifyStatus: "passed", ActualVerifyStatus: "failed"}
+	if *got.FixupSelfReportDivergence != want {
+		t.Errorf("FixupSelfReportDivergence = %+v, want %+v", *got.FixupSelfReportDivergence, want)
+	}
+
+	ev.FixupSelfReportDivergence = nil
+	if none := gateEvidenceForReview(ev); none.FixupSelfReportDivergence != nil {
+		t.Errorf("nil divergence input mapped to %+v, want nil", none.FixupSelfReportDivergence)
+	}
+}
+
+// TestFixupSelfReportDivergence_GateEvidence_EndToEnd is the #1210 cross-boundary
+// integration test: a divergence flows across EVERY serialized seam — the runner's
+// gate_evidence wire payload (the exact JSON composeGateEvidence emits, the
+// fixup_selfreport_divergence tag and all) -> bundle.ExtractGateEvidence ->
+// gateEvidenceForReview -> the writeGateEvidence-rendered implement-review text.
+// A drift in any json tag or mapping along the chain breaks the rendered assertion.
+func TestFixupSelfReportDivergence_GateEvidence_EndToEnd(t *testing.T) {
+	gatePayload, err := json.Marshal(map[string]any{
+		"scope_facts": map[string]any{"declared_files": 1},
+		"fixup_selfreport_divergence": map[string]any{
+			"claimed_verify_status": "passed",
+			"actual_verify_status":  "failed",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type line struct {
+		Seq  int             `json:"seq"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	lines := []line{
+		{Seq: 1, Kind: bundle.EventKindManifest, Data: mdata},
+		{Seq: 2, Kind: bundle.EventKindGateEvidence, Data: gatePayload},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, merr := json.Marshal(l)
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, werr := w.Write(raw.Bytes()); werr != nil {
+		t.Fatal(werr)
+	}
+	if cerr := w.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+
+	// Seam 1: runner wire JSON -> bundle.GateEvidence.
+	ev, err := bundle.ExtractGateEvidence(gz.Bytes())
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if ev.FixupSelfReportDivergence == nil || ev.FixupSelfReportDivergence.ClaimedVerifyStatus != "passed" {
+		t.Fatalf("bundle.GateEvidence.FixupSelfReportDivergence = %+v", ev.FixupSelfReportDivergence)
+	}
+	// Seam 2: bundle.GateEvidence -> prompt.GateEvidence.
+	pe := gateEvidenceForReview(ev)
+	// Seam 3: prompt.GateEvidence -> writeGateEvidence-rendered reviewer text.
+	got, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: &plan.Plan{PlanVersion: "standard_v1", Summary: "selfreport-divergence e2e"},
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: pe,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	if !strings.Contains(got, "Fix-up self-report divergence") ||
+		!strings.Contains(got, "CLAIMED the verify gate `passed`") ||
+		!strings.Contains(got, "committed-tree verify gate `failed`") {
+		t.Errorf("end-to-end divergence did not reach the rendered reviewer text:\n%s", got)
+	}
+}
+
 // TestScopeExemption_GateEvidence_EndToEnd is the #1153 cross-boundary
 // integration test (binding condition 3): a validated exemption set flows
 // across EVERY serialized seam in one test — the runner's gate_evidence wire

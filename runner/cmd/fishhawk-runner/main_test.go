@@ -10852,6 +10852,262 @@ func TestSweepStaleScopeJustification(t *testing.T) {
 	}
 }
 
+// --- #1210 fix-up self-report divergence ---------------------------------
+
+func fixupReportCfg() config {
+	return config{runID: "run-cccc", stageID: "stage-dddd"}
+}
+
+// writeFixupReportSidecar redirects fixupSelfReportDir to a temp dir and writes
+// raw JSON to cfg's keyed fix-up self-report path.
+func writeFixupReportSidecar(t *testing.T, cfg config, raw string) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := fixupSelfReportDir
+	fixupSelfReportDir = dir
+	t.Cleanup(func() { fixupSelfReportDir = orig })
+	path := fixupSelfReportPath(cfg.runID, cfg.stageID)
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestLoadFixupSelfReport_AbsentSidecar: no sidecar → "" with no log.
+func TestLoadFixupSelfReport_AbsentSidecar(t *testing.T) {
+	cfg := fixupReportCfg()
+	dir := t.TempDir()
+	orig := fixupSelfReportDir
+	fixupSelfReportDir = dir
+	t.Cleanup(func() { fixupSelfReportDir = orig })
+
+	var logSink strings.Builder
+	if got := loadFixupSelfReport(cfg, &logSink); got != "" {
+		t.Errorf("absent sidecar must yield \"\", got %q", got)
+	}
+	if logSink.Len() != 0 {
+		t.Errorf("absent sidecar must not log, got %q", logSink.String())
+	}
+}
+
+// TestLoadFixupSelfReport_MalformedJSON: malformed → "" + fixup_selfreport_invalid,
+// file removed.
+func TestLoadFixupSelfReport_MalformedJSON(t *testing.T) {
+	cfg := fixupReportCfg()
+	path := writeFixupReportSidecar(t, cfg, "{not json")
+
+	var logSink strings.Builder
+	if got := loadFixupSelfReport(cfg, &logSink); got != "" {
+		t.Errorf("malformed sidecar must FAIL CLOSED (\"\"), got %q", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_invalid"`) {
+		t.Errorf("expected fixup_selfreport_invalid, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("malformed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupSelfReport_StaleID: embedded ids not matching cfg → "" +
+// fixup_selfreport_stale, file removed.
+func TestLoadFixupSelfReport_StaleID(t *testing.T) {
+	cfg := fixupReportCfg()
+	path := writeFixupReportSidecar(t, cfg,
+		`{"run_id":"OTHER","stage_id":"OTHER","verify_status":"passed"}`)
+
+	var logSink strings.Builder
+	if got := loadFixupSelfReport(cfg, &logSink); got != "" {
+		t.Errorf("stale-id sidecar must FAIL CLOSED (\"\"), got %q", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_stale"`) {
+		t.Errorf("expected fixup_selfreport_stale, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("stale sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupSelfReport_StatusIgnored: an unrecognized status AND an
+// absent/empty status both → "" + fixup_selfreport_status_ignored, file removed.
+func TestLoadFixupSelfReport_StatusIgnored(t *testing.T) {
+	cfg := fixupReportCfg()
+	for _, raw := range []string{
+		`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"skipped"}`, // not in {passed,failed}
+		`{"run_id":"run-cccc","stage_id":"stage-dddd"}`,                           // absent/empty status
+	} {
+		path := writeFixupReportSidecar(t, cfg, raw)
+		var logSink strings.Builder
+		if got := loadFixupSelfReport(cfg, &logSink); got != "" {
+			t.Errorf("unrecognized status must FAIL CLOSED (\"\"), got %q for %s", got, raw)
+		}
+		if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_status_ignored"`) {
+			t.Errorf("expected fixup_selfreport_status_ignored for %s, got %q", raw, logSink.String())
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("ignored-status sidecar must be removed, stat err = %v", err)
+		}
+	}
+}
+
+// TestLoadFixupSelfReport_Valid: a fresh, well-formed sidecar with a recognized
+// status yields that status AND is consumed (removed).
+func TestLoadFixupSelfReport_Valid(t *testing.T) {
+	cfg := fixupReportCfg()
+	for _, status := range []string{"passed", "failed"} {
+		path := writeFixupReportSidecar(t, cfg,
+			fmt.Sprintf(`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":%q}`, status))
+		var logSink strings.Builder
+		if got := loadFixupSelfReport(cfg, &logSink); got != status {
+			t.Fatalf("valid sidecar must yield %q, got %q", status, got)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("consumed sidecar must be removed, stat err = %v", err)
+		}
+	}
+}
+
+// TestSweepStaleFixupSelfReport: a pre-existing keyed sidecar is removed and
+// fixup_selfreport_swept logged; an absent one is a silent no-op.
+func TestSweepStaleFixupSelfReport(t *testing.T) {
+	cfg := fixupReportCfg()
+	path := writeFixupReportSidecar(t, cfg, `{"stale":"leftover"}`)
+
+	var logSink strings.Builder
+	sweepStaleFixupSelfReport(cfg, &logSink)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("pre-existing sidecar must be swept, stat err = %v", err)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_swept"`) {
+		t.Errorf("expected fixup_selfreport_swept, got %q", logSink.String())
+	}
+
+	var logSink2 strings.Builder
+	sweepStaleFixupSelfReport(cfg, &logSink2)
+	if logSink2.Len() != 0 {
+		t.Errorf("absent-sidecar sweep must be silent, got %q", logSink2.String())
+	}
+}
+
+// TestTerminalVerifyOutcome: verify_summary.Outcome wins when present; else the
+// LAST verify_run.Outcome; else "" when no verify event is present.
+func TestTerminalVerifyOutcome(t *testing.T) {
+	mkRun := func(outcome string) agent.Event {
+		return agent.Event{Kind: "verify_run", Payload: agent.MakePayload(map[string]any{"outcome": outcome})}
+	}
+	mkSummary := func(outcome string) agent.Event {
+		return agent.Event{Kind: "verify_summary", Payload: agent.MakePayload(map[string]any{"outcome": outcome})}
+	}
+
+	// verify_summary present → its outcome wins over verify_run.
+	got := terminalVerifyOutcome([]agent.Event{mkRun("failed"), mkSummary("passed")})
+	if got != "passed" {
+		t.Errorf("verify_summary should win, got %q", got)
+	}
+	// No verify_summary → last verify_run wins.
+	got = terminalVerifyOutcome([]agent.Event{mkRun("failed"), mkRun("passed")})
+	if got != "passed" {
+		t.Errorf("last verify_run should win, got %q", got)
+	}
+	// No verify event → "".
+	got = terminalVerifyOutcome([]agent.Event{{Kind: "invocation_start"}})
+	if got != "" {
+		t.Errorf("no verify event should yield \"\", got %q", got)
+	}
+}
+
+// TestFixupSelfReportDiverges covers every branch of the pure detector: a
+// determinate disagreement (both directions) fires; agreement does not; any
+// indeterminate side (actual ""/skipped, an absent/invalid claim "") does not.
+func TestFixupSelfReportDiverges(t *testing.T) {
+	cases := []struct {
+		claimed, actual string
+		want            bool
+	}{
+		{"passed", "failed", true},   // determinate disagreement
+		{"failed", "passed", true},   // determinate disagreement, other direction
+		{"passed", "passed", false},  // agreement
+		{"failed", "failed", false},  // agreement
+		{"passed", "", false},        // indeterminate actual (no verify gate)
+		{"failed", "skipped", false}, // indeterminate actual (skipped gate)
+		{"", "failed", false},        // absent/invalid claim
+		{"", "", false},              // both absent
+	}
+	for _, c := range cases {
+		if got := fixupSelfReportDiverges(c.claimed, c.actual); got != c.want {
+			t.Errorf("fixupSelfReportDiverges(%q,%q) = %v, want %v", c.claimed, c.actual, got, c.want)
+		}
+	}
+}
+
+// TestFixupSelfReportDivergenceEvent: the event carries the right kind and
+// claimed/actual payload.
+func TestFixupSelfReportDivergenceEvent(t *testing.T) {
+	ev := fixupSelfReportDivergenceEvent(fixupReportCfg(), "passed", "failed")
+	if ev.Kind != "fixup_selfreport_divergence" {
+		t.Fatalf("kind = %q", ev.Kind)
+	}
+	var w struct {
+		RunID   string `json:"run_id"`
+		StageID string `json:"stage_id"`
+		Claimed string `json:"claimed_verify_status"`
+		Actual  string `json:"actual_verify_status"`
+	}
+	if err := json.Unmarshal(ev.Payload, &w); err != nil {
+		t.Fatal(err)
+	}
+	if w.RunID != "run-cccc" || w.StageID != "stage-dddd" || w.Claimed != "passed" || w.Actual != "failed" {
+		t.Errorf("payload = %+v", w)
+	}
+}
+
+// TestFixupSelfReport_VocabularyMatchesProductionVerifyOutcome anchors the
+// detector's and claim channel's verify vocabulary to the literals the PRODUCTION
+// verify gate actually emits (binding condition 2). It runs the real committed-
+// tree verify (the shared producer feeding runVerifyFixLoop / runVerifyGateCommitted)
+// to obtain the live "passed"/"failed" literals, then asserts: terminalVerifyOutcome
+// reads them, the divergence detector treats a pass-vs-fail disagreement as
+// determinate against them, and loadFixupSelfReport accepts them as claim statuses.
+// A future verify-vocabulary drift fails this test instead of silently rendering
+// the detector inert (the exact silent-no-op this ticket is about).
+func TestFixupSelfReport_VocabularyMatchesProductionVerifyOutcome(t *testing.T) {
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "f.txt"), "hello\n")
+	runGit("add", ".")
+	runGit("commit", "-m", "seed")
+	headSHA := gitHead(t, repo)
+	ctx := context.Background()
+
+	_, _, prodPass := runVerifyCommittedTree(ctx, "true", repo, headSHA, time.Minute)
+	_, _, prodFail := runVerifyCommittedTree(ctx, "false", repo, headSHA, time.Minute)
+	if prodPass == prodFail {
+		t.Fatalf("production pass/fail verify literals must differ, both = %q", prodPass)
+	}
+
+	// terminalVerifyOutcome reads the production literals.
+	passEvent := verifyRunEvent("true", headSHA, "", 0, "", prodPass)
+	if got := terminalVerifyOutcome([]agent.Event{passEvent}); got != prodPass {
+		t.Fatalf("terminalVerifyOutcome = %q, want production literal %q", got, prodPass)
+	}
+
+	// The detector's determinate vocabulary MUST equal the production literals:
+	// a real pass-vs-fail disagreement must fire. If production drifts to a
+	// literal the detector does not recognize, this fails (the inert-detector guard).
+	if !fixupSelfReportDiverges(prodPass, prodFail) {
+		t.Fatalf("detector inert against production verify literals %q/%q", prodPass, prodFail)
+	}
+
+	// The CLAIM vocabulary (loadFixupSelfReport) MUST accept the SAME production
+	// literals, so a claim can ever match reality.
+	for _, lit := range []string{prodPass, prodFail} {
+		cfg := fixupReportCfg()
+		writeFixupReportSidecar(t, cfg,
+			fmt.Sprintf(`{"run_id":%q,"stage_id":%q,"verify_status":%q}`, cfg.runID, cfg.stageID, lit))
+		if got := loadFixupSelfReport(cfg, io.Discard); got != lit {
+			t.Fatalf("loadFixupSelfReport rejected production verify literal %q (got %q)", lit, got)
+		}
+	}
+}
+
 // --- #1165 near-deterministic fix-up apply path ---------------------------
 
 // fixupApplyTestSeams swaps the #1165 apply seams with recording fakes and

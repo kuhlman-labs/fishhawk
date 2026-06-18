@@ -3357,6 +3357,133 @@ func TestBuild_ImplementReview_GateEvidence_NoScopeExemptionsSection(t *testing.
 	}
 }
 
+func TestFixupSelfReportPath_Format(t *testing.T) {
+	// #1210 condition 2 (format-drift): assert the LITERAL path string with
+	// concrete ids — NOT the function output — so a one-sided edit to either
+	// module's format string is caught.
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got := FixupSelfReportPath(runID, stageID)
+	want := "/tmp/fishhawk-fixup-selfreport-" + runID + "-" + stageID + ".json"
+	if got != want {
+		t.Errorf("FixupSelfReportPath = %q, want %q", got, want)
+	}
+}
+
+func TestBuild_ImplementFixup_SelfReport_RendersKeyedPathAndLiterals(t *testing.T) {
+	// #1210: the slim fix-up prompt renders the verify-outcome self-report block
+	// with the run/stage-keyed sidecar path, the literal run_id/stage_id, and BOTH
+	// status literals ("passed"|"failed"). FixupConcerns routes to buildImplementFixup.
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		FixupConcerns:    []string{"[medium] tighten the bound check"},
+		ImplementRunID:   runID,
+		ImplementStageID: stageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wantPath := "/tmp/fishhawk-fixup-selfreport-" + runID + "-" + stageID + ".json"
+	for _, w := range []string{
+		"### Report your verify outcome",
+		"advisory honesty cross-check",
+		wantPath,
+		`"run_id":"` + runID + `"`,
+		`"stage_id":"` + stageID + `"`,
+		`"verify_status":"passed"`,
+		"`passed`",
+		"`failed`",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fix-up self-report prompt missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Implement_SelfReport_AbsentOnFullImplement(t *testing.T) {
+	// #1210: the self-report block is fix-up-only — the full implement prompt
+	// (no FixupConcerns) must NOT render it, even with run/stage ids populated.
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		ImplementRunID:   "11112222333344445555666677778888",
+		ImplementStageID: "99990000aaaabbbbccccddddeeeeffff",
+		// FixupConcerns deliberately nil → full buildImplement.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Report your verify outcome") {
+		t.Errorf("self-report block must be absent on the full implement prompt:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementFixup_SelfReport_AbsentWhenIDsUnset(t *testing.T) {
+	// #1210: a fix-up trigger missing the run/stage ids omits the section rather
+	// than rendering a malformed (unkeyed) sidecar path.
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []string{"[medium] tighten the bound check"},
+		// ImplementRunID / ImplementStageID deliberately empty.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Report your verify outcome") {
+		t.Errorf("self-report block must be absent when run/stage ids are unset:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_GateEvidence_RendersFixupSelfReportDivergence(t *testing.T) {
+	// #1210: the Gate evidence section renders the advisory fix-up self-report
+	// divergence — claimed vs actual verify outcome — framed as an honesty flag
+	// the reviewer arbitrates.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts:                &GateScopeFacts{DeclaredFiles: 1},
+			FixupSelfReportDivergence: &GateFixupSelfReportDivergence{ClaimedVerifyStatus: "passed", ActualVerifyStatus: "failed"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Fix-up self-report divergence (advisory honesty flag)",
+		"CLAIMED the verify gate `passed`",
+		"committed-tree verify gate `failed`",
+		"ADVISORY signal",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("divergence render missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_GateEvidence_NoFixupSelfReportDivergenceSection(t *testing.T) {
+	// #1210 additive property: with no divergence the block is absent.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Fix-up self-report divergence") {
+		t.Errorf("divergence block must be absent when none was reported:\n%s", got)
+	}
+}
+
 func TestBuild_ImplementReview_GateEvidence_AbsorbedThenPassed(t *testing.T) {
 	// #1205 end-to-end render: a verify-fix loop that absorbed a first failing
 	// iteration and re-ran green. The absorbed (superseded) run must carry the

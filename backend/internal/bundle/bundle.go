@@ -252,6 +252,23 @@ type GateEvidence struct {
 	// unchanged and justified in-band, each with its reason, so the implement
 	// review sees what was self-exempted and why. Nil when none were validated.
 	ScopeExemptions []ScopeExemptionEvidence `json:"scope_exemptions,omitempty"`
+	// FixupSelfReportDivergence carries the ADVISORY fix-up self-report
+	// divergence (#1210): on a fix-up pass the agent CLAIMED a verify outcome
+	// that disagreed with the committed-tree verify outcome the runner computed,
+	// so the implement review can arbitrate the honesty flag. Nil (the byte-
+	// identical default) when there was no fix-up pass, no claim, or claim and
+	// reality agreed. The json tag MUST stay identical to the composer.
+	FixupSelfReportDivergence *FixupSelfReportDivergenceEvidence `json:"fixup_selfreport_divergence,omitempty"`
+}
+
+// FixupSelfReportDivergenceEvidence is the advisory fix-up self-report
+// divergence (#1210): the agent's claimed verify status vs the runner's actual
+// committed-tree verify outcome. Mirrors the runner's
+// fixupSelfReportDivergenceEvidence — the json tags MUST stay identical to the
+// composer, same lockstep wire contract as the parent payload.
+type FixupSelfReportDivergenceEvidence struct {
+	ClaimedVerifyStatus string `json:"claimed_verify_status"`
+	ActualVerifyStatus  string `json:"actual_verify_status"`
 }
 
 // ScopeExemptionEvidence is one validated scope self-exemption (#1153): a

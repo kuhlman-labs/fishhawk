@@ -2876,6 +2876,12 @@ func gateEvidenceForReview(ev bundle.GateEvidence) *prompt.GateEvidence {
 			Reason: ex.Reason,
 		})
 	}
+	if ev.FixupSelfReportDivergence != nil {
+		out.FixupSelfReportDivergence = &prompt.GateFixupSelfReportDivergence{
+			ClaimedVerifyStatus: ev.FixupSelfReportDivergence.ClaimedVerifyStatus,
+			ActualVerifyStatus:  ev.FixupSelfReportDivergence.ActualVerifyStatus,
+		}
+	}
 	return out
 }
 

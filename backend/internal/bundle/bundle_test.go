@@ -750,6 +750,10 @@ func gateEvidenceLine(t *testing.T, seq int) Line {
 		"scope_exemptions": []map[string]any{
 			{"path": "backend/internal/foo/foo.go", "reason": "already correct, no change needed"},
 		},
+		"fixup_selfreport_divergence": map[string]any{
+			"claimed_verify_status": "passed",
+			"actual_verify_status":  "failed",
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -858,6 +862,41 @@ func TestExtractGateEvidence_HappyPath(t *testing.T) {
 	wantEx := ScopeExemptionEvidence{Path: "backend/internal/foo/foo.go", Reason: "already correct, no change needed"}
 	if got.ScopeExemptions[0] != wantEx {
 		t.Errorf("ScopeExemptions[0] = %+v, want %+v", got.ScopeExemptions[0], wantEx)
+	}
+	// Fix-up self-report divergence (#1210) round-trips the runner's
+	// fixup_selfreport_divergence digest field-for-field — a silent zero here
+	// means the runner↔backend wire tags diverged.
+	if got.FixupSelfReportDivergence == nil {
+		t.Fatal("FixupSelfReportDivergence = nil, want populated")
+	}
+	wantDiv := FixupSelfReportDivergenceEvidence{ClaimedVerifyStatus: "passed", ActualVerifyStatus: "failed"}
+	if *got.FixupSelfReportDivergence != wantDiv {
+		t.Errorf("FixupSelfReportDivergence = %+v, want %+v", *got.FixupSelfReportDivergence, wantDiv)
+	}
+}
+
+func TestExtractGateEvidence_OlderBundleWithoutFixupSelfReportDivergence(t *testing.T) {
+	// #1210 additive/omitempty proof: a gate_evidence payload with NO
+	// fixup_selfreport_divergence field (an older runner, or a non-fix-up stage)
+	// decodes to a nil FixupSelfReportDivergence — the section is then omitted.
+	payload, err := json.Marshal(map[string]any{
+		"verify_summary": map[string]any{"outcome": "passed", "iterations": 1, "max_iterations": 1},
+		"scope_facts":    map[string]any{"declared_files": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: payload},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractGateEvidence(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if got.FixupSelfReportDivergence != nil {
+		t.Errorf("FixupSelfReportDivergence = %+v, want nil for an older/non-fix-up bundle", got.FixupSelfReportDivergence)
 	}
 }
 
