@@ -364,28 +364,9 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 
 	// (2) Resolve the runner binary.
 	// Resolution order: input > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > error.
-	binary := in.RunnerBinary
-	if binary == "" {
-		if env := r.getenv("FISHHAWK_RUNNER_BIN"); env != "" {
-			binary = env
-		}
-	}
-	if binary == "" {
-		if exe, exeErr := runStageExecutable(); exeErr == nil {
-			sibling := filepath.Join(filepath.Dir(exe), "fishhawk-runner")
-			if _, statErr := os.Stat(sibling); statErr == nil {
-				binary = sibling
-			}
-		}
-	}
-	if binary == "" {
-		resolved, lerr := runStageLookPath("fishhawk-runner")
-		if lerr != nil {
-			return nil, RunStageOutput{}, errors.New(
-				"fishhawk-runner not on PATH; this tool requires local MCP execution — " +
-					"pass runner_binary, set FISHHAWK_RUNNER_BIN, or co-locate fishhawk-runner with fishhawk-mcp")
-		}
-		binary = resolved
+	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
+	if err != nil {
+		return nil, RunStageOutput{}, err
 	}
 
 	workingDir := in.WorkingDir
@@ -449,97 +430,23 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		argv = append(argv, "--no-pr")
 	}
 
-	cmd := runStageCommand(binary, argv...)
-	cmd.Env = append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
+	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
-	// Run the subprocess in its own process group so signals reach
-	// the whole tree, not just the direct child. The runner spawns
-	// further descendants (the agent it invokes, that agent's tool
-	// processes); without a group, SIGTERM/SIGKILL on the runner
-	// leaves orphans alive that inherit our stdout fd — which keeps
-	// the pipe open and prevents the bufio scanner from ever
-	// reaching EOF. Signalling -pgid hits every descendant in
-	// lockstep. The #446 plan's risk section claimed "SIGKILL
-	// handles orphans" — that's incorrect for Unix fd inheritance,
-	// surfaced by TestRunStage_ContextCancelSendsSIGTERM after the
-	// pipe-drain reorder.
-	runStageSetProcessGroup(cmd)
-
-	// (5) Wire stderr to a JSONL parser via TeeReader so events reach
-	// the accumulator while the raw stream is also forwarded to the
-	// operator's terminal. Stdout carries no structured events when
-	// --upload-trace is set (the runner writes all JSONL to stderr /
-	// logSink), so forward it directly to the terminal.
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, RunStageOutput{}, fmt.Errorf("attach stderr: %w", err)
-	}
-	cmd.Stdout = os.Stdout
-
-	if err := cmd.Start(); err != nil {
-		return nil, RunStageOutput{}, fmt.Errorf("spawn fishhawk-runner: %w", err)
-	}
-
-	// Concurrently: parse stdout into events; watch ctx for
-	// cancellation and signal the child. parseDone closes when the
-	// parser goroutine drains stdout to EOF — guaranteeing cmd.Wait
-	// is called after the pipe is fully read (#446).
-	var (
-		events    []RunnerEvent
-		eventsMu  sync.Mutex
-		parseDone = make(chan struct{})
-		progToken any
-	)
+	// (5)+(6)+(7) Spawn the runner in its own process group, parse its
+	// JSONL stream, watch ctx for cancellation (SIGTERM→grace→SIGKILL the
+	// group), and wait for exit — the whole spawn-to-exit core, extracted
+	// into spawnRunnerStage so fishhawk_run_children shares the identical
+	// process-group SIGKILL contract. The parser goroutine's warnings are
+	// returned and merged after this call's pre-existing repo-detect
+	// warnings, preserving the original ordering.
+	var progToken any
 	if req != nil && req.Params != nil {
 		progToken = req.Params.GetProgressToken()
 	}
-
-	go func() {
-		defer close(parseDone)
-		runStageParseEvents(ctx, io.TeeReader(stderrPipe, os.Stderr), &events, &eventsMu, &warnings, req, progToken)
-	}()
-
-	// (6) Cancellation watcher: on ctx.Done(), signal the whole
-	// process group (not just the direct child) so descendants that
-	// inherited stdout die too — only then does the pipe close and
-	// the scanner reach EOF. Escalates to SIGKILL (group-wide)
-	// after the grace period.
-	//
-	// Snapshot the grace period at entry so a test's t.Cleanup
-	// restoring runStageGracePeriod doesn't race the goroutine.
-	grace := runStageGracePeriod
-	go func() {
-		select {
-		case <-parseDone:
-			// Normal exit — subprocess closed stdout, scanner drained.
-		case <-ctx.Done():
-			runStageSignalGroup(cmd, syscall.SIGTERM)
-			select {
-			case <-parseDone:
-				// Subprocess exited within grace; scanner done.
-			case <-time.After(grace):
-				runStageSignalGroup(cmd, syscall.SIGKILL)
-				<-parseDone
-			}
-		}
-	}()
-
-	// (7) Block until the parser goroutine has fully drained stdout,
-	// then call cmd.Wait(). The pipe is guaranteed drained at this
-	// point — no scanner-vs-Wait race.
-	<-parseDone
-	waitErr := cmd.Wait()
-
-	exitCode := 0
-	switch {
-	case waitErr == nil:
-		exitCode = 0
-	case errors.As(waitErr, new(*exec.ExitError)):
-		var exitErr *exec.ExitError
-		_ = errors.As(waitErr, &exitErr)
-		exitCode = exitErr.ExitCode()
-	default:
-		return nil, RunStageOutput{}, fmt.Errorf("runner subprocess: %w", waitErr)
+	events, spawnWarnings, exitCode, spawnErr := spawnRunnerStage(ctx, binary, argv, env, req, progToken)
+	warnings = append(warnings, spawnWarnings...)
+	if spawnErr != nil {
+		return nil, RunStageOutput{}, spawnErr
 	}
 
 	// Fetch the post-run stage state. Best-effort: a backend hiccup
@@ -720,6 +627,124 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 
 	return nil, out, nil
+}
+
+// resolveRunnerBinary resolves the fishhawk-runner binary path shared by
+// fishhawk_run_stage and fishhawk_run_children. Resolution order: explicit
+// input > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > a clean
+// remediation error. The runStageExecutable / runStageLookPath test seams keep
+// the sibling/PATH rungs injectable.
+func resolveRunnerBinary(input string, getenv func(string) string) (string, error) {
+	binary := input
+	if binary == "" {
+		if env := getenv("FISHHAWK_RUNNER_BIN"); env != "" {
+			binary = env
+		}
+	}
+	if binary == "" {
+		if exe, exeErr := runStageExecutable(); exeErr == nil {
+			sibling := filepath.Join(filepath.Dir(exe), "fishhawk-runner")
+			if _, statErr := os.Stat(sibling); statErr == nil {
+				binary = sibling
+			}
+		}
+	}
+	if binary == "" {
+		resolved, lerr := runStageLookPath("fishhawk-runner")
+		if lerr != nil {
+			return "", errors.New(
+				"fishhawk-runner not on PATH; this tool requires local MCP execution — " +
+					"pass runner_binary, set FISHHAWK_RUNNER_BIN, or co-locate fishhawk-runner with fishhawk-mcp")
+		}
+		binary = resolved
+	}
+	return binary, nil
+}
+
+// spawnRunnerStage is the single source of truth for the process-group
+// spawn/parse/kill contract that both fishhawk_run_stage and
+// fishhawk_run_children share. It builds the subprocess via runStageCommand
+// (the test seam), runs it in its OWN process group, parses each stderr JSONL
+// line into a RunnerEvent, watches ctx for cancellation (SIGTERM → grace →
+// SIGKILL the whole group), and waits for exit — returning the accumulated
+// events, the parser's warnings, the process exit code, and a non-nil error
+// ONLY for a non-ExitError wait failure (a spawn failure or a non-zero exit is
+// returned as data: exitCode carries it, err is nil).
+//
+// The process-group + parseDone-before-Wait ordering is load-bearing and
+// unchanged from the original inline runStage body (#446): the runner spawns
+// descendants (the agent, its tool processes) that inherit our stdout fd, so
+// signalling -pgid is the only way to close the pipe and let the bufio scanner
+// reach EOF. Calling cmd.Wait() only after the parser drains avoids the
+// scanner-vs-Wait race. The grace period is snapshotted at entry so a test's
+// t.Cleanup restoring runStageGracePeriod can't race the watcher goroutine.
+func spawnRunnerStage(ctx context.Context, binary string, argv []string, env []string, req *mcp.CallToolRequest, progToken any) ([]RunnerEvent, []string, int, error) {
+	cmd := runStageCommand(binary, argv...)
+	cmd.Env = env
+
+	// Own process group so signals reach the whole tree, not just the direct
+	// child (#446) — see the doc comment.
+	runStageSetProcessGroup(cmd)
+
+	// Wire stderr to a JSONL parser via TeeReader so events reach the
+	// accumulator while the raw stream is also forwarded to the operator's
+	// terminal. Stdout carries no structured events when --upload-trace is set
+	// (the runner writes all JSONL to stderr / logSink), so forward it directly.
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("attach stderr: %w", err)
+	}
+	cmd.Stdout = os.Stdout
+
+	if err := cmd.Start(); err != nil {
+		return nil, nil, 0, fmt.Errorf("spawn fishhawk-runner: %w", err)
+	}
+
+	// Concurrently: parse stderr into events; watch ctx for cancellation and
+	// signal the child. parseDone closes when the parser goroutine drains the
+	// pipe to EOF — guaranteeing cmd.Wait is called after the pipe is fully
+	// read (#446).
+	var (
+		events    []RunnerEvent
+		warnings  []string
+		eventsMu  sync.Mutex
+		parseDone = make(chan struct{})
+	)
+	go func() {
+		defer close(parseDone)
+		runStageParseEvents(ctx, io.TeeReader(stderrPipe, os.Stderr), &events, &eventsMu, &warnings, req, progToken)
+	}()
+
+	grace := runStageGracePeriod
+	go func() {
+		select {
+		case <-parseDone:
+			// Normal exit — subprocess closed stderr, scanner drained.
+		case <-ctx.Done():
+			runStageSignalGroup(cmd, syscall.SIGTERM)
+			select {
+			case <-parseDone:
+				// Subprocess exited within grace; scanner done.
+			case <-time.After(grace):
+				runStageSignalGroup(cmd, syscall.SIGKILL)
+				<-parseDone
+			}
+		}
+	}()
+
+	<-parseDone
+	waitErr := cmd.Wait()
+
+	switch {
+	case waitErr == nil:
+		return events, warnings, 0, nil
+	case errors.As(waitErr, new(*exec.ExitError)):
+		var exitErr *exec.ExitError
+		_ = errors.As(waitErr, &exitErr)
+		return events, warnings, exitErr.ExitCode(), nil
+	default:
+		return events, warnings, 0, fmt.Errorf("runner subprocess: %w", waitErr)
+	}
 }
 
 // resolveStageID resolves the stage UUID to spawn the runner against

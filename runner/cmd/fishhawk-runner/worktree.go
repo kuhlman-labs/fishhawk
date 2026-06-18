@@ -37,8 +37,16 @@ import (
 // run's own id for a solo run. It is the same key shortID derives for the
 // shared branch at the decomposition push path, so the worktree and the
 // shared branch agree.
-func lineageRoot(runID, decomposedFromRunID string) string {
-	if decomposedFromRunID != "" {
+//
+// parallelIsolate (E24.4 / #1144) inverts the child case ONLY: when set
+// AND this is a decomposed child, the root is the child's OWN id so each
+// concurrent sibling provisions an isolated worktree (run-<child>) instead
+// of racing the one shared run-<parent> tree. Concurrent children already
+// own distinct per-slice sole-writer branches, so isolation is the correct
+// shape for parallel; serial drive leaves it off and keeps the shared tree.
+// The solo path is unaffected either way (it already keys on its own id).
+func lineageRoot(runID, decomposedFromRunID string, parallelIsolate bool) string {
+	if decomposedFromRunID != "" && !parallelIsolate {
 		return shortID(decomposedFromRunID)
 	}
 	return shortID(runID)
@@ -50,8 +58,14 @@ func lineageRoot(runID, decomposedFromRunID string) string {
 // backend's lineage_complete read can't take, so the full id is recorded
 // in a sidecar beside the worktree (writeLineageRunID) for the sweep to
 // resolve the short directory name back to a run id.
-func lineageRootFull(runID, decomposedFromRunID string) string {
-	if decomposedFromRunID != "" {
+//
+// parallelIsolate mirrors lineageRoot exactly so the sidecar names the
+// SAME run id the (now per-child) worktree directory is keyed on: under
+// the flag a decomposed child records its own full id, so the sweep's
+// lineage_complete read targets the child (which, having no children of
+// its own, is terminal == lineage_complete).
+func lineageRootFull(runID, decomposedFromRunID string, parallelIsolate bool) string {
+	if decomposedFromRunID != "" && !parallelIsolate {
 		return decomposedFromRunID
 	}
 	return runID

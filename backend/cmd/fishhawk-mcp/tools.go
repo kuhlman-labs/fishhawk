@@ -58,6 +58,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerRevisePlan(srv, resolver)
 	registerListRuns(srv, resolver)
 	registerRunStage(srv, resolver)
+	registerRunChildren(srv, resolver)
 	registerRuntimeCalibration(srv, resolver)
 	registerVerifyRun(srv, resolver)
 	registerVouchCommit(srv, resolver)

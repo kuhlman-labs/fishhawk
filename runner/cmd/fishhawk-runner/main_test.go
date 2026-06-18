@@ -3485,6 +3485,38 @@ func TestParseFlags_VerifyMaxIterations(t *testing.T) {
 	}
 }
 
+func TestParseFlags_ParallelIsolate(t *testing.T) {
+	// --parallel-isolate parses into cfg; absent defaults to false (the
+	// shared lineage-root worktree for serial drive, E24.4 / #1144).
+	var out strings.Builder
+	cfg, err := parseFlags([]string{
+		"--run-id", "1",
+		"--backend-url", "https://x",
+		"--workflow", "w",
+		"--stage", "s",
+		"--parallel-isolate",
+	}, &out)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if !cfg.parallelIsolate {
+		t.Errorf("parallelIsolate = false, want true when --parallel-isolate is passed")
+	}
+
+	cfgDefault, err := parseFlags([]string{
+		"--run-id", "1",
+		"--backend-url", "https://x",
+		"--workflow", "w",
+		"--stage", "s",
+	}, &out)
+	if err != nil {
+		t.Fatalf("parseFlags (default): %v", err)
+	}
+	if cfgDefault.parallelIsolate {
+		t.Errorf("parallelIsolate default = true, want false")
+	}
+}
+
 // TestRun_FetchPrompt_ServerTimeout_Applied verifies that when --timeout is
 // not passed (default 0) and FetchPrompt returns AgentTimeoutSeconds=1800,
 // the agent invocation's Budget.Timeout equals 30 minutes.
@@ -6108,9 +6140,9 @@ func captureImplementVerifyCommit(t *testing.T, repo string, fixup, decomposed b
 		t.Fatal("VerifyCommit hook not captured")
 	}
 	// Recompute the lineage worktree dir the closure was bound to (#1137).
-	root := lineageRoot("11111111-2222-3333-4444-555555555555", "")
+	root := lineageRoot("11111111-2222-3333-4444-555555555555", "", false)
 	if decomposed {
-		root = lineageRoot("11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+		root = lineageRoot("11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", false)
 	}
 	wtParent, err := worktreesDir(context.Background(), repo)
 	if err != nil {

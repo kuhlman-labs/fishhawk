@@ -1018,6 +1018,39 @@ func TestRunStage_ContextCancelSendsSIGTERM(t *testing.T) {
 	}
 }
 
+// TestSpawnRunnerStage_ParsesEventsAndExitCode pins the extracted
+// spawnRunnerStage contract directly (the shared spawn-to-exit core
+// fishhawk_run_stage and fishhawk_run_children both delegate to): it parses
+// each stderr JSONL line into an event, returns the process exit code as DATA
+// (a non-zero exit is NOT a Go error), and a non-JSON line lands in warnings
+// rather than failing. The fishhawk_run_stage regressions above exercise it
+// through the tool; this asserts the helper in isolation.
+func TestSpawnRunnerStage_ParsesEventsAndExitCode(t *testing.T) {
+	withFakeRunner(t, `printf '%s\n' '{"kind":"runner_started"}'>&2; printf '%s\n' 'not json'>&2; printf '%s\n' '{"event":"runner_completed","outcome":"failed"}'>&2; exit 5`)
+
+	events, warnings, exitCode, err := spawnRunnerStage(
+		context.Background(), "/fake/fishhawk-runner",
+		[]string{"--run-id", "x"}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("spawnRunnerStage returned an error for a non-zero exit: %v", err)
+	}
+	if exitCode != 5 {
+		t.Errorf("exitCode = %d, want 5", exitCode)
+	}
+	if len(events) != 2 {
+		t.Errorf("parsed %d events, want 2 (the JSON lines)", len(events))
+	}
+	var sawNonJSON bool
+	for _, wmsg := range warnings {
+		if strings.Contains(wmsg, "non-JSON runner stderr") {
+			sawNonJSON = true
+		}
+	}
+	if !sawNonJSON {
+		t.Errorf("warnings = %v, want a non-JSON-line warning", warnings)
+	}
+}
+
 // --- helpers + parsers ---
 
 // TestJSONInt covers each jsonInt branch directly (#1181 concern 3). The
