@@ -24,7 +24,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/codex"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
-	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
@@ -3533,15 +3532,16 @@ func withFakeRemoteBranchExists(t *testing.T, exists bool) {
 	t.Cleanup(func() { remoteBranchExists = orig })
 }
 
-// TestRun_ImplementStage_DecomposedFirstChild verifies that when
-// DecomposedFromRunID is set and the shared branch does not yet exist on the
-// remote, the runner uses the shared branch name, pushes with --force-with-lease
-// (ForceWithLease=true), does NOT rebase (RebaseFromRemote=false), and — per
-// ADR-032 (#714) — does NOT open a PR (the parent run opens the consolidated PR).
-func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
+// TestRun_ImplementStage_DecomposedChild_SliceZero verifies the ADR-041
+// (#1141) slice-branch routing for a child at slice 0 (the omitempty-default
+// SliceIndex): the runner pushes onto its own sole-writer slice branch
+// fishhawk/run-<parent>/slice-0 cut fresh from base, with the shared-branch
+// push coupling dropped — ForceWithLease=false, RebaseFromRemote=false,
+// UpdateTrackingRef=false — and per ADR-032 (#714) does NOT open a PR.
+func TestRun_ImplementStage_DecomposedChild_SliceZero(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
-	withFakeRemoteBranchExists(t, false) // first child: branch not yet on remote
+	withFakeRemoteBranchExists(t, false) // sole-writer slice branch never pre-exists
 
 	parentRunID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	fu := newFakeUploader(t)
@@ -3551,6 +3551,7 @@ func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 		Prompt:              "implement",
 		PromptHash:          "h",
 		DecomposedFromRunID: parentRunID,
+		// SliceIndex omitted → 0 (guards omitempty/zero handling).
 	}
 	withFakeUploader(t, fu)
 	fp := &fakePusher{}
@@ -3573,40 +3574,41 @@ func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 	if fp.gotArgs == nil {
 		t.Fatal("CommitAndPush not called")
 	}
-	// shared branch: fishhawk/run-<shortParentID> — first 8 chars of parentRunID without hyphens
-	wantBranch := "fishhawk/run-aaaaaaaa"
+	// slice branch: fishhawk/run-<shortParentID>/slice-0
+	wantBranch := "fishhawk/run-aaaaaaaa/slice-0"
 	if fp.gotArgs.Branch != wantBranch {
-		t.Errorf("branch = %q, want %q (shared parent branch)", fp.gotArgs.Branch, wantBranch)
+		t.Errorf("branch = %q, want %q (sole-writer slice branch)", fp.gotArgs.Branch, wantBranch)
 	}
-	if !fp.gotArgs.ForceWithLease {
-		t.Error("ForceWithLease = false, want true for decomposed child")
+	// ADR-041: the shared-branch push coupling is dropped for children.
+	if fp.gotArgs.ForceWithLease {
+		t.Error("ForceWithLease = true, want false (no shared branch to force-push, ADR-041)")
 	}
 	if fp.gotArgs.RebaseFromRemote {
-		t.Error("RebaseFromRemote = true, want false for first child (branch not yet on remote)")
+		t.Error("RebaseFromRemote = true, want false (slice branch cut fresh from base, no prior sibling commit)")
 	}
-	// First child cuts the shared branch from the freshly-fetched authoritative
-	// base, not ambient HEAD, so a foreign #797 commit can't become the fork
-	// point (ADR-035, #865). implementEnv sets the base ref to "main".
+	if fp.gotArgs.UpdateTrackingRef {
+		t.Error("UpdateTrackingRef = true, want false (no shared branch to keep in sync, ADR-041)")
+	}
+	// Each child cuts its slice branch from the freshly-fetched authoritative
+	// base, not ambient HEAD (ADR-035, #861). implementEnv sets base ref "main".
 	if fp.gotArgs.FreshFetchBase != "main" {
-		t.Errorf("FreshFetchBase = %q, want %q (first child cuts from freshly-fetched base, #865)", fp.gotArgs.FreshFetchBase, "main")
+		t.Errorf("FreshFetchBase = %q, want %q (slice cut from freshly-fetched base)", fp.gotArgs.FreshFetchBase, "main")
 	}
-	// Compile gate (#728) is now wired on the decomposed-child path too
-	// (#766): a scope-bounded child commit is the highest-risk path for a
-	// drift-dropped non-compiling HEAD, so it must be gated, not tolerated.
+	// Compile gate (#728/#766) stays wired on the decomposed-child path.
 	if fp.gotArgs.VerifyCommit == nil {
 		t.Error("VerifyCommit hook should be set for decomposed children (#766)")
 	}
-	// First child: per ADR-032 the child no longer opens a PR — the parent
-	// run opens the single consolidated PR once all children settle.
+	// Per ADR-032 the child no longer opens a PR — the parent run opens the
+	// single consolidated PR once all children settle.
 	if fpr.gotArgs != nil {
-		t.Error("OpenPR called for first decomposed child — should be suppressed (parent opens the PR)")
+		t.Error("OpenPR called for decomposed child — should be suppressed (parent opens the PR)")
 	}
 	// But the child DOES report its push success via /pull-request with
 	// Outcome=="pushed" (#771) so the backend can drive the child stage's
 	// terminal transition its push_to_shared_branch trace gate left in
-	// `running`. No PR artifact — just the shared-branch commit coordinates.
+	// `running`. No PR artifact — just the slice-branch commit coordinates.
 	if fu.gotPRArgs == nil {
-		t.Fatal("ShipPullRequest (child-push report) not called for first decomposed child (#771)")
+		t.Fatal("ShipPullRequest (child-push report) not called for decomposed child (#771)")
 	}
 	if fu.gotPRArgs.Outcome != "pushed" {
 		t.Errorf("child-push report Outcome = %q, want \"pushed\"", fu.gotPRArgs.Outcome)
@@ -3620,14 +3622,15 @@ func TestRun_ImplementStage_DecomposedFirstChild(t *testing.T) {
 	}
 }
 
-// TestRun_ImplementStage_DecomposedSubsequentChild verifies that when
-// DecomposedFromRunID is set and the shared branch already exists on the
-// remote, the runner rebases (RebaseFromRemote=true), pushes with
-// --force-with-lease, and skips OpenPR + ShipPullRequest.
-func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
+// TestRun_ImplementStage_DecomposedChild_SliceTwo verifies that a non-zero
+// SliceIndex routes onto the matching slice branch fishhawk/run-<parent>/slice-2,
+// with the same dropped push coupling (ForceWithLease=false,
+// UpdateTrackingRef=false) — the cross-boundary field->branch-name end of the
+// slice_index contract (ADR-041 / #1141).
+func TestRun_ImplementStage_DecomposedChild_SliceTwo(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
-	withFakeRemoteBranchExists(t, true) // subsequent child: branch already on remote
+	withFakeRemoteBranchExists(t, false) // sole-writer slice branch never pre-exists
 
 	parentRunID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	fu := newFakeUploader(t)
@@ -3637,6 +3640,7 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 		Prompt:              "implement",
 		PromptHash:          "h",
 		DecomposedFromRunID: parentRunID,
+		SliceIndex:          2,
 	}
 	withFakeUploader(t, fu)
 	fp := &fakePusher{}
@@ -3659,44 +3663,121 @@ func TestRun_ImplementStage_DecomposedSubsequentChild(t *testing.T) {
 	if fp.gotArgs == nil {
 		t.Fatal("CommitAndPush not called")
 	}
-	wantBranch := "fishhawk/run-aaaaaaaa"
+	wantBranch := "fishhawk/run-aaaaaaaa/slice-2"
 	if fp.gotArgs.Branch != wantBranch {
-		t.Errorf("branch = %q, want %q (shared parent branch)", fp.gotArgs.Branch, wantBranch)
+		t.Errorf("branch = %q, want %q (slice-2 sole-writer branch)", fp.gotArgs.Branch, wantBranch)
 	}
-	if !fp.gotArgs.ForceWithLease {
-		t.Error("ForceWithLease = false, want true for decomposed child")
+	if fp.gotArgs.ForceWithLease {
+		t.Error("ForceWithLease = true, want false (ADR-041)")
 	}
-	if !fp.gotArgs.RebaseFromRemote {
-		t.Error("RebaseFromRemote = false, want true for subsequent child (branch exists on remote)")
+	if fp.gotArgs.RebaseFromRemote {
+		t.Error("RebaseFromRemote = true, want false (slice cut fresh from base)")
 	}
-	// Subsequent child must leave FreshFetchBase empty: RebaseFromRemote owns
-	// the routing for the existing shared branch, and the #865 fresh-fetch is
-	// only for the first child's branch creation — no regression here.
-	if fp.gotArgs.FreshFetchBase != "" {
-		t.Errorf("FreshFetchBase = %q, want empty for subsequent child (RebaseFromRemote owns routing, #865)", fp.gotArgs.FreshFetchBase)
+	if fp.gotArgs.UpdateTrackingRef {
+		t.Error("UpdateTrackingRef = true, want false (ADR-041)")
 	}
-	// (#766): the compile gate is wired on EVERY decomposed-child commit
-	// path, not just the first child. Asserting it here too closes the gap
-	// where a guard re-introduced as `isDecomposed && isSubsequent` would
-	// leave the gate off for subsequent children while DecomposedFirstChild
-	// still passed.
-	if fp.gotArgs.VerifyCommit == nil {
-		t.Error("VerifyCommit hook should be set for subsequent decomposed children (#766)")
-	}
-	// Subsequent child: PR must NOT be opened (first child already did it).
 	if fpr.gotArgs != nil {
-		t.Error("OpenPR called for subsequent decomposed child — should be skipped")
+		t.Error("OpenPR called for decomposed child — should be suppressed")
 	}
-	// A subsequent child still reports its push success (#771) — the gate is
-	// per-child, not first-child-only.
 	if fu.gotPRArgs == nil {
-		t.Fatal("ShipPullRequest (child-push report) not called for subsequent decomposed child (#771)")
-	}
-	if fu.gotPRArgs.Outcome != "pushed" {
-		t.Errorf("child-push report Outcome = %q, want \"pushed\"", fu.gotPRArgs.Outcome)
+		t.Fatal("ShipPullRequest (child-push report) not called")
 	}
 	if fu.gotPRArgs.Branch != wantBranch {
 		t.Errorf("child-push report Branch = %q, want %q", fu.gotPRArgs.Branch, wantBranch)
+	}
+}
+
+// TestResolveImplementBranchRouting covers one behavioral case per routing
+// branch (ADR-041 / #1141): standalone, fix-up, and decomposed children at
+// slice 0 and slice 2. The decomposed cases also pin the ADR-041 decoupling:
+// even when the slice branch is (anomalously) reported present on the remote,
+// isSubsequent stays false so RebaseFromRemote is never set for a child.
+func TestResolveImplementBranchRouting(t *testing.T) {
+	const (
+		runID    = "11111111-2222-3333-4444-555555555555"
+		stageID  = "22222222-3333-4444-5555-666666666666"
+		parentID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		baseRef  = "main"
+	)
+	tests := []struct {
+		name           string
+		cfg            config
+		sliceIndex     int  // sets the package-level runSliceIndex for the case
+		remoteExists   bool // value the remoteBranchExists seam returns
+		wantBranch     string
+		wantDecomposed bool
+		wantSubsequent bool
+		wantFixup      bool
+		wantFreshBase  string
+	}{
+		{
+			name:          "standalone",
+			cfg:           config{runID: runID, stageID: stageID},
+			wantBranch:    "fishhawk/run-11111111/stage-22222222",
+			wantFreshBase: baseRef,
+		},
+		{
+			name:       "fixup",
+			cfg:        config{runID: runID, stageID: stageID, fixup: true, fixupBranch: "fishhawk/run-11111111/stage-22222222"},
+			wantBranch: "fishhawk/run-11111111/stage-22222222",
+			wantFixup:  true,
+			// fix-up rebases the existing PR branch from the remote.
+			wantSubsequent: true,
+		},
+		{
+			name:           "decomposed slice-0",
+			cfg:            config{runID: runID, stageID: stageID, decomposedFromRunID: parentID},
+			sliceIndex:     0,
+			wantBranch:     "fishhawk/run-aaaaaaaa/slice-0",
+			wantDecomposed: true,
+			wantFreshBase:  baseRef,
+		},
+		{
+			name:           "decomposed slice-2",
+			cfg:            config{runID: runID, stageID: stageID, decomposedFromRunID: parentID},
+			sliceIndex:     2,
+			wantBranch:     "fishhawk/run-aaaaaaaa/slice-2",
+			wantDecomposed: true,
+			wantFreshBase:  baseRef,
+		},
+		{
+			// ADR-041 decoupling guard: a child must NOT become "subsequent"
+			// (RebaseFromRemote) even if the slice branch is reported present.
+			name:           "decomposed ignores remote branch presence",
+			cfg:            config{runID: runID, stageID: stageID, decomposedFromRunID: parentID},
+			sliceIndex:     1,
+			remoteExists:   true,
+			wantBranch:     "fishhawk/run-aaaaaaaa/slice-1",
+			wantDecomposed: true,
+			wantSubsequent: false,
+			wantFreshBase:  baseRef,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			withFakeRemoteBranchExists(t, tc.remoteExists)
+			runSliceIndex = tc.sliceIndex
+			t.Cleanup(func() { runSliceIndex = 0 })
+			r, err := resolveImplementBranchRouting(context.Background(), tc.cfg, ".", baseRef)
+			if err != nil {
+				t.Fatalf("resolveImplementBranchRouting: %v", err)
+			}
+			if r.branch != tc.wantBranch {
+				t.Errorf("branch = %q, want %q", r.branch, tc.wantBranch)
+			}
+			if r.isDecomposed != tc.wantDecomposed {
+				t.Errorf("isDecomposed = %t, want %t", r.isDecomposed, tc.wantDecomposed)
+			}
+			if r.isSubsequent != tc.wantSubsequent {
+				t.Errorf("isSubsequent = %t, want %t", r.isSubsequent, tc.wantSubsequent)
+			}
+			if r.isFixup != tc.wantFixup {
+				t.Errorf("isFixup = %t, want %t", r.isFixup, tc.wantFixup)
+			}
+			if r.freshFetchBase != tc.wantFreshBase {
+				t.Errorf("freshFetchBase = %q, want %q", r.freshFetchBase, tc.wantFreshBase)
+			}
+		})
 	}
 }
 
@@ -3725,16 +3806,18 @@ func runDecomposedChildStage(t *testing.T, stderr *strings.Builder) int {
 	}, stderr)
 }
 
-// TestRun_DecomposedSubsequentChild_EstablishesBaseBeforeAgentInvoke is the
-// #1036 regression: a subsequent decomposed child's declared policy base is
-// the shared parent branch (#765), so the runner must fetch + checkout that
-// branch BEFORE the agent is invoked — never run the agent against the
-// operator's incidental checkout, where a slice depending on a prior
-// sibling's code cannot compile — and restore the operator's original ref
-// afterwards, mirroring the fix-up flow's #967 discipline.
-func TestRun_DecomposedSubsequentChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
+// TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke exercises the
+// retained #1036 base-establishment block: IF a child's slice branch is present
+// on the remote (forced here via the remoteBranchExists seam), the runner
+// fetches + checks it out BEFORE the agent is invoked and restores the
+// operator's original ref afterwards. Under ADR-041 (#1141) each child owns a
+// sole-writer slice branch minted once, so this path is dormant in production
+// (the branch never pre-exists — see DecomposedChild_SkipsChildBaseCheckout for
+// the real remoteBranchExists=false case); the block is retained and tested so
+// it stays correct if a future shared-checkout variant re-enables it.
+func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeRemoteBranchExists(t, true) // subsequent child: branch already on remote
+	withFakeRemoteBranchExists(t, true) // force the retained base-establishment path
 
 	// Ordered spy: the agent invocation must observe the checkout already
 	// requested.
@@ -3790,15 +3873,15 @@ func TestRun_DecomposedSubsequentChild_EstablishesBaseBeforeAgentInvoke(t *testi
 	if len(order) < 2 || order[0] != "checkout" || order[1] != "invoke" {
 		t.Errorf("order = %v, want the shared-branch checkout BEFORE the agent invocation", order)
 	}
-	if gotBranch != "fishhawk/run-aaaaaaaa" {
-		t.Errorf("checkout branch = %q, want the shared parent branch", gotBranch)
+	if gotBranch != "fishhawk/run-aaaaaaaa/slice-0" {
+		t.Errorf("checkout branch = %q, want the child's slice branch", gotBranch)
 	}
 	if gotRemote != gitops.DefaultRemote {
 		t.Errorf("checkout remote = %q, want %q", gotRemote, gitops.DefaultRemote)
 	}
 	for _, want := range []string{
 		`"event":"child_base_established"`,
-		`"branch":"fishhawk/run-aaaaaaaa"`,
+		`"branch":"fishhawk/run-aaaaaaaa/slice-0"`,
 		`"head_sha":"shared-branch-tip-sha"`,
 		`"original_ref":"main"`,
 	} {
@@ -3821,12 +3904,14 @@ func TestRun_DecomposedSubsequentChild_EstablishesBaseBeforeAgentInvoke(t *testi
 	}
 }
 
-// TestRun_DecomposedFirstChild_SkipsChildBaseCheckout: the first child has no
-// shared branch on the remote yet and legitimately runs against the operator's
-// base-branch checkout — the pre-invoke checkout must not fire at all.
-func TestRun_DecomposedFirstChild_SkipsChildBaseCheckout(t *testing.T) {
+// TestRun_DecomposedChild_SkipsChildBaseCheckout is the production case under
+// ADR-041 (#1141): a child's sole-writer slice branch never pre-exists on the
+// remote (remoteBranchExists=false), so the pre-invoke base-establishment
+// checkout must not fire — the child runs against the operator's base-branch
+// checkout, cutting its slice fresh from base.
+func TestRun_DecomposedChild_SkipsChildBaseCheckout(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeRemoteBranchExists(t, false) // first child: branch not yet on remote
+	withFakeRemoteBranchExists(t, false) // slice branch never pre-exists
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 	fu := newFakeUploader(t)
 	fu.promptResp = decomposedChildPromptResp()
@@ -3853,11 +3938,12 @@ func TestRun_DecomposedFirstChild_SkipsChildBaseCheckout(t *testing.T) {
 	}
 }
 
-// TestRun_DecomposedSubsequentChild_CheckoutFailure_FailsBeforeAgentInvoke:
-// a shared-branch checkout failure (fetch auth, force-checkout error) must
-// fail the runner fast — the agent is NEVER invoked, no agent turns are
+// TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke: when the
+// retained base-establishment block fires (slice branch present, forced via the
+// seam) and the slice-branch checkout fails (fetch auth, force-checkout error),
+// the runner must fail fast — the agent is NEVER invoked, no agent turns are
 // spent, and the failure names the child_base_checkout reason.
-func TestRun_DecomposedSubsequentChild_CheckoutFailure_FailsBeforeAgentInvoke(t *testing.T) {
+func TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeRemoteBranchExists(t, true)
 	inv := &fakeInvoker{canned: agent.Result{OK: true}}
@@ -3942,7 +4028,7 @@ func TestRun_ImplementStage_DecomposedChild_NoChanges_ReportsFailedCategoryC(t *
 	}
 	for _, want := range []string{
 		`"event":"implement_child_no_changes"`,
-		`"shared_branch":"fishhawk/run-aaaaaaaa"`,
+		`"shared_branch":"fishhawk/run-aaaaaaaa/slice-0"`,
 		`"base_sha":"base"`,
 		`"event":"pull_request_failure_reported"`,
 	} {
@@ -8940,12 +9026,16 @@ func TestTouchedPackageArgs(t *testing.T) {
 	}
 }
 
-// TestResolvePolicyBaseRef covers base-ref selection across the three
-// cases: standalone, first decomposition child, and subsequent child.
-// It drives the remoteBranchExists seam (#765).
+// TestResolvePolicyBaseRef covers base-ref selection under ADR-041 (#1141):
+// standalone, a decomposed child whose sole-writer slice branch is absent (the
+// production invariant — a slice branch is minted once and never pre-exists),
+// and the retained-but-dormant forced-present path. It drives the
+// remoteBranchExists seam.
 func TestResolvePolicyBaseRef(t *testing.T) {
 	const sharedRunID = "abcdef0123456789"
-	sharedBranch := "fishhawk/run-" + shortID(sharedRunID)
+	// Under ADR-041 the policy base for a decomposed child keys off the
+	// per-child slice branch, not the pre-ADR-041 shared branch.
+	sliceBranch := childSliceBranch(sharedRunID, 0)
 
 	t.Run("standalone returns checkBaseRef", func(t *testing.T) {
 		// No seam override needed: the empty decomposedFromRunID short-
@@ -8956,31 +9046,54 @@ func TestResolvePolicyBaseRef(t *testing.T) {
 		}
 	})
 
-	t.Run("first child (shared branch absent) returns checkBaseRef", func(t *testing.T) {
+	t.Run("decomposed child (slice branch absent) returns checkBaseRef", func(t *testing.T) {
+		// The ADR-041 production case: a sole-writer slice branch never
+		// pre-exists, so each child's policy diff is bounded against base —
+		// each slice is an independent increment off base, not a cumulative
+		// fan-out (#765 superseded). The policy_base_decomposition_child
+		// event must NOT fire (no shared-branch tip to bound against).
 		withFakeRemoteBranchExists(t, false)
 		cfg := config{checkBaseRef: "main", decomposedFromRunID: sharedRunID}
-		if got := resolvePolicyBaseRef(context.Background(), cfg, io.Discard); got != "main" {
+		runSliceIndex = 2
+		t.Cleanup(func() { runSliceIndex = 0 })
+		var sink strings.Builder
+		if got := resolvePolicyBaseRef(context.Background(), cfg, &sink); got != "main" {
 			t.Fatalf("resolvePolicyBaseRef = %q, want %q", got, "main")
+		}
+		if strings.Contains(sink.String(), "policy_base_decomposition_child") {
+			t.Errorf("unexpected policy_base_decomposition_child emission:\n%s", sink.String())
 		}
 	})
 
-	t.Run("subsequent child (shared branch present) returns origin/<shared-branch>", func(t *testing.T) {
+	t.Run("decomposed child (slice branch forced present) returns origin/<slice-branch>", func(t *testing.T) {
+		// Dormant path: a sole-writer slice branch never pre-exists in
+		// production, but if the seam reports it present the retained logic
+		// bounds against origin/<slice-branch> and emits the event — covering
+		// the branch so it stays correct if a future variant re-enables it.
 		withFakeRemoteBranchExists(t, true)
 		cfg := config{checkBaseRef: "main", decomposedFromRunID: sharedRunID, stageID: "s1"}
-		want := "origin/" + sharedBranch
-		if got := resolvePolicyBaseRef(context.Background(), cfg, io.Discard); got != want {
+		runSliceIndex = 0
+		t.Cleanup(func() { runSliceIndex = 0 })
+		want := "origin/" + sliceBranch
+		var sink strings.Builder
+		if got := resolvePolicyBaseRef(context.Background(), cfg, &sink); got != want {
 			t.Fatalf("resolvePolicyBaseRef = %q, want %q", got, want)
+		}
+		if !strings.Contains(sink.String(), "policy_base_decomposition_child") {
+			t.Errorf("missing policy_base_decomposition_child emission:\n%s", sink.String())
 		}
 	})
 }
 
-// TestComputeAndEmitDiff_DecompositionChild_MeasuresIncrement is the
-// end-to-end proof for #765: it crosses resolvePolicyBaseRef -> gitdiff
-// -> constraint.Evaluate against a real git repo. A 2-child
-// decomposition whose CUMULATIVE file count exceeds the cap passes
-// because each child's increment is measured against the prior
-// shared-branch tip; the pre-fix `main` base would have failed.
-func TestComputeAndEmitDiff_DecompositionChild_MeasuresIncrement(t *testing.T) {
+// TestComputeAndEmitDiff_DecompositionChild_MeasuresAgainstBase is the
+// ADR-041 (#1141) end-to-end proof: it crosses resolvePolicyBaseRef -> gitdiff
+// -> constraint.Evaluate against a real git repo. Under ADR-041 each child
+// owns a sole-writer slice branch cut fresh from base (the branch never
+// pre-exists on the remote), so a child's policy diff is bounded against
+// checkBaseRef (main) — its own slice increment, not a cumulative fan-out on a
+// shared branch (the pre-ADR-041 #765 shared-branch increment model is
+// superseded; slices no longer layer onto each other).
+func TestComputeAndEmitDiff_DecompositionChild_MeasuresAgainstBase(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -9008,78 +9121,43 @@ func TestComputeAndEmitDiff_DecompositionChild_MeasuresIncrement(t *testing.T) {
 
 	const maxFiles = 5
 
-	// Child A: a commit on the shared branch carrying enough files that
-	// the cumulative count (A + B) exceeds the cap.
+	// The child's slice increment: a set of NEW files staged but not
+	// committed, cut from base (the working tree stays on main — the
+	// sole-writer slice branch is created fresh at push time). Under the cap.
+	const childFiles = 3
+	for i := 0; i < childFiles; i++ {
+		name := fmt.Sprintf("c%d.go", i)
+		if err := os.WriteFile(filepath.Join(repo, name), []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if childFiles > maxFiles {
+		t.Fatalf("test misconfigured: child increment %d must be under maxFiles %d", childFiles, maxFiles)
+	}
+
 	sharedRunID := "abcdef0123456789"
-	sharedBranch := "fishhawk/run-" + shortID(sharedRunID)
-	runGit("checkout", "-b", sharedBranch)
-	const childAFiles = 4
-	for i := 0; i < childAFiles; i++ {
-		name := fmt.Sprintf("a%d.go", i)
-		if err := os.WriteFile(filepath.Join(repo, name), []byte("package x\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	runGit("add", "-A")
-	runGit("commit", "-m", "child A")
-
-	// Mirror the post-push remote-tracking ref so remoteBranchExists and
-	// `git diff origin/<shared-branch>` both resolve the child-A tip
-	// without a network fetch.
-	runGit("update-ref", "refs/remotes/origin/"+sharedBranch, "HEAD")
-
-	// Child B increment: a small set of NEW files staged but not
-	// committed, under the cap on its own.
-	const childBFiles = 2
-	for i := 0; i < childBFiles; i++ {
-		name := fmt.Sprintf("b%d.go", i)
-		if err := os.WriteFile(filepath.Join(repo, name), []byte("package x\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Sanity: cumulative (A + B) exceeds the cap, each increment is under it.
-	if childAFiles+childBFiles <= maxFiles {
-		t.Fatalf("test misconfigured: cumulative %d must exceed maxFiles %d", childAFiles+childBFiles, maxFiles)
-	}
-	if childBFiles > maxFiles {
-		t.Fatalf("test misconfigured: child-B increment %d must be under maxFiles %d", childBFiles, maxFiles)
-	}
-
 	cfg := config{
 		workingDir:          repo,
 		checkBaseRef:        "main",
 		decomposedFromRunID: sharedRunID,
-		stageID:             "s-childB",
+		stageID:             "s-child",
 	}
+	runSliceIndex = 1
+	t.Cleanup(func() { runSliceIndex = 0 })
 
-	// Subsequent child: remoteBranchExists reports the shared branch is
-	// present, so the policy diff resolves against origin/<shared-branch>.
-	withFakeRemoteBranchExists(t, true)
+	// Production invariant: the sole-writer slice branch is absent on the
+	// remote, so the policy diff resolves against checkBaseRef (main).
+	withFakeRemoteBranchExists(t, false)
 	d, _, err := computeAndEmitDiff(cfg, io.Discard)
 	if err != nil {
 		t.Fatalf("computeAndEmitDiff: %v", err)
 	}
-	if got := len(d.ChangedFiles); got != childBFiles {
-		t.Fatalf("increment diff = %d files (%v), want %d (the child-B increment only)",
-			got, d.ChangedFiles, childBFiles)
+	if got := len(d.ChangedFiles); got != childFiles {
+		t.Fatalf("slice diff = %d files (%v), want %d (the child's own increment off base)",
+			got, d.ChangedFiles, childFiles)
 	}
 	if v := constraint.Evaluate(d, constraint.Constraints{MaxFilesChanged: maxFiles}); len(v) != 0 {
-		t.Fatalf("increment of %d under maxFiles %d should not violate; got %v", childBFiles, maxFiles, v)
-	}
-
-	// Pre-fix behavior: the same staged index measured against `main`
-	// yields the cumulative set that exceeds the cap (the #765 bug).
-	gd := &gitdiff.Runner{}
-	cumulative, err := gd.Run(context.Background(), "main", repo)
-	if err != nil {
-		t.Fatalf("cumulative diff: %v", err)
-	}
-	if got := len(cumulative.ChangedFiles); got != childAFiles+childBFiles {
-		t.Fatalf("cumulative diff = %d files, want %d", got, childAFiles+childBFiles)
-	}
-	if v := constraint.Evaluate(cumulative, constraint.Constraints{MaxFilesChanged: maxFiles}); len(v) == 0 {
-		t.Fatalf("cumulative of %d over maxFiles %d must violate (pre-fix repro)", childAFiles+childBFiles, maxFiles)
+		t.Fatalf("increment of %d under maxFiles %d should not violate; got %v", childFiles, maxFiles, v)
 	}
 }
 
@@ -9235,90 +9313,14 @@ func TestComputeAndEmitDiff_CategorizesScopeDrift(t *testing.T) {
 	})
 }
 
-// TestDecompositionFanout_TrackingRefMaterialized_RoutesSubsequent crosses
-// the real gitops push -> tracking-ref -> production remoteBranchExists ->
-// routing seam end-to-end (#770). The bug lives in that seam: a decomposed
-// child pushes the shared branch with a URL push (git push <url> HEAD:<branch>),
-// which never updates refs/remotes/origin/<branch>, so the production
-// remoteBranchExists read sees the branch as absent and mis-routes the next
-// child to the first-child `checkout -b` path (which then fails because the
-// local branch already exists). Per-layer unit tests on a swapped fake pusher
-// could not catch this — it only surfaces when the REAL Pusher's URL push
-// feeds the REAL remoteBranchExists. This is the same git-state-staleness
-// family as #767 (the stale --force-with-lease, fixed by the same maintained
-// ref). The test deliberately does NOT swap newPusher or remoteBranchExists.
-func TestDecompositionFanout_TrackingRefMaterialized_RoutesSubsequent(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-
-	dir := t.TempDir()
-	repo := filepath.Join(dir, "src")
-	bare := filepath.Join(dir, "origin.git")
-	if err := os.Mkdir(repo, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	runGit := func(args ...string) {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = repo
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-		}
-	}
-	runGit("init", "--initial-branch=main")
-	runGit("config", "user.name", "init")
-	runGit("config", "user.email", "init@example.com")
-	if err := os.WriteFile(filepath.Join(repo, "base.go"), []byte("package x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit("add", "-A")
-	runGit("commit", "-m", "base")
-	runGit("init", "--bare", bare)
-	runGit("remote", "add", "origin", bare)
-
-	const parentRunID = "aaaaaaaabbbbcccc"
-	sharedBranch := "fishhawk/run-" + shortID(parentRunID)
-	ctx := context.Background()
-
-	// Before any child pushes, the production routing read must report the
-	// shared branch as absent (first-child path).
-	if remoteBranchExists(ctx, repo, sharedBranch) {
-		t.Fatal("remoteBranchExists = true before any push; want false")
-	}
-
-	// Child A: first child of the fan-out. Commit + push the shared branch
-	// via the REAL gitops.Pusher (a URL push), with UpdateTrackingRef:true as
-	// the runner sets for decomposed children. NOT a fake pusher — the bug is
-	// in the real URL-push-vs-tracking-ref seam.
-	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	p := &gitops.Pusher{}
-	if _, err := p.CommitAndPush(ctx, gitops.CommitAndPushArgs{
-		RepoDir:           repo,
-		Branch:            sharedBranch,
-		CommitMessage:     "child A",
-		RemoteURL:         bare,
-		ForceWithLease:    true,
-		UpdateTrackingRef: true,
-	}); err != nil {
-		t.Fatalf("child A CommitAndPush: %v", err)
-	}
-
-	// The seam AND the routing decision in one read: the upload phase computes
-	// child B's isSubsequent as exactly remoteBranchExists(ctx, repo, sharedBranch)
-	// (main.go), so this single call is both the #770 regression guard and the
-	// routing assertion. Even though child A pushed by URL, the production
-	// remoteBranchExists now observes the shared branch as present because
-	// CommitAndPush materialized refs/remotes/origin/<branch> — so child B
-	// routes to RebaseFromRemote, not the first-child `checkout -b` that would
-	// fail on the existing local branch. (A second identical call would add no
-	// signal — git state is unchanged — so it was removed per the review.)
-	if isSubsequent := remoteBranchExists(ctx, repo, sharedBranch); !isSubsequent {
-		t.Fatal("child B routing: remoteBranchExists = false after child A's URL push — the #770 bug (tracking ref not materialized); want true (RebaseFromRemote path)")
-	}
-}
+// Note: the pre-ADR-041 TestDecompositionFanout_TrackingRefMaterialized_RoutesSubsequent
+// was removed with #1141. It guarded the shared-branch #770 seam — a decomposed
+// child's URL push materializing refs/remotes/origin/<shared-branch> so the NEXT
+// child's remoteBranchExists routing read saw it present and routed
+// RebaseFromRemote. ADR-041 drops that model: each child owns a sole-writer slice
+// branch, no child sets UpdateTrackingRef, and no child routes "subsequent" off a
+// sibling's push. The branch-routing decoupling is now covered by
+// TestResolveImplementBranchRouting (isSubsequent stays false for children).
 
 // verifiedTreeRepo builds the #960 integration fixture: a real repo with a
 // local bare `origin` holding main, a `url.insteadOf` rewrite so the

@@ -491,6 +491,58 @@ func TestFetchPrompt_DecodesScopeFiles(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesSliceIndex confirms the client decodes the backend's
+// slice_index response field into FetchedPrompt.SliceIndex (ADR-041 / #1141) —
+// the decode half of the cross-module slice_index seam. The runner threads
+// FetchedPrompt.SliceIndex into cfg.sliceIndex (fetchPromptToFile) and routes
+// the child onto fishhawk/run-<parent>/slice-<n>; that field->branch-name half
+// is asserted by TestRun_ImplementStage_DecomposedChild_SliceTwo in the runner
+// command package.
+func TestFetchPrompt_DecodesSliceIndex(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"decomposed_from_run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		"slice_index": 2
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.SliceIndex != 2 {
+		t.Errorf("SliceIndex = %d, want 2", got.SliceIndex)
+	}
+}
+
+// TestFetchPrompt_SliceIndexOmittedWhenAbsent confirms SliceIndex decodes to 0
+// when the backend omits the field (standalone run, or a slice-0 child where
+// omitempty drops it) — the correct value the runner reads for slice 0.
+func TestFetchPrompt_SliceIndexOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.SliceIndex != 0 {
+		t.Errorf("SliceIndex = %d, want 0 when absent", got.SliceIndex)
+	}
+}
+
 // TestFetchPrompt_DecodesCommitAuthor confirms the client decodes the
 // backend's commit_author_name/commit_author_email response fields into
 // FetchedPrompt so App-backed commits attribute to the App's bot (#722).

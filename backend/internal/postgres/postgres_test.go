@@ -205,13 +205,24 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0033 (#1165) added the
-	// review_concerns.suggested_patch column; its down migration drops
-	// it. Confirm: the column is gone, but every prior migration's effect
-	// is still present — notably 0032's (#1057) widened stages_state_check
-	// still admits 'awaiting_input' (only 0033 rolled back), plus runs.drive
-	// from 0031, review_concerns from 0030, scope_amendments from 0029,
-	// cost_usd_total + resolved_model from 0028, etc.
+	// MigrateDown rolls back one step. 0034 (#1141) added the
+	// runs.slice_index column; its down migration drops it. Confirm: the
+	// column is gone, but every prior migration's effect is still present —
+	// notably 0033's (#1165) review_concerns.suggested_patch column (only
+	// 0034 rolled back), 0032's (#1057) widened stages_state_check still
+	// admits 'awaiting_input', plus runs.drive from 0031, review_concerns
+	// from 0030, scope_amendments from 0029, cost_usd_total + resolved_model
+	// from 0028, etc.
+	var sliceIndexCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'slice_index'`,
+	).Scan(&sliceIndexCol); err != nil {
+		t.Fatalf("query runs.slice_index column: %v", err)
+	}
+	if sliceIndexCol != 0 {
+		t.Errorf("runs.slice_index count after MigrateDown = %d, want 0 (0034 down should have dropped it)", sliceIndexCol)
+	}
 	var suggestedPatchCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -219,8 +230,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&suggestedPatchCol); err != nil {
 		t.Fatalf("query review_concerns.suggested_patch column: %v", err)
 	}
-	if suggestedPatchCol != 0 {
-		t.Errorf("review_concerns.suggested_patch count after MigrateDown = %d, want 0 (0033 down should have dropped it)", suggestedPatchCol)
+	if suggestedPatchCol != 1 {
+		t.Errorf("review_concerns.suggested_patch count after MigrateDown = %d, want 1 (0033 still applied; only 0034 rolled back)", suggestedPatchCol)
 	}
 	var stageStateCheckDef string
 	if err := pool.QueryRow(context.Background(),

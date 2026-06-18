@@ -607,8 +607,13 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 	}
 
 	childIDs := make([]string, 0, len(approvedPlan.Decomposition.SubPlans))
-	for _, sub := range approvedPlan.Decomposition.SubPlans {
+	for i, sub := range approvedPlan.Decomposition.SubPlans {
 		parentID := parent.ID
+		// Capture the loop index into a local: each child is routed by
+		// the runner onto its own sole-writer slice branch
+		// fishhawk/run-<parent>/slice-<idx> (E24.1 / #1141 / ADR-041).
+		// The index is the sub_plan's position in dependency order.
+		idx := i
 		childCtx := childIssueContextFromSubPlan(parent, sub)
 		child, err := o.Runs.CreateRun(ctx, run.CreateRunParams{
 			Repo:           parent.Repo,
@@ -619,6 +624,7 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 			InstallationID: parent.InstallationID,
 			ParentRunID:    &parentID,
 			DecomposedFrom: &parentID,
+			SliceIndex:     &idx,
 			RunnerKind:     parent.RunnerKind,
 			IssueContext:   childCtx,
 			// Inherit the parent's cached workflow spec so the child's
@@ -653,6 +659,7 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 			slog.String("child_run_id", child.ID.String()),
 			slog.String("child_implement_stage_id", childImpl.ID.String()),
 			slog.String("sub_plan_title", sub.Title),
+			slog.Int("slice_index", idx),
 		)
 	}
 

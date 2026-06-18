@@ -206,6 +206,68 @@ func TestPostgres_Drive_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestPostgres_SliceIndex_RoundTrip exercises the nullable runs.slice_index
+// column (E24.1 / #1141): a decomposed child persists and reads back its
+// 0-based sub_plan position, while a run created without a SliceIndex
+// round-trips as nil (the non-decomposed default).
+func TestPostgres_SliceIndex_RoundTrip(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+
+	idx := 2
+	child, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+		SliceIndex:    &idx,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if child.SliceIndex == nil || *child.SliceIndex != 2 {
+		t.Errorf("created SliceIndex = %v, want 2", child.SliceIndex)
+	}
+	got, err := repo.GetRun(context.Background(), child.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.SliceIndex == nil || *got.SliceIndex != 2 {
+		t.Errorf("read-back SliceIndex = %v, want 2", got.SliceIndex)
+	}
+
+	// Slice 0 must round-trip as a non-nil pointer to 0, distinct from the
+	// nil non-decomposed default — the runner reads slice_index only when
+	// decomposed_from_run_id is set, so a child's 0 must survive persistence.
+	zero := 0
+	sliceZero, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+		SliceIndex:    &zero,
+	})
+	if err != nil {
+		t.Fatalf("create slice-0 run: %v", err)
+	}
+	if sliceZero.SliceIndex == nil || *sliceZero.SliceIndex != 0 {
+		t.Errorf("slice-0 SliceIndex = %v, want non-nil 0", sliceZero.SliceIndex)
+	}
+
+	// A run created without a SliceIndex (non-decomposed) reads back nil.
+	plain := makeRun(t, repo)
+	if plain.SliceIndex != nil {
+		t.Errorf("default SliceIndex = %v, want nil", plain.SliceIndex)
+	}
+	gotPlain, err := repo.GetRun(context.Background(), plain.ID)
+	if err != nil {
+		t.Fatalf("get plain run: %v", err)
+	}
+	if gotPlain.SliceIndex != nil {
+		t.Errorf("read-back default SliceIndex = %v, want nil", gotPlain.SliceIndex)
+	}
+}
+
 func TestPostgres_GetRun_NotFound(t *testing.T) {
 	pool := startPostgres(t)
 	repo := run.NewPostgresRepository(pool)
