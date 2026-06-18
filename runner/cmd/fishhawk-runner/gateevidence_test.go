@@ -75,6 +75,30 @@ func TestComposeGateEvidence_FoldsBindingAssertions(t *testing.T) {
 	}
 }
 
+func TestComposeGateEvidence_FoldsScopeExemptions(t *testing.T) {
+	// A scope_files_exempted event (#1153) is a gate on its own, and its
+	// validated path/reason entries fold into gate_evidence.ScopeExemptions.
+	// A SINGLE such event folds to exactly its entries — no duplication — so
+	// the run()-side single emission cannot double-count (binding condition 1).
+	cfg := config{runID: "r1", stageID: "s1"}
+	events := []agent.Event{
+		scopeFilesExemptedEvent(cfg, []scopeExemption{
+			{Path: "a.go", Reason: "already correct"},
+			{Path: "b.go", Reason: "no change needed"},
+		}),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 2))
+	if len(p.ScopeExemptions) != 2 {
+		t.Fatalf("scope_exemptions = %d, want 2 (single event folds once)", len(p.ScopeExemptions))
+	}
+	if p.ScopeExemptions[0] != (scopeExemptionEvidence{Path: "a.go", Reason: "already correct"}) {
+		t.Errorf("exemption[0] = %+v", p.ScopeExemptions[0])
+	}
+	if p.ScopeExemptions[1] != (scopeExemptionEvidence{Path: "b.go", Reason: "no change needed"}) {
+		t.Errorf("exemption[1] = %+v", p.ScopeExemptions[1])
+	}
+}
+
 func TestComposeGateEvidence_NoBindingAssertionsField(t *testing.T) {
 	// A stage with a verify gate but no binding_assertion event adds no
 	// binding_assertions field — byte-identical to before #1171.

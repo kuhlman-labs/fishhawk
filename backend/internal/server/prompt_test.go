@@ -377,6 +377,45 @@ func TestGetStagePrompt_HappyPath_ImplementWithIssue(t *testing.T) {
 	}
 }
 
+func TestGetStagePrompt_Implement_CarriesScopeJustificationPath(t *testing.T) {
+	// #1153: the implement handler populates trigger.ImplementRunID /
+	// ImplementStageID, so the rendered prompt carries the run/stage-keyed scope
+	// self-exempt sidecar path. Asserting the path proves the ids were threaded.
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	installation := int64(99)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "Body text", State: "open"}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wantPath := "/tmp/fishhawk-scope-justifications-" + runID.String() + "-" + stageID.String() + ".json"
+	if !contains(resp.Prompt, wantPath) {
+		t.Errorf("implement prompt missing the keyed scope-justification path %q\n---\n%s", wantPath, resp.Prompt)
+	}
+	if !contains(resp.Prompt, "### Deliberately-unchanged declared scope files") {
+		t.Errorf("implement prompt missing the scope self-exempt section:\n%s", resp.Prompt)
+	}
+}
+
 func TestGetStagePrompt_PlanStage_DoesNotFetchIssue_WhenNotIssueTriggered(t *testing.T) {
 	s, rr, sf, gh := newPromptServer(t)
 	runID := uuid.New()

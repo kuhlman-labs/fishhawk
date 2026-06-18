@@ -549,6 +549,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// because the agent loop reassigns res wholesale — on the fallback path
 		// that would otherwise discard the apply-attempt trace.
 		fixupApplyEvents []agent.Event
+		// validatedExemptions is the agent's validated scope self-exemptions
+		// (#1153): declared scope.files paths deliberately left unchanged and
+		// justified in-band. Read + validated after the agent settles (run()
+		// line ~1162), surfaced once to gate_evidence, and threaded into
+		// openPRAndShipArtifact so the pre-push scope-completeness gate subtracts
+		// them from its missing set. Empty on every non-standalone-implement path
+		// (the gate is inert there), keeping the strict gate byte-identical.
+		validatedExemptions []scopeExemption
 	)
 
 	// Capture the operator's HEAD ref BEFORE the agent is invoked (#941).
@@ -596,6 +604,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			preAgentDirty = dirty
 			preAgentDirtyCaptured = true
 		}
+		// Pre-invoke scope-justification sweep (#1153): delete any leftover
+		// sidecar at THIS run/stage's keyed path before the agent runs — the
+		// load-bearing freshness defense that stops a same-keyed leftover from a
+		// prior retry of this run/stage bleeding a stale exemption into a fresh
+		// attempt. (The keyed path + embedded-id validation are the other two
+		// independent defenses.)
+		sweepStaleScopeJustification(cfg, logSink)
 	}
 
 	// Run()-level restore net (#953, the #941 residual): the restore defers
@@ -1141,6 +1156,25 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Scope self-exempt read + validate (#1153). On the standalone open-PR
+	// implement path — the only path the pre-push scope-completeness gate
+	// (#1151/#1154) runs on — read the agent's run/stage-keyed justification
+	// sidecar, validate freshness fail-closed, and surface the validated
+	// exemptions BOTH to the audit/review (a single scope_files_exempted event
+	// appended to res.Events here, BEFORE composeGateEvidence folds it into
+	// gate_evidence) AND to the gate (threaded into openPRAndShipArtifact as the
+	// last param). Emitted EXACTLY ONCE here so the gate_evidence fold counts it
+	// once regardless of whether the gate later passes (all-exempted) or fails
+	// (partial); the gate site never re-emits. Same standalone guard as the
+	// binding-assertion evidence block above (gate excludes fix-ups + decomposed
+	// children). loadScopeExemptions consumes (deletes) the sidecar.
+	if res.OK && stageType == "implement" && !cfg.noPR && cfg.decomposedFromRunID == "" && !cfg.fixup {
+		validatedExemptions = loadScopeExemptions(cfg, scopePaths(cfg.scopeFiles), logSink)
+		if len(validatedExemptions) > 0 {
+			res.Events = append(res.Events, scopeFilesExemptedEvent(cfg, validatedExemptions))
+		}
+	}
+
 	// Emit the GenAI observability span for this stage as soon as the
 	// agent invocation (and any self-retries) settled — before bundle
 	// packing / upload, so a downstream upload failure doesn't lose
@@ -1415,7 +1449,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions)
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, validatedExemptions)
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
@@ -1434,7 +1468,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			if prErr != nil && errors.Is(prErr, gitops.ErrBaseRebaseConflict) &&
 				(willOpenPR || willPushChild) {
 				if rerr := reinvokeOnBaseRebaseConflict(ctx, cfg, invoker, inv, &res, prErr, logSink); rerr == nil {
-					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions)
+					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, validatedExemptions)
 				} else {
 					// Re-invoke infra exhaustion (or checkout failure): log and
 					// fall through to the unchanged category-B failure path
@@ -3946,7 +3980,7 @@ func resolveImplementBranchRouting(ctx context.Context, cfg config, repoDir, bas
 // enforces the verified-SHA invariant (#960) against it — see the closure
 // below. Empty disables the check (no committed-tree gate ran: plan stage,
 // --no-pr, verifyCmd unset, or gate skipped).
-func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, applyPath string, bindingAssertions []upload.BindingAssertion) error {
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, applyPath string, bindingAssertions []upload.BindingAssertion, scopeExemptions []scopeExemption) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -4173,23 +4207,30 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// standalone open-PR push ONLY: NOT fix-ups (which legitimately touch
 		// fewer files than the full scope) and NOT decomposed children (narrowed
 		// slice scope on a shared branch). Fail category-B BEFORE the push
-		// (origin untouched). The v1 gate is STRICT — a deliberately-no-op
-		// declared file fails here by design; an in-band self-exempt is deferred
-		// to #1153.
+		// (origin untouched). The gate honors the agent's validated in-band
+		// self-exemptions (#1153): a deliberately-unchanged declared file the
+		// agent justified is subtracted from `missing` before the len>0 check, so
+		// an all-exempted shortfall passes the gate and a partial one fails
+		// listing only the unexempted remainder (noting which were self-exempted).
+		// The exemptions were validated fail-closed and recorded once via the
+		// scope_files_exempted event in run(); this gate runs after the trace
+		// ship, so it re-emits nothing.
 		if !isFixup && !isDecomposed && len(gateScopeFiles) > 0 {
 			missing, committed, merr := gitops.MissingScopeFiles(ctx, repoDir, headSHA, gateScopeFiles)
 			if merr != nil {
 				return merr
 			}
-			if len(missing) > 0 {
-				missingJSON, _ := json.Marshal(missing)
+			exempted, remaining := partitionExemptedMissing(missing, scopeExemptions)
+			if len(remaining) > 0 {
+				remainingJSON, _ := json.Marshal(remaining)
 				declaredJSON, _ := json.Marshal(gateScopeFiles)
 				committedJSON, _ := json.Marshal(committed)
+				exemptedJSON, _ := json.Marshal(exempted)
 				_, _ = fmt.Fprintf(logSink,
-					`{"event":"scope_files_missing","run_id":%q,"stage_id":%q,"head_sha":%q,"declared":%s,"committed":%s,"missing":%s}`+"\n",
-					cfg.runID, cfg.stageID, headSHA, declaredJSON, committedJSON, missingJSON)
+					`{"event":"scope_files_missing","run_id":%q,"stage_id":%q,"head_sha":%q,"declared":%s,"committed":%s,"missing":%s,"exempted":%s}`+"\n",
+					cfg.runID, cfg.stageID, headSHA, declaredJSON, committedJSON, remainingJSON, exemptedJSON)
 				return fmt.Errorf("%w: %s", gitops.ErrScopeFilesMissing,
-					missingScopeFilesMessage(cfg.scopeFiles, missing, len(gateScopeFiles), len(committed)))
+					missingScopeFilesMessage(cfg.scopeFiles, remaining, exempted, len(gateScopeFiles), len(committed)))
 			}
 		}
 		// Binding-assertion gate (#1171): the operator-declared deterministic
@@ -4892,10 +4933,13 @@ func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *confi
 // declared path with its declared operation (create/modify/delete) from
 // scopeFiles. declaredCount/committedCount render the precise "declared N scope
 // file(s), committed M" preamble from real data (the MissingScopeFiles committed
-// return), not a recomputation. The recovery guidance is STRICT: there is no
-// self-exempt for a deliberately-no-op declared file in v1 — replan to drop it,
-// or fishhawk_resume_run; the in-band self-exempt is deferred to #1153.
-func missingScopeFilesMessage(scopeFiles []upload.ScopeFile, missing []string, declaredCount, committedCount int) string {
+// return), not a recomputation. `missing` is the UNEXEMPTED remainder (the
+// validated #1153 self-exemptions already subtracted); `exempted` names the
+// declared paths the agent self-exempted, appended as context so the message
+// distinguishes a dropped edit from a deliberately-justified no-op. The recovery
+// guidance: justify the file in-band via the scope self-exempt sidecar if it
+// correctly needs no change, replan to drop it, or fishhawk_resume_run.
+func missingScopeFilesMessage(scopeFiles []upload.ScopeFile, missing, exempted []string, declaredCount, committedCount int) string {
 	op := make(map[string]string, len(scopeFiles))
 	for _, f := range scopeFiles {
 		op[f.Path] = f.Operation
@@ -4908,12 +4952,175 @@ func missingScopeFilesMessage(scopeFiles []upload.ScopeFile, missing []string, d
 			annotated = append(annotated, m)
 		}
 	}
-	return fmt.Sprintf("declared %d scope file(s), committed %d; missing: %s. "+
+	exemptNote := ""
+	if len(exempted) > 0 {
+		exemptNote = fmt.Sprintf(" (%d declared path(s) were self-exempted in-band and are not counted here: %s)",
+			len(exempted), strings.Join(exempted, ", "))
+	}
+	return fmt.Sprintf("declared %d scope file(s), committed %d; missing: %s%s. "+
 		"The implement commit did not touch every concrete file the approved plan declared in scope.files — "+
-		"a declared edit was dropped (the subset-PR class). Replan to drop the intentionally-unchanged file, "+
-		"or recover with fishhawk_resume_run; an in-band self-exempt for a deliberately-no-op declared file is "+
-		"deferred to #1153.",
-		declaredCount, committedCount, strings.Join(annotated, ", "))
+		"a declared edit was dropped (the subset-PR class). If a missing file correctly needs no change, justify it "+
+		"in-band via the scope self-exempt sidecar (#1153); otherwise replan to drop the intentionally-unchanged "+
+		"file, or recover with fishhawk_resume_run.",
+		declaredCount, committedCount, strings.Join(annotated, ", "), exemptNote)
+}
+
+// scopeJustificationDir is the directory the run/stage-keyed scope self-exempt
+// sidecar lives in (#1153). var (not const) so tests can redirect it to a
+// t.TempDir, avoiding /tmp pollution / parallel-test races — the same seam
+// pattern as pullRequestDescriptionPath.
+var scopeJustificationDir = "/tmp"
+
+// scopeJustificationPath mirrors prompt.ScopeJustificationPath in the backend:
+// the run/stage-keyed path the implement agent writes its scope self-exempt
+// sidecar to and the runner reads it from (#1153). The format string is
+// hardcoded in both independent modules by design — the same coordination as
+// pullRequestDescriptionPath/PullRequestDescriptionPath. The FULL run + stage
+// ids key the path so a leftover sidecar from another run/stage can never
+// collide (the first of three freshness defenses; the others are the embedded-
+// id validation in loadScopeExemptions and the pre-invoke sweep in run()).
+func scopeJustificationPath(runID, stageID string) string {
+	return filepath.Join(scopeJustificationDir, fmt.Sprintf("fishhawk-scope-justifications-%s-%s.json", runID, stageID))
+}
+
+// scopeExemption is one validated scope self-exemption (#1153): a declared
+// scope.files path the agent deliberately left unchanged plus its reason.
+type scopeExemption struct {
+	Path   string
+	Reason string
+}
+
+// sweepStaleScopeJustification deletes any leftover scope self-exempt sidecar
+// at this run/stage's keyed path before the agent is invoked (#1153) — the
+// pre-invoke freshness defense that stops a same-keyed leftover from a prior
+// retry of THIS run/stage bleeding a stale exemption into a fresh attempt.
+// Best-effort: a not-exist (the common case) is silent; a leftover that was
+// actually removed emits scope_justification_swept.
+func sweepStaleScopeJustification(cfg config, logSink io.Writer) {
+	path := scopeJustificationPath(cfg.runID, cfg.stageID)
+	if rerr := os.Remove(path); rerr == nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_justification_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+	}
+}
+
+// loadScopeExemptions reads + validates the agent's scope self-exempt sidecar
+// (#1153) fail-closed. An absent (or unreadable) sidecar returns nil — the
+// normal strict path, no log. On a present sidecar it deletes the file on EVERY
+// return path (consumed/malformed/stale all clean up, so an invalid sidecar is
+// never left behind to bleed into a later read — binding condition 4), and:
+//   - fails closed (nil) on malformed JSON, logging scope_justification_invalid;
+//   - fails closed (nil) when the embedded run_id/stage_id do not match cfg,
+//     logging scope_justification_stale (a leftover from another run/stage);
+//   - drops any entry whose path is not a CONCRETE declared scope.files path
+//     (trailing-slash directory entries and unknown paths excluded) or whose
+//     reason is empty/whitespace, logging scope_justification_entry_ignored.
+//
+// `declared` is the declared scope.files path set (scopePaths(cfg.scopeFiles)).
+// Returns the surviving validated entries.
+func loadScopeExemptions(cfg config, declared []string, logSink io.Writer) []scopeExemption {
+	path := scopeJustificationPath(cfg.runID, cfg.stageID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		// Absent sidecar is the common no-op (strict gate, no exemptions); any
+		// other read error is fail-closed too. Only an existing file's content
+		// can exempt anything, so no log on the not-exist path.
+		return nil
+	}
+	// A present sidecar is consumed regardless of outcome: remove it on every
+	// return path so a malformed/stale/parsed sidecar is never left behind.
+	defer func() { _ = os.Remove(path) }()
+
+	var doc struct {
+		RunID      string `json:"run_id"`
+		StageID    string `json:"stage_id"`
+		Exemptions []struct {
+			Path   string `json:"path"`
+			Reason string `json:"reason"`
+		} `json:"exemptions"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_justification_invalid","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+		return nil
+	}
+	if doc.RunID != cfg.runID || doc.StageID != cfg.stageID {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_justification_stale","run_id":%q,"stage_id":%q,"sidecar_run_id":%q,"sidecar_stage_id":%q}`+"\n",
+			cfg.runID, cfg.stageID, doc.RunID, doc.StageID)
+		return nil
+	}
+	concrete := make(map[string]bool, len(declared))
+	for _, d := range declared {
+		if d == "" || strings.HasSuffix(d, "/") {
+			continue // directory entries are not concrete declared paths
+		}
+		concrete[d] = true
+	}
+	var out []scopeExemption
+	for _, e := range doc.Exemptions {
+		if !concrete[e.Path] {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"scope_justification_entry_ignored","run_id":%q,"stage_id":%q,"path":%q,"reason":"not a concrete declared scope.files path"}`+"\n",
+				cfg.runID, cfg.stageID, e.Path)
+			continue
+		}
+		if strings.TrimSpace(e.Reason) == "" {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"scope_justification_entry_ignored","run_id":%q,"stage_id":%q,"path":%q,"reason":"empty justification reason"}`+"\n",
+				cfg.runID, cfg.stageID, e.Path)
+			continue
+		}
+		out = append(out, scopeExemption{Path: e.Path, Reason: e.Reason})
+	}
+	return out
+}
+
+// partitionExemptedMissing splits the scope-completeness gate's `missing`
+// declared-path set into the subset covered by validated self-exemptions
+// (#1153) and the unexempted remainder. Only paths that are actually missing
+// AND exempted land in `exempted`; the remainder still fails the gate.
+// Order-preserving over `missing`. With no exemptions every missing path
+// remains, keeping the strict gate byte-identical.
+func partitionExemptedMissing(missing []string, exemptions []scopeExemption) (exempted, remaining []string) {
+	if len(exemptions) == 0 {
+		return nil, missing
+	}
+	ex := make(map[string]bool, len(exemptions))
+	for _, e := range exemptions {
+		ex[e.Path] = true
+	}
+	for _, m := range missing {
+		if ex[m] {
+			exempted = append(exempted, m)
+		} else {
+			remaining = append(remaining, m)
+		}
+	}
+	return exempted, remaining
+}
+
+// scopeFilesExemptedEvent builds the scope_files_exempted trace event (#1153)
+// composeGateEvidence folds into gate_evidence and the audit surfaces. Emitted
+// EXACTLY ONCE in run() before composeGateEvidence; the gate site never
+// re-emits (binding condition 1).
+func scopeFilesExemptedEvent(cfg config, exemptions []scopeExemption) agent.Event {
+	// Reuse the gate_evidence wire type so the composeGateEvidence fold
+	// (Exemptions []scopeExemptionEvidence) decodes the event byte-for-byte.
+	out := make([]scopeExemptionEvidence, 0, len(exemptions))
+	for _, e := range exemptions {
+		out = append(out, scopeExemptionEvidence(e))
+	}
+	return agent.Event{
+		Kind: "scope_files_exempted",
+		Payload: agent.MakePayload(map[string]any{
+			"run_id":     cfg.runID,
+			"stage_id":   cfg.stageID,
+			"exemptions": out,
+		}),
+	}
 }
 
 // toGitopsBindingAssertions converts the decoded prompt-response

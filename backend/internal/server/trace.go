@@ -2870,6 +2870,12 @@ func gateEvidenceForReview(ev bundle.GateEvidence) *prompt.GateEvidence {
 			Files:      pv.Files,
 		})
 	}
+	for _, ex := range ev.ScopeExemptions {
+		out.ScopeExemptions = append(out.ScopeExemptions, prompt.GateScopeExemption{
+			Path:   ex.Path,
+			Reason: ex.Reason,
+		})
+	}
 	return out
 }
 

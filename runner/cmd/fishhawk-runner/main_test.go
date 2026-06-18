@@ -9513,7 +9513,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 
 	// The re-verify command fails → the push must be blocked.
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
 	}
@@ -9557,7 +9557,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	logs := logSink.String()
@@ -9630,7 +9630,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMatch_NoReverify(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	if lines := countLines(t, counter); lines != 1 {
@@ -9663,7 +9663,7 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil); err != nil {
 		t.Fatalf("empty verifiedTreeSHA must disable the check, got: %v\n%s", err, logSink.String())
 	}
 	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified", "verify_run"} {
@@ -9673,6 +9673,96 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	}
 	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
 		t.Errorf("run branch %s missing from the bare remote on the no-op path: %v", branch, rerr)
+	}
+}
+
+// TestOpenPRAndShipArtifact_ScopeExemption_AllExemptedPasses is the #1153
+// cross-boundary gate anchor (strategy test 6): a declared scope.files path the
+// commit did not touch is the ONLY shortfall, and a validated self-exemption
+// covers it, so the scope-completeness gate PASSES and the push proceeds. It
+// also asserts single-emission of the scope_files_exempted event: the gate site
+// emits NO such event (the sole emission lives in run(), before
+// composeGateEvidence), so the gate_evidence fold can never double-count.
+func TestOpenPRAndShipArtifact_ScopeExemption_AllExemptedPasses(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	// b.txt is declared but never edited → a shortfall the exemption covers.
+	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "b.txt", Operation: "modify"})
+
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	exemptions := []scopeExemption{{Path: "b.txt", Reason: "already correct, no change needed"}}
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions); err != nil {
+		t.Fatalf("all-exempted shortfall must pass the gate, got: %v\n%s", err, logSink.String())
+	}
+	if strings.Contains(logSink.String(), `"event":"scope_files_missing"`) {
+		t.Errorf("all-exempted shortfall must not log scope_files_missing:\n%s", logSink.String())
+	}
+	// Single-emission: the gate site never emits scope_files_exempted (run()
+	// owns the sole emission), so it cannot double-count in the gate_evidence
+	// fold (binding condition 1).
+	if strings.Contains(logSink.String(), `scope_files_exempted`) {
+		t.Errorf("the gate site must NOT emit scope_files_exempted (single-emission lives in run()):\n%s", logSink.String())
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+		t.Errorf("run branch %s missing from the bare remote after the exempted-gate push: %v", branch, rerr)
+	}
+}
+
+// TestOpenPRAndShipArtifact_ScopeExemption_PartialStillFails (strategy test 7):
+// two declared paths are missing but only one is exempted → the gate still
+// FAILS ErrScopeFilesMissing, the message lists only the unexempted remainder,
+// the scope_files_missing log carries the exempted subset, and origin is
+// untouched.
+func TestOpenPRAndShipArtifact_ScopeExemption_PartialStillFails(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	cfg.scopeFiles = append(cfg.scopeFiles,
+		upload.ScopeFile{Path: "b.txt", Operation: "modify"},
+		upload.ScopeFile{Path: "c.txt", Operation: "modify"})
+
+	exemptions := []scopeExemption{{Path: "b.txt", Reason: "already correct"}}
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, exemptions)
+	if !errors.Is(err, gitops.ErrScopeFilesMissing) {
+		t.Fatalf("partial exemption must still fail ErrScopeFilesMissing, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "c.txt") {
+		t.Errorf("message must name the unexempted remainder c.txt: %v", err)
+	}
+	if strings.Contains(err.Error(), "missing: b.txt") {
+		t.Errorf("message must not list the exempted b.txt in the missing set: %v", err)
+	}
+	missingLine := ""
+	for _, line := range strings.Split(logSink.String(), "\n") {
+		if strings.Contains(line, `"event":"scope_files_missing"`) {
+			missingLine = line
+		}
+	}
+	if missingLine == "" || !strings.Contains(missingLine, `"exempted":["b.txt"]`) {
+		t.Errorf("scope_files_missing log must carry the exempted subset:\n%s", logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run after a blocked shortfall push")
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("run branch %s reached the bare remote despite the blocked push", branch)
 	}
 }
 
@@ -9780,7 +9870,7 @@ exit 0
 	}
 
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified\n%s", err, logSink.String())
 	}
@@ -10451,7 +10541,7 @@ func TestMissingScopeFilesMessage(t *testing.T) {
 		{Path: "b.go", Operation: "create"},
 		{Path: "c.go", Operation: "delete"},
 	}
-	msg := missingScopeFilesMessage(scopeFiles, []string{"a.go", "c.go"}, 3, 1)
+	msg := missingScopeFilesMessage(scopeFiles, []string{"a.go", "c.go"}, nil, 3, 1)
 
 	if !strings.Contains(msg, "a.go (modify)") {
 		t.Errorf("message %q must annotate a.go with its modify operation", msg)
@@ -10466,17 +10556,205 @@ func TestMissingScopeFilesMessage(t *testing.T) {
 		t.Errorf("message %q must carry the declared/committed counts", msg)
 	}
 	if !strings.Contains(msg, "#1153") {
-		t.Errorf("message %q must point recovery at the deferred self-exempt follow-up #1153", msg)
+		t.Errorf("message %q must point recovery at the in-band self-exempt (#1153)", msg)
+	}
+	// With no exemptions the self-exempt note is omitted.
+	if strings.Contains(msg, "self-exempted in-band") {
+		t.Errorf("message %q must omit the self-exempt note when none were exempted", msg)
 	}
 
 	// A missing path with no matching scope entry (operation unknown) renders
 	// bare rather than with an empty parenthesized operation.
-	bare := missingScopeFilesMessage(scopeFiles, []string{"unknown.go"}, 3, 2)
+	bare := missingScopeFilesMessage(scopeFiles, []string{"unknown.go"}, nil, 3, 2)
 	if strings.Contains(bare, "unknown.go (") {
 		t.Errorf("message %q must render an unmatched path without an empty operation suffix", bare)
 	}
 	if !strings.Contains(bare, "unknown.go") {
 		t.Errorf("message %q must still name the unmatched missing path", bare)
+	}
+
+	// When some declared paths were self-exempted (#1153), the message lists
+	// only the unexempted remainder and notes the exempted ones for context.
+	withExempt := missingScopeFilesMessage(scopeFiles, []string{"a.go"}, []string{"c.go"}, 3, 1)
+	if !strings.Contains(withExempt, "a.go (modify)") {
+		t.Errorf("message %q must name the unexempted remainder a.go", withExempt)
+	}
+	if !strings.Contains(withExempt, "self-exempted in-band") || !strings.Contains(withExempt, "c.go") {
+		t.Errorf("message %q must note the self-exempted path c.go", withExempt)
+	}
+}
+
+// --- #1153 run/stage-scoped scope self-exempt ----------------------------
+
+// writeSidecar writes a scope self-exempt sidecar to cfg's keyed path with the
+// given raw JSON, after redirecting scopeJustificationDir to a temp dir.
+func writeSidecar(t *testing.T, cfg config, raw string) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := scopeJustificationDir
+	scopeJustificationDir = dir
+	t.Cleanup(func() { scopeJustificationDir = orig })
+	path := scopeJustificationPath(cfg.runID, cfg.stageID)
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func exemptCfg() config {
+	return config{runID: "run-aaaa", stageID: "stage-bbbb"}
+}
+
+// TestLoadScopeExemptions_AbsentSidecar: no sidecar → nil (strict gate, no log).
+func TestLoadScopeExemptions_AbsentSidecar(t *testing.T) {
+	cfg := exemptCfg()
+	dir := t.TempDir()
+	orig := scopeJustificationDir
+	scopeJustificationDir = dir
+	t.Cleanup(func() { scopeJustificationDir = orig })
+
+	var logSink strings.Builder
+	got := loadScopeExemptions(cfg, []string{"a.go"}, &logSink)
+	if got != nil {
+		t.Errorf("absent sidecar must yield nil, got %v", got)
+	}
+	if logSink.Len() != 0 {
+		t.Errorf("absent sidecar must not log, got %q", logSink.String())
+	}
+}
+
+// TestLoadScopeExemptions_MalformedJSON: a malformed sidecar → nil +
+// scope_justification_invalid, and the file is removed (binding condition 4).
+func TestLoadScopeExemptions_MalformedJSON(t *testing.T) {
+	cfg := exemptCfg()
+	path := writeSidecar(t, cfg, "{not json")
+
+	var logSink strings.Builder
+	got := loadScopeExemptions(cfg, []string{"a.go"}, &logSink)
+	if got != nil {
+		t.Errorf("malformed sidecar must FAIL CLOSED (nil), got %v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"scope_justification_invalid"`) {
+		t.Errorf("expected scope_justification_invalid, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("malformed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadScopeExemptions_StaleID: embedded run_id/stage_id not matching cfg →
+// nil + scope_justification_stale, file removed (binding condition 4).
+func TestLoadScopeExemptions_StaleID(t *testing.T) {
+	cfg := exemptCfg()
+	path := writeSidecar(t, cfg,
+		`{"run_id":"OTHER","stage_id":"OTHER","exemptions":[{"path":"a.go","reason":"unchanged"}]}`)
+
+	var logSink strings.Builder
+	got := loadScopeExemptions(cfg, []string{"a.go"}, &logSink)
+	if got != nil {
+		t.Errorf("stale-id sidecar must FAIL CLOSED (nil), got %v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"scope_justification_stale"`) {
+		t.Errorf("expected scope_justification_stale, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("stale sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadScopeExemptions_EmptyReason: an entry with a whitespace-only reason is
+// dropped (that path is NOT exempted) while a sibling valid entry survives.
+func TestLoadScopeExemptions_EmptyReason(t *testing.T) {
+	cfg := exemptCfg()
+	writeSidecar(t, cfg,
+		`{"run_id":"run-aaaa","stage_id":"stage-bbbb","exemptions":[{"path":"a.go","reason":"   "},{"path":"b.go","reason":"correctly unchanged"}]}`)
+
+	var logSink strings.Builder
+	got := loadScopeExemptions(cfg, []string{"a.go", "b.go"}, &logSink)
+	if len(got) != 1 || got[0].Path != "b.go" {
+		t.Fatalf("empty-reason entry must be dropped, surviving = %v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"scope_justification_entry_ignored"`) {
+		t.Errorf("expected scope_justification_entry_ignored for the empty reason, got %q", logSink.String())
+	}
+}
+
+// TestLoadScopeExemptions_UndeclaredAndDir: a path absent from declared scope
+// and a trailing-slash directory entry are both ignored.
+func TestLoadScopeExemptions_UndeclaredAndDir(t *testing.T) {
+	cfg := exemptCfg()
+	writeSidecar(t, cfg,
+		`{"run_id":"run-aaaa","stage_id":"stage-bbbb","exemptions":[{"path":"nope.go","reason":"r"},{"path":"pkg/","reason":"r"}]}`)
+
+	var logSink strings.Builder
+	// "pkg/" is declared as a directory entry; it must still be non-exemptable.
+	got := loadScopeExemptions(cfg, []string{"a.go", "pkg/"}, &logSink)
+	if len(got) != 0 {
+		t.Fatalf("undeclared path and directory entry must be ignored, got %v", got)
+	}
+	if strings.Count(logSink.String(), `"event":"scope_justification_entry_ignored"`) != 2 {
+		t.Errorf("expected two entry_ignored events, got %q", logSink.String())
+	}
+}
+
+// TestLoadScopeExemptions_Valid: a well-formed, fresh, concretely-declared,
+// non-empty-reason sidecar yields the exemption AND is consumed (removed).
+func TestLoadScopeExemptions_Valid(t *testing.T) {
+	cfg := exemptCfg()
+	path := writeSidecar(t, cfg,
+		`{"run_id":"run-aaaa","stage_id":"stage-bbbb","exemptions":[{"path":"a.go","reason":"already correct"}]}`)
+
+	var logSink strings.Builder
+	got := loadScopeExemptions(cfg, []string{"a.go"}, &logSink)
+	if len(got) != 1 || got[0].Path != "a.go" || got[0].Reason != "already correct" {
+		t.Fatalf("valid sidecar must yield the exemption, got %v", got)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("consumed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestPartitionExemptedMissing covers the gate's subtraction: all-exempted →
+// empty remainder (gate passes); partial → unexempted remainder (gate fails);
+// no exemptions → every missing path remains (strict gate byte-identical).
+func TestPartitionExemptedMissing(t *testing.T) {
+	exempted, remaining := partitionExemptedMissing([]string{"b.go"}, []scopeExemption{{Path: "b.go", Reason: "r"}})
+	if len(remaining) != 0 || len(exempted) != 1 || exempted[0] != "b.go" {
+		t.Errorf("all-exempted: exempted=%v remaining=%v", exempted, remaining)
+	}
+
+	exempted, remaining = partitionExemptedMissing([]string{"b.go", "c.go"}, []scopeExemption{{Path: "b.go", Reason: "r"}})
+	if len(remaining) != 1 || remaining[0] != "c.go" || len(exempted) != 1 || exempted[0] != "b.go" {
+		t.Errorf("partial: exempted=%v remaining=%v", exempted, remaining)
+	}
+
+	exempted, remaining = partitionExemptedMissing([]string{"b.go"}, nil)
+	if exempted != nil || len(remaining) != 1 || remaining[0] != "b.go" {
+		t.Errorf("no-exemptions: exempted=%v remaining=%v", exempted, remaining)
+	}
+}
+
+// TestSweepStaleScopeJustification covers the pre-invoke freshness sweep
+// (binding condition / strategy test 8): a pre-existing keyed sidecar is removed
+// and scope_justification_swept logged; an absent one is a silent no-op.
+func TestSweepStaleScopeJustification(t *testing.T) {
+	cfg := exemptCfg()
+	path := writeSidecar(t, cfg, `{"stale":"leftover"}`)
+
+	var logSink strings.Builder
+	sweepStaleScopeJustification(cfg, &logSink)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("pre-existing sidecar must be swept, stat err = %v", err)
+	}
+	if !strings.Contains(logSink.String(), `"event":"scope_justification_swept"`) {
+		t.Errorf("expected scope_justification_swept, got %q", logSink.String())
+	}
+
+	// Second sweep (now absent) is a silent no-op.
+	var logSink2 strings.Builder
+	sweepStaleScopeJustification(cfg, &logSink2)
+	if logSink2.Len() != 0 {
+		t.Errorf("absent-sidecar sweep must be silent, got %q", logSink2.String())
 	}
 }
 
