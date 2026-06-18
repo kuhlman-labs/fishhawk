@@ -130,6 +130,18 @@ The final tool result is **compact by default**: the routine `stage_progress` he
 
 This roughly halves the driving agent's per-stage context cost without losing any durable signal — the audit log and signed trace bundle are unchanged. Pass `verbose: true` on the input to restore the full event list including every heartbeat (e.g. a driver that wants to inspect per-heartbeat progression).
 
+## Parallel decomposed children (`fishhawk_run_children`, [#1144](https://github.com/kuhlman-labs/fishhawk/issues/1144))
+
+`fishhawk_run_children` is the fan-out sibling of `fishhawk_run_stage`: where `run_stage` drives **one** stage of **one** run, `run_children` drives **all** of a decomposed parent's pending children **concurrently**. Pass the decomposed **parent's** `run_id`; the tool:
+
+- **Discovers** the children from the parent's `plan_decomposed` audit entry (`child_run_ids` + `effective_max_parallel`); a run with no such entry is a clean error (it is not a decomposed parent).
+- **Partitions** by freshly-read state — only `pending` children are spawned; in-flight and terminal children are reported as-is, so a re-invocation is **idempotent**.
+- **Spawns** each pending child's implement stage as a `fishhawk-runner` subprocess (the same `spawnRunnerStage` process-group/SIGKILL core `run_stage` uses) with `--parallel-isolate` appended, so each child provisions its **own isolated per-child git worktree** (`run-<child>`) — concurrent siblings, which already own distinct per-slice sole-writer branches (E24.1), never race a shared checkout, and the operator's tracked tree stays untouched.
+- **Bounds** concurrency with an `errgroup` whose limit is the orchestrator-resolved effective cap, **clamp-DOWN-only** against an optional `max_parallel` override (it can lower an unlimited/looser cap, never raise it; `effective_max_parallel == 0` means unlimited and skips the limit).
+- **Awaits ALL with no sibling-cancel.** A child failure is **data**, not a tool error: every child is awaited and surfaces in `children[]` with its `exit_code`, `outcome`, and `stage_state` regardless of success.
+
+Returns `children[]` (one entry per discovered child, in `plan_decomposed` order), `dispatched_count` (how many were pending and spawned), and `effective_cap` (the cap used; 0 = unlimited). Requires the `fishhawk-runner` binary to resolve on the MCP host, exactly like `fishhawk_run_stage`.
+
 ## Server-suggested next actions (`next_actions`, #1024)
 
 `fishhawk_get_run_status` and the run-terminal `fishhawk_run_stage` result both carry a `next_actions` block — the generalization of `review_action_hint` (#777/#860) across the whole run lifecycle. The classifier (`next_actions.go`) is a pure function over data the tools already fetch (run row, stage rows, review statuses, the computed hint, the drive read view): no extra backend round-trip, no new endpoint.

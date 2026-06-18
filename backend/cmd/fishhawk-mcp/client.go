@@ -1216,6 +1216,52 @@ func (c *apiClient) ListRecentRunAudit(ctx context.Context, runID uuid.UUID, lim
 	return res.Items, nil
 }
 
+// PlanDecomposed is the decoded plan_decomposed audit payload (E24.6 /
+// #1146) the orchestrator emits when it mints a decomposed parent's
+// children: the minted child run ids and the orchestrator-resolved
+// effective concurrency cap (0 == unlimited). The fishhawk_run_children
+// tool reads it to discover which children to dispatch and at what
+// concurrency — the MCP cannot reach the workflow spec or the
+// FISHHAWK_MAX_PARALLEL_CHILDREN default, so the cap is read from here.
+type PlanDecomposed struct {
+	ChildRunIDs          []string `json:"child_run_ids"`
+	EffectiveMaxParallel int      `json:"effective_max_parallel"`
+}
+
+// LatestPlanDecomposed returns the decoded payload of the run's most-recent
+// plan_decomposed audit entry, or (nil, nil) when the run has none (it is
+// not a decomposed parent). The per-run audit endpoint returns entries
+// sequence-ascending, so the authoritative entry is the last one. A corrupt
+// payload surfaces as a decode error — unlike the best-effort plan-gate
+// advisory reads (loadScopePrecheck et al.), run_children cannot proceed
+// without the child ids, so a malformed entry must fail loud rather than
+// silently dispatch nothing.
+func (c *apiClient) LatestPlanDecomposed(ctx context.Context, runID uuid.UUID) (*PlanDecomposed, error) {
+	entries, _, err := c.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "plan_decomposed",
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return nil, fmt.Errorf("plan_decomposed entry %s has no payload", newest.ID)
+	}
+	raw, err := json.Marshal(newest.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("re-encode plan_decomposed payload: %w", err)
+	}
+	var pd PlanDecomposed
+	if err := json.Unmarshal(raw, &pd); err != nil {
+		return nil, fmt.Errorf("decode plan_decomposed payload: %w", err)
+	}
+	return &pd, nil
+}
+
 // CalibrationParams scopes a GET /v0/calibration request. Empty
 // fields drop from the query string; StageType defaults to "implement"
 // server-side when omitted.

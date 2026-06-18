@@ -105,8 +105,8 @@ type runResult struct {
 // take the same-lineage lock. The returned release MUST be deferred by the
 // caller (stage end). decomposedFrom is "" for a solo run, the parent run id
 // for a decomposed child.
-func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, client lineageStatusClient) (wt string, release func(), err error) {
-	root := lineageRoot(runID, decomposedFrom)
+func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, parallelIsolate bool, client lineageStatusClient) (wt string, release func(), err error) {
+	root := lineageRoot(runID, decomposedFrom, parallelIsolate)
 	// Cross-lineage worktree-admin lock (#1181): serialize the fast
 	// sweep+provision critical section against sibling lineages, then release
 	// before the (here, simulated) long stage — exactly as main.go wires it.
@@ -121,7 +121,7 @@ func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, clie
 		return "", nil, err
 	}
 	adminRelease()
-	writeLineageRunID(ctx, repo, root, lineageRootFull(runID, decomposedFrom), io.Discard)
+	writeLineageRunID(ctx, repo, root, lineageRootFull(runID, decomposedFrom, parallelIsolate), io.Discard)
 	release, err = acquireLineageLock(ctx, repo, root, runID, io.Discard)
 	if err != nil {
 		return "", nil, err
@@ -134,7 +134,7 @@ func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, clie
 // commit one file there. The commit lands on the worktree's HEAD, isolated
 // from any concurrent run.
 func simulateSolo(ctx context.Context, repo, runID, stageID, file, content string, client lineageStatusClient) (res runResult) {
-	wt, release, err := provisionFlow(ctx, repo, runID, "", client)
+	wt, release, err := provisionFlow(ctx, repo, runID, "", false, client)
 	if err != nil {
 		res.err = err
 		return res
@@ -158,7 +158,7 @@ func simulateSolo(ctx context.Context, repo, runID, stageID, file, content strin
 // one file there. Each child runs as its own stage with its own lock
 // acquire/release, mirroring two sequential runner invocations.
 func simulateChild(ctx context.Context, repo, parentID, childID, file, content string, isFirst bool, client lineageStatusClient) (wt, commit string, err error) {
-	wt, release, err := provisionFlow(ctx, repo, childID, parentID, client)
+	wt, release, err := provisionFlow(ctx, repo, childID, parentID, false, client)
 	if err != nil {
 		return "", "", err
 	}
@@ -415,7 +415,7 @@ func TestWorktreeAdminLock_ConcurrentSweepWithLiveSibling(t *testing.T) {
 
 	// Pre-provision a terminal lineage's worktree + sidecar, then mark it
 	// complete so the next provision's sweep removes it.
-	termRoot := lineageRoot(termID, "")
+	termRoot := lineageRoot(termID, "", false)
 	termPath, err := provisionLineageWorktree(ctx, repo, termRoot, io.Discard)
 	if err != nil {
 		t.Fatalf("provision terminal lineage: %v", err)
@@ -483,6 +483,123 @@ func TestWorktreeAdminLock_ConcurrentSweepWithLiveSibling(t *testing.T) {
 	// sweep+add, and its HEAD never moved.
 	if status := gitPorcelain(t, repo); status != "" {
 		t.Errorf("operator git status not clean after concurrent sweep+add:\n%s", status)
+	}
+	if head := gitPorcelainHead(t, repo); head != seed {
+		t.Errorf("operator HEAD moved: %q, want seed %q", head, seed)
+	}
+}
+
+// simulateIsolatedChild drives one decomposed child under --parallel-isolate
+// (E24.4 / #1144): it provisions the child's OWN worktree (keyed on the child
+// id, not the shared parent root), cuts the child's distinct per-slice
+// sole-writer branch (E24.1 fishhawk/run-<parent>/slice-<n>) with --detach-free
+// checkout -b, and commits one file. Safe to run from a goroutine.
+func simulateIsolatedChild(ctx context.Context, repo, parentID, childID, sliceBranch, file, content string, client lineageStatusClient) (wt, commit string, err error) {
+	wt, release, err := provisionFlow(ctx, repo, childID, parentID, true, client)
+	if err != nil {
+		return "", "", err
+	}
+	defer release()
+	if err = runGitErr(wt, "checkout", "-b", sliceBranch); err != nil {
+		return "", "", err
+	}
+	if err = commitFile(wt, file, content, "child "+shortID(childID)); err != nil {
+		return "", "", err
+	}
+	commit, err = runGitOut(wt, "rev-parse", "HEAD")
+	return wt, commit, err
+}
+
+// TestWorktreeIsolation_ParallelChildren is the runner-side real-git half of
+// the E24.4 / #1144 cross-boundary contract: two decomposed children of ONE
+// parent provision their worktrees CONCURRENTLY against the same shared gitdir
+// under --parallel-isolate and must land in DISTINCT per-child checkouts
+// (run-<child1> vs run-<child2>) — not the one shared run-<parent> tree the
+// off path uses. Each child owns a distinct per-slice sole-writer branch, so
+// the concurrent `git worktree add --detach` never trips git's same-branch
+// refusal. The operator's tracked tree stays clean throughout. (The MCP→runner
+// seam that actually passes --parallel-isolate is proven end to end by
+// TestRunChildren_CrossBoundary_SpawnsRealRunners in the fishhawk-mcp package.)
+func TestWorktreeIsolation_ParallelChildren(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	client := &syncLineageClient{complete: map[string]bool{}}
+
+	seed := gitPorcelainHead(t, repo)
+	if status := gitPorcelain(t, repo); status != "" {
+		t.Fatalf("operator tree dirty before any run:\n%s", status)
+	}
+
+	const (
+		parent = "c3c3c3c3-0000-0000-0000-000000000003"
+		child1 = "d4d4d4d4-0000-0000-0000-000000000004"
+		child2 = "e5e5e5e5-0000-0000-0000-000000000005"
+	)
+	slice1 := "fishhawk/run-" + shortID(parent) + "/slice-0"
+	slice2 := "fishhawk/run-" + shortID(parent) + "/slice-1"
+
+	var (
+		wg         sync.WaitGroup
+		wt1, wt2   string
+		tip1, tip2 string
+		err1, err2 error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		wt1, tip1, err1 = simulateIsolatedChild(ctx, repo, parent, child1, slice1, "c1.txt", "C1\n", client)
+	}()
+	go func() {
+		defer wg.Done()
+		wt2, tip2, err2 = simulateIsolatedChild(ctx, repo, parent, child2, slice2, "c2.txt", "C2\n", client)
+	}()
+	wg.Wait()
+
+	if err1 != nil {
+		t.Fatalf("child1 flow failed: %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("child2 flow failed: %v", err2)
+	}
+
+	// DISTINCT per-child worktrees — the load-bearing parallel-isolate property.
+	if canonPath(wt1) == canonPath(wt2) {
+		t.Errorf("parallel-isolate children shared a worktree: %q", wt1)
+	}
+	// Each is keyed on the CHILD id, not the shared parent root.
+	wtDir, err := worktreesDir(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantC1 := filepath.Join(wtDir, "run-"+shortID(child1))
+	wantC2 := filepath.Join(wtDir, "run-"+shortID(child2))
+	if canonPath(wt1) != canonPath(wantC1) {
+		t.Errorf("child1 worktree = %q, want per-child %q", wt1, wantC1)
+	}
+	if canonPath(wt2) != canonPath(wantC2) {
+		t.Errorf("child2 worktree = %q, want per-child %q", wt2, wantC2)
+	}
+	// Neither child's commit cross-contaminated: each carries only its own file.
+	if got := commitFiles(t, repo, tip1); !equalStrings(got, []string{"c1.txt"}) {
+		t.Errorf("child1 commit diff = %v, want [c1.txt]", got)
+	}
+	if got := commitFiles(t, repo, tip2); !equalStrings(got, []string{"c2.txt"}) {
+		t.Errorf("child2 commit diff = %v, want [c2.txt]", got)
+	}
+	if tree := treeFiles(t, repo, tip2); containsStr(tree, "c1.txt") {
+		t.Errorf("child2 isolated tree leaked child1's file: %v", tree)
+	}
+	// Both per-slice branches exist and are registered worktrees.
+	registered, err := listWorktreePaths(ctx, repo)
+	if err != nil {
+		t.Fatalf("list worktrees: %v", err)
+	}
+	if !isRegisteredWorktree(wt1, registered) || !isRegisteredWorktree(wt2, registered) {
+		t.Errorf("a per-child worktree is not registered: %v", registered)
+	}
+	// Operator tree clean, HEAD never moved.
+	if status := gitPorcelain(t, repo); status != "" {
+		t.Errorf("operator git status not clean after parallel-isolate children:\n%s", status)
 	}
 	if head := gitPorcelainHead(t, repo); head != seed {
 		t.Errorf("operator HEAD moved: %q, want seed %q", head, seed)

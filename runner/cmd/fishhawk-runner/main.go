@@ -367,7 +367,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// into the worktree — every downstream `repoDir := cfg.workingDir`
 		// git op then runs in isolation with no further change. The lock is
 		// released at stage end via defer.
-		root := lineageRoot(cfg.runID, cfg.decomposedFromRunID)
+		root := lineageRoot(cfg.runID, cfg.decomposedFromRunID, cfg.parallelIsolate)
 		baseRepoDir := cfg.workingDir
 		if baseRepoDir == "" {
 			baseRepoDir = "."
@@ -407,7 +407,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// later sweep can resolve the short `run-<root>` dir name back to a
 		// run id for the lineage_complete read (best-effort).
 		writeLineageRunID(ctx, baseRepoDir, root,
-			lineageRootFull(cfg.runID, cfg.decomposedFromRunID), logSink)
+			lineageRootFull(cfg.runID, cfg.decomposedFromRunID, cfg.parallelIsolate), logSink)
 		release, lockErr := acquireLineageLock(ctx, baseRepoDir, root, cfg.runID, logSink)
 		if lockErr != nil {
 			_, _ = fmt.Fprintf(logSink,

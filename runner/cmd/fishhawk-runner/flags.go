@@ -75,6 +75,18 @@ type config struct {
 	// Threaded through but not yet consumed.
 	verifyMaxIterations int
 
+	// parallelIsolate, when true, keys the per-run lineage worktree on
+	// the run's OWN id instead of the shared lineage root (E24.4 / #1144).
+	// The MCP fishhawk_run_children driver sets it for the concurrent
+	// decomposed children it dispatches so each sibling provisions an
+	// ISOLATED checkout (run-<child>) instead of racing the one shared
+	// run-<parent> tree; the children already own distinct per-slice
+	// sole-writer branches (E24.1, fishhawk/run-<parent>/slice-<n>), so
+	// isolated checkouts are the correct shape for parallel. Default off
+	// preserves the shared lineage-root worktree for serial decomposition
+	// drive and is a no-op for solo runs (which already key on their own id).
+	parallelIsolate bool
+
 	// decomposedFromRunID is set at runtime (not a flag) when the
 	// fetched prompt reveals that this run is a decomposed child.
 	// Drives shared-branch routing in openPRAndShipArtifact.
@@ -166,6 +178,8 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"wall-clock cap on the verify command; 0 means fall back to 10m inside runVerifyGate")
 	fs.IntVar(&cfg.verifyMaxIterations, "verify-max-iterations", 0,
 		"verify-fix loop budget; 0 (default) preserves the single-shot demote-on-failure gate. Corresponds to executor.verify.max_iterations in the workflow spec.")
+	fs.BoolVar(&cfg.parallelIsolate, "parallel-isolate", false,
+		"key the per-run worktree on this run's own id instead of the shared lineage root; set by the MCP fishhawk_run_children driver for concurrent decomposed children so each provisions an isolated checkout. Off (default) preserves the shared lineage-root worktree for serial drive (E24.4 / #1144)")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err

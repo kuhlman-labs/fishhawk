@@ -45,13 +45,42 @@ func TestLineageRoot(t *testing.T) {
 		runID  = "11111111-2222-3333-4444-555555555555"
 		parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	)
-	// Solo run keys on its own id.
-	if got, want := lineageRoot(runID, ""), shortID(runID); got != want {
+	// Solo run keys on its own id (parallel-isolate off — the default).
+	if got, want := lineageRoot(runID, "", false), shortID(runID); got != want {
 		t.Errorf("solo lineageRoot = %q, want %q", got, want)
 	}
 	// Decomposed child keys on the parent id — so siblings share a tree.
-	if got, want := lineageRoot(runID, parent), shortID(parent); got != want {
+	if got, want := lineageRoot(runID, parent, false), shortID(parent); got != want {
 		t.Errorf("child lineageRoot = %q, want %q", got, want)
+	}
+}
+
+// TestLineageRoot_ParallelIsolate asserts the E24.4 / #1144 keying flip: a
+// decomposed child under parallel-isolate keys on its OWN id (so concurrent
+// siblings get distinct worktrees), two siblings of one parent resolve to
+// DISTINCT roots, and the solo path is unchanged regardless of the flag.
+func TestLineageRoot_ParallelIsolate(t *testing.T) {
+	const (
+		parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		child1 = "11111111-2222-3333-4444-555555555555"
+		child2 = "22222222-3333-4444-5555-666666666666"
+		solo   = "99999999-8888-7777-6666-555555555555"
+	)
+	// A decomposed child under parallel-isolate keys on its OWN id.
+	if got, want := lineageRoot(child1, parent, true), shortID(child1); got != want {
+		t.Errorf("parallel-isolate child lineageRoot = %q, want own id %q", got, want)
+	}
+	// Two siblings of one parent get DISTINCT roots (no shared-tree race).
+	if a, b := lineageRoot(child1, parent, true), lineageRoot(child2, parent, true); a == b {
+		t.Errorf("parallel-isolate siblings shared a root: %q", a)
+	}
+	// And distinct from the shared-tree root the off path would pick.
+	if got, shared := lineageRoot(child1, parent, true), lineageRoot(child1, parent, false); got == shared {
+		t.Errorf("parallel-isolate child collided with the shared parent root: %q", got)
+	}
+	// Solo runs are unaffected by the flag (own id either way).
+	if got, want := lineageRoot(solo, "", true), shortID(solo); got != want {
+		t.Errorf("parallel-isolate solo lineageRoot = %q, want %q", got, want)
 	}
 }
 
@@ -302,11 +331,16 @@ func TestLineageRootFull(t *testing.T) {
 		runID  = "11111111-2222-3333-4444-555555555555"
 		parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	)
-	if got := lineageRootFull(runID, ""); got != runID {
+	if got := lineageRootFull(runID, "", false); got != runID {
 		t.Errorf("solo lineageRootFull = %q, want %q", got, runID)
 	}
-	if got := lineageRootFull(runID, parent); got != parent {
+	if got := lineageRootFull(runID, parent, false); got != parent {
 		t.Errorf("child lineageRootFull = %q, want %q", got, parent)
+	}
+	// Under parallel-isolate a decomposed child records its OWN full id so the
+	// sidecar names the same run the per-child worktree dir is keyed on.
+	if got := lineageRootFull(runID, parent, true); got != runID {
+		t.Errorf("parallel-isolate child lineageRootFull = %q, want own id %q", got, runID)
 	}
 }
 
